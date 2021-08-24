@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
 
   spec.summary       = "Write a short summary, because RubyGems requires one."
   spec.description   = "Write a longer description or delete this line."
-  # spec.homepage      = " Put your gem's website or public repo URL here."
+  spec.homepage      = "http://savechina.github.io/zen"
   spec.license       = "MIT"
   spec.required_ruby_version = Gem::Requirement.new(">= 2.3.0")
 
@@ -32,6 +32,7 @@ Gem::Specification.new do |spec|
   # Uncomment to register a new dependency of your gem
   spec.add_dependency "tty-prompt", "~> 0.23.0"
   spec.add_dependency "thor", "~> 1.1"
+  spec.add_dependency "git", "~> 1.9.1"
 
   # For more information and examples about making a new gem, checkout our
   # guide at: https://bundler.io/guides/creating_gem.html
