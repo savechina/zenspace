@@ -1,6 +1,7 @@
 require "thor"
 # require_relative "version"
 require "yaml"
+require_relative "cmd/repo"
 
 module Zen
   class CLI < Thor
@@ -32,5 +33,8 @@ module Zen
     def version
       puts VERSION.to_s
     end
+
+    desc "repo SUBCOMMAND ...ARGS", "manage set of tracked repositories"
+    subcommand "repo", Zen::RepoCmd
   end
 end

@@ -2,6 +2,7 @@
 
 require_relative "zen/version"
 require_relative "zen/cli"
+require_relative "zen/repo"
 
 module Zen
   class Error < StandardError; end
