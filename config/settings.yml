@@ -1,0 +1,5 @@
+zen:
+  commands: "hello"
+  repokit: "~/CodeRepo"
+  data:
+    db: "test.db"

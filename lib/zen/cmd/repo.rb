@@ -1,6 +1,6 @@
 require "zen/repo"
 module Zen
-  class RepoCmd < Thor
+  class RepoCommand < Thor
     desc "fetch <repository> [<refspec>...]", "Download objects and refs from another repository"
     options all: :boolean, multiple: :boolean
     option :append, type: :boolean, aliases: :a

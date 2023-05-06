@@ -35,6 +35,6 @@ module Zen
     end
 
     desc "repo SUBCOMMAND ...ARGS", "manage set of tracked repositories"
-    subcommand "repo", Zen::RepoCmd
+    subcommand "repo", Zen::RepoCommand
   end
 end

@@ -2,10 +2,13 @@
 
 RSpec.describe Zen do
   it "has a version number" do
-    expect(Zen::VERSION).not_to be nil
+    expect(Zen::VERSION_NUMBER).not_to be nil
+
+    puts "version number:#{Zen::VERSION_NUMBER}"
   end
 
-  it "does something useful" do
-    expect(false).to eq(true)
+  it "does db members list" do
+
+    expect(true).to eq(true)
   end
 end

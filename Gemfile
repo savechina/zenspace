@@ -12,3 +12,11 @@ gem "rspec", "~> 3.0" , group: :development
 gem "rubocop", "~> 0.80"
 
 gem "solargraph", group: :development
+
+gem "factory_bot", "~> 6.2"
+
+gem 'sqlite3', '~> 1.4', '>= 1.4.2'
+
+gem 'sequel', '~> 5.54'
+
+gem 'config', '~> 4.0'
