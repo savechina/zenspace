@@ -1,0 +1,12 @@
+# TypeProf 0.21.3
+
+# Classes
+module Zen
+  MAJOR: Integer
+  MINOR: Integer
+  TINY: Integer
+  VERSION: String
+  VERSION_NUMBER: Integer
+
+  def self.version: -> String
+end

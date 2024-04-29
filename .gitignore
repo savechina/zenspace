@@ -9,4 +9,13 @@
 
 # rspec failure tracking
 .rspec_status
-/.idea
+.idea
+.vscode
+
+log/
+templates/*
+
+test.db
+
+.env
+.env.development

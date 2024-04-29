@@ -2,4 +2,4 @@
 
 require "zen"
 
-Zen::CLI.start(ARGV)
+Zen::Commands::CLI.start(ARGV)

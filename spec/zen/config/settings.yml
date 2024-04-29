@@ -1,6 +1,6 @@
 %YAML 1.1
---- 
-zen: 
+---
+zen:
   commands: hello
   repokit: "~/CodeRepo"
   members:

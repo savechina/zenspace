@@ -1,6 +1,6 @@
-require 'thor'
+require "thor"
 
-require 'thor/rake_compat'
+require "thor/rake_compat"
 require "rake/tasklib"
 
 class RakeTask < Rake::TaskLib
@@ -27,12 +27,12 @@ end
 class ThorTask < Thor
   include Thor::RakeCompat
   RakeTask.new
-  
-  desc 'cool', 'say cool'
+
+  desc "cool", "say cool"
   def cool
-    Rake::Task['cool'].invoke
-    puts ThorTask.tasks['cool'].description
+    Rake::Task["cool"].invoke
+    puts ThorTask.tasks["cool"].description
   end
 end
 
-# ThorTask.start(ARGV)
+ThorTask.start(ARGV)

@@ -21,7 +21,7 @@ module Zen
         # 出生日期
         Date    :birthdate,           null: true
         # 状态
-        Integer :state,               null: false;
+        Integer :state,               null: false
       end
     end
 
@@ -56,11 +56,7 @@ module Zen
       attr_accessor :name
       # member's id
       attr_accessor :id
-      attr_accessor :rank
-      attr_accessor :hiredate
-      attr_accessor :sex
-      attr_accessor :age
-      attr_accessor :birthdate
+      attr_accessor :rank, :hiredate, :sex, :age, :birthdate
 
       def initialize(name = [nil])
         @name = name

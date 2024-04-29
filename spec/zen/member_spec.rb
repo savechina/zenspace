@@ -3,7 +3,6 @@
 require "sequel"
 
 RSpec.describe Zen::MemberKit do
-
   it "does something useful" do
     member = Zen::MemberKit::Member.new
     member.name = "wan"
@@ -22,6 +21,8 @@ RSpec.describe Zen::MemberKit do
 
     f = File.expand_path("config/settings.yml", __dir__)
     puts "expand_path #{f}"
+
+    puts "local: #{__dir__}"
 
     # connect to an in-memory database
     DB = Sequel.sqlite("test.db")

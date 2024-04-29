@@ -1,0 +1,10 @@
+#
+# Zen module
+#
+module Zen
+  #
+  # Error
+  #
+  class Error < StandardError
+  end
+end

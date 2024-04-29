@@ -1,13 +1,21 @@
+# frozen_string_literal: true
+# typed: true
+
 module Zen
   # Member Kit
   module MemberKit
+    require "zen/system/import"
+
+    # include Import["logger"]
     require "sequel"
+
+    Application.logger.info("memberkit init")
 
     Configuration.configurate
 
     df_file = "test.db" if Settings.zen.data.db.nil?
 
-    puts "#{Settings.zen.data.db}"
+    # puts "#{Settings.zen.data.db}"
 
     DB = Sequel.sqlite(df_file)
 

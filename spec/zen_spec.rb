@@ -8,7 +8,6 @@ RSpec.describe Zen do
   end
 
   it "does db members list" do
-
     expect(true).to eq(true)
   end
 end

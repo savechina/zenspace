@@ -1,5 +1,9 @@
 zen:
+  system:
+    config:
+    providiers:
   commands: "hello"
-  repokit: "~/CodeRepo"
+  components:
+    repokit: "~/CodeRepo"
   data:
-    db: "test.db"
+    db: "zen.db"
