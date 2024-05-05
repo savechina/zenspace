@@ -41,3 +41,7 @@ gem "dry-events", "~> 1.0"
 gem "dry-monitor", "~> 1.0"
 
 gem "dotenv", "~> 3.1"
+
+gem "dry-struct", "~> 1.6"
+
+gem "activesupport", "~> 7.1.2"

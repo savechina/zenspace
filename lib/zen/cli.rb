@@ -51,6 +51,8 @@ module Zen
       # finish application container initial
       Application.finalize!
 
+      # Application.keys
+
       ##
       # the SubCommand defines
 

@@ -15,11 +15,11 @@ module Zen
 
     DEFAULT_ENV = "production"
 
-    DEFALUT_USER_ROOT = Zen::USER_ROOT
+    user_root = Zen::USER_ROOT
 
-    DEFALUT_USER_CONFIG_ROOT = File.join(DEFALUT_USER_ROOT, DEFALUT_CONFIG_ROOT)
+    DEFALUT_USER_CONFIG_ROOT = File.join(user_root, DEFALUT_CONFIG_ROOT)
 
-    DEFALUT_USER_DATA_ROOT = File.join(DEFALUT_USER_ROOT, DEFALUT_DATA_ROOT)
+    user_data_root = Zen::USER_ROOT_DATA
 
     def self.configurate(config_root = nil, env = nil)
       Config.setup do |config|

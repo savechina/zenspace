@@ -14,10 +14,6 @@ module Zen
   ROOT = File.dirname(File.expand_path(__dir__))
 
   ##
-  # The template root path for Zen templates
-  TEMPLATE_ROOT = File.join(ROOT, "templates")
-
-  ##
   # The user root path for Zen store user's config and data ,templates etc.
   USER_ROOT = File.join(Dir.home, ".zen")
 
@@ -26,6 +22,7 @@ module Zen
 
   # require submodule lib
   require_relative "zen/version"
+  require_relative "zen/contants"
   require_relative "zen/errors"
 
   # System
@@ -35,7 +32,7 @@ module Zen
 
   # Components
   # require_relative "zen/config"
-  require_relative "zen/components/starter"
+  # require_relative "zen/components/starter"
 
   # Commands
   require_relative "zen/command"
@@ -43,7 +40,7 @@ module Zen
 
   # Application.finalize!
 
-  # puts Application.keys
+  puts Application.keys
 
   # puts "Container keys: #{Application.keys}"
   # puts "User repo:      #{service.user_repo.inspect}"
@@ -54,30 +51,4 @@ module Zen
 
   # greeter = Application["zen.components.greeter"]
   # puts greeter.call("world zenspace")
-
-  # include Zen::Import["logger"]
-
-  # logger = Application.logger
-
-  # logger.debug("logger first application")
-
-  # # puts "_dir_ : #{__dir__}"
-
-  # # puts "_file_ : #{__FILE__}"
-
-  # puts "user:#{Dir.home}"
-
-  # Using Dir.pwd and File.dirname
-  # current_dir = __dir__
-  # project_root = File.dirname(current_dir)
-  # puts "project_root : #{project_root}"
-
-  # puts "ROOT:#{ROOT}"
-  # puts "ROOT: #{File.expand_path(ROOT)}"
-  # puts "TEMPLATE_ROOT: #{File.expand_path(TEMPLATE_ROOT)}"
-
-  # # Application
-  # pp "Configuration:  #{Application["settings"].to_h}"
-
-  # pp "#{Settings}"
 end

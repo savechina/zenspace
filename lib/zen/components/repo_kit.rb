@@ -4,7 +4,7 @@ require "git"
 
 module Zen
   module Components
-    class Repo
+    class RepoKit
       # CodeReop root path
       attr_accessor :root
       # code workspace

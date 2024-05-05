@@ -2,25 +2,27 @@
 # typed: true
 
 module Zen
-  # Member Kit
-  module MemberKit
-    require "zen/system/import"
+  module Components
+    # Member Kit
+    module MemberKit
+      require "zen/system/import"
 
-    # include Import["logger"]
-    require "sequel"
+      # include Import["logger"]
+      require "sequel"
 
-    Application.logger.info("memberkit init")
+      Application.logger.info("memberkit init")
 
-    Configuration.configurate
+      Configuration.configurate
 
-    df_file = "test.db" if Settings.zen.data.db.nil?
+      df_file = "test.db" if Settings.zen.data.db.nil?
 
-    # puts "#{Settings.zen.data.db}"
+      # puts "#{Settings.zen.data.db}"
 
-    DB = Sequel.sqlite(df_file)
+      DB = Sequel.sqlite(df_file)
 
-    require_relative "member/member"
+      require_relative "member/member"
 
-    def init; end
+      def init; end
+    end
   end
 end

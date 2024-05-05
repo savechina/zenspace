@@ -1,9 +1,12 @@
 zen:
-  system:
-    config:
-    providiers:
+  config:
+    database:
+      tpye: "sqlite"
+      url: "sqlite::memory"
+  providiers:
   commands: "hello"
   components:
     repokit: "~/CodeRepo"
+    startkit:
   data:
     db: "zen.db"

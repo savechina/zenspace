@@ -1,11 +1,11 @@
-require "zen/components/repo"
+# require "zen/components/repo"
 module Zen
   module Commands
     ##
     # RepoCommand for repo Utils
     #
     class RepoCommand < Zen::Commands::BaseCommand
-      include Import["zen.components.repo"]
+      include Import["zen.components.repo_kit"]
 
       ##
       # define command
