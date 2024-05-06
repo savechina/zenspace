@@ -7,9 +7,8 @@ require "active_support/all"
 module Zen
   module Components
     require_relative "starter_kit/model/java_project"
-    require_relative "starter_kit/repository/starter_repository"
-    # require "dry-struct"
-    # require "ostruct"
+    # require_relative "starter_kit/repository/starter_repository"
+
     ##
     # StarterKit
     #

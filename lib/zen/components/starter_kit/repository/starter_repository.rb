@@ -25,22 +25,15 @@ module Zen
             db.schema(table_name)
           end
 
+          ##
+          # fetch all class from database by table
+          # @return [StarterKit::JavaClass[]]
           def fetch_all_class
             all_class = []
             all_table = db.tables
+
             all_table.each do |table_name|
-              fields = []
-
-              db.schema(table_name).each do |col, value|
-                puts "#{col},#{value[:db_type]}"
-
-                java_field = StarterKit::JavaField.new(field_name: col.to_s.camelcase(:lower),
-                                                       field_type: value[:type].to_s,
-                                                       comment: "",
-                                                       column_name: col.to_s,
-                                                       column_type: value[:db_type])
-                fields << java_field
-              end
+              fields = fetch_all_fields(table_name)
 
               java_class = StarterKit::JavaClass.new(package_name: "nil",
                                                      table_name: table_name.to_s,
@@ -51,6 +44,24 @@ module Zen
             end
 
             all_class
+          end
+
+          ##
+          # fetch all field from database by <table_name>
+          # @return [StarterKit::JavaField[]]
+          def fetch_all_fields(table_name)
+            fields = []
+
+            db.schema(table_name).each do |col, value|
+              java_field = StarterKit::JavaField.new(field_name: col.to_s.camelcase(:lower),
+                                                     field_type: value[:type].to_s,
+                                                     comment: "",
+                                                     column_name: col.to_s,
+                                                     column_type: value[:db_type])
+              fields << java_field
+            end
+
+            fields
           end
         end
       end
