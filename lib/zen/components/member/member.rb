@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+# typed:true
+
 require "sequel"
 
 module Zen

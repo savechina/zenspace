@@ -1,3 +1,4 @@
+# typed: true
 # frozen_string_literal: true
 
 require "fileutils"
@@ -58,7 +59,8 @@ module Zen
           { column_name: "email", data_type: "VARCHAR(255)" }
         ]
 
-        template_class = File.join(Zen::TEMPLATE_ROOT, "class", "class.erb")
+        class_template_name = "class.erb"
+        template_class = File.join(Zen::TEMPLATE_ROOT, "class", class_template_name)
 
         # Create ERB template object
         template = ERB.new(File.read(template_class))
@@ -70,6 +72,9 @@ module Zen
         }
 
         puts template_data
+
+        b = binding
+        puts binding.local_variables
 
         # Parse and generate Java class code
         generated_code = template.result(binding)

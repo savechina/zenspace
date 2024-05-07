@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+# typed:true
+
 module Zen
   module Components
     require "dry-struct"

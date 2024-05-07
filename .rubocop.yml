@@ -1,3 +1,11 @@
+require:
+  - rubocop-rake
+  - rubocop-rspec
+  - rubocop-sequel
+  - rubocop-sorbet
+AllCops:
+  NewCops: enable
+
 Style/StringLiterals:
   Enabled: true
   EnforcedStyle: double_quotes
@@ -8,8 +16,7 @@ Style/StringLiteralsInInterpolation:
 
 Layout/LineLength:
   Max: 120
-AllCops:
-  NewCops: enable
+
 Gemspec/DeprecatedAttributeAssignment: # new in 1.30
   Enabled: true
 Gemspec/DevelopmentDependencies: # new in 1.44

@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+# typed:true
+
 require "yaml"
 require "pathname"
 require "git"

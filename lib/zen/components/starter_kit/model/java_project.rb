@@ -1,3 +1,6 @@
+# frozen_string_literal: true
+# typed:true
+
 require "dry/types"
 require "dry-struct"
 

@@ -1,5 +1,5 @@
-# frozen_string_literal: true
 # typed: true
+# frozen_string_literal: true
 
 ##
 # Zen is a productivity suite designed to help you conquer common workplace challenges with ease.
