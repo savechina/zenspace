@@ -7,7 +7,8 @@ module Zen
     # RepoCommand for repo Utils
     #
     class RepoCommand < Zen::Commands::BaseCommand
-      include Import["zen.components.repo_kit"]
+      # @return [Zen::Components::RepoKit]
+      include Import["zen.components.repo_kit"] # => [Zen::Components::RepoKit]
 
       ##
       # define command
@@ -18,7 +19,10 @@ module Zen
       def fetch(respository, *_refspec)
         # implement git fetch here
 
-        r = repo
+        # repo_kit
+
+        # @type [Zen::Components::RepoKit]
+        r = repo_kit
         r.fetch respository
       end
 

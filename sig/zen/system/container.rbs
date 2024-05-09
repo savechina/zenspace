@@ -1,8 +1,0 @@
-require "dry/system"
-require "dry/system/container"
-
-# Classes
-module Zen
-  class Application 
-  end
-end

@@ -1,0 +1,9 @@
+# TypeProf 0.21.11
+
+# Classes
+module Zen
+  Import:  Dry::AutoInject
+
+  class Application < Dry::System::Container
+  end
+end

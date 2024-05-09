@@ -11,11 +11,12 @@ module Zen
   ##
   # Settings for Application common config
   #
+  #
   # @example
   #   ENV["XXX_ENV"]
   #   Settings["database"]
   #
-  #
+  # @type Zen::Application
   Application.register_provider(:settings, from: :dry_system) do
     # prepare hook
     prepare do
@@ -53,12 +54,5 @@ module Zen
       new_variable = ENV.fetch("APP_ENV", :development)
       puts "#{new_variable}....ENV"
     end
-
-    # #open happen error
-    # start do
-    # end
-
-    # stop do
-    # end
   end
 end

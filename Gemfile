@@ -57,3 +57,7 @@ group :development do
 
   gem "typeprof", "~> 0.21.11", group: :development
 end
+
+gem "ruby-enum", "~> 1.0"
+
+gem "steep", "~> 1.4", :group => :development
