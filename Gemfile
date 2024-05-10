@@ -60,4 +60,4 @@ end
 
 gem "ruby-enum", "~> 1.0"
 
-gem "steep", "~> 1.4", :group => :development
+gem "steep", "~> 1.4", group: :development

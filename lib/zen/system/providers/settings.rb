@@ -52,7 +52,7 @@ module Zen
       end
 
       new_variable = ENV.fetch("APP_ENV", :development)
-      puts "#{new_variable}....ENV"
+      # puts "#{new_variable}....ENV"
     end
   end
 end

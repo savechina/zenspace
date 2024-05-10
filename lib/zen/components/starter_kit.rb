@@ -21,7 +21,11 @@ module Zen
       # end
       def load(project_name, group_name, package_name, output_root)
         logger.info "StarterKit init project load ...."
-        project = StarterKit::JavaProject.new(project_name:, group_name:, package_name:)
+        project = StarterKit::Model::JavaProject.new(
+          project_name:,
+          group_name:,
+          package_name:
+        )
 
         logger.info "StarterKit::JavaProject :#{project.group_name}"
 
