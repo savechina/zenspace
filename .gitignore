@@ -13,7 +13,8 @@
 .vscode
 
 log/
-templates/*
+templates/java
+templates/__app__
 
 test.db
 

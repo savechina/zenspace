@@ -1,0 +1,21 @@
+<% class_name = @table_name.camelcase %>
+package <%= @pcakage_name%>;
+public class <%= class_name %> {
+
+    <% for column in @columns %>
+        private <%= column[:data_type] %> <%= column[:column_name] %>;
+    <% end %>
+
+
+     <% for column in @columns %>
+
+        public <%= column[:data_type] %> get<%= column[:column_name].camelcase %>() {
+            return <%= column[:column_name] %>;
+        }
+
+        public void set<%= column[:column_name].camelcase %> (<%= column[:data_type] %> <%= column[:column_name] %>) {
+            this.<%= column[:column_name] %> = <%= column[:column_name] %>;
+        }
+    <% end %>
+
+}
