@@ -13,7 +13,7 @@ module Zen
     # use plugin
     use :logging
     use :env, inferrer: -> { ENV.fetch("APP_ENV", :development).to_sym }
-    use :monitoring
+    # use :monitoring
     use :zeitwerk, debug: false
 
     # application config
@@ -36,6 +36,12 @@ module Zen
       config.inflector = Dry::Inflector.new do |inflections|
         inflections.acronym("CLI")
       end
+
+      log_dir = File.join(Zen::USER_ROOT, "log")
+
+      FileUtils.mkdir_p(log_dir) unless File.exist?(log_dir)
+
+      config.log_dir = log_dir
     end
   end
 

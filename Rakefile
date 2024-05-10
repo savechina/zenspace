@@ -25,3 +25,5 @@ namespace :starter do
 end
 # clean build or test target file
 CLEAN.include "bluekit-sample"
+
+CLEAN.include "vendor"
