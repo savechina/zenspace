@@ -12,6 +12,8 @@ module Zen
         class StarterRepository
           include Import["persistence.db"]
 
+          JavaField = StarterKit::Model::JavaField
+
           def fetch_all_tables
             db.create_table :posts do
               primary_key :id
@@ -38,10 +40,12 @@ module Zen
             all_table.each do |table_name|
               fields = fetch_all_fields(table_name)
 
-              java_class = StarterKit::Model::JavaClass.new(package_name: "nil",
-                                                            table_name: table_name.to_s,
-                                                            class_name: table_name.to_s.camelcase,
-                                                            fields:)
+              java_class = StarterKit::Model::JavaClass.new(
+                package_name: "nil",
+                table_name: table_name.to_s,
+                class_name: table_name.to_s.camelcase,
+                fields:
+              )
 
               all_class << java_class
             end
@@ -56,11 +60,18 @@ module Zen
             fields = []
 
             db.schema(table_name).each do |col, value|
-              java_field = StarterKit::Model::JavaField.new(field_name: col.to_s.camelcase(:lower),
-                                                            field_type: value[:type].to_s,
-                                                            comment: "",
-                                                            column_name: col.to_s,
-                                                            column_type: value[:db_type])
+              puts "#{col},#{value}"
+
+              col_type = value[:db_type].to_s.downcase.start_with?("varchar") ? "VARCHAR" : value[:db_type]
+
+              java_field = StarterKit::Model::JavaField.new(
+                field_name: col.to_s.camelcase(:lower),
+                field_type: value[:type].to_s,
+                comment: "",
+                column_name: col.to_s,
+                column_type: col_type
+              )
+
               fields << java_field
             end
 

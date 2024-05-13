@@ -6,12 +6,9 @@ require "dry-struct"
 
 module Zen
   module Components
-    module Types
-      include Dry.Types()
-    end
-
     class StarterKit
       module Model
+        Types = Dry.Types()
         ##
         # Java Project
         class JavaProject < Dry::Struct

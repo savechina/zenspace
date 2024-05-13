@@ -13,6 +13,7 @@ module Zen
           include Ruby::Enum
 
           define :VARCHAR, { db_type: "VARCHAR", java_type: "String", jdbc_type: "VARCHAR" }
+          define :INT, { db_type: "INT", java_type: "Integer", jdbc_type: "INT" }
         end
       end
     end
