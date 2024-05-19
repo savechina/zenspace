@@ -31,7 +31,18 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   # Uncomment to register a new dependency of your gem
+  spec.add_dependency "activesupport", "~> 7.1.2"
+  spec.add_dependency "config", "~> 4.0"
+  spec.add_dependency "dotenv", "~> 3.1"
+  spec.add_dependency "dry-events", "~> 1.0"
+  spec.add_dependency "dry-monitor", "~> 1.0"
+  spec.add_dependency "dry-struct", "~> 1.6"
+  spec.add_dependency "dry-system", "~> 1.0"
+  spec.add_dependency "factory_bot", "~> 6.2"
   spec.add_dependency "git", "~> 1.9.1"
+  spec.add_dependency "ruby-enum", "~> 1.0"
+  spec.add_dependency "sequel", "~> 5.54"
+  spec.add_dependency "sqlite3", ">= 1.4.2"
   spec.add_dependency "thor", "~> 1.1"
   # spec.add_dependency "tty-prompt", "~> 0.23.0"
 

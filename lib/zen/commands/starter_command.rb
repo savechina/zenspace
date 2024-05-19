@@ -68,8 +68,8 @@ module Zen
 
       ##
       # new command
-      desc "new", "init project from template"
-      def new(project_name)
+      desc "add", "init project from template"
+      def add(project_name)
         puts project_name
 
         starter_kit.add(project_name)

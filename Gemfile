@@ -6,26 +6,6 @@ source "https://rubygems.org"
 # Specify your gem's dependencies in zen.gemspec
 gemspec
 
-gem "sequel", "~> 5.54"
-
-gem "config", "~> 4.0"
-
-gem "factory_bot", "~> 6.2"
-
-gem "sqlite3",  ">= 1.4.2"
-
-gem "dry-system", "~> 1.0"
-
-gem "dry-events", "~> 1.0"
-
-gem "dry-monitor", "~> 1.0"
-
-gem "dotenv", "~> 3.1"
-
-gem "dry-struct", "~> 1.6"
-
-gem "activesupport", "~> 7.1.2"
-
 group :development do
   gem "rake", "~> 13.0", group: :development
 
@@ -55,9 +35,6 @@ group :development do
 
   gem "rubocop-thread_safety", "~> 0.5.1"
 
+  gem "steep", "~> 1.4", group: :development
   gem "typeprof", "~> 0.21.11", group: :development
 end
-
-gem "ruby-enum", "~> 1.0"
-
-gem "steep", "~> 1.4", group: :development

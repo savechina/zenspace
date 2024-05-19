@@ -49,6 +49,10 @@ module Zen
         puts VERSION
       end
 
+      def self.exit_on_failure?
+        true
+      end
+
       # finish application container initial
       Application.finalize!
 

@@ -1,5 +1,5 @@
-# frozen_string_literal: true
 # typed:true
+# frozen_string_literal: true
 
 require "yaml"
 require "pathname"
@@ -29,6 +29,7 @@ module Zen
         path = Pathname.new(@root).join(@workspace).join(reponame)
         git = Git.open(path)
         puts git.show
+        puts git.fetch
       end
     end
   end
