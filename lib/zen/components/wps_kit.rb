@@ -1,21 +1,18 @@
 # typed: true
 # frozen_string_literal: true
 
-require "fileutils"
-# require "erb"
-require "active_support/all"
-require "digest"
-
 module Zen
   module Components
-    # require_relative "starter_kit/model/java_project"
-    # require_relative "starter_kit/repository/starter_repository"
-
+    require "fileutils"
+    require "active_support/all"
+    require "digest"
     ##
     # StarterKit
     #
     class WpsKit
-      def fdupes(file_regex)
+      ##
+      # find file duplicates
+      def find_duplicates(file_regex)
         file_unique = {}
         file_dupes = {}
         Dir.glob("#{file_regex}").each do |file|
@@ -31,7 +28,7 @@ module Zen
         end
 
         # "file : #{pp file_unique}"
-        pp file_dupes
+        file_dupes
       end
 
       def file_checksum(file_path)
@@ -39,8 +36,6 @@ module Zen
         file = File.open(file_path, "rb")
 
         file_stat = file.stat
-
-        # puts File.basename(file)
 
         # Initialize variables for SHA256 hash and block count
         md5_hash = Digest::MD5.new
@@ -63,11 +58,7 @@ module Zen
         # Get the final MD5 hash digest
         md5_digest = md5_hash.hexdigest
 
-        # Print the results
-        # puts "MD5 Hash: #{md5_digest}"
-        # puts "Block Count: #{block_count}"
-
-        OpenStruct.new(file_hash: md5_digest, block_count:)
+        OpenStruct.new(file_hash: md5_digest, block_count:, file_stat: "")
       end
 
       def file_checksum2(file)
