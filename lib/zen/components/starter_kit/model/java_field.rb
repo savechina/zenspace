@@ -3,22 +3,40 @@
 
 module Zen
   module Components
-    require "dry-struct"
-
     class StarterKit
       module Model
         ##
-        # Java Object
-        class JavaField < Dry::Struct
-          attribute :field_name, Types::String
+        # Java Object Field
+        class JavaField
+          ##
+          # field name
+          # @return [String]
+          attr_accessor :field_name
 
-          attribute :field_type, Types::String
+          # field comment
+          # @return [String]
+          attr_accessor :field_comment
 
-          attribute :comment, Types::String
+          # field type: Java Type
+          # @return [String]
+          # @see [JavaTypes]
+          attr_accessor :java_type
 
-          attribute :column_name, Types::String
+          # @return [String]
+          attr_accessor :column_name
 
-          attribute :column_type, Types::String
+          ##
+          # database column  type
+          attr_accessor :table_name
+
+          # @return [String]
+          # @see [JavaTypes]
+          attr_accessor :column_type
+
+          # type: JDBC Type
+          # @return [String]
+          # @see [JavaTypes]
+          attr_accessor :jdbc_type
         end
       end
     end

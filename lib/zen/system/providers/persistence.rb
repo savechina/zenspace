@@ -16,8 +16,9 @@ module Zen
     end
 
     start do
-      url = "sqlite::memory"
-      register("persistence.db", Sequel.connect(url))
+      # settings database url
+      url = target[:settings].database.url
+      register "persistence.db", Sequel.connect(url)
     end
 
     stop do

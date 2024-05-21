@@ -15,6 +15,7 @@
 log/
 templates/java
 templates/__app__
+templates/stater/ddd_init/__app__
 
 test.db
 

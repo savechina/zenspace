@@ -15,7 +15,7 @@ module Zen
           define :VARCHAR, { db_type: "VARCHAR", java_type: "String", jdbc_type: "VARCHAR" }
           define :CHAR, { db_type: "CHAR", java_type: "String", jdbc_type: "CHAR" }
           define :BLOB, { db_type: "BLOB", java_type: "byte[]", jdbc_type: "BLOB" }
-          define :TEXT, { db_type: "TEXT", ava_type: "String", jdbc_type: "VARCHAR" }
+          define :TEXT, { db_type: "TEXT", java_type: "String", jdbc_type: "VARCHAR" }
 
           # INT 映射到 JDBC 的 INTEGER
           define :INT, { db_type: "INT", java_type: "Integer", jdbc_type: "INTEGER" }

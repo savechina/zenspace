@@ -4,20 +4,35 @@
 require_relative "java_field"
 module Zen
   module Components
-    require "dry-struct"
-
     class StarterKit
       module Model
         ##
         # Java Object
-        class JavaClass < Dry::Struct
-          attribute :package_name, Types::String.optional
+        class JavaClass
+          # Package Name
+          # @return [String]
+          attr_accessor :package_name
 
-          attribute :class_name, Types::String
+          # Class Name
+          # @return [String]
+          attr_accessor :class_name
 
-          attribute :table_name, Types::String
+          # Class Comment
+          # @return [String]
+          attr_accessor :class_comment
 
-          attribute :fields, Types::Array.of(StarterKit::Model::JavaField)
+          # Table Name
+          # @return [String]
+          attr_accessor :table_name
+
+          ##
+          # Fields
+          # @return [Array<JavaField>]
+          attr_accessor :fields
+
+          # Feature Name
+          # @return [String]
+          attr_accessor :feature_name
         end
       end
     end

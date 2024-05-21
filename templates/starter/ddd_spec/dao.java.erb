@@ -1,0 +1,38 @@
+<% 
+packageName = "#{modules[:mapper].full_package}.#{model.package_name}" 
+entityPackageName = "#{modules[:entity].full_package}.#{model.package_name}"  
+tableEntity = model.feature_name.camelcase + model.class_name + "Entity"
+tableEntityInstance = "#{model.class_name.camelcase(:lower)}Entity"
+
+daoName = "Mapper"
+tableDao = "#{model.feature_name.camelcase}#{model.class_name}#{daoName}"
+%> 
+<%    
+tableVO = "#{model.class_name}VO"
+tableVOInstance = "#{model.class_name}VO"
+
+tableResponse = "#{model.class_name}Response"
+tableQueryVO = "#{model.class_name}QueryVO"
+tableQueryVOInstance = "#{model.class_name}QueryVO"
+%>
+package <%= packageName %>;
+
+import <%= entityPackageName %>.<%= tableEntity %>;
+
+import java.util.*;
+import org.apache.ibatis.annotations.Param;
+
+public interface <%= tableDao %>  {
+    Integer insert(<%= tableEntity %> <%= tableEntityInstance %>);
+    Integer insertBatch(List<<%= tableEntity %>> list);
+
+    Integer deleteByPrimaryKey(Long id);
+    Integer deleteBatchByPrimaryKey(List<Long> ids);
+
+    Integer update(<%= tableEntity %> <%= tableEntityInstance %>);
+    Integer updateBatch(List<<%= tableEntity %>> list);
+
+    List<<%= tableEntity %>> selectBy(<%= tableEntity %> <%= tableEntityInstance %>);
+
+    <%= tableEntity %> getById(Long id);
+}

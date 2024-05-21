@@ -1,0 +1,42 @@
+<% 
+voName="Vo"
+voEntity="#{model.feature_name.camelcase}#{model.class_name}#{voName}" 
+voPackageName = "#{modules[:vo].full_package}.#{model.package_name}" 
+
+class_name = voEntity
+%>
+package <%= voPackageName%>;
+
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.math.BigDecimal;
+import java.util.*;
+
+/**
+*  <%= model.class_name %> 
+*  <%= model.class_comment%>
+*/
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class <%= class_name %> {
+    <% for column in model.fields %>
+     /**
+      * <%= column.field_comment %>
+      */
+    private <%= column.java_type %> <%= column.field_name %>;
+    <% end %>
+
+    <% for column in model.fields %>
+    public <%= column.java_type %> get<%= column.field_name.camelcase %>() {
+        return <%= column.field_name %>;
+    }
+
+    public void set<%= column.field_name.camelcase %> (<%= column.java_type %> <%= column.field_name %>) {
+        this.<%= column.field_name %> = <%= column.field_name%>;
+    }
+    <% end %>
+}

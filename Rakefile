@@ -20,10 +20,12 @@ end
 namespace :starter do
   desc "starter init test project  "
   task :init do
-    sh "bundle exec zen starter init bluekit-sample org.renyan.bluekit.sample  org.renyan.bluekit.sample"
+    sh "bundle exec zen starter init bluekit-sample org.renyan.bluekit.sample  org.renyan.bluekit.sample target"
   end
 end
 # clean build or test target file
 CLEAN.include "bluekit-sample"
 
 CLEAN.include "vendor"
+
+CLEAN.include "target"

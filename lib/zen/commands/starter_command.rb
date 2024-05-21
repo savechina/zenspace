@@ -31,14 +31,9 @@ module Zen
         $ zen starter init bluekit-sample org.renyan.bluekit.sample  org.renyan.bluekit.sample
 
       LONGDESC
-
+      option :verbose, type: :boolean, aliases: "-v", desc: "Verbose output"
       def init(project_name = nil, group_name = nil, package_name = nil, output_root = nil)
-        puts "#{project_name},#{group_name},#{package_name},#{output_root}"
-
-        # if project_name.nil?
-        #   puts "init must project_name args is nil"
-        #   exit!(1)
-        # end
+        #        puts "#{project_name},#{group_name},#{package_name},#{output_root}"
 
         raise ArgumentError, "init must given <project_name> args is nil" if project_name.nil?
 
@@ -49,30 +44,77 @@ module Zen
         # if output is nil set current to output dir
         output_root = Dir.pwd if output_root.nil?
 
-        puts "output: #{output_root}"
+        Application.logger.level = "DEBUG" if options[:verbose]
 
-        # @type [Zen::Components::StarterKit::Model::JavaProject]
-        java_project = Zen::Components::StarterKit::Model::JavaProject.new(
-          project_name:,
-          group_name:,
-          package_name:
-        )
-        # puts java_project.project_name
-        # java_project.group_name = group_name
+        # @type [Bluekit::Components::StarterKit::Model::JavaProject]
+        project = Components::StarterKit::Model::JavaProject.new
+        # project = java_project
+        project.project_name = project_name
+        project.group_name = group_name
+        project.package_name = package_name
 
-        starter_kit.load(project_name, group_name, package_name, output_root)
+        starter_kit.load(project, output_root)
+
+        puts "Starter init project, #{project_name},#{group_name},#{package_name}!" if options[:verbose]
       rescue StandardError => e
         puts "starter init error, Error:#{e.message}"
         exit(1)
       end
 
       ##
-      # new command
-      desc "add", "init project from template"
-      def add(project_name)
-        puts project_name
+      # add command
+      desc "add NAME TABLE_NAME", "Add project feature"
+      option :all, type: :boolean, aliases: "-a", desc: "enable all layer"
+      option :verbose, type: :boolean, aliases: "-v", desc: "Verbose output"
+      option :controler, type: :boolean, aliases: "-c", desc: "enable controler layer"
+      option :infra, type: :boolean, aliases: "-i", desc: "enable infrastructure layer"
+      option :project_name, type: :string, aliases: "-p", desc: "project name"
+      option :package_name, type: :string, desc: "base package name"
+      option :group_name, type: :string, desc: "group name"
+      option :force, type: :boolean, aliases: "-f", desc: "Force Overwriter"
+      def add(feature_name, table_name, output_root = nil)
+        project_name = options[:project_name]
 
-        starter_kit.add(project_name)
+        package_name = options[:package_name]
+
+        group_name = options[:group_name]
+
+        overwrite = options[:force]
+
+        # if output is nil set current to output dir
+        output_root = Dir.pwd if output_root.nil? || output_root.strip.empty?
+
+        @project = Components::StarterKit::Model::JavaProject.new
+
+        @project.project_name = if project_name.nil? || project_name.strip.empty?
+                                  ENV.fetch("project_name", nil)
+                                else
+                                  project_name
+                                end
+
+        @project.package_name = if package_name.nil? || package_name.strip.empty?
+                                  ENV.fetch("package_name", nil)
+                                else
+                                  package_name
+                                end
+
+        @project.group_name = if group_name.nil? || group_name.strip.empty?
+                                ENV.fetch("group_name", nil)
+                              else
+                                group_name
+                              end
+
+        pp @project
+
+        starter_kit.add(@project, feature_name, table_name, output_root)
+
+        puts "Hello, #{@project.project_name}!,#{table_name}"
+      end
+
+      desc "workspace ", "Initialize Worksapce directory structure."
+      def workspace
+        # call starter workspace initialize
+        starter_kit.workspace
       end
 
       # base define

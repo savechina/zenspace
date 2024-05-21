@@ -28,8 +28,10 @@ module Zen
     #
     require "dotenv/load"
 
-    # puts "root: #{target.root}, env: #{target.config.env}"
-    # puts "#{target.settings["env"]}"
+    # zen user config file
+    local_zen_config = ".zen"
+
+    Dotenv.load local_zen_config if File.exist?(local_zen_config) && File.file?(local_zen_config)
 
     settings do
       # puts "setting prepare.... config init"
@@ -46,13 +48,15 @@ module Zen
       Zen::Configuration.configurate(config_root)
 
       # Pass a block for nested configuration (works to any depth)
+
       setting :database do
-        # Can pass a default value
-        setting :url, default: "sqlite:memory"
+        setting :url, default: ENV.fetch("database.url", "sqlite::memory:")
       end
 
+      setting :logger_level, default: :info
+
       new_variable = ENV.fetch("APP_ENV", :development)
-      # puts "#{new_variable}....ENV"
+      puts "#{new_variable}....ENV"
     end
   end
 end

@@ -1,0 +1,126 @@
+<%
+packageName = "#{modules[:repository_impl].full_package}.#{model.package_name}" 
+repositoryImplName = "RepositoryImpl"
+tableRepositoryImpl = "#{model.feature_name.camelcase}#{model.class_name}#{repositoryImplName}"
+
+repositoryPackageName = "#{modules[:repository].full_package}.#{model.package_name}" 
+repositoryName = "Repository"
+tableRepository = "#{model.feature_name.camelcase}#{model.class_name}#{repositoryName}"
+
+entityPackageName = "#{modules[:entity].full_package}.#{model.package_name}"  
+tableEntity = model.feature_name.camelcase + model.class_name + "Entity"
+tableEntityInstance = "#{model.class_name.camelcase(:lower)}Entity"
+
+entityConvertPackageName = "#{modules[:entity_convert].full_package}.#{model.package_name}"
+convertName = "EntityConvert"
+tableEntityConvert = "#{model.feature_name.camelcase}#{model.class_name}#{convertName}"
+tableEntityConvertInstance = "#{model.feature_name.camelcase(:lower)}#{model.class_name}#{convertName}"
+
+daoPackageName = "#{modules[:mapper].full_package}.#{model.package_name}" 
+daoName = "Mapper"
+tableDao = "#{model.feature_name.camelcase}#{model.class_name}#{daoName}"
+tableDaoInstance=tableDao.camelcase(:lower)
+
+doPackageName = "#{modules[:model].full_package}.#{model.package_name}"
+doName="DO"
+doEntity="#{model.feature_name.camelcase}#{model.class_name}#{doName}" 
+doEntityInstance = "#{model.class_name.camelcase(:lower)}DO"
+
+%> 
+<%    
+# tableVO = "#{model.class_name}VO"
+# tableVOInstance = "#{model.class_name}VO"
+
+# tableResponse = "#{model.class_name}Response"
+# tableQueryVO = "#{model.class_name}QueryVO"
+# tableQueryVOInstance = "#{model.class_name}QueryVO"
+%>
+package <%= packageName %>;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Repository;
+
+import <%= doPackageName %>.<%= doEntity %>;
+import <%= entityPackageName %>.<%= tableEntity %>;
+import <%= daoPackageName %>.<%= tableDao %>;
+import <%= entityConvertPackageName %>.<%= tableEntityConvert %>;
+import <%= repositoryPackageName %>.<%= tableRepository %>;
+
+import java.util.*;
+
+@Repository
+public class <%=tableRepositoryImpl%> implements <%= tableRepository %>  {
+
+
+    @Autowired
+    private <%=tableEntityConvert%> <%=tableEntityConvertInstance%>;
+    @Autowired
+    private <%=tableDao%> <%=tableDaoInstance%>;
+
+    /**
+     * 插入 <%=model.class_comment%> 
+     *
+     * @param <%= doEntityInstance %> <%=model.class_comment%> 
+     * @return  Integer
+     */
+    @Override
+    public Integer insert(<%= doEntity %> <%= doEntityInstance %>){
+        
+        <%=tableEntity%>  entity = <%=tableEntityConvertInstance%>.reverseConvert(<%= doEntityInstance %>);
+
+        return <%=tableDaoInstance%>.insert(entity);
+    }
+
+   /**
+     * 批量插入 <%=model.class_comment%> 
+     *
+     * @param  list List<<%= doEntity %>> <%=model.class_comment%> 
+     * @return  Integer
+     */ 
+    @Override
+    public Integer insertBatch(List<<%= doEntity %>> list){
+
+        List<<%=tableEntity%>>  entityList = <%=tableEntityConvertInstance%>.batchReverseConvert(list);
+
+        return <%=tableDaoInstance%>.insertBatch(entityList);
+    }
+
+    @Override
+    public Integer deleteByPrimaryKey(Long id){
+        return <%=tableDaoInstance%>.deleteByPrimaryKey(id);
+    }
+
+    @Override
+    public Integer deleteBatchByPrimaryKey(List<Long> ids){
+        return <%=tableDaoInstance%>.deleteBatchByPrimaryKey(ids);
+    }
+
+    @Override
+    public Integer update(<%= doEntity %> <%= doEntityInstance %>){
+        <%=tableEntity%>  entity = <%=tableEntityConvertInstance%>.reverseConvert(<%= doEntityInstance %>);
+        return <%=tableDaoInstance%>.update(entity);
+    }
+
+    @Override
+    public Integer updateBatch(List<<%= doEntity %>> list){
+        List<<%=tableEntity%>>  entityList = <%=tableEntityConvertInstance%>.batchReverseConvert(list);
+        
+        return <%=tableDaoInstance%>.updateBatch(entityList);
+    }
+
+    @Override
+    public List<<%= doEntity %>> selectBy(<%= doEntity %> <%= doEntityInstance %>){
+        <%=tableEntity%>  param = <%=tableEntityConvertInstance%>.reverseConvert(<%= doEntityInstance %>);
+
+        List<<%=tableEntity%>>  entityList = <%=tableDaoInstance%>.selectBy(param);
+        return <%=tableEntityConvertInstance%>.batchConvert(entityList);
+    }
+
+    @Override
+    public <%= doEntity %> getById(Long id){
+
+        <%=tableEntity%>  entity = <%=tableDaoInstance%>.getById(id);
+
+        return <%=tableEntityConvertInstance%>.convert(entity);
+    }
+}
