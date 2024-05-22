@@ -1,25 +1,30 @@
+# typed: false
 # frozen_string_literal: true
 
 require "zen"
 require "fileutils"
 
-RSpec.describe Zen::ScaffoldKit::JavaScaffold do
+RSpec.describe Zen::Components::StarterKit::JavaScaffold do
   it "test java scaffold new" do
-    project_name = "airp-scm-planning"
+    project_name = "bluekit-sample"
 
     if Dir.exist?(project_name)
       puts "dir had exists ,should delete.. #{project_name}"
       FileUtils.rm_rf project_name
 
     end
-    package_name = "com.jd.airp.scm.planning"
 
-    puts "com.jd.airp.scm.planning:#{package_name.gsub(".", "/")}"
+    java_project = Zen::Components::StarterKit::Model::JavaProject.new
+    java_project.project_name = project_name
 
-    project_group = "com.jd.airp.scm"
-    package_name = "com.jd.airp.scm.planning"
-    java_scaffold = Zen::ScaffoldKit::JavaScaffold.new(project_name, project_group, package_name, nil)
+    package_name = "org.renyan.bluekit.sample"
 
-    java_scaffold.generate
+    java_project.group_name = "org.renyan.bluekit"
+    java_project.package_name = "org.renyan.bluekit.sample"
+    output_root = "target"
+    java_scaffold = Zen::Components::StarterKit::JavaScaffold.new(java_project.project_name, java_project.group_name,
+                                                                  java_project.package_name, output_root)
+
+    java_scaffold.generate output_root
   end
 end
