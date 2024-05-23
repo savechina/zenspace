@@ -15,9 +15,11 @@
 log/
 templates/java
 templates/__app__
-templates/stater/ddd_init/__app__
+templates/starter/ddd_init/__app__
 
 test.db
 
 .env
 .env.development
+
+target

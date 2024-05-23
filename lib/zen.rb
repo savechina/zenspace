@@ -46,7 +46,7 @@ module Zen
 
   # Application.finalize!
 
-  puts Application.keys
+  # puts Application.keys
 
   # puts "Container keys: #{Application.keys}"
   # puts "User repo:      #{service.user_repo.inspect}"

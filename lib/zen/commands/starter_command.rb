@@ -6,7 +6,7 @@ module Zen
     require "zen/components/starter_kit/model/java_project"
 
     ##
-    # RepoCommand for repo Utils
+    # StarterCommand for initialize work
     #
     class StarterCommand < Zen::Commands::BaseCommand
       include Import["zen.components.starter_kit"

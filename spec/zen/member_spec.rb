@@ -1,14 +1,15 @@
+# typed: false
 # frozen_string_literal: true
 
 require "sequel"
+require "zen"
 
-RSpec.describe Zen::MemberKit do
+RSpec.describe Zen::Components::MemberKit do
   it "does something useful" do
-    member = Zen::MemberKit::Member.new
+    member = Zen::Components::MemberKit::Model::Member.new
     member.name = "wan"
     member.age = 37
     member.id = 0
-    member.rank = Zen::MemberKit::Member::RANKS[0]
 
     puts "member name #{member.name},age #{member.age}"
 
@@ -24,23 +25,25 @@ RSpec.describe Zen::MemberKit do
 
     puts "local: #{__dir__}"
 
-    # connect to an in-memory database
-    DB = Sequel.sqlite("test.db")
+    file = Tempfile.new("test.db")
+    puts file.path
 
-    is = DB.supports_create_table_if_not_exists?
+    db = Sequel.sqlite(file.path)
+
+    is = db.supports_create_table_if_not_exists?
 
     it "does members list" do
       puts "supports_create_table_if_not_exists #{is}"
 
       # create an items table
-      DB.create_table! :items do
+      db.create_table! :items do
         primary_key :id
         String :name, unique: true, null: false
         Float :price, null: false
       end
 
       # create a dataset from the items table
-      items = DB[:items]
+      items = db[:items]
 
       # populate the table
       items.insert(name: "abc", price: rand * 100)
@@ -62,14 +65,14 @@ RSpec.describe Zen::MemberKit do
 
     it "does model sample" do
       # init db create person table  if exists and drop table
-      DB.create_table! :zen_persons do
+      db.create_table! :zen_persons do
         primary_key :id
         String :name, unique: true, null: false
         Float :price, null: false
         Integer :sex, null: false
       end
 
-      class Person < Sequel::Model(DB[:zen_persons])
+      class Person < Sequel::Model(db[:zen_persons])
       end
 
       # Person.dataset.destroy

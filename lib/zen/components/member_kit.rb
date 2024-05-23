@@ -4,7 +4,7 @@
 module Zen
   module Components
     # Member Kit
-    module MemberKit
+    class MemberKit
       require "zen/system/import"
 
       # include Import["logger"]
@@ -20,7 +20,7 @@ module Zen
 
       DB = Sequel.sqlite(df_file)
 
-      require_relative "member/member"
+      # require_relative "member/member"
 
       def init; end
     end
