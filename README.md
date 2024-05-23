@@ -23,7 +23,30 @@ Or install it yourself as:
 
 ## Usage
 
-TODO: Write usage instructions here
+Zen Command help
+
+    ➜  zenspace git:(master) bundle exec zen
+    Commands:
+    zen goodbye                  # say goodbye to the world
+    zen hello NAME --from=FROM   # say hello to NAME
+    zen help [COMMAND]           # Describe available commands or one specific command
+    zen repo SUBCOMMAND ...ARGS  # manage set of tracked repositories
+    zen starter [COMMAND]        # init project from template and add new feature to prjoct
+    zen version                  # Zen version
+    zen wps [COMMAND]            # work process suite
+
+    Options:
+    [--verbose], [--no-verbose], [--skip-verbose]
+
+
+Stater command :
+
+Initial project :
+
+    $ zen starter init bluekit-sample org.renyan.bluekit.sample  org.renyan.bluekit.sample
+
+
+
 
 ## Development
 
