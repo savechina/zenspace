@@ -7,7 +7,7 @@ require "config"
 
 RSpec.describe Zen::Configuration do
   it "does zen load configuation" do
-    config_root = File.absolute_path("config", __FILE__)
+    config_root = File.join(File.dirname(__FILE__), "config")
 
     puts config_root
 
@@ -15,13 +15,13 @@ RSpec.describe Zen::Configuration do
 
     puts "config.name #{config}"
 
-    # expect(config.has_key?(:zen)).to eq(true)
+    expect(config.has_key?(:zen)).to eq(true)
 
     puts Settings.key?(:zen)
 
     puts File.expand_path("~/.config/settings.yml")
 
-    puts "#{Settings.zen[:members]}"
+    puts "members: #{Settings.zen.members.db}"
 
     # Settings.zen.members = { "db" => "hello.db", "database" => "data" }
 
@@ -31,7 +31,7 @@ RSpec.describe Zen::Configuration do
 
     puts File.exist?(f)
 
-    puts config
+    # puts config
     puts config.to_json
 
     # YAML.add_tag=nil
