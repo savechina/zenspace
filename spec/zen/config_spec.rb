@@ -3,6 +3,7 @@
 
 require "zen"
 require "zen/configuration"
+require "config"
 
 RSpec.describe Zen::Configuration do
   it "does zen load configuation" do
@@ -20,7 +21,9 @@ RSpec.describe Zen::Configuration do
 
     puts File.expand_path("~/.config/settings.yml")
 
-    Settings.zen.members = { "db" => "hello.db", "database" => "data" }
+    puts "#{Settings.zen.members}"
+
+    # Settings.zen.members = { "db" => "hello.db", "database" => "data" }
 
     puts config.to_yaml
 
