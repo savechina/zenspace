@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "zen"
+require "zen/configuration"
 
 RSpec.describe Zen::Configuration do
   it "does zen load configuation" do
