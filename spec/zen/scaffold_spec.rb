@@ -17,8 +17,6 @@ RSpec.describe Zen::Components::StarterKit::JavaScaffold do
     java_project = Zen::Components::StarterKit::Model::JavaProject.new
     java_project.project_name = project_name
 
-    package_name = "org.renyan.bluekit.sample"
-
     java_project.group_name = "org.renyan.bluekit"
     java_project.package_name = "org.renyan.bluekit.sample"
     output_root = "target"

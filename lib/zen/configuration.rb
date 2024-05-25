@@ -19,7 +19,7 @@ module Zen
 
     DEFALUT_USER_CONFIG_ROOT = File.join(user_root, DEFALUT_CONFIG_ROOT)
 
-    user_data_root = Zen::USER_ROOT_DATA
+    user_root_data = Zen::USER_ROOT_DATA
 
     def self.configurate(config_root = nil, env = nil)
       Config.setup do |config|

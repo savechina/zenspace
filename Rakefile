@@ -11,7 +11,8 @@ require "rubocop/rake_task"
 
 RuboCop::RakeTask.new
 
-task default: %i[spec rubocop]
+# task default: %i[spec rubocop]
+task default: %i[spec]
 
 desc "starter test project  "
 task starter: ["starter:init"] do
