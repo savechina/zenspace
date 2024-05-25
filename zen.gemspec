@@ -39,7 +39,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency "dry-struct", "~> 1.6"
   spec.add_dependency "dry-system", "~> 1.0"
   spec.add_dependency "factory_bot", "~> 6.2"
-  spec.add_dependency "git", "~> 1.9.1"
+  spec.add_dependency "git", ">= 1.9.1", "< 2.1.0"
   spec.add_dependency "ruby-enum", "~> 1.0"
   spec.add_dependency "ruby-mysql", "~> 4.1"
   spec.add_dependency "sequel", "~> 5.54"
