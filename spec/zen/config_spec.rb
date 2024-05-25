@@ -21,7 +21,7 @@ RSpec.describe Zen::Configuration do
 
     puts File.expand_path("~/.config/settings.yml")
 
-    puts "#{Settings.zen.members}"
+    puts "#{Settings.zen[:members]}"
 
     # Settings.zen.members = { "db" => "hello.db", "database" => "data" }
 
