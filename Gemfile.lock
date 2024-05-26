@@ -10,7 +10,7 @@ PATH
       dry-struct (~> 1.6)
       dry-system (~> 1.0)
       factory_bot (~> 6.2)
-      git (>= 1.9.1, < 2.1.0)
+      git (>= 1.13.0, < 2.1.0)
       ruby-enum (~> 1.0)
       ruby-mysql (~> 4.1)
       sequel (~> 5.54)

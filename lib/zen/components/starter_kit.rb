@@ -525,7 +525,7 @@ module Zen
 
           #
           # foreach all template file
-          Dir.glob("#{template_root}/**/**").each do |path|
+          Dir.glob("#{template_root}/**/{*,.*}").each do |path|
             # template file path
             el = Pathname.new(path)
 

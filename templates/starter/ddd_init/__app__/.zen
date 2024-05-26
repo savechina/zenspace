@@ -1,0 +1,10 @@
+# to modify your project database connect infomation
+database.url="mysql://{{mysql_user}}:{{mysql_password}}@{{mysql_host}}:3306/{{database}}?encoding=utf8mb4&max_allowed_packet=128m"
+# to modify your project database type
+database.type = {{sqlite}}
+# to modify your project database schema
+database.schema = {{airp_sample}}
+
+project_name=__app__
+group_name=__group__
+package_name=__package__
