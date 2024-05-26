@@ -23,7 +23,7 @@ Or install it yourself as:
 
 ## Usage
 
-Zen Command help
+### Zen Command: `zen`
 
     ➜  zenspace git:(master) bundle exec zen
     Commands:
@@ -39,14 +39,39 @@ Zen Command help
     [--verbose], [--no-verbose], [--skip-verbose]
 
 
-Stater command :
+### Stater command : `zen starter`
 
-Initial project :
+    $ zen starter 
+    Commands:
+    zen starter add                               # init project from template
+    zen starter help [COMMAND]                    # Describe subcommands or one specific sub...
+    zen starter init <PROJECT> <GROUP> <PACKAGE>  # init project from template by project.
+
+
+use `init` subcommand to  initial project : `zen starter init `
 
     $ zen starter init bluekit-sample org.renyan.bluekit.sample  org.renyan.bluekit.sample
 
+use `add` subcommand to  add new feature for project : `zen starter add `
 
+    $ zen starter add wms putin_bills
 
+use `workspace` subcommand to initial your workspace full directory : `zen starter workspace `
+
+    $ zen starter workspace
+
+it will initial some workspace directory:
+
+    ~/CodeRepo/ownspace        
+    ~/CodeRepo/workspace
+    ~/CodeRepo/workspace/airp
+    ~/CodeRepo/workspace/bluekit
+    ~/Documents/Work
+    ~/Documents/Other
+    ~/Documents/Personal
+    ~/Documents/Archive
+
+`CodeRepo` is Source Code repoisitory, `Work` is work docuemnt . `Personal` is personal docuemnt. 
 
 ## Development
 

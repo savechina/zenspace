@@ -17,15 +17,6 @@ module Zen
   # The user root path for Zen store user's config and data ,templates etc.
   USER_ROOT = File.join(Dir.home, ".zen")
 
-  # templates root workspace
-  TEMPLATE_ROOT = File.join(ROOT, "templates")
-
-  # templates root workspace
-  USER_TEMPLATE_ROOT = File.join(USER_ROOT, "templates")
-
-  # @deprecated Use {Config::CONFIG_DIR}
-  # CONFIG_DIR = Config::CONFIG_DIR
-
   # require submodule lib
   require_relative "zen/version"
   require_relative "zen/contants"

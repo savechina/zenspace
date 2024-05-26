@@ -55,8 +55,8 @@ module Zen
 
       setting :logger_level, default: :info
 
-      new_variable = ENV.fetch("APP_ENV", :development)
-      puts "#{new_variable}....ENV"
+      # new_variable = ENV.fetch("APP_ENV", :development)
+      # puts "#{new_variable}....ENV"
     end
   end
 end
