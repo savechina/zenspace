@@ -1,0 +1,51 @@
+# Zen Command Usage
+
+
+## `zen` Command: 
+
+    ➜  zenspace git:(master) bundle exec zen
+    Commands:
+    zen goodbye                  # say goodbye to the world
+    zen hello NAME --from=FROM   # say hello to NAME
+    zen help [COMMAND]           # Describe available commands or one specific command
+    zen repo SUBCOMMAND ...ARGS  # manage set of tracked repositories
+    zen starter [COMMAND]        # init project from template and add new feature to prjoct
+    zen version                  # Zen version
+    zen wps [COMMAND]            # work process suite
+
+    Options:
+    [--verbose], [--no-verbose], [--skip-verbose]
+
+## `starter` command : `zen starter`
+
+    $ zen starter 
+    Commands:
+    zen starter add                               # init project from template
+    zen starter help [COMMAND]                    # Describe subcommands or one specific sub...
+    zen starter init <PROJECT> <GROUP> <PACKAGE>  # init project from template by project.
+
+
+use `init` subcommand to  initial project : `zen starter init `
+
+    $ zen starter init bluekit-sample org.renyan.bluekit.sample  org.renyan.bluekit.sample
+
+use `add` subcommand to  add new feature for project : `zen starter add `
+
+    $ zen starter add wms putin_bills
+
+use `workspace` subcommand to initial your workspace full directory : `zen starter workspace `
+
+    $ zen starter workspace
+
+it will initial some workspace directory:
+
+    ~/CodeRepo/ownspace        
+    ~/CodeRepo/workspace
+    ~/CodeRepo/workspace/airp
+    ~/CodeRepo/workspace/bluekit
+    ~/Documents/Work
+    ~/Documents/Other
+    ~/Documents/Personal
+    ~/Documents/Archive
+
+`CodeRepo` is Source Code repoisitory, `Work` is work docuemnt . `Personal` is personal docuemnt
