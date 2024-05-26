@@ -25,7 +25,7 @@ Or install it yourself as:
 
 ### Zen Command: `zen`
 
-    ➜  zenspace git:(master) bundle exec zen
+    ➜  zenspace git:(main) bundle exec zen
     Commands:
     zen goodbye                  # say goodbye to the world
     zen hello NAME --from=FROM   # say hello to NAME
@@ -81,7 +81,7 @@ To install this gem onto your local machine, run `bundle exec rake install`. To 
 
 ## Contributing
 
-Bug reports and pull requests are welcome on GitHub at https://github.com/savechina/zenspace. This project is intended to be a safe, welcoming space for collaboration, and contributors are expected to adhere to the [code of conduct](https://github.com/savechina/zenspace/blob/master/CODE_OF_CONDUCT.md).
+Bug reports and pull requests are welcome on GitHub at https://github.com/savechina/zenspace. This project is intended to be a safe, welcoming space for collaboration, and contributors are expected to adhere to the [code of conduct](https://github.com/savechina/zenspace/blob/main/CODE_OF_CONDUCT.md).
 
 ## License
 
@@ -89,4 +89,4 @@ The gem is available as open source under the terms of the [MIT License](https:/
 
 ## Code of Conduct
 
-Everyone interacting in the Zen project's codebases, issue trackers, chat rooms and mailing lists is expected to follow the [code of conduct](https://github.com/savechina/zenspace/blob/master/CODE_OF_CONDUCT.md).
+Everyone interacting in the Zen project's codebases, issue trackers, chat rooms and mailing lists is expected to follow the [code of conduct](https://github.com/savechina/zenspace/blob/main/CODE_OF_CONDUCT.md).
