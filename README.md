@@ -73,6 +73,17 @@ it will initial some workspace directory:
 
 `CodeRepo` is Source Code repoisitory, `Work` is work docuemnt . `Personal` is personal docuemnt. 
 
+### WPS command: `zen wps`
+
+    $ zen wps
+    Commands:
+    zen wps fdupes DIRECTORY  # Find duplicates file in given your path
+    zen wps help [COMMAND]    # Describe subcommands or one specific subcommand
+
+use `fdupes` subcommand to  Find duplicates file in given your path : `zen wps fdupes `
+
+    $ zen wps fdupes -r  .
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake spec` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

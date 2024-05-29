@@ -49,3 +49,14 @@ it will initial some workspace directory:
     ~/Documents/Archive
 
 `CodeRepo` is Source Code repoisitory, `Work` is work docuemnt . `Personal` is personal docuemnt
+
+## `wps` command: `zen wps`
+
+    $ zen wps
+    Commands:
+    zen wps fdupes DIRECTORY  # Find duplicates file in given your path
+    zen wps help [COMMAND]    # Describe subcommands or one specific subcommand
+
+use `fdupes` subcommand to  Find duplicates file in given your path : `zen wps fdupes `
+
+    $ zen wps fdupes -r  .
