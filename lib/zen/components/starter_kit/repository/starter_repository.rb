@@ -22,7 +22,7 @@ module Zen
               index :title
             end
 
-            puts "#{db.tables}"
+            # puts "#{db.tables}"
             db.tables
           end
 
@@ -84,7 +84,8 @@ module Zen
           def fetch_all_class(table_name)
             all_class = []
 
-            puts "fetch_all_class:#{table_name}"
+            # puts "fetch_all_class:#{table_name}"
+
             if table_name.nil?
 
               all_table = db.tables
@@ -107,7 +108,7 @@ module Zen
 
               table_comment = nil
 
-              puts "#{db_type},#{"mysql".casecmp(db_type)}"
+              # puts "#{db_type},#{"mysql".casecmp(db_type)}"
 
               if "mysql".casecmp(db_type) == 0
 
@@ -153,7 +154,7 @@ module Zen
             table_comment = nil
             is_mysql = false
 
-            puts "#{db_type},#{"mysql".casecmp(db_type)}"
+            # puts "#{db_type},#{"mysql".casecmp(db_type)}"
 
             is_mysql = true if "mysql".casecmp(db_type) == 0
 
@@ -192,7 +193,7 @@ module Zen
               db.schema(table_name).each do |col, value|
                 column_type = value[:db_type].to_s.upcase
                 column_type = "VARCHAR" if column_type.start_with?("VARCHAR")
-                puts "#{column_type},#{value}"
+                # puts "#{column_type},#{value}"
 
                 java_field = StarterKit::Model::JavaField.new
 

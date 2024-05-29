@@ -13,13 +13,20 @@ module Zen
     # StarterKit
     #
     class StarterKit
-      include Import["logger"]
+      include Import["logger", "settings"]
       include Import["zen.components.starter_kit.repository.starter_repository"]
+
+      # settings do
+      #   setting :verbose
+      #   setting :force
+      # end
 
       #
       # @param [project]
       def load(project, output_root)
         puts "StarterKit in ... #{Application["settings"].logger_level} .." if Application.logger.debug?
+
+        puts "settings  #{settings.options.verbose}"
 
         @user_template = File.join(USER_TEMPLATE_ROOT, "starter/ddd_init")
 
@@ -95,7 +102,8 @@ module Zen
       # Starter Add feature
       # @api
       def add(project, feature_name, table_name, output_root)
-        puts "JavaTypes:#{StarterKit::Model::JavaTypes.value("varchar".upcase.to_sym)}"
+        # puts "JavaTypes:#{StarterKit::Model::JavaTypes.value("varchar".upcase.to_sym)}"
+        # puts "settings  #{settings.options.verbose}"
 
         all_tables = starter_repository.fetch_all_tables
 
@@ -104,7 +112,7 @@ module Zen
         clazz_model.package_name = "#{feature_name}"
         clazz_model.feature_name = feature_name
 
-        puts "#{table_name} create class : #{pp clazz_model}"
+        # puts "#{table_name} create class : #{pp clazz_model}"
 
         @user_template = File.join(USER_TEMPLATE_ROOT, "starter/ddd_init")
 
@@ -359,11 +367,13 @@ module Zen
                                 clazz_model.package_name,
                                 "#{clazz_model.feature_name.camelcase}#{clazz_model.class_name}Vo.java")
 
+        template_base = "starter/ddd_spec"
+
         process_template(template_name, output_path, context)
 
         # 生成新的文件
 
-        puts "add: #{output_path} done"
+        puts "add: #{table_name} done"
       end
 
       require "erb"
@@ -373,7 +383,7 @@ module Zen
       # @api private
       def process_template(template_name, output_path, context)
         template_path = File.join(Zen::TEMPLATE_ROOT, "starter/ddd_spec", template_name)
-        puts "template name :#{template_path}"
+        puts "template name :#{template_path}" if settings.options.verbose
 
         # 读取模板文件内容
         template_content = File.read(template_path)
@@ -390,8 +400,18 @@ module Zen
         # 确保输出目录存在
         FileUtils.mkdir_p(File.dirname(output_path))
 
+        puts "output: file. file:#{output_path}" if settings.options.verbose
+
         if File.exist?(output_path)
-          puts "output: file is exist. file:#{output_path}"
+
+          if settings.options.force
+            puts "output: file is exist. overwrite."
+            # 生成新的文件
+            File.write(output_path, result)
+          elsif settings.options.verbose
+            puts "output: file is exist."
+          end
+
           nil
         else
           # 生成新的文件

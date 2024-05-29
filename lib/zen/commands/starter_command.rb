@@ -32,6 +32,7 @@ module Zen
 
       LONGDESC
       option :verbose, type: :boolean, aliases: "-v", desc: "Verbose output"
+      option :template, type: :string, aliases: "-t", default: "ddd", desc: "arch type template name"
       def init(project_name = nil, group_name = nil, package_name = nil, output_root = nil)
         #        puts "#{project_name},#{group_name},#{package_name},#{output_root}"
 
@@ -72,6 +73,7 @@ module Zen
       option :package_name, type: :string, desc: "base package name"
       option :group_name, type: :string, desc: "group name"
       option :force, type: :boolean, aliases: "-f", desc: "Force Overwriter"
+      option :arch_type, type: :string, aliases: "-t", default: "ddd", desc: "arch type template name"
       def add(feature_name, table_name, output_root = nil)
         project_name = options[:project_name]
 
@@ -81,8 +83,16 @@ module Zen
 
         overwrite = options[:force]
 
+        arch_type = options[:arch_type]
+
         # if output is nil set current to output dir
         output_root = Dir.pwd if output_root.nil? || output_root.strip.empty?
+
+        Application.logger.level = "DEBUG" if options[:verbose]
+
+        Application[:settings].options.verbose = true if options[:verbose]
+
+        Application[:settings].options.force = true if options[:force]
 
         @project = Components::StarterKit::Model::JavaProject.new
 
@@ -104,7 +114,15 @@ module Zen
                                 group_name
                               end
 
-        pp @project
+        # pp @project
+
+        @project.arch_type = if arch_type.nil? || arch_type.strip.empty?
+                               ENV.fetch("arch_type", "ddd")
+                             else
+                               arch_type
+                             end
+
+        # pp @project
 
         starter_kit.add(@project, feature_name, table_name, output_root)
 

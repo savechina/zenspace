@@ -21,6 +21,10 @@ module Zen
           # Project Comment
           # @return [String]
           attr_accessor :project_comment
+
+          # arch type
+          # @return [String]
+          attr_accessor :arch_type
         end
       end
     end
