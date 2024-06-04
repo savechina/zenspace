@@ -1,0 +1,38 @@
+<% packageName = "#{modules[:entity].full_package}.#{model.package_name}" %> 
+<%#+ entityPackageSuffix %>
+<% tableEntity = model.feature_name.camelcase + model.class_name + "Entity" %>
+package <%= packageName %>;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.util.Date;
+/**
+* <%= model.class_name %>
+* <%= model.class_comment %>
+*/
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class <%= tableEntity %> implements java.io.Serializable{
+
+    <% model.fields.each do |field| %>
+    /**
+    * <%= field.field_name %>
+    * <%= field.field_comment %>
+    */
+    private <%= field.java_type %>  <%= field.field_name %>;
+    <% end %>
+
+    <% model.fields.each do |field| %>
+        <% setMethod = field.field_name.camelcase + "(" + field.java_type + " " +  field.field_name + ")" %>
+
+    public void  set<%= setMethod %>{
+        this.<%= field.field_name %> = <%= field.field_name %>;
+    }
+    public <%= field.java_type %>  get<%= field.field_name.camelcase %>() {
+        return this.<%= field.field_name %>;
+    }
+    <% end %>
+
+}

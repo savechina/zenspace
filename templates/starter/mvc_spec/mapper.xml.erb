@@ -1,0 +1,124 @@
+<%
+namespace = "#{modules[:mapper].full_package}.#{model.package_name}.#{model.feature_name.camelcase }#{model.class_name}Mapper"
+
+entityPath =  "#{modules[:entity].full_package}.#{model.package_name}.#{model.feature_name.camelcase }#{model.class_name}Entity"
+tableVO = "#{model.class_name}VO"
+tableVOPath = "#{model.package_name}domain.vo.#{tableVO}"
+%>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="<%= namespace %>">
+
+    <resultMap id="BaseResultMap" type="<%= entityPath %>">
+        <% model.fields.each do |field| %>
+        <result column="<%= field.column_name %>" jdbcType="<%= field.jdbc_type %>" property="<%= field.field_name %>"/>
+        <% end %>
+    </resultMap>
+
+    <sql id="Base_Column_List">
+        <% model.fields.each_with_index do |field, index|%>
+        <%= ',' if index > 0 %><%= field.column_name %>
+        <% end %>
+    </sql>
+
+    <insert id="insert" parameterType="<%= entityPath %>">
+        insert into <%= model.table_name %>
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            <% model.fields.each_with_index do |field, index| %>
+                <%= ',' if index > 0 %><%= field.column_name %>
+            <% end %>
+        </trim>
+        <trim prefix="values (" suffix=")" suffixOverrides=",">
+            <% model.fields.each_with_index do |field, index| %>
+                <%= ',' if index > 0 %><%= field.field_name %>
+            <% end %>
+        </trim>
+    </insert>
+
+    <insert id="insertBatch" parameterType="java.util.List">
+        insert into <%= model.table_name %>
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            <% model.fields.each_with_index do |field, index| %>
+                <%= ',' if index > 0 %><%= field.column_name %>
+            <% end %>
+        </trim>
+        values
+        <foreach collection="list" item="item" separator=",">
+            (
+            <% model.fields.each_with_index do |field, index| %>
+                <%= ',' if index > 0 %>{item.<%= field.field_name %>}
+            <% end %>
+            )
+        </foreach>
+    </insert>
+
+    <delete id="deleteByPrimaryKey" parameterType="java.lang.Long">
+        delete from <%= model.table_name %>
+        where id = #{id}
+    </delete>
+
+    <delete id="deleteBatchByPrimaryKey" parameterType="java.util.List">
+        delete from <%= model.table_name %>
+        where id in
+        <foreach collection="list" item="item" open="(" close=")" separator=",">
+            #{item}
+        </foreach>
+    </delete>
+
+    <update id="update" parameterType="<%= entityPath %>">
+        update <%= model.table_name %>
+        <set>
+            <% model.fields.each do |field| %>
+            <if test="<%= field.field_name %> != null">
+                <%= field.column_type %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>},
+            </if>
+            <% end %>
+        </set>
+        where id = #{id}
+    </update>
+
+    <update id="updateBatch" parameterType="<%= entityPath %>">
+        <foreach collection="list" item="item" index="index" separator=";">
+            update <%= model.table_name %>
+            <set>
+                <% model.fields.each do |field| %>
+                <if test="item.<%= field.field_name %> != null">
+                    <%= field.column_type %> = #{item.<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>},
+                </if>
+                <% end %>
+            </set>
+            where id = #{item.id}
+        </foreach>
+    </update>
+
+    <select id="selectBy" parameterType="<%= entityPath %>" resultMap="BaseResultMap">
+        select
+        <include refid="Base_Column_List" />
+        from <%= model.table_name %>
+        <where>
+            1=1
+            <% model.fields.each do |field| %>
+                <% if field.column_type == "id" %>
+                <if test="id != null">
+                    and id = #{id,jdbcType=BIGINT}
+                </if>
+                <% else %>
+                <if test="<%= field.field_name %> != null and <%= field.field_name %> != ''">
+                    and <%= field.column_type %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>}
+                </if>
+                <% end %>
+            <% end %>
+        </where>
+        order by id desc
+    </select>
+
+    <select id="getById" parameterType="java.lang.Long" resultMap="BaseResultMap">
+        select
+            <include refid="Base_Column_List" />
+            from <%= model.table_name %>
+            <where>
+               id = #{id}
+            </where>
+            order by id desc
+    </select>
+</mapper>
