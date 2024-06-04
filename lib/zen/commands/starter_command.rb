@@ -32,7 +32,8 @@ module Zen
 
       LONGDESC
       option :verbose, type: :boolean, aliases: "-v", desc: "Verbose output"
-      option :template, type: :string, aliases: "-t", default: "ddd", desc: "arch type template name"
+      option :force, type: :boolean, aliases: "-f", desc: "Force Overwriter"
+      option :arch_type, type: :string, aliases: "-t", default: "ddd", desc: "arch type template name"
       def init(project_name = nil, group_name = nil, package_name = nil, output_root = nil)
         #        puts "#{project_name},#{group_name},#{package_name},#{output_root}"
 
@@ -45,7 +46,15 @@ module Zen
         # if output is nil set current to output dir
         output_root = Dir.pwd if output_root.nil?
 
+        overwrite = options[:force]
+
+        arch_type = options[:arch_type]
+
         Application.logger.level = "DEBUG" if options[:verbose]
+
+        Application[:settings].options.verbose = true if options[:verbose]
+
+        Application[:settings].options.force = true if options[:force]
 
         # @type [Bluekit::Components::StarterKit::Model::JavaProject]
         project = Components::StarterKit::Model::JavaProject.new
@@ -53,6 +62,12 @@ module Zen
         project.project_name = project_name
         project.group_name = group_name
         project.package_name = package_name
+
+        project.arch_type = if arch_type.nil? || arch_type.strip.empty?
+                              ENV.fetch("arch_type", "ddd")
+                            else
+                              arch_type
+                            end
 
         starter_kit.load(project, output_root)
 

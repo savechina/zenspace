@@ -41,6 +41,20 @@ module Zen
 
         logger.info "StarterKit::JavaProject :#{project.group_name}"
 
+        if project.arch_type.downcase == "ddd"
+          puts "use arch type. #{project.arch_type}"
+
+          template_base = load_template("starter/ddd_init")
+
+        elsif project.arch_type.downcase == "mvc"
+          puts "use arch type. #{project.arch_type}"
+
+          template_base = load_template("starter/mvc_init")
+
+        else
+          puts "not support arch type.#{project.arch_type}"
+        end
+
         java_starter = JavaScaffold.new(project.project_name, project.group_name, project.package_name, output_root)
 
         java_starter.generate(output_root)
