@@ -702,7 +702,7 @@ module Zen
         template_content = File.read(template_path)
 
         # 使用ERB进行模板替换
-        template = ERB.new(template_content)
+        template = ERB.new(template_content, trim_mode: "-")
         result = template.result(context.get_binding)
 
         # 生成输出文件的完整路径

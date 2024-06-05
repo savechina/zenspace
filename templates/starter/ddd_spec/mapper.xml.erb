@@ -1,10 +1,10 @@
-<%
+<%-
 namespace = "#{modules[:mapper].full_package}.#{model.package_name}.#{model.feature_name.camelcase }#{model.class_name}Mapper"
 
 entityPath =  "#{modules[:entity].full_package}.#{model.package_name}.#{model.feature_name.camelcase }#{model.class_name}Entity"
 tableVO = "#{model.class_name}VO"
 tableVOPath = "#{model.package_name}domain.vo.#{tableVO}"
-%>
+-%>
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="<%= namespace %>">
@@ -16,38 +16,38 @@ tableVOPath = "#{model.package_name}domain.vo.#{tableVO}"
     </resultMap>
 
     <sql id="Base_Column_List">
-        <% model.fields.each_with_index do |field, index|%>
+        <%- model.fields.each_with_index do |field, index| -%>
         <%= ',' if index > 0 %><%= field.column_name %>
-        <% end %>
+        <%- end -%>
     </sql>
 
     <insert id="insert" parameterType="<%= entityPath %>">
         insert into <%= model.table_name %>
         <trim prefix="(" suffix=")" suffixOverrides=",">
-            <% model.fields.each_with_index do |field, index| %>
+            <%- model.fields.each_with_index do |field, index| -%>
                 <%= ',' if index > 0 %><%= field.column_name %>
-            <% end %>
+            <%- end -%>
         </trim>
         <trim prefix="values (" suffix=")" suffixOverrides=",">
-            <% model.fields.each_with_index do |field, index| %>
-                <%= ',' if index > 0 %><%= field.field_name %>
-            <% end %>
+            <%- model.fields.each_with_index do |field, index| -%>
+                <%= ',' if index > 0 %>#{<%= field.field_name %>}
+            <%- end -%>
         </trim>
     </insert>
 
     <insert id="insertBatch" parameterType="java.util.List">
         insert into <%= model.table_name %>
         <trim prefix="(" suffix=")" suffixOverrides=",">
-            <% model.fields.each_with_index do |field, index| %>
+            <%- model.fields.each_with_index do |field, index| -%>
                 <%= ',' if index > 0 %><%= field.column_name %>
-            <% end %>
+            <%- end -%>
         </trim>
         values
         <foreach collection="list" item="item" separator=",">
             (
-            <% model.fields.each_with_index do |field, index| %>
-                <%= ',' if index > 0 %>{item.<%= field.field_name %>}
-            <% end %>
+            <%- model.fields.each_with_index do |field, index| -%>
+                <%= ',' if index > 0 %>#{item.<%= field.field_name %>}
+            <%- end -%>
             )
         </foreach>
     </insert>
@@ -70,7 +70,7 @@ tableVOPath = "#{model.package_name}domain.vo.#{tableVO}"
         <set>
             <% model.fields.each do |field| %>
             <if test="<%= field.field_name %> != null">
-                <%= field.column_type %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>},
+                <%= field.column_name %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>},
             </if>
             <% end %>
         </set>
@@ -83,7 +83,7 @@ tableVOPath = "#{model.package_name}domain.vo.#{tableVO}"
             <set>
                 <% model.fields.each do |field| %>
                 <if test="item.<%= field.field_name %> != null">
-                    <%= field.column_type %> = #{item.<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>},
+                    <%= field.column_name %> = #{item.<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>},
                 </if>
                 <% end %>
             </set>
@@ -97,17 +97,17 @@ tableVOPath = "#{model.package_name}domain.vo.#{tableVO}"
         from <%= model.table_name %>
         <where>
             1=1
-            <% model.fields.each do |field| %>
-                <% if field.column_type == "id" %>
+            <%- model.fields.each do |field| -%>
+                <% if field.column_name == "id" %>
                 <if test="id != null">
                     and id = #{id,jdbcType=BIGINT}
                 </if>
                 <% else %>
                 <if test="<%= field.field_name %> != null and <%= field.field_name %> != ''">
-                    and <%= field.column_type %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>}
+                    and <%= field.column_name %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>}
                 </if>
                 <% end %>
-            <% end %>
+            <%- end -%>
         </where>
         order by id desc
     </select>
