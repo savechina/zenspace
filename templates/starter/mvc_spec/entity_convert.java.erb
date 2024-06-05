@@ -1,4 +1,4 @@
-<% 
+<%-
 packageName = "#{modules[:entity_convert].full_package}.#{model.package_name}"
 
 entityPackageName = "#{modules[:entity].full_package}.#{model.package_name}" 
@@ -12,8 +12,7 @@ doName="DO"
 doEntity="#{model.feature_name.camelcase}#{model.class_name}#{doName}" 
 doPackageName = "#{modules[:model].full_package}.#{model.package_name}" 
 
-%> 
-
+-%> 
 package <%=packageName%>;
 
 import <%=project.package_name%>.common.convert.EntityConverter;
