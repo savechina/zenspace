@@ -1,11 +1,11 @@
-<%
-packageName = "#{modules[:repository_impl].full_package}.#{model.package_name}" 
-repositoryImplName = "RepositoryImpl"
-tableRepositoryImpl = "#{model.feature_name.camelcase}#{model.class_name}#{repositoryImplName}"
+<%-
+packageName = "#{modules[:service_impl].full_package}.#{model.package_name}.impl" 
+serviceImplName = "ServiceImpl"
+tableServiceImpl = "#{model.feature_name.camelcase}#{model.class_name}#{serviceImplName}"
 
-repositoryPackageName = "#{modules[:repository].full_package}.#{model.package_name}" 
-repositoryName = "Repository"
-tableRepository = "#{model.feature_name.camelcase}#{model.class_name}#{repositoryName}"
+servicePackageName = "#{modules[:service].full_package}.#{model.package_name}" 
+serviceName = "Service"
+tableService = "#{model.feature_name.camelcase}#{model.class_name}#{serviceName}"
 
 entityPackageName = "#{modules[:entity].full_package}.#{model.package_name}"  
 tableEntity = model.feature_name.camelcase + model.class_name + "Entity"
@@ -26,15 +26,15 @@ doName="DO"
 doEntity="#{model.feature_name.camelcase}#{model.class_name}#{doName}" 
 doEntityInstance = "#{model.class_name.camelcase(:lower)}DO"
 
-%> 
-<%    
+-%> 
+<%-
 # tableVO = "#{model.class_name}VO"
 # tableVOInstance = "#{model.class_name}VO"
 
 # tableResponse = "#{model.class_name}Response"
 # tableQueryVO = "#{model.class_name}QueryVO"
 # tableQueryVOInstance = "#{model.class_name}QueryVO"
-%>
+-%>
 package <%= packageName %>;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -44,12 +44,12 @@ import <%= doPackageName %>.<%= doEntity %>;
 import <%= entityPackageName %>.<%= tableEntity %>;
 import <%= daoPackageName %>.<%= tableDao %>;
 import <%= entityConvertPackageName %>.<%= tableEntityConvert %>;
-import <%= repositoryPackageName %>.<%= tableRepository %>;
+import <%= servicePackageName %>.<%= tableService %>;
 
 import java.util.*;
 
 @Repository
-public class <%=tableRepositoryImpl%> implements <%= tableRepository %>  {
+public class <%=tableServiceImpl%> implements <%= tableService %>  {
 
 
     @Autowired

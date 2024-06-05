@@ -543,7 +543,7 @@ module Zen
         service_impl_module.module_name = "SERVICE_IMPL"
         service_impl_module.module_template = "service_impl.java.erb"
         service_impl_module.project = project
-        service_impl_module.module_package = "impl"
+        service_impl_module.module_package = "domain.service"
         service_impl_module.module_path = "#{project.project_name}-domain"
         service_impl_module.module_type = Model::JavaModule::SOURCE_TYPE
         service_impl_module.module_suffix = "ServiceImpl"
@@ -633,27 +633,28 @@ module Zen
 
         process_template(template_base, template_name, output_path, context)
 
-        # Repository Module process template
-        template_name = repository_module.module_template
+        # Service Module process template
+        template_name = service_module.module_template
 
         output_path = File.join(output_root,
-                                repository_module.full_path,
+                                service_module.full_path,
                                 clazz_model.package_name,
-                                "#{clazz_model.feature_name.camelcase}#{clazz_model.class_name}Repository.java")
+                                "#{clazz_model.feature_name.camelcase}#{clazz_model.class_name}Service.java")
 
         process_template(template_base, template_name, output_path, context)
 
-        # Repository Impl Module process template
-        template_name = repository_impl_module.module_template
+        # Service Impl Module process template
+        template_name = service_impl_module.module_template
 
         output_path = File.join(output_root,
-                                repository_impl_module.full_path,
+                                service_impl_module.full_path,
                                 clazz_model.package_name,
-                                "#{clazz_model.feature_name.camelcase}#{clazz_model.class_name}RepositoryImpl.java")
+                                "impl",
+                                "#{clazz_model.feature_name.camelcase}#{clazz_model.class_name}ServiceImpl.java")
 
         process_template(template_base, template_name, output_path, context)
 
-        # Repository Impl Module process template
+        # View Module process template
         template_name = view_module.module_template
 
         output_path = File.join(output_root,

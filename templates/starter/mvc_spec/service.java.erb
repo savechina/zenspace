@@ -1,7 +1,7 @@
 <% 
-packageName = "#{modules[:repository].full_package}.#{model.package_name}" 
-repositoryName = "Repository"
-tableRepository = "#{model.feature_name.camelcase}#{model.class_name}#{repositoryName}"
+packageName = "#{modules[:service].full_package}.#{model.package_name}" 
+serviceName = "Service"
+tableService = "#{model.feature_name.camelcase}#{model.class_name}#{serviceName}"
 
 entityPackageName = "#{modules[:entity].full_package}.#{model.package_name}"  
 tableEntity = model.feature_name.camelcase + model.class_name + "Entity"
@@ -31,7 +31,7 @@ import <%= doPackageName %>.<%= doEntity %>;
 
 import java.util.*;
 
-public interface <%= tableRepository %>  {
+public interface <%= tableService %>  {
     Integer insert(<%= doEntity %> <%= doEntityInstance %>);
     Integer insertBatch(List<<%= doEntity %>> list);
 
