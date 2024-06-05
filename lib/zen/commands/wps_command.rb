@@ -39,6 +39,11 @@ module Zen
         end
       end
 
+      desc "dotfiles ", "dotfiles backup and restore."
+      def dotfiles
+        puts "dotfiel tool"
+      end
+
       # base define
       self.command_name = "wps"
       self.command_usage = "wps [COMMAND]"
