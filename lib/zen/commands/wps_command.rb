@@ -42,6 +42,8 @@ module Zen
       desc "dotfiles ", "dotfiles backup and restore."
       def dotfiles
         puts "dotfiel tool"
+
+        wps_kit.dotfiles
       end
 
       # base define

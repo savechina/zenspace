@@ -6,6 +6,8 @@ module Zen
     require "fileutils"
     require "active_support/all"
     require "digest"
+    require "rake/file_list"
+
     ##
     # WpsKit Work Process Suite
     #
@@ -66,6 +68,30 @@ module Zen
         md5_digest = md5_hash.hexdigest
 
         OpenStruct.new(file_hash: md5_digest, block_count:, file_stat: "")
+      end
+
+      def dotfiles
+        # os home directory
+        home = Dir.home
+        archive_root = File.join(home, "Documents/Archive")
+
+        dotpath = "dotfiles"
+
+        file_list = [
+          File.join(".zshrc"),
+          ".zshenv",
+          ".zprofile",
+          ".profile",
+          ".gitconfig",
+          ".ssh",
+          ".m2/setting.xml"
+        ]
+
+        file_list.each do |file|
+          src_path = File.join(Dir.home, file)
+          out_path = File.join(archive_root, dotpath, file)
+          puts "dotfiles:#{src_path}, #{out_path}"
+        end
       end
     end
   end
