@@ -77,7 +77,7 @@ module Zen
         home = Dir.home
         archive_root = File.join(home, "Documents/Archive")
 
-        dotpath = "dotfiles2"
+        dotpath = "dotfiles"
 
         file_list = [
           ".zshrc",
@@ -88,7 +88,9 @@ module Zen
           ".ssh",
           ".m2/setting.xml",
           ".rbenv/version",
-          ".pyenv/version"
+          ".pyenv/version",
+          ".vimrc",
+          ".vim"
         ]
 
         file_list.each do |file|
@@ -104,8 +106,8 @@ module Zen
 
           # system("cp -fr #{src_file}  #{to_dir}")
           FileUtils.cp_r(src_file, to_dir)
-          puts "done"
         end
+        puts "dotfiles done."
       end
 
       ##
