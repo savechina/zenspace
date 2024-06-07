@@ -10,7 +10,7 @@ module Zen
       include Import["zen.components.wps_kit"
                   ]
 
-      desc "fdupes DIRECTORY", "Find duplicates file in given your path"
+      desc "fdupes [DIRECTORY]", "Find duplicates file in given your path"
       option :recurse, type: :boolean, aliases: "-r", desc: "enable recurse directory"
       option :filter, type: :string, aliases: "-f", desc: "filter file use regex"
       def fdupes(file_path)
@@ -44,6 +44,15 @@ module Zen
         puts "dotfiel tool"
 
         wps_kit.dotfiles
+      end
+
+      desc "zstds [DIRECTORY] [OUTPUT_FILE]", "use tar and zstd compression and decompression driectory."
+      def zstds(from_dir, output_file = nil)
+        output_file = "#{from_dir}.tar.zst" if output_file.nil?
+
+        puts "zstd compress directory: #{from_dir} > #{output_file}"
+
+        wps_kit.zstds(from_dir, output_file)
       end
 
       # base define

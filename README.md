@@ -84,6 +84,11 @@ use `fdupes` subcommand to  Find duplicates file in given your path : `zen wps f
 
     $ zen wps fdupes -r  .
 
+
+### Other command usage
+
+To read  more command and [command usage](https://github.com/savechina/zenspace/blob/main/COMMAND_USAGE.md).
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake spec` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.

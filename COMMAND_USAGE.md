@@ -54,9 +54,20 @@ it will initial some workspace directory:
 
     $ zen wps
     Commands:
-    zen wps fdupes DIRECTORY  # Find duplicates file in given your path
-    zen wps help [COMMAND]    # Describe subcommands or one specific subcommand
+        zen wps dotfiles                         # dotfiles backup and restore.
+        zen wps fdupes DIRECTORY                 # Find duplicates file in given your path
+        zen wps help [COMMAND]                   # Describe subcommands or one specific subcommand
+        zen wps zstds [DIRECTORY] [OUTPUT_FILE]  # zstd compression and decompression driectory
 
 use `fdupes` subcommand to  Find duplicates file in given your path : `zen wps fdupes `
 
     $ zen wps fdupes -r  .
+
+
+use `dotfiles` subcommand to backup and restore dotfiles. : `zen wps dotfiles `
+
+    $ zen wps dotfiles 
+
+use `zstds` subcommand to  zstd compression and decompression driectory : `zen wps zstds `
+
+    $ zen wps zstds  dotfile dotfile.tar.zst
