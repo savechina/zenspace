@@ -744,13 +744,16 @@ module Zen
         file_list = [
           File.join(home, "export"),
           File.join(home, "CodeRepo/ownspace"),
+          File.join(home, "CodeRepo/funspace"),
+          File.join(home, "CodeRepo/acespace"),
           File.join(home, "CodeRepo/workspace"),
           File.join(home, "CodeRepo/workspace/airp"),
           File.join(home, "CodeRepo/workspace/bluekit"),
           File.join(home, "Documents/Work"),
           File.join(home, "Documents/Other"),
           File.join(home, "Documents/Personal"),
-          File.join(home, "Documents/Archive")
+          File.join(home, "Documents/Archive"),
+          File.join(home, "Software")
         ]
 
         file_list.each do |file|
