@@ -90,7 +90,10 @@ module Zen
           ".rbenv/version",
           ".pyenv/version",
           ".vimrc",
-          ".vim"
+          ".vim",
+          ".config/gem",
+          ".config/gh",
+          ".config/pip"
         ]
 
         file_list.each do |file|

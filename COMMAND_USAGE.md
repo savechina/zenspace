@@ -39,6 +39,8 @@ use `workspace` subcommand to initial your workspace full directory : `zen start
 
 it will initial some workspace directory:
 
+    ~/CodeRepo/acespace        
+    ~/CodeRepo/funspace        
     ~/CodeRepo/ownspace        
     ~/CodeRepo/workspace
     ~/CodeRepo/workspace/airp
@@ -47,6 +49,7 @@ it will initial some workspace directory:
     ~/Documents/Other
     ~/Documents/Personal
     ~/Documents/Archive
+    ~/Software
 
 `CodeRepo` is Source Code repoisitory, `Work` is work docuemnt . `Personal` is personal docuemnt
 
@@ -67,6 +70,24 @@ use `fdupes` subcommand to  Find duplicates file in given your path : `zen wps f
 use `dotfiles` subcommand to backup and restore dotfiles. : `zen wps dotfiles `
 
     $ zen wps dotfiles 
+
+
+dotfiles contain :
+
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".profile",
+    ".gitconfig",
+    ".ssh",
+    ".m2/setting.xml",
+    ".rbenv/version",
+    ".pyenv/version",
+    ".vimrc",
+    ".vim",
+    ".config/gem",
+    ".config/gh",
+    ".config/pip"
 
 use `zstds` subcommand to  zstd compression and decompression driectory : `zen wps zstds `
 
