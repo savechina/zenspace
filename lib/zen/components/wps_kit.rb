@@ -113,9 +113,25 @@ module Zen
         puts "dotfiles done."
       end
 
+      #
+      # check command exists
+      # @return [boolean]
+      def command_exists?(command)
+        system("which #{command} > /dev/null 2>&1")
+        $?.success?
+      end
+
       ##
       # Use tar  and zstd compression and decompression directory
       def zstds(from_dir, output_filename)
+        zstd_available = command_exists?("zstd")
+
+        if zstd_available
+          puts "zstd command is available."
+        else
+          puts "zstd command is not available. use `brew install zstd` to install zstd."
+        end
+
         # Use zstd if desired, otherwise comment out the line
         system("tar -cf - #{from_dir} | zstd -f > #{output_filename}")
 
