@@ -55,6 +55,16 @@ module Zen
         wps_kit.zstds(from_dir, output_file)
       end
 
+      desc "archive [DIRECTORY] [OUTPUT_FILE]",
+           "archive workspace directory ,use tar and  zstd compression to Archive driectory."
+      def archive(from_dir = nil, output_file = nil)
+        output_file = "#{from_dir}.tar.zst" if output_file.nil?
+
+        puts "zstd compress directory: #{from_dir} > #{output_file}"
+
+        wps_kit.archive(from_dir, output_file)
+      end
+
       # base define
       self.command_name = "wps"
       self.command_usage = "wps [COMMAND]"

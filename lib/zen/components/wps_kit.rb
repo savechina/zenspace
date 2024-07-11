@@ -127,16 +127,70 @@ module Zen
         zstd_available = command_exists?("zstd")
 
         if zstd_available
-          puts "zstd command is available."
+          # puts "zstd command is available."
         else
           puts "zstd command is not available. use `brew install zstd` to install zstd."
         end
 
+        from_path = File.dirname(from_dir)
+
+        from_name = File.basename(from_dir)
+
         # Use zstd if desired, otherwise comment out the line
-        system("tar -cf - #{from_dir} | zstd -f > #{output_filename}")
+
+        puts("tar -cf - -C #{from_path} #{from_name} | zstd -f > #{output_filename}")
+
+        system("tar -cf - -C #{from_path} #{from_name} | zstd -f > #{output_filename}")
 
         # Alternative for gzip compression (replace zstd with gzip)
         # system("tar -cf - #{_from} | gzip > #{output_filename}")
+      end
+
+      ##
+      # Use tar and zstd compression and archive worksapce directory
+      def archive(from_dir, _output_filename)
+        require "date"
+
+        # os home directory
+        home = Dir.home
+
+        file_list = [from_dir]
+
+        if from_dir.nil?
+          file_list = [
+            # File.join(home, "CodeRepo/ownspace"),
+            # File.join(home, "CodeRepo/funspace"),
+            # File.join(home, "CodeRepo/acespace"),
+            # File.join(home, "CodeRepo/workspace"),
+            File.join(home, "Documents/Work"),
+            File.join(home, "Documents/Other"),
+            File.join(home, "Documents/Personal"),
+            File.join(home, "Documents/Book")
+          ]
+        end
+
+        archive_path = File.join(home, "Documents/Archive")
+
+        file_list.each do |file|
+          file_name = File.basename(file)
+
+          # puts File.path(file)
+
+          next unless File.exist?(file)
+
+          now = Date.today
+
+          now_date = now.strftime("%Y%m%d")
+
+          archive_name = "#{file_name}-#{now_date}.tar.zst"
+
+          # archive_name
+          archive_file = File.join(archive_path, archive_name)
+
+          puts "archive #{file}  to #{archive_file}"
+          # zstd file
+          zstds(file, archive_file)
+        end
       end
     end
   end
