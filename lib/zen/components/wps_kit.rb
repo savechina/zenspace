@@ -108,7 +108,7 @@ module Zen
           next unless File.exist?(src_file)
 
           # system("cp -fr #{src_file}  #{to_dir}")
-          FileUtils.cp_r(src_file, to_dir)
+          FileUtils.cp_r(src_file, to_dir, remove_destination: true)
         end
         puts "dotfiles done."
       end
