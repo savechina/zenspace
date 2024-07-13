@@ -192,6 +192,45 @@ module Zen
           zstds(file, archive_file)
         end
       end
+
+      def unixtime(timestamp, _timeunit)
+        now = if timestamp.nil?
+                # 获取当前时间的长时间戳
+                DateTime.now
+              else
+                Time.at timestamp.to_d
+              end
+
+        seconds = now.to_i
+
+        puts "Current Time: #{now}"
+
+        puts "Seconds since Epoch: #{seconds}"
+
+        microseconds = now.usec
+
+        # 计算总的微秒值
+        microseconds_epoch = (seconds * 1_000_000) + microseconds
+
+        # 将秒数转换为毫秒，并加上微秒数的千分之一
+        milliseconds = (seconds * 1_000) + (microseconds / 1_000)
+
+        nanoseconds = now.nsec
+
+        nanoseconds_epoch = (seconds * 1_000_000_000) + nanoseconds
+
+        puts "Milliseconds since Epoch: #{milliseconds}"
+
+        puts "Microseconds since Epoch: #{microseconds_epoch}"
+
+        puts "Nanoseconds since Epoch: #{nanoseconds_epoch}"
+
+        puts "Current Time UTC: #{now.utc}"
+
+        # 格式化时间戳
+        formatted_time = now.localtime.strftime("%Y-%m-%d %H:%M:%S.%6N %z")
+        puts "Local Date Time: #{formatted_time}"
+      end
     end
   end
 end

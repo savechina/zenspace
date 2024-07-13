@@ -65,6 +65,39 @@ module Zen
         wps_kit.archive(from_dir, output_file)
       end
 
+      desc "unixtime [TIMESTAMP] ", "UnixTime ,The starting point for Unix Time is January 1, 1970, at 00:00:00 UTC."
+      option :timeunit, type: :string, aliases: "-t", default: "s", desc: "TIMESTAMP timeunit. :s, :ms ,:us ,:ns "
+      def unixtime(timestamp = nil)
+        timeunit = options[:timeunit]
+
+        if timestamp.nil?
+          wps_kit.unixtime(timestamp, timeunit)
+        else
+
+          if timeunit.nil? || timeunit.strip.empty?
+            puts "require timeunit. "
+            return
+          end
+
+          case timeunit
+          when "s"
+            timestamp = timestamp.to_d
+          when "ms"
+            timestamp = timestamp.to_d / 1_000.0
+          when "us"
+            timestamp = timestamp.to_d / 1_000.0 / 1_000.0
+          when "ns"
+            timestamp = timestamp.to_d / 1_000.0 / 1_000.0 / 1_000.0
+          else
+            puts " timeunit not support. timeunit:#{timeunit}"
+          end
+
+          puts "Timestamp:#{timestamp},timeunit:#{timeunit}"
+
+          wps_kit.unixtime(timestamp, timeunit)
+        end
+      end
+
       # base define
       self.command_name = "wps"
       self.command_usage = "wps [COMMAND]"
