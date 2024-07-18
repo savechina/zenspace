@@ -231,6 +231,31 @@ module Zen
         formatted_time = now.localtime.strftime("%Y-%m-%d %H:%M:%S.%6N %z")
         puts "Local Date Time: #{formatted_time}"
       end
+
+      def giturl(from_url)
+        # 使用URI.parse来解析URL
+        uri = URI.parse(from_url)
+
+        # 检查是否是合法的HTTP或HTTPS URL
+        unless uri.scheme == "http" || uri.scheme == "https"
+          raise ArgumentError, "Invalid URL: URL must be HTTP or HTTPS"
+        end
+
+        # 获取主机名和路径
+        host = uri.host
+        path = uri.path
+
+        # 移除路径的前导斜杠
+        path.slice!(0) if path.start_with?("/")
+
+        # 组装SSH URL
+        ssh_url = "git@#{host}:#{path}"
+        ssh_url.sub!(".git", "") unless path.end_with?(".git") # 确保路径以.git结尾
+        ssh_url << ".git" unless ssh_url.end_with?(".git") # 确保路径以.git结尾
+
+        ssh_url
+        puts "\tssh  : #{ssh_url}"
+      end
     end
   end
 end

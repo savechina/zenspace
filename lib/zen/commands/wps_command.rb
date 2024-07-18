@@ -98,6 +98,19 @@ module Zen
         end
       end
 
+      desc "giturl [URL] ",
+           "giturl convert git http url to ssh url format."
+      def giturl(from_url)
+        if from_url.nil? || from_url.strip.empty?
+          puts "require http_url. http:// or https:// "
+          return
+        end
+
+        puts "git url \n\thttp : #{from_url} "
+
+        wps_kit.giturl(from_url)
+      end
+
       # base define
       self.command_name = "wps"
       self.command_usage = "wps [COMMAND]"
