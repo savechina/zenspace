@@ -792,7 +792,8 @@ module Zen
         # install develop tools
         #
         tools.each do |tool|
-          exec "brew install #{tool}"
+          puts "start to install  #{tool} ...."
+          system("brew install #{tool}")
         end
 
         # config jenv add openjdk to versions
