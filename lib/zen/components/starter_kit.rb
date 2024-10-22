@@ -778,7 +778,16 @@ module Zen
                  "jenv",
                  "pyenv",
                  "zstd",
-                 "pyenv-virtualenv"]
+                 "pyenv-virtualenv",
+                 "maven",
+                 "intellij-idea",
+                 "visual-studio-code",
+                 "iterm2",
+                 "dbeaver-community",
+                 "cloc",
+                 "octosql",
+                 "tree",
+                 "sqlite"]
 
         # install develop tools
         #
