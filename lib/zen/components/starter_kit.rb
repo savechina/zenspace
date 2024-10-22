@@ -769,6 +769,28 @@ module Zen
         exec "ln -s #{File.join(home, "export")} /export"
       end
 
+      ##
+      # develop tools install to workspace
+      def develop_tools
+        java_version = "openjdk@11"
+
+        tools = [java_version,
+                 "jenv",
+                 "pyenv",
+                 "zstd",
+                 "pyenv-virtualenv"]
+
+        # install develop tools
+        #
+        tools.each do |tool|
+          exec "brew install #{tool}"
+        end
+
+        # config jenv add openjdk to versions
+        #
+        exec "jenv add /opt/homebrew/opt/#{java_version}/libexec/openjdk.jdk/Contents/Home"
+      end
+
       #
       # Scaffold 脚手架
       #

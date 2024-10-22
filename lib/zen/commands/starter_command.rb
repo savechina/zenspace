@@ -150,6 +150,11 @@ module Zen
         starter_kit.workspace
       end
 
+      des "develop", "Initialize develop ENV to install develop tools."
+      def develop
+        starter_kit.develop_tools
+      end
+
       # base define
       self.command_name = "starter"
       self.command_usage = "starter [COMMAND]"
