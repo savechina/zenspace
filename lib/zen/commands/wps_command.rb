@@ -4,7 +4,7 @@
 module Zen
   module Commands
     ##
-    # WpsCommand for repo Utils
+    # WpsCommand for Work Utils
     #
     class WpsCommand < Zen::Commands::BaseCommand
       include Import["zen.components.wps_kit"
@@ -114,7 +114,7 @@ module Zen
       # base define
       self.command_name = "wps"
       self.command_usage = "wps [COMMAND]"
-      self.command_description = "work process suite"
+      self.command_description = "Work process suite"
     end
   end
 end
