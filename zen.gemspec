@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
 
   spec.summary       = "Write a short summary, because RubyGems requires one."
   spec.description   = "Write a longer description or delete this line."
-  spec.homepage      = "http://savechina.github.io/zenspaca"
+  spec.homepage      = "http://savechina.github.io/zenspace"
   spec.license       = "MIT"
   spec.required_ruby_version = Gem::Requirement.new(">= 3.2.0")
 

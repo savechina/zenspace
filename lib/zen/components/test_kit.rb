@@ -10,9 +10,6 @@ module Zen
     require "factory_bot"
     # require "faker"
 
-    class User
-    end
-
     ##
     # WpsKit Work Process Suite
     #
@@ -20,20 +17,18 @@ module Zen
     class TestKit
       def init
         puts "test init"
-
-        # This will guess the User class
         # FactoryBot.define do
         #   factory :user do
         #     first_name { "Joe" }
         #     last_name  { "Blow" }
         #     email { "#{first_name}.#{last_name}@example.com".downcase }
         #   end
-
-        #   create(:user, last_name: "Doe").email
         #   # => "joe.doe@example.com"
         # end
 
-        # user = FactoryBot.create(:user)
+        # This will guess the User class
+        # user = FactoryBot.create(:User)
+
         # puts user.name
         # puts user.email
       end

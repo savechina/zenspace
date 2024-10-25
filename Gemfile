@@ -17,7 +17,7 @@ group :development do
 
   gem "debug"
 
-  # gem "ruby-watchman"
+  gem "ruby-watchman"
 
   gem "sorbet"
 
@@ -38,3 +38,5 @@ group :development do
   gem "steep", "~> 1.4", group: :development
   gem "typeprof", "~> 0.21.11", group: :development
 end
+
+gem "faker", "~> 3.5"
