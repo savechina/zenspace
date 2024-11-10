@@ -65,7 +65,7 @@ module Zen
         file.close
 
         # Get the final MD5 hash digest
-        md5_digest = md5_hash.hexdigest
+        md5_digest = sha2_hash.hexdigest
 
         OpenStruct.new(file_hash: md5_digest, block_count:, file_stat: "")
       end
