@@ -57,7 +57,7 @@ module Zen
 
         java_starter = JavaScaffold.new(project.project_name, project.group_name, project.package_name, output_root)
 
-        java_starter.generate(output_root)
+        java_starter.generate(template_base,output_root)
 
         logger.info "StarterKit init project done."
       end
@@ -832,23 +832,9 @@ module Zen
 
         ##
         # generate project structure
-        def generate(output_root)
+        def generate(template_base,output_root)
           # template root directory
-          templates_root = File.join(Zen::TEMPLATE_ROOT, TEMPLATE_NAME)
-
-          if !Dir.exist?(templates_root) && Application.logger.debug?
-            Application.logger.debug "JavaScaffold: template not exists ."
-          end
-
-          # use template root directory
-          user_template = File.join(Zen::USER_TEMPLATE_ROOT, TEMPLATE_NAME)
-
-          if Dir.exist?(user_template)
-            templates_root = user_template
-            if Application.logger.debug?
-              Application.logger.debug "JavaScaffold: user template exists, use this template."
-            end
-          end
+          templates_root = template_base 
 
           # output root directory
           target_root = File.join(output_root, ".")
