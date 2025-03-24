@@ -102,6 +102,10 @@ tableVOPath = "#{model.package_name}domain.vo.#{tableVO}"
                 <if test="id != null">
                     and id = #{id,jdbcType=BIGINT}
                 </if>
+                <%- elsif field.java_type =="String" -%>
+                <if test="<%= field.field_name %> != null and <%= field.field_name %> != ''">
+                    and <%= field.column_name %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>}
+                </if>
                 <% else %>
                 <if test="<%= field.field_name %> != null and <%= field.field_name %> != ''">
                     and <%= field.column_name %> = #{<%= field.field_name %>,jdbcType=<%= field.jdbc_type %>}
