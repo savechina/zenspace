@@ -23,3 +23,6 @@ test.db
 .env.development
 
 target
+.zed
+
+.DS_Store
