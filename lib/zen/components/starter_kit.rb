@@ -57,7 +57,7 @@ module Zen
 
         java_starter = JavaScaffold.new(project.project_name, project.group_name, project.package_name, output_root)
 
-        java_starter.generate(template_base,output_root)
+        java_starter.generate(template_base, output_root)
 
         logger.info "StarterKit init project done."
       end
@@ -283,7 +283,7 @@ module Zen
         service_impl_module.module_name = "SERVICE_IMPL"
         service_impl_module.module_template = "service_impl.java.erb"
         service_impl_module.project = project
-        service_impl_module.module_package = "impl"
+        service_impl_module.module_package = "domain.service"
         service_impl_module.module_path = "#{project.project_name}-domain"
         service_impl_module.module_type = Model::JavaModule::SOURCE_TYPE
         service_impl_module.module_suffix = "ServiceImpl"
@@ -393,7 +393,28 @@ module Zen
 
         process_template(template_base, template_name, output_path, context)
 
-        # Repository Impl Module process template
+        # Service Module process template
+        template_name = service_module.module_template
+
+        output_path = File.join(output_root,
+                                service_module.full_path,
+                                clazz_model.package_name,
+                                "#{clazz_model.feature_name.camelcase}#{clazz_model.class_name}Service.java")
+
+        process_template(template_base, template_name, output_path, context)
+
+        # Service Impl Module process template
+        template_name = service_impl_module.module_template
+
+        output_path = File.join(output_root,
+                                service_impl_module.full_path,
+                                clazz_model.package_name,
+                                "impl",
+                                "#{clazz_model.feature_name.camelcase}#{clazz_model.class_name}ServiceImpl.java")
+
+        process_template(template_base, template_name, output_path, context)
+
+        # View Module process template
         template_name = view_module.module_template
 
         output_path = File.join(output_root,
@@ -832,9 +853,9 @@ module Zen
 
         ##
         # generate project structure
-        def generate(template_base,output_root)
+        def generate(template_base, output_root)
           # template root directory
-          templates_root = template_base 
+          templates_root = template_base
 
           # output root directory
           target_root = File.join(output_root, ".")

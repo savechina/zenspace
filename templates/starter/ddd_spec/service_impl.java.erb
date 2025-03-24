@@ -1,0 +1,123 @@
+<%-
+packageName = "#{modules[:service_impl].full_package}.#{model.package_name}.impl" 
+serviceImplName = "ServiceImpl"
+tableServiceImpl = "#{model.feature_name.camelcase}#{model.class_name}#{serviceImplName}"
+
+servicePackageName = "#{modules[:service].full_package}.#{model.package_name}" 
+serviceName = "Service"
+tableService = "#{model.feature_name.camelcase}#{model.class_name}#{serviceName}"
+
+repositoryPackageName = "#{modules[:repository].full_package}.#{model.package_name}" 
+repositoryName = "Repository"
+tableRepository = "#{model.feature_name.camelcase}#{model.class_name}#{repositoryName}"
+tableRepositoryInstance=tableRepository.camelcase(:lower)
+
+entityPackageName = "#{modules[:entity].full_package}.#{model.package_name}"  
+tableEntity = model.feature_name.camelcase + model.class_name + "Entity"
+tableEntityInstance = "#{model.class_name.camelcase(:lower)}Entity"
+
+entityConvertPackageName = "#{modules[:entity_convert].full_package}.#{model.package_name}"
+convertName = "EntityConvert"
+tableEntityConvert = "#{model.feature_name.camelcase}#{model.class_name}#{convertName}"
+tableEntityConvertInstance = "#{model.feature_name.camelcase(:lower)}#{model.class_name}#{convertName}"
+
+daoPackageName = "#{modules[:mapper].full_package}.#{model.package_name}" 
+daoName = "Mapper"
+tableDao = "#{model.feature_name.camelcase}#{model.class_name}#{daoName}"
+tableDaoInstance=tableDao.camelcase(:lower)
+
+doPackageName = "#{modules[:model].full_package}.#{model.package_name}"
+doName="DO"
+doEntity="#{model.feature_name.camelcase}#{model.class_name}#{doName}" 
+doEntityInstance = "#{model.class_name.camelcase(:lower)}DO"
+
+-%> 
+<%-
+# tableVO = "#{model.class_name}VO"
+# tableVOInstance = "#{model.class_name}VO"
+
+# tableResponse = "#{model.class_name}Response"
+# tableQueryVO = "#{model.class_name}QueryVO"
+# tableQueryVOInstance = "#{model.class_name}QueryVO"
+-%>
+package <%= packageName %>;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import lombok.extern.slf4j.Slf4j;
+
+import <%= doPackageName %>.<%= doEntity %>;
+import <%= repositoryPackageName %>.<%= tableRepository %>;
+import <%= servicePackageName %>.<%= tableService %>;
+
+import java.util.*;
+
+@Slf4j
+@Service
+public class <%=tableServiceImpl%> implements <%= tableService %>  {
+  
+    @Autowired
+    private <%=tableRepository%> <%=tableRepositoryInstance%>;
+
+    /**
+     * 插入 <%=model.class_comment%> 
+     *
+     * @param <%= doEntityInstance %> <%=model.class_comment%> 
+     * @return  Integer
+     */
+    @Override
+    public Integer insert(<%= doEntity %> <%= doEntityInstance %>){
+
+        return <%=tableRepositoryInstance%>.insert(<%= doEntityInstance %>);
+    }
+
+   /**
+     * 批量插入 <%=model.class_comment%> 
+     *
+     * @param  list List<<%= doEntity %>> <%=model.class_comment%> 
+     * @return  Integer
+     */ 
+    @Override
+    public Integer insertBatch(List<<%= doEntity %>> list){
+
+
+        return <%=tableRepositoryInstance%>.insertBatch(list);
+    }
+
+    @Override
+    public Integer deleteByPrimaryKey(Long id){
+        return <%=tableRepositoryInstance%>.deleteByPrimaryKey(id);
+    }
+
+    @Override
+    public Integer deleteBatchByPrimaryKey(List<Long> ids){
+        return <%=tableRepositoryInstance%>.deleteBatchByPrimaryKey(ids);
+    }
+
+    @Override
+    public Integer update(<%= doEntity %> <%= doEntityInstance %>){
+        return <%=tableRepositoryInstance%>.update(<%= doEntityInstance %>);
+    }
+
+    @Override
+    public Integer updateBatch(List<<%= doEntity %>> list){
+        
+        return <%=tableRepositoryInstance%>.updateBatch(list);
+    }
+
+    @Override
+    public List<<%= doEntity %>> selectBy(<%= doEntity %> <%= doEntityInstance %>){
+        <%=doEntity%>  param = <%= doEntityInstance %>;
+
+        List<<%=doEntity%>>  entityList = <%=tableRepositoryInstance%>.selectBy(param);
+        return entityList;
+    }
+
+    @Override
+    public <%= doEntity %> getById(Long id){
+
+        <%=doEntity%>  entity = <%=tableRepositoryInstance%>.getById(id);
+
+        return entity;
+    }
+}

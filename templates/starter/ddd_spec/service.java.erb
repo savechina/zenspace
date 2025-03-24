@@ -1,0 +1,47 @@
+<% 
+packageName = "#{modules[:service].full_package}.#{model.package_name}" 
+serviceName = "Service"
+tableService = "#{model.feature_name.camelcase}#{model.class_name}#{serviceName}"
+
+entityPackageName = "#{modules[:entity].full_package}.#{model.package_name}"  
+tableEntity = model.feature_name.camelcase + model.class_name + "Entity"
+tableEntityInstance = "#{model.class_name.camelcase(:lower)}Entity"
+
+daoPackageName = "#{modules[:mapper].full_package}.#{model.package_name}" 
+daoName = "Mapper"
+tableDao = "#{model.feature_name.camelcase}#{model.class_name}#{daoName}"
+
+doPackageName = "#{modules[:model].full_package}.#{model.package_name}"
+doName="DO"
+doEntity="#{model.feature_name.camelcase}#{model.class_name}#{doName}" 
+doEntityInstance = "#{model.class_name.camelcase(:lower)}DO"
+
+%> 
+<%    
+# tableVO = "#{model.class_name}VO"
+# tableVOInstance = "#{model.class_name}VO"
+
+# tableResponse = "#{model.class_name}Response"
+# tableQueryVO = "#{model.class_name}QueryVO"
+# tableQueryVOInstance = "#{model.class_name}QueryVO"
+%>
+package <%= packageName %>;
+
+import <%= doPackageName %>.<%= doEntity %>;
+
+import java.util.*;
+
+public interface <%= tableService %>  {
+    Integer insert(<%= doEntity %> <%= doEntityInstance %>);
+    Integer insertBatch(List<<%= doEntity %>> list);
+
+    Integer deleteByPrimaryKey(Long id);
+    Integer deleteBatchByPrimaryKey(List<Long> ids);
+
+    Integer update(<%= doEntity %> <%= doEntityInstance %>);
+    Integer updateBatch(List<<%= doEntity %>> list);
+
+    List<<%= doEntity %>> selectBy(<%= doEntity %> <%= doEntityInstance %>);
+
+    <%= doEntity %> getById(Long id);
+}
