@@ -26,14 +26,15 @@ module Zen
 
         4. <output root> , optional ,value is  default current directory.
 
-        Example:
+       Example:
 
         $ zen starter init bluekit-sample org.renyan.bluekit.sample  org.renyan.bluekit.sample
 
       LONGDESC
       option :verbose, type: :boolean, aliases: "-v", desc: "Verbose output"
       option :force, type: :boolean, aliases: "-f", desc: "Force Overwriter"
-      option :arch_type, type: :string, aliases: "-t", default: "ddd", desc: "arch type template name"
+      option :arch_type, type: :string, aliases: "-t", default: "ddd",
+                         desc: "arch type template name.arch type support: ddd, mvc"
       def init(project_name = nil, group_name = nil, package_name = nil, output_root = nil)
         #        puts "#{project_name},#{group_name},#{package_name},#{output_root}"
 

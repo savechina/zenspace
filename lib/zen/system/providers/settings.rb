@@ -33,6 +33,11 @@ module Zen
 
     Dotenv.load local_zen_config if File.exist?(local_zen_config) && File.file?(local_zen_config)
 
+    # user root config .bluekit file
+    user_config_bucket = File.join(Zen::USER_ROOT, "config", ".zen")
+
+    Dotenv.load user_config_bucket if File.exist?(user_config_bucket)
+
     settings do
       # puts "setting prepare.... config init"
 
