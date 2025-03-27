@@ -9,30 +9,33 @@ module Zen
     # require "rake/file_list"
     require "factory_bot"
     require "faker"
-    require_relative "test_kit/model/user"
+    # require_relative "test_kit/model/user"
+
     ##
-    # WpsKit Work Process Suite
-    #
+    # TestKit
     #
     class TestKit
       def init
         puts "test init"
 
-        FactoryBot.define do
-          factory :user do
-            first_name { Faker::Name.name }
-            last_name  { "Blow" }
-            email { "#{first_name}.#{last_name}@example.com".downcase }
-            skip_create
-          end
-          # => "joe.doe@example.com"
-        end
+        puts File.expand_path("test_kit/factories", __dir__)
+        # 指定 factories 目录
+        FactoryBot.definition_file_paths = [File.expand_path("test_kit/factories", __dir__)]
+
+        FactoryBot.find_definitions
+
+        # 检查 Factory 是否注册成功
+        puts FactoryBot.factories.map(&:name) # 应包含 :product 和 :warehouse_item
 
         # This will guess the User class
-        user = FactoryBot.create(:user)
+        user = FactoryBot.build(:user)
 
         puts user.first_name
         puts user.email
+
+        # This will guess the Sku class
+        sku = FactoryBot.build(:sku)
+        pp sku
       end
     end
   end

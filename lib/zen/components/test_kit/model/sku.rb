@@ -1,18 +1,18 @@
-# typed: false
+# typed: true
+# frozen_string_literal: true
 
 module Zen
   module Components
-    require "factory_bot"
-    # require "faker"
-
     ##
-    # TestKit Test Process Suite
+    # TestKit Test Suite
     #
     class TestKit
       module Model
         ##
-        #Sku
+        # Sku
         class Sku
+          # name
+          attr_accessor :name
         end
       end
     end
