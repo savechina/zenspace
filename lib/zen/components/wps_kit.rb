@@ -54,7 +54,7 @@ module Zen
         # Read the file in 4096-byte blocks
         block_size = 4096
         while block = file.read(block_size)
-          # Update the MD5 hash with each block
+          # Update the SHA256 hash with each block
           sha2_hash.update(block)
 
           # Increment the block count
