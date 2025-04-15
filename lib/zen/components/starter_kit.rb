@@ -797,9 +797,8 @@ module Zen
 
         tools = [java_version,
                  "jenv",
-                 "pyenv",
+                 "rbenv",
                  "zstd",
-                 "pyenv-virtualenv",
                  "maven",
                  "intellij-idea",
                  "visual-studio-code",
@@ -808,7 +807,10 @@ module Zen
                  "cloc",
                  "octosql",
                  "tree",
-                 "sqlite"]
+                 "sqlite",
+                 "uv",
+                 "zed",
+                 "helix"]
 
         # install develop tools
         #
