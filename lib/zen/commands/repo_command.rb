@@ -8,7 +8,7 @@ module Zen
     #
     class RepoCommand < Zen::Commands::BaseCommand
       # @return [Zen::Components::RepoKit]
-      include Import["zen.components.repo_kit","logger"] # => [Zen::Components::RepoKit]
+      include Import["zen.components.repo_kit", "logger"] # => [Zen::Components::RepoKit]
 
       ##
       # define command

@@ -13,7 +13,7 @@ group :development do
 
   gem "rubocop", "~>1.50.2"
 
-  gem "ruby-lsp"
+  gem "ruby-lsp", "~>0.21.2"
 
   gem "debug"
 
@@ -22,6 +22,10 @@ group :development do
   gem "sorbet"
 
   gem "solargraph"
+
+  gem "stringio", "~>3.0.4"
+
+  gem "psych", "~>5.2"
 
   gem "rubocop-sequel", "~> 0.3.4", group: :development
 
