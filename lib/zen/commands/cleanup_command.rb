@@ -4,15 +4,14 @@
 module Zen
   module Commands
     ##
-    # CleanCommand for cleanup macos logs and cache Utils
+    # CleanCommand for cleanup  logs and cache Utils for MacOS
     #
     class CleanupCommand < Zen::Commands::BaseCommand
-      include Import["zen.components.cleanup_kit", "logger"] # => [Zen::Components::RepoKit]
+      include Import["zen.components.cleanup_kit", "logger"]
 
-      desc "all ", "fetch NAME repository"
+      desc "all ", "clean all ."
       def all
-        logger.info("entry repo clean ")
-        puts "cleanup start"
+        puts "cleanup all start ..."
         cleanup_kit.clean_all
       end
 
@@ -22,7 +21,7 @@ module Zen
       #  base define
       self.command_name = "cleanup"
       self.command_usage = "cleanup "
-      self.command_description = "cleanup macos logs and cache Utils"
+      self.command_description = "cleanup logs and cache Utils for MacOS"
     end
   end
 end
