@@ -21,7 +21,7 @@ module Zen
       # base command for CLI tool
       #
       desc "hello NAME", "say hello to NAME"
-      options from: :required, yell: :boolean
+      options from: :required, default: "Zen", yell: :boolean
       def hello(name)
         puts "> saying hello" if options[:verbose]
         output = []
