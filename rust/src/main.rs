@@ -35,7 +35,10 @@ fn main() {
         //     excute_calc_command(operation);
         // }
         Commands::Version => {
-            println!("version 0.1.0")
+            // Get the package version from Cargo.toml at compile time
+            let version = env!("CARGO_PKG_VERSION");
+            // Print the version to the console
+            println!("zen version: {}", version);
         }
     }
 }
