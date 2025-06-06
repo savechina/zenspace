@@ -3,7 +3,7 @@ mod commands;
 mod config;
 
 use clap::{Args, Parser, Subcommand};
-
+use dotenvy;
 #[derive(Parser)]
 #[command(author="ren", version, about="about zenspace utils", long_about = None)]
 struct Cli {
@@ -25,6 +25,13 @@ enum Commands {
 }
 
 fn main() {
+    // Load environment variables from .env file.
+    // Fails if .env file not found, not readable or invalid.
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("Failed to load .env file: {}", err);
+        std::process::exit(1);
+    }
+
     println!("Hello, world!");
     let cli = Cli::parse();
 
