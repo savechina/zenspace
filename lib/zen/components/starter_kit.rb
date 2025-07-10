@@ -810,7 +810,11 @@ module Zen
                  "sqlite",
                  "uv",
                  "zed",
-                 "helix"]
+                 "helix",
+                 "bat",
+                 "zoxide",
+                 "fzf",
+                 "ripgrep"]
 
         # install develop tools
         #
