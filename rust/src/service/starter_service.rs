@@ -127,6 +127,4 @@ pub(crate) fn workspace() {
             .status()
             .unwrap();
     }
-
-    // Ok(())
 }
