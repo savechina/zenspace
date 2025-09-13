@@ -1,5 +1,7 @@
+use crate::util;
 use std::env::{self, home_dir};
 use std::fs;
+use std::process::{Command, Stdio};
 
 pub(crate) fn init() {
     println!("{} ", "Develop initialize:");
@@ -9,8 +11,74 @@ pub(crate) fn add() {
     println!("{} ", "Develop initialize:");
 }
 
-pub(crate) fn develop() {
+pub(crate) fn develop_tool() {
     println!("{} ", "Develop initialize:");
+
+    let exists = util::command_exists("cargo");
+
+    println!("rustc exists: {}", exists);
+
+    let java_version = "openjdk@11";
+
+    let tools = vec![
+        java_version,
+        "jenv",
+        "rbenv",
+        "zstd",
+        "maven",
+        "intellij-idea",
+        "visual-studio-code",
+        "iterm2",
+        "dbeaver-community",
+        "cloc",
+        "octosql",
+        "tree",
+        "sqlite",
+        "uv",
+        "zed",
+        "helix",
+        "bat",
+        "zoxide",
+        "fzf",
+        "ripgrep",
+    ];
+
+    // Install development tools using Homebrew
+    for tool in tools {
+        println!("Start to install {}...", tool);
+
+        let status = Command::new("brew")
+            .arg("install")
+            .arg(tool)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .unwrap();
+
+        if !status.success() {
+            eprintln!("Failed to install {}", tool);
+        }
+    }
+
+    // Configure jenv to add OpenJDK
+    println!("Configuring jenv to add OpenJDK...");
+
+    let java_home = format!(
+        "/opt/homebrew/opt/{}/libexec/openjdk.jdk/Contents/Home",
+        java_version
+    );
+
+    let status = Command::new("jenv")
+        .arg("add")
+        .arg(java_home)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .unwrap();
+
+    if !status.success() {
+        eprintln!("Failed to configure jenv");
+    }
 }
 
 pub(crate) fn workspace() {

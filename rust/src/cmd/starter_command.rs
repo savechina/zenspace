@@ -5,19 +5,25 @@ use tracing::info;
 
 #[derive(Subcommand)]
 pub(crate) enum StarterCommands {
-    /// Start the server
+    /// Init project from template by project
     Init {
-        /// The first number
-        #[arg(default_value = "9001", short, long)]
-        a: i32,
-        /// The second number
-        #[arg(default_value = "9001", short, long)]
-        b: i32,
+        /// The project name
+        project: String,
+        /// The group name
+        group: String,
+        /// The package name
+        package: String,
     },
-    /// Stop the server
-    Add,
 
-    /// Develop Env and Tool initialize
+    /// Add project feature
+    Add {
+        /// The package name
+        package: String,
+        /// The table name
+        table: String,
+    },
+
+    ///Initialize develop ENV to install develop tools.
     Develop,
 
     /// Workspace initialize
@@ -27,19 +33,22 @@ pub(crate) enum StarterCommands {
 ///执行 clac command run
 pub(crate) fn excute_command(operation: &StarterCommands) {
     match operation {
-        StarterCommands::Init { a, b } => {
-            info!("Starting Jento Server application...");
-            info!("{} + {} = {}", a, b, a + b);
-
+        StarterCommands::Init {
+            project,
+            group,
+            package,
+        } => {
+            println!("{} + {} + {}", project, group, package);
             starter_service::init();
         }
 
-        StarterCommands::Add => {
+        StarterCommands::Add { package, table } => {
+            println!("Package: {} \t Table: {} ", package, table);
             starter_service::add();
         }
 
         StarterCommands::Develop => {
-            starter_service::develop();
+            starter_service::develop_tool();
         }
 
         StarterCommands::Workspace => {

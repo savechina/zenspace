@@ -1,7 +1,8 @@
 use clap::{Args, Parser, Subcommand};
-use dotenvy;
+// use dotenvy;
 
 use crate::cmd::starter_command::{self, StarterCommands};
+use crate::cmd::wps_command::{self, WpsCommands};
 
 #[derive(Parser)]
 #[command(author="JenYen", version, about="About zenspace utils", long_about = None)]
@@ -20,6 +21,11 @@ enum Commands {
         #[command(subcommand)]
         operation: StarterCommands,
     },
+    /// Work process suite
+    Wps {
+        #[command(subcommand)]
+        operation: WpsCommands,
+    },
 
     /// Zen version
     Version,
@@ -36,6 +42,10 @@ pub(crate) fn shell() {
 
         Commands::Starter { operation } => {
             starter_command::excute_command(operation);
+        }
+
+        Commands::Wps { operation } => {
+            wps_command::excute_command(operation);
         }
 
         Commands::Version => {
