@@ -17,6 +17,12 @@ static CONFIGS: Dir = include_dir!("config");
 
 struct Configuration {}
 
+#[derive(Debug, Deserialize, Getters, Clone)]
+struct StarterConfig {
+    #[getset(get = "pub", set = "pub")]
+    tools: Vec<String>,
+}
+
 pub(crate) fn load() -> Result<Config, ZenError> {
     // Load the environment variables from a .env file
     dotenvy::dotenv().ok();
@@ -28,10 +34,20 @@ pub(crate) fn load() -> Result<Config, ZenError> {
     for file in util::TEMPLATES.dirs() {
         println!("Recursive File path: {:?}", file.path());
 
+        file.dirs().for_each(|f| {
+            println!("Recursive File path: {:?}", f.path());
+        });
+
         file.files().for_each(|f| {
             println!("Recursive File path: {:?}", f.path());
         });
     }
+
+    let f = util::TEMPLATES.get_entry("starter/ddd_init").unwrap();
+
+    // for entry in f {
+    //     println!("f : {:?}", entry);
+    // }
 
     let config_path = CONFIGS.path();
     println!("config path: {:?}", config_path);
@@ -45,15 +61,15 @@ pub(crate) fn load() -> Result<Config, ZenError> {
         // });
     }
 
-    //  Add a specific file like "config.toml"
+    //Get a config file "config.toml"
     let config_file = CONFIGS.get_file("config.toml").unwrap();
+
     let contents = config_file.contents_utf8().expect("UTF-8 content");
 
     // Build the configuration using the config crate
     // This allows you to load configuration from multiple sources such as files and environment variables
     // The configuration is built in a way that it can be easily extended and modified
-    //
-    let builder = Config::builder()
+    let mut builder = Config::builder()
         // Start off by merging in the "application" configuration file
         // .add_source(File::with_name("config/config"))
         .add_source(File::from_str(contents, FileFormat::Toml))
@@ -76,6 +92,14 @@ pub(crate) fn load() -> Result<Config, ZenError> {
         // .set_override("database.url", "sqlite://memory:")?
         .set_default("debug", false)?
         .set_default("database.pool_size", 10)?;
+
+    //user config path .zen/config/config.toml
+    let config_path = util::USER_ROOT.join("config/config.toml");
+
+    if config_path.exists() {
+        let base_name = config_path.to_str().unwrap();
+        builder = builder.add_source(File::with_name(base_name));
+    }
 
     // let mut temp_file = tempfile::Builder::new()
     //     .suffix(".toml")

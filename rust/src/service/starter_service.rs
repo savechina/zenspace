@@ -1,10 +1,39 @@
 use crate::util;
 use std::env::{self, home_dir};
-use std::fs;
+use std::fs::DirEntry;
+use std::fs::{self, FileType};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub(crate) fn init() {
     println!("{} ", "Develop initialize:");
+
+    let template_name = "templates";
+
+    let template_path = PathBuf::from(template_name);
+
+    if template_path.exists() {
+        println!("template path exists: {}", true);
+    }
+
+    let ddd_path = template_path.join("starter/ddd_init");
+
+    println!("ddd_path exists: {} ", ddd_path.exists());
+
+    let ddd_dir = fs::read_dir(ddd_path).unwrap();
+    // let ddd_dir = ddd_path.read_dir().unwrap();
+
+    for entry in ddd_dir {
+        let entry: DirEntry = entry.unwrap();
+        let file_name = entry.file_name();
+        let file_type: FileType = entry.file_type().unwrap();
+        let path = entry.path();
+
+        println!(
+            "file name: {:?},type: {:?} ,path: {:?}",
+            file_name, file_type, path
+        );
+    }
 }
 
 pub(crate) fn add() {
@@ -85,7 +114,7 @@ pub(crate) fn workspace() {
     println!("Workspace initialize:");
 
     // Get the home directory
-    let home = env::home_dir().expect("Could not get home directory");
+    let home = home::home_dir().expect("Could not get home directory");
 
     // List of directories
     let file_list = vec![
@@ -111,7 +140,7 @@ pub(crate) fn workspace() {
             fs::create_dir_all(&file).unwrap();
             println!("Created directory: {}", file.display());
         }
-        println!("workspace init: {}", file.display());
+        println!("workspace init: {} done", file.display());
     }
 
     // Create symbolic link for export
