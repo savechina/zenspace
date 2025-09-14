@@ -1,8 +1,11 @@
 use std::error::Error;
+#[macro_use]
+extern crate getset;
 
 mod cli;
 mod cmd;
 mod config;
+mod errors;
 mod service;
 mod util;
 
@@ -13,6 +16,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("Warn: Failed to load .env file: {}", err);
         // std::process::exit(1);
     }
+
+    config::load().unwrap();
 
     cli::shell();
 

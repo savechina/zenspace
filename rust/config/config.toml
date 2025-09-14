@@ -1,0 +1,4 @@
+
+[starter]
+tool=["openjdk@11","iterm2","cloc","ripgrep"]
+java="openjdk@11"
