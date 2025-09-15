@@ -8,6 +8,22 @@ use std::process::{Command, Stdio};
 pub(crate) fn init() {
     println!("{} ", "Develop initialize:");
 
+    let template_path = util::TEMPLATES.path();
+    println!("template path: {:?}", template_path);
+
+    // 遍历所有文件（包括子目录中的文件）
+    for file in util::TEMPLATES.dirs() {
+        println!("Recursive File path: {:?}", file.path());
+
+        file.dirs().for_each(|f| {
+            println!("Recursive File path: {:?}", f.path());
+        });
+
+        file.files().for_each(|f| {
+            println!("Recursive File path: {:?}", f.path());
+        });
+    }
+
     let template_name = "templates";
 
     let template_path = PathBuf::from(template_name);
@@ -34,6 +50,11 @@ pub(crate) fn init() {
             file_name, file_type, path
         );
     }
+
+    let entry = util::TEMPLATES.get_entry("starter/ddd_init").unwrap();
+    // println!("entry : {:?}", entry);
+
+    process_entry(entry, 0);
 }
 
 pub(crate) fn add() {
@@ -155,5 +176,42 @@ pub(crate) fn workspace() {
             .arg("/export")
             .status()
             .unwrap();
+    }
+}
+
+fn process_entry(entry: &include_dir::DirEntry, depth: usize) {
+    let indent = "  ".repeat(depth);
+    match entry {
+        include_dir::DirEntry::Dir(dir) => {
+            let path = dir.path().strip_prefix("starter/ddd_init").unwrap();
+
+            let os_path = path.as_os_str();
+
+            let mut file_name = path.file_name();
+
+            if path.starts_with("__app__") {
+                let name = file_name
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace("__app__", "bluekit-sample");
+
+                println!("new name: {}", name);
+            }
+
+            println!("{}目录: {}, {:?}", indent, dir.path().display(), path);
+
+            for subentry in dir.entries() {
+                process_entry(subentry, depth + 1);
+            }
+        }
+        include_dir::DirEntry::File(file) => {
+            println!("{}文件: {}", indent, file.path().display());
+
+            if let Some(content) = file.contents_utf8() {
+                println!("{}  内容: {:?}", indent, content.len());
+            } else {
+                println!("{}  字节数: {}", indent, file.contents().len());
+            }
+        }
     }
 }

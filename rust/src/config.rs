@@ -4,7 +4,7 @@ use anyhow::Result;
 use config::{Config, Environment, File, FileFormat};
 use dotenvy;
 use getset::Getters;
-use include_dir::{Dir, include_dir};
+use include_dir::{Dir, DirEntry, include_dir};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_derive::Deserialize;
 
@@ -26,40 +26,6 @@ struct StarterConfig {
 pub(crate) fn load() -> Result<Config, ZenError> {
     // Load the environment variables from a .env file
     dotenvy::dotenv().ok();
-
-    let template_path = util::TEMPLATES.path();
-    println!("template path: {:?}", template_path);
-
-    // 遍历所有文件（包括子目录中的文件）
-    for file in util::TEMPLATES.dirs() {
-        println!("Recursive File path: {:?}", file.path());
-
-        file.dirs().for_each(|f| {
-            println!("Recursive File path: {:?}", f.path());
-        });
-
-        file.files().for_each(|f| {
-            println!("Recursive File path: {:?}", f.path());
-        });
-    }
-
-    let f = util::TEMPLATES.get_entry("starter/ddd_init").unwrap();
-
-    // for entry in f {
-    //     println!("f : {:?}", entry);
-    // }
-
-    let config_path = CONFIGS.path();
-    println!("config path: {:?}", config_path);
-
-    // 遍历所有文件（包括子目录中的文件）
-    for file in CONFIGS.files() {
-        println!("Recursive File path: {:?}", file.path());
-
-        // file.files().for_each(|f| {
-        //     println!("Recursive File path: {:?}", f.path());
-        // });
-    }
 
     //Get a config file "config.toml"
     let config_file = CONFIGS.get_file("config.toml").unwrap();
@@ -117,9 +83,9 @@ pub(crate) fn load() -> Result<Config, ZenError> {
 
     let setting = builder.build().map_err(|e| ZenError::Config(e)).unwrap();
 
-    println!("setting : {:?}", setting);
-    let tools = setting.get_array("starter.tool").unwrap();
+    // println!("setting : {:?}", setting);
+    // let tools = setting.get_array("starter.tool").unwrap();
 
-    println!("tools : {:?}", tools);
+    // println!("tools : {:?}", tools);
     Ok(setting)
 }
