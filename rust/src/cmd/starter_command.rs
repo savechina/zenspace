@@ -64,6 +64,8 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
             println!("Output: {}", output_root.display());
 
             starter_service::init(project, output_root);
+
+            println!("Init project done");
         }
 
         StarterCommands::Add { package, table } => {
