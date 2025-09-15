@@ -1,3 +1,5 @@
+use tracing_subscriber::fmt::writer::OrElse;
+
 use crate::model::starter::Project;
 use crate::util;
 use std::env::{self, home_dir};
@@ -6,69 +8,72 @@ use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub(crate) fn init() {
+pub(crate) fn init(project: Project, output_root: PathBuf) {
     println!("{} ", "Develop initialize:");
 
-    let template_path = util::TEMPLATES.path();
-    println!("template path: {:?}", template_path);
+    // let template_path = util::TEMPLATES.path();
+    // println!("template path: {:?}", template_path);
 
-    // 遍历所有文件（包括子目录中的文件）
-    for file in util::TEMPLATES.dirs() {
-        println!("Recursive File path: {:?}", file.path());
+    // // 遍历所有文件（包括子目录中的文件）
+    // for file in util::TEMPLATES.dirs() {
+    //     println!("Recursive File path: {:?}", file.path());
 
-        file.dirs().for_each(|f| {
-            println!("Recursive File path: {:?}", f.path());
-        });
+    //     file.dirs().for_each(|f| {
+    //         println!("Recursive File path: {:?}", f.path());
+    //     });
 
-        file.files().for_each(|f| {
-            println!("Recursive File path: {:?}", f.path());
-        });
-    }
+    //     file.files().for_each(|f| {
+    //         println!("Recursive File path: {:?}", f.path());
+    //     });
+    // }
 
-    let template_name = "templates";
+    // let template_name = "templates";
 
-    let template_path = PathBuf::from(template_name);
+    // let template_path = PathBuf::from(template_name);
 
-    if template_path.exists() {
-        println!("template path exists: {}", true);
-    }
+    // if template_path.exists() {
+    //     println!("template path exists: {}", true);
+    // }
 
-    let ddd_path = template_path.join("starter/ddd_init");
+    // let ddd_path = template_path.join("starter/ddd_init");
 
-    println!("ddd_path exists: {} ", ddd_path.exists());
+    // println!("ddd_path exists: {} ", ddd_path.exists());
 
-    let ddd_dir = fs::read_dir(ddd_path).unwrap();
+    // let ddd_dir = fs::read_dir(ddd_path).unwrap();
 
-    for entry in ddd_dir {
-        let entry: DirEntry = entry.unwrap();
-        let file_name = entry.file_name();
-        let file_type: FileType = entry.file_type().unwrap();
-        let path = entry.path();
+    // for entry in ddd_dir {
+    //     let entry: DirEntry = entry.unwrap();
+    //     let file_name = entry.file_name();
+    //     let file_type: FileType = entry.file_type().unwrap();
+    //     let path = entry.path();
 
-        println!(
-            "file name: {:?},type: {:?} ,path: {:?}",
-            file_name, file_type, path
-        );
-    }
+    //     println!(
+    //         "file name: {:?},type: {:?} ,path: {:?}",
+    //         file_name, file_type, path
+    //     );
+    // }
+    //
 
-    let template_base = "starter/ddd_init";
-
-    let entry = util::TEMPLATES.get_entry(template_base).unwrap();
-
-    let project = Project {
-        project_name: String::from("bluekit-sample"),
-        group_name: String::from("org.renyan.bluekit.sample"),
-        package_name: String::from("org.renyan.bluekit.sample"),
-        arch_type: String::from("ddd"),
+    let arch_type = &project.arch_type;
+    let template_base = if arch_type.eq_ignore_ascii_case("ddd") {
+        "starter/ddd_init"
+    } else if arch_type.eq_ignore_ascii_case("mvc") {
+        "starter/mvc_init"
+    } else {
+        //default ddd
+        "starter/ddd_init"
     };
 
-    let current_dir = env::current_dir().unwrap();
+    //get template entry from TEMPLATES
+    let template_entry = util::TEMPLATES.get_entry(template_base).unwrap();
 
-    println!("current: {}", current_dir.display());
-
-    let output_root = current_dir.join("target");
-
-    process_entry(entry, 0, project, template_base.to_string(), output_root);
+    process_entry(
+        template_entry,
+        0,
+        project,
+        template_base.to_string(),
+        output_root,
+    );
 }
 
 pub(crate) fn add() {
@@ -193,6 +198,7 @@ pub(crate) fn workspace() {
     }
 }
 
+/// process template entry
 fn process_entry(
     entry: &include_dir::DirEntry,
     depth: usize,
@@ -202,6 +208,7 @@ fn process_entry(
 ) {
     let indent = "  ".repeat(depth);
     let base = template_base.clone();
+
     match entry {
         include_dir::DirEntry::Dir(dir) => {
             //template path
@@ -214,7 +221,7 @@ fn process_entry(
             let output_path = output_root.join(target_path.clone());
 
             println!(
-                "{}目录: tpl: {}, target: {} , exists: {}",
+                "{}D tpl: {}, target: {} , exists: {}",
                 indent,
                 dir.path().display(),
                 target_path,
@@ -245,7 +252,7 @@ fn process_entry(
             let output_path = output_root.join(target_path.clone());
 
             println!(
-                "{}文件: tpl: {}, target: {} , exists: {}",
+                "{}F tpl: {}, target: {} , exists: {}",
                 indent,
                 file.path().display(),
                 target_path,
@@ -259,9 +266,9 @@ fn process_entry(
                 //write target context to file
                 std::fs::write(output_path, target_content).expect("write target file is error");
 
-                println!("{}  内容: {}", indent, content.len());
+                println!("{}C  内容: {}", indent, content.len());
             } else {
-                println!("{}  字节数: {}", indent, file.contents().len());
+                println!("{}C  字节数: {}", indent, file.contents().len());
             }
         }
     }

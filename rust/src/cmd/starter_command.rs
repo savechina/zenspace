@@ -1,6 +1,9 @@
-use crate::service::starter_service;
+use std::env;
+
+use crate::{model::starter::Project, service::starter_service};
 
 use clap::{Args, Subcommand};
+use include_dir::Dir;
 use tracing::info;
 
 #[derive(Subcommand)]
@@ -13,6 +16,9 @@ pub(crate) enum StarterCommands {
         group: String,
         /// The package name
         package: String,
+        /// the arch type for template. it support: ddd, mvc .
+        #[arg(short = 't', long, env, default_value = "ddd")]
+        arch_type: String,
     },
 
     /// Add project feature
@@ -37,9 +43,27 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
             project,
             group,
             package,
+            arch_type,
         } => {
-            println!("{} + {} + {}", project, group, package);
-            starter_service::init();
+            println!(
+                "Project: {} + {} + {} + {} ",
+                project, group, package, arch_type
+            );
+
+            let project = Project {
+                project_name: project.clone(),
+                group_name: group.clone(),
+                package_name: package.clone(),
+                arch_type: arch_type.clone(),
+            };
+
+            //pwd current directory
+            let current_dir = env::current_dir().unwrap();
+
+            let output_root = current_dir.join("target");
+            println!("Output: {}", output_root.display());
+
+            starter_service::init(project, output_root);
         }
 
         StarterCommands::Add { package, table } => {
