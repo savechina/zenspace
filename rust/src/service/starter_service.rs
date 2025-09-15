@@ -57,8 +57,8 @@ pub(crate) fn init() {
 
     let project = Project {
         project_name: String::from("bluekit-sample"),
-        group_name: String::from("com.jd.bluekit.sample"),
-        package_name: String::from("com.jd.bluekit.sample"),
+        group_name: String::from("org.renyan.bluekit.sample"),
+        package_name: String::from("org.renyan.bluekit.sample"),
         arch_type: String::from("ddd"),
     };
 
