@@ -1,3 +1,4 @@
+use crate::model::starter::Project;
 use crate::util;
 use std::env::{self, home_dir};
 use std::fs::DirEntry;
@@ -37,7 +38,6 @@ pub(crate) fn init() {
     println!("ddd_path exists: {} ", ddd_path.exists());
 
     let ddd_dir = fs::read_dir(ddd_path).unwrap();
-    // let ddd_dir = ddd_path.read_dir().unwrap();
 
     for entry in ddd_dir {
         let entry: DirEntry = entry.unwrap();
@@ -51,10 +51,24 @@ pub(crate) fn init() {
         );
     }
 
-    let entry = util::TEMPLATES.get_entry("starter/ddd_init").unwrap();
-    // println!("entry : {:?}", entry);
+    let template_base = "starter/ddd_init";
 
-    process_entry(entry, 0);
+    let entry = util::TEMPLATES.get_entry(template_base).unwrap();
+
+    let project = Project {
+        project_name: String::from("bluekit-sample"),
+        group_name: String::from("com.jd.bluekit.sample"),
+        package_name: String::from("com.jd.bluekit.sample"),
+        arch_type: String::from("ddd"),
+    };
+
+    let current_dir = env::current_dir().unwrap();
+
+    println!("current: {}", current_dir.display());
+
+    let output_root = current_dir.join("target");
+
+    process_entry(entry, 0, project, template_base.to_string(), output_root);
 }
 
 pub(crate) fn add() {
@@ -179,39 +193,105 @@ pub(crate) fn workspace() {
     }
 }
 
-fn process_entry(entry: &include_dir::DirEntry, depth: usize) {
+fn process_entry(
+    entry: &include_dir::DirEntry,
+    depth: usize,
+    project: Project,
+    template_base: String,
+    output_root: PathBuf,
+) {
     let indent = "  ".repeat(depth);
+    let base = template_base.clone();
     match entry {
         include_dir::DirEntry::Dir(dir) => {
-            let path = dir.path().strip_prefix("starter/ddd_init").unwrap();
+            //template path
+            let tpl_path = dir.path().strip_prefix(base).unwrap();
 
-            let os_path = path.as_os_str();
+            //target path
+            let target_path = handle_target_path(tpl_path, &project);
 
-            let mut file_name = path.file_name();
+            //output full path
+            let output_path = output_root.join(target_path.clone());
 
-            if path.starts_with("__app__") {
-                let name = file_name
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace("__app__", "bluekit-sample");
+            println!(
+                "{}目录: tpl: {}, target: {} , exists: {}",
+                indent,
+                dir.path().display(),
+                target_path,
+                output_path.exists()
+            );
 
-                println!("new name: {}", name);
+            if !output_path.exists() {
+                fs::create_dir_all(output_path).expect("create target directory is error");
             }
-
-            println!("{}目录: {}, {:?}", indent, dir.path().display(), path);
 
             for subentry in dir.entries() {
-                process_entry(subentry, depth + 1);
+                process_entry(
+                    subentry,
+                    depth + 1,
+                    project.clone(),
+                    template_base.clone(),
+                    output_root.clone(),
+                );
             }
         }
+
         include_dir::DirEntry::File(file) => {
-            println!("{}文件: {}", indent, file.path().display());
+            let tpl_path = file.path().strip_prefix(base).unwrap();
+
+            let file_name = tpl_path.file_name();
+
+            let target_path = handle_target_path(tpl_path, &project);
+            let output_path = output_root.join(target_path.clone());
+
+            println!(
+                "{}文件: tpl: {}, target: {} , exists: {}",
+                indent,
+                file.path().display(),
+                target_path,
+                output_path.exists()
+            );
 
             if let Some(content) = file.contents_utf8() {
-                println!("{}  内容: {:?}", indent, content.len());
+                //parse template context ,and get target context
+                let target_content = handle_target_context(project, content);
+
+                //write target context to file
+                std::fs::write(output_path, target_content).expect("write target file is error");
+
+                println!("{}  内容: {}", indent, content.len());
             } else {
                 println!("{}  字节数: {}", indent, file.contents().len());
             }
         }
     }
+}
+
+fn handle_target_context(project: Project, content: &str) -> String {
+    let project_name = &project.project_name;
+    let package_name = &project.package_name;
+    let group_name = &project.group_name;
+
+    //handle template output target context
+    let target_content = content
+        .replace("__app__", project_name)
+        .replace("__package__", package_name)
+        .replace("__group__", group_name);
+    target_content
+}
+
+fn handle_target_path(source_path: &Path, project: &Project) -> String {
+    let project_name = project.project_name.clone();
+    let package_name = project.package_name.clone();
+    let group_name = project.group_name.clone();
+
+    let target_path = source_path
+        .to_string_lossy()
+        .replace("__app__", project_name.as_str())
+        .replace(
+            "__package__",
+            package_name.to_string().replace(".", "/").as_str(),
+        );
+
+    target_path
 }

@@ -6,6 +6,7 @@ mod cli;
 mod cmd;
 mod config;
 mod errors;
+mod model;
 mod service;
 mod util;
 
