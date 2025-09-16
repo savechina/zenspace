@@ -23,7 +23,7 @@ pub(crate) fn command_exists(command: &str) -> bool {
 
     let exists = match result {
         Ok(path) => {
-            println!("path:{:?}", path);
+            println!("path:{}", path.display());
             true
         }
         Err(_) => false,
