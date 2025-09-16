@@ -1,6 +1,7 @@
 use crate::errors::ServiceError;
 use crate::util;
 use chrono::Date;
+use chrono::DateTime;
 use chrono::Local;
 
 use std::fs;
@@ -102,5 +103,12 @@ pub(crate) fn archive(
         //zstd to compress file
         zstds(file, archive_file)?;
     }
+    Ok(())
+}
+
+pub(crate) fn unixtime(timestamp: Option<i64>, timeunit: String) -> Result<(), ServiceError> {
+    let now = Local::now();
+    println!("now: {}", now.to_rfc3339());
+    println!("local: {}", now);
     Ok(())
 }

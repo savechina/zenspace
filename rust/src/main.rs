@@ -1,4 +1,6 @@
 use std::error::Error;
+
+use cmd::starter_command::StarterCommands;
 #[macro_use]
 extern crate getset;
 
@@ -18,7 +20,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // std::process::exit(1);
     }
 
-    config::load().unwrap();
+    config::load().expect("failed to load config");
 
     cli::shell();
 
