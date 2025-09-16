@@ -22,20 +22,24 @@ pub(crate) fn zstds(from_dir: PathBuf, output_file: PathBuf) -> Result<(), Servi
         return Err(ServiceError::Io(Error::from(ErrorKind::NotFound)));
     }
 
-    let from_path = from_dir;
+    let from_path = from_dir.parent().expect("file parent path not found");
+    let from_file = from_dir.file_name().expect("file name not dound");
     let to_path = output_file;
 
     println!(
-        "tar --zstd -cf {} {}",
+        "tar --zstd -cf {} -C {} {}",
         to_path.display(),
-        from_path.display()
+        from_path.display(),
+        from_file.to_string_lossy()
     );
 
     let status = Command::new("tar")
         .arg("--zstd")
         .arg("-cf")
         .arg(to_path)
+        .arg("-C")
         .arg(from_path)
+        .arg(from_file)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
