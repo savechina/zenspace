@@ -3,6 +3,8 @@ use crate::util;
 use chrono::Date;
 use chrono::DateTime;
 use chrono::Local;
+use chrono::Timelike;
+use chrono::Utc;
 
 use std::fs;
 use std::fs::File;
@@ -110,5 +112,13 @@ pub(crate) fn unixtime(timestamp: Option<i64>, timeunit: String) -> Result<(), S
     let now = Local::now();
     println!("now: {}", now.to_rfc3339());
     println!("local: {}", now);
+    println!("timestamp: {}", now.timestamp());
+    println!("timestamp millis: {}", now.timestamp_millis());
+    println!("timestamp micros: {}", now.timestamp_micros());
+    println!("timestamp nanos: {}", now.timestamp_nanos());
+
+    let now = now.to_utc();
+    println!("UTC: {}", now.to_rfc3339());
+    println!("UTC: {}", now);
     Ok(())
 }
