@@ -1,7 +1,6 @@
-use tracing_subscriber::fmt::writer::OrElse;
-
-use crate::model::starter_model::Project;
+use crate::model::starter_model::{JavaTypeMapping, JavaTypes, Project};
 use crate::util;
+use heck::{self, ToUpperCamelCase};
 use std::env::{self, home_dir};
 use std::fs::DirEntry;
 use std::fs::{self, FileType};
@@ -78,6 +77,10 @@ pub(crate) fn init(project: Project, output_root: PathBuf) {
 
 pub(crate) fn add() {
     println!("{} ", "Develop initialize:");
+
+    let char = JavaTypes::Char.info();
+
+    char.db_type.to_upper_camel_case();
 }
 
 pub(crate) fn develop_tool() {

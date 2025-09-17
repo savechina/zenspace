@@ -1839,6 +1839,7 @@ dependencies = [
  "config",
  "dotenvy",
  "getset",
+ "heck",
  "home",
  "include_dir",
  "rand 0.9.2",
