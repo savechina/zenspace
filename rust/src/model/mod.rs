@@ -1,1 +1,1 @@
-pub(crate) mod starter;
+pub(crate) mod starter_model;

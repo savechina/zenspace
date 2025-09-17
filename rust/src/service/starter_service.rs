@@ -1,6 +1,6 @@
 use tracing_subscriber::fmt::writer::OrElse;
 
-use crate::model::starter::Project;
+use crate::model::starter_model::Project;
 use crate::util;
 use std::env::{self, home_dir};
 use std::fs::DirEntry;
