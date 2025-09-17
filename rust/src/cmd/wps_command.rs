@@ -46,7 +46,7 @@ pub(crate) fn excute_command(operation: &WpsCommands) {
             timestamp,
             timeunit,
         } => {
-            println!("{} - {}", timestamp.clone().unwrap_or(-1), timeunit);
+            // println!("{} - {}", timestamp.clone().unwrap_or(-1), timeunit);
 
             wps_service::unixtime(timestamp.clone(), timeunit.clone()).unwrap();
         } // StarterCommands::Mul(Mul { a, b }) => {

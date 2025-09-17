@@ -3,6 +3,7 @@ use crate::util;
 use chrono::Date;
 use chrono::DateTime;
 use chrono::Local;
+use chrono::TimeZone;
 use chrono::Timelike;
 use chrono::Utc;
 
@@ -109,7 +110,26 @@ pub(crate) fn archive(
 }
 
 pub(crate) fn unixtime(timestamp: Option<i64>, timeunit: String) -> Result<(), ServiceError> {
-    let now = Local::now();
+    //parse datatime from timestamp and timeunit
+    let now = if let Some(t) = timestamp {
+        match timeunit.to_ascii_lowercase().as_str() {
+            //second
+            "s" => Local.timestamp_opt(t, 0).unwrap(),
+            //millis second
+            "ms" => Local.timestamp_millis_opt(t).unwrap(),
+            //micros second
+            "us" => Local.timestamp_micros(t).unwrap(),
+            //nanos second
+            "ns" => Local.timestamp_nanos(t),
+            //second default
+            _ => Local.timestamp_opt(t, 0).unwrap(), // default case
+        }
+    } else {
+        //default now datetime
+        Local::now()
+    };
+
+    // let now = Local::now();
     println!("now: {}", now.to_rfc3339());
     println!("local: {}", now);
     println!("timestamp: {}", now.timestamp());
