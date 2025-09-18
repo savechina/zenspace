@@ -8,6 +8,7 @@ mod cli;
 mod cmd;
 mod config;
 mod errors;
+mod infra;
 mod model;
 mod service;
 mod util;
