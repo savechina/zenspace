@@ -40,22 +40,29 @@ pub(crate) enum StarterCommands {
 pub(crate) fn excute_command(operation: &StarterCommands) {
     match operation {
         StarterCommands::Init {
-            project,
-            group,
-            package,
+            project: project_name,
+            group: group_name,
+            package: package_name,
             arch_type,
         } => {
             println!(
                 "Project: {} + {} + {} + {} ",
-                project, group, package, arch_type
+                project_name, group_name, package_name, arch_type
             );
 
             let project = Project {
-                project_name: project.clone(),
-                group_name: group.clone(),
-                package_name: package.clone(),
+                project_name: project_name.clone(),
+                group_name: group_name.clone(),
+                package_name: package_name.clone(),
                 arch_type: arch_type.clone(),
             };
+
+            // let project = Project::builder()
+            //     .project_name(project.clone())
+            //     .group_name(group.clone())
+            //     .package_name(package.clone())
+            //     .arch_type(arch_type.clone())
+            //     .build();
 
             //pwd current directory
             let current_dir = env::current_dir().unwrap();

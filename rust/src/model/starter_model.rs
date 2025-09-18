@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumCount, EnumIter, EnumString};
+use typed_builder::TypedBuilder;
 
-#[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize, TypedBuilder)]
 pub(crate) struct Project {
     ///Project Name
     pub(crate) project_name: String,
@@ -14,7 +15,7 @@ pub(crate) struct Project {
 }
 
 /// Represents a field in a Java object and its corresponding database column mapping.
-#[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize, TypedBuilder)]
 pub struct JavaField {
     /// The name of the field in the Java class.
     pub field_name: String,
@@ -39,7 +40,7 @@ pub struct JavaField {
 }
 
 /// Represents a Java class and its database table mapping.
-#[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize, TypedBuilder)]
 pub struct JavaClass {
     /// The package name of the Java class (e.g., "com.example.model").
     pub package_name: String,
@@ -60,7 +61,7 @@ pub struct JavaClass {
     pub feature_name: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, TypedBuilder)]
 pub struct JavaModule {
     // Constants
     // pub const SOURCES_ROOT: &'static str = "src/main/java";

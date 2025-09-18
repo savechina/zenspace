@@ -1,3 +1,4 @@
+use crate::infra::starter_repository;
 use crate::model::starter_model::{JavaTypeMapping, JavaTypes, Project};
 use crate::util;
 use heck::{self, ToUpperCamelCase};
@@ -77,7 +78,8 @@ pub(crate) fn init(project: Project, output_root: PathBuf) {
     );
 }
 
-pub(crate) fn add() {
+#[tokio::main]
+pub(crate) async fn add() {
     println!("{} ", "Develop initialize:");
 
     let char = JavaTypes::Char.info();
@@ -92,6 +94,13 @@ pub(crate) fn add() {
     for t in JavaTypes::iter() {
         println!("JavaTypes: {:?}", t.info());
     }
+
+    println!("fetch field ...");
+    let table_name = "qms_monitor_data";
+
+    starter_repository::fetch_field(table_name.to_ascii_uppercase())
+        .await
+        .unwrap();
 }
 
 pub(crate) fn develop_tool() {
