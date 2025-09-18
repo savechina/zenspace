@@ -6,6 +6,8 @@ use std::fs::DirEntry;
 use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
+use strum::IntoEnumIterator;
 
 pub(crate) fn init(project: Project, output_root: PathBuf) {
     println!("{} ", "Develop initialize:");
@@ -80,7 +82,16 @@ pub(crate) fn add() {
 
     let char = JavaTypes::Char.info();
 
-    char.db_type.to_upper_camel_case();
+    let column_type = char.db_type.to_upper_camel_case();
+    println!("Char column_type:{}", column_type);
+
+    // "Char".make_ascii_uppercase();
+    let c = JavaTypes::from_str("Char").unwrap();
+    println!("JavaTypes: {:?}", c.info());
+
+    for t in JavaTypes::iter() {
+        println!("JavaTypes: {:?}", t.info());
+    }
 }
 
 pub(crate) fn develop_tool() {

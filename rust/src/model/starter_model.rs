@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use strum::{Display, EnumCount, EnumIter, EnumString};
 
 #[derive(Debug, Clone, Default, Getters, Setters, Serialize, Deserialize)]
 pub(crate) struct Project {
@@ -94,7 +95,7 @@ pub struct JavaTypeMapping {
 
 // The enum representing the different Java types.
 // We derive `Debug` to allow easy printing of the enum variants.
-#[derive(Debug)]
+#[derive(Debug, EnumString, EnumIter, EnumCount, Display)]
 pub enum JavaTypes {
     Varchar,
     Char,
