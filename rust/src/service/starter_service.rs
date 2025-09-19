@@ -1,7 +1,7 @@
 use crate::infra::starter_repository;
 use crate::model::starter_model::{JavaTypeMapping, JavaTypes, Project};
 use crate::util;
-use heck::{self, ToUpperCamelCase};
+use heck::{self, ToLowerCamelCase, ToPascalCase, ToSnekCase, ToTitleCase, ToUpperCamelCase};
 use std::env::{self, home_dir};
 use std::fs::DirEntry;
 use std::fs::{self, FileType};
@@ -87,8 +87,14 @@ pub(crate) async fn add() {
     let column_type = char.db_type.to_upper_camel_case();
     println!("Char column_type:{}", column_type);
 
-    // "Char".make_ascii_uppercase();
-    let c = JavaTypes::from_str("Char").unwrap();
+    let a = "CharWorld";
+
+    println!("heck to_snek_case: {}", a.to_snek_case());
+    println!("heck to_lower_camel_case: {}", a.to_lower_camel_case());
+    println!("heck to_upper_camel_case: {}", a.to_upper_camel_case());
+    println!("heck to_pascal_case: {}", a.to_pascal_case());
+
+    let c = JavaTypes::from_str("chAr").unwrap();
     println!("JavaTypes: {:?}", c.info());
 
     for t in JavaTypes::iter() {
@@ -98,11 +104,7 @@ pub(crate) async fn add() {
     println!("fetch field ...");
     let table_name = "qms_monitor_data";
 
-    starter_repository::fetch_clazz(table_name.to_ascii_uppercase()).await;
-
-    starter_repository::fetch_field(table_name.to_ascii_uppercase())
-        .await
-        .unwrap();
+    starter_repository::fetch_clazz(Some(table_name.to_ascii_uppercase())).await;
 }
 
 pub(crate) fn develop_tool() {

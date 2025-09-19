@@ -97,6 +97,7 @@ pub struct JavaTypeMapping {
 // The enum representing the different Java types.
 // We derive `Debug` to allow easy printing of the enum variants.
 #[derive(Debug, EnumString, EnumIter, EnumCount, Display)]
+#[strum(ascii_case_insensitive)]
 pub enum JavaTypes {
     Varchar,
     Char,
