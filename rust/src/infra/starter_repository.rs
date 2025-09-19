@@ -11,17 +11,15 @@ use sqlx::{Any, ColumnIndex, Pool};
 use sqlx::{Connection, pool};
 use sqlx::{Database, MySql};
 
-pub(crate) fn fetch_clazz(table_name: String) -> JavaClass {
-    JavaClass::default()
-}
+pub(crate) async fn fetch_clazz(table_name: String) -> JavaClass {
+    let schema_name = "airp";
+    let table_name = "hms_monitor_data";
 
-pub(crate) async fn fetch_field(table_name: String) -> Result<JavaClass, ServiceError> {
     let url = env::var("database.url").expect("can't found database url");
 
     // 创建一个数据库连接
     let pool = MySqlPool::connect(url.as_str()).await.unwrap();
-    let schema_name = "airp";
-    let table_name = "hms_monitor_data";
+
     let sql = r#"
         SELECT
           TABLE_NAME,TABLE_COMMENT
@@ -30,6 +28,37 @@ pub(crate) async fn fetch_field(table_name: String) -> Result<JavaClass, Service
             TABLE_SCHEMA = ? AND TABLE_NAME = ?
         "#;
 
+    // 查询数据
+    let rows = sqlx::query(sql)
+        .bind(schema_name)
+        .bind(table_name)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+    // println!("db: rows {:?}", rows);
+
+    for row in rows {
+        let column_name: String = row.get("TABLE_NAME");
+        let column_comment: String = row.get("TABLE_COMMENT");
+        println!(
+            "TABLE_NAME: {},  TABLE_COMMENT: {}",
+            column_name, column_comment
+        );
+    }
+
+    JavaClass::default()
+}
+
+pub(crate) async fn fetch_field(table_name: String) -> Result<JavaClass, ServiceError> {
+    let schema_name = "airp";
+    let table_name = "hms_monitor_data";
+
+    let url = env::var("database.url").expect("can't found database url");
+    println!("database:{}", url);
+
+    // 创建一个数据库连接
+    let pool = MySqlPool::connect(url.as_str()).await.unwrap();
     let sql = r#"
         SELECT
             COLUMN_NAME,

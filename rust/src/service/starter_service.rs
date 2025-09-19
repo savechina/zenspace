@@ -98,6 +98,8 @@ pub(crate) async fn add() {
     println!("fetch field ...");
     let table_name = "qms_monitor_data";
 
+    starter_repository::fetch_clazz(table_name.to_ascii_uppercase()).await;
+
     starter_repository::fetch_field(table_name.to_ascii_uppercase())
         .await
         .unwrap();
