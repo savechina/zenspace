@@ -27,6 +27,8 @@ pub(crate) fn load() -> Result<Config, ZenError> {
     // Load the environment variables from a .env file
     dotenvy::dotenv().ok();
 
+    dotenvy::from_filename(".zen").ok();
+
     //Get a config file "config.toml"
     let config_file = CONFIGS.get_file("config.toml").unwrap();
 

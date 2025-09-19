@@ -79,7 +79,7 @@ pub(crate) fn init(project: Project, output_root: PathBuf) {
 }
 
 #[tokio::main]
-pub(crate) async fn add() {
+pub(crate) async fn add(feature_name: String, table_name: String, project: Project) {
     println!("{} ", "Develop initialize:");
 
     let char = JavaTypes::Char.info();
@@ -102,7 +102,7 @@ pub(crate) async fn add() {
     }
 
     println!("fetch field ...");
-    let table_name = "qms_monitor_data";
+    // let table_name = "qms_monitor_data";
 
     starter_repository::fetch_clazz(Some(table_name.to_ascii_uppercase())).await;
 }

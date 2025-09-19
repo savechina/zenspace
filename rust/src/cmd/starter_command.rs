@@ -23,10 +23,22 @@ pub(crate) enum StarterCommands {
 
     /// Add project feature
     Add {
-        /// The package name
-        package: String,
+        ///The feature Name
+        feature_name: String,
         /// The table name
-        table: String,
+        table_name: String,
+        /// The project name
+        #[arg(short = 'n', long, env)]
+        project_name: String,
+        /// The group name
+        #[arg(short, long, env)]
+        group_name: String,
+        /// The package name
+        #[arg(short, long, env)]
+        package_name: String,
+        /// the arch type for template. it support: ddd, mvc .
+        #[arg(short = 't', long, env, default_value = "ddd")]
+        arch_type: String,
     },
 
     ///Initialize develop ENV to install develop tools.
@@ -75,9 +87,24 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
             println!("Init project done");
         }
 
-        StarterCommands::Add { package, table } => {
-            println!("Package: {} \t Table: {} ", package, table);
-            starter_service::add();
+        StarterCommands::Add {
+            feature_name,
+            table_name,
+            project_name,
+            group_name,
+            package_name,
+            arch_type,
+        } => {
+            println!("Package: {} \t Table: {} ", feature_name, table_name);
+
+            let project = Project::builder()
+                .project_name(project_name.clone())
+                .group_name(group_name.clone())
+                .package_name(package_name.clone())
+                .arch_type(arch_type.clone())
+                .build();
+
+            starter_service::add(feature_name.clone(), table_name.clone(), project);
         }
 
         StarterCommands::Develop => {
