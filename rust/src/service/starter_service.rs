@@ -1,5 +1,5 @@
 use crate::infra::starter_repository;
-use crate::model::starter_model::{JavaTypeMapping, JavaTypes, Project};
+use crate::model::starter_model::{JavaModule, JavaTypeMapping, JavaTypes, Project};
 use crate::util;
 use heck::{self, ToLowerCamelCase, ToPascalCase, ToSnekCase, ToTitleCase, ToUpperCamelCase};
 use std::env::{self, home_dir};
@@ -102,9 +102,56 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
     }
 
     println!("fetch field ...");
-    // let table_name = "qms_monitor_data";
+    // let table_name = "hms_monitor_data";
 
-    starter_repository::fetch_clazz(Some(table_name.to_ascii_uppercase())).await;
+    let mut clazz_list =
+        starter_repository::fetch_clazz(Some(table_name.to_ascii_uppercase())).await;
+
+    let clazz_model = clazz_list.first_mut().unwrap();
+
+    clazz_model.feature_name = feature_name;
+    clazz_model.package_name = project.package_name.clone();
+
+    let arch_type = &project.arch_type;
+
+    //template base
+    let template_base = if arch_type.eq_ignore_ascii_case("ddd") {
+        "starter/ddd_spec"
+    } else if arch_type.eq_ignore_ascii_case("mvc") {
+        "starter/mvc_spec"
+    } else {
+        //default ddd
+        "starter/ddd_spec"
+    };
+
+    //get template entry from TEMPLATES
+    let template_entry = util::TEMPLATES.get_entry(template_base).unwrap();
+
+    match template_entry {
+        include_dir::DirEntry::Dir(dir) => {
+            dir.dirs().for_each(|f| {
+                println!("Recursive File path: {:?}", f.path());
+            });
+
+            dir.files().for_each(|f| {
+                println!("Recursive File path: {:?}", f.path());
+            });
+        }
+        include_dir::DirEntry::File(file) => {
+            println!("Recursive File path: {:?}", file.path());
+        }
+    }
+
+    dbg!(clazz_model.clone());
+
+    let entity_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("Entity".to_string()))
+        .build();
+
+    dbg!(entity_module);
 }
 
 pub(crate) fn develop_tool() {

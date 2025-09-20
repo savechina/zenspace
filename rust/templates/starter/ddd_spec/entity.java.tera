@@ -1,0 +1,35 @@
+{%- set package_name = modules.entity.full_package ~ "." ~ model.package_name -%}
+{%- set table_entity = model.feature_name | capitalize | replace(from="_", to="") ~ model.class_name ~ "Entity" -%}
+package {{ package_name }};
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.util.Date;
+/**
+* {{ model.class_name }}
+* {{ model.class_comment }}
+*/
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class {{ table_entity }} implements java.io.Serializable{
+
+    {% for field in model.fields %}
+    /**
+    * {{ field.field_name }}
+    * {{ field.field_comment }}
+    */
+    private {{ field.java_type }} {{ field.field_name }};
+    {% endfor %}
+
+    {% for field in model.fields %}
+    public void set{{ field.field_name | capitalize }}({{ field.java_type }} {{ field.field_name }}) {
+        this.{{ field.field_name }} = {{ field.field_name }};
+    }
+    public {{ field.java_type }} get{{ field.field_name | capitalize }}() {
+        return this.{{ field.field_name }};
+    }
+    {% endfor %}
+
+}

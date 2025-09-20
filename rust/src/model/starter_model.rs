@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumCount, EnumIter, EnumString};
 use typed_builder::TypedBuilder;
@@ -63,24 +65,81 @@ pub struct JavaClass {
 
 #[derive(Debug, Clone, TypedBuilder)]
 pub struct JavaModule {
-    // Constants
-    // pub const SOURCES_ROOT: &'static str = "src/main/java";
-    // pub const RESOURCES_ROOT: &'static str = "src/main/resources";
-    // pub const SOURCE_TYPE: &'static str = "java";
-    // pub const RESOURCE_TYPE: &'static str = "resource";
-
-    // Fields (corresponding to Ruby attr_accessor)
-    pub project: Option<Project>, // Using Option to handle uninitialized state
+    // Fields
+    pub project: Option<Project>,
     pub module_name: Option<String>,
+    #[builder(default)]
     pub module_package: Option<String>,
+    #[builder(default)]
     pub module_path: Option<String>,
+    #[builder(default)]
     pub module_template: Option<String>,
+    #[builder(default)]
     pub module_type: Option<String>,
+    #[builder(default)]
     pub module_suffix: Option<String>,
+    #[builder(default)]
     pub module_prefix: Option<String>,
+    #[builder(default)]
     pub module_output: Option<String>,
+    #[builder(default)]
     pub module_model: Option<JavaClass>,
-    full_path: Option<String>, // Internal field to cache full_path
+    // Internal field to cache full_path
+    #[builder(default)]
+    full_path: Option<String>,
+}
+
+impl JavaModule {
+    // Constants
+    pub(crate) const SOURCES_ROOT: &'static str = "src/main/java";
+    pub(crate) const RESOURCES_ROOT: &'static str = "src/main/resources";
+    pub(crate) const SOURCE_TYPE: &'static str = "java";
+    pub(crate) const RESOURCE_TYPE: &'static str = "resource";
+
+    pub fn full_package(&self) -> Option<String> {
+        match &self.module_type {
+            Some(module_type) if module_type == Self::SOURCE_TYPE => {
+                if let (Some(project), Some(module_package)) = (&self.project, &self.module_package)
+                {
+                    Some(format!("{}.{}", project.package_name, module_package))
+                } else {
+                    None
+                }
+            }
+            Some(module_type) if module_type == Self::RESOURCE_TYPE => self.module_package.clone(),
+            _ => None,
+        }
+    }
+
+    pub fn root_path(&mut self) -> Option<String> {
+        match &self.module_type {
+            Some(module_type) if module_type == Self::SOURCE_TYPE => {
+                if let Some(module_path) = &self.module_path {
+                    let path = Path::new(module_path)
+                        .join(Self::SOURCES_ROOT)
+                        .to_string_lossy()
+                        .into_owned();
+                    self.full_path = Some(path.clone());
+                    Some(path)
+                } else {
+                    None
+                }
+            }
+            Some(module_type) if module_type == Self::RESOURCE_TYPE => {
+                if let Some(module_path) = &self.module_path {
+                    let path = Path::new(module_path)
+                        .join(Self::RESOURCES_ROOT)
+                        .to_string_lossy()
+                        .into_owned();
+                    self.full_path = Some(path.clone());
+                    Some(path)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 /// JavaTypeMapping struct to hold the associated data for each Java type.
