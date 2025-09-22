@@ -1,5 +1,8 @@
 package __package__.domain.service.sku.impl;
 
+import __package__.domain.convert.sku.SkuExampleEntityConvert;
+import __package__.domain.entity.sku.SkuExampleEntity;
+import __package__.domain.mapper.sku.SkuExampleMapper;
 import __package__.domain.model.sku.SkuDO;
 import __package__.domain.repository.sku.SkuExampleRepository;
 import __package__.domain.service.sku.SkuService;
@@ -20,11 +23,11 @@ import java.util.List;
 @Service
 public class SkuServiceImpl implements SkuService {
 
-    /**
-     * Sku Example Repository
-     */
+
     @Autowired
-    private SkuExampleRepository skuExampleRepository;
+    private SkuExampleEntityConvert skuExampleEntityConvert;
+    @Autowired
+    private SkuExampleMapper skuExampleMapper;
 
     /**
      * Sku Example Rpc
@@ -33,7 +36,10 @@ public class SkuServiceImpl implements SkuService {
     private SkuExampleRpc skuExampleRpc;
 
     public SkuDO getSku(Long skuId) {
-        SkuDO sku = skuExampleRepository.getSku(skuId);
+
+        SkuExampleEntity entity = new SkuExampleEntity();
+        // convert to model
+        var sku =skuExampleEntityConvert.convert(entity);
 
         List<SkuExampleDTO> skuExampleDTOS = skuExampleRpc.fetchSkuList(List.of(String.valueOf(skuId)));
 

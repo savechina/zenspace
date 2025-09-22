@@ -1,8 +1,8 @@
-package __package__.infrastructure.convert.sku;
+package __package__.domain.convert.sku;
 
 import __package__.common.convert.EntityConverter;
 import __package__.domain.model.sku.SkuDO;
-import __package__.infrastructure.entity.sku.SkuExampleEntity;
+import __package__.domain.entity.sku.SkuExampleEntity;
 import org.mapstruct.Mapper;
 
 /**

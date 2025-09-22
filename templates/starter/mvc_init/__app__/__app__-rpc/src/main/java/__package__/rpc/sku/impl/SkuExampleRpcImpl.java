@@ -1,4 +1,4 @@
-package __package__.infrastructure.rpc.sku;
+package __package__.rpc.sku.impl;
 
 import __package__.rpc.sku.SkuExampleRpc;
 import __package__.rpc.sku.dto.SkuExampleDTO;

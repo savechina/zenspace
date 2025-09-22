@@ -1,4 +1,4 @@
-package __package__.infrastructure.config.datasource;
+package __package__.domain.config.datasource;
 
 import com.zaxxer.hikari.HikariDataSource;
 import org.apache.ibatis.session.SqlSessionFactory;
@@ -15,7 +15,7 @@ import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
  * @Description
  */
 @Configuration
-@MapperScan(basePackages = "__package__.infrastructure.mapper.**", sqlSessionFactoryRef = "sqlSessionFactory")
+@MapperScan(basePackages = "__package__.domain.mapper.**", sqlSessionFactoryRef = "sqlSessionFactory")
 public class DataSource {
 
     @Bean

@@ -25,7 +25,6 @@
         <module>__app__-common</module>
         <module>__app__-api</module>
         <module>__app__-application</module>
-        <module>__app__-infrastructure</module>
         <module>__app__-domain</module>
         <module>__app__-rpc</module>
         <module>__app__-bootstrap</module>

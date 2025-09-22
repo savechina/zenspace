@@ -1,4 +1,4 @@
-package __package__.infrastructure.mapper.sku;
+package __package__.domain.mapper.sku;
 
 import org.apache.ibatis.annotations.Mapper;
 

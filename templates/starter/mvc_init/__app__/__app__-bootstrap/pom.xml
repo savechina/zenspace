@@ -31,7 +31,7 @@
 
         <dependency>
             <groupId>__group__</groupId>
-            <artifactId>__app__-infrastructure</artifactId>
+            <artifactId>__app__-domain</artifactId>
             <version>0.1-SNAPSHOT</version>
         </dependency>
 

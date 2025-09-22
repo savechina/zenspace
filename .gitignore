@@ -16,7 +16,7 @@ log/
 templates/java
 templates/__app__
 #templates/starter/ddd_init
-templates/starter/mvc_init/__app__
+#templates/starter/mvc_init/__app__
 test.db
 
 .env

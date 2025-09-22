@@ -1,4 +1,4 @@
-package __package__.infrastructure.entity.sku;
+package __package__.domain.entity.sku;
 
 /**
  * SkuExampleEntity
