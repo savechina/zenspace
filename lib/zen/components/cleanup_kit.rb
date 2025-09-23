@@ -29,6 +29,9 @@ module Zen
         puts File.join("~/.Trash/*")
         puts File.join("/Volumes/*/.Trashes/*")
 
+        # cleanup Trash
+        system("osascript", "-e", 'tell application "Finder" to empty trash')
+
         FileUtils.rm_rf(File.join("~/.Trash/*"))
         FileUtils.rm_rf(File.join("/Volumes/*/.Trashes/*"))
         FileUtils.rm_rf(File.join("/Library/Logs/DiagnosticReports/*"))
