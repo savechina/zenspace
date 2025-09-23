@@ -1,7 +1,9 @@
+use crate::errors::ServiceError;
 use crate::infra::starter_repository;
 use crate::model::starter_model::{JavaModule, JavaTypeMapping, JavaTypes, Project};
 use crate::util;
 use heck::{self, ToLowerCamelCase, ToPascalCase, ToSnekCase, ToTitleCase, ToUpperCamelCase};
+use std::collections::HashMap;
 use std::env::{self, home_dir};
 use std::fs::DirEntry;
 use std::fs::{self, FileType};
@@ -9,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
+use tera::{Context, Tera, Value};
 
 pub(crate) fn init(project: Project, output_root: PathBuf) {
     println!("{} ", "Develop initialize:");
@@ -115,8 +118,8 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
 
     let clazz_model = clazz_list.first_mut().unwrap();
 
-    clazz_model.feature_name = feature_name;
-    clazz_model.package_name = project.package_name.clone();
+    clazz_model.feature_name = feature_name.clone();
+    clazz_model.package_name = feature_name.clone();
 
     let arch_type = &project.arch_type;
 
@@ -150,7 +153,7 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
 
     dbg!(clazz_model.clone());
 
-    let entity_module = JavaModule::builder()
+    let mut entity_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -164,17 +167,61 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
 
     let output_path = PathBuf::new()
         .join(output_root)
-        .join(entity_module.clone().full_path().unwrap())
-        .join(clazz_model.package_name.clone())
-        .join(format!(
-            "{}{}{}",
-            clazz_model.feature_name.to_pascal_case(),
-            clazz_model.class_name,
-            entity_module.clone().module_output.unwrap()
-        ));
+        .join(entity_module.clone().output_path().unwrap());
 
-    dbg!(entity_module);
+    dbg!(entity_module.clone());
+
     println!("entity_module: {}", output_path.display());
+
+    let template_entry = util::TEMPLATES
+        .get_file(format!("{}/{}", template_base, "entity.java.tera"))
+        .unwrap();
+
+    let template_context = template_entry.contents_utf8().unwrap();
+    // 1. 创建 Tera 实例并加载模板
+    let mut tera = Tera::default();
+
+    // tera.add_raw_template("entity.java.tera");
+
+    tera.register_filter("to_pascal_case", to_pascal_case_filter);
+
+    let mut modules = HashMap::new();
+
+    modules.insert("entity", &entity_module);
+
+    // 2. 创建 Context 对象并插入数据
+    let mut context = Context::new();
+    context.insert("greeting", &"Hello");
+    context.insert("modules", &modules);
+    context.insert("project", &project);
+    context.insert("model", &clazz_model);
+
+    context.insert("items", &vec!["apple", "banana", "orange"]);
+
+    let result = tera.render_str(template_context, &context);
+
+    println!("temtlate output:\n{}", result.unwrap())
+}
+
+// 1. 定义过滤器函数
+fn to_pascal_case_filter(value: &Value, _: &HashMap<String, Value>) -> Result<Value, tera::Error> {
+    if let Some(s) = value.as_str() {
+        let pascal_case = s
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                }
+            })
+            .collect::<String>();
+        Ok(tera::to_value(pascal_case).unwrap())
+    } else {
+        Err(tera::Error::msg(
+            "`to_pascal_case` 过滤器只能用于字符串".to_string(),
+        ))
+    }
 }
 
 pub(crate) fn develop_tool() {

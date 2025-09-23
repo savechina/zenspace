@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use heck::ToPascalCase;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumCount, EnumIter, EnumString};
 use typed_builder::TypedBuilder;
@@ -63,7 +64,7 @@ pub struct JavaClass {
     pub feature_name: String,
 }
 
-#[derive(Debug, Clone, TypedBuilder)]
+#[derive(Debug, Clone, Getters, Setters, Serialize, Deserialize, TypedBuilder)]
 pub struct JavaModule {
     // Fields
     pub project: Option<Project>,
@@ -154,6 +155,21 @@ impl JavaModule {
         self.full_package()
             .map(|p| p.replace(".", "/"))
             .and_then(|p| self.root_path().map(|root| root.join(p)))
+    }
+    pub fn output_path(&mut self) -> Option<PathBuf> {
+        let clazz_model = self.module_model.clone().unwrap();
+
+        let output_path = PathBuf::new()
+            .join(self.full_path().unwrap())
+            .join(clazz_model.package_name.clone())
+            .join(format!(
+                "{}{}{}",
+                clazz_model.feature_name.to_pascal_case(),
+                clazz_model.class_name,
+                self.module_output.clone().unwrap()
+            ));
+
+        Some(output_path)
     }
 }
 

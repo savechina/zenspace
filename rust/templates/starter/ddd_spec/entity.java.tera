@@ -1,5 +1,5 @@
-{%- set package_name = modules.entity.full_package ~ "." ~ model.package_name -%}
-{%- set table_entity = model.feature_name | capitalize | replace(from="_", to="") ~ model.class_name ~ "Entity" -%}
+{%- set package_name = modules.entity.module_package ~ "." ~ model.package_name -%}
+{%- set table_entity = model.feature_name ~ model.class_name ~ "Entity" | to_pascal_case -%}
 package {{ package_name }};
 import lombok.AllArgsConstructor;
 import lombok.Data;

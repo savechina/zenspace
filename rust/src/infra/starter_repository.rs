@@ -4,7 +4,7 @@ use std::{env, vec};
 
 use crate::model::starter_model::{JavaField, JavaTypes};
 use crate::{errors::ServiceError, model::starter_model::JavaClass};
-use heck::ToLowerCamelCase;
+use heck::{ToLowerCamelCase, ToPascalCase};
 use sqlx::MySqlPool;
 use sqlx::Row;
 
@@ -57,7 +57,8 @@ pub(crate) async fn fetch_clazz(table_name: Option<String>) -> Vec<JavaClass> {
         );
 
         let mut clazz = JavaClass::default();
-        clazz.table_name = table_name;
+        clazz.table_name = table_name.clone();
+        clazz.class_name = table_name.to_pascal_case();
         clazz.class_comment = table_comment;
         clazz.fields = field_list;
 
