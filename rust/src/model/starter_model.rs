@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumCount, EnumIter, EnumString};
@@ -111,27 +111,19 @@ impl JavaModule {
         }
     }
 
-    pub fn root_path(&mut self) -> Option<String> {
+    pub fn root_path(&mut self) -> Option<PathBuf> {
         match &self.module_type {
-            Some(module_type) if module_type == Self::SOURCE_TYPE => {
-                if let Some(module_path) = &self.module_path {
-                    let path = Path::new(module_path)
-                        .join(Self::SOURCES_ROOT)
-                        .to_string_lossy()
-                        .into_owned();
-                    self.full_path = Some(path.clone());
-                    Some(path)
+            Some(module_type) => {
+                let root = if module_type == Self::SOURCE_TYPE {
+                    Self::SOURCE_TYPE
+                } else if module_type == Self::RESOURCE_TYPE {
+                    Self::RESOURCE_TYPE
                 } else {
-                    None
-                }
-            }
-            Some(module_type) if module_type == Self::RESOURCE_TYPE => {
+                    return None;
+                };
+
                 if let Some(module_path) = &self.module_path {
-                    let path = Path::new(module_path)
-                        .join(Self::RESOURCES_ROOT)
-                        .to_string_lossy()
-                        .into_owned();
-                    self.full_path = Some(path.clone());
+                    let path = Path::new(module_path).join(root);
                     Some(path)
                 } else {
                     None
@@ -139,6 +131,29 @@ impl JavaModule {
             }
             _ => None,
         }
+    }
+
+    pub fn full_path(&mut self) -> Option<PathBuf> {
+        // let full_path = match self.full_package() {
+        //     Some(package) => Some(package.replace(".", "/")),
+        //     _ => None,
+        // };
+
+        // match full_path {
+        //     Some(p) => {
+        //         if let Some(root) = self.root_path() {
+        //             let path = root.join(p);
+        //             Some(path)
+        //         } else {
+        //             None
+        //         }
+        //     }
+        //     None => return None,
+        // }
+
+        self.full_package()
+            .map(|p| p.replace(".", "/"))
+            .and_then(|p| self.root_path().map(|root| root.join(p)))
     }
 }
 

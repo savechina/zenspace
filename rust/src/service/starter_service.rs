@@ -82,6 +82,12 @@ pub(crate) fn init(project: Project, output_root: PathBuf) {
 pub(crate) async fn add(feature_name: String, table_name: String, project: Project) {
     println!("{} ", "Develop initialize:");
 
+    //pwd current directory
+    let current_dir = env::current_dir().unwrap();
+
+    let output_root = current_dir.join("target");
+    println!("Output: {}", output_root.display());
+
     let char = JavaTypes::Char.info();
 
     let column_type = char.db_type.to_upper_camel_case();
@@ -148,10 +154,27 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
-        .module_name(Some("Entity".to_string()))
+        .module_name(Some("ENTITY".to_string()))
+        .module_template(Some("entity.java.tera".to_string()))
+        .module_package(Some("infrastructure.entity".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("Entity".to_string()))
+        .module_output(Some("Entity.java".to_string()))
         .build();
 
+    let output_path = PathBuf::new()
+        .join(output_root)
+        .join(entity_module.clone().full_path().unwrap())
+        .join(clazz_model.package_name.clone())
+        .join(format!(
+            "{}{}{}",
+            clazz_model.feature_name.to_pascal_case(),
+            clazz_model.class_name,
+            entity_module.clone().module_output.unwrap()
+        ));
+
     dbg!(entity_module);
+    println!("entity_module: {}", output_path.display());
 }
 
 pub(crate) fn develop_tool() {
