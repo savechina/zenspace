@@ -1,0 +1,27 @@
+{%- set package_name =  modules.model.full_package -%}
+{%- set do_entity =  modules.model.full_name  -%}
+
+package {{ package_name }};
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import java.math.BigDecimal;
+import java.util.Date;
+/**
+* {{ model.class_name }}
+* {{ model.class_comment }}
+*/
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class {{ do_entity }} implements java.io.Serializable{
+
+    {% for field in model.fields %}
+    /**
+    * {{ field.field_name }}
+    * {{ field.field_comment }}
+    */
+    private {{ field.java_type }} {{ field.field_name }};
+    {% endfor %}
+
+}

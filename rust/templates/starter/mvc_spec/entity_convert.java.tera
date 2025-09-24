@@ -1,0 +1,22 @@
+{%- set package_name =  modules.entity_convert.full_package -%}
+{%- set entity_convert =  modules.entity_convert.full_name  -%}
+{%- set entity_package_name =  modules.entity.full_package -%}
+{%- set table_entity =  modules.entity.full_name  -%}
+{%- set do_package_name =  modules.model.full_package -%}
+{%- set do_entity =  modules.model.full_name  -%}
+package {{package_name}};
+
+import {{project.package_name}}.common.convert.EntityConverter;
+import {{do_package_name}}.{{do_entity}};
+import {{entity_package_name}}.{{table_entity}};
+import org.mapstruct.Mapper;
+
+/**
+ * {{entity_convert}}
+ * {{model.class_comment}} EntityConvert
+ * @author weirenyan
+ * @date 2024/5/9
+ */
+@Mapper(componentModel = "spring", uses = {})
+public interface {{entity_convert}} extends EntityConverter<{{table_entity}}, {{do_entity}}> {
+}

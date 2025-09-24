@@ -1,5 +1,7 @@
 use anyhow::Result;
-use std::{env, path::PathBuf, sync::LazyLock};
+use heck::{ToLowerCamelCase, ToPascalCase};
+use std::{collections::HashMap, env, path::PathBuf, sync::LazyLock};
+use tera::Value;
 use which;
 
 use include_dir::{Dir, include_dir};
@@ -30,4 +32,34 @@ pub(crate) fn command_exists(command: &str) -> bool {
     };
 
     exists
+}
+
+/// 定义to_pascal_case过滤器函数
+pub(crate) fn to_pascal_case_filter(
+    value: &Value,
+    _: &HashMap<String, Value>,
+) -> Result<Value, tera::Error> {
+    if let Some(s) = value.as_str() {
+        let pascal_case = s.to_pascal_case();
+        Ok(tera::to_value(pascal_case).unwrap())
+    } else {
+        Err(tera::Error::msg(
+            "`to_pascal_case` 过滤器只能用于字符串".to_string(),
+        ))
+    }
+}
+
+/// 定义to_lower_camel_case过滤器函数
+pub(crate) fn to_lower_camel_case_filter(
+    value: &Value,
+    _: &HashMap<String, Value>,
+) -> Result<Value, tera::Error> {
+    if let Some(s) = value.as_str() {
+        let pascal_case = s.to_lower_camel_case();
+        Ok(tera::to_value(pascal_case).unwrap())
+    } else {
+        Err(tera::Error::msg(
+            "`to_lower_camel_case` 过滤器只能用于字符串".to_string(),
+        ))
+    }
 }
