@@ -143,18 +143,6 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
     println!("Add feature: {} Done", table_name);
 }
 
-// 1. 定义过滤器函数
-fn to_pascal_case_filter(value: &Value, _: &HashMap<String, Value>) -> Result<Value, tera::Error> {
-    if let Some(s) = value.as_str() {
-        let pascal_case = s.to_pascal_case();
-        Ok(tera::to_value(pascal_case).unwrap())
-    } else {
-        Err(tera::Error::msg(
-            "`to_pascal_case` 过滤器只能用于字符串".to_string(),
-        ))
-    }
-}
-
 pub(crate) fn develop_tool() {
     println!("{} ", "Develop initialize:");
 
