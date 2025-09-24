@@ -67,27 +67,35 @@ pub struct JavaClass {
 #[derive(Debug, Clone, Getters, Setters, Serialize, Deserialize, TypedBuilder)]
 pub struct JavaModule {
     // Fields
-    pub project: Option<Project>,
-    pub module_name: Option<String>,
+    pub(crate) project: Option<Project>,
+    pub(crate) module_name: Option<String>,
     #[builder(default)]
-    pub module_package: Option<String>,
+    pub(crate) module_package: Option<String>,
     #[builder(default)]
-    pub module_path: Option<String>,
+    pub(crate) module_package_suffix: Option<String>,
     #[builder(default)]
-    pub module_template: Option<String>,
+    pub(crate) module_path: Option<String>,
     #[builder(default)]
-    pub module_type: Option<String>,
+    pub(crate) module_template: Option<String>,
     #[builder(default)]
-    pub module_suffix: Option<String>,
+    pub(crate) module_type: Option<String>,
     #[builder(default)]
-    pub module_prefix: Option<String>,
+    pub(crate) module_prefix: Option<String>,
     #[builder(default)]
-    pub module_output: Option<String>,
+    pub(crate) module_suffix: Option<String>,
     #[builder(default)]
-    pub module_model: Option<JavaClass>,
-    // Internal field to cache full_path
+    pub(crate) module_output: Option<String>,
     #[builder(default)]
-    full_path: Option<String>,
+    pub(crate) module_model: Option<JavaClass>,
+    //计算字段输出
+    #[builder(default)]
+    pub(crate) full_package: Option<String>,
+
+    #[builder(default)]
+    pub(crate) full_name: Option<String>,
+
+    #[builder(default)]
+    pub(crate) full_path: Option<PathBuf>,
 }
 
 impl JavaModule {
@@ -97,12 +105,41 @@ impl JavaModule {
     pub(crate) const SOURCE_TYPE: &'static str = "java";
     pub(crate) const RESOURCE_TYPE: &'static str = "resource";
 
+    pub fn refresh(&mut self) -> Self {
+        let full_package = self.full_package();
+        self.full_package = full_package;
+
+        let full_path = self.full_path();
+        self.full_path = full_path;
+
+        let clazz_model = self.module_model.clone().unwrap();
+        let full_name = format!(
+            "{}{}{}",
+            clazz_model.feature_name.to_pascal_case(),
+            clazz_model.class_name,
+            self.module_suffix.clone().unwrap()
+        );
+
+        self.full_name = Some(full_name);
+
+        self.clone()
+    }
     pub fn full_package(&self) -> Option<String> {
         match &self.module_type {
             Some(module_type) if module_type == Self::SOURCE_TYPE => {
-                if let (Some(project), Some(module_package)) = (&self.project, &self.module_package)
+                if let (Some(project), Some(module_package), Some(model)) =
+                    (&self.project, &self.module_package, &self.module_model)
                 {
-                    Some(format!("{}.{}", project.package_name, module_package))
+                    match &self.module_package_suffix {
+                        Some(suffix) => Some(format!(
+                            "{}.{}.{}.{}",
+                            project.package_name, module_package, suffix, model.package_name
+                        )),
+                        None => Some(format!(
+                            "{}.{}.{}",
+                            project.package_name, module_package, model.package_name
+                        )),
+                    }
                 } else {
                     None
                 }

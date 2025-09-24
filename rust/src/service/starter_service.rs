@@ -160,10 +160,14 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
         .module_name(Some("ENTITY".to_string()))
         .module_template(Some("entity.java.tera".to_string()))
         .module_package(Some("infrastructure.entity".to_string()))
+        .module_package_suffix(Some("impl".to_string()))
         .module_path(Some(format!("{}-infrastructure", project.project_name)))
         .module_suffix(Some("Entity".to_string()))
         .module_output(Some("Entity.java".to_string()))
-        .build();
+        .build()
+        .refresh();
+
+    entity_module.refresh();
 
     let output_path = PathBuf::new()
         .join(output_root)
@@ -191,7 +195,6 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
 
     // 2. 创建 Context 对象并插入数据
     let mut context = Context::new();
-    context.insert("greeting", &"Hello");
     context.insert("modules", &modules);
     context.insert("project", &project);
     context.insert("model", &clazz_model);
@@ -206,16 +209,7 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
 // 1. 定义过滤器函数
 fn to_pascal_case_filter(value: &Value, _: &HashMap<String, Value>) -> Result<Value, tera::Error> {
     if let Some(s) = value.as_str() {
-        let pascal_case = s
-            .split('_')
-            .map(|word| {
-                let mut chars = word.chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                }
-            })
-            .collect::<String>();
+        let pascal_case = s.to_pascal_case();
         Ok(tera::to_value(pascal_case).unwrap())
     } else {
         Err(tera::Error::msg(

@@ -1,5 +1,7 @@
-{%- set package_name = modules.entity.module_package ~ "." ~ model.package_name -%}
+{%- set package_name = modules.entity.full_package -%}
 {%- set table_entity = model.feature_name ~ model.class_name ~ "Entity" | to_pascal_case -%}
+{%- set table_entity =  modules.entity.full_name  -%}
+
 package {{ package_name }};
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -24,10 +26,10 @@ public class {{ table_entity }} implements java.io.Serializable{
     {% endfor %}
 
     {% for field in model.fields %}
-    public void set{{ field.field_name | capitalize }}({{ field.java_type }} {{ field.field_name }}) {
+    public void set{{ field.field_name | to_pascal_case }}({{ field.java_type }} {{ field.field_name }}) {
         this.{{ field.field_name }} = {{ field.field_name }};
     }
-    public {{ field.java_type }} get{{ field.field_name | capitalize }}() {
+    public {{ field.java_type }} get{{ field.field_name | to_pascal_case }}() {
         return this.{{ field.field_name }};
     }
     {% endfor %}
