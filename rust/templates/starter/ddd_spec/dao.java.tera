@@ -1,0 +1,29 @@
+{%- set package_name = modules.mapper.full_package -%}
+{%- set table_dao = modules.mapper.full_name -%}
+
+{%- set entity_package_name =  modules.entity.full_package -%}
+{%- set table_entity =  modules.entity.full_name  -%}
+{%- set do_package_name =  modules.model.full_package -%}
+{%- set do_entity =  modules.model.full_name  -%}
+{%- set table_entity_instance = modules.entity.full_name | to_lower_camel_case -%}
+package {{ package_name }};
+
+import {{ entity_package_name }}.{{ table_entity }};
+
+import java.util.*;
+import org.apache.ibatis.annotations.Param;
+
+public interface {{ table_dao }} {
+    Integer insert({{ table_entity }} {{ table_entity_instance }});
+    Integer insertBatch(List<{{ table_entity }}> list);
+
+    Integer deleteByPrimaryKey(Long id);
+    Integer deleteBatchByPrimaryKey(List<Long> ids);
+
+    Integer update({{ table_entity }} {{ table_entity_instance }});
+    Integer updateBatch(List<{{ table_entity }}> list);
+
+    List<{{ table_entity }}> selectBy({{ table_entity }} {{ table_entity_instance }});
+
+    {{ table_entity }} getById(Long id);
+}

@@ -1,0 +1,31 @@
+{%- set package_name = modules.repository.full_package  -%}
+{%- set table_repository = modules.repository.full_name -%}
+{%- set entity_package_name =  modules.entity.full_package -%}
+{%- set table_entity =  modules.entity.full_name  -%}
+{%- set table_entity_instance = modules.entity.full_name | to_lower_camel_case -%}
+{%- set dao_package_name = modules.mapper.full_package -%}
+{%- set table_dao = modules.mapper.full_name -%}
+{%- set do_package_name =  modules.model.full_package -%}
+{%- set do_entity =  modules.model.full_name  -%}
+{%- set do_entity_instance = modules.model.full_name | to_lower_camel_case -%}
+
+package {{ package_name }};
+
+import {{ do_package_name }}.{{ do_entity }};
+
+import java.util.*;
+
+public interface {{ table_repository }} {
+    Integer insert({{ do_entity }} {{ do_entity_instance }});
+    Integer insertBatch(List<{{ do_entity }}> list);
+
+    Integer deleteByPrimaryKey(Long id);
+    Integer deleteBatchByPrimaryKey(List<Long> ids);
+
+    Integer update({{ do_entity }} {{ do_entity_instance }});
+    Integer updateBatch(List<{{ do_entity }}> list);
+
+    List<{{ do_entity }}> selectBy({{ do_entity }} {{ do_entity_instance }});
+
+    {{ do_entity }} getById(Long id);
+}
