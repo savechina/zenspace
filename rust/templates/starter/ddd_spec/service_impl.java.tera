@@ -1,0 +1,99 @@
+{%- set package_name = modules.service_impl.full_package -%}
+{%- set table_service_impl = modules.service_impl.full_name -%}
+
+{%- set service_package_name = modules.service.full_package -%}
+{%- set table_service = modules.service.full_name -%}
+
+{%- set repository_package_name = modules.repository.full_package  -%}
+{%- set table_repository = modules.repository.full_name -%}
+{%- set table_repository_instance = table_repository | to_lower_camel_case -%}
+
+{%- set entity_package_name =  modules.entity.full_package -%}
+{%- set table_entity =  modules.entity.full_name  -%}
+{%- set table_entity_instance = modules.entity.full_name | to_lower_camel_case -%}
+
+{%- set entity_convert_package_name = modules.entity_convert.full_package -%}
+{%- set table_entity_convert = modules.entity_convert.full_name -%}
+{%- set table_entity_convert_instance = modules.entity_convert.full_name | to_lower_camel_case -%}
+
+{%- set dao_package_name = modules.mapper.full_package -%}
+{%- set table_dao = modules.mapper.full_name -%}
+{%- set table_dao_instance = table_dao | to_lower_camel_case -%}
+
+{%- set do_package_name =  modules.model.full_package -%}
+{%- set do_entity =  modules.model.full_name  -%}
+{%- set do_entity_instance = modules.model.full_name | to_lower_camel_case -%}
+package {{ package_name }};
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import lombok.extern.slf4j.Slf4j;
+
+import {{ do_package_name }}.{{ do_entity }};
+import {{ repository_package_name }}.{{ table_repository }};
+import {{ service_package_name }}.{{ table_service }};
+
+import java.util.*;
+
+@Slf4j
+@Service
+public class {{ table_service_impl }} implements {{ table_service }} {
+
+    @Autowired
+    private {{ table_repository }} {{ table_repository_instance }};
+
+    /**
+     * 插入 {{ model.class_comment }}
+     *
+     * @param {{ do_entity_instance }} {{ model.class_comment }}
+     * @return  Integer
+     */
+    @Override
+    public Integer insert({{ do_entity }} {{ do_entity_instance }}){
+        return {{ table_repository_instance }}.insert({{ do_entity_instance }});
+    }
+
+   /**
+     * 批量插入 {{ model.class_comment }}
+     *
+     * @param  list List<{{ do_entity }}> {{ model.class_comment }}
+     * @return  Integer
+     */
+    @Override
+    public Integer insertBatch(List<{{ do_entity }}> list){
+        return {{ table_repository_instance }}.insertBatch(list);
+    }
+
+    @Override
+    public Integer deleteByPrimaryKey(Long id){
+        return {{ table_repository_instance }}.deleteByPrimaryKey(id);
+    }
+
+    @Override
+    public Integer deleteBatchByPrimaryKey(List<Long> ids){
+        return {{ table_repository_instance }}.deleteBatchByPrimaryKey(ids);
+    }
+
+    @Override
+    public Integer update({{ do_entity }} {{ do_entity_instance }}){
+        return {{ table_repository_instance }}.update({{ do_entity_instance }});
+    }
+
+    @Override
+    public Integer updateBatch(List<{{ do_entity }}> list){
+        return {{ table_repository_instance }}.updateBatch(list);
+    }
+
+    @Override
+    public List<{{ do_entity }}> selectBy({{ do_entity }} {{ do_entity_instance }}){
+        {{ do_entity }} param = {{ do_entity_instance }};
+        List<{{ do_entity }}> entityList = {{ table_repository_instance }}.selectBy(param);
+        return entityList;
+    }
+
+    @Override
+    public {{ do_entity }} getById(Long id){
+        {{ do_entity }} entity = {{ table_repository_instance }}.getById(id);
+        return entity;
+    }
+}

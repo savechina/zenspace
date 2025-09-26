@@ -1,5 +1,5 @@
-{%- set package_name = modules.repository.full_package  -%}
-{%- set table_repository = modules.repository.full_name -%}
+{%- set package_name = modules.service.full_package -%}
+{%- set table_service = modules.service.full_name -%}
 
 {%- set entity_package_name =  modules.entity.full_package -%}
 {%- set table_entity =  modules.entity.full_name  -%}
@@ -7,18 +7,18 @@
 
 {%- set dao_package_name = modules.mapper.full_package -%}
 {%- set table_dao = modules.mapper.full_name -%}
+{%- set table_dao_instance = table_dao | to_camel_case -%}
 
 {%- set do_package_name =  modules.model.full_package -%}
 {%- set do_entity =  modules.model.full_name  -%}
 {%- set do_entity_instance = modules.model.full_name | to_lower_camel_case -%}
-
 package {{ package_name }};
 
 import {{ do_package_name }}.{{ do_entity }};
 
 import java.util.*;
 
-public interface {{ table_repository }} {
+public interface {{ table_service }} {
     Integer insert({{ do_entity }} {{ do_entity_instance }});
     Integer insertBatch(List<{{ do_entity }}> list);
 

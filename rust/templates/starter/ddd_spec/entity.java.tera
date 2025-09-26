@@ -1,5 +1,4 @@
 {%- set package_name = modules.entity.full_package -%}
-{%- set table_entity = model.feature_name ~ model.class_name ~ "Entity" | to_pascal_case -%}
 {%- set table_entity =  modules.entity.full_name  -%}
 
 package {{ package_name }};

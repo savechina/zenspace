@@ -1,0 +1,110 @@
+{%- set package_name = modules.repository_impl.full_package  -%}
+{%- set table_repository_impl = modules.repository_impl.full_name -%}
+
+{%- set repository_package_name = modules.repository.full_package  -%}
+{%- set table_repository = modules.repository.full_name -%}
+
+{%- set entity_package_name =  modules.entity.full_package -%}
+{%- set table_entity =  modules.entity.full_name  -%}
+{%- set table_entity_instance = modules.entity.full_name | to_lower_camel_case -%}
+
+{%- set entity_convert_package_name = modules.entity_convert.full_package -%}
+{%- set table_entity_convert = modules.entity_convert.full_name -%}
+{%- set table_entity_convert_instance = modules.entity_convert.full_name | to_lower_camel_case -%}
+
+{%- set dao_package_name = modules.mapper.full_package -%}
+{%- set table_dao = modules.mapper.full_name -%}
+{%- set table_dao_instance = table_dao | to_camel_case -%}
+
+{%- set do_package_name =  modules.model.full_package -%}
+{%- set do_entity =  modules.model.full_name  -%}
+{%- set do_entity_instance = modules.model.full_name | to_lower_camel_case -%}
+
+package {{ package_name }};
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Repository;
+
+import {{ do_package_name }}.{{ do_entity }};
+import {{ entity_package_name }}.{{ table_entity }};
+import {{ dao_package_name }}.{{ table_dao }};
+import {{ entity_convert_package_name }}.{{ table_entity_convert }};
+import {{ repository_package_name }}.{{ table_repository }};
+
+import java.util.*;
+
+@Repository
+public class {{ table_repository_impl }} implements {{ table_repository }} {
+
+    @Autowired
+    private {{ table_entity_convert }} {{ table_entity_convert_instance }};
+    @Autowired
+    private {{ table_dao }} {{ table_dao_instance }};
+
+    /**
+     * 插入 {{ model.class_comment }}
+     *
+     * @param {{ do_entity_instance }} {{ model.class_comment }}
+     * @return  Integer
+     */
+    @Override
+    public Integer insert({{ do_entity }} {{ do_entity_instance }}){
+
+        {{ table_entity }} entity = {{ table_entity_convert_instance }}.reverseConvert({{ do_entity_instance }});
+
+        return {{ table_dao_instance }}.insert(entity);
+    }
+
+   /**
+     * 批量插入 {{ model.class_comment }}
+     *
+     * @param  list List<{{ do_entity }}> {{ model.class_comment }}
+     * @return  Integer
+     */
+    @Override
+    public Integer insertBatch(List<{{ do_entity }}> list){
+
+        List<{{ table_entity }}> entityList = {{ table_entity_convert_instance }}.batchReverseConvert(list);
+
+        return {{ table_dao_instance }}.insertBatch(entityList);
+    }
+
+    @Override
+    public Integer deleteByPrimaryKey(Long id){
+        return {{ table_dao_instance }}.deleteByPrimaryKey(id);
+    }
+
+    @Override
+    public Integer deleteBatchByPrimaryKey(List<Long> ids){
+        return {{ table_dao_instance }}.deleteBatchByPrimaryKey(ids);
+    }
+
+    @Override
+    public Integer update({{ do_entity }} {{ do_entity_instance }}){
+        {{ table_entity }} entity = {{ table_entity_convert_instance }}.reverseConvert({{ do_entity_instance }});
+        return {{ table_dao_instance }}.update(entity);
+    }
+
+    @Override
+    public Integer updateBatch(List<{{ do_entity }}> list){
+        List<{{ table_entity }}> entityList = {{ table_entity_convert_instance }}.batchReverseConvert(list);
+
+        return {{ table_dao_instance }}.updateBatch(entityList);
+    }
+
+    @Override
+    public List<{{ do_entity }}> selectBy({{ do_entity }} {{ do_entity_instance }}){
+        {{ table_entity }} param = {{ table_entity_convert_instance }}.reverseConvert({{ do_entity_instance }});
+
+        List<{{ table_entity }}> entityList = {{ table_dao_instance }}.selectBy(param);
+        return {{ table_entity_convert_instance }}.batchConvert(entityList);
+    }
+
+    @Override
+    public {{ do_entity }} getById(Long id){
+
+        {{ table_entity }} entity = {{ table_dao_instance }}.getById(id);
+
+        return {{ table_entity_convert_instance }}.convert(entity);
+    }
+}

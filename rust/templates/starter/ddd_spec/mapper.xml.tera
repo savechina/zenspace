@@ -1,6 +1,8 @@
 {%- set mapper_package = modules.mapper.full_package  -%}
+
 {%- set entity_package = modules.entity.full_package  -%}
 {%- set entity_name = modules.entity.full_name -%}
+
 {%- set namespace = mapper_package ~ "." ~ modules.entity.full_name -%}
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
