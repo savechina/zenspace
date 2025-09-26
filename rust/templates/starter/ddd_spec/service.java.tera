@@ -7,7 +7,7 @@
 
 {%- set dao_package_name = modules.mapper.full_package -%}
 {%- set table_dao = modules.mapper.full_name -%}
-{%- set table_dao_instance = table_dao | to_camel_case -%}
+{%- set table_dao_instance = table_dao | to_lower_camel_case -%}
 
 {%- set do_package_name =  modules.model.full_package -%}
 {%- set do_entity =  modules.model.full_name  -%}
