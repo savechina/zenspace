@@ -11,6 +11,7 @@ struct Cli {
     command: Commands,
 }
 
+/// zen subcommand
 #[derive(Subcommand)]
 enum Commands {
     /// Hello say Name
@@ -31,6 +32,7 @@ enum Commands {
     Version,
 }
 
+/// Zen CLI command entry
 pub(crate) fn shell() {
     // CLI parse
     let cli = Cli::parse();

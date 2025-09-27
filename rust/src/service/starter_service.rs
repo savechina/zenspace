@@ -1,18 +1,12 @@
-use crate::errors::ServiceError;
 use crate::infra::starter_repository;
-use crate::model::starter_model::{JavaClass, JavaModule, JavaTypeMapping, JavaTypes, Project};
+use crate::model::starter_model::{JavaClass, JavaModule, Project};
 use crate::util;
-use heck::{self, ToLowerCamelCase, ToPascalCase, ToSnekCase, ToTitleCase, ToUpperCamelCase};
 use std::collections::HashMap;
-use std::env::{self, home_dir};
-use std::fs::{self, FileType};
-use std::fs::{DirEntry, File};
-use std::io::Write;
+use std::env::{self};
+use std::fs::{self};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::str::FromStr;
-use strum::IntoEnumIterator;
-use tera::{Context, Tera, Value};
+use tera::{Context, Tera};
 
 pub(crate) fn init_project(project: Project, output_root: PathBuf) {
     println!("{} ", "Develop initialize:");
@@ -367,7 +361,7 @@ fn get_ddd_feature_modules(
     entity_module.refresh();
     modules.insert("entity", entity_module);
 
-    let mut mapper_module = JavaModule::builder()
+    let mapper_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -383,7 +377,7 @@ fn get_ddd_feature_modules(
 
     modules.insert("mapper", mapper_module);
 
-    let mut mapper_res_module = JavaModule::builder()
+    let mapper_res_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::RESOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -398,7 +392,7 @@ fn get_ddd_feature_modules(
 
     modules.insert("mapper_resource", mapper_res_module);
 
-    let mut entity_convert_module = JavaModule::builder()
+    let entity_convert_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -412,7 +406,7 @@ fn get_ddd_feature_modules(
         .refresh();
     modules.insert("entity_convert", entity_convert_module);
 
-    let mut model_module = JavaModule::builder()
+    let model_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -428,7 +422,7 @@ fn get_ddd_feature_modules(
 
     modules.insert("model", model_module);
 
-    let mut repository_module = JavaModule::builder()
+    let repository_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -444,7 +438,7 @@ fn get_ddd_feature_modules(
 
     modules.insert("repository", repository_module);
 
-    let mut repository_impl_module = JavaModule::builder()
+    let repository_impl_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -460,7 +454,7 @@ fn get_ddd_feature_modules(
 
     modules.insert("repository_impl", repository_impl_module);
 
-    let mut service_module = JavaModule::builder()
+    let service_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -476,7 +470,7 @@ fn get_ddd_feature_modules(
 
     modules.insert("service", service_module);
 
-    let mut service_impl_module = JavaModule::builder()
+    let service_impl_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -492,7 +486,7 @@ fn get_ddd_feature_modules(
 
     modules.insert("service_impl", service_impl_module);
 
-    let mut view_module = JavaModule::builder()
+    let view_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -516,7 +510,7 @@ fn get_mvc_feature_modules(
 ) -> HashMap<&'static str, JavaModule> {
     let mut modules = HashMap::new();
 
-    let mut entity_module = JavaModule::builder()
+    let entity_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -530,10 +524,9 @@ fn get_mvc_feature_modules(
         .build()
         .refresh();
 
-    entity_module.refresh();
     modules.insert("entity", entity_module);
 
-    let mut mapper_module = JavaModule::builder()
+    let mapper_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -549,7 +542,7 @@ fn get_mvc_feature_modules(
 
     modules.insert("mapper", mapper_module);
 
-    let mut mapper_res_module = JavaModule::builder()
+    let mapper_res_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::RESOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -564,7 +557,7 @@ fn get_mvc_feature_modules(
 
     modules.insert("mapper_resource", mapper_res_module);
 
-    let mut entity_convert_module = JavaModule::builder()
+    let entity_convert_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -594,7 +587,7 @@ fn get_mvc_feature_modules(
 
     modules.insert("model", model_module);
 
-    let mut repository_module = JavaModule::builder()
+    let repository_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -610,7 +603,7 @@ fn get_mvc_feature_modules(
 
     modules.insert("repository", repository_module);
 
-    let mut repository_impl_module = JavaModule::builder()
+    let repository_impl_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -642,7 +635,7 @@ fn get_mvc_feature_modules(
 
     modules.insert("service", service_module);
 
-    let mut service_impl_module = JavaModule::builder()
+    let service_impl_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -658,7 +651,7 @@ fn get_mvc_feature_modules(
 
     modules.insert("service_impl", service_impl_module);
 
-    let mut view_module = JavaModule::builder()
+    let view_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
