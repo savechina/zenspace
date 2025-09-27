@@ -13,53 +13,9 @@ use std::process::{Command, Stdio};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 use tera::{Context, Tera, Value};
-use tracing_subscriber::fmt::MakeWriter;
 
-pub(crate) fn init(project: Project, output_root: PathBuf) {
+pub(crate) fn init_project(project: Project, output_root: PathBuf) {
     println!("{} ", "Develop initialize:");
-
-    // let template_path = util::TEMPLATES.path();
-    // println!("template path: {:?}", template_path);
-
-    // // 遍历所有文件（包括子目录中的文件）
-    // for file in util::TEMPLATES.dirs() {
-    //     println!("Recursive File path: {:?}", file.path());
-
-    //     file.dirs().for_each(|f| {
-    //         println!("Recursive File path: {:?}", f.path());
-    //     });
-
-    //     file.files().for_each(|f| {
-    //         println!("Recursive File path: {:?}", f.path());
-    //     });
-    // }
-
-    // let template_name = "templates";
-
-    // let template_path = PathBuf::from(template_name);
-
-    // if template_path.exists() {
-    //     println!("template path exists: {}", true);
-    // }
-
-    // let ddd_path = template_path.join("starter/ddd_init");
-
-    // println!("ddd_path exists: {} ", ddd_path.exists());
-
-    // let ddd_dir = fs::read_dir(ddd_path).unwrap();
-
-    // for entry in ddd_dir {
-    //     let entry: DirEntry = entry.unwrap();
-    //     let file_name = entry.file_name();
-    //     let file_type: FileType = entry.file_type().unwrap();
-    //     let path = entry.path();
-
-    //     println!(
-    //         "file name: {:?},type: {:?} ,path: {:?}",
-    //         file_name, file_type, path
-    //     );
-    // }
-    //
 
     let arch_type = &project.arch_type;
     let template_base = if arch_type.eq_ignore_ascii_case("ddd") {
@@ -84,36 +40,12 @@ pub(crate) fn init(project: Project, output_root: PathBuf) {
 }
 
 #[tokio::main]
-pub(crate) async fn add(feature_name: String, table_name: String, project: Project) {
-    println!("{} ", "Develop initialize:");
-
+pub(crate) async fn add_feature(feature_name: String, table_name: String, project: Project) {
     //pwd current directory
     let current_dir = env::current_dir().unwrap();
 
     let output_root = current_dir;
     println!("Output: {}", output_root.display());
-
-    let char = JavaTypes::Char.info();
-
-    let column_type = char.db_type.to_upper_camel_case();
-    println!("Char column_type:{}", column_type);
-
-    let a = "CharWorld";
-
-    println!("heck to_snek_case: {}", a.to_snek_case());
-    println!("heck to_lower_camel_case: {}", a.to_lower_camel_case());
-    println!("heck to_upper_camel_case: {}", a.to_upper_camel_case());
-    println!("heck to_pascal_case: {}", a.to_pascal_case());
-
-    let c = JavaTypes::from_str("chAr").unwrap();
-    println!("JavaTypes: {:?}", c.info());
-
-    for t in JavaTypes::iter() {
-        println!("JavaTypes: {:?}", t.info());
-    }
-
-    println!("fetch field ...");
-    // let table_name = "hms_monitor_data";
 
     let mut clazz_list =
         starter_repository::fetch_clazz(Some(table_name.to_ascii_uppercase())).await;
@@ -123,24 +55,7 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
     clazz_model.feature_name = feature_name.clone();
     clazz_model.package_name = feature_name.clone();
 
-    let arch_type = &project.arch_type;
-
-    //template base
-    let template_base = if arch_type.eq_ignore_ascii_case("ddd") {
-        "starter/ddd_spec"
-    } else if arch_type.eq_ignore_ascii_case("mvc") {
-        "starter/mvc_spec"
-    } else {
-        //default ddd
-        "starter/ddd_spec"
-    };
-
-    add_feature(
-        project,
-        clazz_model.clone(),
-        template_base.to_string(),
-        output_root,
-    );
+    add_feature_modules(project, clazz_model.clone(), output_root);
 
     println!("Add feature: {} Done", table_name);
 }
@@ -368,12 +283,71 @@ fn handle_target_path(source_path: &Path, project: &Project) -> String {
     target_path
 }
 
-pub(crate) fn add_feature(
-    project: Project,
-    clazz_model: JavaClass,
-    template_base: String,
-    output_root: PathBuf,
-) {
+pub(crate) fn add_feature_modules(project: Project, clazz_model: JavaClass, output_root: PathBuf) {
+    //template base and feature modules
+    let (template_base, mut modules) = if project.arch_type.eq_ignore_ascii_case("ddd") {
+        (
+            "starter/ddd_spec",
+            get_ddd_feature_modules(&project, &clazz_model),
+        )
+    } else if project.arch_type.eq_ignore_ascii_case("mvc") {
+        (
+            "starter/mvc_spec",
+            get_mvc_feature_modules(&project, &clazz_model),
+        )
+    } else {
+        //default ddd
+        (
+            "starter/ddd_spec",
+            get_ddd_feature_modules(&project, &clazz_model),
+        )
+    };
+
+    // 1. 创建 Tera 实例
+    let mut tera = Tera::default();
+    //注册过滤器
+    tera.register_filter("to_pascal_case", util::to_pascal_case_filter);
+    tera.register_filter("to_lower_camel_case", util::to_lower_camel_case_filter);
+
+    // 2. 创建 Context 对象并插入数据
+    let mut context = Context::new();
+    context.insert("modules", &modules);
+    context.insert("project", &project);
+    context.insert("model", &clazz_model);
+
+    for (name, module) in &mut modules {
+        let template_file = module.module_template.clone().unwrap();
+
+        let output_path = PathBuf::new()
+            .join(output_root.clone())
+            .join(module.output_path().unwrap());
+
+        dbg!(name);
+
+        // 获取模板及内容
+        let template_entry = util::TEMPLATES
+            .get_file(format!("{}/{}", template_base, template_file))
+            .unwrap();
+
+        let template_context = template_entry.contents_utf8().unwrap();
+
+        // 渲染处理模板内容
+        let result = tera.render_str(template_context, &context);
+
+        let output_dir = output_path.parent().unwrap();
+
+        fs::create_dir_all(output_dir).expect("create output directroy is error");
+
+        fs::write(output_path.clone(), result.unwrap()).expect("wirte resut context is error");
+
+        println!("temtlate output:{} \n", output_path.display())
+    }
+}
+
+fn get_ddd_feature_modules(
+    project: &Project,
+    clazz_model: &JavaClass,
+) -> HashMap<&'static str, JavaModule> {
     let mut modules = HashMap::new();
 
     let mut entity_module = JavaModule::builder()
@@ -533,46 +507,171 @@ pub(crate) fn add_feature(
         .refresh();
 
     modules.insert("vo", view_module);
+    modules
+}
 
-    // 1. 创建 Tera 实例
-    let mut tera = Tera::default();
-    //注册过滤器
-    tera.register_filter("to_pascal_case", util::to_pascal_case_filter);
-    tera.register_filter("to_lower_camel_case", util::to_lower_camel_case_filter);
+fn get_mvc_feature_modules(
+    project: &Project,
+    clazz_model: &JavaClass,
+) -> HashMap<&'static str, JavaModule> {
+    let mut modules = HashMap::new();
 
-    // 2. 创建 Context 对象并插入数据
-    let mut context = Context::new();
-    context.insert("modules", &modules);
-    context.insert("project", &project);
-    context.insert("model", &clazz_model);
+    let mut entity_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("ENTITY".to_string()))
+        .module_template(Some("entity.java.tera".to_string()))
+        .module_package(Some("infrastructure.entity".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("Entity".to_string()))
+        .module_output(Some("Entity.java".to_string()))
+        .build()
+        .refresh();
 
-    for (name, module) in &mut modules {
-        let template_file = module.module_template.clone().unwrap();
+    entity_module.refresh();
+    modules.insert("entity", entity_module);
 
-        let output_path = PathBuf::new()
-            .join(output_root.clone())
-            .join(module.output_path().unwrap());
+    let mut mapper_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("MAPPER".to_string()))
+        .module_template(Some("dao.java.tera".to_string()))
+        .module_package(Some("infrastructure.mapper".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("Mapper".to_string()))
+        .module_output(Some("Mapper.java".to_string()))
+        .build()
+        .refresh();
 
-        dbg!(name);
+    modules.insert("mapper", mapper_module);
 
-        // 获取模板及内容
-        let template_entry = util::TEMPLATES
-            .get_file(format!("{}/{}", template_base, template_file))
-            .unwrap();
+    let mut mapper_res_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::RESOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("MAPPER_RESOURCE".to_string()))
+        .module_template(Some("mapper.xml.tera".to_string()))
+        .module_package(Some("mapper".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("Mapper".to_string()))
+        .module_output(Some("Mapper.xml".to_string()))
+        .build()
+        .refresh();
 
-        let template_context = template_entry.contents_utf8().unwrap();
+    modules.insert("mapper_resource", mapper_res_module);
 
-        // 渲染处理模板内容
-        let result = tera.render_str(template_context, &context);
+    let mut entity_convert_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("ENTITY".to_string()))
+        .module_template(Some("entity_convert.java.tera".to_string()))
+        .module_package(Some("infrastructure.convert".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("EntityConvert".to_string()))
+        .module_output(Some("EntityConvert.java".to_string()))
+        .build()
+        .refresh();
+    modules.insert("entity_convert", entity_convert_module);
 
-        let output_dir = output_path.parent().unwrap();
+    let mut model_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("MODEL".to_string()))
+        .module_template(Some("model.java.tera".to_string()))
+        .module_package(Some("domain.model".to_string()))
+        .module_package_suffix(None)
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("DO".to_string()))
+        .module_output(Some("DO.java".to_string()))
+        .build()
+        .refresh();
 
-        fs::create_dir_all(output_dir);
+    modules.insert("model", model_module);
 
-        let mut file = File::create(output_path.clone()).unwrap();
+    let mut repository_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("REPOSITORY".to_string()))
+        .module_template(Some("repository.java.tera".to_string()))
+        .module_package(Some("domain.repository".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("Repository".to_string()))
+        .module_output(Some("Repository.java".to_string()))
+        .build()
+        .refresh();
 
-        fs::write(output_path.clone(), result.unwrap());
+    modules.insert("repository", repository_module);
 
-        println!("temtlate output:{} \n", output_path.display())
-    }
+    let mut repository_impl_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("REPOSITORY_IMPL".to_string()))
+        .module_template(Some("repository_impl.java.tera".to_string()))
+        .module_package(Some("infrastructure.repository".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("RepositoryImpl".to_string()))
+        .module_output(Some("RepositoryImpl.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("repository_impl", repository_impl_module);
+
+    let mut service_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("SERVICE".to_string()))
+        .module_template(Some("service.java.tera".to_string()))
+        .module_package(Some("domain.service".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("Service".to_string()))
+        .module_output(Some("Service.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("service", service_module);
+
+    let mut service_impl_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("SERVICE_IMPL".to_string()))
+        .module_template(Some("service_impl.java.tera".to_string()))
+        .module_package(Some("domain.service".to_string()))
+        .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("ServiceImpl".to_string()))
+        .module_output(Some("ServiceImpl.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("service_impl", service_impl_module);
+
+    let mut view_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("VIEW".to_string()))
+        .module_template(Some("vo.java.tera".to_string()))
+        .module_package(Some("domain.vo".to_string()))
+        .module_package_suffix(None)
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("Vo".to_string()))
+        .module_output(Some("Vo.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("vo", view_module);
+    modules
 }

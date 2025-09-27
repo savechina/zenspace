@@ -32,7 +32,7 @@ enum Commands {
 }
 
 pub(crate) fn shell() {
-    println!("Hello, world!");
+    // CLI parse
     let cli = Cli::parse();
 
     match &cli.command {

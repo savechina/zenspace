@@ -1,6 +1,5 @@
 use std::error::Error;
 
-use cmd::starter_command::StarterCommands;
 #[macro_use]
 extern crate getset;
 

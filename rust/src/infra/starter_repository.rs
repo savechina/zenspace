@@ -49,12 +49,12 @@ pub(crate) async fn fetch_clazz(table_name: Option<String>) -> Vec<JavaClass> {
 
         let field_list = fetch_field(table_name.to_ascii_uppercase()).await.unwrap();
 
-        dbg!(
-            "TABLE_NAME: {},  TABLE_COMMENT: {}, Fields: {:?}",
-            table_name.clone(),
-            table_comment.clone(),
-            field_list.clone()
-        );
+        // dbg!(
+        //     "TABLE_NAME: {},  TABLE_COMMENT: {}, Fields: {:?}",
+        //     table_name.clone(),
+        //     table_comment.clone(),
+        //     field_list.clone()
+        // );
 
         let mut clazz = JavaClass::default();
         clazz.table_name = table_name.clone();
@@ -125,7 +125,7 @@ pub(crate) async fn fetch_field(table_name: String) -> Result<Vec<JavaField>, Se
             .build();
 
         // println!("field: {:?}", field.clone());
-        dbg!(field.clone());
+        // dbg!(field.clone());
 
         field_list.push(field);
     }

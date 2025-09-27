@@ -79,10 +79,10 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
             //pwd current directory
             let current_dir = env::current_dir().unwrap();
 
-            let output_root = current_dir.join("target");
+            let output_root = current_dir;
             println!("Output: {}", output_root.display());
 
-            starter_service::init(project, output_root);
+            starter_service::init_project(project, output_root);
 
             println!("Init project done");
         }
@@ -95,6 +95,7 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
             package_name,
             arch_type,
         } => {
+            println!("{} ", "Develop add feature:");
             println!("Package: {} \t Table: {} ", feature_name, table_name);
 
             let project = Project::builder()
@@ -104,7 +105,7 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
                 .arch_type(arch_type.clone())
                 .build();
 
-            starter_service::add(feature_name.clone(), table_name.clone(), project);
+            starter_service::add_feature(feature_name.clone(), table_name.clone(), project);
         }
 
         StarterCommands::Develop => {

@@ -5,6 +5,6 @@ database.type = {{sqlite}}
 # to modify your project database schema
 database.schema = {{airp_sample}}
 
-project_name=__app__
-group_name=__group__
-package_name=__package__
+PROJECT_NAME=__app__
+GROUP_NAME=__group__
+PACKAGE_NAME=__package__
