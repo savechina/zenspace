@@ -4,7 +4,6 @@ use crate::{model::starter_model::Project, service::starter_service};
 
 use clap::{Args, Subcommand};
 use include_dir::Dir;
-use tracing::info;
 
 #[derive(Subcommand)]
 pub(crate) enum StarterCommands {
@@ -42,9 +41,11 @@ pub(crate) enum StarterCommands {
     },
 
     ///Initialize develop ENV to install develop tools.
+    #[command(visible_aliases = ["tool","dev"] )]
     Develop,
 
-    /// Workspace initialize
+    /// Workspace initialize.
+    #[command(visible_aliases = ["space","s"] )]
     Workspace,
 }
 
@@ -68,13 +69,6 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
                 package_name: package_name.clone(),
                 arch_type: arch_type.clone(),
             };
-
-            // let project = Project::builder()
-            //     .project_name(project.clone())
-            //     .group_name(group.clone())
-            //     .package_name(package.clone())
-            //     .arch_type(arch_type.clone())
-            //     .build();
 
             //pwd current directory
             let current_dir = env::current_dir().unwrap();

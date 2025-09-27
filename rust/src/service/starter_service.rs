@@ -587,38 +587,6 @@ fn get_mvc_feature_modules(
 
     modules.insert("model", model_module);
 
-    let repository_module = JavaModule::builder()
-        .project(Some(project.clone()))
-        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
-        .module_model(Some(clazz_model.clone()))
-        .module_name(Some("REPOSITORY".to_string()))
-        .module_template(Some("repository.java.tera".to_string()))
-        .module_package(Some("domain.repository".to_string()))
-        // .module_package_suffix(Some("impl".to_string()))
-        .module_path(Some(format!("{}-domain", project.project_name)))
-        .module_suffix(Some("Repository".to_string()))
-        .module_output(Some("Repository.java".to_string()))
-        .build()
-        .refresh();
-
-    // modules.insert("repository", repository_module);
-
-    let repository_impl_module = JavaModule::builder()
-        .project(Some(project.clone()))
-        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
-        .module_model(Some(clazz_model.clone()))
-        .module_name(Some("REPOSITORY_IMPL".to_string()))
-        .module_template(Some("repository_impl.java.tera".to_string()))
-        .module_package(Some("domain.repository".to_string()))
-        .module_package_suffix(Some("impl".to_string()))
-        .module_path(Some(format!("{}-domain", project.project_name)))
-        .module_suffix(Some("RepositoryImpl".to_string()))
-        .module_output(Some("RepositoryImpl.java".to_string()))
-        .build()
-        .refresh();
-
-    // modules.insert("repository_impl", repository_impl_module);
-
     let service_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))

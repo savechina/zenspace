@@ -6,6 +6,7 @@ use crate::cmd::wps_command::{self, WpsCommands};
 
 #[derive(Parser)]
 #[command(author="JenYen", version, about="About zenspace utils", long_about = None)]
+#[command(propagate_version = false)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -39,7 +40,7 @@ pub(crate) fn shell() {
 
     match &cli.command {
         Commands::Hello { name } => {
-            println!("hello to {}", name)
+            println!("hello:\n{}", name)
         }
 
         Commands::Starter { operation } => {
@@ -49,7 +50,6 @@ pub(crate) fn shell() {
         Commands::Wps { operation } => {
             wps_command::excute_command(operation);
         }
-
         Commands::Version => {
             // Get the package version from Cargo.toml at compile time
             let version = env!("CARGO_PKG_VERSION");
