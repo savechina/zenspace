@@ -516,9 +516,9 @@ fn get_mvc_feature_modules(
         .module_model(Some(clazz_model.clone()))
         .module_name(Some("ENTITY".to_string()))
         .module_template(Some("entity.java.tera".to_string()))
-        .module_package(Some("infrastructure.entity".to_string()))
+        .module_package(Some("domain.entity".to_string()))
         // .module_package_suffix(Some("impl".to_string()))
-        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_path(Some(format!("{}-domain", project.project_name)))
         .module_suffix(Some("Entity".to_string()))
         .module_output(Some("Entity.java".to_string()))
         .build()
@@ -532,9 +532,9 @@ fn get_mvc_feature_modules(
         .module_model(Some(clazz_model.clone()))
         .module_name(Some("MAPPER".to_string()))
         .module_template(Some("dao.java.tera".to_string()))
-        .module_package(Some("infrastructure.mapper".to_string()))
+        .module_package(Some("domain.mapper".to_string()))
         // .module_package_suffix(Some("impl".to_string()))
-        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_path(Some(format!("{}-domain", project.project_name)))
         .module_suffix(Some("Mapper".to_string()))
         .module_output(Some("Mapper.java".to_string()))
         .build()
@@ -549,7 +549,7 @@ fn get_mvc_feature_modules(
         .module_name(Some("MAPPER_RESOURCE".to_string()))
         .module_template(Some("mapper.xml.tera".to_string()))
         .module_package(Some("mapper".to_string()))
-        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_path(Some(format!("{}-domain", project.project_name)))
         .module_suffix(Some("Mapper".to_string()))
         .module_output(Some("Mapper.xml".to_string()))
         .build()
@@ -563,15 +563,15 @@ fn get_mvc_feature_modules(
         .module_model(Some(clazz_model.clone()))
         .module_name(Some("ENTITY".to_string()))
         .module_template(Some("entity_convert.java.tera".to_string()))
-        .module_package(Some("infrastructure.convert".to_string()))
-        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_package(Some("domain.convert".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
         .module_suffix(Some("EntityConvert".to_string()))
         .module_output(Some("EntityConvert.java".to_string()))
         .build()
         .refresh();
     modules.insert("entity_convert", entity_convert_module);
 
-    let mut model_module = JavaModule::builder()
+    let model_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))
@@ -601,7 +601,7 @@ fn get_mvc_feature_modules(
         .build()
         .refresh();
 
-    modules.insert("repository", repository_module);
+    // modules.insert("repository", repository_module);
 
     let repository_impl_module = JavaModule::builder()
         .project(Some(project.clone()))
@@ -609,17 +609,17 @@ fn get_mvc_feature_modules(
         .module_model(Some(clazz_model.clone()))
         .module_name(Some("REPOSITORY_IMPL".to_string()))
         .module_template(Some("repository_impl.java.tera".to_string()))
-        .module_package(Some("infrastructure.repository".to_string()))
-        // .module_package_suffix(Some("impl".to_string()))
-        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_package(Some("domain.repository".to_string()))
+        .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
         .module_suffix(Some("RepositoryImpl".to_string()))
         .module_output(Some("RepositoryImpl.java".to_string()))
         .build()
         .refresh();
 
-    modules.insert("repository_impl", repository_impl_module);
+    // modules.insert("repository_impl", repository_impl_module);
 
-    let mut service_module = JavaModule::builder()
+    let service_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
         .module_model(Some(clazz_model.clone()))

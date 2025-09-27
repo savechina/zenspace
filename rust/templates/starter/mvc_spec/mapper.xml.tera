@@ -1,0 +1,128 @@
+{%- set mapper_package = modules.mapper.full_package  -%}
+
+{%- set entity_package = modules.entity.full_package  -%}
+{%- set entity_name = modules.entity.full_name -%}
+
+{%- set entity_path = entity_package ~ "." ~ entity_name-%}
+{%- set namespace = mapper_package ~ "." ~ modules.mapper.full_name -%}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="{{ namespace }}">
+
+    <resultMap id="BaseResultMap" type="{{ entity_path }}">
+        {% for field in model.fields %}
+        <result column="{{ field.column_name }}" jdbcType="{{ field.jdbc_type }}" property="{{ field.field_name }}"/>
+        {%- endfor %}
+    </resultMap>
+
+    <sql id="Base_Column_List">
+        {% for field in model.fields %}
+        {%- if loop.first -%}
+          {{ field.column_name }}
+        {%- else -%}
+          ,{{ field.column_name }}
+        {%- endif %}
+        {% endfor %}
+    </sql>
+
+    <insert id="insert" parameterType="{{ entity_path }}">
+        insert into {{ model.table_name }}
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            {% for field in model.fields %}
+            {%- if not loop.first -%},{%- endif -%}{{ field.column_name }}
+            {% endfor %}
+        </trim>
+        <trim prefix="values (" suffix=")" suffixOverrides=",">
+            {% for field in model.fields %}
+            {%- if not loop.first -%},{%- endif -%}#{ {{ field.field_name }} }
+            {% endfor %}
+        </trim>
+    </insert>
+
+    <insert id="insertBatch" parameterType="java.util.List">
+        insert into {{ model.table_name }}
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            {% for field in model.fields %}
+            {%- if not loop.first -%},{%- endif -%}{{ field.column_name }}
+            {% endfor %}
+        </trim>
+        values
+        <foreach collection="list" item="item" separator=",">
+            (
+            {% for field in model.fields %}
+            {%- if not loop.first -%},{%- endif -%}#{ item.{{ field.field_name }} }
+            {% endfor %}
+            )
+        </foreach>
+    </insert>
+
+    <delete id="deleteByPrimaryKey" parameterType="java.lang.Long">
+        delete from {{ model.table_name }}
+        where id = #{id}
+    </delete>
+
+    <delete id="deleteBatchByPrimaryKey" parameterType="java.util.List">
+        delete from {{ model.table_name }}
+        where id in
+        <foreach collection="list" item="item" open="(" close=")" separator=",">
+            #{item}
+        </foreach>
+    </delete>
+
+    <update id="update" parameterType="{{ entity_path }}">
+        update {{ model.table_name }}
+        <set>
+            {% for field in model.fields %}
+            <if test="{{ field.field_name }} != null">
+                {{ field.column_name }} = #{ {{ field.field_name }},jdbcType={{ field.jdbc_type }} },
+            </if>
+            {% endfor %}
+        </set>
+        where id = #{id}
+    </update>
+
+    <update id="updateBatch" parameterType="{{ entity_path }}">
+        <foreach collection="list" item="item" index="index" separator=";">
+            update {{ model.table_name }}
+            <set>
+                {% for field in model.fields %}
+                <if test="item.{{ field.field_name }} != null">
+                    {{ field.column_name }} = #{ item.{{ field.field_name }},jdbcType={{ field.jdbc_type }} },
+                </if>
+                {% endfor %}
+            </set>
+            where id = #{item.id}
+        </foreach>
+    </update>
+
+    <select id="selectBy" parameterType="{{ entity_path }}" resultMap="BaseResultMap">
+        select
+        <include refid="Base_Column_List" />
+        from {{ model.table_name }}
+        <where>
+            1=1
+            {%- for field in model.fields -%}
+            {% if field.column_name == "id" %}
+            <if test="id != null">
+                and id = #{id,jdbcType=BIGINT}
+            </if>
+            {%- else -%}
+            <if test="{{ field.field_name }} != null and {{ field.field_name }} != ''">
+                and {{ field.column_name }} = #{ {{ field.field_name }},jdbcType={{ field.jdbc_type }} }
+            </if>
+            {% endif %}
+            {%- endfor -%}
+        </where>
+        order by id desc
+    </select>
+
+    <select id="getById" parameterType="java.lang.Long" resultMap="BaseResultMap">
+        select
+        <include refid="Base_Column_List" />
+        from {{ model.table_name }}
+        <where>
+            id = #{id}
+        </where>
+        order by id desc
+    </select>
+</mapper>
