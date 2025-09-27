@@ -5,13 +5,15 @@ use crate::util;
 use heck::{self, ToLowerCamelCase, ToPascalCase, ToSnekCase, ToTitleCase, ToUpperCamelCase};
 use std::collections::HashMap;
 use std::env::{self, home_dir};
-use std::fs::DirEntry;
 use std::fs::{self, FileType};
+use std::fs::{DirEntry, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 use tera::{Context, Tera, Value};
+use tracing_subscriber::fmt::MakeWriter;
 
 pub(crate) fn init(project: Project, output_root: PathBuf) {
     println!("{} ", "Develop initialize:");
@@ -389,7 +391,7 @@ pub(crate) fn add_feature(
     entity_module.refresh();
 
     let output_path = PathBuf::new()
-        .join(output_root)
+        .join(output_root.clone())
         .join(entity_module.clone().output_path().unwrap());
 
     dbg!(entity_module.clone());
@@ -439,15 +441,10 @@ pub(crate) fn add_feature(
 
     let mut modules = HashMap::new();
 
-    modules.insert("entity", &entity_module);
-    modules.insert("model", &model_module);
-    modules.insert("vo", &view_module);
-    modules.insert("entity_convert", &entity_convert_module);
-
-    for (name, module) in modules.clone() {
-        dbg!(name);
-        dbg!(module);
-    }
+    modules.insert("entity", entity_module);
+    modules.insert("model", model_module);
+    modules.insert("vo", view_module);
+    modules.insert("entity_convert", entity_convert_module);
 
     // 1. 创建 Tera 实例
     let mut tera = Tera::default();
@@ -461,15 +458,33 @@ pub(crate) fn add_feature(
     context.insert("project", &project);
     context.insert("model", &clazz_model);
 
-    // 获取模板及内容
-    let template_entry = util::TEMPLATES
-        .get_file(format!("{}/{}", template_base, "entity_convert.java.tera"))
-        .unwrap();
+    for (name, module) in &mut modules {
+        let template_file = module.module_template.clone().unwrap();
 
-    let template_context = template_entry.contents_utf8().unwrap();
+        let output_path = PathBuf::new()
+            .join(output_root.clone())
+            .join(module.output_path().unwrap());
 
-    // 渲染处理模板内容
-    let result = tera.render_str(template_context, &context);
+        dbg!(name);
 
-    println!("temtlate output:\n{}", result.unwrap())
+        // 获取模板及内容
+        let template_entry = util::TEMPLATES
+            .get_file(format!("{}/{}", template_base, template_file))
+            .unwrap();
+
+        let template_context = template_entry.contents_utf8().unwrap();
+
+        // 渲染处理模板内容
+        let result = tera.render_str(template_context, &context);
+
+        let output_dir = output_path.parent().unwrap();
+
+        fs::create_dir_all(output_dir);
+
+        let mut file = File::create(output_path.clone()).unwrap();
+
+        fs::write(output_path.clone(), result.unwrap());
+
+        println!("temtlate output:{} \n", output_path.display())
+    }
 }
