@@ -90,7 +90,7 @@ pub(crate) async fn add(feature_name: String, table_name: String, project: Proje
     //pwd current directory
     let current_dir = env::current_dir().unwrap();
 
-    let output_root = current_dir.join("target");
+    let output_root = current_dir;
     println!("Output: {}", output_root.display());
 
     let char = JavaTypes::Char.info();
@@ -374,6 +374,8 @@ pub(crate) fn add_feature(
     template_base: String,
     output_root: PathBuf,
 ) {
+    let mut modules = HashMap::new();
+
     let mut entity_module = JavaModule::builder()
         .project(Some(project.clone()))
         .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
@@ -381,7 +383,7 @@ pub(crate) fn add_feature(
         .module_name(Some("ENTITY".to_string()))
         .module_template(Some("entity.java.tera".to_string()))
         .module_package(Some("infrastructure.entity".to_string()))
-        .module_package_suffix(Some("impl".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
         .module_path(Some(format!("{}-infrastructure", project.project_name)))
         .module_suffix(Some("Entity".to_string()))
         .module_output(Some("Entity.java".to_string()))
@@ -389,14 +391,38 @@ pub(crate) fn add_feature(
         .refresh();
 
     entity_module.refresh();
+    modules.insert("entity", entity_module);
 
-    let output_path = PathBuf::new()
-        .join(output_root.clone())
-        .join(entity_module.clone().output_path().unwrap());
+    let mut mapper_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("MAPPER".to_string()))
+        .module_template(Some("dao.java.tera".to_string()))
+        .module_package(Some("infrastructure.mapper".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("Mapper".to_string()))
+        .module_output(Some("Mapper.java".to_string()))
+        .build()
+        .refresh();
 
-    dbg!(entity_module.clone());
+    modules.insert("mapper", mapper_module);
 
-    println!("entity_module: {}", output_path.display());
+    let mut mapper_res_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::RESOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("MAPPER_RESOURCE".to_string()))
+        .module_template(Some("mapper.xml.tera".to_string()))
+        .module_package(Some("mapper".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("Mapper".to_string()))
+        .module_output(Some("Mapper.xml".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("mapper_resource", mapper_res_module);
 
     let mut entity_convert_module = JavaModule::builder()
         .project(Some(project.clone()))
@@ -410,6 +436,7 @@ pub(crate) fn add_feature(
         .module_output(Some("EntityConvert.java".to_string()))
         .build()
         .refresh();
+    modules.insert("entity_convert", entity_convert_module);
 
     let mut model_module = JavaModule::builder()
         .project(Some(project.clone()))
@@ -418,12 +445,78 @@ pub(crate) fn add_feature(
         .module_name(Some("MODEL".to_string()))
         .module_template(Some("model.java.tera".to_string()))
         .module_package(Some("domain.model".to_string()))
-        .module_package_suffix(Some("impl".to_string()))
+        .module_package_suffix(None)
         .module_path(Some(format!("{}-domain", project.project_name)))
         .module_suffix(Some("DO".to_string()))
         .module_output(Some("DO.java".to_string()))
         .build()
         .refresh();
+
+    modules.insert("model", model_module);
+
+    let mut repository_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("REPOSITORY".to_string()))
+        .module_template(Some("repository.java.tera".to_string()))
+        .module_package(Some("domain.repository".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("Repository".to_string()))
+        .module_output(Some("Repository.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("repository", repository_module);
+
+    let mut repository_impl_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("REPOSITORY_IMPL".to_string()))
+        .module_template(Some("repository_impl.java.tera".to_string()))
+        .module_package(Some("infrastructure.repository".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-infrastructure", project.project_name)))
+        .module_suffix(Some("RepositoryImpl".to_string()))
+        .module_output(Some("RepositoryImpl.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("repository_impl", repository_impl_module);
+
+    let mut service_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("SERVICE".to_string()))
+        .module_template(Some("service.java.tera".to_string()))
+        .module_package(Some("domain.service".to_string()))
+        // .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("Service".to_string()))
+        .module_output(Some("Service.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("service", service_module);
+
+    let mut service_impl_module = JavaModule::builder()
+        .project(Some(project.clone()))
+        .module_type(Some(JavaModule::SOURCE_TYPE.to_string()))
+        .module_model(Some(clazz_model.clone()))
+        .module_name(Some("SERVICE_IMPL".to_string()))
+        .module_template(Some("service_impl.java.tera".to_string()))
+        .module_package(Some("domain.service".to_string()))
+        .module_package_suffix(Some("impl".to_string()))
+        .module_path(Some(format!("{}-domain", project.project_name)))
+        .module_suffix(Some("ServiceImpl".to_string()))
+        .module_output(Some("ServiceImpl.java".to_string()))
+        .build()
+        .refresh();
+
+    modules.insert("service_impl", service_impl_module);
 
     let mut view_module = JavaModule::builder()
         .project(Some(project.clone()))
@@ -439,12 +532,7 @@ pub(crate) fn add_feature(
         .build()
         .refresh();
 
-    let mut modules = HashMap::new();
-
-    modules.insert("entity", entity_module);
-    modules.insert("model", model_module);
     modules.insert("vo", view_module);
-    modules.insert("entity_convert", entity_convert_module);
 
     // 1. 创建 Tera 实例
     let mut tera = Tera::default();

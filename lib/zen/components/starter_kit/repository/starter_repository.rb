@@ -15,12 +15,12 @@ module Zen
           JavaField = StarterKit::Model::JavaField
 
           def fetch_all_tables
-            db.create_table :posts do
-              primary_key :id
-              column :title, String
-              String :content
-              index :title
-            end
+            # db.create_table :posts do
+            #   primary_key :id
+            #   column :title, String
+            #   String :content
+            #   index :title
+            # end
 
             # puts "#{db.tables}"
             db.tables

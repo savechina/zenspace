@@ -3,7 +3,8 @@
 {%- set entity_package = modules.entity.full_package  -%}
 {%- set entity_name = modules.entity.full_name -%}
 
-{%- set namespace = mapper_package ~ "." ~ modules.entity.full_name -%}
+{%- set entity_path = entity_package ~ "." ~ entity_name-%}
+{%- set namespace = mapper_package ~ "." ~ modules.mapper.full_name -%}
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="{{ namespace }}">
@@ -11,12 +12,16 @@
     <resultMap id="BaseResultMap" type="{{ entity_path }}">
         {% for field in model.fields %}
         <result column="{{ field.column_name }}" jdbcType="{{ field.jdbc_type }}" property="{{ field.field_name }}"/>
-        {% endfor %}
+        {%- endfor %}
     </resultMap>
 
     <sql id="Base_Column_List">
         {% for field in model.fields %}
-        {{- "," if loop.first == false }}{{ field.column_name }}
+        {%- if loop.first -%}
+          {{ field.column_name }}
+        {%- else -%}
+          ,{{ field.column_name }}
+        {%- endif %}
         {% endfor %}
     </sql>
 
@@ -24,12 +29,12 @@
         insert into {{ model.table_name }}
         <trim prefix="(" suffix=")" suffixOverrides=",">
             {% for field in model.fields %}
-            {{- "," if loop.first == false }}{{ field.column_name }}
+            {%- if not loop.first -%},{%- endif -%}{{ field.column_name }}
             {% endfor %}
         </trim>
         <trim prefix="values (" suffix=")" suffixOverrides=",">
             {% for field in model.fields %}
-            {{- "," if loop.first == false }}#{ {{ field.field_name }} }
+            {%- if not loop.first -%},{%- endif -%}#{ {{ field.field_name }} }
             {% endfor %}
         </trim>
     </insert>
@@ -38,14 +43,14 @@
         insert into {{ model.table_name }}
         <trim prefix="(" suffix=")" suffixOverrides=",">
             {% for field in model.fields %}
-            {{- "," if loop.first == false }}{{ field.column_name }}
+            {%- if not loop.first -%},{%- endif -%}{{ field.column_name }}
             {% endfor %}
         </trim>
         values
         <foreach collection="list" item="item" separator=",">
             (
             {% for field in model.fields %}
-            {{- "," if loop.first == false }}#{ item.{{ field.field_name }} }
+            {%- if not loop.first -%},{%- endif -%}#{ item.{{ field.field_name }} }
             {% endfor %}
             )
         </foreach>
@@ -96,17 +101,17 @@
         from {{ model.table_name }}
         <where>
             1=1
-            {% for field in model.fields %}
+            {%- for field in model.fields -%}
             {% if field.column_name == "id" %}
             <if test="id != null">
                 and id = #{id,jdbcType=BIGINT}
             </if>
-            {% else %}
+            {%- else -%}
             <if test="{{ field.field_name }} != null and {{ field.field_name }} != ''">
                 and {{ field.column_name }} = #{ {{ field.field_name }},jdbcType={{ field.jdbc_type }} }
             </if>
             {% endif %}
-            {% endfor %}
+            {%- endfor -%}
         </where>
         order by id desc
     </select>

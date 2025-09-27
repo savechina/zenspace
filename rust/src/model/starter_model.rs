@@ -133,7 +133,7 @@ impl JavaModule {
                     match &self.module_package_suffix {
                         Some(suffix) => Some(format!(
                             "{}.{}.{}.{}",
-                            project.package_name, module_package, suffix, model.package_name
+                            project.package_name, module_package, model.package_name, suffix
                         )),
                         None => Some(format!(
                             "{}.{}.{}",
@@ -144,7 +144,15 @@ impl JavaModule {
                     None
                 }
             }
-            Some(module_type) if module_type == Self::RESOURCE_TYPE => self.module_package.clone(),
+            Some(module_type) if module_type == Self::RESOURCE_TYPE => {
+                if let (Some(module_package), Some(model)) =
+                    (&self.module_package, &self.module_model)
+                {
+                    Some(format!("{}.{}", module_package, model.package_name))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -153,9 +161,9 @@ impl JavaModule {
         match &self.module_type {
             Some(module_type) => {
                 let root = if module_type == Self::SOURCE_TYPE {
-                    Self::SOURCE_TYPE
+                    Self::SOURCES_ROOT
                 } else if module_type == Self::RESOURCE_TYPE {
-                    Self::RESOURCE_TYPE
+                    Self::RESOURCES_ROOT
                 } else {
                     return None;
                 };
@@ -198,7 +206,7 @@ impl JavaModule {
 
         let output_path = PathBuf::new()
             .join(self.full_path().unwrap())
-            .join(clazz_model.package_name.clone())
+            // .join(clazz_model.package_name.clone())
             .join(format!(
                 "{}{}{}",
                 clazz_model.feature_name.to_pascal_case(),

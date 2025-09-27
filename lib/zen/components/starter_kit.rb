@@ -195,7 +195,7 @@ module Zen
         mapper_res_module.project = project
         mapper_res_module.module_package = "mapper"
         mapper_res_module.module_path = "#{project.project_name}-infrastructure"
-        mapper_res_module.module_type = "resource"
+        mapper_res_module.module_type =  Model::JavaModule::RESOURCE_TYPE
         mapper_res_module.module_suffix = "Mapper"
         mapper_res_module.module_output = "Mapper.xml"
 
