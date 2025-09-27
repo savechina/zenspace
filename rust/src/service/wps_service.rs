@@ -6,6 +6,7 @@ use chrono::Local;
 use chrono::TimeZone;
 use chrono::Utc;
 
+use std::fs;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -102,6 +103,68 @@ pub(crate) fn archive(
 
         //zstd to compress file
         zstds(file, archive_file)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
+    //user home path
+    let home = home::home_dir().expect("failed found HOME");
+
+    // user documents path
+    let documents = home.join("Documents");
+    let archive_path = documents.join("Archive");
+
+    let dotpath = "dotfiles3";
+
+    let file_list = vec![
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".profile",
+        ".gitconfig",
+        ".ssh",
+        ".m2/setting.xml",
+        ".rbenv/version",
+        ".pyenv/version",
+        ".vimrc",
+        ".vim",
+        ".config/gem",
+        ".config/gh",
+        ".config/pip",
+    ];
+
+    if restore {
+        println!("restore:");
+    } else {
+        println!("backup:");
+
+        for file in file_list {
+            let from_path = home.join(file);
+            let to_path = archive_path.join(dotpath).join(file);
+            let to_dir = to_path.parent().expect("not found parent direcotry");
+
+            println!(
+                "from:{},to:{},is_file:{},{}",
+                from_path.display(),
+                to_path.display(),
+                to_path.is_file(),
+                to_dir.display()
+            );
+
+            if !to_dir.exists() {
+                println!("create:{}", to_dir.display());
+                fs::create_dir_all(to_dir).expect("failed to create dir");
+            }
+
+            if from_path.exists() {
+                if from_path.is_file() {
+                    fs::copy(from_path, to_path).unwrap();
+                }
+
+                // todo: copy directory
+            }
+        }
     }
     Ok(())
 }

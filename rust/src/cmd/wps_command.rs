@@ -10,13 +10,18 @@ pub(crate) enum WpsCommands {
         /// The DIRECTORY
         from_dir: Option<String>,
     },
+    /// Dotfiles backup and restore.
+    Dotfiles {
+        #[arg(short, long, default_value = "false")]
+        restore: bool,
+    },
     /// The unixtime converter.
     /// The starting point for Unix Time is January 1, 1970, at 00:00:00 UTC.
     Unixtime {
         /// The TIMESTAMP
         timestamp: Option<i64>,
         /// TIMESTAMP timeunit. :s, :ms ,:us ,:ns
-        #[arg(short = 't', default_value = "s")]
+        #[arg(short = 't', long, default_value = "s")]
         timeunit: String,
     },
     // /// Subtracts two numbers
@@ -41,6 +46,10 @@ pub(crate) fn excute_command(operation: &WpsCommands) {
             );
 
             wps_service::archive(from_dir.clone(), None).unwrap();
+        }
+        WpsCommands::Dotfiles { restore } => {
+            println!("dotfiles restore: {}", restore);
+            wps_service::dotfiles(restore.clone()).unwrap();
         }
         WpsCommands::Unixtime {
             timestamp,
