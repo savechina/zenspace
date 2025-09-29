@@ -11,12 +11,14 @@ pub(crate) enum WpsCommands {
         from_dir: Option<String>,
     },
     /// Dotfiles backup and restore.
+    #[command(visible_aliases = ["dot"] )]
     Dotfiles {
         #[arg(short, long, default_value = "false")]
         restore: bool,
     },
     /// The unixtime converter.
     /// The starting point for Unix Time is January 1, 1970, at 00:00:00 UTC.
+    #[command(visible_aliases = ["time","t","timestamp"] )]
     Unixtime {
         /// The TIMESTAMP
         timestamp: Option<i64>,
@@ -24,13 +26,6 @@ pub(crate) enum WpsCommands {
         #[arg(short = 't', long, default_value = "s")]
         timeunit: String,
     },
-    // /// Subtracts two numbers
-    // Sub {
-    //     /// The first number
-    //     a: i32,
-    //     /// The second number
-    //     b: i32,
-    // },
 }
 
 ///执行 clac command run

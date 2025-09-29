@@ -1,17 +1,19 @@
-use crate::errors::ServiceError;
-use crate::util;
 use chrono::Date;
 use chrono::DateTime;
 use chrono::Local;
 use chrono::TimeZone;
 use chrono::Utc;
-
+use fs_extra;
+use fs_extra::dir::CopyOptions;
 use std::fs;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+
+use crate::errors::ServiceError;
+use crate::util;
 
 pub(crate) fn zstds(from_dir: PathBuf, output_file: PathBuf) -> Result<(), ServiceError> {
     //check command exists
@@ -110,12 +112,11 @@ pub(crate) fn archive(
 pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
     //user home path
     let home = home::home_dir().expect("failed found HOME");
+    let dotfiles_path = "dotfiles";
 
     // user documents path
     let documents = home.join("Documents");
-    let archive_path = documents.join("Archive");
-
-    let dotpath = "dotfiles3";
+    let archive_path = documents.join("Archive").join(dotfiles_path);
 
     let file_list = vec![
         ".zshrc",
@@ -132,6 +133,9 @@ pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
         ".config/gem",
         ".config/gh",
         ".config/pip",
+        ".bundle/config",
+        // ".tiup/data",
+        "Library/DBeaverData/workspace6",
     ];
 
     if restore {
@@ -141,16 +145,8 @@ pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
 
         for file in file_list {
             let from_path = home.join(file);
-            let to_path = archive_path.join(dotpath).join(file);
+            let to_path = archive_path.join(file);
             let to_dir = to_path.parent().expect("not found parent direcotry");
-
-            println!(
-                "from:{},to:{},is_file:{},{}",
-                from_path.display(),
-                to_path.display(),
-                to_path.is_file(),
-                to_dir.display()
-            );
 
             if !to_dir.exists() {
                 println!("create:{}", to_dir.display());
@@ -158,11 +154,16 @@ pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
             }
 
             if from_path.exists() {
-                if from_path.is_file() {
-                    fs::copy(from_path, to_path).unwrap();
+                println!("from:{},to:{}", from_path.display(), to_path.display(),);
+
+                if to_path.exists() {
+                    let _ = fs_extra::remove_items(&[to_path.clone()]);
                 }
 
-                // todo: copy directory
+                //copy directory and file
+                let options = CopyOptions::new().overwrite(true).copy_inside(true);
+                let _status = fs_extra::copy_items(&[from_path.clone()], to_dir, &options)
+                    .expect("copy to is error");
             }
         }
     }

@@ -2,6 +2,7 @@ use std::error::Error;
 
 #[macro_use]
 extern crate getset;
+extern crate fs_extra;
 
 mod cli;
 mod cmd;

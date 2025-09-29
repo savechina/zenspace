@@ -34,3 +34,4 @@ sqlx = { version = "0.8.6", features = [
     "runtime-tokio",
 ] }
 tokio = { version = "1.47.1", features = ["full"] }
+fs_extra = "1.3.0"
