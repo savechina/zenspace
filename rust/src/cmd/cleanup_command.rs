@@ -1,6 +1,4 @@
 use clap::{Args, Subcommand};
-use include_dir::Dir;
-use tracing_subscriber::filter::targets;
 
 use crate::service::cleanup_service;
 
@@ -14,7 +12,7 @@ pub(crate) enum CleanupCommands {
     Cache,
 }
 
-///执行 clac command run
+///执行 Clean command run
 pub(crate) fn excute_command(operation: &CleanupCommands) {
     match operation {
         CleanupCommands::All => {
@@ -26,12 +24,6 @@ pub(crate) fn excute_command(operation: &CleanupCommands) {
 
         CleanupCommands::Cache => {
             cleanup_service::clean_cache();
-        } // None => {
-          //     // This is the default behavior.
-          //     // You can print a help message, run another subcommand, etc.
-          //     println!("No subcommand provided. Running the default behavior.");
-          //     // Example: run the "list" command by default
-          //     run_default_list_command();
-          // }
+        }
     }
 }

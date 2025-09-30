@@ -1,10 +1,10 @@
 use anyhow::Result;
+use glob;
 use heck::{ToLowerCamelCase, ToPascalCase};
+use include_dir::{Dir, include_dir};
 use std::{collections::HashMap, env, path::PathBuf, sync::LazyLock};
 use tera::Value;
 use which;
-
-use include_dir::{Dir, include_dir};
 
 /// Assets
 pub(crate) static ASSETS: Dir = include_dir!("assets");
@@ -32,6 +32,28 @@ pub(crate) fn command_exists(command: &str) -> bool {
     };
 
     exists
+}
+
+///delete file from glob match `path_pattern` files list
+pub(crate) fn delete_pattern(path_pattern: &str) {
+    // Collect all matching paths.
+    let mut file_list: Vec<PathBuf> = Vec::new();
+
+    // use path pattern glob find all matchs files
+    for entry in glob::glob(path_pattern).unwrap() {
+        if let Ok(path) = entry {
+            file_list.push(path);
+        }
+    }
+
+    // Use fs_extra to remove the collected items.
+    if !file_list.is_empty() {
+        println!("Deleting the following files: {:?}", file_list);
+        fs_extra::remove_items(&file_list)
+            .expect(format!("Deleting {} files failed", path_pattern).as_str());
+    } else {
+        println!("No {} files found to delete.", path_pattern);
+    }
 }
 
 /// 定义to_pascal_case过滤器函数

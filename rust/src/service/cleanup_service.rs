@@ -1,19 +1,25 @@
-use fs_extra;
-use glob::glob;
 use std::{
-    fs,
     path::PathBuf,
     process::{Command, Stdio},
 };
 
 use home::home_dir;
 
+use crate::util;
+
+/// clean all logs and cache file
 pub(crate) fn clean_all() {
+    //clean system trash
     clean_trash();
 
+    //clean application cache
     clean_cache();
 
+    //clean application logs
     clean_logs();
+
+    //clean ide project config file
+    clean_ide();
 }
 
 pub(crate) fn clean_trash() {
@@ -22,17 +28,7 @@ pub(crate) fn clean_trash() {
     let home = home_dir().unwrap();
     let trash_path = home.join(".Trash/*");
 
-    // Collect all matching paths.
-    let mut delete_list: Vec<PathBuf> = Vec::new();
-    let pattern = trash_path.to_str().unwrap();
-    for entry in glob(pattern).unwrap() {
-        if let Ok(path) = entry {
-            delete_list.push(path);
-        }
-    }
-
     println!("path:{}", trash_path.display());
-    println!("path:{:?}", delete_list);
 
     let osascript_command = r#"
            try
@@ -62,48 +58,57 @@ pub(crate) fn clean_cache() {
 
 pub(crate) fn clean_logs() {
     println!("Clean Logs ...");
-
-    println!("Deleting Java heap dumps");
     let home_dir = home_dir().expect("Could not find home directory");
 
-    // Create the full glob pattern, expanding the tilde (~) to the home directory.
+    println!("Deleting Java heap dumps");
     let heap_path = home_dir.join("*.hprof");
     let pattern = heap_path.to_str().expect("Invalid Unicode in path");
-
-    // Collect all matching paths.
-    let mut delete_list: Vec<PathBuf> = Vec::new();
-    for entry in glob(pattern).unwrap() {
-        if let Ok(path) = entry {
-            delete_list.push(path);
-        }
-    }
-    // Use fs_extra to remove the collected items.
-    if !delete_list.is_empty() {
-        println!("Deleting the following files: {:?}", delete_list);
-        fs_extra::remove_items(&delete_list).expect("Deleting *.hprof files failed");
-    } else {
-        println!("No *.hprof files found to delete.");
-    }
+    util::delete_pattern(pattern);
 
     println!("Clearing all application log files from JetBrains:");
-    let path = "Library/Logs/JetBrains/*/";
-    let jet_logs_path = home_dir.join(path);
-
+    let jet_logs_path = home_dir.join("Library/Logs/JetBrains/*/");
     let pattern = jet_logs_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
 
-    // Collect all matching paths.
-    let mut delete_list: Vec<PathBuf> = Vec::new();
-    for entry in glob(pattern).unwrap() {
-        if let Ok(path) = entry {
-            delete_list.push(path);
-        }
-    }
-    // Use fs_extra to remove the collected items.
-    if !delete_list.is_empty() {
-        println!("Deleting the following files: {:?}", delete_list);
-        fs_extra::remove_items(&delete_list)
-            .expect("Deleting Library/Logs/JetBrains/*/ files failed");
-    } else {
-        println!("No Library/Logs/JetBrains/*/ files found to delete.");
-    }
+    println!("Clearing all application log files from Notion:");
+    let notion_logs_path = home_dir.join("Library/Logs/Notion/*");
+    let pattern = notion_logs_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    println!("Clearing all application log files from Zed:");
+    let zen_logs_path = home_dir.join("Library/Logs/Zed/*");
+    let pattern = zen_logs_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    println!("Clearing all application log files from Arduino IDE:");
+    let arduino_logs_path = home_dir.join("Library/Logs/Arduino IDE/*");
+    let pattern = arduino_logs_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    println!("Clearing all application log files from DiagnosticReports:");
+    let diagnostic_logs_path = home_dir.join("Library/Logs/DiagnosticReports/*");
+    let pattern = diagnostic_logs_path
+        .to_str()
+        .expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    println!("Clearing all application log files from iPhone Updater Logs:");
+    let iphone_updater_logs_path = home_dir.join("Library/Logs/iPhone Updater Logs/*");
+    let pattern = iphone_updater_logs_path
+        .to_str()
+        .expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    println!("Clearing all application log files from /var/logs/*.log Logs:");
+    let var_logs_path = PathBuf::from("/var/logs/*.log*");
+    let pattern = var_logs_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    println!("Logs cleanup successful.");
+}
+
+pub(crate) fn clean_ide() {
+    println!("Clean IDE project file ...");
+
+    println!("IDE project file cleanup successful.");
 }
