@@ -38,6 +38,10 @@ pub(crate) fn clean_trash() {
            end try
        "#;
 
+    if !util::command_exists("osascript") {
+        println!("osascript command is not available.please check your macos version.");
+    }
+
     let status = Command::new("osascript")
         .arg("-e")
         .arg(osascript_command)
@@ -54,6 +58,49 @@ pub(crate) fn clean_trash() {
 }
 pub(crate) fn clean_cache() {
     println!("Clean Cache ...");
+
+    println!("Cleaning RubyGems cache");
+
+    let gem_command = "gem";
+    if !util::command_exists(gem_command) {
+        println!("osascript command is not available.please check your macos version.");
+    }
+
+    let status = Command::new(gem_command)
+        .arg("cleanup")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect(format!("failed to execute {} command", gem_command).as_str());
+
+    if status.success() {
+        println!("{} cache cleanup successful.", gem_command);
+    } else {
+        eprintln!(
+            "{} cache cleanup might have failed for other reasons.",
+            gem_command
+        );
+    }
+
+    println!("Cleaning Homebrew cache");
+
+    let brew = "brew";
+    if !util::command_exists(brew) {
+        println!("brew command is not available.please install `brew` command.");
+    }
+
+    let status = Command::new(brew)
+        .arg("cleanup")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect(format!("failed to execute {} command", brew).as_str());
+
+    if status.success() {
+        println!("Homebrew cache cleanup successful.");
+    } else {
+        eprintln!("Homebrew cache cleanup might have failed for other reasons.",);
+    }
 }
 
 pub(crate) fn clean_logs() {
