@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 // use dotenvy;
 
+use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::starter_command::{self, StarterCommands};
 use crate::cmd::wps_command::{self, WpsCommands};
 
@@ -17,6 +18,11 @@ struct Cli {
 enum Commands {
     /// Hello say Name
     Hello { name: String },
+    /// cleanup trash, cache, logs etc.
+    Clean {
+        #[command(subcommand)]
+        operation: Option<CleanupCommands>,
+    },
 
     /// init project from template and add new feature to prjoct
     Starter {
@@ -41,6 +47,11 @@ pub(crate) fn shell() {
     match &cli.command {
         Commands::Hello { name } => {
             println!("hello:\n{}", name)
+        }
+
+        Commands::Clean { operation } => {
+            let op = operation.as_ref().unwrap_or(&CleanupCommands::Trash);
+            cleanup_command::excute_command(op);
         }
 
         Commands::Starter { operation } => {

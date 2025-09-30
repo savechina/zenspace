@@ -3141,6 +3141,7 @@ dependencies = [
  "dotenvy",
  "fs_extra",
  "getset",
+ "glob",
  "heck",
  "home",
  "include_dir",
