@@ -101,6 +101,30 @@ pub(crate) fn clean_cache() {
     } else {
         eprintln!("Homebrew cache cleanup might have failed for other reasons.",);
     }
+
+    println!("Cleaning Go cache");
+
+    let golang = "go";
+    if !util::command_exists(golang) {
+        println!("go command is not available.please install `go` command.");
+    }
+
+    let status = Command::new(golang)
+        .arg("clean")
+        .arg("-cache")
+        .arg("-modcache")
+        .arg("-testcache")
+        .arg("-fuzzcache")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect(format!("failed to execute {} command", golang).as_str());
+
+    if status.success() {
+        println!("Go cache cleanup successful.");
+    } else {
+        eprintln!("Go cache cleanup might have failed for other reasons.",);
+    }
 }
 
 pub(crate) fn clean_logs() {
