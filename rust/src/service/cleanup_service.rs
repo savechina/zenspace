@@ -59,71 +59,136 @@ pub(crate) fn clean_trash() {
 pub(crate) fn clean_cache() {
     println!("Clean Cache ...");
 
-    println!("Cleaning RubyGems cache");
-
     let gem_command = "gem";
-    if !util::command_exists(gem_command) {
-        println!("osascript command is not available.please check your macos version.");
-    }
+    if util::command_exists(gem_command) {
+        println!("Cleaning RubyGems cache");
 
-    let status = Command::new(gem_command)
-        .arg("cleanup")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect(format!("failed to execute {} command", gem_command).as_str());
+        let status = Command::new(gem_command)
+            .arg("cleanup")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect(format!("failed to execute {} command", gem_command).as_str());
 
-    if status.success() {
-        println!("{} cache cleanup successful.", gem_command);
+        if status.success() {
+            println!("{} cache cleanup successful.", gem_command);
+        } else {
+            eprintln!(
+                "{} cache cleanup might have failed for other reasons.",
+                gem_command
+            );
+        }
     } else {
-        eprintln!(
-            "{} cache cleanup might have failed for other reasons.",
-            gem_command
-        );
+        // eprintln!("gem command is not available.please install it.");
     }
 
-    println!("Cleaning Homebrew cache");
+    let brew_command = "brew";
+    if util::command_exists(brew_command) {
+        println!("Cleaning Homebrew cache");
+        let status = Command::new(brew_command)
+            .arg("cleanup")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect(format!("failed to execute {} command", brew_command).as_str());
 
-    let brew = "brew";
-    if !util::command_exists(brew) {
-        println!("brew command is not available.please install `brew` command.");
-    }
-
-    let status = Command::new(brew)
-        .arg("cleanup")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect(format!("failed to execute {} command", brew).as_str());
-
-    if status.success() {
-        println!("Homebrew cache cleanup successful.");
+        if status.success() {
+            println!("Homebrew cache cleanup successful.");
+        } else {
+            eprintln!("Homebrew cache cleanup might have failed for other reasons.",);
+        }
     } else {
-        eprintln!("Homebrew cache cleanup might have failed for other reasons.",);
+        // eprintln!("brew command is not available.please install `brew` command.");
     }
 
-    println!("Cleaning Go cache");
+    let golang_command = "go";
+    if util::command_exists(golang_command) {
+        println!("Cleaning Go cache");
 
-    let golang = "go";
-    if !util::command_exists(golang) {
-        println!("go command is not available.please install `go` command.");
-    }
+        let status = Command::new(golang_command)
+            .arg("clean")
+            .arg("-cache")
+            .arg("-modcache")
+            .arg("-testcache")
+            .arg("-fuzzcache")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect(format!("failed to execute {} command", golang_command).as_str());
 
-    let status = Command::new(golang)
-        .arg("clean")
-        .arg("-cache")
-        .arg("-modcache")
-        .arg("-testcache")
-        .arg("-fuzzcache")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .expect(format!("failed to execute {} command", golang).as_str());
-
-    if status.success() {
-        println!("Go cache cleanup successful.");
+        if status.success() {
+            println!("Go cache cleanup successful.");
+        } else {
+            eprintln!("Go cache cleanup might have failed for other reasons.",);
+        }
     } else {
-        eprintln!("Go cache cleanup might have failed for other reasons.",);
+        // eprintln!("go command is not available.please install `go` command.");
+    }
+
+    let poetry_command = "poetry";
+    if util::command_exists(poetry_command) {
+        println!("Cleaning Poetry cache");
+        let status = Command::new(poetry_command)
+            .arg("cache")
+            .arg("clear")
+            .arg("--all")
+            .arg("pypi")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect(format!("failed to execute {} command", poetry_command).as_str());
+
+        if status.success() {
+            println!("Poetry cache cleanup successful.");
+        } else {
+            eprintln!("Poetry cache cleanup might have failed for other reasons.",);
+        }
+    } else {
+        // println!("Poetry command is not available.please install `Poetry` command.");
+    }
+
+    let uv_command = "uv";
+    if util::command_exists(uv_command) {
+        println!("Cleaning uv cache");
+
+        let status = Command::new(uv_command)
+            .arg("cache")
+            .arg("prune")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect(format!("failed to execute {} command", uv_command).as_str());
+        if status.success() {
+            println!("uv cache cleanup successful.");
+        } else {
+            eprintln!("uv cache cleanup might have failed for other reasons.",);
+        }
+    }
+
+    let pip_command = "pip";
+    if util::command_exists(pip_command) {
+        println!("Cleaning pip cache");
+
+        let status = Command::new(pip_command)
+            .arg("cache")
+            .arg("purge")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect(format!("failed to execute {} command", pip_command).as_str());
+        if status.success() {
+            println!("pip cache cleanup successful.");
+        } else {
+            eprintln!("pip cache cleanup might have failed for other reasons.",);
+        }
+    }
+
+    let home_dir = home_dir().expect("Could not find home directory");
+    let cargo_cache_path = home_dir.join(".cargo/registry/cache");
+    if cargo_cache_path.exists() {
+        println!("Cleaning Cargo cache");
+        let pattern = cargo_cache_path.to_str().expect("Invalid Unicode in path");
+        util::delete_pattern(pattern);
     }
 }
 
