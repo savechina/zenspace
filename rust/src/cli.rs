@@ -22,6 +22,8 @@ enum Commands {
     Clean {
         #[command(subcommand)]
         operation: Option<CleanupCommands>,
+        #[arg(short, long, action, default_value = "false")]
+        dry_run: bool,
     },
 
     /// init project from template and add new feature to prjoct
@@ -49,7 +51,7 @@ pub(crate) fn shell() {
             println!("hello:\n{}", name)
         }
 
-        Commands::Clean { operation } => {
+        Commands::Clean { operation, dry_run } => {
             let op = operation.as_ref().unwrap_or(&CleanupCommands::Trash);
             cleanup_command::excute_command(op);
         }

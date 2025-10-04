@@ -184,10 +184,45 @@ pub(crate) fn clean_cache() {
     }
 
     let home_dir = home_dir().expect("Could not find home directory");
-    let cargo_cache_path = home_dir.join(".cargo/registry/cache");
+    let cargo_cache_path = home_dir.join(".cargo/registry");
     if cargo_cache_path.exists() {
         println!("Cleaning Cargo cache");
         let pattern = cargo_cache_path.to_str().expect("Invalid Unicode in path");
+        util::delete_pattern(pattern);
+    }
+
+    let edge_cache_path = home_dir.join("Library/Caches/Microsoft Edge/Default/Cache");
+    if edge_cache_path.exists() {
+        println!("Cleaning Microsoft Edge cache");
+        let pattern = edge_cache_path.to_str().expect("Invalid Unicode in path");
+        util::delete_pattern(pattern);
+    }
+
+    let edge_cache_path = home_dir.join("Library/Caches/Microsoft Edge/Default/Cache");
+    if edge_cache_path.exists() {
+        println!("Cleaning Microsoft Edge cache");
+        let pattern = edge_cache_path.to_str().expect("Invalid Unicode in path");
+        util::delete_pattern(pattern);
+    }
+
+    let edge_cache_path = home_dir.join("Library/Caches/Microsoft Edge/Default/Code Cache");
+    if edge_cache_path.exists() {
+        println!("Cleaning Microsoft Edge Code cache");
+        let pattern = edge_cache_path.to_str().expect("Invalid Unicode in path");
+        util::delete_pattern(pattern);
+    }
+
+    let chrome_cache_path = home_dir.join("Library/Caches/Google/Chrome/Default/Cache");
+    if chrome_cache_path.exists() {
+        println!("Cleaning Google Chrome cache");
+        let pattern = chrome_cache_path.to_str().expect("Invalid Unicode in path");
+        util::delete_pattern(pattern);
+    }
+
+    let chrome_cache_path = home_dir.join("Library/Caches/Google/Chrome/Default/Code Cache");
+    if chrome_cache_path.exists() {
+        println!("Cleaning Google Chrome Code cache");
+        let pattern = chrome_cache_path.to_str().expect("Invalid Unicode in path");
         util::delete_pattern(pattern);
     }
 }
