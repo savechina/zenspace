@@ -134,7 +134,7 @@ pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
         ".config/gh",
         ".config/pip",
         ".bundle/config",
-        // ".tiup/data",
+        ".tiup/data",
         "Library/DBeaverData/workspace6",
     ];
 
