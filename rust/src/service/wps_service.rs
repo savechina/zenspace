@@ -148,12 +148,13 @@ pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
             let to_path = archive_path.join(file);
             let to_dir = to_path.parent().expect("not found parent direcotry");
 
-            if !to_dir.exists() {
-                println!("create:{}", to_dir.display());
-                fs::create_dir_all(to_dir).expect("failed to create dir");
-            }
-
             if from_path.exists() {
+                //create dest directory
+                if !to_dir.exists() {
+                    println!("create:{}", to_dir.display());
+                    fs::create_dir_all(to_dir).expect("failed to create dir");
+                }
+
                 println!("from:{},to:{}", from_path.display(), to_path.display(),);
 
                 if to_path.exists() {
