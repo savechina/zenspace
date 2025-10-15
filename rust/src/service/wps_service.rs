@@ -5,9 +5,11 @@ use chrono::TimeZone;
 use chrono::Utc;
 use fs_extra;
 use fs_extra::dir::CopyOptions;
+use std::env;
 use std::fs;
 use std::io::Error;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
@@ -77,7 +79,20 @@ pub(crate) fn archive(
                 documents.join("Book"),
             ]
         }
-        Some(dir) => vec![PathBuf::from(dir)],
+        Some(dir_name) => {
+            let file_path = Path::new(&dir_name);
+
+            if file_path.is_absolute() {
+                //absolute path
+                vec![PathBuf::from(dir_name)]
+            } else {
+                // Get the current directory's path.
+                let current_dir = env::current_dir().expect("Failed to get current directory");
+                let archive_file = current_dir.join(dir_name);
+
+                vec![archive_file]
+            }
+        }
     };
 
     let archive_path = documents.join("Archive");
