@@ -1,4 +1,5 @@
 use std::{
+    env,
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -280,6 +281,33 @@ pub(crate) fn clean_logs() {
 
 pub(crate) fn clean_ide() {
     println!("Clean IDE project file ...");
+
+    println!("Clearing all files from IDE:");
+    let current_dir = env::current_dir().unwrap();
+
+    let dot_idea_path = current_dir.join(".idea");
+    let pattern = dot_idea_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    let dot_settings_path = current_dir.join("**/.settings");
+    let pattern = dot_settings_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    let dot_flat_path = current_dir.join("**/.flattened-pom.xml");
+    let pattern = dot_flat_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    let dot_project_path = current_dir.join("**/.project");
+    let pattern = dot_project_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    let dot_factory_path = current_dir.join("**/.factorypath");
+    let pattern = dot_factory_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
+
+    let dot_class_path = current_dir.join("**/.classpath");
+    let pattern = dot_class_path.to_str().expect("Invalid Unicode in path");
+    util::delete_pattern(pattern);
 
     println!("IDE project file cleanup successful.");
 }
