@@ -102,7 +102,10 @@ pub(crate) fn archive(
 
         //file not exists ignore
         if !file.exists() {
-            eprintln!("zstd compress directory: {} , not found", file.display());
+            eprintln!(
+                "zstd compress directory: {} , not exists, skip archive",
+                file.display()
+            );
 
             continue;
         }
@@ -134,6 +137,7 @@ pub(crate) fn dotfiles(restore: bool) -> Result<(), ServiceError> {
     let archive_path = documents.join("Archive").join(dotfiles_path);
 
     let file_list = vec![
+        ".bashrc",
         ".zshrc",
         ".zshenv",
         ".zprofile",
