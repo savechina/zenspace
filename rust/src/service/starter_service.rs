@@ -44,14 +44,15 @@ pub(crate) async fn add_feature(feature_name: String, table_name: String, projec
     let mut clazz_list =
         starter_repository::fetch_clazz(Some(table_name.to_ascii_uppercase())).await;
 
-    let clazz_model = clazz_list.first_mut().unwrap();
+    if let Some(clazz_model) = clazz_list.first_mut() {
+        clazz_model.feature_name = feature_name.clone();
+        clazz_model.package_name = feature_name.clone();
 
-    clazz_model.feature_name = feature_name.clone();
-    clazz_model.package_name = feature_name.clone();
-
-    add_feature_modules(project, clazz_model.clone(), output_root);
-
-    println!("Add feature: {} Done", table_name);
+        add_feature_modules(project, clazz_model.clone(), output_root);
+        println!("Add feature: {} Done", table_name);
+    } else {
+        eprintln!("Add feature: {} table not found ", table_name);
+    }
 }
 
 pub(crate) fn develop_tool() {

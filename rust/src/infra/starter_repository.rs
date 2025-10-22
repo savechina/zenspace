@@ -29,7 +29,7 @@ pub(crate) async fn fetch_clazz(table_name: Option<String>) -> Vec<JavaClass> {
           TABLE_NAME,TABLE_COMMENT
         FROM information_schema.TABLES
           WHERE
-            TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            UPPER(TABLE_SCHEMA) = UPPER(?) AND UPPER(TABLE_NAME) = UPPER(?)
         "#;
 
     // 查询数据
