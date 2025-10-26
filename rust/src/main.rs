@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     config::load().expect("failed to load config");
 
-    cli::shell();
+    cli::shell()?;
 
     Ok(())
 }

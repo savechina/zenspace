@@ -1,6 +1,6 @@
 use std::env;
 
-use crate::{model::starter_model::Project, service::starter_service};
+use crate::{errors::ZenError, model::starter_model::Project, service::starter_service};
 
 use clap::Subcommand;
 
@@ -49,7 +49,7 @@ pub(crate) enum StarterCommands {
 }
 
 ///执行 clac command run
-pub(crate) fn excute_command(operation: &StarterCommands) {
+pub(crate) fn excute_command(operation: &StarterCommands) -> Result<(), ZenError> {
     match operation {
         StarterCommands::Init {
             project: project_name,
@@ -78,6 +78,7 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
             starter_service::init_project(project, output_root);
 
             println!("Init project done");
+            Ok(())
         }
 
         StarterCommands::Add {
@@ -99,14 +100,17 @@ pub(crate) fn excute_command(operation: &StarterCommands) {
                 .build();
 
             starter_service::add_feature(feature_name.clone(), table_name.clone(), project);
+            Ok(())
         }
 
         StarterCommands::Develop => {
             starter_service::develop_tool();
+            Ok(())
         }
 
         StarterCommands::Workspace => {
             starter_service::workspace();
+            Ok(())
         }
     }
 }

@@ -9,6 +9,7 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::starter_command::{self, StarterCommands};
 use crate::cmd::wps_command::{self, WpsCommands};
+use crate::errors::ZenError;
 
 #[derive(Parser)]
 #[command(author="JenYen", version, about="About zenspace utils", long_about = None)]
@@ -49,7 +50,7 @@ enum Commands {
 }
 
 /// Zen CLI command entry
-pub(crate) fn shell() {
+pub(crate) fn shell() -> Result<(), ZenError> {
     // CLI parse
     let cli = Cli::parse();
 
@@ -67,26 +68,27 @@ pub(crate) fn shell() {
     match &cli.command {
         Commands::Hello { name } => {
             debug!("hello :");
-            println!("hello:\n{}", name)
+            println!("hello:\n{}", name);
+            Ok(())
         }
 
         Commands::Clean { operation, dry_run } => {
             let op = operation.as_ref().unwrap_or(&CleanupCommands::Trash);
-            cleanup_command::excute_command(op);
+            cleanup_command::excute_command(op)?;
+            Ok(())
         }
 
         Commands::Starter { operation } => {
-            starter_command::excute_command(operation);
+            starter_command::excute_command(operation)?;
+            Ok(())
         }
-
-        Commands::Wps { operation } => {
-            wps_command::excute_command(operation);
-        }
+        Commands::Wps { operation } => wps_command::excute_command(operation),
         Commands::Version => {
             // Get the package version from Cargo.toml at compile time
             let version = env!("CARGO_PKG_VERSION");
             // Print the version to the console
             println!("zen version: {}", version);
+            Ok(())
         }
     }
 }

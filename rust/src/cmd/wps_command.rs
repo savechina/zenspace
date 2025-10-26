@@ -1,6 +1,7 @@
 use clap::Subcommand;
+use tracing::debug;
 
-use crate::service::wps_service;
+use crate::{errors::ZenError, service::wps_service};
 
 #[derive(Subcommand)]
 pub(crate) enum WpsCommands {
@@ -29,7 +30,7 @@ pub(crate) enum WpsCommands {
 }
 
 ///执行 clac command run
-pub(crate) fn excute_command(operation: &WpsCommands) {
+pub(crate) fn excute_command(operation: &WpsCommands) -> Result<(), ZenError> {
     match operation {
         WpsCommands::Archive {
             from_dir,
@@ -40,24 +41,19 @@ pub(crate) fn excute_command(operation: &WpsCommands) {
                 from_dir.clone().unwrap_or(String::new())
             );
 
-            wps_service::archive(from_dir.clone(), None).unwrap();
+            wps_service::archive(from_dir.clone(), None).map_err(|error| ZenError::Service(error))
         }
         WpsCommands::Dotfiles { restore } => {
             println!("dotfiles restore: {}", restore);
-            wps_service::dotfiles(restore.clone()).unwrap();
+            wps_service::dotfiles(restore.clone()).map_err(|error| ZenError::Service(error))
         }
         WpsCommands::Unixtime {
             timestamp,
             timeunit,
         } => {
-            // println!("{} - {}", timestamp.clone().unwrap_or(-1), timeunit);
-
-            wps_service::unixtime(timestamp.clone(), timeunit.clone()).unwrap();
-        } // StarterCommands::Mul(Mul { a, b }) => {
-          //     println!("{} * {} = {}", a, b, a * b);
-          // }
-          // StarterCommands::Div(s) => {
-          //     println!("{} / {} = {}", s.a, s.b, s.a / s.b);
-          // }
+            debug!("{} - {}", timestamp.clone().unwrap_or(-1), timeunit);
+            wps_service::unixtime(timestamp.clone(), timeunit.clone())
+                .map_err(|error| ZenError::Service(error))
+        }
     }
 }

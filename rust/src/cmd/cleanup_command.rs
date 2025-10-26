@@ -1,6 +1,6 @@
 use clap::Subcommand;
 
-use crate::service::cleanup_service;
+use crate::{errors::ZenError, service::cleanup_service};
 
 #[derive(Subcommand)]
 pub(crate) enum CleanupCommands {
@@ -13,17 +13,20 @@ pub(crate) enum CleanupCommands {
 }
 
 ///执行 Clean command run
-pub(crate) fn excute_command(operation: &CleanupCommands) {
+pub(crate) fn excute_command(operation: &CleanupCommands) -> Result<(), ZenError> {
     match operation {
         CleanupCommands::All => {
             cleanup_service::clean_all();
+            Ok(())
         }
         CleanupCommands::Trash => {
             cleanup_service::clean_trash();
+            Ok(())
         }
 
         CleanupCommands::Cache => {
             cleanup_service::clean_cache();
+            Ok(())
         }
     }
 }

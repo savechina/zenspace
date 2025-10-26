@@ -13,7 +13,7 @@ pub enum ZenError {
     Message(String),
 
     #[error("Service failed.{0}")]
-    Service(String),
+    Service(#[from] ServiceError),
 
     #[error("Other error: {0}")]
     Other(#[from] anyhow::Error), // Catch-all for other errors
