@@ -73,6 +73,7 @@ pub(crate) fn shell() -> Result<(), ZenError> {
         }
 
         Commands::Clean { operation, dry_run } => {
+            debug!("clean dry_run:{}", dry_run);
             let op = operation.as_ref().unwrap_or(&CleanupCommands::Trash);
             cleanup_command::excute_command(op)?;
             Ok(())
