@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 // use dotenvy;
 
 use crate::cmd::cleanup_command::{self, CleanupCommands};

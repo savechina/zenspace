@@ -2,8 +2,7 @@ use std::env;
 
 use crate::{model::starter_model::Project, service::starter_service};
 
-use clap::{Args, Subcommand};
-use include_dir::Dir;
+use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub(crate) enum StarterCommands {

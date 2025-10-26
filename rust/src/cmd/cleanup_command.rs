@@ -1,4 +1,4 @@
-use clap::{Args, Subcommand};
+use clap::Subcommand;
 
 use crate::service::cleanup_service;
 

@@ -1,10 +1,8 @@
-use std::io::Write;
-
 use anyhow::Result;
 use config::{Config, Environment, File, FileFormat};
 use dotenvy;
 use getset::Getters;
-use include_dir::{Dir, DirEntry, include_dir};
+use include_dir::{Dir, include_dir};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_derive::Deserialize;
 

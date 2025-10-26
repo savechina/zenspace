@@ -2,10 +2,11 @@ use anyhow::Result;
 use glob;
 use heck::{ToLowerCamelCase, ToPascalCase};
 use include_dir::{Dir, include_dir};
-use std::{collections::HashMap, env, path::PathBuf, sync::LazyLock};
+use std::{collections::HashMap, path::PathBuf, sync::LazyLock};
 use tera::Value;
 use which;
 
+#[allow(dead_code)]
 /// Assets
 pub(crate) static ASSETS: Dir = include_dir!("assets");
 
@@ -40,17 +41,17 @@ pub(crate) fn delete_pattern(path_pattern: &str) {
     let mut file_list: Vec<PathBuf> = Vec::new();
 
     // use path pattern glob find all matchs files
-    for entry in glob::glob(path_pattern).unwrap() {
-        if let Ok(path) = entry {
-            file_list.push(path);
-        }
+    for entry in glob::glob(path_pattern).unwrap().flatten() {
+        // if let Ok(path) = entry {
+        file_list.push(entry);
+        // }
     }
 
     // Use fs_extra to remove the collected items.
     if !file_list.is_empty() {
         println!("Deleting the following files: {:?}", file_list);
         fs_extra::remove_items(&file_list)
-            .expect(format!("Deleting {} files failed", path_pattern).as_str());
+            .unwrap_or_else(|_| panic!("Deleting {} files failed", path_pattern));
     } else {
         println!("No {} files found to delete.", path_pattern);
     }

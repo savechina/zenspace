@@ -115,7 +115,7 @@ pub(crate) fn clean_cache() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .expect(format!("failed to execute {} command", golang_command).as_str());
+            .unwrap_or_else(|_| panic!("failed to execute {} command", golang_command));
 
         if status.success() {
             println!("Go cache cleanup successful.");
@@ -176,7 +176,7 @@ pub(crate) fn clean_cache() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .expect(format!("failed to execute {} command", pip_command).as_str());
+            .unwrap_or_else(|_| panic!("failed to execute {} command", pip_command));
         if status.success() {
             println!("pip cache cleanup successful.");
         } else {

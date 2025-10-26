@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use tera::{Context, Tera};
 
 pub(crate) fn init_project(project: Project, output_root: PathBuf) {
-    println!("{} ", "Develop initialize:");
+    println!("Project initialize: ");
 
     let arch_type = &project.arch_type;
     let template_base = if arch_type.eq_ignore_ascii_case("ddd") {
@@ -56,7 +56,7 @@ pub(crate) async fn add_feature(feature_name: String, table_name: String, projec
 }
 
 pub(crate) fn develop_tool() {
-    println!("{} ", "Develop initialize:");
+    println!("Develop initialize: ");
 
     let exists = util::command_exists("cargo");
 
@@ -255,11 +255,10 @@ fn handle_target_context(project: Project, content: &str) -> String {
     let group_name = &project.group_name;
 
     //handle template output target context
-    let target_content = content
+    content
         .replace("__app__", project_name)
         .replace("__package__", package_name)
-        .replace("__group__", group_name);
-    target_content
+        .replace("__group__", group_name)
 }
 
 fn handle_target_path(source_path: &Path, project: &Project) -> String {
