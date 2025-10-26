@@ -1,4 +1,9 @@
 use clap::{Parser, Subcommand};
+
+use tracing::{debug, info};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
 // use dotenvy;
 
 use crate::cmd::cleanup_command::{self, CleanupCommands};
@@ -9,6 +14,8 @@ use crate::cmd::wps_command::{self, WpsCommands};
 #[command(author="JenYen", version, about="About zenspace utils", long_about = None)]
 #[command(propagate_version = false)]
 struct Cli {
+    #[command(flatten)]
+    verbose: clap_verbosity_flag::Verbosity<clap_verbosity_flag::InfoLevel>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -46,8 +53,20 @@ pub(crate) fn shell() {
     // CLI parse
     let cli = Cli::parse();
 
+    let filter = EnvFilter::builder()
+        .with_default_directive(cli.verbose.tracing_level_filter().into())
+        .from_env()
+        .unwrap();
+
+    let reg = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().without_time())
+        .with(filter);
+
+    reg.init();
+
     match &cli.command {
         Commands::Hello { name } => {
+            debug!("hello :");
             println!("hello:\n{}", name)
         }
 

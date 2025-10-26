@@ -36,3 +36,4 @@ sqlx = { version = "0.8.6", features = [
 tokio = { version = "1.47.1", features = ["full"] }
 fs_extra = "1.3.0"
 glob = "0.3.3"
+clap-verbosity-flag = { version = "3.0.4", features = ["tracing"] }
