@@ -1,0 +1,40 @@
+[package]
+name = "zen-cli"
+version = "0.1.0"
+edition.workspace = true
+description = "Zenspace CLI — productivity suite"
+
+[[bin]]
+name = "zen"
+path = "src/main.rs"
+
+[dependencies]
+zen-service = { path = "../zen-service" }
+zen-gateway = { path = "../zen-gateway" }
+zen-core = { path = "../zen-core" }
+zen-knowledge = { path = "../zen-knowledge" }
+zen-agents = { path = "../zen-agents" }
+zen-memory = { path = "../zen-memory" }
+zen-provider = { path = "../zen-provider" }
+zen-plugin = { path = "../zen-plugin" }
+clap = { workspace = true }
+clap-verbosity-flag = { workspace = true }
+colored = "2"
+dotenvy = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+rig-compose = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

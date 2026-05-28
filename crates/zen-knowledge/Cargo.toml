@@ -1,0 +1,36 @@
+[package]
+name = "zen-knowledge"
+version = "0.1.0"
+edition.workspace = true
+description = "Knowledge domain — note, wiki, search, consolidation"
+
+[dependencies]
+zen-core = { path = "../zen-core" }
+zen-data = { path = "../zen-data" }
+zen-provider = { path = "../zen-provider" }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+rig-compose = { workspace = true }
+rig-core = { workspace = true }
+rig-sqlite = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tera = { workspace = true }
+serde_yaml = "0.9"
+which = { workspace = true }
+sha2 = { version = "0.10", default-features = false }
+walkdir = "2"
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+feed = { workspace = true }
+html2md = { workspace = true }
+ort = { workspace = true }
+schemars = "0.8"
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

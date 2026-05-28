@@ -1,0 +1,34 @@
+# Environment
+.env
+.env.*
+
+# Build artifacts
+target/
+debug/
+release/
+*.rs.bk
+*.rlib
+*.prof*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.zen/
+
+# Logs
+*.log
+
+# Rust analyzer
+.rust-analyzer/
+
+# Test data directories (created during integration tests)
+knowledge/
+reports/
+sessions/
+test_data/
+*.mv2

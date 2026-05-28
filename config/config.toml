@@ -1,0 +1,100 @@
+# =============================================================================
+# Zen — Default Agentic Configuration (embedded at compile-time)
+# =============================================================================
+# Overrides: ~/.zen/config.toml, .zen/config.toml, ZEN_* env vars
+
+# =============================================================================
+# Top-level defaults
+# =============================================================================
+
+default_provider = "ollama"
+default_model = "qwen3-coder"
+
+# =============================================================================
+# Provider definitions — connection settings (defined once, referenced by name)
+# =============================================================================
+
+[providers.ollama]
+type = "ollama"
+base_url = "http://127.0.0.1:11434"
+default_model = "qwen3-coder"
+
+[providers.openai]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+default_model = "gpt-4o-mini"
+
+# =============================================================================
+# Agent task routing — which provider/model per task
+# =============================================================================
+
+[agents.entity_extraction]
+provider = "ollama"
+model = "qwen3-coder"
+
+[agents.contradiction_detection]
+provider = "ollama"
+model = "qwen3-coder"
+
+[agents.synthesis]
+provider = "ollama"
+model = "qwen3-coder"
+
+[agents.dispatch]
+provider = "openai"
+model = "gpt-4o-mini"
+
+# =============================================================================
+# Feature flags
+# =============================================================================
+
+[features]
+multi_agent = true
+auto_research = true
+
+# =============================================================================
+# QQ Bot integration (FR-004)
+# =============================================================================
+
+# [qqbot]
+# app_id = ""
+# token_env = "QQBOT_TOKEN"
+# secret_env = "QQBOT_SECRET"
+# groups = []
+
+# =============================================================================
+# Cron scheduling
+# =============================================================================
+
+[cron]
+consolidation_time = "02:00"
+timezone = "Asia/Shanghai"
+subconscious_interval_minutes = 5
+dream_start_hour = 2
+dream_end_hour = 4
+
+# =============================================================================
+# Plugin system
+# =============================================================================
+
+[plugin]
+scan_dir = "~/.zen/plugins"
+wasm_cache_dir = "~/.zen/plugins/cache"
+
+# =============================================================================
+# Learning / auto-research
+# =============================================================================
+
+[learning]
+auto_research = true
+interval = "daily"
+
+# =============================================================================
+# Finance aggregation
+# =============================================================================
+
+[finance]
+base_currency = "CNY"
+disclaimer_acknowledged = false
+# tracked_categories = ["food", "transport", "entertainment"]

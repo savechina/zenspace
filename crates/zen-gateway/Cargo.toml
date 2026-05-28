@@ -1,0 +1,27 @@
+[package]
+name = "zen-gateway"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+zen-core = { path = "../zen-core" }
+zen-knowledge = { path = "../zen-knowledge" }
+zen-agents = { path = "../zen-agents" }
+zen-provider = { path = "../zen-provider" }
+zen-memory = { path = "../zen-memory" }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+uuid = { workspace = true }
+rig-compose = { workspace = true }
+rig-mcp = { workspace = true }

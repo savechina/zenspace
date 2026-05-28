@@ -1,0 +1,200 @@
+use chrono::Local;
+use chrono::TimeZone;
+use fs_extra::dir::CopyOptions;
+use std::env;
+use std::fs;
+use std::io::Error;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+
+use zen_core::errors::ServiceError;
+
+use crate::utils;
+
+pub fn zstds(from_dir: PathBuf, output_file: PathBuf) -> Result<(), ServiceError> {
+    if !utils::command_exists("zstd") {
+        println!("zstd command is not available. use `brew install zstd` to install zstd.")
+    }
+
+    if !from_dir.exists() {
+        return Err(ServiceError::Io(Error::from(ErrorKind::NotFound)));
+    }
+
+    let from_path = from_dir.parent().expect("file parent path not found");
+    let from_file = from_dir.file_name().expect("file name not dound");
+    let to_path = output_file;
+
+    println!(
+        "tar --zstd -cf {} -C {} {}",
+        to_path.display(),
+        from_path.display(),
+        from_file.to_string_lossy()
+    );
+
+    let status = Command::new("tar")
+        .arg("--zstd")
+        .arg("-cf")
+        .arg(to_path)
+        .arg("-C")
+        .arg(from_path)
+        .arg(from_file)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("failed to execute tar zstd file");
+
+    if !status.success() {
+        return Err(ServiceError::Message(String::from(
+            "tar execute to zstd file,status is failed",
+        )));
+    }
+
+    Ok(())
+}
+
+pub fn archive(from_dir: Option<String>, _output_file: Option<String>) -> Result<(), ServiceError> {
+    let home = home::home_dir().expect("failed found HOME");
+
+    let documents = home.join("Documents");
+
+    let file_list = match from_dir {
+        None => {
+            vec![
+                documents.join("Work"),
+                documents.join("Other"),
+                documents.join("Personal"),
+                documents.join("Book"),
+            ]
+        },
+        Some(dir_name) => {
+            let file_path = Path::new(&dir_name);
+
+            if file_path.is_absolute() {
+                vec![PathBuf::from(dir_name)]
+            } else {
+                let current_dir = env::current_dir().expect("Failed to get current directory");
+                let archive_file = current_dir.join(dir_name);
+
+                vec![archive_file]
+            }
+        },
+    };
+
+    let archive_path = documents.join("Archive");
+
+    for file in file_list {
+        let file_name = file.file_name().unwrap();
+
+        if !file.exists() {
+            eprintln!(
+                "zstd compress directory: {} , not exists, skip archive",
+                file.display()
+            );
+
+            continue;
+        }
+
+        let now_date = Local::now().format("%Y%m%d");
+
+        let archive_name = format!("{}-{}.tar.zst", file_name.to_string_lossy(), now_date);
+
+        let archive_file = archive_path.join(archive_name);
+
+        println!("archive {}  to {}", file.display(), archive_file.display());
+
+        zstds(file, archive_file)?;
+    }
+    Ok(())
+}
+
+pub fn dotfiles(restore: bool) -> Result<(), ServiceError> {
+    let home = home::home_dir().expect("failed found HOME");
+    let dotfiles_path = "dotfiles";
+
+    let documents = home.join("Documents");
+    let archive_path = documents.join("Archive").join(dotfiles_path);
+
+    let file_list = vec![
+        ".bashrc",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".profile",
+        ".gitconfig",
+        ".ssh",
+        ".m2/setting.xml",
+        ".rbenv/version",
+        ".pyenv/version",
+        ".vimrc",
+        ".vim",
+        ".config/gem",
+        ".config/gh",
+        ".config/pip",
+        ".bundle/config",
+        ".tiup/data",
+        "Library/DBeaverData/workspace6",
+    ];
+
+    if restore {
+        println!("restore:");
+    } else {
+        println!("backup:");
+
+        for file in file_list {
+            let from_path = home.join(file);
+            let to_path = archive_path.join(file);
+            let to_dir = to_path.parent().expect("not found parent direcotry");
+
+            if from_path.exists() {
+                if !to_dir.exists() {
+                    println!("create:{}", to_dir.display());
+                    fs::create_dir_all(to_dir).expect("failed to create dir");
+                }
+
+                println!("from:{},to:{}", from_path.display(), to_path.display(),);
+
+                if to_path.exists() {
+                    let _ = fs_extra::remove_items(std::slice::from_ref(&to_path));
+                }
+
+                let options = CopyOptions::new().overwrite(true).copy_inside(true);
+                let _status =
+                    fs_extra::copy_items(std::slice::from_ref(&from_path), to_dir, &options)
+                        .expect("copy to is error");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn unixtime(timestamp: Option<i64>, timeunit: String) -> Result<(), ServiceError> {
+    let now = if let Some(t) = timestamp {
+        match timeunit.to_ascii_lowercase().as_str() {
+            "s" => Local.timestamp_opt(t, 0).unwrap(),
+            "ms" => Local.timestamp_millis_opt(t).unwrap(),
+            "us" => Local.timestamp_micros(t).unwrap(),
+            "ns" => Local.timestamp_nanos(t),
+            _ => Local.timestamp_opt(t, 0).unwrap(),
+        }
+    } else {
+        Local::now()
+    };
+
+    println!("now: {}", now.to_rfc3339());
+    println!("local: {}", now);
+    println!("timestamp: {}", now.timestamp());
+    println!("timestamp millis: {}", now.timestamp_millis());
+    println!("timestamp micros: {}", now.timestamp_micros());
+    println!(
+        "timestamp nanos: {}",
+        now.timestamp_nanos_opt().unwrap_or(0)
+    );
+
+    let now = now.to_utc();
+    println!("UTC: {}", now.to_rfc3339());
+    println!("UTC: {}", now);
+    Ok(())
+}

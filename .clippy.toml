@@ -1,0 +1,17 @@
+# Clippy Configuration
+# Constitution VI: All code changes MUST pass cargo clippy with no warnings
+
+# Cognitive complexity limit
+cognitive-complexity-threshold = 25
+
+# Type complexity threshold
+type-complexity-threshold = 250
+
+# Minimum function length warning threshold
+single-char-binding-names-threshold = 4
+
+# Idents considered valid in doc comments
+doc-valid-idents = ["Clap", "Rust", "SQLite", "SQLx", "TOML", "UUID", "JSON", "YAML", "Markdown"]
+
+# Maximum struct size for pass-by-value
+pass-by-value-size-limit = 256

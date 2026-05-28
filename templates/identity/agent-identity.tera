@@ -1,0 +1,16 @@
+---
+agent_name: "{{ agent_name }}"
+role: "{{ role }}"
+capabilities: [{{ capabilities | join(sep='", "') | safe }}]
+created_at: {{ created_at }}
+{% if last_session %}last_session: {{ last_session }}
+{% endif %}session_count: {{ session_count }}
+---
+
+{% if session_history %}
+## Session History
+
+{% for entry in session_history %}
+- **{{ entry.timestamp }}** | `{{ entry.session_id }}` | {{ entry.summary | default(value="") }}
+{% endfor %}
+{% endif %}

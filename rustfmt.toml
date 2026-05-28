@@ -1,0 +1,116 @@
+# Rustfmt Configuration
+# Rust Edition 2024 style
+
+edition = "2024"
+
+# Maximum line length (RFC style)
+max_width = 100
+
+# Number of spaces per tab
+tab_spaces = 4
+
+# Use spaces instead of tabs
+hard_tabs = false
+
+# Function arguments layout
+fn_params_layout = "Tall"
+
+# Import grouping and sorting
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+# Struct literal styling
+struct_lit_single_line = true
+struct_lit_width = 18
+
+# Where clause styling
+where_single_line = true
+
+# Comment wrapping
+wrap_comments = true
+comment_width = 80
+normalize_comments = true
+
+# Doc comment formatting
+format_code_in_doc_comments = true
+doc_comment_code_block_width = 100
+normalize_doc_attributes = true
+
+# String literal formatting
+format_strings = true
+format_string_literals = true
+
+# Macro formatting
+format_macro_matchers = true
+format_macro_bodies = true
+
+# Chain formatting
+chain_width = 60
+chains_overflow_last = true
+
+# Single-line if-else expressions
+single_line_if_else_max_width = 50
+
+# Force explicit type bounds in generics
+force_explicit_abi = true
+
+# Use field init shorthand
+use_field_init_shorthand = true
+
+# Use try! macro instead of ? operator in some cases (disabled for modern Rust)
+use_try_shorthand = false
+
+# Blank lines lower bound
+blank_lines_lower_bound = 0
+blank_lines_upper_bound = 1
+
+# Brace style for items
+brace_style = "SameLineWhere"
+
+# Control brace style
+control_brace_style = "AlwaysSameLine"
+
+# Enum discriminant alignment
+enum_discrim_align_threshold = 20
+
+# Closure block styling
+closure_block_style = "SameLineWhere"
+
+# Match arm styling
+match_arm_blocks = true
+match_block_trailing_comma = true
+
+# Spaces around ranges
+space_before_colon = false
+space_after_colon = true
+
+# Spaces around operators
+spaces_around_ranges = false
+
+# Binop separator styling
+binop_separator = "Front"
+
+# Combined styling
+combine_control_expr = true
+
+# Array width threshold
+array_width = 60
+
+# Attribute styling
+attributes_always_same_line = false
+inline_attribute_width = 50
+
+# Trailing comma
+trailing_comma = "Vertical"
+trailing_semicolon = true
+
+# Match pattern separator styling
+match_pattern_separator_carriage_return = false
+
+# Indent style
+indent_style = "Block"
+
+# Empty line after outer attribute
+empty_line_after_outer_attr = false

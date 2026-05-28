@@ -1,0 +1,18 @@
+[package]
+name = "zen-auth"
+version = "0.1.0"
+edition.workspace = true
+description = "Keychain + credential resolution for zenspace"
+
+[dependencies]
+zen-core = { path = "../zen-core" }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+
+# macOS Keychain (FR-061)
+security-framework = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

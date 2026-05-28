@@ -1,0 +1,19 @@
+[package]
+name = "zen-memory"
+version = "0.1.0"
+edition.workspace = true
+description = "Agent internal memory — SOUL.md, MEMORY.md, session context, conversation history"
+
+[dependencies]
+zen-core = { path = "../zen-core" }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+rig-core = { workspace = true }
+rig-memvid = { workspace = true }
+tempfile = { workspace = true }

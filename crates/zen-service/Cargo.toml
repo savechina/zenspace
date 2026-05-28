@@ -1,0 +1,23 @@
+[package]
+name = "zen-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+zen-core = { path = "../zen-core" }
+home = { workspace = true }
+which = { workspace = true }
+fs_extra = { workspace = true }
+glob = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tera = { workspace = true }
+include_dir = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+typed-builder = { workspace = true }
+heck = { workspace = true }
+strum = { workspace = true }
