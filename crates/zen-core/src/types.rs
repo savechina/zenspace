@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use tracing::{debug, info};
 use uuid::Uuid;
+
+use crate::paths::ZenPaths;
 
 // ---------------------------------------------------------------------------
 // Sensitivity (FR-080)
@@ -72,6 +79,151 @@ impl fmt::Display for SessionStatus {
             SessionStatus::Failed => write!(f, "Failed"),
             SessionStatus::Archived => write!(f, "Archived"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionEntity (FR-078, FR-081) — canonical definition
+// ---------------------------------------------------------------------------
+
+/// Session entity persisted to `~/.zen/sessions/<id>.json`.
+///
+/// Per data-model.md §3.9: JSON file is primary storage (Tier 2 derived cache).
+/// SQLite table is derived from these files for fast queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEntity {
+    /// Unique session identifier (UUID v7).
+    pub id: String,
+    /// Agent name from zen-agents registry.
+    pub agent_name: String,
+    /// Computed max sensitivity across retrieved notes.
+    pub sensitivity_policy: Sensitivity,
+    /// Session creation time (ISO 8601).
+    pub created_at: DateTime<Utc>,
+    /// Last session activity (ISO 8601).
+    pub updated_at: DateTime<Utc>,
+    /// Session lifecycle state.
+    pub status: SessionStatus,
+    /// Workspace path for the session.
+    pub workspace: String,
+}
+
+impl SessionEntity {
+    /// Create a new session entity with the given agent name and workspace.
+    pub fn new(agent_name: &str, workspace: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::now_v7().to_string(),
+            agent_name: agent_name.to_string(),
+            sensitivity_policy: Sensitivity::Private, // Safe default (FR-071)
+            created_at: now,
+            updated_at: now,
+            status: SessionStatus::Active,
+            workspace: workspace.to_string(),
+        }
+    }
+
+    /// Save this session to `~/.zen/sessions/<id>.json`.
+    pub fn save(&self) -> Result<PathBuf> {
+        let dir = Self::sessions_dir()?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create sessions directory: {}", dir.display()))?;
+
+        let file_path = dir.join(format!("{}.json", self.id));
+        let json =
+            serde_json::to_string_pretty(self).context("failed to serialize session entity")?;
+        std::fs::write(&file_path, json)
+            .with_context(|| format!("failed to write session file: {}", file_path.display()))?;
+
+        debug!("saved session {} to {}", self.id, file_path.display());
+        Ok(file_path)
+    }
+
+    /// Load a session from `~/.zen/sessions/<id>.json`.
+    pub fn load(id: &str) -> Result<SessionEntity> {
+        let dir = Self::sessions_dir()?;
+        let file_path = dir.join(format!("{}.json", id));
+
+        let json = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("session not found: {id}"))?;
+        let session: SessionEntity = serde_json::from_str(&json)
+            .with_context(|| format!("failed to parse session file: {}", file_path.display()))?;
+
+        Ok(session)
+    }
+
+    /// List all sessions, sorted by updated_at descending.
+    pub fn list() -> Result<Vec<SessionEntity>> {
+        let dir = Self::sessions_dir()?;
+
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut sessions = Vec::new();
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("failed to read sessions directory: {}", dir.display()))?;
+
+        for entry in entries {
+            let entry = entry.context("failed to read directory entry")?;
+            let path = entry.path();
+
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                match Self::load(&path.file_stem().expect("valid filename").to_string_lossy()) {
+                    Ok(session) => sessions.push(session),
+                    Err(e) => debug!("skipping invalid session file {}: {}", path.display(), e),
+                }
+            }
+        }
+
+        // Sort by updated_at descending (most recent first)
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+
+        debug!("listed {} sessions from {}", sessions.len(), dir.display());
+        Ok(sessions)
+    }
+
+    /// List only active sessions.
+    pub fn list_active() -> Result<Vec<SessionEntity>> {
+        Ok(Self::list()?
+            .into_iter()
+            .filter(|s| s.status == SessionStatus::Active)
+            .collect())
+    }
+
+    /// Transition session to Archived state (terminal).
+    pub fn archive(&mut self) -> Result<()> {
+        self.status = SessionStatus::Archived;
+        self.updated_at = Utc::now();
+        self.save()?;
+        info!(session_id = %self.id, "session archived");
+        Ok(())
+    }
+
+    /// Transition session to Compacted state (context was truncated).
+    pub fn compact(&mut self) -> Result<()> {
+        self.status = SessionStatus::Compacted;
+        self.updated_at = Utc::now();
+        self.save()?;
+        info!(session_id = %self.id, "session compacted");
+        Ok(())
+    }
+
+    /// Reactivate a compacted session.
+    pub fn reactivate(&mut self) -> Result<()> {
+        if self.status == SessionStatus::Archived {
+            anyhow::bail!("cannot reactivate archived session");
+        }
+        self.status = SessionStatus::Active;
+        self.updated_at = Utc::now();
+        self.save()?;
+        info!(session_id = %self.id, "session reactivated");
+        Ok(())
+    }
+
+    fn sessions_dir() -> Result<PathBuf> {
+        let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
+        Ok(paths.sessions())
     }
 }
 
@@ -369,5 +521,44 @@ mod tests {
         let json = serde_json::to_string(&note).unwrap();
         let decoded: RetrievedNote = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.path, "/test.md");
+    }
+
+    #[test]
+    fn test_session_entity_new_has_correct_defaults() {
+        let session = SessionEntity::new("test-agent", "/workspace");
+        assert_eq!(session.agent_name, "test-agent");
+        assert_eq!(session.workspace, "/workspace");
+        assert_eq!(session.sensitivity_policy, Sensitivity::Private);
+        assert_eq!(session.status, SessionStatus::Active);
+        assert!(!session.id.is_empty());
+    }
+
+    #[test]
+    fn test_session_entity_serialization_roundtrip() {
+        let session = SessionEntity::new("Sisyphus-Junior", "/tmp");
+        let json = serde_json::to_string(&session).unwrap();
+        let loaded: SessionEntity = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.agent_name, "Sisyphus-Junior");
+        assert_eq!(loaded.workspace, "/tmp");
+        assert_eq!(loaded.status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn test_session_state_transitions() {
+        let mut session = SessionEntity::new("test", "/workspace");
+        assert_eq!(session.status, SessionStatus::Active);
+
+        session.compact().unwrap();
+        assert_eq!(session.status, SessionStatus::Compacted);
+
+        session.reactivate().unwrap();
+        assert_eq!(session.status, SessionStatus::Active);
+
+        session.archive().unwrap();
+        assert_eq!(session.status, SessionStatus::Archived);
+
+        // Archived cannot be reactivated
+        assert!(session.reactivate().is_err());
     }
 }

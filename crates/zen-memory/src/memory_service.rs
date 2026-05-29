@@ -115,7 +115,7 @@ pub fn load_all(zen_paths: &ZenPaths) -> Result<IdentityContext> {
     ctx.merge(global_identity);
 
     // Tier 1: user identity directory ~/.zen/identity/
-    let identity_dir = zen_paths.global_root().join("identity");
+    let identity_dir = zen_paths.identity();
     let user_identity = load_identity_from_dir(&identity_dir)?;
     ctx.merge(user_identity);
 

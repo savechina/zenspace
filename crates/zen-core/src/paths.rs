@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use crate::constants::{
-    CACHE_DIR, CONFIG_FILE, DB_DIR, FINANCE_DIR, INBOX_DIR, KNOWLEDGE_DIR, MEMORY_DIR, RAW_DIR,
-    SESSIONS_DIR, SKILLS_DIR, WIKI_DIR, ZEN_HOME_ENV,
+    CACHE_DIR, CONFIG_FILE, DB_DIR, FINANCE_DIR, IDENTITY_DIR, INBOX_DIR, KNOWLEDGE_DIR, LOGS_DIR,
+    MEMORY_DIR, OUTPUT_DIR, PLUGINS_DIR, RAW_DIR, SESSIONS_DIR, SKILLS_DIR, WIKI_DIR,
+    ZEN_HOME_ENV,
 };
 use crate::errors::PathError;
 
@@ -30,7 +31,7 @@ impl ZenPaths {
             return Err(PathError::HomeDirNotFound);
         }
 
-        let workspace_root = Self::find_workspace_root();
+        let workspace_root = Self::find_workspace_root(&global_root);
 
         Ok(Self {
             global_root,
@@ -56,16 +57,20 @@ impl ZenPaths {
         self.global_root.join(CACHE_DIR).join(domain)
     }
 
+    pub fn knowledge(&self) -> PathBuf {
+        self.user_data(KNOWLEDGE_DIR)
+    }
+
     pub fn inbox(&self) -> PathBuf {
-        self.user_data(KNOWLEDGE_DIR).join(INBOX_DIR)
+        self.knowledge().join(INBOX_DIR)
     }
 
     pub fn raw(&self) -> PathBuf {
-        self.user_data(KNOWLEDGE_DIR).join(RAW_DIR)
+        self.knowledge().join(RAW_DIR)
     }
 
     pub fn wiki(&self) -> PathBuf {
-        self.user_data(KNOWLEDGE_DIR).join(WIKI_DIR)
+        self.knowledge().join(WIKI_DIR)
     }
 
     pub fn skills(&self) -> PathBuf {
@@ -77,7 +82,7 @@ impl ZenPaths {
     }
 
     pub fn sessions(&self) -> PathBuf {
-        self.user_data(SESSIONS_DIR)
+        self.global_root.join(SESSIONS_DIR)
     }
 
     pub fn finance(&self) -> PathBuf {
@@ -88,6 +93,25 @@ impl ZenPaths {
         self.global_root.join(MEMORY_DIR)
     }
 
+    pub fn identity(&self) -> PathBuf {
+        self.global_root.join(IDENTITY_DIR)
+    }
+
+    pub fn logs(&self) -> PathBuf {
+        self.global_root.join(LOGS_DIR)
+    }
+
+    pub fn output(&self) -> PathBuf {
+        self.workspace_root
+            .as_ref()
+            .map(|w| w.join(OUTPUT_DIR))
+            .unwrap_or_else(|| self.global_root.join(OUTPUT_DIR))
+    }
+
+    pub fn plugins(&self) -> PathBuf {
+        self.global_root.join(PLUGINS_DIR)
+    }
+
     pub fn global_root(&self) -> &PathBuf {
         &self.global_root
     }
@@ -96,9 +120,22 @@ impl ZenPaths {
         self.workspace_root.as_ref()
     }
 
-    fn find_workspace_root() -> Option<PathBuf> {
+    fn find_workspace_root(global_root: &PathBuf) -> Option<PathBuf> {
+        if let Ok(path) = env::var("ZEN_WORKSPACE") {
+            let candidate = PathBuf::from(path);
+            if candidate.join(".zen").is_dir() || candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+
+        let home = home::home_dir()?;
         let mut current = env::current_dir().ok()?;
+
         loop {
+            if current == home || &current == global_root {
+                break;
+            }
+
             let candidate = current.join(".zen");
             if candidate.is_dir() {
                 return Some(current);

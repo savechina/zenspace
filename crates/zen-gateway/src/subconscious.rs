@@ -90,7 +90,7 @@ fn evaluate_tick(
         },
     }
 
-    let pending_notes = count_inbox_notes(zen_paths.global_root());
+    let pending_notes = count_inbox_notes(zen_paths);
     if pending_notes > 0 {
         actions.push(MicroAction::Organize(format!(
             "{pending_notes} inbox notes are pending consolidation"
@@ -109,8 +109,8 @@ fn load_identity(zen_paths: &ZenPaths) -> Result<IdentityContext> {
     zen_memory::memory_service::load_all(zen_paths)
 }
 
-fn count_inbox_notes(global_root: &std::path::Path) -> usize {
-    let inbox = global_root.join("knowledge").join("inbox");
+fn count_inbox_notes(zen_paths: &ZenPaths) -> usize {
+    let inbox = zen_paths.inbox();
     if !inbox.is_dir() {
         return 0;
     }
@@ -129,7 +129,7 @@ fn count_inbox_notes(global_root: &std::path::Path) -> usize {
 }
 
 fn subconscious_log_path(zen_paths: &ZenPaths) -> PathBuf {
-    zen_paths.global_root().join("logs").join("subconscious.md")
+    zen_paths.logs().join("subconscious.md")
 }
 
 fn append_subconscious_log(zen_paths: &ZenPaths, actions: &[MicroAction]) -> Result<()> {
@@ -177,10 +177,5 @@ mod tests {
             MicroAction::Remind(msg) => assert_eq!(msg, "test"),
             _ => panic!("wrong variant"),
         }
-    }
-
-    #[test]
-    fn test_count_inbox_notes_empty() {
-        assert_eq!(count_inbox_notes(std::path::Path::new("/nonexistent")), 0);
     }
 }

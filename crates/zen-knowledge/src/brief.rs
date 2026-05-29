@@ -95,7 +95,7 @@ pub fn render_briefing_md(briefing: &Briefing) -> String {
 
 /// Persist the briefing markdown to `~/.zen/output/brief-YYYY-MM-DD.md`.
 pub fn save_briefing(zen_paths: &ZenPaths, md: &str) -> Result<std::path::PathBuf, anyhow::Error> {
-    let output_dir = zen_paths.global_root().join("output");
+    let output_dir = zen_paths.output();
     std::fs::create_dir_all(&output_dir)?;
 
     let date = chrono::Utc::now().naive_utc().date();
@@ -189,7 +189,7 @@ fn read_habits_and_goals(
 fn count_contradictions(zen_paths: &ZenPaths) -> Result<usize, anyhow::Error> {
     // Read contradiction records from knowledge/contradictions/ if present.
     let contra_dir = zen_paths
-        .user_data("knowledge")
+        .knowledge()
         .join("consolidate")
         .join("contradictions");
     if !contra_dir.is_dir() {

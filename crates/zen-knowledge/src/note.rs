@@ -353,7 +353,7 @@ impl NoteService {
         };
 
         let paths = ZenPaths::detect()?;
-        let knowledge_dir = paths.user_data("knowledge");
+        let knowledge_dir = paths.knowledge();
         let file_path = write_note(&note, &knowledge_dir)?;
 
         let mut note = note;

@@ -150,7 +150,7 @@ impl IdentityFileManager {
     ///
     /// `~/.zen/identity/`
     fn identity_dir(zen_paths: &ZenPaths) -> PathBuf {
-        zen_paths.global_root().join("identity")
+        zen_paths.identity()
     }
 
     /// Compute the file path for a given agent name.

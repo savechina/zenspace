@@ -31,6 +31,21 @@ pub enum PendingCallKind {
     Streaming(PendingLlmCallStream),
 }
 
+const MAX_HISTORY: usize = 100;
+
+pub const SLASH_COMMANDS: &[&str] = &[
+    "help", "quit", "clear", "thinking", "export", "note",
+    "search", "session", "serve", "config", "model",
+    "consolidate", "lint",
+];
+
+pub const CLI_COMMANDS: &[&str] = &[
+    "hello", "clean", "starter", "wps", "version", "session",
+    "serve", "agent", "workspace", "config", "provider", "audit",
+    "note", "search", "similar", "graph", "reindex", "research",
+    "consolidate", "lint", "ingest", "routine", "task", "brief", "plugin",
+];
+
 pub struct App {
     pub input: String,
     pub cursor_position: usize,
@@ -47,6 +62,12 @@ pub struct App {
     pub pending_calls: Vec<PendingCallKind>,
     pub message_queue: VecDeque<String>,
     pub current_query: String,
+    pub command_history: Vec<String>,
+    pub history_position: Option<usize>,
+    pub autocomplete_suggestions: Vec<String>,
+    pub autocomplete_selected: usize,
+    pub autocomplete_scroll_offset: usize,
+    pub show_autocomplete: bool,
     orchestrator: Option<Arc<AgentOrchestrator>>,
     session: Option<SessionContext>,
 }
@@ -73,6 +94,12 @@ impl App {
             pending_calls: Vec::new(),
             message_queue: VecDeque::new(),
             current_query: String::new(),
+            command_history: Vec::new(),
+            history_position: None,
+            autocomplete_suggestions: Vec::new(),
+            autocomplete_selected: 0,
+            autocomplete_scroll_offset: 0,
+            show_autocomplete: false,
             orchestrator: None,
             session: None,
         }
@@ -101,6 +128,104 @@ impl App {
         while self.output.len() > 500 {
             self.output.pop_front();
         }
+    }
+
+    pub fn push_history(&mut self, cmd: &str) {
+        if cmd.is_empty() || self.command_history.last().map(|h| h.as_str()) == Some(cmd) {
+            return;
+        }
+        self.command_history.push(cmd.to_string());
+        if self.command_history.len() > MAX_HISTORY {
+            self.command_history.remove(0);
+        }
+        self.history_position = None;
+    }
+
+    pub fn history_up(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        let new_pos = match self.history_position {
+            None => self.command_history.len() - 1,
+            Some(0) => 0,
+            Some(p) => p - 1,
+        };
+        self.history_position = Some(new_pos);
+        if let Some(entry) = self.command_history.get(new_pos) {
+            self.input = entry.clone();
+            self.cursor_position = self.input.len();
+        }
+    }
+
+    pub fn history_down(&mut self) {
+        match self.history_position {
+            None => {},
+            Some(p) if p + 1 >= self.command_history.len() => {
+                self.history_position = None;
+                self.input.clear();
+                self.cursor_position = 0;
+            },
+            Some(p) => {
+                self.history_position = Some(p + 1);
+                if let Some(entry) = self.command_history.get(p + 1) {
+                    self.input = entry.clone();
+                    self.cursor_position = self.input.len();
+                }
+            },
+        }
+    }
+
+    pub fn update_autocomplete(&mut self) {
+        let input = self.input.trim_start();
+        if input.is_empty() || (!input.starts_with('/') && input.len() < 2) {
+            self.autocomplete_suggestions.clear();
+            self.show_autocomplete = false;
+            return;
+        }
+        let prefix = input.strip_prefix('/').unwrap_or(input);
+        let mut suggestions: Vec<String> = SLASH_COMMANDS
+            .iter()
+            .filter(|c| c.starts_with(prefix))
+            .map(|c| format!("/{}", c))
+            .collect();
+        if !input.starts_with('/') {
+            suggestions.extend(
+                CLI_COMMANDS.iter()
+                    .filter(|c| c.starts_with(prefix))
+                    .map(|c| c.to_string()),
+            );
+        }
+        suggestions.sort();
+        suggestions.dedup();
+        if suggestions.len() > 1 && suggestions != self.autocomplete_suggestions {
+            self.autocomplete_suggestions = suggestions;
+            self.autocomplete_selected = 0;
+            self.autocomplete_scroll_offset = 0;
+            self.show_autocomplete = true;
+        } else {
+            self.autocomplete_suggestions.clear();
+            self.show_autocomplete = false;
+        }
+    }
+
+    pub fn autocomplete_cycle(&mut self) {
+        if self.autocomplete_suggestions.is_empty() { return; }
+        self.autocomplete_selected = (self.autocomplete_selected + 1) % self.autocomplete_suggestions.len();
+        let max_visible = 5;
+        if self.autocomplete_selected >= self.autocomplete_scroll_offset + max_visible {
+            self.autocomplete_scroll_offset = self.autocomplete_selected.saturating_sub(max_visible - 1);
+        } else if self.autocomplete_selected < self.autocomplete_scroll_offset {
+            self.autocomplete_scroll_offset = self.autocomplete_selected;
+        }
+    }
+
+    pub fn autocomplete_accept(&mut self) {
+        if let Some(s) = self.autocomplete_suggestions.get(self.autocomplete_selected) {
+            self.input = s.clone();
+            self.cursor_position = self.input.len();
+        }
+        self.autocomplete_suggestions.clear();
+        self.show_autocomplete = false;
     }
 
     pub fn handle_command(&mut self, cmd: &str) {
@@ -184,6 +309,14 @@ Use /thinking to show/hide thinking process."#;
             .map(|o| o.route(query))
             .unwrap_or_else(|| "unknown".to_string());
 
+        let context = self.auto_search_knowledge(query);
+        if !context.is_empty() {
+            self.push_output(
+                format!("[Knowledge] Found {} relevant notes", context.len()),
+                false,
+            );
+        }
+
         self.push_output(format!("You: {}", query), false);
         self.push_output(
             format!(
@@ -192,7 +325,30 @@ Use /thinking to show/hide thinking process."#;
             ),
             false,
         );
-        self.start_llm_call_via_orchestrator(query, &[]);
+        self.start_llm_call_via_orchestrator(query, &context);
+    }
+
+    fn auto_search_knowledge(&self, query: &str) -> Vec<String> {
+        use zen_core::paths::ZenPaths;
+        use zen_knowledge::search::{SearchService, TierSelector};
+
+        let tier = TierSelector::select_tier(query);
+        let paths = match ZenPaths::detect() {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+        let base_dir = paths.inbox();
+
+        match SearchService::new().search(query, &base_dir, Some(tier)) {
+            Ok(results) => {
+                results
+                    .into_iter()
+                    .take(3)
+                    .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
+                    .collect()
+            },
+            Err(_) => Vec::new(),
+        }
     }
 
     fn start_llm_call_via_orchestrator(&mut self, query: &str, context: &[String]) {
@@ -217,7 +373,7 @@ Use /thinking to show/hide thinking process."#;
             },
         };
 
-        let session = match &self.session {
+        let mut session = match &self.session {
             Some(s) => s.clone(),
             None => {
                 let _ = done_tx.send(Err("Session not initialized".to_string()));
@@ -225,7 +381,16 @@ Use /thinking to show/hide thinking process."#;
             },
         };
 
-        let _context: Vec<String> = context.to_vec();
+        if !context.is_empty() {
+            for (i, note_content) in context.iter().enumerate() {
+                session.knowledge.push(zen_core::types::RetrievedNote {
+                    path: format!("auto-search-{}", i),
+                    content: note_content.clone(),
+                    sensitivity: zen_core::types::Sensitivity::Public,
+                    relevance: 1.0 - (i as f64 * 0.1),
+                });
+            }
+        }
 
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -456,7 +621,7 @@ Use /thinking to show/hide thinking process."#;
     fn execute_session(&mut self, _args: Option<&str>) {
         use zen_memory::session_manager::SessionManager;
         let manager = SessionManager::new();
-        match manager.create_session("default") {
+        match manager.create_session("default", ".") {
             Ok(session) => {
                 self.session_id = Some(session.id.clone());
                 self.push_output(
@@ -474,13 +639,146 @@ Use /thinking to show/hide thinking process."#;
     fn execute_serve(&mut self, args: Option<&str>) {
         match args {
             Some("start") => {
-                self.push_output("Gateway daemon started (stub)".into(), false);
+                match self.spawn_gateway_daemon() {
+                    Ok(msg) => self.push_output(msg, false),
+                    Err(e) => self.push_output(format!("Gateway error: {}", e), true),
+                }
             },
             Some("stop") => {
-                self.push_output("Gateway daemon stopped (stub)".into(), false);
+                match self.stop_gateway_daemon() {
+                    Ok(msg) => self.push_output(msg, false),
+                    Err(e) => self.push_output(format!("Gateway error: {}", e), true),
+                }
             },
-            _ => self.push_output("Usage: /serve start|stop".into(), true),
+            Some("status") => {
+                match self.check_gateway_status() {
+                    Ok(msg) => self.push_output(msg, false),
+                    Err(e) => self.push_output(format!("Gateway error: {}", e), true),
+                }
+            },
+            _ => self.push_output("Usage: /serve start|stop|status".into(), true),
         }
+    }
+
+    fn spawn_gateway_daemon(&self) -> Result<String, String> {
+        use std::process::{Command, Stdio};
+
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let pid_path = zen_core::paths::ZenPaths::detect()
+            .map_err(|e| e.to_string())?
+            .global_root()
+            .join("daemon.pid");
+
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = pid_str.trim().parse::<u32>() {
+            #[cfg(unix)]
+            {
+                if unsafe { libc::kill(pid as i32, 0) == 0 } {
+                    return Err(format!("Gateway already running (pid: {})", pid));
+                }
+            }
+        }
+
+        let mut cmd = Command::new(&exe);
+        cmd.arg("serve").arg("start").arg("--foreground");
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
+        let child = cmd.spawn().map_err(|e| format!("Failed to spawn: {}", e))?;
+        let child_pid = child.id();
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        #[cfg(unix)]
+        {
+            if unsafe { libc::kill(child_pid as i32, 0) != 0 } {
+                return Err("Gateway daemon failed to start".to_string());
+            }
+        }
+
+        if let Some(parent) = pid_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&pid_path, child_pid.to_string()).ok();
+
+        let config = zen_gateway::HttpConfig::default();
+        Ok(format!(
+            "Gateway started in background (pid: {}) on http://{}:{}",
+            child_pid, config.bind_addr, config.port
+        ))
+    }
+
+    fn stop_gateway_daemon(&self) -> Result<String, String> {
+        let pid_path = zen_core::paths::ZenPaths::detect()
+            .map_err(|e| e.to_string())?
+            .global_root()
+            .join("daemon.pid");
+
+        if !pid_path.exists() {
+            return Ok("Gateway not running (no PID file)".to_string());
+        }
+
+        let pid_str = std::fs::read_to_string(&pid_path).map_err(|e| e.to_string())?;
+        let pid = pid_str.trim().parse::<u32>().map_err(|e| e.to_string())?;
+
+        #[cfg(unix)]
+        {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if unsafe { libc::kill(pid as i32, 0) != 0 } {
+                    break;
+                }
+            }
+
+            if unsafe { libc::kill(pid as i32, 0) == 0 } {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        std::fs::remove_file(&pid_path).ok();
+        Ok(format!("Gateway stopped (pid: {})", pid))
+    }
+
+    fn check_gateway_status(&self) -> Result<String, String> {
+        let pid_path = zen_core::paths::ZenPaths::detect()
+            .map_err(|e| e.to_string())?
+            .global_root()
+            .join("daemon.pid");
+
+        if !pid_path.exists() {
+            return Ok("Gateway not running".to_string());
+        }
+
+        let pid_str = std::fs::read_to_string(&pid_path).map_err(|e| e.to_string())?;
+        let pid = pid_str.trim().parse::<u32>().map_err(|e| e.to_string())?;
+
+        #[cfg(unix)]
+        {
+            if unsafe { libc::kill(pid as i32, 0) == 0 } {
+                let config = zen_gateway::HttpConfig::default();
+                return Ok(format!(
+                    "Gateway running (pid: {}) on http://{}:{}",
+                    pid, config.bind_addr, config.port
+                ));
+            }
+        }
+
+        Ok(format!("Gateway stale (pid: {} is dead)", pid))
     }
 
     fn execute_config(&mut self) {
@@ -519,7 +817,7 @@ Use /thinking to show/hide thinking process."#;
         use zen_core::paths::ZenPaths;
         use zen_knowledge::maintenance::Linter;
         if let Ok(paths) = ZenPaths::detect() {
-            match Linter::new().run(&paths.global_root().join("knowledge/wiki")) {
+            match Linter::new().run(&paths.wiki()) {
                 Ok(result) => {
                     self.push_output("Lint complete:".into(), false);
                     self.push_output(
@@ -558,6 +856,7 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Re
             match crate::tui::handler::handle_key(key, &mut app) {
                 crate::tui::handler::KeyAction::Submit => {
                     let cmd = app.input.clone();
+                    app.push_history(&cmd);
                     app.input.clear();
                     app.cursor_position = 0;
                     app.handle_command(&cmd);

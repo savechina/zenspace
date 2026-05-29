@@ -156,7 +156,7 @@ pub async fn shell() -> Result<(), ZenError> {
 
     if is_tui {
         let log_dir = zen_core::paths::ZenPaths::detect()
-            .map(|p| p.global_root().join("logs"))
+            .map(|p| p.logs())
             .unwrap_or_else(|_| std::env::temp_dir().join("zen-logs"));
         std::fs::create_dir_all(&log_dir).ok();
         let log_path = log_dir.join("zen.log");
@@ -168,7 +168,9 @@ pub async fn shell() -> Result<(), ZenError> {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
-                    .without_time()
+                    .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
+                        time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap(),
+                    ))
                     .with_ansi(false)
                     .with_writer(std::sync::Mutex::new(file)),
             )
@@ -178,7 +180,9 @@ pub async fn shell() -> Result<(), ZenError> {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
-                    .without_time()
+                    .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
+                        time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap(),
+                    ))
                     .with_writer(std::io::stderr),
             )
             .with(filter)

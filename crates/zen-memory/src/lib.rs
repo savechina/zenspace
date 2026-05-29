@@ -25,5 +25,5 @@ pub use memory_service::IdentityContext;
 pub use prompt::PromptAssembly;
 pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity};
 pub use session::{ConversationTurn, RetrievedNote, SessionContext};
-pub use session_manager::{SessionEntity, SessionManager};
-pub use zen_core::types::SessionStatus;
+pub use session_manager::SessionManager;
+pub use zen_core::types::{SessionEntity, SessionStatus};

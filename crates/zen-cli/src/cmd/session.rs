@@ -3,6 +3,7 @@ use colored::Colorize;
 use tracing::debug;
 
 use zen_core::errors::ZenError;
+use zen_core::types::SessionStatus;
 
 use crate::session::{self, SessionOrchestrator};
 
@@ -81,9 +82,9 @@ pub fn execute_command(operation: &SessionCommands) -> Result<(), ZenError> {
                 println!("{} Sessions ({}):", "📋".bold(), sessions.len());
                 for s in &sessions {
                     let status_color = match s.status {
-                        session::SessionStatus::Active => "Active".green(),
-                        session::SessionStatus::Completed => "Completed".blue(),
-                        session::SessionStatus::Failed => "Failed".red(),
+                        SessionStatus::Active => "Active".green(),
+                        SessionStatus::Completed => "Completed".blue(),
+                        SessionStatus::Failed => "Failed".red(),
                     };
                     println!(
                         "  {} — {} — {}",

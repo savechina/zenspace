@@ -27,7 +27,7 @@ pub fn execute_command(cmd: &ReindexCommands) -> Result<(), ZenError> {
                 Some(p) => p.clone(),
                 None => {
                     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-                    paths.user_data("knowledge")
+                    paths.knowledge()
                 },
             };
 

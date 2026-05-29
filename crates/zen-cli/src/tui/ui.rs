@@ -3,7 +3,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let queue_height = if app.message_queue.is_empty() { 0 } else { 2 + app.message_queue.len() as u16 };
@@ -74,11 +74,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.message_queue.is_empty() {
         let mut queue_lines: Vec<Line> = Vec::new();
         for (i, msg) in app.message_queue.iter().enumerate() {
-            let prefix = if i == 0 {
-                " ▶ "
-            } else {
-                "   "
-            };
+            let prefix = if i == 0 { " ▶ " } else { "   " };
             queue_lines.push(Line::from(Span::styled(
                 format!("{}{}. {}", prefix, i + 1, msg),
                 Style::default().fg(Color::Cyan),
@@ -94,17 +90,19 @@ pub fn render(frame: &mut Frame, app: &App) {
         frame.render_widget(queue, chunks[2]);
     }
 
-    let input_area = chunks[3].inner(Margin {
+    let input_chunk = chunks[3];
+    let input_area = input_chunk.inner(Margin {
         horizontal: 1,
         vertical: 1,
     });
     let visible_width = input_area.width as usize;
 
     let cursor_col = app.cursor_position.min(app.input.len());
-    let (scroll_start, display_text) = if cursor_col <= visible_width {
+    let (scroll_start, display_text) = if visible_width < 2 || cursor_col <= visible_width {
         (0, app.input.as_str())
     } else {
-        let offset = cursor_col - visible_width + 1;
+        let offset = cursor_col.saturating_sub(visible_width.saturating_sub(2));
+        let offset = offset.min(app.input.len());
         (offset, &app.input[offset..])
     };
 
@@ -112,9 +110,63 @@ pub fn render(frame: &mut Frame, app: &App) {
     let input = Paragraph::new(input_display).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Input (Enter=send, Ctrl+D=quit) "),
+            .title(" Input (Enter=send, Ctrl+D=quit, Tab=complete) "),
     );
-    frame.render_widget(input, chunks[3]);
+    frame.render_widget(input, input_chunk);
+
+    if app.show_autocomplete && !app.autocomplete_suggestions.is_empty() {
+        let max_suggestions = 5;
+        let suggestion_count = app.autocomplete_suggestions.len().min(max_suggestions);
+        let popup_height = (suggestion_count + 2) as u16;
+        let popup_width = input_chunk.width.min(50);
+
+        let popup_y = input_chunk.y.saturating_sub(popup_height);
+        let popup_area = ratatui::layout::Rect {
+            x: input_chunk.x,
+            y: popup_y,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        if popup_y < input_chunk.y {
+            frame.render_widget(Clear, popup_area);
+
+            let scroll_offset = app.autocomplete_scroll_offset;
+            let suggestion_lines: Vec<Line> = app
+                .autocomplete_suggestions
+                .iter()
+                .enumerate()
+                .skip(scroll_offset)
+                .take(max_suggestions)
+                .map(|(i, s)| {
+                    let style = if i == app.autocomplete_selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let marker = if i == app.autocomplete_selected { "▸ " } else { "  " };
+                    Line::from(Span::styled(format!("{}{}", marker, s), style))
+                })
+                .collect();
+
+            let total = app.autocomplete_suggestions.len();
+            let title = if total > max_suggestions {
+                format!(" Suggestions ({}/{}) (Tab=next, Enter=select, Esc=close) ",
+                    app.autocomplete_selected + 1, total)
+            } else {
+                " Suggestions (Tab=next, Enter=select, Esc=close) ".to_string()
+            };
+
+            let suggestions = Paragraph::new(suggestion_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title),
+                )
+                .wrap(Wrap { trim: true });
+            frame.render_widget(suggestions, popup_area);
+        }
+    }
 
     frame.set_cursor_position((
         input_area.x + (cursor_col.saturating_sub(scroll_start)) as u16 + 2,

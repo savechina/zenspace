@@ -17,6 +17,10 @@ pub const SKILLS_DIR: &str = "skills/";
 pub const FINANCE_DIR: &str = "finance/";
 pub const CACHE_DIR: &str = "cache/";
 pub const MEMORY_DIR: &str = "memory/";
+pub const IDENTITY_DIR: &str = "identity/";
+pub const LOGS_DIR: &str = "logs/";
+pub const OUTPUT_DIR: &str = "output/";
+pub const PLUGINS_DIR: &str = "plugins/";
 pub const CONFIG_FILE: &str = "config.toml";
 
 pub const ZEN_HOME_ENV: &str = "ZEN_HOME";

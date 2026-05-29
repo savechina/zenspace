@@ -156,7 +156,7 @@ fn update_memory(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
 /// For logs older than 30 days, prepends a summary block and is
 /// considered "compressed" once marked.
 fn compress_old_logs(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
-    let logs_dir = zen_paths.global_root().join("logs");
+    let logs_dir = zen_paths.logs();
     if !logs_dir.is_dir() {
         return Ok(false);
     }

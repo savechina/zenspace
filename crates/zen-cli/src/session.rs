@@ -2,92 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 use zen_agents::{AgentRegistry, DefaultAgentRegistry};
 use zen_core::paths::ZenPaths;
-use zen_core::types::{Sensitivity, SessionStatus};
+use zen_core::types::{Sensitivity, SessionEntity, SessionStatus};
 use zen_memory::memory_service::IdentityContext;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionEntity {
-    pub id: String,
-    pub agent_name: String,
-    pub sensitivity_policy: Sensitivity,
-    pub created_at: chrono::DateTime<Utc>,
-    pub updated_at: chrono::DateTime<Utc>,
-    pub status: SessionStatus,
-    pub workspace: String,
-}
-
-// ---------------------------------------------------------------------------
-// Session entity persistence (T068)
-// ---------------------------------------------------------------------------
-
-impl SessionEntity {
-    /// Save this session to `~/.zen/sessions/<id>.json`.
-    pub fn save(&self) -> Result<PathBuf> {
-        let dir = Self::sessions_dir()?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create sessions directory: {}", dir.display()))?;
-
-        let file_path = dir.join(format!("{}.json", self.id));
-        let json =
-            serde_json::to_string_pretty(self).context("failed to serialize session entity")?;
-        std::fs::write(&file_path, json)
-            .with_context(|| format!("failed to write session file: {}", file_path.display()))?;
-
-        debug!("saved session {} to {}", self.id, file_path.display());
-        Ok(file_path)
-    }
-
-    /// Load a session from `~/.zen/sessions/<id>.json`.
-    pub fn load(id: &str) -> Result<SessionEntity> {
-        let dir = Self::sessions_dir()?;
-        let file_path = dir.join(format!("{}.json", id));
-
-        let json = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("session not found: {id}"))?;
-        let session: SessionEntity = serde_json::from_str(&json)
-            .with_context(|| format!("failed to parse session file: {}", file_path.display()))?;
-
-        Ok(session)
-    }
-
-    /// List all sessions from `~/.zen/sessions/*.json`.
-    pub fn list() -> Result<Vec<SessionEntity>> {
-        let dir = Self::sessions_dir()?;
-
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut sessions = Vec::new();
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("failed to read sessions directory: {}", dir.display()))?;
-
-        for entry in entries {
-            let entry = entry.context("failed to read directory entry")?;
-            let path = entry.path();
-
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                match Self::load(&path.file_stem().expect("valid filename").to_string_lossy()) {
-                    Ok(session) => sessions.push(session),
-                    Err(e) => debug!("skipping invalid session file {}: {}", path.display(), e),
-                }
-            }
-        }
-
-        debug!("listed {} sessions from {}", sessions.len(), dir.display());
-        Ok(sessions)
-    }
-
-    fn sessions_dir() -> Result<PathBuf> {
-        let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
-        Ok(paths.sessions())
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Session context assembly (T067)
@@ -208,6 +128,16 @@ pub fn compute_max_sensitivity(notes: &[zen_knowledge::Note]) -> Sensitivity {
         return Sensitivity::Private;
     }
     Sensitivity::max_of(&notes.iter().map(|n| n.sensitivity).collect::<Vec<_>>())
+}
+
+
+// ---------------------------------------------------------------------------
+// Session persistence helpers
+// ---------------------------------------------------------------------------
+
+/// Persist session metadata to disk.
+pub fn save_session(session: &SessionEntity) -> Result<PathBuf> {
+    session.save()
 }
 
 #[cfg(test)]
