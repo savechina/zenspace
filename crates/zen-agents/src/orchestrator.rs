@@ -12,8 +12,8 @@ use zen_core::types::SessionContext;
 use zen_memory::ZenMemvidStore;
 use zen_provider::DefaultRouter;
 
+use crate::delegate_tools;
 use crate::delegate_tools::ZenDelegateTools;
-use crate::delegate_tools as delegate_tools;
 use crate::execution::{AgentExecution, ExecutionMetadata};
 use crate::review::QualityPipeline;
 use crate::wiring::ZenWiring;
@@ -73,7 +73,9 @@ impl AgentOrchestrator {
     }
 
     pub fn budget_consumed(&self) -> u64 {
-        self.token_budget.capacity().saturating_sub(self.token_budget.available())
+        self.token_budget
+            .capacity()
+            .saturating_sub(self.token_budget.available())
     }
 
     pub fn delegates(&self) -> &ZenDelegateTools {
@@ -112,74 +114,106 @@ impl AgentOrchestrator {
     fn classify_agent(&self, query: &str) -> String {
         let lower = query.to_lowercase();
 
-        if lower.contains("implement") || lower.contains("code") || lower.contains("function")
-            || lower.contains("class") || lower.contains("refactor") || lower.contains("debug")
+        if lower.contains("implement")
+            || lower.contains("code")
+            || lower.contains("function")
+            || lower.contains("class")
+            || lower.contains("refactor")
+            || lower.contains("debug")
         {
             return "Hephaestus".to_string();
         }
 
-        if lower.contains("research") || lower.contains("explore") || lower.contains("discover")
-            || lower.contains("find information") || lower.contains("investigate")
+        if lower.contains("research")
+            || lower.contains("explore")
+            || lower.contains("discover")
+            || lower.contains("find information")
+            || lower.contains("investigate")
         {
             return "Explore".to_string();
         }
 
-        if lower.contains("analyze") || lower.contains("analysis") || lower.contains("deep")
-            || lower.contains("architecture") || lower.contains("design")
+        if lower.contains("analyze")
+            || lower.contains("analysis")
+            || lower.contains("deep")
+            || lower.contains("architecture")
+            || lower.contains("design")
         {
             return "Oracle".to_string();
         }
 
-        if lower.contains("organize") || lower.contains("knowledge") || lower.contains("wiki")
-            || lower.contains("notes") || lower.contains("catalog") || lower.contains("dedup")
+        if lower.contains("organize")
+            || lower.contains("knowledge")
+            || lower.contains("wiki")
+            || lower.contains("notes")
+            || lower.contains("catalog")
+            || lower.contains("dedup")
         {
             return "Librarian".to_string();
         }
 
-        if lower.contains("consolidate") || lower.contains("pipeline") || lower.contains("merge")
+        if lower.contains("consolidate")
+            || lower.contains("pipeline")
+            || lower.contains("merge")
             || lower.contains("compile wiki")
         {
             return "Hermes".to_string();
         }
 
-        if lower.contains("review") || lower.contains("audit") || lower.contains("check quality")
+        if lower.contains("review")
+            || lower.contains("audit")
+            || lower.contains("check quality")
             || lower.contains("security")
         {
             return "Momus".to_string();
         }
 
-        if lower.contains("plan") || lower.contains("strategy") || lower.contains("roadmap")
-            || lower.contains("spec") || lower.contains("milestone")
+        if lower.contains("plan")
+            || lower.contains("strategy")
+            || lower.contains("roadmap")
+            || lower.contains("spec")
+            || lower.contains("milestone")
         {
             return "Prometheus".to_string();
         }
 
-        if lower.contains("gap") || lower.contains("tactical") || lower.contains("assumption")
+        if lower.contains("gap")
+            || lower.contains("tactical")
+            || lower.contains("assumption")
             || lower.contains("feasibility")
         {
             return "Metis".to_string();
         }
 
-        if lower.contains("batch") || lower.contains("automate") || lower.contains("routine")
+        if lower.contains("batch")
+            || lower.contains("automate")
+            || lower.contains("routine")
             || lower.contains("schedule")
         {
             return "Atlas".to_string();
         }
 
-        if lower.contains("format") || lower.contains("convert") || lower.contains("download")
+        if lower.contains("format")
+            || lower.contains("convert")
+            || lower.contains("download")
             || lower.contains("clean")
         {
             return "Junior".to_string();
         }
 
-        if lower.contains("value") || lower.contains("align") || lower.contains("priority")
+        if lower.contains("value")
+            || lower.contains("align")
+            || lower.contains("priority")
             || lower.contains("should we")
         {
             return "Zeus".to_string();
         }
 
-        if lower.contains("image") || lower.contains("chart") || lower.contains("visual")
-            || lower.contains("diagram") || lower.contains("screenshot")
+        if lower.contains("image")
+            || lower.contains("chart")
+            || lower.contains("visual")
+            || lower.contains("diagram")
+            || lower.contains("screenshot")
         {
             return "Argus".to_string();
         }
@@ -205,7 +239,10 @@ impl AgentOrchestrator {
         session.agent_name.clone_from(&agent_name);
 
         let estimated_tokens = user_query.len() / 4 + 512;
-        let reservation = self.token_budget.try_reserve_tokens(estimated_tokens as u64).await?;
+        let reservation = self
+            .token_budget
+            .try_reserve_tokens(estimated_tokens as u64)
+            .await?;
         if reservation.is_none() {
             return Err(anyhow::anyhow!(
                 "Token budget exhausted ({} consumed, {} capacity)",
@@ -218,7 +255,9 @@ impl AgentOrchestrator {
         let response = zen_agent.execute(user_query, session).await?;
 
         let actual_tokens = (response.len() / 4 + user_query.len() / 4) as u64;
-        self.token_budget.record_usage(reservation, actual_tokens, actual_tokens).await;
+        self.token_budget
+            .record_usage(reservation, actual_tokens, actual_tokens)
+            .await;
 
         // Check if the query suggests needing sub-agent help
         let mut sub_agent_results = Vec::new();
@@ -267,7 +306,11 @@ impl AgentOrchestrator {
     }
 
     /// Execute with backward compatibility — returns String for existing callers.
-    pub async fn execute_string(&self, session: &mut SessionContext, user_query: &str) -> Result<String> {
+    pub async fn execute_string(
+        &self,
+        session: &mut SessionContext,
+        user_query: &str,
+    ) -> Result<String> {
         let execution = self.execute(session, user_query).await?;
         Ok(execution.response)
     }
@@ -294,12 +337,21 @@ impl AgentOrchestrator {
 
         session.agent_name.clone_from(&agent_name);
 
-        let response = zen_agent.execute_stream(user_query, session, &mut on_token).await?;
+        let response = zen_agent
+            .execute_stream(user_query, session, &mut on_token)
+            .await?;
 
         let actual_tokens = (response.len() / 4 + user_query.len() / 4) as u64;
-        let reservation = self.token_budget.try_reserve_tokens(actual_tokens).await.ok().flatten();
+        let reservation = self
+            .token_budget
+            .try_reserve_tokens(actual_tokens)
+            .await
+            .ok()
+            .flatten();
         if let Some(res) = reservation {
-            self.token_budget.record_usage(res, actual_tokens, actual_tokens).await;
+            self.token_budget
+                .record_usage(res, actual_tokens, actual_tokens)
+                .await;
         }
 
         let _duration_ms = start.elapsed().as_millis() as u64;

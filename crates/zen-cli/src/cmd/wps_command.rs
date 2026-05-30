@@ -34,11 +34,14 @@ pub fn execute_command(operation: &WpsCommands) -> Result<(), ZenError> {
         WpsCommands::Archive { from_dir, json } => {
             wps_service::archive(from_dir.clone(), None)?;
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "archive",
-                    "from_dir": from_dir
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "archive",
+                        "from_dir": from_dir
+                    })
+                );
             } else {
                 println!(
                     "zstd compress directory: {:}  ",
@@ -50,11 +53,14 @@ pub fn execute_command(operation: &WpsCommands) -> Result<(), ZenError> {
         WpsCommands::Dotfiles { restore, json } => {
             wps_service::dotfiles(*restore)?;
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "dotfiles",
-                    "restore": restore
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "dotfiles",
+                        "restore": restore
+                    })
+                );
             } else {
                 println!("dotfiles restore: {}", restore);
             }
@@ -68,12 +74,15 @@ pub fn execute_command(operation: &WpsCommands) -> Result<(), ZenError> {
             debug!("{} - {}", (*timestamp).unwrap_or(-1), timeunit);
             wps_service::unixtime(*timestamp, timeunit.clone())?;
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "unixtime",
-                    "timestamp": timestamp,
-                    "timeunit": timeunit
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "unixtime",
+                        "timestamp": timestamp,
+                        "timeunit": timeunit
+                    })
+                );
             }
             Ok(())
         },

@@ -35,7 +35,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         Err(e) => {
             tracing::warn!(path = ?soul_path, error = %e, "SOUL.md not found or unreadable");
             String::new()
-        }
+        },
     };
 
     let agents_path = root.join("AGENTS.md");
@@ -44,7 +44,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         Err(e) => {
             tracing::warn!(path = ?agents_path, error = %e, "AGENTS.md not found or unreadable");
             String::new()
-        }
+        },
     };
 
     let memory_path = root.join("MEMORY.md");
@@ -53,7 +53,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         Err(e) => {
             tracing::warn!(path = ?memory_path, error = %e, "MEMORY.md not found or unreadable");
             String::new()
-        }
+        },
     };
 
     IdentityContext {
@@ -82,10 +82,8 @@ impl ZenAgent {
     pub async fn execute(&self, query: &str, session: &mut SessionContext) -> Result<String> {
         let mut ctx = InvestigationContext::new("zen-session", "query");
 
-        ctx.evidence.push(
-            Evidence::new("user-input", "query")
-                .with_detail(json!({ "text": query })),
-        );
+        ctx.evidence
+            .push(Evidence::new("user-input", "query").with_detail(json!({ "text": query })));
 
         if let Some(ref identity) = self.identity {
             ctx.evidence.push(
@@ -183,10 +181,8 @@ impl ZenAgent {
     ) -> Result<String> {
         let mut ctx = InvestigationContext::new("zen-session", "query");
 
-        ctx.evidence.push(
-            Evidence::new("user-input", "query")
-                .with_detail(json!({ "text": query })),
-        );
+        ctx.evidence
+            .push(Evidence::new("user-input", "query").with_detail(json!({ "text": query })));
 
         if let Some(ref identity) = self.identity {
             ctx.evidence.push(
@@ -322,22 +318,16 @@ impl ZenAgentBuilder {
         self
     }
 
-    pub fn build(
-        self,
-        wiring: &ZenWiring,
-        router: &DefaultRouter,
-    ) -> Result<ZenAgent> {
-        let completion_model = ZenCompletionModel::new(router.clone(), router.default_provider_name());
+    pub fn build(self, wiring: &ZenWiring, router: &DefaultRouter) -> Result<ZenAgent> {
+        let completion_model =
+            ZenCompletionModel::new(router.clone(), router.default_provider_name());
 
         let generic = GenericAgent::builder(&self.name)
             .with_skills(self.skill_ids.clone())
             .with_tools(self.tool_ids.clone())
             .build(&wiring.skills, &wiring.tools)?;
 
-        let identity = self
-            .zen_paths
-            .as_ref()
-            .map(load_identity_files);
+        let identity = self.zen_paths.as_ref().map(load_identity_files);
 
         Ok(ZenAgent {
             generic,

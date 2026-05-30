@@ -1,58 +1,39 @@
 use rig::agent::AgentBuilder;
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
-use rig::providers::openai;
+use rig::providers::cohere;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::router::LlmError;
 
 #[derive(Debug, Clone)]
-pub struct OpenAIProvider {
+pub struct CohereProvider {
     pub api_key: String,
     pub model: String,
-    pub base_url: String,
 }
 
-impl OpenAIProvider {
+impl CohereProvider {
     pub fn new(api_key: String, model: String) -> Self {
-        Self {
-            api_key,
-            model,
-            base_url: "https://api.openai.com".into(),
-        }
-    }
-
-    pub fn new_with_base_url(api_key: String, model: String, base_url: String) -> Self {
-        Self {
-            api_key,
-            model,
-            base_url,
-        }
+        Self { api_key, model }
     }
 
     pub async fn complete_async(&self, prompt: &str) -> Result<String, LlmError> {
-        let mut builder = openai::Client::builder().api_key(&self.api_key);
-
-        if self.base_url != "https://api.openai.com" {
-            builder = builder.base_url(&self.base_url);
-        }
-
-        let client = builder.build().map_err(|e| LlmError::Call {
-            reason: format!("Failed to create OpenAI client: {}", e),
+        let client = cohere::Client::new(&self.api_key).map_err(|e| LlmError::Call {
+            reason: format!("Failed to create Cohere client: {}", e),
         })?;
 
         let model = client.completion_model(&self.model);
         let agent = AgentBuilder::new(model).build();
 
         let response = agent.prompt(prompt).await.map_err(|e| LlmError::Call {
-            reason: format!("OpenAI completion failed: {}", e),
+            reason: format!("Cohere completion failed: {}", e),
         })?;
 
         info!(
             model = self.model,
             response_len = response.len(),
-            "OpenAIProvider complete"
+            "CohereProvider complete"
         );
         Ok(response)
     }
@@ -60,21 +41,16 @@ impl OpenAIProvider {
     pub fn complete(&self, prompt: &str) -> Result<String, LlmError> {
         let api_key = self.api_key.clone();
         let model = self.model.clone();
-        let base_url = self.base_url.clone();
         let prompt = prompt.to_string();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let provider = OpenAIProvider {
-                api_key,
-                model,
-                base_url,
-            };
+            let provider = CohereProvider { api_key, model };
             rt.block_on(provider.complete_async(&prompt))
         })
         .join()
         .map_err(|e| LlmError::Call {
-            reason: format!("OpenAI thread panic: {:?}", e),
+            reason: format!("Cohere thread panic: {:?}", e),
         })?
     }
 
@@ -97,5 +73,14 @@ impl OpenAIProvider {
             }
         }
         Ok(())
+    }
+
+    pub fn health_check(&self) -> bool {
+        if self.api_key.is_empty() {
+            warn!("Cohere health check: API key is empty");
+            return false;
+        }
+        info!("CohereProvider health check (key present)");
+        true
     }
 }

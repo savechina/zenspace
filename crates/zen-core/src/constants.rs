@@ -24,3 +24,18 @@ pub const PLUGINS_DIR: &str = "plugins/";
 pub const CONFIG_FILE: &str = "config.toml";
 
 pub const ZEN_HOME_ENV: &str = "ZEN_HOME";
+
+pub const SUPPORTED_LLM_PROVIDERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "deepseek",
+    "aliyun",
+    "mistral",
+    "groq",
+    "moonshot",
+    "xai",
+    "perplexity",
+    "gemini",
+    "ollama",
+    "qqbot",
+];

@@ -21,22 +21,22 @@ pub use agent_profile::{
     SensitivityLevel,
 };
 pub use blackboard::{
-    Blackboard, BlackboardHandle, BlackboardTask, Deliverable, DeliverableMetadata,
-    Feedback, FeedbackErrorType, SystemEvent, ValidationStatus,
+    Blackboard, BlackboardHandle, BlackboardTask, Deliverable, DeliverableMetadata, Feedback,
+    FeedbackErrorType, SystemEvent, ValidationStatus,
 };
 pub use context::AgentContext;
 pub use coordinator::ZenCoordinator;
 pub use execution::{AgentExecution, ExecutionMetadata, ToolCall};
 pub use executor::{AgentExecutor, ErrorCategory, RetryPolicy};
 pub use observability::create_telemetry_hook;
-pub use rig_tap::{EventKind, ObservabilityEvent, extract_event, EVENT_TARGET};
 pub use orchestrator::AgentOrchestrator;
 pub use registry::{AgentRegistry, DefaultAgentRegistry, RegistryError};
-pub use review::{MetisReviewer, MomusReviewer, HermesValidator, ZeusEscalation, QualityPipeline};
+pub use review::{HermesValidator, MetisReviewer, MomusReviewer, QualityPipeline, ZeusEscalation};
+pub use rig_tap::{EVENT_TARGET, EventKind, ObservabilityEvent, extract_event};
 pub use sandbox::{ExecutionOutput, ResourceLimits, WasmSandbox};
-pub use zen_skill::{ZenSkill, ZenTool};
 pub use wiring::ZenWiring;
-pub use zen_agent::{ZenAgent, ZenAgentBuilder, IdentityContext, load_identity_files};
+pub use zen_agent::{IdentityContext, ZenAgent, ZenAgentBuilder, load_identity_files};
+pub use zen_skill::{ZenSkill, ZenTool};
 
 // Re-export memory types from zen-memory
 pub use zen_memory::{MemoryEntry, MemoryStats, MemoryStore};

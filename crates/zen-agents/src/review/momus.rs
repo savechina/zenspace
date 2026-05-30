@@ -1,5 +1,5 @@
+use crate::sandbox::{ExecutionOutput, ResourceLimits, WasmSandbox};
 use zen_core::types::Task;
-use crate::sandbox::{WasmSandbox, ResourceLimits, ExecutionOutput};
 
 #[derive(Debug, Clone)]
 pub struct MomusFinding {
@@ -85,7 +85,8 @@ impl MomusReviewer {
         if has_create && has_delete && sentences.len() > 1 {
             findings.push(MomusFinding {
                 finding_type: MomusFindingType::PlanInconsistency,
-                description: "Plan contains both creation and deletion actions without ordering".to_string(),
+                description: "Plan contains both creation and deletion actions without ordering"
+                    .to_string(),
                 is_blocking: true,
             });
         }
@@ -125,9 +126,18 @@ impl MomusReviewer {
         let has_criteria = ["verify", "validate", "test", "check", "assert", "confirm"]
             .iter()
             .any(|t| lower.contains(t));
-        let has_metrics = ["percent", "count", "score", "threshold", "minimum", "maximum", "less than", "more than"]
-            .iter()
-            .any(|t| lower.contains(t));
+        let has_metrics = [
+            "percent",
+            "count",
+            "score",
+            "threshold",
+            "minimum",
+            "maximum",
+            "less than",
+            "more than",
+        ]
+        .iter()
+        .any(|t| lower.contains(t));
 
         let word_count = plan.split_whitespace().count();
         if !has_criteria && word_count > 10 {
@@ -158,15 +168,21 @@ impl MomusReviewer {
         let lower = plan.to_lowercase();
         let lines: Vec<&str> = plan.lines().filter(|l| !l.trim().is_empty()).collect();
 
-        let lines_without_subject = lines.iter().filter(|l| {
-            let trimmed = l.trim();
-            trimmed.starts_with("and") || trimmed.starts_with("or") || trimmed.starts_with("then")
-        }).count();
+        let lines_without_subject = lines
+            .iter()
+            .filter(|l| {
+                let trimmed = l.trim();
+                trimmed.starts_with("and")
+                    || trimmed.starts_with("or")
+                    || trimmed.starts_with("then")
+            })
+            .count();
 
         if lines_without_subject > lines.len() / 2 && lines.len() > 2 {
             findings.push(MomusFinding {
                 finding_type: MomusFindingType::MissingVerifiability,
-                description: "Majority of steps lack clear subject — hard to verify independently".to_string(),
+                description: "Majority of steps lack clear subject — hard to verify independently"
+                    .to_string(),
                 is_blocking: true,
             });
         }
@@ -186,7 +202,8 @@ impl MomusReviewer {
     pub fn validate_via_wasm(&self, wasm_bytes: &[u8]) -> Result<ExecutionOutput, String> {
         let sandbox = WasmSandbox::new(ResourceLimits::default())
             .map_err(|e| format!("WasmSandbox creation failed: {e}"))?;
-        sandbox.validate_module(wasm_bytes)
+        sandbox
+            .validate_module(wasm_bytes)
             .map_err(|e| format!("WASM validation failed: {e}"))?;
         Ok(ExecutionOutput {
             stdout: String::new(),
@@ -226,7 +243,10 @@ mod tests {
     fn momus_veto_on_plan_with_issues() {
         let reviewer = MomusReviewer::new();
         let task = Task::new("test task", 0.5, TaskType::Code);
-        let review = reviewer.gate_review(&task, "create the new table. delete the old table. verify it works");
+        let review = reviewer.gate_review(
+            &task,
+            "create the new table. delete the old table. verify it works",
+        );
         assert!(!review.approved);
         assert!(review.veto_reason.is_some());
     }

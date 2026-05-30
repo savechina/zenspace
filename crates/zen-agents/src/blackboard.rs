@@ -2,12 +2,12 @@
 // Multi-producer, multi-consumer channels with backpressure
 // broadcast for event fan-out to all agents
 
-use tokio::sync::{mpsc, broadcast};
-use uuid::Uuid;
+use arrow::array::RecordBatch;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use arrow::array::RecordBatch;
+use tokio::sync::{broadcast, mpsc};
+use uuid::Uuid;
 
 use zen_core::types::{ComplexityLevel, TaskType};
 
@@ -341,13 +341,10 @@ mod tests {
         bb.push_task(task).await.unwrap();
 
         // Event should be received
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            subscriber.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         match event {
             SystemEvent::TaskEnqueued { task_id: id } => assert_eq!(id, expected_id),
@@ -375,13 +372,12 @@ mod tests {
         use arrow::array::StringArray;
         use arrow::datatypes::{DataType, Field, Schema};
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(StringArray::from(vec!["Alice", "Bob"]))],
-        ).unwrap();
+        )
+        .unwrap();
 
         let deliverable = Deliverable::new(Uuid::new_v4(), "agent", "content".to_string())
             .with_arrow_data(Arc::new(batch));

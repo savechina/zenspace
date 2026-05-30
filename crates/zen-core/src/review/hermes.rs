@@ -93,18 +93,30 @@ impl HermesValidator {
         let lines: Vec<&str> = deliverable.lines().collect();
         let has_any_structure = lines.iter().any(|l| {
             let t = l.trim();
-            t.starts_with("#") || t.starts_with("-") || t.starts_with("*") || t.chars().next().is_some_and(|c| c.is_ascii_digit())
+            t.starts_with("#")
+                || t.starts_with("-")
+                || t.starts_with("*")
+                || t.chars().next().is_some_and(|c| c.is_ascii_digit())
         });
 
         if lines.len() > 10 && !has_any_structure {
             findings.push(HermesFinding {
                 finding_type: HermesFindingType::FormatNonCompliance,
-                description: "Long deliverable lacks structural elements (headings, lists, numbered steps)".to_string(),
+                description:
+                    "Long deliverable lacks structural elements (headings, lists, numbered steps)"
+                        .to_string(),
                 requires_revision: true,
             });
         }
 
-        if deliverable.as_bytes().iter().filter(|b| **b == b'`').count() % 2 != 0 {
+        if deliverable
+            .as_bytes()
+            .iter()
+            .filter(|b| **b == b'`')
+            .count()
+            % 2
+            != 0
+        {
             findings.push(HermesFinding {
                 finding_type: HermesFindingType::FormatNonCompliance,
                 description: "Unmatched backtick characters detected in formatting".to_string(),
@@ -150,7 +162,12 @@ mod tests {
         let task = Task::new("implement authentication middleware", 0.7, TaskType::Code);
         let validation = validator.validate_deliverable(&task, "simple code output");
         assert!(!validation.delivery_ready);
-        assert!(validation.findings.iter().any(|f| matches!(f.finding_type, HermesFindingType::FactCheckFailure)));
+        assert!(
+            validation
+                .findings
+                .iter()
+                .any(|f| matches!(f.finding_type, HermesFindingType::FactCheckFailure))
+        );
     }
 
     #[test]

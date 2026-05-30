@@ -4,9 +4,9 @@ use ratatui::backend::CrosstermBackend;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
+use zen_agents::AgentOrchestrator;
 use zen_core::config::load_config;
 use zen_core::types::SessionContext;
-use zen_agents::AgentOrchestrator;
 use zen_provider::DefaultRouter;
 
 #[derive(Debug)]
@@ -34,16 +34,47 @@ pub enum PendingCallKind {
 const MAX_HISTORY: usize = 100;
 
 pub const SLASH_COMMANDS: &[&str] = &[
-    "help", "quit", "clear", "thinking", "export", "note",
-    "search", "session", "serve", "config", "model",
-    "consolidate", "lint",
+    "help",
+    "quit",
+    "clear",
+    "thinking",
+    "export",
+    "note",
+    "search",
+    "session",
+    "serve",
+    "config",
+    "model",
+    "consolidate",
+    "lint",
 ];
 
 pub const CLI_COMMANDS: &[&str] = &[
-    "hello", "clean", "starter", "wps", "version", "session",
-    "serve", "agent", "workspace", "config", "provider", "audit",
-    "note", "search", "similar", "graph", "reindex", "research",
-    "consolidate", "lint", "ingest", "routine", "task", "brief", "plugin",
+    "hello",
+    "clean",
+    "starter",
+    "wps",
+    "version",
+    "session",
+    "serve",
+    "agent",
+    "workspace",
+    "config",
+    "provider",
+    "audit",
+    "note",
+    "search",
+    "similar",
+    "graph",
+    "reindex",
+    "research",
+    "consolidate",
+    "lint",
+    "ingest",
+    "routine",
+    "task",
+    "brief",
+    "plugin",
 ];
 
 pub struct App {
@@ -190,7 +221,8 @@ impl App {
             .collect();
         if !input.starts_with('/') {
             suggestions.extend(
-                CLI_COMMANDS.iter()
+                CLI_COMMANDS
+                    .iter()
                     .filter(|c| c.starts_with(prefix))
                     .map(|c| c.to_string()),
             );
@@ -209,18 +241,25 @@ impl App {
     }
 
     pub fn autocomplete_cycle(&mut self) {
-        if self.autocomplete_suggestions.is_empty() { return; }
-        self.autocomplete_selected = (self.autocomplete_selected + 1) % self.autocomplete_suggestions.len();
+        if self.autocomplete_suggestions.is_empty() {
+            return;
+        }
+        self.autocomplete_selected =
+            (self.autocomplete_selected + 1) % self.autocomplete_suggestions.len();
         let max_visible = 5;
         if self.autocomplete_selected >= self.autocomplete_scroll_offset + max_visible {
-            self.autocomplete_scroll_offset = self.autocomplete_selected.saturating_sub(max_visible - 1);
+            self.autocomplete_scroll_offset =
+                self.autocomplete_selected.saturating_sub(max_visible - 1);
         } else if self.autocomplete_selected < self.autocomplete_scroll_offset {
             self.autocomplete_scroll_offset = self.autocomplete_selected;
         }
     }
 
     pub fn autocomplete_accept(&mut self) {
-        if let Some(s) = self.autocomplete_suggestions.get(self.autocomplete_selected) {
+        if let Some(s) = self
+            .autocomplete_suggestions
+            .get(self.autocomplete_selected)
+        {
             self.input = s.clone();
             self.cursor_position = self.input.len();
         }
@@ -318,13 +357,7 @@ Use /thinking to show/hide thinking process."#;
         }
 
         self.push_output(format!("You: {}", query), false);
-        self.push_output(
-            format!(
-                "[{}] Thinking...",
-                specialist
-            ),
-            false,
-        );
+        self.push_output(format!("[{}] Thinking...", specialist), false);
         self.start_llm_call_via_orchestrator(query, &context);
     }
 
@@ -340,13 +373,11 @@ Use /thinking to show/hide thinking process."#;
         let base_dir = paths.inbox();
 
         match SearchService::new().search(query, &base_dir, Some(tier)) {
-            Ok(results) => {
-                results
-                    .into_iter()
-                    .take(3)
-                    .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
-                    .collect()
-            },
+            Ok(results) => results
+                .into_iter()
+                .take(3)
+                .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -355,11 +386,12 @@ Use /thinking to show/hide thinking process."#;
         let (tokens_tx, tokens_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let query_owned = query.to_string();
-        self.pending_calls.push(PendingCallKind::Streaming(PendingLlmCallStream {
-            tokens_rx,
-            done_rx,
-            query: query_owned.clone(),
-        }));
+        self.pending_calls
+            .push(PendingCallKind::Streaming(PendingLlmCallStream {
+                tokens_rx,
+                done_rx,
+                query: query_owned.clone(),
+            }));
         self.is_streaming = true;
         if self.pending_calls.len() == 1 {
             self.streaming_buffer.clear();
@@ -424,27 +456,69 @@ Use /thinking to show/hide thinking process."#;
                     }
                     match s.done_rx.try_recv() {
                         Ok(result) => {
-                            results.push((idx, Some((s.query.clone(), StreamResult { done_result: Some(result), tokens }))));
+                            results.push((
+                                idx,
+                                Some((
+                                    s.query.clone(),
+                                    StreamResult {
+                                        done_result: Some(result),
+                                        tokens,
+                                    },
+                                )),
+                            ));
                         },
                         Err(mpsc::TryRecvError::Empty) => {
-                            results.push((idx, Some((s.query.clone(), StreamResult { done_result: None, tokens }))));
+                            results.push((
+                                idx,
+                                Some((
+                                    s.query.clone(),
+                                    StreamResult {
+                                        done_result: None,
+                                        tokens,
+                                    },
+                                )),
+                            ));
                         },
                         Err(mpsc::TryRecvError::Disconnected) => {
-                            results.push((idx, Some((s.query.clone(), StreamResult { done_result: Some(Err("disconnected".into())), tokens }))));
+                            results.push((
+                                idx,
+                                Some((
+                                    s.query.clone(),
+                                    StreamResult {
+                                        done_result: Some(Err("disconnected".into())),
+                                        tokens,
+                                    },
+                                )),
+                            ));
                         },
                     }
                 },
-                PendingCallKind::SingleShot(ss) => {
-                    match ss.rx.try_recv() {
-                        Ok(result) => {
-                            results.push((idx, Some((ss.query.clone(), StreamResult { done_result: Some(result), tokens: Vec::new() }))));
-                        },
-                        Err(mpsc::TryRecvError::Empty) => {
-                        },
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            results.push((idx, Some((ss.query.clone(), StreamResult { done_result: Some(Err("disconnected".into())), tokens: Vec::new() }))));
-                        },
-                    }
+                PendingCallKind::SingleShot(ss) => match ss.rx.try_recv() {
+                    Ok(result) => {
+                        results.push((
+                            idx,
+                            Some((
+                                ss.query.clone(),
+                                StreamResult {
+                                    done_result: Some(result),
+                                    tokens: Vec::new(),
+                                },
+                            )),
+                        ));
+                    },
+                    Err(mpsc::TryRecvError::Empty) => {},
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        results.push((
+                            idx,
+                            Some((
+                                ss.query.clone(),
+                                StreamResult {
+                                    done_result: Some(Err("disconnected".into())),
+                                    tokens: Vec::new(),
+                                },
+                            )),
+                        ));
+                    },
                 },
             }
         }
@@ -505,10 +579,7 @@ Use /thinking to show/hide thinking process."#;
     fn execute_model(&mut self, args: Option<&str>) {
         match args {
             None => {
-                self.push_output(
-                    format!("Current model: {}", self.model),
-                    false,
-                );
+                self.push_output(format!("Current model: {}", self.model), false);
             },
             Some(arg) => {
                 let parts: Vec<&str> = arg.splitn(2, ' ').collect();
@@ -520,22 +591,54 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn set_model(&mut self, provider: &str, model: &str) {
-        let router = match provider {
-            "ollama" | "openai" | "mock" => {
-                DefaultRouter::new_for_provider(provider, model)
-            },
-            _ => {
+        use zen_core::constants::SUPPORTED_LLM_PROVIDERS;
+
+        let valid_providers = SUPPORTED_LLM_PROVIDERS;
+        let is_valid = valid_providers.contains(&provider) || provider == "mock";
+
+        if !is_valid {
+            self.push_output(
+                format!(
+                    "Unknown provider: {}. Supported: {}",
+                    provider,
+                    "openai, anthropic, deepseek, aliyun, mistral, groq, moonshot, xai, perplexity, gemini, ollama, qqbot, mock"
+                ),
+                true,
+            );
+            return;
+        }
+
+        if provider != "ollama" && provider != "mock" {
+            let agentic = zen_core::config::load_embedded_config()
+                .unwrap_or_else(|_| zen_core::config::AgenticConfig::default());
+
+            let env_var = agentic
+                .providers
+                .get(provider)
+                .and_then(|cfg| {
+                    cfg.api_key
+                        .as_ref()
+                        .and_then(|sr| match sr {
+                            zen_core::secrets::SecretRef::Env { env } => Some(env.clone()),
+                            _ => None,
+                        })
+                        .or_else(|| cfg.api_key_env.clone())
+                })
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()));
+
+            if std::env::var(&env_var).is_err() {
                 self.push_output(
                     format!(
-                        "Unknown provider: {}. Use ollama, openai, or mock",
-                        provider
+                        "Provider '{}' needs API key. Set {} or use: /model ollama (running)",
+                        provider, env_var
                     ),
                     true,
                 );
                 return;
-            },
-        };
+            }
+        }
 
+        let router = DefaultRouter::new_for_provider(provider, model);
         let new_model = format!("{}/{}", provider, model);
         let orchestrator = Arc::new(AgentOrchestrator::new(router));
 
@@ -638,23 +741,17 @@ Use /thinking to show/hide thinking process."#;
 
     fn execute_serve(&mut self, args: Option<&str>) {
         match args {
-            Some("start") => {
-                match self.spawn_gateway_daemon() {
-                    Ok(msg) => self.push_output(msg, false),
-                    Err(e) => self.push_output(format!("Gateway error: {}", e), true),
-                }
+            Some("start") => match self.spawn_gateway_daemon() {
+                Ok(msg) => self.push_output(msg, false),
+                Err(e) => self.push_output(format!("Gateway error: {}", e), true),
             },
-            Some("stop") => {
-                match self.stop_gateway_daemon() {
-                    Ok(msg) => self.push_output(msg, false),
-                    Err(e) => self.push_output(format!("Gateway error: {}", e), true),
-                }
+            Some("stop") => match self.stop_gateway_daemon() {
+                Ok(msg) => self.push_output(msg, false),
+                Err(e) => self.push_output(format!("Gateway error: {}", e), true),
             },
-            Some("status") => {
-                match self.check_gateway_status() {
-                    Ok(msg) => self.push_output(msg, false),
-                    Err(e) => self.push_output(format!("Gateway error: {}", e), true),
-                }
+            Some("status") => match self.check_gateway_status() {
+                Ok(msg) => self.push_output(msg, false),
+                Err(e) => self.push_output(format!("Gateway error: {}", e), true),
             },
             _ => self.push_output("Usage: /serve start|stop|status".into(), true),
         }
@@ -670,7 +767,8 @@ Use /thinking to show/hide thinking process."#;
             .join("daemon.pid");
 
         if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
-            && let Ok(pid) = pid_str.trim().parse::<u32>() {
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+        {
             #[cfg(unix)]
             {
                 if unsafe { libc::kill(pid as i32, 0) == 0 } {
@@ -786,10 +884,7 @@ Use /thinking to show/hide thinking process."#;
         match load_config() {
             Ok(cfg) => {
                 self.push_output("Configuration:".into(), false);
-                self.push_output(
-                    format!("  LLM default: {:?}", cfg.default_provider),
-                    false,
-                );
+                self.push_output(format!("  LLM default: {:?}", cfg.default_provider), false);
                 self.push_output(format!("  Cron: {:?}", cfg.cron.consolidation_time), false);
             },
             Err(e) => self.push_output(format!("Config error: {}", e), true),

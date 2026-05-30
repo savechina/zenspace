@@ -27,11 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rig_compose::agent::GenericAgent;
-use rig_compose::coordinator::{CoordinatorAgent, RoutingRule};
 use rig_compose::context::InvestigationContext;
+use rig_compose::coordinator::{CoordinatorAgent, RoutingRule};
 use rig_compose::delegate::DelegateRegistry;
 use rig_compose::registry::KernelError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use zen_core::types::{ComplexityLevel, SemanticEntropy};
@@ -163,10 +163,7 @@ impl ZenCoordinator {
             },
             RoutingRule {
                 agent_name: "coder".to_string(),
-                signals: vec![
-                    "code-generation".to_string(),
-                    "wiki-compile".to_string(),
-                ],
+                signals: vec!["code-generation".to_string(), "wiki-compile".to_string()],
             },
             RoutingRule {
                 agent_name: "analyst".to_string(),
@@ -178,10 +175,7 @@ impl ZenCoordinator {
             },
             RoutingRule {
                 agent_name: "consolidator".to_string(),
-                signals: vec![
-                    "consolidate".to_string(),
-                    "pipeline".to_string(),
-                ],
+                signals: vec!["consolidate".to_string(), "pipeline".to_string()],
             },
             RoutingRule {
                 agent_name: "conversation".to_string(),
@@ -202,7 +196,11 @@ impl ZenCoordinator {
             // T292: additional 7 agent rules (13 total matching orchestrator)
             RoutingRule {
                 agent_name: "Sisyphus".to_string(),
-                signals: vec!["execute".to_string(), "workflow".to_string(), "default".to_string()],
+                signals: vec![
+                    "execute".to_string(),
+                    "workflow".to_string(),
+                    "default".to_string(),
+                ],
             },
             RoutingRule {
                 agent_name: "Junior".to_string(),
@@ -373,8 +371,7 @@ impl ZenCoordinator {
     pub fn route(&self, query: &str) -> String {
         let signal = Self::classify_intent(query);
 
-        let ctx = InvestigationContext::new("zen-coordination", "default")
-            .with_signal(&signal);
+        let ctx = InvestigationContext::new("zen-coordination", "default").with_signal(&signal);
 
         match self.coordinator.route(&ctx) {
             Some(agent) => agent.name().to_string(),
@@ -402,17 +399,11 @@ impl ZenCoordinator {
             return "consolidate".to_string();
         }
 
-        if lower.contains("analyze")
-            || lower.contains("check")
-            || lower.contains("detect")
-        {
+        if lower.contains("analyze") || lower.contains("check") || lower.contains("detect") {
             return "analysis".to_string();
         }
 
-        if lower.contains("compile")
-            || lower.contains("wiki")
-            || lower.contains("create")
-        {
+        if lower.contains("compile") || lower.contains("wiki") || lower.contains("create") {
             return "wiki-compile".to_string();
         }
 
@@ -436,10 +427,7 @@ impl ZenCoordinator {
             return "system".to_string();
         }
 
-        if lower.contains("search")
-            || lower.contains("find")
-            || lower.contains("query")
-        {
+        if lower.contains("search") || lower.contains("find") || lower.contains("query") {
             return "knowledge-query".to_string();
         }
 
@@ -574,11 +562,15 @@ impl ZenCoordinator {
         let result = tokio::time::timeout(DEFAULT_TIMEOUT, async {
             let args = json!({ "query": query, "agent": specialist_name });
             delegate.invoke(args).await
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(response)) => {
-                info!(specialist = specialist_name, "ZenCoordinator: specialist succeeded");
+                info!(
+                    specialist = specialist_name,
+                    "ZenCoordinator: specialist succeeded"
+                );
                 let response_str = extract_response_string(&response);
                 SpecialistInvocationResult {
                     results: vec![SpecialistResult {
@@ -629,7 +621,8 @@ impl ZenCoordinator {
                 }
             },
             Err(_) => {
-                let err = format!("specialist '{specialist_name}' timed out after {DEFAULT_TIMEOUT:?}");
+                let err =
+                    format!("specialist '{specialist_name}' timed out after {DEFAULT_TIMEOUT:?}");
                 warn!("{err}");
                 SpecialistInvocationResult {
                     results: Vec::new(),
@@ -852,18 +845,9 @@ mod tests {
         let router = mock_router();
         let coordinator = ZenCoordinator::new(&wiring, &router);
 
-        assert_eq!(
-            coordinator.route("SEARCH for documents"),
-            "researcher"
-        );
-        assert_eq!(
-            coordinator.route("CONSOLIDATE notes"),
-            "consolidator"
-        );
-        assert_eq!(
-            coordinator.route("Wiki Compile me"),
-            "coder"
-        );
+        assert_eq!(coordinator.route("SEARCH for documents"), "researcher");
+        assert_eq!(coordinator.route("CONSOLIDATE notes"), "consolidator");
+        assert_eq!(coordinator.route("Wiki Compile me"), "coder");
     }
 
     #[test]

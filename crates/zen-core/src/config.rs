@@ -56,7 +56,14 @@ pub struct ProviderConfig {
     /// Base URL for the provider API.
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Environment variable name for the API key.
+    /// Secret reference for API key (FR-061c).
+    ///
+    /// TOML formats:
+    /// - `api_key = { keychain: "zen-openai-api-key" }`
+    /// - `api_key = { env: "ZEN_OPENAI_API_KEY" }`
+    #[serde(default)]
+    pub api_key: Option<crate::secrets::SecretRef>,
+    /// Legacy env var name for backward compatibility (deprecated).
     #[serde(rename = "env_key", default)]
     pub api_key_env: Option<String>,
     /// Default model for this provider.
@@ -310,7 +317,7 @@ fn load_file_config(path: PathBuf) -> Result<AgenticConfig, ZenError> {
     Ok(config)
 }
 
-fn load_embedded_config() -> Result<AgenticConfig, ZenError> {
+pub fn load_embedded_config() -> Result<AgenticConfig, ZenError> {
     let config_file = CONFIGS.get_file("config.toml").ok_or_else(|| {
         ZenError::Config(ConfigError::MissingFile {
             path: "embedded://config.toml".into(),
@@ -465,7 +472,12 @@ fn apply_env_overrides(mut config: AgenticConfig) -> AgenticConfig {
 
 fn apply_agent_env(agents: &mut HashMap<String, AgentTaskConfig>) {
     // Per-task env overrides: ZEN_AGENT_{TASK}_PROVIDER, ZEN_AGENT_{TASK}_MODEL
-    for task in ["entity_extraction", "contradiction_detection", "synthesis", "dispatch"] {
+    for task in [
+        "entity_extraction",
+        "contradiction_detection",
+        "synthesis",
+        "dispatch",
+    ] {
         let provider_key = format!("ZEN_AGENT_{}_PROVIDER", task.to_uppercase());
         let model_key = format!("ZEN_AGENT_{}_MODEL", task.to_uppercase());
         if let Some(v) = env_str(&provider_key) {
@@ -582,7 +594,9 @@ pub fn get_agent_task<'a>(config: &'a AgenticConfig, name: &str) -> Option<&'a A
 
 /// Resolve the effective provider for a task, falling back to default.
 pub fn resolve_task_provider<'a>(config: &'a AgenticConfig, task: &str) -> &'a str {
-    config.agents.get(task)
+    config
+        .agents
+        .get(task)
         .and_then(|a| a.provider.as_deref())
         .or(config.default_provider.as_deref())
         .unwrap_or("ollama")
@@ -591,9 +605,16 @@ pub fn resolve_task_provider<'a>(config: &'a AgenticConfig, task: &str) -> &'a s
 /// Resolve the effective model for a task, falling back through provider default → global default.
 pub fn resolve_task_model<'a>(config: &'a AgenticConfig, task: &str) -> &'a str {
     let provider_name = resolve_task_provider(config, task);
-    config.agents.get(task)
+    config
+        .agents
+        .get(task)
         .and_then(|a| a.model.as_deref())
-        .or_else(|| config.providers.get(provider_name).and_then(|p| p.default_model.as_deref()))
+        .or_else(|| {
+            config
+                .providers
+                .get(provider_name)
+                .and_then(|p| p.default_model.as_deref())
+        })
         .or(config.default_model.as_deref())
         .unwrap_or("qwen3-coder")
 }

@@ -8,7 +8,9 @@ pub mod platform;
 pub mod review;
 pub mod sandbox;
 pub mod sanitize;
+pub mod secrets;
 pub mod types;
 pub mod validate;
 
 pub use definition::AgentDefinition;
+pub use secrets::SecretRef;

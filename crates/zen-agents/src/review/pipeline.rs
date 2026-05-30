@@ -74,12 +74,15 @@ impl QualityPipeline {
             if momus_review.approved {
                 review_notes.push_str("Momus gate: APPROVED\n");
                 let mut task_with_revision = task.clone();
-                task_with_revision.metadata.insert("revision_count".to_string(), "0".to_string());
+                task_with_revision
+                    .metadata
+                    .insert("revision_count".to_string(), "0".to_string());
                 let raw = deliverable_cb(current_plan.clone()).await;
                 let mut hermes_revisions = 0u8;
 
                 loop {
-                    let hermes_validation = self.hermes.validate_deliverable(&task_with_revision, &raw);
+                    let hermes_validation =
+                        self.hermes.validate_deliverable(&task_with_revision, &raw);
 
                     if self.hermes.can_push(&hermes_validation) {
                         review_notes.push_str("Hermes validation: DELIVERY READY\n");
@@ -95,10 +98,9 @@ impl QualityPipeline {
                     hermes_revisions += 1;
                     if hermes_revisions > self.max_hermes_revisions {
                         let is_high_risk = task.semantic_entropy > 0.8;
-                        let should_escalate = self.zeus.should_escalate(
-                            hermes_revisions,
-                            task.user_input.len() * 4,
-                        );
+                        let should_escalate = self
+                            .zeus
+                            .should_escalate(hermes_revisions, task.user_input.len() * 4);
 
                         if should_escalate || is_high_risk {
                             review_notes.push_str("Hermes deadlock detected, escalating to Zeus\n");
@@ -121,7 +123,8 @@ impl QualityPipeline {
                             };
                         }
 
-                        review_notes.push_str("Hermes revision limit reached, returning deliverable\n");
+                        review_notes
+                            .push_str("Hermes revision limit reached, returning deliverable\n");
                         return PipelineResult {
                             plan_approved: true,
                             review_notes,
@@ -215,27 +218,34 @@ mod tests {
         let task = Task::new("create a feature with tests", 0.4, TaskType::Code);
         let plan = "1. Create the feature\n2. Add tests\n3. Verify pass";
 
-        let result = pipeline.execute(&task, plan, |p| {
-            Box::pin(async move { mock_deliverable(p).await })
-        }).await;
+        let result = pipeline
+            .execute(&task, plan, |p| {
+                Box::pin(async move { mock_deliverable(p).await })
+            })
+            .await;
 
         assert!(result.plan_approved);
         assert!(result.delivery_ready);
         assert!(result.athena_shield.is_none());
         assert!(result.review_notes.contains("Momus gate: APPROVED"));
-        assert!(result.review_notes.contains("Hermes validation: DELIVERY READY"));
+        assert!(
+            result
+                .review_notes
+                .contains("Hermes validation: DELIVERY READY")
+        );
     }
 
     #[tokio::test]
     async fn pipeline_momus_veto_escalates_to_zeus() {
-        let pipeline = QualityPipeline::new()
-            .with_limits(0, 1);
+        let pipeline = QualityPipeline::new().with_limits(0, 1);
         let task = Task::new("create then delete", 0.9, TaskType::Code);
         let plan = "create the new table. delete the old table. verify it works";
 
-        let result = pipeline.execute(&task, plan, |p| {
-            Box::pin(async move { mock_deliverable(p).await })
-        }).await;
+        let result = pipeline
+            .execute(&task, plan, |p| {
+                Box::pin(async move { mock_deliverable(p).await })
+            })
+            .await;
 
         assert!(!result.plan_approved);
         assert!(!result.delivery_ready);
@@ -245,14 +255,15 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_hermes_loopback_on_bad_deliverable() {
-        let pipeline = QualityPipeline::new()
-            .with_limits(2, 0);
+        let pipeline = QualityPipeline::new().with_limits(2, 0);
         let task = Task::new("implement authentication middleware", 0.5, TaskType::Code);
         let plan = "1. Implement auth middleware\n2. Write tests";
 
-        let result = pipeline.execute(&task, plan, |_p| {
-            Box::pin(async move { "bad deliverable with no auth middleware".to_string() })
-        }).await;
+        let result = pipeline
+            .execute(&task, plan, |_p| {
+                Box::pin(async move { "bad deliverable with no auth middleware".to_string() })
+            })
+            .await;
 
         assert!(result.plan_approved);
         assert!(result.review_notes.contains("Momus gate: APPROVED"));

@@ -24,20 +24,26 @@ pub fn execute_command(operation: &StarterCommands) -> Result<(), ZenError> {
         StarterCommands::Develop { json } => {
             starter_service::develop_tool();
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "develop"
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "develop"
+                    })
+                );
             }
             Ok(())
         },
         StarterCommands::Workspace { json } => {
             starter_service::workspace();
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "workspace"
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "workspace"
+                    })
+                );
             }
             Ok(())
         },

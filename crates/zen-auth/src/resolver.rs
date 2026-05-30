@@ -1,50 +1,15 @@
 use crate::keychain::{AuthError, Keychain};
-use serde::Deserialize;
 
-// ---------------------------------------------------------------------------
-// SecretRef — T034: TOML inline-table secret reference
-// ---------------------------------------------------------------------------
+// Re-export SecretRef from zen-core for convenience
+pub use zen_core::secrets::SecretRef;
 
-/// Represents a secret reference in configuration.
-///
-/// Deserialises from two TOML inline-table formats:
-/// - `{ keychain: "zen-openai-api-key" }` — look up in macOS Keychain
-/// - `{ env: "ZEN_OPENAI_API_KEY" }` — look up in environment variables
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum SecretRef {
-    /// Look up in macOS Keychain.
-    Keychain { keychain: String },
-    /// Look up in an environment variable.
-    Env { env: String },
-}
-
-impl SecretRef {
-    /// Resolve the secret reference to its plaintext value.
-    ///
-    /// Resolution order per design:
-    /// 1. Keychain lookup (for `{ keychain: "..." }` refs)
-    /// 2. Environment variable (for `{ env: "..." }` refs)
-    /// 3. [`AuthError::CredentialNotFound`] if all sources fail
-    pub fn resolve(&self) -> Result<String, AuthError> {
-        match self {
-            SecretRef::Keychain { keychain } => Keychain::retrieve(keychain, "zen"),
-            SecretRef::Env { env } => {
-                std::env::var(env).map_err(|_| AuthError::CredentialNotFound {
-                    service: format!("env:{env}"),
-                    account: "zen".to_string(),
-                })
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for SecretRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SecretRef::Keychain { keychain } => write!(f, "keychain:{keychain}"),
-            SecretRef::Env { env } => write!(f, "env:{env}"),
-        }
+pub fn resolve_secret_ref(ref_: &SecretRef) -> Result<String, AuthError> {
+    match ref_ {
+        SecretRef::Keychain { keychain } => Keychain::retrieve(keychain, "zen"),
+        SecretRef::Env { env } => std::env::var(env).map_err(|_| AuthError::CredentialNotFound {
+            service: format!("env:{env}"),
+            account: "zen".to_string(),
+        }),
     }
 }
 

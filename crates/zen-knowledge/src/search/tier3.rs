@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rig_core::Embed;
-use rig_sqlite::{SqliteVectorStoreTable, Column, ColumnValue};
+use rig_sqlite::{Column, ColumnValue, SqliteVectorStoreTable};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -23,14 +23,20 @@ pub struct KnowledgeDocument {
 }
 
 impl SqliteVectorStoreTable for KnowledgeDocument {
-    fn name() -> &'static str { "knowledge_docs" }
-    fn schema() -> Vec<Column> { vec![
-        Column::new("id", "TEXT PRIMARY KEY"),
-        Column::new("content", "TEXT"),
-        Column::new("source", "TEXT"),
-        Column::new("sensitivity", "TEXT"),
-    ]}
-    fn id(&self) -> String { self.id.clone() }
+    fn name() -> &'static str {
+        "knowledge_docs"
+    }
+    fn schema() -> Vec<Column> {
+        vec![
+            Column::new("id", "TEXT PRIMARY KEY"),
+            Column::new("content", "TEXT"),
+            Column::new("source", "TEXT"),
+            Column::new("sensitivity", "TEXT"),
+        ]
+    }
+    fn id(&self) -> String {
+        self.id.clone()
+    }
     fn column_values(&self) -> Vec<(&'static str, Box<dyn ColumnValue>)> {
         vec![
             ("id", Box::new(self.id.clone())),

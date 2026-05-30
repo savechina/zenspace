@@ -8,6 +8,7 @@ use zen_core::errors::ZenError;
 
 use crate::cmd::agent_command::{self, AgentCommands};
 use crate::cmd::audit_command::{self, AuditCommands};
+use crate::cmd::auth_command::{self, AuthCommands};
 use crate::cmd::brief_command::{self, BriefCommands};
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::config_command::{self, ConfigCommands};
@@ -142,6 +143,10 @@ enum Commands {
         #[command(subcommand)]
         operation: PluginCommands,
     },
+    Auth {
+        #[command(subcommand)]
+        operation: AuthCommands,
+    },
 }
 
 pub async fn shell() -> Result<(), ZenError> {
@@ -169,7 +174,10 @@ pub async fn shell() -> Result<(), ZenError> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
-                        time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap(),
+                        time::format_description::parse(
+                            "[year]-[month]-[day] [hour]:[minute]:[second]",
+                        )
+                        .unwrap(),
                     ))
                     .with_ansi(false)
                     .with_writer(std::sync::Mutex::new(file)),
@@ -181,7 +189,10 @@ pub async fn shell() -> Result<(), ZenError> {
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
-                        time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap(),
+                        time::format_description::parse(
+                            "[year]-[month]-[day] [hour]:[minute]:[second]",
+                        )
+                        .unwrap(),
                     ))
                     .with_writer(std::io::stderr),
             )
@@ -203,7 +214,9 @@ pub async fn shell() -> Result<(), ZenError> {
 
         Some(Commands::Clean { operation, dry_run }) => {
             debug!("clean dry_run:{}", dry_run);
-            let op = operation.as_ref().unwrap_or(&CleanupCommands::Trash { json: false });
+            let op = operation
+                .as_ref()
+                .unwrap_or(&CleanupCommands::Trash { json: false });
             cleanup_command::execute_command(op)?;
             Ok(())
         },
@@ -244,5 +257,6 @@ pub async fn shell() -> Result<(), ZenError> {
         Some(Commands::Routine { operation }) => routine_command::execute_command(operation),
         Some(Commands::Brief { operation }) => brief_command::execute_command(operation),
         Some(Commands::Plugin { operation }) => plugin_command::execute_command(operation),
+        Some(Commands::Auth { operation }) => auth_command::execute_command(operation),
     }
 }

@@ -103,11 +103,13 @@ mod tests {
     fn test_write_and_search_memory() {
         let store = MemoryStore::new(100);
 
-        store.write_memory(
-            "Alice prefers Rust over Python for systems programming.",
-            vec!["preference", "user_profile"],
-            Some("user/alice"),
-        ).unwrap();
+        store
+            .write_memory(
+                "Alice prefers Rust over Python for systems programming.",
+                vec!["preference", "user_profile"],
+                Some("user/alice"),
+            )
+            .unwrap();
 
         let stats = store.stats().unwrap();
         assert_eq!(stats.entry_count, 1);

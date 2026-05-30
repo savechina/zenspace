@@ -130,7 +130,6 @@ pub fn compute_max_sensitivity(notes: &[zen_knowledge::Note]) -> Sensitivity {
     Sensitivity::max_of(&notes.iter().map(|n| n.sensitivity).collect::<Vec<_>>())
 }
 
-
 // ---------------------------------------------------------------------------
 // Session persistence helpers
 // ---------------------------------------------------------------------------

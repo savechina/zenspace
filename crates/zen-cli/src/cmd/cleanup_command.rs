@@ -25,30 +25,39 @@ pub fn execute_command(operation: &CleanupCommands) -> Result<(), ZenError> {
         CleanupCommands::All { json } => {
             cleanup_service::clean_all()?;
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "clean_all"
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "clean_all"
+                    })
+                );
             }
             Ok(())
         },
         CleanupCommands::Trash { json } => {
             cleanup_service::clean_trash()?;
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "clean_trash"
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "clean_trash"
+                    })
+                );
             }
             Ok(())
         },
         CleanupCommands::Cache { json } => {
             cleanup_service::clean_cache()?;
             if *json {
-                println!("{}", json!({
-                    "status": "success",
-                    "command": "clean_cache"
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "status": "success",
+                        "command": "clean_cache"
+                    })
+                );
             }
             Ok(())
         },

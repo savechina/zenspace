@@ -1,11 +1,45 @@
-use crate::providers::{OllamaProvider, OpenAIProvider};
+use crate::providers::{
+    AnthropicProvider, CohereProvider, GeminiProvider, MistralProvider, OllamaProvider,
+    OpenAIProvider,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-pub use zen_core::config::{LlmConfig, LlmTaskConfig};
+pub use zen_core::config::{AgenticConfig, LlmConfig, LlmTaskConfig, ProviderConfig};
 use zen_core::errors::ZenError;
+use zen_core::secrets::SecretRef;
 use zen_core::types::Sensitivity;
+
+// ---------------------------------------------------------------------------
+// API Key Resolution (FR-061c)
+// ---------------------------------------------------------------------------
+
+/// Resolve API key from ProviderConfig using SecretRef or legacy env var.
+///
+/// Resolution order:
+/// 1. `api_key` (SecretRef) — Keychain-first if `{ keychain: "..." }`, env if `{ env: "..." }`
+/// 2. `api_key_env` (legacy) — direct env var name
+/// 3. Default env var: `{PROVIDER}_API_KEY`
+fn resolve_api_key(p: &ProviderConfig, provider_name: &str) -> Option<String> {
+    if let Some(ref secret_ref) = p.api_key {
+        match zen_auth::resolve_secret_ref(secret_ref) {
+            Ok(key) => {
+                info!(provider = provider_name, source = %secret_ref, "resolved API key via SecretRef");
+                return Some(key);
+            },
+            Err(e) => {
+                // Expected when provider not configured — downgrade to debug
+                tracing::debug!(provider = provider_name, secret_ref = %secret_ref, error = %e, "SecretRef not found, falling back to env var");
+            },
+        }
+    }
+
+    let default_env = SecretRef::legacy_env_var(provider_name);
+    let env_name = p.api_key_env.as_deref().unwrap_or(&default_env);
+
+    std::env::var(env_name).ok()
+}
 
 // ---------------------------------------------------------------------------
 // LlmError
@@ -32,6 +66,13 @@ pub enum Provider {
     OpenAI,
     Anthropic,
     DeepSeek,
+    Aliyun,
+    Mistral,
+    Groq,
+    Moonshot,
+    XAI,
+    Perplexity,
+    Gemini,
     QQBot,
     Ollama,
     #[serde(rename = "mock")]
@@ -45,6 +86,13 @@ impl std::fmt::Display for Provider {
             Provider::OpenAI => write!(f, "openai"),
             Provider::Anthropic => write!(f, "anthropic"),
             Provider::DeepSeek => write!(f, "deepseek"),
+            Provider::Aliyun => write!(f, "aliyun"),
+            Provider::Mistral => write!(f, "mistral"),
+            Provider::Groq => write!(f, "groq"),
+            Provider::Moonshot => write!(f, "moonshot"),
+            Provider::XAI => write!(f, "xai"),
+            Provider::Perplexity => write!(f, "perplexity"),
+            Provider::Gemini => write!(f, "gemini"),
             Provider::QQBot => write!(f, "qqbot"),
             Provider::Ollama => write!(f, "ollama"),
             Provider::Mock => write!(f, "mock"),
@@ -272,6 +320,82 @@ impl TaskContext {
 }
 
 // ---------------------------------------------------------------------------
+// ProviderInstance — dynamic provider wrapper for registry
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum ProviderInstance {
+    Anthropic(AnthropicProvider),
+    AnthropicCompatible(AnthropicProvider),
+    Cohere(CohereProvider),
+    Gemini(GeminiProvider),
+    Mistral(MistralProvider),
+    Ollama(OllamaProvider),
+    OpenAICompatible(OpenAIProvider),
+    Mock(MockProvider),
+}
+
+impl ProviderInstance {
+    pub fn complete(&self, prompt: &str) -> Result<String, LlmError> {
+        match self {
+            ProviderInstance::Anthropic(p) => p.complete(prompt),
+            ProviderInstance::AnthropicCompatible(p) => p.complete(prompt),
+            ProviderInstance::Cohere(p) => p.complete(prompt),
+            ProviderInstance::Gemini(p) => p.complete(prompt),
+            ProviderInstance::Mistral(p) => p.complete(prompt),
+            ProviderInstance::Ollama(p) => p.complete(prompt),
+            ProviderInstance::OpenAICompatible(p) => p.complete(prompt),
+            ProviderInstance::Mock(p) => p.complete("call", prompt),
+        }
+    }
+
+    pub async fn complete_streaming(
+        &self,
+        prompt: &str,
+        token_tx: mpsc::UnboundedSender<String>,
+    ) -> Result<(), LlmError> {
+        match self {
+            ProviderInstance::Anthropic(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::AnthropicCompatible(p) => {
+                p.complete_streaming(prompt, token_tx).await
+            },
+            ProviderInstance::Cohere(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::Gemini(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::Mistral(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::Ollama(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::OpenAICompatible(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::Mock(p) => p.complete_streaming("call", prompt, token_tx).await,
+        }
+    }
+
+    pub fn model_name(&self) -> &str {
+        match self {
+            ProviderInstance::Anthropic(p) => &p.model,
+            ProviderInstance::AnthropicCompatible(p) => &p.model,
+            ProviderInstance::Cohere(p) => &p.model,
+            ProviderInstance::Gemini(p) => &p.model,
+            ProviderInstance::Mistral(p) => &p.model,
+            ProviderInstance::Ollama(p) => &p.model,
+            ProviderInstance::OpenAICompatible(p) => &p.model,
+            ProviderInstance::Mock(_) => "mock",
+        }
+    }
+
+    pub fn base_url(&self) -> Option<&str> {
+        match self {
+            ProviderInstance::Anthropic(_) => None,
+            ProviderInstance::AnthropicCompatible(p) => Some(&p.base_url),
+            ProviderInstance::Cohere(_) => None,
+            ProviderInstance::Gemini(_) => None,
+            ProviderInstance::Mistral(_) => None,
+            ProviderInstance::Ollama(p) => Some(&p.base_url),
+            ProviderInstance::OpenAICompatible(p) => Some(&p.base_url),
+            ProviderInstance::Mock(_) => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DefaultRouter — loads routing preferences from AgenticConfig
 // ---------------------------------------------------------------------------
 
@@ -279,71 +403,177 @@ impl TaskContext {
 pub struct DefaultRouter {
     config: zen_core::config::AgenticConfig,
     mock: MockProvider,
-    ollama: Option<OllamaProvider>,
-    openai: Option<OpenAIProvider>,
+    providers: std::collections::HashMap<String, ProviderInstance>,
 }
 
 impl DefaultRouter {
     /// Create from a full [`zen_core::config::AgenticConfig`].
     pub fn from_agentic(agentic: &zen_core::config::AgenticConfig) -> Self {
-        let ollama = agentic.providers.get("ollama").map(|p| {
-            OllamaProvider::new(
-                p.base_url.clone().unwrap_or_else(|| "http://127.0.0.1:11434".into()),
-                p.default_model.clone().unwrap_or_else(|| "qwen3-coder".into()),
-            )
-        });
+        let mut providers = std::collections::HashMap::new();
 
-        let openai = agentic.providers.get("openai").and_then(|p| {
-            let key_env = p.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-            if let Ok(api_key) = std::env::var(key_env) {
-                Some(OpenAIProvider::new(
-                    api_key,
-                    p.default_model.clone().unwrap_or_else(|| "gpt-4o-mini".into()),
-                ))
-            } else {
-                None
+        for (name, cfg) in &agentic.providers {
+            let instance = Self::create_provider_instance(name, cfg);
+            if let Some(p) = instance {
+                providers.insert(name.clone(), p);
             }
-        });
+        }
 
         Self {
             config: agentic.clone(),
             mock: MockProvider::default(),
-            ollama,
-            openai,
+            providers,
+        }
+    }
+
+    fn create_provider_instance(
+        name: &str,
+        cfg: &zen_core::config::ProviderConfig,
+    ) -> Option<ProviderInstance> {
+        let provider_type = cfg.r#type.as_deref().unwrap_or("openai-compatible");
+
+        match provider_type {
+            "ollama" => {
+                let base_url = cfg
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "qwen3-coder".into());
+                Some(ProviderInstance::Ollama(OllamaProvider::new(
+                    base_url, model,
+                )))
+            },
+            "mock" => Some(ProviderInstance::Mock(MockProvider::default())),
+            "anthropic" => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "claude-3-5-sonnet-20241022".into());
+                Some(ProviderInstance::Anthropic(AnthropicProvider::new(
+                    api_key, model,
+                )))
+            },
+            "anthropic-compatible" => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let base_url = cfg.base_url.clone()?;
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "default".into());
+                Some(ProviderInstance::AnthropicCompatible(
+                    AnthropicProvider::new_with_base_url(api_key, model, base_url),
+                ))
+            },
+            "cohere" => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "command-r".into());
+                Some(ProviderInstance::Cohere(CohereProvider::new(
+                    api_key, model,
+                )))
+            },
+            "gemini" => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "gemini-2.0-flash".into());
+                Some(ProviderInstance::Gemini(GeminiProvider::new(
+                    api_key, model,
+                )))
+            },
+            "mistral" => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "mistral-large-latest".into());
+                Some(ProviderInstance::Mistral(MistralProvider::new(
+                    api_key, model,
+                )))
+            },
+            "openai" => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let base_url = cfg
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into());
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-4o-mini".into());
+                Some(ProviderInstance::OpenAICompatible(
+                    OpenAIProvider::new_with_base_url(api_key, model, base_url),
+                ))
+            },
+            "openai-compatible" | _ => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let base_url = cfg.base_url.clone()?;
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "default".into());
+                Some(ProviderInstance::OpenAICompatible(
+                    OpenAIProvider::new_with_base_url(api_key, model, base_url),
+                ))
+            },
         }
     }
 
     /// Create from a legacy [`LlmConfig`] for backward compatibility.
     pub fn new(config: LlmConfig) -> Self {
-        let ollama = config.entity_extraction.as_ref().and_then(|tc| {
-            if tc.provider.as_deref() == Some("ollama") {
-                Some(OllamaProvider::new(
-                    tc.base_url
-                        .clone()
-                        .unwrap_or_else(|| "http://127.0.0.1:11434".into()),
-                    tc.model.clone().unwrap_or_else(|| "llama3.2".into()),
-                ))
-            } else {
-                None
-            }
-        });
+        let mut providers = std::collections::HashMap::new();
 
-        let openai = config.dispatch.as_ref().and_then(|tc| {
-            if tc.provider.as_deref() == Some("openai") {
-                if let Ok(api_key) =
-                    std::env::var(tc.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY"))
-                {
-                    Some(OpenAIProvider::new(
-                        api_key,
-                        tc.model.clone().unwrap_or_else(|| "gpt-4o-mini".into()),
-                    ))
-                } else {
-                    None
-                }
-            } else {
-                None
+        if let Some(tc) = config.entity_extraction.as_ref() {
+            if tc.provider.as_deref() == Some("ollama") {
+                let base_url = tc
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+                let model = tc.model.clone().unwrap_or_else(|| "llama3.2".into());
+                providers.insert(
+                    "ollama".into(),
+                    ProviderInstance::Ollama(OllamaProvider::new(base_url, model)),
+                );
             }
-        });
+        }
+
+        if let Some(tc) = config.dispatch.as_ref() {
+            if let Some(ref provider_name) = tc.provider {
+                if provider_name == "ollama" {
+                    // Ollama handled above in entity_extraction
+                } else if provider_name != "mock" {
+                    // Cloud provider: resolve API key and base_url from config
+                    let default_env = format!("{}_API_KEY", provider_name.to_uppercase());
+                    let env_var: &str = match provider_name.as_str() {
+                        "aliyun" => "DASHSCOPE_API_KEY",
+                        _ => tc.api_key_env.as_deref().unwrap_or(&default_env),
+                    };
+
+                    if let Ok(api_key) = std::env::var(env_var) {
+                        // Use base_url from config, fail if not set
+                        if let Some(ref base_url) = tc.base_url {
+                            let model = tc.model.clone().unwrap_or_else(|| "default".into());
+                            providers.insert(
+                                provider_name.clone(),
+                                ProviderInstance::OpenAICompatible(
+                                    OpenAIProvider::new_with_base_url(
+                                        api_key,
+                                        model,
+                                        base_url.clone(),
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         Self {
             config: zen_core::config::AgenticConfig {
@@ -360,62 +590,29 @@ impl DefaultRouter {
                 finance: zen_core::config::FinanceConfig::default(),
             },
             mock: MockProvider::default(),
-            ollama,
-            openai,
+            providers,
         }
     }
 
     /// Create a [`DefaultRouter`] configured for a specific provider and model at runtime.
     ///
-    /// This is a convenience constructor that builds an [`LlmConfig`], populates
-    /// the necessary provider fields, and returns a ready-to-use router.
-    /// Does **not** read or write any files.
+    /// Loads provider config from embedded config.toml, overrides model if specified.
     pub fn new_for_provider(provider_name: &str, model_name: &str) -> Self {
-        let config = match provider_name {
-            "ollama" => LlmConfig {
-                default_provider: Some("ollama".into()),
-                entity_extraction: Some(LlmTaskConfig {
-                    provider: Some("ollama".into()),
-                    model: Some(model_name.into()),
-                    base_url: Some("http://127.0.0.1:11434".into()),
-                    api_key_env: None,
-                }),
-                contradiction_detection: Some(LlmTaskConfig {
-                    provider: Some("ollama".into()),
-                    model: Some(model_name.into()),
-                    base_url: Some("http://127.0.0.1:11434".into()),
-                    api_key_env: None,
-                }),
-                synthesis: Some(LlmTaskConfig {
-                    provider: Some("ollama".into()),
-                    model: Some(model_name.into()),
-                    base_url: Some("http://127.0.0.1:11434".into()),
-                    api_key_env: None,
-                }),
-                dispatch: Some(LlmTaskConfig {
-                    provider: Some("ollama".into()),
-                    model: Some(model_name.into()),
-                    base_url: Some("http://127.0.0.1:11434".into()),
-                    api_key_env: None,
-                }),
-            },
-            "openai" => LlmConfig {
-                default_provider: Some("openai".into()),
-                dispatch: Some(LlmTaskConfig {
-                    provider: Some("openai".into()),
-                    model: Some(model_name.into()),
-                    base_url: None,
-                    api_key_env: Some("OPENAI_API_KEY".into()),
-                }),
-                ..LlmConfig::default()
-            },
-            _ => LlmConfig {
-                default_provider: Some("mock".into()),
-                ..LlmConfig::default()
-            },
-        };
+        // Load embedded config as source of truth
+        let agentic =
+            zen_core::config::load_embedded_config().unwrap_or_else(|_| AgenticConfig::default());
 
-        Self::new(config)
+        // Override model in provider config if specified
+        let mut providers = agentic.providers.clone();
+        if let Some(cfg) = providers.get_mut(provider_name) {
+            cfg.default_model = Some(model_name.into());
+        }
+
+        let mut config = agentic.clone();
+        config.default_provider = Some(provider_name.into());
+        config.providers = providers;
+
+        Self::from_agentic(&config)
     }
 
     /// Return the configured default provider name (e.g. "ollama", "openai").
@@ -425,9 +622,12 @@ impl DefaultRouter {
 
     // -- internal helpers --
 
-    fn resolve_provider(cfg: &zen_core::config::AgenticConfig, task_ctx: TaskContext) -> Option<Provider> {
+    fn resolve_provider(
+        cfg: &zen_core::config::AgenticConfig,
+        task_ctx: TaskContext,
+    ) -> Option<Provider> {
         let task_name = task_ctx.config_key();
-        
+
         // 1. Agent task config
         if let Some(agent) = cfg.agents.get(task_name)
             && let Some(ref name) = agent.provider
@@ -507,10 +707,12 @@ impl DefaultRouter {
     }
 
     fn is_local_llm_available(&self) -> bool {
-        if let Some(ref ollama) = self.ollama
-            && ollama.health_check()
-        {
-            return true;
+        if let Some(instance) = self.providers.get("ollama") {
+            if let ProviderInstance::Ollama(ollama) = instance {
+                if ollama.health_check() {
+                    return true;
+                }
+            }
         }
         warn!("is_local_llm_available: no reachable local LLM provider");
         false
@@ -518,12 +720,13 @@ impl DefaultRouter {
 
     #[allow(dead_code)]
     pub fn health_check(&self) -> bool {
-        if let Some(ref ollama) = self.ollama {
-            ollama.health_check()
-        } else {
-            tracing::info!("DefaultRouter health check: no local LLM configured");
-            false
+        if let Some(instance) = self.providers.get("ollama") {
+            if let ProviderInstance::Ollama(ollama) = instance {
+                return ollama.health_check();
+            }
         }
+        tracing::info!("DefaultRouter health check: no local LLM configured");
+        false
     }
 
     /// Route based on agent LLM preferences, falling back to standard routing.
@@ -595,62 +798,39 @@ impl LlmRouter for DefaultRouter {
     }
 
     fn call(&self, provider: Provider, prompt: &str) -> Result<String, LlmError> {
-        match provider.clone() {
-            Provider::Mock => {
-                info!(
-                    prompt_len = prompt.len(),
-                    "DefaultRouter: delegating to MockProvider"
-                );
-                self.mock.complete("call", prompt)
-            },
-            Provider::Unknown(ref name) if name == "mock" => {
-                info!(
-                    prompt_len = prompt.len(),
-                    "DefaultRouter: delegating to MockProvider"
-                );
-                self.mock.complete("call", prompt)
-            },
-            Provider::Ollama => {
-                if let Some(ref ollama) = self.ollama {
-                    info!(
-                        model = ollama.model,
-                        prompt_len = prompt.len(),
-                        "DefaultRouter: calling Ollama"
-                    );
-                    ollama.complete(prompt)
-                } else {
-                    Err(LlmError::ProviderUnavailable {
-                        provider: "ollama".into(),
-                        reason: "Ollama provider not configured. Set [llm.entity_extraction] in config.toml".into(),
-                    })
-                }
-            },
-            Provider::OpenAI => {
-                if let Some(ref openai) = self.openai {
-                    info!(
-                        model = openai.model,
-                        prompt_len = prompt.len(),
-                        "DefaultRouter: calling OpenAI"
-                    );
-                    openai.complete(prompt)
-                } else {
-                    Err(LlmError::ProviderUnavailable {
-                        provider: "openai".into(),
-                        reason: "OpenAI provider not configured. Set OPENAI_API_KEY env var and [llm.dispatch] in config.toml".into(),
-                    })
-                }
-            },
-            _ => {
-                info!(
-                    provider = %provider,
-                    prompt_len = prompt.len(),
-                    "DefaultRouter: call stub (no real HTTP)"
-                );
-                Ok(format!(
-                    "[stub] provider={provider} prompt_len={}",
-                    prompt.len()
-                ))
-            },
+        let provider_name = match &provider {
+            Provider::Unknown(name) => name.clone(),
+            _ => provider.to_string(),
+        };
+
+        if provider_name == "mock" {
+            info!(
+                prompt_len = prompt.len(),
+                "DefaultRouter: delegating to MockProvider"
+            );
+            return self.mock.complete("call", prompt);
+        }
+
+        if let Some(instance) = self.providers.get(&provider_name) {
+            info!(
+                provider = provider_name,
+                model = instance.model_name(),
+                base_url = instance
+                    .base_url()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                prompt_len = prompt.len(),
+                "DefaultRouter: calling provider"
+            );
+            instance.complete(prompt)
+        } else {
+            Err(LlmError::ProviderUnavailable {
+                provider: provider_name.clone(),
+                reason: format!(
+                    "Provider '{}' not configured. Add to ~/.zen/config.toml: [providers.{}]",
+                    provider_name, provider_name
+                ),
+            })
         }
     }
 
@@ -661,67 +841,40 @@ impl LlmRouter for DefaultRouter {
     ) -> Result<crate::stream::StreamResponse, LlmError> {
         let (stream_resp, token_tx, done_tx) = crate::stream::StreamResponse::new();
 
-        match provider {
-            Provider::Mock => {
-                let prompt = prompt.to_string();
-                info!(prompt_len = prompt.len(), "DefaultRouter: MockProvider stream");
-                let mock = self.mock.clone();
-                tokio::spawn(async move {
-                    let result = mock.complete_streaming("call", &prompt, token_tx).await;
-                    let _ = done_tx.send(result.map_err(|e| e.to_string()));
-                });
-            },
-            Provider::Unknown(ref name) if name == "mock" => {
-                let prompt = prompt.to_string();
-                info!(prompt_len = prompt.len(), "DefaultRouter: MockProvider stream");
-                let mock = self.mock.clone();
-                tokio::spawn(async move {
-                    let result = mock.complete_streaming("call", &prompt, token_tx).await;
-                    let _ = done_tx.send(result.map_err(|e| e.to_string()));
-                });
-            },
-            Provider::Ollama => {
-                if let Some(ref ollama) = self.ollama {
-                    let prompt = prompt.to_string();
-                    info!(model = ollama.model, prompt_len = prompt.len(), "DefaultRouter: Ollama stream");
-                    let ollama = ollama.clone();
-                    tokio::spawn(async move {
-                        let result = ollama.complete_streaming(&prompt, token_tx).await;
-                        let _ = done_tx.send(result.map_err(|e| e.to_string()));
-                    });
-                } else {
-                    let _ = done_tx.send(Err("Ollama provider not configured".into()));
-                }
-            },
-            Provider::OpenAI => {
-                if let Some(ref openai) = self.openai {
-                    let prompt = prompt.to_string();
-                    info!(model = openai.model, prompt_len = prompt.len(), "DefaultRouter: OpenAI stream");
-                    let openai = openai.clone();
-                    tokio::spawn(async move {
-                        let result = openai.complete_streaming(&prompt, token_tx).await;
-                        let _ = done_tx.send(result.map_err(|e| e.to_string()));
-                    });
-                } else {
-                    let _ = done_tx.send(Err("OpenAI provider not configured".into()));
-                }
-            },
-            _ => {
-                info!(provider = %provider, prompt_len = prompt.len(), "DefaultRouter: stream stub");
-                let reply = format!("[stub stream] provider={provider} prompt_len={}", prompt.len());
-                let words: Vec<&str> = reply.split_whitespace().collect();
-                let mut buf = String::new();
-                for word in words {
-                    buf.push_str(word);
-                    buf.push(' ');
-                    let chunk = buf.clone();
-                    buf.clear();
-                    if token_tx.send(chunk).is_err() {
-                        break;
-                    }
-                }
-                let _ = done_tx.send(Ok(()));
-            },
+        let provider_name = match &provider {
+            Provider::Unknown(name) => name.clone(),
+            _ => provider.to_string(),
+        };
+
+        if provider_name == "mock" {
+            let prompt = prompt.to_string();
+            info!(
+                prompt_len = prompt.len(),
+                "DefaultRouter: MockProvider stream"
+            );
+            let mock = self.mock.clone();
+            tokio::spawn(async move {
+                let result = mock.complete_streaming("call", &prompt, token_tx).await;
+                let _ = done_tx.send(result.map_err(|e| e.to_string()));
+            });
+            return Ok(stream_resp);
+        }
+
+        if let Some(instance) = self.providers.get(&provider_name) {
+            let prompt = prompt.to_string();
+            info!(
+                provider = provider_name,
+                model = instance.model_name(),
+                prompt_len = prompt.len(),
+                "DefaultRouter: provider stream"
+            );
+            let instance = instance.clone();
+            tokio::spawn(async move {
+                let result = instance.complete_streaming(&prompt, token_tx).await;
+                let _ = done_tx.send(result.map_err(|e| e.to_string()));
+            });
+        } else {
+            let _ = done_tx.send(Err(format!("Provider '{}' not configured", provider_name)));
         }
 
         Ok(stream_resp)
@@ -730,27 +883,20 @@ impl LlmRouter for DefaultRouter {
     fn list_providers(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
 
-        // Named provider definitions
-        for (name, provider) in &self.config.providers {
-            let model = provider.default_model.clone().unwrap_or_else(|| "default".into());
-            result.push((name.clone(), model));
+        for (name, instance) in &self.providers {
+            result.push((name.clone(), instance.model_name().to_string()));
         }
 
-        // Agent task routing references
-        for agent in self.config.agents.values() {
-            if let Some(ref p) = agent.provider {
-                let model = agent.model.clone().unwrap_or_else(|| "default".into());
-                if !result.iter().any(|(n, _)| n == p) {
-                    result.push((p.clone(), model));
-                }
+        if result.is_empty() {
+            if let Some(ref name) = self.config.default_provider {
+                result.push((
+                    name.clone(),
+                    self.config
+                        .default_model
+                        .clone()
+                        .unwrap_or_else(|| "default".into()),
+                ));
             }
-        }
-
-        // Default provider fallback
-        if let Some(ref name) = self.config.default_provider
-            && !result.iter().any(|(n, _)| n == name)
-        {
-            result.push((name.clone(), self.config.default_model.clone().unwrap_or_else(|| "default".into())));
         }
 
         result
@@ -766,6 +912,13 @@ fn parse_provider_name(name: &str) -> Provider {
         "openai" | "oa" => Provider::OpenAI,
         "anthropic" | "an" => Provider::Anthropic,
         "deepseek" | "ds" | "deep_seek" => Provider::DeepSeek,
+        "aliyun" | "qwen" | "alibaba" => Provider::Aliyun,
+        "mistral" | "mi" => Provider::Mistral,
+        "groq" => Provider::Groq,
+        "moonshot" | "ms" => Provider::Moonshot,
+        "xai" => Provider::XAI,
+        "perplexity" => Provider::Perplexity,
+        "gemini" | "ge" => Provider::Gemini,
         "qq" | "qqbot" | "qq_bot" => Provider::QQBot,
         "ollama" | "local" | "ollama-local" => Provider::Ollama,
         "mock" => Provider::Unknown("mock".into()),

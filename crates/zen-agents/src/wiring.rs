@@ -18,9 +18,9 @@ use zen_knowledge::tools::{ZenTool, ZenToolError};
 
 // Re-exports for consumers
 pub use rig_compose::delegate::DelegateRegistry as _DelegateRegistry;
+pub use rig_compose::registry::KernelError as _KernelError;
 pub use rig_compose::registry::SkillRegistry as _SkillRegistry;
 pub use rig_compose::registry::ToolRegistry as _ToolRegistry;
-pub use rig_compose::registry::KernelError as _KernelError;
 
 // ---------------------------------------------------------------------------
 // Adapter: ZenTool → rig_compose::tool::Tool
@@ -60,10 +60,7 @@ impl<T: ZenTool + Send + Sync> Tool for ZenToolToolAdapter<T> {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        self.inner
-            .invoke(args)
-            .await
-            .map_err(zen_error_to_kernel)
+        self.inner.invoke(args).await.map_err(zen_error_to_kernel)
     }
 }
 
@@ -122,19 +119,19 @@ impl Skill for ConsolidationPipelineSkillAdapter {
             })?;
 
         let pipeline = zen_knowledge::ConsolidationPipeline::new();
-        let report = pipeline.run(&inbox_dir, &wiki_dir).map_err(|e| {
-            KernelError::SkillFailed(e.to_string())
-        })?;
+        let report = pipeline
+            .run(&inbox_dir, &wiki_dir)
+            .map_err(|e| KernelError::SkillFailed(e.to_string()))?;
 
-        ctx.evidence.push(rig_compose::context::Evidence::new(
-            self.id(),
-            "consolidation_pipeline_report",
-        ).with_detail(serde_json::json!({
-            "notes_processed": report.notes_processed,
-            "entities_extracted": report.entities_extracted,
-            "wiki_pages_created": report.wiki_pages_created,
-            "contradictions_found": report.contradictions_found,
-        })));
+        ctx.evidence.push(
+            rig_compose::context::Evidence::new(self.id(), "consolidation_pipeline_report")
+                .with_detail(serde_json::json!({
+                    "notes_processed": report.notes_processed,
+                    "entities_extracted": report.entities_extracted,
+                    "wiki_pages_created": report.wiki_pages_created,
+                    "contradictions_found": report.contradictions_found,
+                })),
+        );
 
         let delta = if report.contradictions_found > 0 {
             (report.contradictions_found.min(5) as f32) * -0.02
@@ -180,18 +177,10 @@ impl ZenWiring {
 
         // --- Register skills -------------------------------------------
 
-        skills.register(Arc::new(
-            zen_knowledge::WikiCompiler::new(),
-        ));
-        skills.register(Arc::new(
-            zen_knowledge::LearningLoop::new(),
-        ));
-        skills.register(Arc::new(
-            zen_knowledge::EntityExtractor::new(),
-        ));
-        skills.register(Arc::new(
-            zen_knowledge::ContradictionDetector::new(),
-        ));
+        skills.register(Arc::new(zen_knowledge::WikiCompiler::new()));
+        skills.register(Arc::new(zen_knowledge::LearningLoop::new()));
+        skills.register(Arc::new(zen_knowledge::EntityExtractor::new()));
+        skills.register(Arc::new(zen_knowledge::ContradictionDetector::new()));
         skills.register(Arc::new(ConsolidationPipelineSkillAdapter));
 
         // --- Register tools --------------------------------------------

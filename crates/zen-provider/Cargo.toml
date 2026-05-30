@@ -6,6 +6,7 @@ description = "Multi-model provider connections using rig-core for zenspace"
 
 [dependencies]
 zen-core = { path = "../zen-core" }
+zen-auth = { path = "../zen-auth" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

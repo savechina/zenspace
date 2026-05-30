@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use anyhow::Result;
-use rig_memvid::{MemvidStore, MemvidPersistHook, MemoryConfig, WritePolicy};
+use rig_memvid::{MemoryConfig, MemvidPersistHook, MemvidStore, WritePolicy};
+use std::path::PathBuf;
 
 pub struct ZenMemvidStore {
     store: MemvidStore,
@@ -30,7 +30,10 @@ impl ZenMemvidStore {
     }
 }
 
-pub fn create_persist_hook(store: MemvidStore, config: MemoryConfig) -> MemvidPersistHook<rig_core::completion::CompletionRequest> {
+pub fn create_persist_hook(
+    store: MemvidStore,
+    config: MemoryConfig,
+) -> MemvidPersistHook<rig_core::completion::CompletionRequest> {
     MemvidPersistHook::new(store, config)
 }
 
@@ -66,7 +69,11 @@ impl CompactionStrategy {
         }
 
         let summary = if turns.len() < conversation_turns.len() {
-            format!("[{} turns compacted to {}]", conversation_turns.len() - turns.len(), turns.len())
+            format!(
+                "[{} turns compacted to {}]",
+                conversation_turns.len() - turns.len(),
+                turns.len()
+            )
         } else {
             String::new()
         };
@@ -128,7 +135,11 @@ mod tests {
     #[test]
     fn compaction_preserves_last_turn() {
         let strategy = CompactionStrategy::new(10);
-        let turns = vec!["short1".to_string(), "short2".to_string(), "keep_this".to_string()];
+        let turns = vec![
+            "short1".to_string(),
+            "short2".to_string(),
+            "keep_this".to_string(),
+        ];
         let result = strategy.compact(&turns);
         assert!(result.tokens_remaining > 0);
     }

@@ -37,11 +37,19 @@ impl ZeusEscalation {
         }
     }
 
-    pub fn check_value_alignment(&self, _deliverable: &str, _shared_vision: &str) -> Vec<ZeusFinding> {
+    pub fn check_value_alignment(
+        &self,
+        _deliverable: &str,
+        _shared_vision: &str,
+    ) -> Vec<ZeusFinding> {
         Vec::new()
     }
 
-    pub fn assess_goal_conformance(&self, _deliverable: &str, _goals: &[String]) -> Vec<ZeusFinding> {
+    pub fn assess_goal_conformance(
+        &self,
+        _deliverable: &str,
+        _goals: &[String],
+    ) -> Vec<ZeusFinding> {
         Vec::new()
     }
 

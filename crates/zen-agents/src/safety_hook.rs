@@ -116,7 +116,9 @@ impl<M: CompletionModel> PromptHook<M> for ZenHook {
             }
 
             // FR-AGENT-006: Planner tier agents MUST NOT execute mutation tools
-            if matches!(agent_role, Role::Planner | Role::Orchestrator) && Self::is_mutation_tool(&tool_name_owned) {
+            if matches!(agent_role, Role::Planner | Role::Orchestrator)
+                && Self::is_mutation_tool(&tool_name_owned)
+            {
                 return ToolCallHookAction::skip(format!(
                     "Planner/Orchestrator agent '{agent_id}' cannot use mutation tool '{tool_name_owned}'"
                 ));

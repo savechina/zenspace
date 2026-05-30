@@ -148,12 +148,15 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             let config = HttpConfig::default();
             let health_url = format!("http://{}:{}/health", config.bind_addr, config.port);
 
-            let addr = format!("{}:{}", config.bind_addr, config.port)
-                .parse::<std::net::SocketAddr>();
+            let addr =
+                format!("{}:{}", config.bind_addr, config.port).parse::<std::net::SocketAddr>();
 
             let http_ok = addr
                 .ok()
-                .and_then(|addr| std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).ok())
+                .and_then(|addr| {
+                    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+                        .ok()
+                })
                 .is_some();
 
             if http_ok {
@@ -164,7 +167,10 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
                     println!("  PID: {}", p);
                 }
                 println!("  Health: {}", health_url);
-                println!("  API:    http://{}:{}/api/v1/", config.bind_addr, config.port);
+                println!(
+                    "  API:    http://{}:{}/api/v1/",
+                    config.bind_addr, config.port
+                );
 
                 let body = fetch_http_body(&config.bind_addr, config.port, "/health");
                 if let Some(b) = body {
@@ -175,7 +181,8 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             } else if let Some(path) = path {
                 if path.exists()
                     && let Ok(pid) = read_pid(&path)
-                    && is_process_alive(pid) {
+                    && is_process_alive(pid)
+                {
                     println!(
                         "{} Gateway process alive (pid: {}) but HTTP not responding",
                         "⚠️".yellow(),
@@ -202,7 +209,9 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             std::io::stdout().flush().ok();
 
             let http_result = std::net::TcpStream::connect_timeout(
-                &http_addr.parse::<std::net::SocketAddr>().map_err(|e| ZenError::Service(e.to_string()))?,
+                &http_addr
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| ZenError::Service(e.to_string()))?,
                 std::time::Duration::from_secs(3),
             );
 
@@ -245,7 +254,8 @@ fn run_foreground(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<
     let bind_addr = config.bind_addr.clone();
 
     let mut gw = HttpGateway::new(config);
-    gw.start(port).map_err(|e| ZenError::Service(e.to_string()))?;
+    gw.start(port)
+        .map_err(|e| ZenError::Service(e.to_string()))?;
 
     write_pid(path).ok();
 
@@ -292,9 +302,9 @@ fn run_background(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<
         }
     }
 
-    let child = cmd.spawn().map_err(|e| {
-        ZenError::Service(format!("Failed to spawn gateway daemon: {}", e))
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| ZenError::Service(format!("Failed to spawn gateway daemon: {}", e)))?;
 
     let child_pid = child.id();
 
@@ -308,7 +318,11 @@ fn run_background(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<
         let port = port.unwrap_or(config.port);
         let bind_addr = bind.unwrap_or(&config.bind_addr);
 
-        println!("{} Gateway started (background, pid: {})", "✅".green(), child_pid);
+        println!(
+            "{} Gateway started (background, pid: {})",
+            "✅".green(),
+            child_pid
+        );
         println!("  Listening on http://{}:{}", bind_addr, port);
         println!("  Health: http://{}:{}/health", bind_addr, port);
         println!("  PID file: {}", path.display());
@@ -345,7 +359,11 @@ fn print_process_stats(pid: u32) {
                 let process_start_secs = starttime / clk_tck;
                 let run_time = uptime_secs.saturating_sub(process_start_secs);
 
-                println!("  CPU time: {}s user + {}s system", utime / clk_tck, stime / clk_tck);
+                println!(
+                    "  CPU time: {}s user + {}s system",
+                    utime / clk_tck,
+                    stime / clk_tck
+                );
                 println!("  Run time: {}s", run_time);
 
                 let status_path = format!("/proc/{}/status", pid);
@@ -400,9 +418,13 @@ fn fetch_http_body(host: &str, port: u16, path: &str) -> Option<String> {
     let mut stream = std::net::TcpStream::connect_timeout(
         &addr.parse::<std::net::SocketAddr>().ok()?,
         std::time::Duration::from_secs(2),
-    ).ok()?;
+    )
+    .ok()?;
 
-    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, addr);
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, addr
+    );
     stream.write_all(request.as_bytes()).ok()?;
 
     let mut response = String::new();

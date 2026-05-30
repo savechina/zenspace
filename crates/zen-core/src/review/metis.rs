@@ -86,7 +86,9 @@ impl MetisReviewer {
             if lower.contains("then") && i > 0 && !sentences[i - 1].contains('.') {
                 findings.push(MetisFinding {
                     finding_type: MetisFindingType::LogicGap,
-                    description: format!("Unsequenced 'then' at position {i} without preceding step"),
+                    description: format!(
+                        "Unsequenced 'then' at position {i} without preceding step"
+                    ),
                     severity: FindingSeverity::Medium,
                     suggestion: "Ensure each step has a clear predecessor".to_string(),
                 });
@@ -96,7 +98,8 @@ impl MetisReviewer {
                     finding_type: MetisFindingType::LogicGap,
                     description: format!("Unresolved marker found: {}", sentence.trim()),
                     severity: FindingSeverity::High,
-                    suggestion: "Replace all TODO/FIXME/placeholder markers with concrete actions".to_string(),
+                    suggestion: "Replace all TODO/FIXME/placeholder markers with concrete actions"
+                        .to_string(),
                 });
             }
         }
@@ -129,7 +132,10 @@ impl MetisReviewer {
             ("obviously", "Assumed triviality — verify the assumption"),
             ("naturally", "Assumed naturalness — verify the assumption"),
             ("clearly", "Assumed clarity — verify the assumption"),
-            ("everyone knows", "Shared-knowledge assumption — state it openly"),
+            (
+                "everyone knows",
+                "Shared-knowledge assumption — state it openly",
+            ),
         ];
 
         for indicator in &assumption_indicators {
@@ -151,7 +157,8 @@ impl MetisReviewer {
                 finding_type: MetisFindingType::MissingAssumption,
                 description: "No prerequisites or requirements section detected".to_string(),
                 severity: FindingSeverity::Low,
-                suggestion: "Add a prerequisites section for plans longer than 20 words".to_string(),
+                suggestion: "Add a prerequisites section for plans longer than 20 words"
+                    .to_string(),
             });
         }
 
@@ -164,11 +171,22 @@ impl MetisReviewer {
             return findings;
         }
 
-        let has_actionable_terms = ["create", "update", "delete", "remove", "add", "replace", "deploy", "build", "test", "verify"].iter()
-            .any(|t| plan.to_lowercase().contains(t));
-        let is_vague = ["should", "might", "could", "probably", "eventually", "hopefully"]
-            .iter()
-            .any(|t| plan.to_lowercase().contains(t));
+        let has_actionable_terms = [
+            "create", "update", "delete", "remove", "add", "replace", "deploy", "build", "test",
+            "verify",
+        ]
+        .iter()
+        .any(|t| plan.to_lowercase().contains(t));
+        let is_vague = [
+            "should",
+            "might",
+            "could",
+            "probably",
+            "eventually",
+            "hopefully",
+        ]
+        .iter()
+        .any(|t| plan.to_lowercase().contains(t));
 
         if !has_actionable_terms && plan.split_whitespace().count() > 5 {
             findings.push(MetisFinding {
@@ -188,11 +206,17 @@ impl MetisReviewer {
             });
         }
 
-        let step_count = plan.split(['\n', '.']).filter(|s| !s.trim().is_empty()).count();
+        let step_count = plan
+            .split(['\n', '.'])
+            .filter(|s| !s.trim().is_empty())
+            .count();
         if step_count < 3 && plan.split_whitespace().count() > 15 {
             findings.push(MetisFinding {
                 finding_type: MetisFindingType::TacticalFeasibility,
-                description: format!("Plan has only {step_count} step(s) but {len} words — consider decomposition", len = plan.split_whitespace().count()),
+                description: format!(
+                    "Plan has only {step_count} step(s) but {len} words — consider decomposition",
+                    len = plan.split_whitespace().count()
+                ),
                 severity: FindingSeverity::Medium,
                 suggestion: "Break large plan into smaller, verifiable steps".to_string(),
             });
@@ -211,16 +235,20 @@ impl MetisReviewer {
         if word_count > 200 {
             findings.push(MetisFinding {
                 finding_type: MetisFindingType::PathOptimization,
-                description: format!("Plan is verbose ({word_count} words) — consider summarization"),
+                description: format!(
+                    "Plan is verbose ({word_count} words) — consider summarization"
+                ),
                 severity: FindingSeverity::Low,
-                suggestion: "Condense plan to essential steps; move details to supporting docs".to_string(),
+                suggestion: "Condense plan to essential steps; move details to supporting docs"
+                    .to_string(),
             });
         }
 
         if plan.to_lowercase().matches("and").count() > 3 {
             findings.push(MetisFinding {
                 finding_type: MetisFindingType::PathOptimization,
-                description: "Multiple compound steps detected — parallelization may be possible".to_string(),
+                description: "Multiple compound steps detected — parallelization may be possible"
+                    .to_string(),
                 severity: FindingSeverity::Low,
                 suggestion: "Consider splitting compound steps for parallel execution".to_string(),
             });
@@ -254,10 +282,16 @@ mod tests {
     fn metis_analysis_methods_return_findings_for_plans_with_issues() {
         let reviewer = MetisReviewer::new();
 
-        let gap_findings = reviewer.analyze_logic_gaps("step one. then step two. TODO: implement this.");
-        assert!(gap_findings.iter().any(|f| matches!(f.finding_type, MetisFindingType::LogicGap)));
+        let gap_findings =
+            reviewer.analyze_logic_gaps("step one. then step two. TODO: implement this.");
+        assert!(
+            gap_findings
+                .iter()
+                .any(|f| matches!(f.finding_type, MetisFindingType::LogicGap))
+        );
 
-        let assumption_findings = reviewer.validate_assumptions("obviously this works and we assume it's fine");
+        let assumption_findings =
+            reviewer.validate_assumptions("obviously this works and we assume it's fine");
         assert!(!assumption_findings.is_empty());
     }
 

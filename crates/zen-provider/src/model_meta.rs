@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
@@ -44,8 +44,14 @@ impl ModelRouter {
     }
 
     pub async fn register_model(&self, name: &str, metadata: ModelMetadata) {
-        self.models.write().await.insert(name.to_string(), name.to_string());
-        self.metadata.write().await.insert(name.to_string(), metadata);
+        self.models
+            .write()
+            .await
+            .insert(name.to_string(), name.to_string());
+        self.metadata
+            .write()
+            .await
+            .insert(name.to_string(), metadata);
     }
 
     pub async fn route_task(&self, _complexity: ComplexityLevel) -> anyhow::Result<String> {
@@ -55,7 +61,8 @@ impl ModelRouter {
             return Ok(self.default_model.clone());
         }
 
-        let target = metadata.iter()
+        let target = metadata
+            .iter()
             .max_by_key(|(_, m)| m.capability_score())
             .map(|(name, _)| name.clone())
             .unwrap_or_else(|| self.default_model.clone());
@@ -71,7 +78,11 @@ impl ModelRouter {
         self.metadata.read().await.keys().cloned().collect()
     }
 
-    pub async fn swap_model(&self, name: &str, new_metadata: ModelMetadata) -> Option<ModelMetadata> {
+    pub async fn swap_model(
+        &self,
+        name: &str,
+        new_metadata: ModelMetadata,
+    ) -> Option<ModelMetadata> {
         let mut metadata = self.metadata.write().await;
         metadata.insert(name.to_string(), new_metadata)
     }
@@ -132,7 +143,8 @@ impl PromptHookTelemetry {
         }
 
         let total_tokens: u64 = model_records.iter().map(|r| r.tokens_used).sum();
-        let avg_latency = model_records.iter().map(|r| r.latency_ms).sum::<u64>() / model_records.len() as u64;
+        let avg_latency =
+            model_records.iter().map(|r| r.latency_ms).sum::<u64>() / model_records.len() as u64;
 
         ModelStats {
             total_requests: model_records.len(),

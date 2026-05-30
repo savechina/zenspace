@@ -1,13 +1,9 @@
-use security_framework::passwords::{
-    delete_generic_password, get_generic_password, set_generic_password,
-};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
 // AuthError
 // ---------------------------------------------------------------------------
 
-/// Auth-specific errors (keychain operations, credential resolution).
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("keychain access denied for service: {service}")]
@@ -24,76 +20,124 @@ pub enum AuthError {
 
     #[error("secret resolution failed: {reason}")]
     ResolutionFailed { reason: String },
+
+    #[error("keychain unavailable on {platform}: {message}")]
+    KeychainUnavailable { platform: String, message: String },
 }
 
 impl AuthError {
-    /// Returns `true` if this is an access/permission-related error.
     pub fn is_access_denied(&self) -> bool {
         matches!(self, AuthError::KeychainAccessDenied { .. })
     }
 
-    /// Returns `true` if the credential was not found.
     pub fn is_not_found(&self) -> bool {
         matches!(self, AuthError::CredentialNotFound { .. })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Keychain — T033: macOS Keychain access via security-framework
+// Platform-specific Keychain implementation (FR-061d)
 // ---------------------------------------------------------------------------
 
-/// macOS credential storage backed by the Keychain.
-///
-/// Service naming convention: `zen-{provider}-{type}`
-/// Example: `zen-openai-api-key`, `zen-jento-bot-token`
-pub struct Keychain;
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::AuthError;
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+    };
 
-// macOS Keychain OSStatus codes (from Security framework)
-const ERRSEC_AUTH_FAILED: i32 = -25293;
-const ERRSEC_ITEM_NOT_FOUND: i32 = -25300;
-const ERRSEC_NOT_AVAILABLE: i32 = -25311;
-const ERRSEC_PERMISSION_DENIED: i32 = -25294;
+    const ERRSEC_AUTH_FAILED: i32 = -25293;
+    const ERRSEC_ITEM_NOT_FOUND: i32 = -25300;
+    const ERRSEC_NOT_AVAILABLE: i32 = -25311;
+    const ERRSEC_PERMISSION_DENIED: i32 = -25294;
 
-impl Keychain {
-    /// Store a password for the given service (e.g. "zen-openai-api-key").
     pub fn store(service: &str, account: &str, password: &str) -> Result<(), AuthError> {
         set_generic_password(service, account, password.as_bytes())
             .map_err(|e| map_err(&e, service))
     }
 
-    /// Retrieve a password for the given service.
     pub fn retrieve(service: &str, account: &str) -> Result<String, AuthError> {
         get_generic_password(service, account)
             .map(|bytes| String::from_utf8(bytes).unwrap_or_default())
             .map_err(|e| map_err(&e, service))
     }
 
-    /// Delete a stored password for the given service.
     pub fn delete(service: &str, account: &str) -> Result<(), AuthError> {
         delete_generic_password(service, account).map_err(|e| map_err(&e, service))
     }
+
+    fn map_err(err: &security_framework::base::Error, service: &str) -> AuthError {
+        let code = err.code();
+
+        if code == ERRSEC_AUTH_FAILED
+            || code == ERRSEC_PERMISSION_DENIED
+            || code == ERRSEC_NOT_AVAILABLE
+        {
+            return AuthError::KeychainAccessDenied {
+                service: service.to_string(),
+            };
+        }
+
+        if code == ERRSEC_ITEM_NOT_FOUND {
+            return AuthError::CredentialNotFound {
+                service: service.to_string(),
+                account: String::new(),
+            };
+        }
+
+        AuthError::Keychain(format!("{err}"))
+    }
 }
 
-fn map_err(err: &security_framework::base::Error, service: &str) -> AuthError {
-    let code = err.code();
+#[cfg(not(target_os = "macos"))]
+mod platform {
+    use super::AuthError;
 
-    if code == ERRSEC_AUTH_FAILED
-        || code == ERRSEC_PERMISSION_DENIED
-        || code == ERRSEC_NOT_AVAILABLE
-    {
-        return AuthError::KeychainAccessDenied {
-            service: service.to_string(),
-        };
+    pub fn store(_service: &str, _account: &str, _password: &str) -> Result<(), AuthError> {
+        let platform = std::env::consts::OS;
+        tracing::warn!(
+            "[AUTH] Keychain unavailable on {}, store is a no-op. Use env vars instead.",
+            platform
+        );
+        Ok(())
     }
 
-    if code == ERRSEC_ITEM_NOT_FOUND {
-        return AuthError::CredentialNotFound {
-            service: service.to_string(),
-            account: String::new(),
-        };
+    pub fn retrieve(_service: &str, _account: &str) -> Result<String, AuthError> {
+        let platform = std::env::consts::OS;
+        Err(AuthError::KeychainUnavailable {
+            platform: platform.to_string(),
+            message: "Keychain not supported on this platform. Use SecretRef::Env or api_key_env fallback.".into(),
+        })
     }
 
-    AuthError::Keychain(format!("{err}"))
+    pub fn delete(_service: &str, _account: &str) -> Result<(), AuthError> {
+        let platform = std::env::consts::OS;
+        tracing::warn!(
+            "[AUTH] Keychain unavailable on {}, delete is a no-op.",
+            platform
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keychain — public API delegates to platform module
+// ---------------------------------------------------------------------------
+
+pub struct Keychain;
+
+impl Keychain {
+    pub fn store(service: &str, account: &str, password: &str) -> Result<(), AuthError> {
+        platform::store(service, account, password)
+    }
+
+    pub fn retrieve(service: &str, account: &str) -> Result<String, AuthError> {
+        platform::retrieve(service, account)
+    }
+
+    pub fn delete(service: &str, account: &str) -> Result<(), AuthError> {
+        platform::delete(service, account)
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +161,15 @@ mod tests {
         };
         assert!(e.is_not_found());
         assert!(!e.is_access_denied());
+    }
+
+    #[test]
+    fn test_keychain_unavailable_error() {
+        let e = AuthError::KeychainUnavailable {
+            platform: "linux".to_string(),
+            message: "test".into(),
+        };
+        assert!(!e.is_access_denied());
+        assert!(!e.is_not_found());
     }
 }

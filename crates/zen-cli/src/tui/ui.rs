@@ -6,7 +6,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let queue_height = if app.message_queue.is_empty() { 0 } else { 2 + app.message_queue.len() as u16 };
+    let queue_height = if app.message_queue.is_empty() {
+        0
+    } else {
+        2 + app.message_queue.len() as u16
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -144,25 +148,28 @@ pub fn render(frame: &mut Frame, app: &App) {
                     } else {
                         Style::default().fg(Color::DarkGray)
                     };
-                    let marker = if i == app.autocomplete_selected { "▸ " } else { "  " };
+                    let marker = if i == app.autocomplete_selected {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
                     Line::from(Span::styled(format!("{}{}", marker, s), style))
                 })
                 .collect();
 
             let total = app.autocomplete_suggestions.len();
             let title = if total > max_suggestions {
-                format!(" Suggestions ({}/{}) (Tab=next, Enter=select, Esc=close) ",
-                    app.autocomplete_selected + 1, total)
+                format!(
+                    " Suggestions ({}/{}) (Tab=next, Enter=select, Esc=close) ",
+                    app.autocomplete_selected + 1,
+                    total
+                )
             } else {
                 " Suggestions (Tab=next, Enter=select, Esc=close) ".to_string()
             };
 
             let suggestions = Paragraph::new(suggestion_lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(title),
-                )
+                .block(Block::default().borders(Borders::ALL).title(title))
                 .wrap(Wrap { trim: true });
             frame.render_widget(suggestions, popup_area);
         }

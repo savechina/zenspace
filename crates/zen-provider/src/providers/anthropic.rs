@@ -1,25 +1,25 @@
 use rig::agent::AgentBuilder;
 use rig::client::CompletionClient;
 use rig::completion::Prompt;
-use rig::providers::openai;
+use rig::providers::anthropic;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::router::LlmError;
 
 #[derive(Debug, Clone)]
-pub struct OpenAIProvider {
+pub struct AnthropicProvider {
     pub api_key: String,
     pub model: String,
     pub base_url: String,
 }
 
-impl OpenAIProvider {
+impl AnthropicProvider {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
             api_key,
             model,
-            base_url: "https://api.openai.com".into(),
+            base_url: "https://api.anthropic.com".into(),
         }
     }
 
@@ -32,27 +32,25 @@ impl OpenAIProvider {
     }
 
     pub async fn complete_async(&self, prompt: &str) -> Result<String, LlmError> {
-        let mut builder = openai::Client::builder().api_key(&self.api_key);
-
-        if self.base_url != "https://api.openai.com" {
+        let mut builder = anthropic::Client::builder().api_key(&self.api_key);
+        if self.base_url != "https://api.anthropic.com" {
             builder = builder.base_url(&self.base_url);
         }
-
         let client = builder.build().map_err(|e| LlmError::Call {
-            reason: format!("Failed to create OpenAI client: {}", e),
+            reason: format!("Failed to create Anthropic client: {}", e),
         })?;
 
         let model = client.completion_model(&self.model);
         let agent = AgentBuilder::new(model).build();
 
         let response = agent.prompt(prompt).await.map_err(|e| LlmError::Call {
-            reason: format!("OpenAI completion failed: {}", e),
+            reason: format!("Anthropic completion failed: {}", e),
         })?;
 
         info!(
             model = self.model,
             response_len = response.len(),
-            "OpenAIProvider complete"
+            "AnthropicProvider complete"
         );
         Ok(response)
     }
@@ -65,7 +63,7 @@ impl OpenAIProvider {
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let provider = OpenAIProvider {
+            let provider = AnthropicProvider {
                 api_key,
                 model,
                 base_url,
@@ -74,7 +72,7 @@ impl OpenAIProvider {
         })
         .join()
         .map_err(|e| LlmError::Call {
-            reason: format!("OpenAI thread panic: {:?}", e),
+            reason: format!("Anthropic thread panic: {:?}", e),
         })?
     }
 
@@ -97,5 +95,25 @@ impl OpenAIProvider {
             }
         }
         Ok(())
+    }
+
+    pub fn health_check(&self) -> bool {
+        let client = reqwest::blocking::Client::new();
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        match client
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+        {
+            Ok(resp) => {
+                // Anthropic returns 405 for GET on messages — that means the endpoint is alive
+                resp.status() == 405 || resp.status().is_success()
+            },
+            Err(e) => {
+                warn!(error = %e, "Anthropic health check failed");
+                false
+            },
+        }
     }
 }

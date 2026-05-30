@@ -315,11 +315,7 @@ impl SemanticEntropy {
         freq.values()
             .map(|&c| {
                 let p = c as f64 / len;
-                if p > 0.0 {
-                    -p * p.log2()
-                } else {
-                    0.0
-                }
+                if p > 0.0 { -p * p.log2() } else { 0.0 }
             })
             .sum()
     }
@@ -459,19 +455,31 @@ mod tests {
 
     #[test]
     fn test_task_classification_code_low_entropy() {
-        let task = Task::new("fn add(a: i32, b: i32) -> i32 { a + b }", 0.2, TaskType::Code);
+        let task = Task::new(
+            "fn add(a: i32, b: i32) -> i32 { a + b }",
+            0.2,
+            TaskType::Code,
+        );
         assert!(matches!(task.complexity, ComplexityLevel::Simple));
     }
 
     #[test]
     fn test_task_classification_code_medium_entropy() {
-        let task = Task::new("implement a complex async state machine", 0.5, TaskType::Code);
+        let task = Task::new(
+            "implement a complex async state machine",
+            0.5,
+            TaskType::Code,
+        );
         assert!(matches!(task.complexity, ComplexityLevel::Standard));
     }
 
     #[test]
     fn test_task_classification_text_high_entropy() {
-        let task = Task::new("analyze philosophical implications of consciousness", 0.8, TaskType::Text);
+        let task = Task::new(
+            "analyze philosophical implications of consciousness",
+            0.8,
+            TaskType::Text,
+        );
         assert!(matches!(task.complexity, ComplexityLevel::Complex));
     }
 

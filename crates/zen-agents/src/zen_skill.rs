@@ -9,7 +9,8 @@ use rig_compose::skill::{Skill, SkillOutcome};
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::Value;
 
-type ToolHandler = dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, KernelError>> + Send>> + Send + Sync;
+type ToolHandler =
+    dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<Value, KernelError>> + Send>> + Send + Sync;
 
 #[derive(Debug, Clone)]
 pub struct ZenSkill {

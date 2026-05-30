@@ -284,12 +284,8 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
                         chars.next();
                         if !link.is_empty() {
                             // Handle [[Page|Alias]] format — extract page name before |
-                            let page_name = link
-                                .split('|')
-                                .next()
-                                .unwrap_or(&link)
-                                .trim()
-                                .to_string();
+                            let page_name =
+                                link.split('|').next().unwrap_or(&link).trim().to_string();
                             links.push(page_name);
                         }
                         break;

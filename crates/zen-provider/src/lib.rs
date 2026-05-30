@@ -8,8 +8,7 @@ pub mod stream;
 
 pub use chat::{ChatMessage, ChatSession, MessageRole};
 pub use model_meta::{
-    ComplexityLevel, ModelMetadata, ModelRouter, ModelStats,
-    PromptHookTelemetry, PromptTelemetry,
+    ComplexityLevel, ModelMetadata, ModelRouter, ModelStats, PromptHookTelemetry, PromptTelemetry,
 };
 pub use router::{
     DefaultRouter, LlmConfig, LlmError, LlmRouter, LlmRouterExt, MockProvider, Provider,

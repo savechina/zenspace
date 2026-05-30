@@ -15,7 +15,14 @@ pub struct ZenDelegateTools {
 }
 
 const AGENT_SKILLS: &[(&str, &[&str])] = &[
-    ("Sisyphus", &["zen-entity-extraction", "zen-wiki-compilation", "zen-consolidation-pipeline"]),
+    (
+        "Sisyphus",
+        &[
+            "zen-entity-extraction",
+            "zen-wiki-compilation",
+            "zen-consolidation-pipeline",
+        ],
+    ),
     ("Junior", &["zen-wiki-compilation"]),
     ("Hermes", &["zen-consolidation-pipeline"]),
     (
@@ -36,7 +43,10 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
         &["zen-wiki-compilation", "zen-entity-extraction"],
     ),
     ("Explore", &["zen-knowledge-learning-loop"]),
-    ("Librarian", &["zen-wiki-compilation", "zen-knowledge-learning-loop"]),
+    (
+        "Librarian",
+        &["zen-wiki-compilation", "zen-knowledge-learning-loop"],
+    ),
     ("Argus", &["zen-knowledge-learning-loop"]),
     (
         "Hephaestus",
@@ -55,7 +65,10 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
 ];
 
 const AGENT_TOOLS: &[(&str, &[&str])] = &[
-    ("Sisyphus", &["tier2_search", "tier4_search", "compute_embeddings"]),
+    (
+        "Sisyphus",
+        &["tier2_search", "tier4_search", "compute_embeddings"],
+    ),
     ("Junior", &["tier2_search", "compute_embeddings"]),
     ("Hermes", &["tier2_search", "tier4_search"]),
     ("Metis", &["tier2_search"]),
@@ -65,7 +78,10 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
     ("Explore", &["tier2_search"]),
     ("Librarian", &["tier2_search", "compute_embeddings"]),
     ("Argus", &["tier2_search"]),
-    ("Hephaestus", &["tier2_search", "tier4_search", "compute_embeddings"]),
+    (
+        "Hephaestus",
+        &["tier2_search", "tier4_search", "compute_embeddings"],
+    ),
     ("Atlas", &["tier2_search", "compute_embeddings"]),
     ("Zeus", &["tier2_search", "tier4_search"]),
 ];
@@ -119,23 +135,35 @@ impl ZenDelegateTools {
 }
 
 fn filter_registered_skills<'a>(ids: &[&'a str], registry: &SkillRegistry) -> Vec<&'a str> {
-    ids.iter().copied().filter(|id| registry.get(id).is_ok()).collect()
+    ids.iter()
+        .copied()
+        .filter(|id| registry.get(id).is_ok())
+        .collect()
 }
 
 fn filter_registered_tools<'a>(ids: &[&'a str], registry: &ToolRegistry) -> Vec<&'a str> {
-    ids.iter().copied().filter(|id| registry.get(id).is_ok()).collect()
+    ids.iter()
+        .copied()
+        .filter(|id| registry.get(id).is_ok())
+        .collect()
 }
 
 /// T310-T313: Public API for skill resolution — single source of truth.
 /// Returns the skill IDs for an agent by name.
 pub fn resolve_skill_ids_for_agent(agent_name: &str) -> Vec<String> {
-    resolve_skill_ids(agent_name).into_iter().map(String::from).collect()
+    resolve_skill_ids(agent_name)
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// T310-T313: Public API for tool resolution — single source of truth.
 /// Returns the tool IDs for an agent by name.
 pub fn resolve_tool_ids_for_agent(agent_name: &str) -> Vec<String> {
-    resolve_tool_ids(agent_name).into_iter().map(String::from).collect()
+    resolve_tool_ids(agent_name)
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 fn resolve_skill_ids(agent_name: &str) -> Vec<&str> {

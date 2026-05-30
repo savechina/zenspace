@@ -2,11 +2,11 @@
 // Single-process gateway — all agents route through this for LLM calls
 // Prompt prefix trie for KV-cache sharing, continuous batching for concurrent requests
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // T270: PromptTrie for KV-cache sharing
@@ -34,7 +34,9 @@ impl PromptTrieNode {
         let mut node = self;
         for ch in text.chars() {
             node.visit_count += 1;
-            node = node.children.entry(ch)
+            node = node
+                .children
+                .entry(ch)
                 .or_insert_with(|| Box::new(PromptTrieNode::new()));
         }
         node.visit_count += 1;
@@ -182,7 +184,10 @@ impl InferenceGateway {
     pub fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
         Self {
             prompt_trie: Arc::new(Mutex::new(PromptTrieNode::new())),
-            batcher: Arc::new(Mutex::new(ContinuousBatcher::new(batch_size, batch_timeout_ms))),
+            batcher: Arc::new(Mutex::new(ContinuousBatcher::new(
+                batch_size,
+                batch_timeout_ms,
+            ))),
             stats: Arc::new(Mutex::new(GatewayStats::new())),
             router: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -190,13 +195,19 @@ impl InferenceGateway {
 
     /// Register a provider endpoint.
     pub async fn register_provider(&self, name: &str, endpoint: &str) {
-        self.router.lock().await.insert(name.to_string(), endpoint.to_string());
+        self.router
+            .lock()
+            .await
+            .insert(name.to_string(), endpoint.to_string());
     }
 
     /// Submit a completion request. Routes through batching if beneficial.
     pub async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, String> {
         let request_id = request.id;
-        let provider_name = request.provider.clone().unwrap_or_else(|| "default".to_string());
+        let provider_name = request
+            .provider
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batched_req = BatchedRequest {
             id: request.id,
@@ -243,10 +254,13 @@ impl InferenceGateway {
         let mut stats = self.stats.lock().await;
         stats.batches_processed += 1;
         stats.avg_batch_size = (stats.avg_batch_size * (stats.batches_processed - 1) as f64
-            + batch.len() as f64) / stats.batches_processed as f64;
+            + batch.len() as f64)
+            / stats.batches_processed as f64;
 
         for req in batch {
-            let _ = req.response_tx.send(Ok(format!("[batched response for: {}]", req.id)));
+            let _ = req
+                .response_tx
+                .send(Ok(format!("[batched response for: {}]", req.id)));
         }
 
         Ok(())
@@ -290,9 +304,24 @@ mod tests {
         let (tx2, _) = tokio::sync::oneshot::channel();
         let (tx3, _) = tokio::sync::oneshot::channel();
 
-        let req1 = BatchedRequest { id: Uuid::new_v4(), prompt: "test1".to_string(), max_tokens: 100, response_tx: tx1 };
-        let req2 = BatchedRequest { id: Uuid::new_v4(), prompt: "test2".to_string(), max_tokens: 100, response_tx: tx2 };
-        let req3 = BatchedRequest { id: Uuid::new_v4(), prompt: "test3".to_string(), max_tokens: 100, response_tx: tx3 };
+        let req1 = BatchedRequest {
+            id: Uuid::new_v4(),
+            prompt: "test1".to_string(),
+            max_tokens: 100,
+            response_tx: tx1,
+        };
+        let req2 = BatchedRequest {
+            id: Uuid::new_v4(),
+            prompt: "test2".to_string(),
+            max_tokens: 100,
+            response_tx: tx2,
+        };
+        let req3 = BatchedRequest {
+            id: Uuid::new_v4(),
+            prompt: "test3".to_string(),
+            max_tokens: 100,
+            response_tx: tx3,
+        };
 
         assert!(batcher.add_request(req1).is_none());
         assert!(batcher.add_request(req2).is_none());
@@ -305,7 +334,12 @@ mod tests {
     fn continuous_batcher_flush() {
         let mut batcher = ContinuousBatcher::new(10, 100);
         let (tx1, _) = tokio::sync::oneshot::channel();
-        let req = BatchedRequest { id: Uuid::new_v4(), prompt: "test".to_string(), max_tokens: 100, response_tx: tx1 };
+        let req = BatchedRequest {
+            id: Uuid::new_v4(),
+            prompt: "test".to_string(),
+            max_tokens: 100,
+            response_tx: tx1,
+        };
         batcher.add_request(req);
 
         let flushed = batcher.flush();
@@ -324,8 +358,12 @@ mod tests {
     #[tokio::test]
     async fn inference_gateway_provider_registration() {
         let gateway = InferenceGateway::new(5, 100);
-        gateway.register_provider("ollama", "http://localhost:11434").await;
-        gateway.register_provider("openai", "https://api.openai.com").await;
+        gateway
+            .register_provider("ollama", "http://localhost:11434")
+            .await;
+        gateway
+            .register_provider("openai", "https://api.openai.com")
+            .await;
 
         let router = gateway.router.lock().await;
         assert_eq!(router.len(), 2);

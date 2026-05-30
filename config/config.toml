@@ -13,6 +13,32 @@ default_model = "qwen3.6:35b-mlx"
 # =============================================================================
 # Provider definitions — connection settings (defined once, referenced by name)
 # =============================================================================
+#
+# Protocol types (rig-core 0.37 native clients):
+#   - "ollama"              → Local Ollama server (no API key needed)
+#   - "openai"              → Native OpenAI API (OPENAI_API_KEY)
+#   - "anthropic"           → Native Anthropic Messages API (ANTHROPIC_API_KEY)
+#   - "anthropic-compatible" → Anthropic-compatible endpoints (Moonshot/MiniMax, requires base_url)
+#   - "cohere"              → Native Cohere API (COHERE_API_KEY)
+#   - "gemini"              → Native Gemini API (GEMINI_API_KEY)
+#   - "mistral"             → Native Mistral API (MISTRAL_API_KEY)
+#   - "openai-compatible"   → OpenAI-compatible APIs (DeepSeek/Groq/Perplexity/xAI, requires base_url)
+#   - "mock"                → Testing mock (no external calls)
+#
+# Dual-protocol providers (can use either type):
+#   - DeepSeek: type="openai-compatible" base_url="https://api.deepseek.com"
+#              OR type="anthropic-compatible" base_url="https://api.deepseek.com/anthropic"
+#   - Moonshot: type="openai-compatible" base_url="https://api.moonshot.cn/v1"
+#              OR type="anthropic-compatible" base_url="https://api.moonshot.cn/anthropic"
+#   - MiniMax:  type="openai-compatible" base_url="https://api.minimax.io/v1"
+#              OR type="anthropic-compatible" base_url="https://api.minimax.io/anthropic"
+#
+# Auth resolution order (per provider):
+#   1. api_key.keychain → macOS Keychain (zen-{provider}-api-key)
+#   2. api_key.env      → Environment variable
+#   3. api_key_env      → Legacy env var field
+#   4. {PROVIDER}_API_KEY → Default env var
+# =============================================================================
 
 [providers.ollama]
 type = "ollama"
@@ -22,8 +48,64 @@ default_model = "qwen3.6:35b-mlx"
 [providers.openai]
 type = "openai"
 base_url = "https://api.openai.com/v1"
-env_key = "OPENAI_API_KEY"
+api_key = { env = "OPENAI_API_KEY" }
 default_model = "gpt-4o-mini"
+
+[providers.anthropic]
+type = "anthropic"
+api_key = { env = "ANTHROPIC_API_KEY" }
+default_model = "claude-3-5-sonnet-20241022"
+
+[providers.aliyun]
+type = "openai-compatible"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = { env = "DASHSCOPE_API_KEY" }
+default_model = "qwen3.5-plus"
+
+[providers.deepseek]
+type = "openai-compatible"
+base_url = "https://api.deepseek.com"
+api_key = { env = "DEEPSEEK_API_KEY" }
+default_model = "deepseek-v4-flash"
+
+[providers.mistral]
+type = "mistral"
+api_key = { env = "MISTRAL_API_KEY" }
+default_model = "mistral-large-latest"
+
+[providers.groq]
+type = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+api_key = { env = "GROQ_API_KEY" }
+default_model = "llama-3.3-70b-versatile"
+
+[providers.moonshot]
+type = "openai-compatible"
+base_url = "https://api.moonshot.cn/v1"
+api_key = { env = "MOONSHOT_API_KEY" }
+default_model = "moonshot-v1-8k"
+
+[providers.xai]
+type = "openai-compatible"
+base_url = "https://api.x.ai/v1"
+api_key = { env = "XAI_API_KEY" }
+default_model = "grok-beta"
+
+[providers.perplexity]
+type = "openai-compatible"
+base_url = "https://api.perplexity.ai"
+api_key = { env = "PERPLEXITY_API_KEY" }
+default_model = "sonar"
+
+[providers.gemini]
+type = "gemini"
+api_key = { env = "GEMINI_API_KEY" }
+default_model = "gemini-2.0-flash"
+
+[providers.cohere]
+type = "cohere"
+api_key = { env = "COHERE_API_KEY" }
+default_model = "command-r"
 
 # =============================================================================
 # Agent task routing — which provider/model per task
