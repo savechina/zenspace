@@ -1,4 +1,4 @@
-# Zen Space
+# Zenspace
 
 **Zen** 是一个本地优先的 Rust CLI 知识管理工具，支持多 LLM 提供商（Ollama、OpenAI、Anthropic、DeepSeek 等）。
 
@@ -14,8 +14,8 @@
 ### Homebrew（推荐 macOS）
 
 ```bash
-brew tap savechina/zen
-brew install zen
+brew tap savechina/zenspace
+brew install zenspace
 ```
 
 ### 从源码构建
