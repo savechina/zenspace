@@ -1,237 +1,195 @@
-# Zen Space (Zen)
+# Zen Space
 
-**Zen** is a Rust CLI productivity suite with agentic workspace architecture. Knowledge-base-first design with LLM routing, vector search, note management, and session lifecycle.
+**Zen** 是一个本地优先的 Rust CLI 知识管理工具，支持多 LLM 提供商（Ollama、OpenAI、Anthropic、DeepSeek 等）。
 
-## Features
+## 产品定位
 
-- **Knowledge base** — Notes, wikis, and search with tier-aware indexing
-- **Agentic sessions** — Start sessions with agents, track status, archive history
-- **Consolidation pipeline** — Auto-extract entities from notes into wiki pages
-- **Multi-provider LLM** — Route tasks across providers (entity extraction, synthesis, dispatch)
-- **Vector similarity** — Find similar notes via embeddings (stub)
-- **Entity graph** — Query relationships between extracted entities (stub)
-- **Knowledge lint** — Detect orphan pages, broken wikilinks, stale claims
-- **Audit logging** — Full lifecycle audit with export and integrity verification
-- **Gateway daemon** — HTTP daemon for API access (stub)
+- **本地知识库** — Markdown 文件作为数据源，SQLite 索引加速搜索
+- **多协议 LLM 支持** — rig-core 原生客户端：Ollama、OpenAI、Anthropic、Gemini、Cohere、Mistral 及 OpenAI-compatible API
+- **实体提取管道** — 自动从笔记提取实体，生成 Wiki 页面
+- **Agentic Session** — 会话生命周期管理，13 种内置 Agent
 
-## Quick Start
+## 安装
+
+### Homebrew（推荐 macOS）
 
 ```bash
-# Build from source
+brew tap savechina/zen
+brew install zen
+```
+
+### 从源码构建
+
+```bash
 git clone https://github.com/savechina/zenspace.git
 cd zenspace
 cargo build --release
 ./target/release/zen --help
-
-# Create a note
-./target/release/zen note create "my first note" --tag work
-
-# Search the knowledge base
-./target/release/zen search run "first note"
 ```
 
-## Commands
+### Cargo 安装（待发布）
 
-| Command | Subcommands | Description |
-| ------- | ----------- | ----------- |
-| `zen` | — | Launch Agentic TUI (planned) |
-| `zen version` | — | Show version |
-| `zen session` | `start`, `status`, `list`, `archive` | Session lifecycle with agents |
-| `zen agent` | `list`, `select`, `configure` | Agent registry management |
-| `zen workspace` | `init`, `status`, `cleanup` | `.zen/` directory structure |
-| `zen config` | `show`, `edit`, `validate` | Config layers (workspace/global/embedded) |
-| `zen llm` | `route`, `test`, `providers` | LLM routing + connectivity |
-| `zen audit` | `log`, `export`, `verify` | Audit log operations |
-| `zen serve` | `start`, `stop`, `status` | Gateway daemon control |
-| `zen note` | `create` | Create notes with tags |
-| `zen search` | `run` | Search knowledge base |
-| `zen similar` | `find` | Vector similarity search (stub) |
-| `zen graph` | `query` | Entity graph query (stub) |
-| `zen consolidate` | `run` | Run consolidation pipeline |
-| `zen reindex` | `run` | Rebuild knowledge index |
-| `zen lint` | `run` | Knowledge lint (orphan pages, broken wikilinks) |
-| `zen ingest` | `run` | Ingest files into raw knowledge directory |
-| `zen starter` | `develop`, `workspace` | Initialize dev tools/workspace |
-| `zen wps` | `archive`, `dotfiles`, `unixtime` | Work process utilities |
-| `zen clean` | `all`, `trash`, `cache` | Clean up system artifacts |
+```bash
+cargo install zen-cli
+```
 
-## Project Structure
+### 二进制下载
+
+从 [GitHub Releases](https://github.com/savechina/zenspace/releases) 下载 macOS 二进制文件。
+
+## 快速开始
+
+```bash
+# 初始化工作空间
+zen workspace init
+
+# 创建笔记
+zen note create "设计文档" --tag project
+
+# 搜索知识库
+zen search run "设计"
+
+# 查看配置
+zen config show
+```
+
+## LLM 提供商配置
+
+Zen 支持多种 LLM 提供商，配置文件位于 `config/config.toml`（编译时嵌入）或 `~/.zen/config.toml`（用户覆盖）。
+
+### 支持的协议类型
+
+| 类型 | 描述 | 示例 |
+|------|------|------|
+| `ollama` | 本地 Ollama 服务 | 无需 API Key |
+| `openai` | OpenAI API | `api_key = { env = "OPENAI_API_KEY" }` |
+| `anthropic` | Anthropic Messages API | `api_key = { env = "ANTHROPIC_API_KEY" }` |
+| `gemini` | Google Gemini API | `api_key = { env = "GEMINI_API_KEY" }` |
+| `cohere` | Cohere API | `api_key = { env = "COHERE_API_KEY" }` |
+| `mistral` | Mistral API | `api_key = { env = "MISTRAL_API_KEY" }` |
+| `openai-compatible` | OpenAI 兼容 API | DeepSeek/Groq/Perplexity/阿里云等 |
+| `anthropic-compatible` | Anthropic 兼容 API | Moonshot/MiniMax 等 |
+
+### 配置示例
+
+```toml
+# 默认提供商
+default_provider = "ollama"
+default_model = "qwen3.6:35b-mlx"
+
+# 本地 Ollama（无 API Key）
+[providers.ollama]
+type = "ollama"
+base_url = "http://127.0.0.1:11434"
+
+# OpenAI 兼容 API（DeepSeek）
+[providers.deepseek]
+type = "openai-compatible"
+base_url = "https://api.deepseek.com"
+api_key = { env = "DEEPSEEK_API_KEY" }
+default_model = "deepseek-v4-flash"
+
+# Anthropic API
+[providers.anthropic]
+type = "anthropic"
+api_key = { env = "ANTHROPIC_API_KEY" }
+default_model = "claude-3-5-sonnet-20241022"
+```
+
+### 设置环境变量
+
+```bash
+# 设置 API Key
+export OPENAI_API_KEY="sk-..."
+export DEEPSEEK_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+## 命令列表
+
+| 命令 | 说明 |
+|------|------|
+| `zen` | 启动 TUI 交互界面 |
+| `zen version` | 显示版本 |
+| `zen workspace init` | 初始化 `.zen/` 工作空间 |
+| `zen config show` | 显示配置（嵌入式/用户/环境变量） |
+| `zen note create "标题"` | 创建笔记 |
+| `zen search run "关键词"` | 搜索知识库 |
+| `zen consolidate run` | 运行实体提取管道 |
+| `zen lint run` | 检查孤立页面、断裂 Wiki 链接 |
+| `zen session start` | 启动 Agentic 会话 |
+| `zen llm providers` | 列出可用 LLM 提供商 |
+| `zen llm test <provider>` | 测试提供商连接 |
+
+完整命令列表见 `zen --help`。
+
+## 项目结构
 
 ```
 zenspace/
-├── crates/               # Rust workspace (10 crates, agentic architecture)
-│   ├── zen-cli/          # CLI entry point + 18 commands
-│   ├── zen-core/         # Config, errors, paths, constants
-│   ├── zen-service/      # Starter/wps/cleanup business logic
-│   ├── zen-data/         # SQLite entities + repositories
-│   ├── zen-knowledge/    # Note, wiki, search, consolidation, lint
-│   ├── zen-memory/       # Identity context (SOUL.md, MEMORY.md)
-│   ├── zen-agents/       # Agent registry + tool permissions
-│   ├── zen-auth/         # Keychain + credential resolution
-│   ├── zen-provider/          # Multi-provider LLM routing
-│   └── zen-gateway/      # HTTP daemon (stub)
-├── bin/                  # Helper scripts (build, test, lint, release)
-├── config/               # Embedded config.toml
-├── docs/specs/           # Agentic foundation specs (~400KB)
-├── templates/            # Tera templates (empty)
-├── Cargo.toml            # Workspace manifest
-└── README.md             # This file
+├── crates/               # 10 个 Rust workspace crates
+│   ├── zen-cli/          # CLI 入口 + TUI
+│   ├── zen-provider/     # 多协议 LLM 路由（rig-core）
+│   ├── zen-knowledge/    # 笔记/Wiki/搜索/实体提取
+│   ├── zen-data/         # SQLite 实体 + Repository
+│   ├── zen-auth/         # macOS Keychain 凭证管理
+│   └── zen-core/         # 配置/错误/路径/常量
+├── config/               # 嵌入式 config.toml
+└── docs/specs/           # 架构规范文档
 ```
 
-## Development
-
-### Rust Development
+## 开发
 
 ```bash
-# Build all crates
+# 构建
 cargo build
 
-# Run integration tests
+# 测试
 cargo test
 
-# Run linter (fmt check + clippy)
-bin/lint
+# 代码检查
+cargo clippy -- -D warnings
+cargo fmt --all --check
 
-# Format code
-cargo fmt --all
-
-# Run binary locally
+# 本地运行
 cargo run --bin zen -- --help
 ```
 
-### Ruby Development
+## 发布流程
 
-Ruby implementation not yet available in this workspace.
+### 版本规范
 
-## CI/CD
+遵循 [Semantic Versioning](https://semver.org/)：MAJOR.MINOR.PATCH
 
-CI/CD pipelines not yet configured. Planned automation:
-- **Rust**: Build, test, lint (Clippy), publish to crates.io
-- **Release**: Cross-platform binaries via `bin/release` script
-
-## Release Process
-
-### Semantic Versioning
-
-This project follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH):
-- **MAJOR**: Breaking changes
-- **MINOR**: New features (backward compatible)
-- **PATCH**: Bug fixes (backward compatible)
-
-### Automated Release Workflow
-
-**Note**: Create `VERSION` file first before using release script.
-
-When you push a version tag (e.g., `v0.1.2`), the planned CI will:
-
-1. ✅ Builds binaries for all platforms:
-   - Linux x86_64 & ARM64
-   - macOS x86_64 & ARM64 (Apple Silicon)
-   - Windows x86_64
-2. ✅ Packages binaries as `.tar.gz` (Unix) or `.zip` (Windows)
-3. ✅ Runs full test suite on all platforms
-4. ✅ Creates GitHub Release with changelog and assets
-5. ✅ Publishes to crates.io
-
-### Create a Release
-
-**Option 1: Using the release helper script (Recommended)**
+### 发布步骤
 
 ```bash
-# Auto-increment patch version (0.1.0 → 0.1.1)
-./bin/release patch
+# 使用发布脚本（推荐）
+./bin/release patch    # 0.1.0 → 0.1.1
+./bin/release minor    # 0.1.0 → 0.2.0
+./bin/release major    # 0.1.0 → 1.0.0
 
-# Auto-increment minor version (0.1.1 → 0.2.0)
-./bin/release minor
-
-# Auto-increment major version (0.1.1 → 1.0.0)
-./bin/release major
-
-# Use specific version
-./bin/release 0.2.0
-
-# Dry run (test without committing)
-./bin/release patch dry-run
-```
-
-**Option 2: Manual release**
-
-```bash
-# 1. Update VERSION file
+# 手动发布
 echo "0.1.2" > VERSION
-
-# 2. Update Cargo.toml version
-sed -i.bak 's/^version = "[^"]*"/version = "0.1.2"/' Cargo.toml
-
-# 3. Commit and tag
-git add VERSION Cargo.toml
-git commit -m "release: v0.1.2"
-git tag "v0.1.2"
-
-# 4. Push to trigger release
-git push origin main
-git push origin "v0.1.2"
+git commit -am "release: v0.1.2"
+git tag v0.1.2
+git push origin main --tags
 ```
 
-### Monitor Release
+### 发布产物（macOS）
 
-After pushing a tag, monitor the release progress:
+- `zen-{version}-aarch64-apple-darwin.tar.gz`（Apple Silicon）
+- `zen-{version}-x86_64-apple-darwin.tar.gz`（Intel）
 
-```bash
-# View GitHub Actions
-open https://github.com/savechina/zenspace/actions
+## 许可证
 
-# Or use GitHub CLI
-gh run watch
-```
+MIT License — 见 [LICENSE.txt](LICENSE.txt)
 
-### Release Assets
+## 文档
 
-Each release includes:
-- `zen-{version}-x86_64-unknown-linux-gnu.tar.gz` — Linux x86_64
-- `zen-{version}-aarch64-unknown-linux-gnu.tar.gz` — Linux ARM64
-- `zen-{version}-x86_64-apple-darwin.tar.gz` — macOS Intel
-- `zen-{version}-aarch64-apple-darwin.tar.gz` — macOS Apple Silicon
-- `zen-{version}-x86_64-pc-windows-msvc.zip` — Windows x86_64
-
-### Installing from Release
-
-```bash
-# Linux/macOS
-curl -L https://github.com/savechina/zenspace/releases/latest/download/zen-$(uname -m)-unknown-linux-gnu.tar.gz | tar xz
-sudo mv zen /usr/local/bin/
-
-# macOS (Homebrew - coming soon)
-# brew install zen
-
-# Windows
-# Download .zip from releases page and add to PATH
-```
-
-### Prerequisites
-
-Before releasing, ensure you have:
-- Write access to the repository
-- `VERSION` file exists with current version
-- Clean git working directory
-- All tests passing locally (`cargo test`)
-
-## License
-
-MIT License — see [LICENSE.txt](LICENSE.txt)
-
-## Contributing
-
-Bug reports and pull requests are welcome on GitHub at https://github.com/savechina/zenspace
-
-## Code of Conduct
-
-Everyone interacting in the Zen project's codebases, issue trackers, chat rooms and mailing lists is expected to follow the [code of conduct](CODE_OF_CONDUCT.md).
+- [AGENTS.md](AGENTS.md) — 项目架构指南
+- [config/config.toml](config/config.toml) — 提供商配置示例
 
 ---
 
-## Detailed Documentation
-
-- [AGENTS.md](AGENTS.md) — Project architecture guide
-- [crates/AGENTS.md](crates/AGENTS.md) — Workspace crate details
-- [docs/specs/AGENTS.md](docs/specs/AGENTS.md) — Specification overview
+**GitHub**: https://github.com/savechina/zenspace

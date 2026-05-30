@@ -16,6 +16,10 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
+repository = "https://github.com/savechina/zenspace"
+homepage = "https://github.com/savechina/zenspace"
+license = "MIT"
+description = "Zenspace AI Agents productivity suite，个人生产力套件"
 
 [workspace.dependencies]
 clap = { version = "4.5.39", features = ["derive", "env", "string"] }
@@ -116,3 +120,8 @@ sysinfo = "0.35"
 notify = "8"
 notify-rust = "4"
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
+
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+lto = true
