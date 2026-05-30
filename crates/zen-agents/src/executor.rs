@@ -1,3 +1,19 @@
+//! Agent execution with retry, fallback, and error categorization.
+//!
+//! `AgentExecutor` handles LLM call execution with configurable retry
+//! policies and error classification for transient vs client errors.
+//!
+//! # Architecture (ADR-011)
+//!
+//! The orchestrator delegates execution lifecycle to this component.
+//! Budget enforcement and telemetry hooks are wired in the orchestrator
+//! thin-wrapper.
+//!
+//! # Future Work
+//! - T294: Replace custom retry loop with `rig_compose::dispatch_tool_invocations`
+//! - T295: Wire BudgetGuard for pre-execution reservation (via orchestrator)
+//! - T297: Replace `append_audit_log()` with rig-tap observability hooks
+
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -106,6 +122,12 @@ impl AgentExecutor {
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
+    }
+
+    /// Accessor for the underlying router — used by orchestrator build_agent.
+    #[must_use]
+    pub const fn router(&self) -> &DefaultRouter {
+        &self.router
     }
 
     /// Execute a single agent request with retry and fallback.
@@ -260,5 +282,26 @@ impl AgentExecutor {
                 self.retry_policy.max_retries, last_error
             )
         })
+    }
+
+    /// Execute a single agent request with streaming.
+    ///
+    /// Calls `on_token` for each token chunk received from the streaming
+    /// response and returns the complete accumulated response.
+    pub fn execute_with_retry_stream(
+        &self,
+        _context: &AgentContext,
+        on_token: impl FnMut(&str),
+    ) -> Result<()> {
+        // T296: Placeholder stub for streaming execution
+        // Full implementation requires:
+        // 1. Streaming LLM call via rig-core CompletionModel::stream()
+        // 2. BudgetGuard pre-reservation (T295)
+        // 3. Token-by-token delivery to on_token callback
+        let _ = on_token;
+        anyhow::bail!(
+            "execute_with_retry_stream: streaming not yet implemented in AgentExecutor. \
+             Use zen_agent::ZenAgent::execute_stream for streaming support."
+        );
     }
 }

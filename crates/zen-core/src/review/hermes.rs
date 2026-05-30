@@ -1,4 +1,4 @@
-use zen_core::types::Task;
+use crate::types::Task;
 
 #[derive(Debug, Clone)]
 pub struct HermesFinding {
@@ -133,7 +133,7 @@ impl Default for HermesValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zen_core::types::{Task, TaskType};
+    use crate::types::{Task, TaskType};
 
     #[test]
     fn hermes_approves_valid_deliverables() {

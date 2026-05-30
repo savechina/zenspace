@@ -1,4 +1,5 @@
 use zen_core::types::Task;
+use crate::sandbox::{WasmSandbox, ResourceLimits, ExecutionOutput};
 
 #[derive(Debug, Clone)]
 pub struct MomusFinding {
@@ -180,6 +181,20 @@ impl MomusReviewer {
         }
 
         findings
+    }
+
+    pub fn validate_via_wasm(&self, wasm_bytes: &[u8]) -> Result<ExecutionOutput, String> {
+        let sandbox = WasmSandbox::new(ResourceLimits::default())
+            .map_err(|e| format!("WasmSandbox creation failed: {e}"))?;
+        sandbox.validate_module(wasm_bytes)
+            .map_err(|e| format!("WASM validation failed: {e}"))?;
+        Ok(ExecutionOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            execution_time_ms: 0,
+            memory_used_bytes: 0,
+        })
     }
 
     pub fn can_veto(&self, review: &MomusReview) -> bool {

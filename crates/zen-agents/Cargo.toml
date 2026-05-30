@@ -28,6 +28,7 @@ async-trait = { workspace = true }
 schemars = "0.8"
 wasmtime = { workspace = true }
 wasi-common = { workspace = true }
+arrow = { workspace = true }
 
 [dev-dependencies]
 rig-core = { workspace = true, features = ["test-utils"] }

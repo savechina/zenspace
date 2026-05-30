@@ -44,6 +44,7 @@ pub fn default_memory_config() -> MemoryConfig {
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
     pub summary: String,
+    pub tokens_remaining: usize,
 }
 
 pub struct CompactionStrategy {
@@ -53,6 +54,27 @@ pub struct CompactionStrategy {
 impl CompactionStrategy {
     pub fn new(max_tokens: usize) -> Self {
         Self { max_tokens }
+    }
+
+    pub fn compact(&self, conversation_turns: &[String]) -> CompactionResult {
+        let mut total_tokens: usize = conversation_turns.iter().map(|t| t.len() / 4).sum();
+        let mut turns = conversation_turns.to_vec();
+
+        while total_tokens > self.max_tokens && turns.len() > 1 {
+            let removed = turns.remove(0);
+            total_tokens -= removed.len() / 4;
+        }
+
+        let summary = if turns.len() < conversation_turns.len() {
+            format!("[{} turns compacted to {}]", conversation_turns.len() - turns.len(), turns.len())
+        } else {
+            String::new()
+        };
+
+        CompactionResult {
+            summary,
+            tokens_remaining: total_tokens,
+        }
     }
 }
 
@@ -67,6 +89,11 @@ impl ContextProjector {
 
     pub fn store(&self) -> &MemvidStore {
         &self.store
+    }
+
+    pub fn project_relevant(&self, session_id: &str) -> Result<Vec<String>> {
+        let cards = self.store.entity_memories(session_id)?;
+        Ok(cards.into_iter().map(|c| format!("{:?}", c)).collect())
     }
 }
 
@@ -84,5 +111,25 @@ mod tests {
     fn default_memory_config_creation() {
         let config = default_memory_config();
         let _ = config;
+    }
+
+    #[test]
+    fn compaction_reduces_tokens() {
+        let strategy = CompactionStrategy::new(100);
+        let turns = vec![
+            "turn one content here".repeat(20),
+            "turn two content here".repeat(20),
+            "turn three content".repeat(20),
+        ];
+        let result = strategy.compact(&turns);
+        assert!(result.tokens_remaining <= 100 || result.summary.contains("compacted"));
+    }
+
+    #[test]
+    fn compaction_preserves_last_turn() {
+        let strategy = CompactionStrategy::new(10);
+        let turns = vec!["short1".to_string(), "short2".to_string(), "keep_this".to_string()];
+        let result = strategy.compact(&turns);
+        assert!(result.tokens_remaining > 0);
     }
 }

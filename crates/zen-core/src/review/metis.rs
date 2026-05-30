@@ -1,4 +1,4 @@
-use zen_core::types::Task;
+use crate::types::Task;
 
 #[derive(Debug, Clone)]
 pub struct MetisFinding {
@@ -239,7 +239,7 @@ impl Default for MetisReviewer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zen_core::types::{Task, TaskType};
+    use crate::types::{Task, TaskType};
 
     #[test]
     fn metis_reviewer_returns_non_empty_review() {

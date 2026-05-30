@@ -2,4 +2,5 @@
 set -euo pipefail
 set -x
 
-cargo install --path .
+#cargo install --path .
+cargo install --path crates/zen-cli --force

@@ -1,9 +1,8 @@
 use zen_core::types::Task;
 
-use super::hermes::HermesValidator;
-use super::metis::MetisReviewer;
+use zen_core::review::{HermesValidator, MetisReviewer, ZeusEscalation};
+
 use super::momus::MomusReviewer;
-use super::zeus::ZeusEscalation;
 
 #[derive(Debug)]
 pub struct PipelineResult {

@@ -6,6 +6,8 @@ use tokio::sync::{mpsc, broadcast};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use arrow::array::RecordBatch;
 
 use zen_core::types::{ComplexityLevel, TaskType};
 
@@ -62,6 +64,8 @@ pub struct Deliverable {
     pub content: String,
     pub metadata: DeliverableMetadata,
     pub validation_status: ValidationStatus,
+    #[serde(skip)]
+    pub arrow_data: Option<Arc<RecordBatch>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +96,13 @@ impl Deliverable {
                 cost_estimate: 0.0,
             },
             validation_status: ValidationStatus::Pending,
+            arrow_data: None,
         }
+    }
+
+    pub fn with_arrow_data(mut self, data: Arc<RecordBatch>) -> Self {
+        self.arrow_data = Some(data);
+        self
     }
 }
 
@@ -357,5 +367,25 @@ mod tests {
     fn deliverable_default_status() {
         let deliverable = Deliverable::new(Uuid::new_v4(), "agent", "content".to_string());
         assert_eq!(deliverable.validation_status, ValidationStatus::Pending);
+        assert!(deliverable.arrow_data.is_none());
+    }
+
+    #[test]
+    fn deliverable_arrow_data_attachment() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["Alice", "Bob"]))],
+        ).unwrap();
+
+        let deliverable = Deliverable::new(Uuid::new_v4(), "agent", "content".to_string())
+            .with_arrow_data(Arc::new(batch));
+        assert!(deliverable.arrow_data.is_some());
+        assert_eq!(deliverable.arrow_data.unwrap().num_rows(), 2);
     }
 }

@@ -85,7 +85,7 @@ impl App {
             running: true,
             workspace,
             session_id: None,
-            model: "ollama/llama3.2".into(),
+            model: "ollama/qwen3.6:35b-mlx".into(),
             memory_count: 0,
             show_thinking: false,
             streaming_buffer: String::new(),

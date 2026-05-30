@@ -100,6 +100,9 @@ rig-tap = "0.1"
 rig-memvid = "0.2"
 rig-sqlite = "0.2"
 
+# Arrow for zero-copy inter-agent data transfer (FR-SO-005)
+arrow = "56"
+
 futures = "0.3"
 
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["cuda"] }

@@ -88,14 +88,20 @@ impl Tool for HealthTool {
         let disks = Disks::new_with_refreshed_list();
         let disk_list: Vec<Value> = disks.list().iter().map(disk_info).collect();
 
+        const MEM_THRESHOLD: u64 = 500 * 1024 * 1024;
+        let mem_used = sys.used_memory();
+        let mem_alert = mem_used > MEM_THRESHOLD;
+
         let mut result = json!({
             "cpu_percent": {
                 "current": sys.global_cpu_usage(),
                 "logical_cores": sys.cpus().len()
             },
             "memory_total_bytes": sys.total_memory(),
-            "memory_used_bytes": sys.used_memory(),
+            "memory_used_bytes": mem_used,
             "memory_free_bytes": sys.total_memory() - sys.used_memory(),
+            "memory_threshold_bytes": MEM_THRESHOLD,
+            "memory_threshold_exceeded": mem_alert,
             "swap_total_bytes": sys.total_swap(),
             "swap_used_bytes": sys.used_swap(),
             "disks": disk_list,

@@ -1,11 +1,15 @@
-pub mod hermes;
-pub mod metis;
-pub mod momus;
-pub mod pipeline;
-pub mod zeus;
+// Pure reviewers now live in zen-core, re-exported here for backward compatibility
+pub use zen_core::review::{
+    HermesFinding, HermesFindingType, HermesValidation, HermesValidator,
+    MetisFinding, MetisFindingType, MetisReview, MetisReviewer,
+    ZeusFinding, ZeusFindingType, ZeusReview, ZeusEscalation,
+    FindingSeverity,
+};
 
-pub use hermes::HermesValidator;
-pub use metis::MetisReviewer;
+// Momus stays in zen-agents (depends on WasmSandbox/wasmtime)
+pub mod momus;
 pub use momus::MomusReviewer;
-pub use pipeline::QualityPipeline;
-pub use zeus::ZeusEscalation;
+
+// Pipeline orchestrator stays in zen-agents (composes Momus + pure reviewers)
+pub mod pipeline;
+pub use pipeline::{PipelineResult, QualityPipeline};

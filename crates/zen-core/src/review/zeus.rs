@@ -1,4 +1,4 @@
-use zen_core::types::Task;
+use crate::types::Task;
 
 #[derive(Debug, Clone)]
 pub struct ZeusFinding {
@@ -67,9 +67,10 @@ impl Default for ZeusEscalation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zen_core::types::{ComplexityLevel, TaskType};
+    use crate::types::TaskType;
 
     #[test]
+
     fn zeus_approves_valid_deliverables() {
         let zeus = ZeusEscalation::new();
         let task = Task::new("test task", 0.5, TaskType::Code);

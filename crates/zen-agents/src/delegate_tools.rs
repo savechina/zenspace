@@ -37,6 +37,21 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
     ),
     ("Explore", &["zen-knowledge-learning-loop"]),
     ("Librarian", &["zen-wiki-compilation", "zen-knowledge-learning-loop"]),
+    ("Argus", &["zen-knowledge-learning-loop"]),
+    (
+        "Hephaestus",
+        &[
+            "zen-entity-extraction",
+            "zen-wiki-compilation",
+            "zen-consolidation-pipeline",
+            "zen-contradiction-detection",
+        ],
+    ),
+    ("Atlas", &["zen-wiki-compilation"]),
+    (
+        "Zeus",
+        &["zen-entity-extraction", "zen-contradiction-detection"],
+    ),
 ];
 
 const AGENT_TOOLS: &[(&str, &[&str])] = &[
@@ -49,6 +64,10 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
     ("Prometheus", &["compute_embeddings"]),
     ("Explore", &["tier2_search"]),
     ("Librarian", &["tier2_search", "compute_embeddings"]),
+    ("Argus", &["tier2_search"]),
+    ("Hephaestus", &["tier2_search", "tier4_search", "compute_embeddings"]),
+    ("Atlas", &["tier2_search", "compute_embeddings"]),
+    ("Zeus", &["tier2_search", "tier4_search"]),
 ];
 
 const BUILTIN_AGENT_NAMES: &[&str] = &[
@@ -61,6 +80,10 @@ const BUILTIN_AGENT_NAMES: &[&str] = &[
     "Prometheus",
     "Explore",
     "Librarian",
+    "Argus",
+    "Hephaestus",
+    "Atlas",
+    "Zeus",
 ];
 
 impl ZenDelegateTools {
@@ -101,6 +124,18 @@ fn filter_registered_skills<'a>(ids: &[&'a str], registry: &SkillRegistry) -> Ve
 
 fn filter_registered_tools<'a>(ids: &[&'a str], registry: &ToolRegistry) -> Vec<&'a str> {
     ids.iter().copied().filter(|id| registry.get(id).is_ok()).collect()
+}
+
+/// T310-T313: Public API for skill resolution — single source of truth.
+/// Returns the skill IDs for an agent by name.
+pub fn resolve_skill_ids_for_agent(agent_name: &str) -> Vec<String> {
+    resolve_skill_ids(agent_name).into_iter().map(String::from).collect()
+}
+
+/// T310-T313: Public API for tool resolution — single source of truth.
+/// Returns the tool IDs for an agent by name.
+pub fn resolve_tool_ids_for_agent(agent_name: &str) -> Vec<String> {
+    resolve_tool_ids(agent_name).into_iter().map(String::from).collect()
 }
 
 fn resolve_skill_ids(agent_name: &str) -> Vec<&str> {
@@ -149,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn zen_delegate_tools_registers_all_eight_agents() {
+    fn zen_delegate_tools_registers_all_thirteen_agents() {
         let wiring = _ZenWiring::new();
         let router = mock_router();
         let delegate_tools = ZenDelegateTools::new(&wiring, &router);

@@ -199,7 +199,7 @@ impl Default for LlmTaskConfig {
     fn default() -> Self {
         Self {
             provider: Some("ollama".into()),
-            model: Some("llama3.2".into()),
+            model: Some("qwen3.6:35b-mlx".into()),
             base_url: Some("http://127.0.0.1:11434".into()),
             api_key_env: None,
         }
