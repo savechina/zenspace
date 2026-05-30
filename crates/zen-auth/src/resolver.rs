@@ -110,7 +110,7 @@ mod tests {
             env: "ZEN_TEST_SECRET".to_string(),
         };
 
-        let result = ref_.resolve();
+        let result = resolve_secret_ref(&ref_);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "test-value-123");
 
@@ -123,7 +123,7 @@ mod tests {
         let ref_ = SecretRef::Env {
             env: "ZEN_NONEXISTENT_VAR_12345".to_string(),
         };
-        let result = ref_.resolve();
+        let result = resolve_secret_ref(&ref_);
         assert!(result.is_err());
         match result.unwrap_err() {
             AuthError::CredentialNotFound { service, .. } => {

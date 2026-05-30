@@ -100,7 +100,6 @@ array_width = 60
 
 # Attribute styling
 attributes_always_same_line = false
-inline_attribute_width = 50
 
 # Trailing comma
 trailing_comma = "Vertical"

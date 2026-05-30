@@ -7,10 +7,6 @@ homepage.workspace = true
 license.workspace = true
 description = "Zenspace CLI — productivity suite"
 
-[[bin]]
-name = "zen"
-path = "src/main.rs"
-
 [dependencies]
 zen-service = { path = "../zen-service" }
 zen-gateway = { path = "../zen-gateway" }

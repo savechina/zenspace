@@ -14,6 +14,7 @@ use super::SearchResult;
 // ---------------------------------------------------------------------------
 
 #[derive(Embed, Clone, Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct KnowledgeDocument {
     pub id: String,
     #[embed]

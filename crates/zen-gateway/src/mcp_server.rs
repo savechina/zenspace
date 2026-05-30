@@ -19,7 +19,9 @@ pub struct McpConfig {
 }
 
 /// MCP server that exposes a rig-compose ToolRegistry via the MCP protocol.
+#[allow(dead_code)]
 pub struct McpServer {
+    #[allow(dead_code)]
     config: McpConfig,
     registry: ToolRegistry,
 }

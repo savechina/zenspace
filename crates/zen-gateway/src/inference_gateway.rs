@@ -89,6 +89,7 @@ pub struct BatchedRequest {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ContinuousBatcher {
     batch_size: usize,
     timeout_ms: u64,

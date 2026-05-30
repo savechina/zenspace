@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/zen",
     "crates/zen-cli",
     "crates/zen-core",
     "crates/zen-data",

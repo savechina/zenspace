@@ -58,6 +58,7 @@ impl RunningState {
         *self.status.lock().await = status;
     }
 
+    #[allow(dead_code)]
     async fn get(&self) -> GatewayStatus {
         self.status.lock().await.clone()
     }

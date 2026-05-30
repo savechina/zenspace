@@ -8973,6 +8973,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zen"
+version = "0.1.0"
+dependencies = [
+ "dotenvy",
+ "tokio",
+ "zen-cli",
+ "zen-core",
+]
+
+[[package]]
 name = "zen-agents"
 version = "0.1.0"
 dependencies = [

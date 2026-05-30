@@ -1,0 +1,18 @@
+[package]
+name = "zen"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "zen"
+path = "src/main.rs"
+
+[dependencies]
+zen-cli = { path = "../zen-cli" }
+zen-core = { path = "../zen-core" }
+dotenvy = { workspace = true }
+tokio = { workspace = true }

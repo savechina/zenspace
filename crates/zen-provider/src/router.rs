@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-pub use zen_core::config::{AgenticConfig, LlmConfig, LlmTaskConfig, ProviderConfig};
+pub use zen_core::config::{AgenticConfig, LlmConfig, ProviderConfig};
 use zen_core::errors::ZenError;
 use zen_core::secrets::SecretRef;
 use zen_core::types::Sensitivity;
@@ -308,6 +308,7 @@ impl TaskContext {
         }
     }
 
+    #[allow(dead_code)]
     fn task_config<'a>(&self, cfg: &'a LlmConfig) -> Option<&'a zen_core::config::LlmTaskConfig> {
         match self {
             TaskContext::EntityExtraction => cfg.entity_extraction.as_ref(),
@@ -511,7 +512,19 @@ impl DefaultRouter {
                     OpenAIProvider::new_with_base_url(api_key, model, base_url),
                 ))
             },
-            "openai-compatible" | _ => {
+            "openai-compatible" => {
+                let api_key = resolve_api_key(cfg, name)?;
+                let base_url = cfg.base_url.clone()?;
+                let model = cfg
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "default".into());
+                Some(ProviderInstance::OpenAICompatible(
+                    OpenAIProvider::new_with_base_url(api_key, model, base_url),
+                ))
+            },
+            unknown => {
+                warn!("Unknown provider type '{unknown}', treating as openai-compatible");
                 let api_key = resolve_api_key(cfg, name)?;
                 let base_url = cfg.base_url.clone()?;
                 let model = cfg
@@ -529,48 +542,47 @@ impl DefaultRouter {
     pub fn new(config: LlmConfig) -> Self {
         let mut providers = std::collections::HashMap::new();
 
-        if let Some(tc) = config.entity_extraction.as_ref() {
-            if tc.provider.as_deref() == Some("ollama") {
-                let base_url = tc
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "http://127.0.0.1:11434".into());
-                let model = tc.model.clone().unwrap_or_else(|| "llama3.2".into());
-                providers.insert(
-                    "ollama".into(),
-                    ProviderInstance::Ollama(OllamaProvider::new(base_url, model)),
-                );
-            }
+        if let Some(tc) = config.entity_extraction.as_ref()
+            && tc.provider.as_deref() == Some("ollama")
+        {
+            let base_url = tc
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+            let model = tc.model.clone().unwrap_or_else(|| "llama3.2".into());
+            providers.insert(
+                "ollama".into(),
+                ProviderInstance::Ollama(OllamaProvider::new(base_url, model)),
+            );
         }
 
-        if let Some(tc) = config.dispatch.as_ref() {
-            if let Some(ref provider_name) = tc.provider {
-                if provider_name == "ollama" {
-                    // Ollama handled above in entity_extraction
-                } else if provider_name != "mock" {
-                    // Cloud provider: resolve API key and base_url from config
-                    let default_env = format!("{}_API_KEY", provider_name.to_uppercase());
-                    let env_var: &str = match provider_name.as_str() {
-                        "aliyun" => "DASHSCOPE_API_KEY",
-                        _ => tc.api_key_env.as_deref().unwrap_or(&default_env),
-                    };
+        if let Some(tc) = config.dispatch.as_ref()
+            && let Some(ref provider_name) = tc.provider
+        {
+            if provider_name == "ollama" {
+                // Ollama handled above in entity_extraction
+            } else if provider_name != "mock" {
+                // Cloud provider: resolve API key and base_url from config
+                let default_env = format!("{}_API_KEY", provider_name.to_uppercase());
+                let env_var: &str = match provider_name.as_str() {
+                    "aliyun" => "DASHSCOPE_API_KEY",
+                    _ => tc.api_key_env.as_deref().unwrap_or(&default_env),
+                };
 
-                    if let Ok(api_key) = std::env::var(env_var) {
-                        // Use base_url from config, fail if not set
-                        if let Some(ref base_url) = tc.base_url {
-                            let model = tc.model.clone().unwrap_or_else(|| "default".into());
-                            providers.insert(
-                                provider_name.clone(),
-                                ProviderInstance::OpenAICompatible(
-                                    OpenAIProvider::new_with_base_url(
-                                        api_key,
-                                        model,
-                                        base_url.clone(),
-                                    ),
-                                ),
-                            );
-                        }
-                    }
+                if let Ok(api_key) = std::env::var(env_var)
+                    && let Some(ref base_url) = tc.base_url
+                {
+                    let model = tc.model.clone().unwrap_or_else(|| "default".into());
+                    providers.insert(
+                        provider_name.clone(),
+                        ProviderInstance::OpenAICompatible(
+                            OpenAIProvider::new_with_base_url(
+                                api_key,
+                                model,
+                                base_url.clone(),
+                            ),
+                        ),
+                    );
                 }
             }
         }
@@ -707,23 +719,22 @@ impl DefaultRouter {
     }
 
     fn is_local_llm_available(&self) -> bool {
-        if let Some(instance) = self.providers.get("ollama") {
-            if let ProviderInstance::Ollama(ollama) = instance {
-                if ollama.health_check() {
-                    return true;
-                }
-            }
+        if let Some(instance) = self.providers.get("ollama")
+            && let ProviderInstance::Ollama(ollama) = instance
+            && ollama.health_check()
+        {
+            return true;
         }
         warn!("is_local_llm_available: no reachable local LLM provider");
         false
     }
 
-    #[allow(dead_code)]
+#[allow(dead_code)]
     pub fn health_check(&self) -> bool {
-        if let Some(instance) = self.providers.get("ollama") {
-            if let ProviderInstance::Ollama(ollama) = instance {
-                return ollama.health_check();
-            }
+        if let Some(instance) = self.providers.get("ollama")
+            && let ProviderInstance::Ollama(ollama) = instance
+        {
+            return ollama.health_check();
         }
         tracing::info!("DefaultRouter health check: no local LLM configured");
         false
@@ -887,16 +898,16 @@ impl LlmRouter for DefaultRouter {
             result.push((name.clone(), instance.model_name().to_string()));
         }
 
-        if result.is_empty() {
-            if let Some(ref name) = self.config.default_provider {
-                result.push((
-                    name.clone(),
-                    self.config
-                        .default_model
-                        .clone()
-                        .unwrap_or_else(|| "default".into()),
-                ));
-            }
+        if result.is_empty()
+            && let Some(ref name) = self.config.default_provider
+        {
+            result.push((
+                name.clone(),
+                self.config
+                    .default_model
+                    .clone()
+                    .unwrap_or_else(|| "default".into()),
+            ));
         }
 
         result

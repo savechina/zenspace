@@ -86,6 +86,7 @@ pub(crate) fn args_schema_entity() -> Value {
     json_schema_object(props, vec!["entity_name"])
 }
 
+#[allow(dead_code)]
 pub(crate) fn args_schema_file_path() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -98,6 +99,7 @@ pub(crate) fn args_schema_file_path() -> Value {
     json_schema_object(props, vec!["file_path"])
 }
 
+#[allow(dead_code)]
 pub(crate) fn args_schema_search_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -127,6 +129,7 @@ pub(crate) fn args_schema_search_insert() -> Value {
     json_schema_object(props, vec!["id", "title", "content", "file_path", "source"])
 }
 
+#[allow(dead_code)]
 pub(crate) fn args_schema_graph_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -144,6 +147,7 @@ pub(crate) fn args_schema_graph_insert() -> Value {
     json_schema_object(props, vec!["id", "name", "entity_type"])
 }
 
+#[allow(dead_code)]
 pub(crate) fn args_schema_relationship_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
