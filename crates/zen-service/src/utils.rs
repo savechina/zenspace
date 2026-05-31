@@ -5,7 +5,7 @@ pub(crate) fn command_exists(command: &str) -> bool {
         Ok(path) => {
             println!("path:{}", path.display());
             true
-        },
+        }
         Err(_) => false,
     }
 }

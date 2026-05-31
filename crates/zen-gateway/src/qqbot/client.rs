@@ -115,11 +115,11 @@ impl QqBotClient {
                             }
                             let _ = event_tx.send(ws);
                         }
-                    },
+                    }
                     Err(e) => {
                         error!("WebSocket read error: {e}");
                         break;
-                    },
+                    }
                 }
             }
         });

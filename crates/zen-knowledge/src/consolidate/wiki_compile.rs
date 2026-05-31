@@ -256,7 +256,7 @@ impl Skill for WikiCompiler {
             Some(dir) => PathBuf::from(dir),
             None => {
                 return Ok(SkillOutcome::noop());
-            },
+            }
         };
 
         let notes_val = ctx

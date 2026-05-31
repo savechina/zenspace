@@ -35,7 +35,7 @@ impl RigOpenAIProvider {
             Err(e) => {
                 info!(error = %e, "OpenAI health check failed");
                 false
-            },
+            }
         }
     }
 }

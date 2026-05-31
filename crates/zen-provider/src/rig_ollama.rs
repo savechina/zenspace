@@ -36,7 +36,7 @@ impl RigOllamaProvider {
             Err(e) => {
                 info!(error = %e, "Ollama health check failed");
                 false
-            },
+            }
         }
     }
 }

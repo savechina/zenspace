@@ -74,6 +74,6 @@ pub fn execute_command(operation: &NoteCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
     }
 }

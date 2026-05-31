@@ -244,7 +244,7 @@ impl AgentExecutor {
                         info!(attempt, agent = agent_name, "Retry succeeded");
                     }
                     return Ok(response);
-                },
+                }
                 Err(e) => {
                     let category = ErrorCategory::from_error_message(&e.to_string());
                     if !category.is_retryable() {
@@ -266,7 +266,7 @@ impl AgentExecutor {
                         "Transient error during agent execution"
                     );
                     last_error = Some(e);
-                },
+                }
             }
         }
 

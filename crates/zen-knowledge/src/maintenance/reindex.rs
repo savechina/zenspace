@@ -96,7 +96,7 @@ impl Reindexer {
                         .errors
                         .push(format!("checksum {}: {}", file_display, e));
                     continue;
-                },
+                }
             };
 
             // Decide: unchanged, new, or changed.
@@ -116,7 +116,7 @@ impl Reindexer {
                 Ok(()) => {
                     info!("Reindexed: {}", file_display);
                     report.files_updated += 1;
-                },
+                }
                 Err(e) => {
                     warn!("Reindex failed for {}: {}", file_display, e);
                     report
@@ -124,7 +124,7 @@ impl Reindexer {
                         .push(format!("reindex {}: {}", file_display, e));
                     // Transactional: we just skip this file (rollback is
                     // implicit because we haven't written anything yet).
-                },
+                }
             }
         }
 
@@ -153,14 +153,14 @@ impl Reindexer {
                     parsed_note.tags.len(),
                     parsed_note.domain
                 );
-            },
+            }
             Err(e) => {
                 warn!(
                     "Frontmatter parse failed for {}: {} — indexing as raw",
                     file_path.display(),
                     e
                 );
-            },
+            }
         }
 
         // FTS5 index update stub.

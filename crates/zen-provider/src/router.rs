@@ -27,11 +27,11 @@ fn resolve_api_key(p: &ProviderConfig, provider_name: &str) -> Option<String> {
             Ok(key) => {
                 info!(provider = provider_name, source = %secret_ref, "resolved API key via SecretRef");
                 return Some(key);
-            },
+            }
             Err(e) => {
                 // Expected when provider not configured — downgrade to debug
                 tracing::debug!(provider = provider_name, secret_ref = %secret_ref, error = %e, "SecretRef not found, falling back to env var");
-            },
+            }
         }
     }
 
@@ -359,7 +359,7 @@ impl ProviderInstance {
             ProviderInstance::Anthropic(p) => p.complete_streaming(prompt, token_tx).await,
             ProviderInstance::AnthropicCompatible(p) => {
                 p.complete_streaming(prompt, token_tx).await
-            },
+            }
             ProviderInstance::Cohere(p) => p.complete_streaming(prompt, token_tx).await,
             ProviderInstance::Gemini(p) => p.complete_streaming(prompt, token_tx).await,
             ProviderInstance::Mistral(p) => p.complete_streaming(prompt, token_tx).await,
@@ -445,7 +445,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::Ollama(OllamaProvider::new(
                     base_url, model,
                 )))
-            },
+            }
             "mock" => Some(ProviderInstance::Mock(MockProvider::default())),
             "anthropic" => {
                 let api_key = resolve_api_key(cfg, name)?;
@@ -456,7 +456,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::Anthropic(AnthropicProvider::new(
                     api_key, model,
                 )))
-            },
+            }
             "anthropic-compatible" => {
                 let api_key = resolve_api_key(cfg, name)?;
                 let base_url = cfg.base_url.clone()?;
@@ -467,7 +467,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::AnthropicCompatible(
                     AnthropicProvider::new_with_base_url(api_key, model, base_url),
                 ))
-            },
+            }
             "cohere" => {
                 let api_key = resolve_api_key(cfg, name)?;
                 let model = cfg
@@ -477,7 +477,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::Cohere(CohereProvider::new(
                     api_key, model,
                 )))
-            },
+            }
             "gemini" => {
                 let api_key = resolve_api_key(cfg, name)?;
                 let model = cfg
@@ -487,7 +487,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::Gemini(GeminiProvider::new(
                     api_key, model,
                 )))
-            },
+            }
             "mistral" => {
                 let api_key = resolve_api_key(cfg, name)?;
                 let model = cfg
@@ -497,7 +497,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::Mistral(MistralProvider::new(
                     api_key, model,
                 )))
-            },
+            }
             "openai" => {
                 let api_key = resolve_api_key(cfg, name)?;
                 let base_url = cfg
@@ -511,7 +511,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::OpenAICompatible(
                     OpenAIProvider::new_with_base_url(api_key, model, base_url),
                 ))
-            },
+            }
             "openai-compatible" => {
                 let api_key = resolve_api_key(cfg, name)?;
                 let base_url = cfg.base_url.clone()?;
@@ -522,7 +522,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::OpenAICompatible(
                     OpenAIProvider::new_with_base_url(api_key, model, base_url),
                 ))
-            },
+            }
             unknown => {
                 warn!("Unknown provider type '{unknown}', treating as openai-compatible");
                 let api_key = resolve_api_key(cfg, name)?;
@@ -534,7 +534,7 @@ impl DefaultRouter {
                 Some(ProviderInstance::OpenAICompatible(
                     OpenAIProvider::new_with_base_url(api_key, model, base_url),
                 ))
-            },
+            }
         }
     }
 
@@ -575,13 +575,11 @@ impl DefaultRouter {
                     let model = tc.model.clone().unwrap_or_else(|| "default".into());
                     providers.insert(
                         provider_name.clone(),
-                        ProviderInstance::OpenAICompatible(
-                            OpenAIProvider::new_with_base_url(
-                                api_key,
-                                model,
-                                base_url.clone(),
-                            ),
-                        ),
+                        ProviderInstance::OpenAICompatible(OpenAIProvider::new_with_base_url(
+                            api_key,
+                            model,
+                            base_url.clone(),
+                        )),
                     );
                 }
             }
@@ -714,7 +712,7 @@ impl DefaultRouter {
                         "Local LLM unavailable. Start Ollama or configure a local provider. {sensitivity} data cannot be routed to cloud."
                     ),
                 })
-            },
+            }
         }
     }
 
@@ -729,7 +727,7 @@ impl DefaultRouter {
         false
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn health_check(&self) -> bool {
         if let Some(instance) = self.providers.get("ollama")
             && let ProviderInstance::Ollama(ollama) = instance
@@ -764,7 +762,7 @@ impl DefaultRouter {
                     warn!(
                         "route_with_preferences: agent requires local-only but no local LLM available"
                     );
-                },
+                }
                 LlmPreference::CloudOnly => {
                     if let Some(ref name) = self.config.default_provider {
                         let p = parse_provider_name(name);
@@ -776,7 +774,7 @@ impl DefaultRouter {
                             return self.enforce_sensitivity(p, requirements.sensitivity);
                         }
                     }
-                },
+                }
                 LlmPreference::Provider(name) => {
                     let p = parse_provider_name(name);
                     info!(
@@ -784,7 +782,7 @@ impl DefaultRouter {
                         name, p
                     );
                     return self.enforce_sensitivity(p, requirements.sensitivity);
-                },
+                }
                 LlmPreference::Any => continue,
             }
         }

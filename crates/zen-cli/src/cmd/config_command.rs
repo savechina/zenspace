@@ -80,7 +80,7 @@ pub fn execute_command(operation: &ConfigCommands) -> Result<(), ZenError> {
                 "(Full config output uses pretty-printing — showing key fields)".dimmed()
             );
             Ok(())
-        },
+        }
         ConfigCommands::Edit { layer } => {
             debug!("editing config layer: {}", layer);
             println!(
@@ -93,19 +93,19 @@ pub fn execute_command(operation: &ConfigCommands) -> Result<(), ZenError> {
                 "  (Config editor integration deferred to zen-service)".dimmed()
             );
             Ok(())
-        },
+        }
         ConfigCommands::Validate => {
             debug!("validating config");
             match load_config() {
                 Ok(_) => {
                     println!("{} Configuration is valid", "✓".green().bold());
                     Ok(())
-                },
+                }
                 Err(e) => {
                     println!("{} Configuration error: {}", "✗".red().bold(), e);
                     Err(e)
-                },
+                }
             }
-        },
+        }
     }
 }

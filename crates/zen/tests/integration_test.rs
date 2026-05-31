@@ -1,6 +1,6 @@
 mod common;
 
-use common::{ZenOutput, ZenTest};
+use common::ZenTest;
 
 #[test]
 fn test_zen_version_shows_version() {

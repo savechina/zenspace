@@ -68,7 +68,7 @@ pub fn archive(from_dir: Option<String>, _output_file: Option<String>) -> Result
                 documents.join("Personal"),
                 documents.join("Book"),
             ]
-        },
+        }
         Some(dir_name) => {
             let file_path = Path::new(&dir_name);
 
@@ -80,7 +80,7 @@ pub fn archive(from_dir: Option<String>, _output_file: Option<String>) -> Result
 
                 vec![archive_file]
             }
-        },
+        }
     };
 
     let archive_path = documents.join("Archive");

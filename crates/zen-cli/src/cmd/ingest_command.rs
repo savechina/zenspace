@@ -63,7 +63,7 @@ pub fn execute_command(cmd: &IngestCommands) -> Result<(), ZenError> {
             );
 
             Ok(())
-        },
+        }
     }
 }
 

@@ -94,11 +94,11 @@ pub fn clean_cache() -> Result<(), ServiceError> {
                         status.code().unwrap_or(-1)
                     ))
                 }
-            },
+            }
             Err(e) => {
                 eprintln!("Failed to execute {}: {}", cmd_name, e);
                 Err(format!("Failed to execute {}: {}", cmd_name, e))
-            },
+            }
         }
     };
 

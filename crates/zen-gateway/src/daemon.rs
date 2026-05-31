@@ -166,7 +166,7 @@ async fn chat_handler(
                     agent: Some(agent_name),
                 }),
             )
-        },
+        }
         Err(_) => (
             StatusCode::NOT_FOUND,
             Json(ChatResponse {
@@ -205,7 +205,7 @@ impl Gateway for HttpGateway {
                     warn!("Failed to bind gateway on {}: {}", addr, e);
                     state.set(GatewayStatus::Error).await;
                     return;
-                },
+                }
             };
 
             info!("Gateway listening on http://{}", addr);

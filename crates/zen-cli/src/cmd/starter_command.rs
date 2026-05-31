@@ -33,7 +33,7 @@ pub fn execute_command(operation: &StarterCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
         StarterCommands::Workspace { json } => {
             starter_service::workspace();
             if *json {
@@ -46,6 +46,6 @@ pub fn execute_command(operation: &StarterCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
     }
 }

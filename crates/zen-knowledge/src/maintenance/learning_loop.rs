@@ -620,7 +620,7 @@ impl Skill for LearningLoop {
             _ => {
                 info!("LearningLoop: missing wiki_dir or output_dir in context, skipping");
                 return Ok(SkillOutcome::noop());
-            },
+            }
         };
 
         let report = Self::run(&wiki_dir, &output_dir)

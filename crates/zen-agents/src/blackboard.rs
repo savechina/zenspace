@@ -333,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn blackboard_event_broadcast() {
-        let (mut bb, _handle) = Blackboard::new(10);
+        let (bb, _handle) = Blackboard::new(10);
         let mut subscriber = bb.subscribe_events();
 
         let task = BlackboardTask::new("test", 0.5, TaskType::Code);

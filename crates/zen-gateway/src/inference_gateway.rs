@@ -245,7 +245,7 @@ impl InferenceGateway {
                     provider: provider_name,
                     cache_hit: false,
                 })
-            },
+            }
             Err(_) => Err("Response channel closed".to_string()),
         }
     }

@@ -26,6 +26,6 @@ pub fn execute_command(cmd: &SimilarCommands) -> Result<(), ZenError> {
             eprintln!("Requested top_k: {k} for note: {note_id}");
 
             Ok(())
-        },
+        }
     }
 }

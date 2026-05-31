@@ -166,10 +166,10 @@ impl PluginRegistry {
                         "Discovered plugin: {} v{}",
                         id, self.plugins[&id].manifest.version
                     );
-                },
+                }
                 Err(e) => {
                     warn!("Failed to load plugin at {}: {}", path.display(), e);
-                },
+                }
             }
         }
 

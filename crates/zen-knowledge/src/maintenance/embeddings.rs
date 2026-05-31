@@ -61,15 +61,15 @@ fn call_ollama_embeddings(text: &str) -> Option<Vec<f32>> {
                     l2_normalize(&mut embedding.clone());
                     return Some(embedding.clone());
                 }
-            },
+            }
             Err(e) => warn!("ComputeEmbeddings: Ollama response parse error: {}", e),
         },
         Ok(resp) => {
             warn!("ComputeEmbeddings: Ollama HTTP {}", resp.status());
-        },
+        }
         Err(e) => {
             warn!("ComputeEmbeddings: Ollama request error: {}", e);
-        },
+        }
     }
     None
 }
@@ -104,15 +104,15 @@ fn call_openai_embeddings(text: &str) -> Option<Vec<f32>> {
                     l2_normalize(&mut emb);
                     return Some(emb);
                 }
-            },
+            }
             Err(e) => warn!("ComputeEmbeddings: OpenAI response parse error: {}", e),
         },
         Ok(resp) => {
             warn!("ComputeEmbeddings: OpenAI HTTP {}", resp.status());
-        },
+        }
         Err(e) => {
             warn!("ComputeEmbeddings: OpenAI request error: {}", e);
-        },
+        }
     }
     None
 }

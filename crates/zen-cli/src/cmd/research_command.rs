@@ -68,7 +68,7 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
                 Err(e) => {
                     warn!("LLM research unavailable, generating stub: {e}");
                     generate_stub_brief(topic)
-                },
+                }
             };
 
             fs::write(&file_path, &brief)
@@ -108,7 +108,7 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
     }
 }
 
@@ -128,11 +128,11 @@ fn search_existing_content(topic: &str, wiki_dir: &std::path::Path) -> Vec<Searc
                 "searched existing content"
             );
             results
-        },
+        }
         Err(e) => {
             warn!(topic, error = %e, "existing content search failed, continuing without context");
             Vec::new()
-        },
+        }
     }
 }
 

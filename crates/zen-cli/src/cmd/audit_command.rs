@@ -47,7 +47,7 @@ pub fn execute_command(operation: &AuditCommands) -> Result<(), ZenError> {
                 "  (Audit log storage deferred to zen-service)".dimmed()
             );
             Ok(())
-        },
+        }
         AuditCommands::Export { format, session } => {
             let sid = session.as_deref().unwrap_or("(all)");
             debug!("exporting audit log: format={} session={}", format, sid);
@@ -59,7 +59,7 @@ pub fn execute_command(operation: &AuditCommands) -> Result<(), ZenError> {
             );
             println!("{}", "  (Audit export deferred to zen-service)".dimmed());
             Ok(())
-        },
+        }
         AuditCommands::Verify { path } => {
             debug!("verifying audit log: {}", path);
             println!(
@@ -72,6 +72,6 @@ pub fn execute_command(operation: &AuditCommands) -> Result<(), ZenError> {
                 "  (Audit verification deferred to zen-service)".dimmed()
             );
             Ok(())
-        },
+        }
     }
 }

@@ -79,15 +79,15 @@ fn evaluate_tick(
                 "Identity loaded: {} files",
                 ctx.file_count()
             )));
-        },
+        }
         Ok(_) => {
             actions.push(MicroAction::Suggest(
                 "No identity context found. Consider creating SOUL.md / MEMORY.md.".to_string(),
             ));
-        },
+        }
         Err(e) => {
             actions.push(MicroAction::Log(format!("Identity load note: {e}")));
-        },
+        }
     }
 
     let pending_notes = count_inbox_notes(zen_paths);

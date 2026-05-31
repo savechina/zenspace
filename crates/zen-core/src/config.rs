@@ -441,7 +441,7 @@ fn merge_finance(base: FinanceConfig, ov: FinanceConfig) -> FinanceConfig {
             (Some(mut b), Some(mut o)) => {
                 b.append(&mut o);
                 Some(b)
-            },
+            }
         },
     }
 }

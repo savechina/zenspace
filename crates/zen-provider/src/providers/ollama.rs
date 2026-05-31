@@ -87,7 +87,7 @@ impl OllamaProvider {
             Err(e) => {
                 warn!(error = %e, "Ollama health check failed");
                 false
-            },
+            }
         }
     }
 }

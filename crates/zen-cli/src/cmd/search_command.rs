@@ -109,6 +109,6 @@ pub fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
     }
 }

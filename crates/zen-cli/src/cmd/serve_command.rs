@@ -94,7 +94,7 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             } else {
                 run_background(&path, bind.as_deref(), *port)
             }
-        },
+        }
         ServeCommands::Stop => {
             let path = pid_path()?;
             if !path.exists() {
@@ -142,7 +142,7 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             remove_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
             println!("{} Gateway stopped", "✅".green());
             Ok(())
-        },
+        }
         ServeCommands::Status => {
             let path = pid_path().ok();
             let config = HttpConfig::default();
@@ -195,7 +195,7 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
                 println!("{} Gateway not running", "⛔".red());
             }
             Ok(())
-        },
+        }
         ServeCommands::Test { port } => {
             let config = HttpConfig::default();
             let port = port.unwrap_or(config.port);
@@ -223,19 +223,19 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
                     if let Some(body) = fetch_http_body(bind_addr, port, "/health") {
                         println!("    Health: {}", body);
                     }
-                },
+                }
                 Err(e) => {
                     println!("{} {}", "FAIL".red(), e);
                     println!("    Gateway may not be running");
                     println!("    Run 'zen serve start' to launch gateway");
-                },
+                }
             }
 
             println!();
             println!("Complete report: {} zen serve status", "→".blue().italic());
 
             Ok(())
-        },
+        }
     }
 }
 

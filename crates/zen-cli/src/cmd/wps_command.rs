@@ -49,7 +49,7 @@ pub fn execute_command(operation: &WpsCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
         WpsCommands::Dotfiles { restore, json } => {
             wps_service::dotfiles(*restore)?;
             if *json {
@@ -65,7 +65,7 @@ pub fn execute_command(operation: &WpsCommands) -> Result<(), ZenError> {
                 println!("dotfiles restore: {}", restore);
             }
             Ok(())
-        },
+        }
         WpsCommands::Unixtime {
             timestamp,
             timeunit,
@@ -85,6 +85,6 @@ pub fn execute_command(operation: &WpsCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
     }
 }

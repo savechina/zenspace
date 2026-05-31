@@ -115,7 +115,7 @@ impl CompletionModel for ZenCompletionModel {
                             Ok(RawStreamingChoice::Message(token.clone())),
                             (token_rx, done_rx, collected),
                         ))
-                    },
+                    }
                     None => {
                         let result = done_rx.try_recv().unwrap_or(Ok(()));
                         let text = std::mem::take(&mut collected);
@@ -133,7 +133,7 @@ impl CompletionModel for ZenCompletionModel {
                                 (token_rx, done_rx, collected),
                             )),
                         }
-                    },
+                    }
                 }
             },
         ));

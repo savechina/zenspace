@@ -44,6 +44,6 @@ pub fn execute_command(cmd: &LintCommands) -> Result<(), ZenError> {
             println!("  Report saved to:    {}", report_path.display());
 
             Ok(())
-        },
+        }
     }
 }

@@ -204,13 +204,13 @@ pub async fn shell() -> Result<(), ZenError> {
         None => {
             // TUI runs on main thread (ratatui requires it)
             crate::tui::run().map_err(|e| ZenError::Message(format!("TUI error: {}", e)))
-        },
+        }
 
         Some(Commands::Hello { name }) => {
             debug!("hello :");
             println!("hello:\n{}", name);
             Ok(())
-        },
+        }
 
         Some(Commands::Clean { operation, dry_run }) => {
             debug!("clean dry_run:{}", dry_run);
@@ -219,18 +219,18 @@ pub async fn shell() -> Result<(), ZenError> {
                 .unwrap_or(&CleanupCommands::Trash { json: false });
             cleanup_command::execute_command(op)?;
             Ok(())
-        },
+        }
 
         Some(Commands::Starter { operation }) => {
             starter_command::execute_command(operation)?;
             Ok(())
-        },
+        }
         Some(Commands::Wps { operation }) => wps_command::execute_command(operation),
         Some(Commands::Version) => {
             let version = env!("CARGO_PKG_VERSION");
             println!("zen version: {}", version);
             Ok(())
-        },
+        }
         Some(Commands::Session { operation }) => session_command::execute_command(operation),
         Some(Commands::Serve { operation }) => serve_command::execute_command(operation).await,
         Some(Commands::Agent { operation }) => agent_command::execute_command(operation),
@@ -238,7 +238,7 @@ pub async fn shell() -> Result<(), ZenError> {
             debug!("workspace dry_run:{}", dry_run);
             workspace_command::execute_command(operation)?;
             Ok(())
-        },
+        }
         Some(Commands::Config { operation }) => config_command::execute_command(operation),
         Some(Commands::Provider { operation }) => provider_command::execute_command(operation),
         Some(Commands::Audit { operation }) => audit_command::execute_command(operation),
@@ -250,7 +250,7 @@ pub async fn shell() -> Result<(), ZenError> {
         Some(Commands::Research { operation }) => research_command::execute_command(operation),
         Some(Commands::Consolidate { operation }) => {
             consolidate_command::execute_command(operation)
-        },
+        }
         Some(Commands::Lint { operation }) => lint_command::execute_command(operation),
         Some(Commands::Ingest { operation }) => ingest_command::execute_command(operation),
         Some(Commands::Task { operation }) => task_command::execute_command(operation),

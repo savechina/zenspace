@@ -107,14 +107,14 @@ impl ConsolidationPipeline {
                     Ok(mut note) => {
                         note.file_path = Some(path.clone());
                         notes.push(note);
-                    },
+                    }
                     Err(e) => {
                         info!(
                             path = %path.display(),
                             error = %e,
                             "Failed to parse frontmatter, skipping note"
                         );
-                    },
+                    }
                 },
                 Err(e) => {
                     info!(
@@ -122,7 +122,7 @@ impl ConsolidationPipeline {
                         error = %e,
                         "Failed to read note file, skipping"
                     );
-                },
+                }
             }
         }
 

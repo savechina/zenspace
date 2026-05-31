@@ -28,7 +28,7 @@ pub fn execute_command(cmd: &ReindexCommands) -> Result<(), ZenError> {
                 None => {
                     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
                     paths.knowledge()
-                },
+                }
             };
 
             if *dry_run {
@@ -61,6 +61,6 @@ pub fn execute_command(cmd: &ReindexCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
     }
 }

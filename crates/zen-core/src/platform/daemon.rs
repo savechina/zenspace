@@ -81,27 +81,27 @@ impl DaemonTool {
                     .run_cmd(&["launchctl", "start", &domain])
                     .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "start", "name": name, "status": out, "running": true }))
-            },
+            }
             "stop" => {
                 let (_, out) = self
                     .run_cmd(&["launchctl", "stop", &domain])
                     .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "stop", "name": name, "status": out, "running": false }))
-            },
+            }
             "restart" => {
                 let _ = self.run_cmd(&["launchctl", "stop", &domain]);
                 let (_, out) = self
                     .run_cmd(&["launchctl", "start", &domain])
                     .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "restart", "name": name, "status": out, "running": true }))
-            },
+            }
             "status" => {
                 let (running, out) = match self.run_cmd(&["launchctl", "list", &domain]) {
                     Ok(r) => r,
                     Err(_) => (false, format!("Service {name} not loaded")),
                 };
                 Ok(json!({ "action": "status", "name": name, "status": out, "running": running }))
-            },
+            }
             _ => Err(KernelError::InvalidArgument(format!(
                 "Invalid action: {action}"
             ))),
@@ -123,26 +123,26 @@ impl DaemonTool {
                     .run_cmd(&["systemctl", "start", &svc])
                     .map_err(|e| KernelError::ToolFailed(e))?;
                 Ok(json!({ "action": "start", "name": name, "status": out, "running": true }))
-            },
+            }
             "stop" => {
                 let (_, out) = self
                     .run_cmd(&["systemctl", "stop", &svc])
                     .map_err(|e| KernelError::ToolFailed(e))?;
                 Ok(json!({ "action": "stop", "name": name, "status": out, "running": false }))
-            },
+            }
             "restart" => {
                 let (_, out) = self
                     .run_cmd(&["systemctl", "restart", &svc])
                     .map_err(|e| KernelError::ToolFailed(e))?;
                 Ok(json!({ "action": "restart", "name": name, "status": out, "running": true }))
-            },
+            }
             "status" => {
                 let (running, out) = match self.run_cmd(&["systemctl", "is-active", &svc]) {
                     Ok(r) => r,
                     Err(out) => (false, out),
                 };
                 Ok(json!({ "action": "status", "name": name, "status": out, "running": running }))
-            },
+            }
             _ => Err(KernelError::InvalidArgument(format!(
                 "Invalid action: {action}"
             ))),
@@ -159,27 +159,27 @@ impl DaemonTool {
                     .run_cmd(&["net", "start", name])
                     .map_err(|e| KernelError::ToolFailed(e))?;
                 Ok(json!({ "action": "start", "name": name, "status": out, "running": true }))
-            },
+            }
             "stop" => {
                 let (_, out) = self
                     .run_cmd(&["net", "stop", name])
                     .map_err(|e| KernelError::ToolFailed(e))?;
                 Ok(json!({ "action": "stop", "name": name, "status": out, "running": false }))
-            },
+            }
             "restart" => {
                 let _ = self.run_cmd(&["net", "stop", name]);
                 let (_, out) = self
                     .run_cmd(&["net", "start", name])
                     .map_err(|e| KernelError::ToolFailed(e))?;
                 Ok(json!({ "action": "restart", "name": name, "status": out, "running": true }))
-            },
+            }
             "status" => {
                 let (running, out) = match self.run_cmd(&["sc", "query", name]) {
                     Ok(r) => r,
                     Err(out) => (false, out),
                 };
                 Ok(json!({ "action": "status", "name": name, "status": out, "running": running }))
-            },
+            }
             _ => Err(KernelError::InvalidArgument(format!(
                 "Invalid action: {action}"
             ))),

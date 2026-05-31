@@ -54,7 +54,7 @@ pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
                 }
             );
             Ok(())
-        },
+        }
         ProviderCommands::Test { provider } => {
             let p = provider.as_deref().unwrap_or("ollama");
             debug!("testing provider: {}", p);
@@ -71,7 +71,7 @@ pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
                 println!("  Ensure Ollama is running at http://localhost:11434");
             }
             Ok(())
-        },
+        }
         ProviderCommands::List => {
             debug!("listing providers");
             let providers = router.list_providers();
@@ -96,6 +96,6 @@ pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
                 }
             );
             Ok(())
-        },
+        }
     }
 }

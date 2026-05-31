@@ -34,7 +34,7 @@ pub fn execute_command(operation: &CleanupCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
         CleanupCommands::Trash { json } => {
             cleanup_service::clean_trash()?;
             if *json {
@@ -47,7 +47,7 @@ pub fn execute_command(operation: &CleanupCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
         CleanupCommands::Cache { json } => {
             cleanup_service::clean_cache()?;
             if *json {
@@ -60,6 +60,6 @@ pub fn execute_command(operation: &CleanupCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
     }
 }

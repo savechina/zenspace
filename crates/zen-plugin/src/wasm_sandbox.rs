@@ -84,12 +84,12 @@ impl WasmSandbox {
                 Err(WasmSandboxError::PermissionDenied {
                     resource: resource.to_string(),
                 })
-            },
+            }
             "filesystem:write" if !permissions.allow_filesystem_write => {
                 Err(WasmSandboxError::PermissionDenied {
                     resource: resource.to_string(),
                 })
-            },
+            }
             "network" if !permissions.allow_network => Err(WasmSandboxError::PermissionDenied {
                 resource: resource.to_string(),
             }),

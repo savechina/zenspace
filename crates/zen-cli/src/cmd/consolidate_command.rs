@@ -44,6 +44,6 @@ pub fn execute_command(cmd: &ConsolidateCommands) -> Result<(), ZenError> {
             println!("  Contradictions found:   {}", report.contradictions_found);
 
             Ok(())
-        },
+        }
     }
 }

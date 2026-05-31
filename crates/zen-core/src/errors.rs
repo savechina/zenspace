@@ -145,7 +145,7 @@ impl AgenticError {
 
             AgenticError::LlmResponseInvalid { .. } | AgenticError::LlmContextOverflow { .. } => {
                 ErrorCategory::UserAction
-            },
+            }
 
             AgenticError::KnowledgeBaseEmpty { .. }
             | AgenticError::KnowledgeSearchFailed { .. }
@@ -154,7 +154,7 @@ impl AgenticError {
 
             AgenticError::QqBotConnectionFailed { .. } | AgenticError::QqBotAuthFailed { .. } => {
                 ErrorCategory::UserAction
-            },
+            }
             AgenticError::QqBotRateLimited { .. } => ErrorCategory::Retryable,
 
             AgenticError::SearchFts5Failed { .. }
@@ -167,7 +167,7 @@ impl AgenticError {
             AgenticError::PluginSandboxViolation { .. } => ErrorCategory::SafetyBlock,
             AgenticError::PluginLoadFailed { .. } | AgenticError::PluginPermissionDenied { .. } => {
                 ErrorCategory::UserAction
-            },
+            }
         }
     }
 }
@@ -219,11 +219,11 @@ impl ZenError {
                 match e.kind() {
                     ErrorKind::PermissionDenied | ErrorKind::NotFound => {
                         Some(ErrorCategory::UserAction)
-                    },
+                    }
                     ErrorKind::TimedOut | ErrorKind::Interrupted => Some(ErrorCategory::Retryable),
                     _ => Some(ErrorCategory::SystemError),
                 }
-            },
+            }
             ZenError::Parse(_) => Some(ErrorCategory::UserAction),
             ZenError::Serialization(_) => Some(ErrorCategory::SystemError),
             ZenError::Service(_) => Some(ErrorCategory::SystemError),

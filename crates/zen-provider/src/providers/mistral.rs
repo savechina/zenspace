@@ -87,7 +87,7 @@ impl MistralProvider {
             Err(e) => {
                 warn!(error = %e, "Mistral health check failed");
                 false
-            },
+            }
         }
     }
 }

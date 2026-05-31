@@ -67,7 +67,7 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                             "Unknown plugin kind: {}",
                             kind_str
                         )));
-                    },
+                    }
                 };
                 if *enabled {
                     registry
@@ -120,7 +120,7 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 entries.len().to_string().green().bold()
             );
             Ok(())
-        },
+        }
 
         PluginCommands::Install { path } => {
             let manifest_path = path.join("manifest.toml");
@@ -167,7 +167,7 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
             println!("  Version: {}", version);
             println!("  Located: {}", target_dir.display());
             Ok(())
-        },
+        }
 
         PluginCommands::Remove { id } => {
             debug!("removing plugin: {}", id);
@@ -198,7 +198,7 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 id.cyan().bold()
             );
             Ok(())
-        },
+        }
 
         PluginCommands::Enable { id } => {
             debug!("enabling plugin: {}", id);
@@ -217,7 +217,7 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 id.cyan().bold()
             );
             Ok(())
-        },
+        }
 
         PluginCommands::Disable { id } => {
             debug!("disabling plugin: {}", id);
@@ -236,7 +236,7 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 id.cyan().bold()
             );
             Ok(())
-        },
+        }
 
         PluginCommands::Discover => {
             let count = registry
@@ -260,7 +260,7 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 );
             }
             Ok(())
-        },
+        }
     }
 }
 

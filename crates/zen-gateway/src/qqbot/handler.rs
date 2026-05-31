@@ -44,19 +44,19 @@ impl QqBotHandler {
                     .await?;
                 self.send_reply(&event.channel_id, &format!("note created: id={}", note.id))
                     .await?;
-            },
+            }
             Some(QqBotCommand::Search { query }) => {
                 info!("search command: {query}");
                 self.send_reply(&event.channel_id, &format!("search: {query}"))
                     .await?;
-            },
+            }
             Some(QqBotCommand::Status) => {
                 self.send_reply(&event.channel_id, "agentic bot online")
                     .await?;
-            },
+            }
             None => {
                 debug!("no command matched");
-            },
+            }
         }
 
         Ok(())

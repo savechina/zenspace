@@ -382,7 +382,7 @@ impl ZenCoordinator {
                     "No specialist matched signal, using fallback"
                 );
                 self.fallback.clone()
-            },
+            }
         }
     }
 
@@ -555,7 +555,7 @@ impl ZenCoordinator {
                     results: Vec::new(),
                     errors: vec![err],
                 };
-            },
+            }
         };
 
         // Execute with timeout using tokio::time::timeout
@@ -579,7 +579,7 @@ impl ZenCoordinator {
                     }],
                     errors: Vec::new(),
                 }
-            },
+            }
             Ok(Err(KernelError::InvalidArgument(msg))) => {
                 let err = format!("specialist '{specialist_name}' invalid args: {msg}");
                 warn!("{err}");
@@ -587,7 +587,7 @@ impl ZenCoordinator {
                     results: Vec::new(),
                     errors: vec![err],
                 }
-            },
+            }
             Ok(Err(KernelError::ToolFailed(msg))) => {
                 let err = format!("specialist '{specialist_name}' tool failed: {msg}");
                 warn!("{err}");
@@ -595,7 +595,7 @@ impl ZenCoordinator {
                     results: Vec::new(),
                     errors: vec![err],
                 }
-            },
+            }
             Ok(Err(KernelError::ToolNotFound(msg))) => {
                 let err = format!("specialist '{specialist_name}' tool not found: {msg}");
                 warn!("{err}");
@@ -603,7 +603,7 @@ impl ZenCoordinator {
                     results: Vec::new(),
                     errors: vec![err],
                 }
-            },
+            }
             Ok(Err(KernelError::SkillFailed(msg))) => {
                 let err = format!("specialist '{specialist_name}' skill failed: {msg}");
                 warn!("{err}");
@@ -611,7 +611,7 @@ impl ZenCoordinator {
                     results: Vec::new(),
                     errors: vec![err],
                 }
-            },
+            }
             Ok(Err(e)) => {
                 let err = format!("specialist '{specialist_name}' error: {e}");
                 warn!("{err}");
@@ -619,7 +619,7 @@ impl ZenCoordinator {
                     results: Vec::new(),
                     errors: vec![err],
                 }
-            },
+            }
             Err(_) => {
                 let err =
                     format!("specialist '{specialist_name}' timed out after {DEFAULT_TIMEOUT:?}");
@@ -628,7 +628,7 @@ impl ZenCoordinator {
                     results: Vec::new(),
                     errors: vec![err],
                 }
-            },
+            }
         }
     }
 

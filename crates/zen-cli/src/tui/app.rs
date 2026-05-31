@@ -144,7 +144,7 @@ impl App {
             Err(e) => {
                 self.push_output(format!("Config load error (using defaults): {}", e), true);
                 return;
-            },
+            }
         };
         let router = DefaultRouter::from_agentic(&config);
         self.orchestrator = Some(Arc::new(AgentOrchestrator::new(router)));
@@ -192,19 +192,19 @@ impl App {
 
     pub fn history_down(&mut self) {
         match self.history_position {
-            None => {},
+            None => {}
             Some(p) if p + 1 >= self.command_history.len() => {
                 self.history_position = None;
                 self.input.clear();
                 self.cursor_position = 0;
-            },
+            }
             Some(p) => {
                 self.history_position = Some(p + 1);
                 if let Some(entry) = self.command_history.get(p + 1) {
                     self.input = entry.clone();
                     self.cursor_position = self.input.len();
                 }
-            },
+            }
         }
     }
 
@@ -291,7 +291,7 @@ impl App {
             "clear" | "cls" => {
                 self.output.clear();
                 self.streaming_buffer.clear();
-            },
+            }
             "thinking" => {
                 self.show_thinking = !self.show_thinking;
                 self.push_output(
@@ -305,7 +305,7 @@ impl App {
                     ),
                     false,
                 );
-            },
+            }
             "export" => self.execute_export(),
             "note" => self.execute_note(parts.get(1).copied()),
             "search" => self.execute_search(parts.get(1).copied().unwrap_or("")),
@@ -404,7 +404,7 @@ Use /thinking to show/hide thinking process."#;
             None => {
                 let _ = done_tx.send(Err("Orchestrator not initialized".to_string()));
                 return;
-            },
+            }
         };
 
         let mut session = match &self.session {
@@ -412,7 +412,7 @@ Use /thinking to show/hide thinking process."#;
             None => {
                 let _ = done_tx.send(Err("Session not initialized".to_string()));
                 return;
-            },
+            }
         };
 
         if !context.is_empty() {
@@ -468,7 +468,7 @@ Use /thinking to show/hide thinking process."#;
                                     },
                                 )),
                             ));
-                        },
+                        }
                         Err(mpsc::TryRecvError::Empty) => {
                             results.push((
                                 idx,
@@ -480,7 +480,7 @@ Use /thinking to show/hide thinking process."#;
                                     },
                                 )),
                             ));
-                        },
+                        }
                         Err(mpsc::TryRecvError::Disconnected) => {
                             results.push((
                                 idx,
@@ -492,9 +492,9 @@ Use /thinking to show/hide thinking process."#;
                                     },
                                 )),
                             ));
-                        },
+                        }
                     }
-                },
+                }
                 PendingCallKind::SingleShot(ss) => match ss.rx.try_recv() {
                     Ok(result) => {
                         results.push((
@@ -507,8 +507,8 @@ Use /thinking to show/hide thinking process."#;
                                 },
                             )),
                         ));
-                    },
-                    Err(mpsc::TryRecvError::Empty) => {},
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
                         results.push((
                             idx,
@@ -520,7 +520,7 @@ Use /thinking to show/hide thinking process."#;
                                 },
                             )),
                         ));
-                    },
+                    }
                 },
             }
         }
@@ -550,12 +550,12 @@ Use /thinking to show/hide thinking process."#;
                             for line in response.lines() {
                                 self.push_output(line.to_string(), false);
                             }
-                        },
+                        }
                         Err(e) => {
                             completed_indices.push(idx);
                             self.streaming_buffer.clear();
                             self.push_output(format!("[LLM] Error: {}", e), true);
-                        },
+                        }
                     }
                 }
             }
@@ -582,13 +582,13 @@ Use /thinking to show/hide thinking process."#;
         match args {
             None => {
                 self.push_output(format!("Current model: {}", self.model), false);
-            },
+            }
             Some(arg) => {
                 let parts: Vec<&str> = arg.splitn(2, ' ').collect();
                 let provider = parts[0];
                 let model = parts.get(1).copied().unwrap_or("default");
                 self.set_model(provider, model);
-            },
+            }
         }
     }
 
@@ -680,7 +680,7 @@ Use /thinking to show/hide thinking process."#;
             Err(e) => {
                 self.push_output(format!("Path error: {}", e), true);
                 return;
-            },
+            }
         };
         let base_dir = paths.inbox();
 
@@ -700,7 +700,7 @@ Use /thinking to show/hide thinking process."#;
                         );
                     }
                 }
-            },
+            }
             Err(e) => self.push_output(format!("Search error: {}", e), true),
         }
     }
@@ -711,7 +711,7 @@ Use /thinking to show/hide thinking process."#;
             _ => {
                 self.push_output("Usage: /note <content>".into(), true);
                 return;
-            },
+            }
         };
         use zen_knowledge::note::NoteService;
         match NoteService::new().create_note(content, vec![], "tui") {
@@ -736,7 +736,7 @@ Use /thinking to show/hide thinking process."#;
                     ),
                     false,
                 );
-            },
+            }
             Err(e) => self.push_output(format!("Session error: {}", e), true),
         }
     }
@@ -888,7 +888,7 @@ Use /thinking to show/hide thinking process."#;
                 self.push_output("Configuration:".into(), false);
                 self.push_output(format!("  LLM default: {:?}", cfg.default_provider), false);
                 self.push_output(format!("  Cron: {:?}", cfg.cron.consolidation_time), false);
-            },
+            }
             Err(e) => self.push_output(format!("Config error: {}", e), true),
         }
     }
@@ -904,7 +904,7 @@ Use /thinking to show/hide thinking process."#;
                         format!("  Notes processed: {}", report.notes_processed),
                         false,
                     );
-                },
+                }
                 Err(e) => self.push_output(format!("Consolidation error: {}", e), true),
             }
         }
@@ -925,7 +925,7 @@ Use /thinking to show/hide thinking process."#;
                         format!("  Broken wikilinks: {}", result.broken_wikilinks.len()),
                         false,
                     );
-                },
+                }
                 Err(e) => self.push_output(format!("Lint error: {}", e), true),
             }
         }
@@ -957,11 +957,11 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Re
                     app.input.clear();
                     app.cursor_position = 0;
                     app.handle_command(&cmd);
-                },
+                }
                 crate::tui::handler::KeyAction::Quit => {
                     app.running = false;
-                },
-                crate::tui::handler::KeyAction::Continue => {},
+                }
+                crate::tui::handler::KeyAction::Continue => {}
             }
             if !app.running {
                 break;

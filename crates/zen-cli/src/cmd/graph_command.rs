@@ -39,6 +39,6 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
     }
 }

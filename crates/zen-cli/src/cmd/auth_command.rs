@@ -59,7 +59,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                             "****".to_string()
                         };
                         format!("{} {}", "✓".green(), masked.dimmed())
-                    },
+                    }
                     Err(AuthError::CredentialNotFound { .. }) => {
                         let env_var = format!("{}_API_KEY", provider.to_uppercase());
                         if std::env::var(&env_var).is_ok() {
@@ -68,7 +68,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                         } else {
                             format!("{} {}", "✗".bright_black(), "no credential".dimmed())
                         }
-                    },
+                    }
                     Err(_) => format!("{} {}", "✗".red(), "access denied".dimmed()),
                 };
 
@@ -87,7 +87,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
             );
 
             Ok(())
-        },
+        }
 
         AuthCommands::Login { provider, key } => {
             debug!("logging in to provider: {}", provider);
@@ -104,7 +104,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                         return Err(ZenError::Message("API key cannot be empty".to_string()));
                     }
                     input
-                },
+                }
             };
 
             Keychain::store(&service, "zen", &api_key).map_err(|e| map_auth_error(e, provider))?;
@@ -120,7 +120,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
             );
 
             Ok(())
-        },
+        }
 
         AuthCommands::Logout { provider } => {
             match provider {
@@ -132,7 +132,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
 
                     println!("{} Logged out from {}", "✓".green().bold(), p.cyan().bold());
                     println!("  Credential removed from Keychain");
-                },
+                }
                 None => {
                     debug!("logging out from all providers");
                     let providers = SUPPORTED_LLM_PROVIDERS;
@@ -151,11 +151,11 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                         "{}",
                         format!("Removed {} credentials from Keychain", count).dimmed()
                     );
-                },
+                }
             }
 
             Ok(())
-        },
+        }
 
         AuthCommands::Status => {
             debug!("showing auth status");
@@ -175,7 +175,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                             provider.cyan(),
                             "logged in (Keychain)".dimmed()
                         );
-                    },
+                    }
                     Err(AuthError::CredentialNotFound { .. }) => {
                         let env_var = format!("{}_API_KEY", provider.to_uppercase());
                         if std::env::var(&env_var).is_ok() {
@@ -187,7 +187,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                                 format!("env var {} set", env_var).dimmed()
                             );
                         }
-                    },
+                    }
                     Err(e) => {
                         println!(
                             "  {} {} — {}",
@@ -195,7 +195,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                             provider.cyan(),
                             e.to_string().dimmed()
                         );
-                    },
+                    }
                 }
             }
 
@@ -208,7 +208,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
     }
 }
 
@@ -225,10 +225,10 @@ fn map_auth_error(e: AuthError, provider: &str) -> ZenError {
         AuthError::Keychain(msg) => ZenError::Message(format!("Keychain error: {}", msg)),
         AuthError::EnvVarNotSet(var) => {
             ZenError::Message(format!("Environment variable '{}' not set", var))
-        },
+        }
         AuthError::ResolutionFailed { reason } => {
             ZenError::Message(format!("Credential resolution failed: {}", reason))
-        },
+        }
         AuthError::KeychainUnavailable { platform, message } => ZenError::Message(format!(
             "Keychain unavailable on {}. {}. Use SecretRef::Env or api_key_env fallback.",
             platform, message

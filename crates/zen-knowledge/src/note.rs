@@ -202,15 +202,15 @@ pub fn parse_frontmatter(content: &str) -> Result<Note, anyhow::Error> {
             "source" => note.source = value,
             "source_id" if !value.is_empty() && value != "null" && value != "~" => {
                 note.source_id = Some(value);
-            },
+            }
             "project" if !value.is_empty() && value != "null" && value != "~" => {
                 note.project = Some(value);
-            },
+            }
             "tags" => note.tags = parse_array(&value),
             "sensitivity" => {
                 note.sensitivity = parse_sensitivity(&value)
                     .ok_or_else(|| anyhow::anyhow!("invalid sensitivity: {}", value))?;
-            },
+            }
             "domain" => {
                 for item in parse_array(&value) {
                     note.domain.push(
@@ -218,18 +218,18 @@ pub fn parse_frontmatter(content: &str) -> Result<Note, anyhow::Error> {
                             .ok_or_else(|| anyhow::anyhow!("invalid domain: {}", item))?,
                     );
                 }
-            },
+            }
             "created_at" => {
                 note.created_at = parse_datetime(&value)
                     .ok_or_else(|| anyhow::anyhow!("invalid created_at: {}", value))?;
-            },
+            }
             "updated_at" => {
                 note.updated_at = parse_datetime(&value)
                     .ok_or_else(|| anyhow::anyhow!("invalid updated_at: {}", value))?;
-            },
+            }
             _ => {
                 // Ignore unknown fields
-            },
+            }
         }
     }
 

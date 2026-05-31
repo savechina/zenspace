@@ -25,16 +25,16 @@ pub fn execute_command(cmd: &TaskCommands) -> Result<(), ZenError> {
             debug!("task list");
             println!("No dispatched tasks");
             Ok(())
-        },
+        }
         TaskCommands::Show { id } => {
             debug!("task show: id={}", id);
             println!("Task {}: status=Pending (stub)", id);
             Ok(())
-        },
+        }
         TaskCommands::Cancel { id } => {
             debug!("task cancel: id={}", id);
             println!("Task {}: cancelled (stub)", id);
             Ok(())
-        },
+        }
     }
 }

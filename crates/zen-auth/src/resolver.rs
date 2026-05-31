@@ -48,13 +48,13 @@ impl SecretResolver {
                     "keychain access denied for '{}', falling back to env var",
                     self.keychain_service
                 );
-            },
+            }
             Err(AuthError::CredentialNotFound { .. }) => {
                 tracing::debug!(
                     "keychain credential not found for '{}', falling back to env var",
                     self.keychain_service
                 );
-            },
+            }
             Err(e) => return Err(e),
         }
 
@@ -66,7 +66,7 @@ impl SecretResolver {
                     "env var '{}' not set, secret resolution failed",
                     self.env_var
                 );
-            },
+            }
         }
 
         // 3) All sources exhausted
@@ -128,7 +128,7 @@ mod tests {
         match result.unwrap_err() {
             AuthError::CredentialNotFound { service, .. } => {
                 assert_eq!(service, "env:ZEN_NONEXISTENT_VAR_12345");
-            },
+            }
             other => panic!("expected CredentialNotFound, got: {other}"),
         }
     }

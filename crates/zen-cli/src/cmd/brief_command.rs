@@ -36,7 +36,7 @@ pub fn execute_command(cmd: &BriefCommands) -> Result<(), ZenError> {
             );
 
             Ok(())
-        },
+        }
     }
 }
 

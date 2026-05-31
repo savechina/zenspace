@@ -30,7 +30,7 @@ impl QqBotAuth {
                 Some(s) => {
                     let now = Utc::now();
                     now + chrono::Duration::seconds(TOKEN_REFRESH_BUFFER) >= s.expires_at
-                },
+                }
                 None => true,
             }
         };

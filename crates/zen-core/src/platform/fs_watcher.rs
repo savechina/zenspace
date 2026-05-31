@@ -79,10 +79,10 @@ impl FsWatcherTool {
                     .map(|s| s.to_string())
                     .collect();
                 tracing::info!(fs_event = kind_str, paths = ?paths);
-            },
+            }
             Err(e) => {
                 tracing::error!(fs_error = %e);
-            },
+            }
         }
     }
 }
@@ -148,7 +148,7 @@ impl Tool for FsWatcherTool {
                     "path": path_str,
                     "message": format!("Watching {path_str} (recursive: {recursive})")
                 }))
-            },
+            }
             "unwatch" => {
                 let path_str = args["path"].as_str().ok_or_else(|| {
                     KernelError::InvalidArgument("Missing 'path' field for unwatch action".into())
@@ -164,7 +164,7 @@ impl Tool for FsWatcherTool {
                     "path": path_str,
                     "removed": removed
                 }))
-            },
+            }
             "list" => {
                 let watchers = self.watchers.lock().unwrap();
                 let paths: Vec<&str> = watchers.iter().map(|(_, p)| p.as_str()).collect();
@@ -174,7 +174,7 @@ impl Tool for FsWatcherTool {
                     "watchers": paths,
                     "count": paths.len()
                 }))
-            },
+            }
             _ => Err(KernelError::InvalidArgument(format!(
                 "Invalid action: {action}"
             ))),

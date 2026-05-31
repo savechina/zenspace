@@ -35,7 +35,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         Err(e) => {
             tracing::warn!(path = ?soul_path, error = %e, "SOUL.md not found or unreadable");
             String::new()
-        },
+        }
     };
 
     let agents_path = root.join("AGENTS.md");
@@ -44,7 +44,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         Err(e) => {
             tracing::warn!(path = ?agents_path, error = %e, "AGENTS.md not found or unreadable");
             String::new()
-        },
+        }
     };
 
     let memory_path = root.join("MEMORY.md");
@@ -53,7 +53,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         Err(e) => {
             tracing::warn!(path = ?memory_path, error = %e, "MEMORY.md not found or unreadable");
             String::new()
-        },
+        }
     };
 
     IdentityContext {
@@ -265,12 +265,12 @@ impl ZenAgent {
                     let token = text.text.clone();
                     full_response.push_str(&token);
                     on_token(&token);
-                },
+                }
                 Ok(StreamedAssistantContent::Final(_)) => break,
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     return Err(anyhow::anyhow!("streaming error: {}", e));
-                },
+                }
             }
         }
 

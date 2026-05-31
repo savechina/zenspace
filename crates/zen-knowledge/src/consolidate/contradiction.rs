@@ -250,11 +250,11 @@ impl Skill for ContradictionDetector {
                     notes.push(note);
                 }
                 (notes, PathBuf::from(dir))
-            },
+            }
             _ => {
                 info!("ContradictionDetector: no notes in context, skipping analysis");
                 return Ok(SkillOutcome::noop());
-            },
+            }
         };
 
         let contradictions = self
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_default_implementation() {
-        let detector = ContradictionDetector::default();
+        let detector = ContradictionDetector;
         let result = detector.detect(&[]).unwrap();
         assert!(result.is_empty());
     }

@@ -65,14 +65,14 @@ pub fn execute_command(operation: &SessionCommands) -> Result<(), ZenError> {
             println!("  Workspace: {}", session.workspace.dimmed());
 
             Ok(())
-        },
+        }
         SessionCommands::Status => {
             debug!("showing session status");
             println!("{}", "📋 Session Status".bold());
             println!("  Status: {}", "No active session".yellow());
             println!("  Sessions dir: {}", "not yet configured".dimmed());
             Ok(())
-        },
+        }
         SessionCommands::List => {
             debug!("listing sessions");
             let orchestrator = SessionOrchestrator::new();
@@ -102,7 +102,7 @@ pub fn execute_command(operation: &SessionCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
         SessionCommands::Archive { session_id } => {
             let sid = session_id.as_deref().unwrap_or("current");
             debug!("archiving session: {}", sid);
@@ -116,6 +116,6 @@ pub fn execute_command(operation: &SessionCommands) -> Result<(), ZenError> {
                 "  (Service-layer session archival deferred to zen-service)".dimmed()
             );
             Ok(())
-        },
+        }
     }
 }

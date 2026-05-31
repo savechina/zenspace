@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_planner_cannot_use_mutation_tools() {
-        let hook = ZenHook::new("Metis")
+        let _hook = ZenHook::new("Metis")
             .with_agent_role(Role::Planner)
             .with_allowed_tools(vec!["read_file".to_string(), "search".to_string()]);
 
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_worker_cannot_use_strategy_tools() {
-        let hook = ZenHook::new("Junior")
+        let _hook = ZenHook::new("Junior")
             .with_agent_role(Role::Worker)
             .with_allowed_tools(vec!["read_file".to_string(), "write_file".to_string()]);
 

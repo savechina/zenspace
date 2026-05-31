@@ -35,7 +35,7 @@ pub fn validate_provider_for_sensitivity(
                      {sensitivity} data cannot be routed to cloud."
                 ))
             }
-        },
+        }
     }
 }
 

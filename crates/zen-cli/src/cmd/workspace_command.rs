@@ -76,7 +76,7 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
             }
 
             Ok(())
-        },
+        }
         WorkspaceCommands::Status => {
             debug!("showing workspace status");
             let paths = ZenPaths::detect().ok();
@@ -100,14 +100,14 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
                         "  Config file: {}",
                         p.config_file().display().to_string().dimmed()
                     );
-                },
+                }
                 None => {
                     println!("  Home directory: {}", "not found".red().bold());
-                },
+                }
             }
 
             Ok(())
-        },
+        }
         WorkspaceCommands::Cleanup { dry_run } => {
             debug!("cleaning workspace (dry_run={})", dry_run);
             println!(
@@ -124,6 +124,6 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
                 "  (Service-layer workspace cleanup deferred to zen-service)".dimmed()
             );
             Ok(())
-        },
+        }
     }
 }

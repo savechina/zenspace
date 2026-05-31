@@ -109,11 +109,11 @@ impl AnthropicProvider {
             Ok(resp) => {
                 // Anthropic returns 405 for GET on messages — that means the endpoint is alive
                 resp.status() == 405 || resp.status().is_success()
-            },
+            }
             Err(e) => {
                 warn!(error = %e, "Anthropic health check failed");
                 false
-            },
+            }
         }
     }
 }

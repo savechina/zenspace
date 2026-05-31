@@ -36,17 +36,17 @@ impl SessionManager {
         match session.status {
             SessionStatus::Active => {
                 tracing::debug!(session_id = %session_id, "resuming active session");
-            },
+            }
             SessionStatus::Compacted => {
                 session.reactivate()?;
                 tracing::info!(session_id = %session_id, "resumed compacted session");
-            },
+            }
             SessionStatus::Archived => {
                 anyhow::bail!("cannot resume archived session '{}'", session_id);
-            },
+            }
             SessionStatus::Completed | SessionStatus::Failed => {
                 anyhow::bail!("cannot resume {} session '{}'", session.status, session_id);
-            },
+            }
         }
 
         Ok(session)

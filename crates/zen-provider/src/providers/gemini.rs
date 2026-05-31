@@ -86,7 +86,7 @@ impl GeminiProvider {
             Err(e) => {
                 warn!(error = %e, "Gemini health check failed");
                 false
-            },
+            }
         }
     }
 }

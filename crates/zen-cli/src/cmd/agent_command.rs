@@ -56,7 +56,7 @@ pub fn execute_command(operation: &AgentCommands) -> Result<(), ZenError> {
                 agents.len().to_string().green().bold()
             );
             Ok(())
-        },
+        }
         AgentCommands::Select { name } => {
             debug!("selecting agent: {}", name);
             match registry.find_by_name(name) {
@@ -69,7 +69,7 @@ pub fn execute_command(operation: &AgentCommands) -> Result<(), ZenError> {
                     println!("  Role: {:?}", agent.role);
                     println!("  Sensitivity: {:?}", agent.max_sensitivity);
                     // TODO: Persist selection to session config
-                },
+                }
                 Err(e) => {
                     println!(
                         "{} Unknown agent '{}' — {}",
@@ -77,10 +77,10 @@ pub fn execute_command(operation: &AgentCommands) -> Result<(), ZenError> {
                         name.bright_yellow(),
                         e
                     );
-                },
+                }
             }
             Ok(())
-        },
+        }
         AgentCommands::Configure { name, key, value } => {
             match (key, value) {
                 (Some(k), Some(v)) => {
@@ -95,16 +95,16 @@ pub fn execute_command(operation: &AgentCommands) -> Result<(), ZenError> {
                                 v.dimmed()
                             );
                             // TODO: Persist config to ~/.zen/agents/<name>.toml
-                        },
+                        }
                         Err(_) => {
                             println!(
                                 "{} Agent '{}' not found in registry",
                                 "✗".red().bold(),
                                 name
                             );
-                        },
+                        }
                     }
-                },
+                }
                 _ => match registry.find_by_name(name) {
                     Ok(agent) => {
                         println!(
@@ -115,13 +115,13 @@ pub fn execute_command(operation: &AgentCommands) -> Result<(), ZenError> {
                         println!("  Role: {:?}", agent.role);
                         println!("  Capabilities: {:?}", agent.capabilities);
                         println!("  LLM Preferences: {:?}", agent.llm_preferences);
-                    },
+                    }
                     Err(_) => {
                         println!("{} Agent '{}' not found", "✗".red().bold(), name);
-                    },
+                    }
                 },
             }
             Ok(())
-        },
+        }
     }
 }
