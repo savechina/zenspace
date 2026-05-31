@@ -121,7 +121,7 @@ impl DaemonTool {
             "start" => {
                 let (_, out) = self
                     .run_cmd(&["systemctl", "start", &svc])
-                    .map_err(|e| KernelError::ToolFailed(e))?;
+                    .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "start", "name": name, "status": out, "running": true }))
             }
             "stop" => {
@@ -157,20 +157,20 @@ impl DaemonTool {
             "start" => {
                 let (_, out) = self
                     .run_cmd(&["net", "start", name])
-                    .map_err(|e| KernelError::ToolFailed(e))?;
+                    .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "start", "name": name, "status": out, "running": true }))
             }
             "stop" => {
                 let (_, out) = self
                     .run_cmd(&["net", "stop", name])
-                    .map_err(|e| KernelError::ToolFailed(e))?;
+                    .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "stop", "name": name, "status": out, "running": false }))
             }
             "restart" => {
                 let _ = self.run_cmd(&["net", "stop", name]);
                 let (_, out) = self
                     .run_cmd(&["net", "start", name])
-                    .map_err(|e| KernelError::ToolFailed(e))?;
+                    .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "restart", "name": name, "status": out, "running": true }))
             }
             "status" => {

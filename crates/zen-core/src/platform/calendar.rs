@@ -61,7 +61,10 @@ impl CalendarTool {
     pub fn new() -> Self {
         CalendarTool
     }
+}
 
+#[cfg(target_os = "macos")]
+impl CalendarTool {
     fn run_cmd(&self, args: &[&str]) -> Result<String, String> {
         let output = Command::new(args[0])
             .args(&args[1..])
@@ -75,10 +78,7 @@ impl CalendarTool {
             Err(if stderr.is_empty() { stdout } else { stderr })
         }
     }
-}
 
-#[cfg(target_os = "macos")]
-impl CalendarTool {
     fn osascript_list_events(
         &self,
         _start: Option<&str>,
