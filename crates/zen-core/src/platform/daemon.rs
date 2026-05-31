@@ -127,13 +127,13 @@ impl DaemonTool {
             "stop" => {
                 let (_, out) = self
                     .run_cmd(&["systemctl", "stop", &svc])
-                    .map_err(|e| KernelError::ToolFailed(e))?;
+                    .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "stop", "name": name, "status": out, "running": false }))
             }
             "restart" => {
                 let (_, out) = self
                     .run_cmd(&["systemctl", "restart", &svc])
-                    .map_err(|e| KernelError::ToolFailed(e))?;
+                    .map_err(KernelError::ToolFailed)?;
                 Ok(json!({ "action": "restart", "name": name, "status": out, "running": true }))
             }
             "status" => {

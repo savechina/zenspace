@@ -121,10 +121,7 @@ end tell
 #[cfg(target_os = "linux")]
 impl CalendarTool {
     fn linux_list_calendars(&self) -> Result<Value, KernelError> {
-        let ics = match std::fs::read_to_string("/usr/share/zoneinfo/") {
-            Ok(_) => true,
-            Err(_) => false,
-        };
+        let ics = std::fs::read_to_string("/usr/share/zoneinfo/").is_ok();
 
         if ics {
             Ok(json!({
@@ -172,12 +169,12 @@ impl Tool for CalendarTool {
             }));
         }
 
-        let start = args.get("start").and_then(|v| v.as_str());
+        let _start = args.get("start").and_then(|v| v.as_str());
         let _end = args.get("end").and_then(|v| v.as_str());
 
         #[cfg(target_os = "macos")]
         {
-            return self.osascript_list_events(start, _end);
+            return self.osascript_list_events(_start, _end);
         }
 
         #[cfg(target_os = "linux")]
