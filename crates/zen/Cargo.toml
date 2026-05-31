@@ -16,3 +16,6 @@ zen-cli = { path = "../zen-cli" }
 zen-core = { path = "../zen-core" }
 dotenvy = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

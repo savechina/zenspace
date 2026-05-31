@@ -8977,6 +8977,7 @@ name = "zen"
 version = "0.1.0"
 dependencies = [
  "dotenvy",
+ "tempfile",
  "tokio",
  "zen-cli",
  "zen-core",
