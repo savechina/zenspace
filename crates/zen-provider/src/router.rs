@@ -437,11 +437,11 @@ impl DefaultRouter {
                 let base_url = cfg
                     .base_url
                     .clone()
-                    .unwrap_or_else(|| "http://127.0.0.1:11434".into());
+                    .unwrap_or_else(|| zen_core::constants::OLLAMA_BASE_URL.into());
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "qwen3-coder".into());
+                    .unwrap_or_else(|| zen_core::constants::OLLAMA_DEFAULT_MODEL.into());
                 Some(ProviderInstance::Ollama(OllamaProvider::new(
                     base_url, model,
                 )))
@@ -452,7 +452,7 @@ impl DefaultRouter {
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "claude-3-5-sonnet-20241022".into());
+                    .unwrap_or_else(|| zen_core::constants::ANTHROPIC_DEFAULT_MODEL.into());
                 Some(ProviderInstance::Anthropic(AnthropicProvider::new(
                     api_key, model,
                 )))
@@ -463,7 +463,7 @@ impl DefaultRouter {
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "default".into());
+                    .unwrap_or_else(|| zen_core::constants::ANTHROPIC_DEFAULT_MODEL.into());
                 Some(ProviderInstance::AnthropicCompatible(
                     AnthropicProvider::new_with_base_url(api_key, model, base_url),
                 ))
@@ -473,7 +473,7 @@ impl DefaultRouter {
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "command-r".into());
+                    .unwrap_or_else(|| zen_core::constants::COHERE_DEFAULT_MODEL.into());
                 Some(ProviderInstance::Cohere(CohereProvider::new(
                     api_key, model,
                 )))
@@ -483,7 +483,7 @@ impl DefaultRouter {
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "gemini-2.0-flash".into());
+                    .unwrap_or_else(|| zen_core::constants::GEMINI_DEFAULT_MODEL.into());
                 Some(ProviderInstance::Gemini(GeminiProvider::new(
                     api_key, model,
                 )))
@@ -493,7 +493,7 @@ impl DefaultRouter {
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "mistral-large-latest".into());
+                    .unwrap_or_else(|| zen_core::constants::MISTRAL_DEFAULT_MODEL.into());
                 Some(ProviderInstance::Mistral(MistralProvider::new(
                     api_key, model,
                 )))
@@ -503,11 +503,11 @@ impl DefaultRouter {
                 let base_url = cfg
                     .base_url
                     .clone()
-                    .unwrap_or_else(|| "https://api.openai.com/v1".into());
+                    .unwrap_or_else(|| zen_core::constants::OPENAI_BASE_URL.into());
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "gpt-4o-mini".into());
+                    .unwrap_or_else(|| zen_core::constants::OPENAI_DEFAULT_MODEL.into());
                 Some(ProviderInstance::OpenAICompatible(
                     OpenAIProvider::new_with_base_url(api_key, model, base_url),
                 ))
@@ -518,7 +518,7 @@ impl DefaultRouter {
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "default".into());
+                    .unwrap_or_else(|| zen_core::constants::OPENAI_DEFAULT_MODEL.into());
                 Some(ProviderInstance::OpenAICompatible(
                     OpenAIProvider::new_with_base_url(api_key, model, base_url),
                 ))
@@ -530,7 +530,7 @@ impl DefaultRouter {
                 let model = cfg
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "default".into());
+                    .unwrap_or_else(|| zen_core::constants::OPENAI_DEFAULT_MODEL.into());
                 Some(ProviderInstance::OpenAICompatible(
                     OpenAIProvider::new_with_base_url(api_key, model, base_url),
                 ))
@@ -572,7 +572,10 @@ impl DefaultRouter {
                 if let Ok(api_key) = std::env::var(env_var)
                     && let Some(ref base_url) = tc.base_url
                 {
-                    let model = tc.model.clone().unwrap_or_else(|| "default".into());
+                    let model = tc
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| zen_core::constants::OPENAI_DEFAULT_MODEL.into());
                     providers.insert(
                         provider_name.clone(),
                         ProviderInstance::OpenAICompatible(OpenAIProvider::new_with_base_url(
@@ -904,7 +907,7 @@ impl LlmRouter for DefaultRouter {
                 self.config
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "default".into()),
+                    .unwrap_or_else(|| zen_core::constants::OPENAI_DEFAULT_MODEL.into()),
             ));
         }
 

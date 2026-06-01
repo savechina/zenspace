@@ -19,7 +19,7 @@ impl OpenAIProvider {
         Self {
             api_key,
             model,
-            base_url: "https://api.openai.com".into(),
+            base_url: zen_core::constants::OPENAI_API_URL.into(),
         }
     }
 
@@ -34,7 +34,7 @@ impl OpenAIProvider {
     pub async fn complete_async(&self, prompt: &str) -> Result<String, LlmError> {
         let mut builder = openai::Client::builder().api_key(&self.api_key);
 
-        if self.base_url != "https://api.openai.com" {
+        if self.base_url != zen_core::constants::OPENAI_API_URL {
             builder = builder.base_url(&self.base_url);
         }
 

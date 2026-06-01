@@ -77,9 +77,9 @@ impl MistralProvider {
 
     pub fn health_check(&self) -> bool {
         let client = reqwest::blocking::Client::new();
-        let url = "https://api.mistral.ai/v1/models";
+        let url = format!("{}{}", zen_core::constants::MISTRAL_API_URL, "/v1/models");
         match client
-            .get(url)
+            .get(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
         {

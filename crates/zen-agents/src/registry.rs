@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::agent_profile::{
-    AgentProfile, Capability, CostPerToken, LlmPreference, Role, SensitivityLevel,
+    AgentClearance, AgentProfile, Capability, CostPerToken, LlmPreference, Role,
 };
 
 use thiserror::Error;
@@ -59,7 +59,7 @@ pub trait AgentRegistry: std::fmt::Debug + Send + Sync {
     /// Filter agents by maximum sensitivity level.
     ///
     /// Returns agents where `profile.can_handle_sensitivity(level)` is true.
-    fn filter_by_sensitivity(&self, max_level: SensitivityLevel) -> Vec<&AgentProfile>;
+    fn filter_by_sensitivity(&self, max_level: AgentClearance) -> Vec<&AgentProfile>;
 }
 
 /// In-memory agent registry with pre-populated default agents.
@@ -130,7 +130,7 @@ impl AgentRegistry for DefaultAgentRegistry {
             })
     }
 
-    fn filter_by_sensitivity(&self, max_level: SensitivityLevel) -> Vec<&AgentProfile> {
+    fn filter_by_sensitivity(&self, max_level: AgentClearance) -> Vec<&AgentProfile> {
         self.agents
             .values()
             .filter(|p| p.can_handle_sensitivity(max_level))
@@ -165,7 +165,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Automation,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::High,
+            max_sensitivity: AgentClearance::High,
             cost_per_token: moderate,
             definition: None,
         },
@@ -181,7 +181,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Documentation,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Medium,
+            max_sensitivity: AgentClearance::Medium,
             cost_per_token: cheap,
             definition: None,
         },
@@ -196,7 +196,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Analysis,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::High,
+            max_sensitivity: AgentClearance::High,
             cost_per_token: moderate,
             definition: None,
         },
@@ -211,7 +211,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Research,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Medium,
+            max_sensitivity: AgentClearance::Medium,
             cost_per_token: moderate,
             definition: None,
         },
@@ -225,7 +225,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::SecurityAudit,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Medium,
+            max_sensitivity: AgentClearance::Medium,
             cost_per_token: cheap,
             definition: None,
         },
@@ -239,7 +239,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Architecture,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::High,
+            max_sensitivity: AgentClearance::High,
             cost_per_token: premium,
             definition: None,
         },
@@ -254,7 +254,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::CodeGeneration,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Medium,
+            max_sensitivity: AgentClearance::Medium,
             cost_per_token: moderate,
             definition: None,
         },
@@ -268,7 +268,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Documentation,
             ],
             llm_preferences: vec![LlmPreference::CloudOnly],
-            max_sensitivity: SensitivityLevel::Low,
+            max_sensitivity: AgentClearance::Low,
             cost_per_token: cheap,
             definition: None,
         },
@@ -283,7 +283,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Research,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::High,
+            max_sensitivity: AgentClearance::High,
             cost_per_token: cheap,
             definition: None,
         },
@@ -297,7 +297,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Documentation,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Medium,
+            max_sensitivity: AgentClearance::Medium,
             cost_per_token: moderate,
             definition: None,
         },
@@ -314,7 +314,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Testing,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::High,
+            max_sensitivity: AgentClearance::High,
             cost_per_token: premium,
             definition: None,
         },
@@ -328,7 +328,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Analysis,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Medium,
+            max_sensitivity: AgentClearance::Medium,
             cost_per_token: cheap,
             definition: None,
         },
@@ -342,7 +342,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 Capability::Analysis,
             ],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::High,
+            max_sensitivity: AgentClearance::High,
             cost_per_token: premium,
             definition: None,
         },
@@ -440,7 +440,7 @@ mod tests {
             role: Role::Worker,
             capabilities: vec![Capability::Testing],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Low,
+            max_sensitivity: AgentClearance::Low,
             cost_per_token: CostPerToken::default(),
             definition: None,
         };
@@ -456,7 +456,7 @@ mod tests {
             role: Role::Worker,
             capabilities: vec![],
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Low,
+            max_sensitivity: AgentClearance::Low,
             cost_per_token: CostPerToken::default(),
             definition: None,
         };
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn filter_by_sensitivity() {
         let registry = DefaultAgentRegistry::new();
-        let high_clearance = registry.filter_by_sensitivity(SensitivityLevel::High);
+        let high_clearance = registry.filter_by_sensitivity(AgentClearance::High);
         assert_eq!(high_clearance.len(), 6);
         let high_names: Vec<&str> = high_clearance.iter().map(|p| p.name.as_str()).collect();
         assert!(high_names.contains(&"Sisyphus"));
@@ -481,11 +481,11 @@ mod tests {
         assert!(high_names.contains(&"Zeus"));
 
         // All 13 agents have max_sensitivity >= Low (Explore=Low, others=Medium+)
-        let low_clearance = registry.filter_by_sensitivity(SensitivityLevel::Low);
+        let low_clearance = registry.filter_by_sensitivity(AgentClearance::Low);
         assert_eq!(low_clearance.len(), 13);
 
         // Filtering by Medium: all except Explore (Low) = 12 agents
-        let medium_clearance = registry.filter_by_sensitivity(SensitivityLevel::Medium);
+        let medium_clearance = registry.filter_by_sensitivity(AgentClearance::Medium);
         assert_eq!(medium_clearance.len(), 12);
         let medium_names: Vec<&str> = medium_clearance.iter().map(|p| p.name.as_str()).collect();
         assert!(medium_names.contains(&"Junior"));

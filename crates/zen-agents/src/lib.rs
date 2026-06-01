@@ -17,8 +17,8 @@ pub mod zen_agent;
 pub mod zen_skill;
 
 pub use agent_profile::{
-    AgentProfile, AgentProfileBuilder, Capability, CostPerToken, LlmPreference, Role,
-    SensitivityLevel,
+    AgentClearance, AgentProfile, AgentProfileBuilder, Capability, CostPerToken, LlmPreference,
+    Role,
 };
 pub use blackboard::{
     Blackboard, BlackboardHandle, BlackboardTask, Deliverable, DeliverableMetadata, Feedback,

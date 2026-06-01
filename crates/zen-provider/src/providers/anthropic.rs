@@ -19,7 +19,7 @@ impl AnthropicProvider {
         Self {
             api_key,
             model,
-            base_url: "https://api.anthropic.com".into(),
+            base_url: zen_core::constants::ANTHROPIC_BASE_URL.into(),
         }
     }
 
@@ -33,7 +33,7 @@ impl AnthropicProvider {
 
     pub async fn complete_async(&self, prompt: &str) -> Result<String, LlmError> {
         let mut builder = anthropic::Client::builder().api_key(&self.api_key);
-        if self.base_url != "https://api.anthropic.com" {
+        if self.base_url != zen_core::constants::ANTHROPIC_BASE_URL {
             builder = builder.base_url(&self.base_url);
         }
         let client = builder.build().map_err(|e| LlmError::Call {

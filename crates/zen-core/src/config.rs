@@ -1,5 +1,5 @@
 use include_dir::{Dir, include_dir};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -124,13 +124,24 @@ pub struct LlmTaskConfig {
 }
 
 /// Agent LLM preference for provider selection.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LlmPreference {
     Any,
     LocalOnly,
     CloudOnly,
     Provider(String),
+}
+
+impl std::fmt::Display for LlmPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmPreference::Any => write!(f, "any"),
+            LlmPreference::LocalOnly => write!(f, "local-only"),
+            LlmPreference::CloudOnly => write!(f, "cloud-only"),
+            LlmPreference::Provider(name) => write!(f, "{name}"),
+        }
+    }
 }
 
 /// QQ Bot integration config.

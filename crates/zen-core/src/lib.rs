@@ -12,5 +12,6 @@ pub mod secrets;
 pub mod types;
 pub mod validate;
 
+pub use config::LlmPreference;
 pub use definition::AgentDefinition;
 pub use secrets::SecretRef;

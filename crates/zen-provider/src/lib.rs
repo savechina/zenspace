@@ -1,8 +1,6 @@
 pub mod chat;
 pub mod model_meta;
 pub mod providers;
-pub mod rig_ollama;
-pub mod rig_openai;
 mod router;
 pub mod stream;
 

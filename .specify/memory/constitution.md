@@ -1,8 +1,8 @@
 <!--
 Sync Impact Report:
-- Version: 1.2.0 → 1.3.0 (MINOR - Rust 2024 unsafe clarification + role alignment)
-- Modified principles: Code Quality §VI (unsafe blocks clarified for Rust 2024 edition)
-- Added principles: None
+- Version: 1.3.0 → 1.4.0 (MINOR - Design-First & Reuse Priority principle added)
+- Modified principles: None
+- Added principles: XI. Design-First & Reuse Priority
 - Removed sections: None
 - Templates requiring updates: None
 - Deferred items: None
@@ -72,6 +72,28 @@ Cold start time MUST be under 500ms. Memory footprint MUST be under 50MB for typ
 
 Rationale: CLI tools must feel responsive; users expect low latency.
 
+### XI. Design-First & Reuse Priority
+
+**All implementation MUST follow this mandatory sequence**:
+1. **Design before coding** — No implementation without documented design decisions
+2. **Reuse existing frameworks** — Search community best practices before custom solutions
+3. **Avoid reinventing the wheel** — Use established libraries, patterns, and frameworks
+4. **Simplicity over novelty** — Prefer proven, battle-tested solutions over clever implementations
+
+**Enforcement requirements**:
+- Every PR MUST document the design rationale (why this approach, what alternatives considered)
+- Custom implementations MUST justify why existing solutions were insufficient
+- Framework/library selection MUST reference community adoption metrics (GitHub stars, maintenance activity)
+- "Simple reuse" is the default; "Custom implementation" requires explicit approval
+
+**Prohibited patterns**:
+- Implementing from scratch when a well-maintained library exists
+- Creating new abstractions without searching existing patterns
+- Preferring novel solutions without documented performance/feature advantages
+- Skipping design phase and jumping directly to implementation
+
+Rationale: Industry best practices reduce maintenance burden, improve reliability, and accelerate development. Proven frameworks handle edge cases we haven't discovered yet.
+
 ## Technology Stack
 
 - **Language**: Rust (edition 2024)
@@ -102,4 +124,4 @@ This constitution supersedes all other practices. Amendments require:
 
 All PRs MUST verify compliance with these principles. The AGENTS.md file serves as runtime development guidance.
 
-**Version**: 1.3.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-05-28
+**Version**: 1.4.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-06-01

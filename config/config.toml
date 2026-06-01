@@ -54,7 +54,7 @@ default_model = "gpt-4o-mini"
 [providers.anthropic]
 type = "anthropic"
 api_key = { env = "ANTHROPIC_API_KEY" }
-default_model = "claude-3-5-sonnet-20241022"
+default_model = "claude-sonnet-4-6"
 
 [providers.aliyun]
 type = "openai-compatible"
@@ -83,7 +83,7 @@ default_model = "llama-3.3-70b-versatile"
 type = "openai-compatible"
 base_url = "https://api.moonshot.cn/v1"
 api_key = { env = "MOONSHOT_API_KEY" }
-default_model = "moonshot-v1-8k"
+default_model = "kimi-k2.5"
 
 [providers.xai]
 type = "openai-compatible"

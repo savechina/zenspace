@@ -39,3 +39,50 @@ pub const SUPPORTED_LLM_PROVIDERS: &[&str] = &[
     "ollama",
     "qqbot",
 ];
+
+// ============================================
+// Provider Type Identifiers
+// ============================================
+pub const PROVIDER_OLLAMA: &str = "ollama";
+pub const PROVIDER_OPENAI: &str = "openai";
+pub const PROVIDER_ANTHROPIC: &str = "anthropic";
+pub const PROVIDER_COHERE: &str = "cohere";
+pub const PROVIDER_GEMINI: &str = "gemini";
+pub const PROVIDER_MISTRAL: &str = "mistral";
+pub const PROVIDER_OPENAI_COMPATIBLE: &str = "openai-compatible";
+pub const PROVIDER_ANTHROPIC_COMPATIBLE: &str = "anthropic-compatible";
+pub const PROVIDER_MOCK: &str = "mock";
+
+// ============================================
+// Provider Default Base URLs
+// ============================================
+pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const OPENAI_API_URL: &str = "https://api.openai.com";
+pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub const MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
+pub const MISTRAL_API_URL: &str = "https://api.mistral.ai";
+pub const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+pub const QQBOT_BASE_URL: &str = "https://api.sgroup.qq.com";
+
+// ============================================
+// Provider Default Models (Commonly Used)
+// ============================================
+pub const OLLAMA_DEFAULT_MODEL: &str = "qwen3-coder";
+pub const OPENAI_DEFAULT_MODEL: &str = "gpt-4o-mini";
+pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+pub const COHERE_DEFAULT_MODEL: &str = "command-r";
+pub const GEMINI_DEFAULT_MODEL: &str = "gemini-2.0-flash";
+pub const MISTRAL_DEFAULT_MODEL: &str = "mistral-large-latest";
+pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-v4-flash";
+pub const ALIYUN_DEFAULT_MODEL: &str = "qwen3.5-plus";
+pub const GROQ_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
+pub const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k2.5";
+pub const XAI_DEFAULT_MODEL: &str = "grok-beta";
+pub const PERPLEXITY_DEFAULT_MODEL: &str = "sonar";
+
+// ============================================
+// Default Provider (Fallback)
+// ============================================
+pub const DEFAULT_PROVIDER: &str = "ollama";
+pub const DEFAULT_MODEL: &str = "gpt-4o-mini";

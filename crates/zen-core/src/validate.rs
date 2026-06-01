@@ -9,7 +9,7 @@ const PROTECTED_FILES: &[&str] = &["config.toml"];
 const RESTRICTED_COMMANDS: &[&str] = &["qq_bot_capture", "qq_bot_edit", "cli_note", "note_edit"];
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SensitivityLevel {
+pub enum SafetyLevel {
     Safe,
     Warning,
     Protected,
@@ -18,7 +18,7 @@ pub enum SensitivityLevel {
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
     pub allowed: bool,
-    pub sensitivity: SensitivityLevel,
+    pub sensitivity: SafetyLevel,
     pub reason: Option<String>,
     pub matched_rule: Option<String>,
 }
@@ -97,7 +97,7 @@ impl RoleSeparationValidator {
 
             return ValidationResult {
                 allowed: false,
-                sensitivity: SensitivityLevel::Protected,
+                sensitivity: SafetyLevel::Protected,
                 reason: Some(format!(
                     "path '{name}' is protected by role separation policy"
                 )),
@@ -106,9 +106,9 @@ impl RoleSeparationValidator {
         }
 
         let sensitivity = if self.is_in_zen_tree(path) {
-            SensitivityLevel::Warning
+            SafetyLevel::Warning
         } else {
-            SensitivityLevel::Safe
+            SafetyLevel::Safe
         };
 
         ValidationResult {
@@ -126,7 +126,7 @@ impl RoleSeparationValidator {
         {
             return ValidationResult {
                 allowed: false,
-                sensitivity: SensitivityLevel::Protected,
+                sensitivity: SafetyLevel::Protected,
                 reason: Some(format!(
                     "command '{command}' is restricted by role separation policy"
                 )),
@@ -136,7 +136,7 @@ impl RoleSeparationValidator {
 
         ValidationResult {
             allowed: true,
-            sensitivity: SensitivityLevel::Safe,
+            sensitivity: SafetyLevel::Safe,
             reason: None,
             matched_rule: None,
         }

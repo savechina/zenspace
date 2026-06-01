@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use zen_core::AgentDefinition;
 
-/// Roles that agents can fulfill in the system.
+pub use zen_core::config::LlmPreference;
+
+/// Agent clearance level - the sensitivity level an agent is permitted to handle.
 ///
 /// Maps to the 3-tier agent taxonomy per ADR-007:
 /// Orchestrator (Sisyphus only — single entry point), Planner (thinking only),
@@ -79,23 +81,20 @@ impl std::fmt::Display for Capability {
     }
 }
 
-/// Sensitivity level an agent is cleared to handle.
-///
-/// Agents are filtered by comparing this against the session's
-/// effective sensitivity to ensure data stays within clearance bounds.
+/// Agent clearance level for handling sensitive data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum SensitivityLevel {
+pub enum AgentClearance {
     Low,
     Medium,
     High,
 }
 
-impl std::fmt::Display for SensitivityLevel {
+impl std::fmt::Display for AgentClearance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SensitivityLevel::Low => write!(f, "Low"),
-            SensitivityLevel::Medium => write!(f, "Medium"),
-            SensitivityLevel::High => write!(f, "High"),
+            AgentClearance::Low => write!(f, "Low"),
+            AgentClearance::Medium => write!(f, "Medium"),
+            AgentClearance::High => write!(f, "High"),
         }
     }
 }
@@ -126,29 +125,6 @@ impl std::fmt::Display for CostPerToken {
     }
 }
 
-/// Agent preference for LLM provider selection.
-///
-/// Guides session assembly when choosing which model backend
-/// to route an agent's requests through.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum LlmPreference {
-    Any,
-    LocalOnly,
-    CloudOnly,
-    Provider(String),
-}
-
-impl std::fmt::Display for LlmPreference {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LlmPreference::Any => write!(f, "any"),
-            LlmPreference::LocalOnly => write!(f, "local-only"),
-            LlmPreference::CloudOnly => write!(f, "cloud-only"),
-            LlmPreference::Provider(name) => write!(f, "{name}"),
-        }
-    }
-}
-
 /// Profile describing an agent's identity, capabilities, and constraints.
 ///
 /// This is the core entity managed by agent registry implementations.
@@ -165,7 +141,7 @@ pub struct AgentProfile {
     pub role: Role,
     pub capabilities: Vec<Capability>,
     pub llm_preferences: Vec<LlmPreference>,
-    pub max_sensitivity: SensitivityLevel,
+    pub max_sensitivity: AgentClearance,
     pub cost_per_token: CostPerToken,
     pub definition: Option<AgentDefinition>,
 }
@@ -181,7 +157,7 @@ impl AgentProfile {
 
     /// Returns true when this agent can handle the given sensitivity level.
     #[must_use]
-    pub fn can_handle_sensitivity(&self, level: SensitivityLevel) -> bool {
+    pub fn can_handle_sensitivity(&self, level: AgentClearance) -> bool {
         self.max_sensitivity >= level
     }
 
@@ -198,7 +174,7 @@ pub struct AgentProfileBuilder {
     role: Role,
     capabilities: Vec<Capability>,
     llm_preferences: Vec<LlmPreference>,
-    max_sensitivity: SensitivityLevel,
+    max_sensitivity: AgentClearance,
     cost_per_token: CostPerToken,
     definition: Option<AgentDefinition>,
 }
@@ -211,7 +187,7 @@ impl AgentProfileBuilder {
             role: Role::Worker,
             capabilities: Vec::new(),
             llm_preferences: vec![LlmPreference::Any],
-            max_sensitivity: SensitivityLevel::Low,
+            max_sensitivity: AgentClearance::Low,
             cost_per_token: CostPerToken::default(),
             definition: None,
         }
@@ -236,7 +212,7 @@ impl AgentProfileBuilder {
     }
 
     #[must_use]
-    pub fn max_sensitivity(mut self, level: SensitivityLevel) -> Self {
+    pub fn max_sensitivity(mut self, level: AgentClearance) -> Self {
         self.max_sensitivity = level;
         self
     }
@@ -276,13 +252,13 @@ mod tests {
         let profile = AgentProfile::builder("test-agent")
             .role(Role::Specialist)
             .capabilities(vec![Capability::CodeReview, Capability::Testing])
-            .max_sensitivity(SensitivityLevel::High)
+            .max_sensitivity(AgentClearance::High)
             .build();
 
         assert_eq!(profile.name, "test-agent");
         assert_eq!(profile.role, Role::Specialist);
         assert_eq!(profile.capabilities.len(), 2);
-        assert_eq!(profile.max_sensitivity, SensitivityLevel::High);
+        assert_eq!(profile.max_sensitivity, AgentClearance::High);
     }
 
     #[test]
@@ -303,19 +279,19 @@ mod tests {
     #[test]
     fn can_handle_sensitivity_respects_ordering() {
         let profile = AgentProfile::builder("a")
-            .max_sensitivity(SensitivityLevel::Medium)
+            .max_sensitivity(AgentClearance::Medium)
             .build();
 
-        assert!(profile.can_handle_sensitivity(SensitivityLevel::Low));
-        assert!(profile.can_handle_sensitivity(SensitivityLevel::Medium));
-        assert!(!profile.can_handle_sensitivity(SensitivityLevel::High));
+        assert!(profile.can_handle_sensitivity(AgentClearance::Low));
+        assert!(profile.can_handle_sensitivity(AgentClearance::Medium));
+        assert!(!profile.can_handle_sensitivity(AgentClearance::High));
     }
 
     #[test]
     fn display_implementations() {
         assert_eq!(Role::Planner.to_string(), "Planner");
         assert_eq!(Capability::CodeReview.to_string(), "code-review");
-        assert_eq!(SensitivityLevel::High.to_string(), "High");
+        assert_eq!(AgentClearance::High.to_string(), "High");
         assert_eq!(LlmPreference::LocalOnly.to_string(), "local-only");
     }
 }

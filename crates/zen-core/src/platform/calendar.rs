@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::LazyLock;
 
