@@ -78,6 +78,11 @@ impl ZenAgent {
         ZenAgentBuilder::new(name)
     }
 
+    /// Access the agent's identity context (SOUL.md/MEMORY.md/AGENTS.md).
+    pub fn identity(&self) -> &Option<IdentityContext> {
+        &self.identity
+    }
+
     /// Execute a user query. Async-native, no nested runtime creation.
     pub async fn execute(&self, query: &str, session: &mut SessionContext) -> Result<String> {
         let mut ctx = InvestigationContext::new("zen-session", "query");

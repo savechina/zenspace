@@ -81,6 +81,9 @@ pub const CLI_COMMANDS: &[&str] = &[
 
 pub struct App {
     pub input: String,
+    /// Character position in the input string (not byte index).
+    /// UTF-8 characters may span multiple bytes, so this tracks the nth character,
+    /// not the nth byte. Use `char_indices()` to convert to byte position when needed.
     pub cursor_position: usize,
     pub output: VecDeque<OutputLine>,
     pub running: bool,
@@ -103,6 +106,10 @@ pub struct App {
     pub show_autocomplete: bool,
     orchestrator: Option<Arc<AgentOrchestrator>>,
     session: Option<SessionContext>,
+    /// IME composition state - tracks preedit text during composition
+    pub ime_preedit: Option<String>,
+    /// IME composition start position (byte position when composition began)
+    pub ime_preedit_start: usize,
 }
 
 impl App {
@@ -135,6 +142,8 @@ impl App {
             show_autocomplete: false,
             orchestrator: None,
             session: None,
+            ime_preedit: None,
+            ime_preedit_start: 0,
         }
     }
 
@@ -186,7 +195,8 @@ impl App {
         self.history_position = Some(new_pos);
         if let Some(entry) = self.command_history.get(new_pos) {
             self.input = entry.clone();
-            self.cursor_position = self.input.len();
+            // Set cursor to end (character count, not byte length)
+            self.cursor_position = self.input.chars().count();
         }
     }
 
@@ -202,7 +212,8 @@ impl App {
                 self.history_position = Some(p + 1);
                 if let Some(entry) = self.command_history.get(p + 1) {
                     self.input = entry.clone();
-                    self.cursor_position = self.input.len();
+                    // Set cursor to end (character count, not byte length)
+                    self.cursor_position = self.input.chars().count();
                 }
             }
         }
@@ -263,7 +274,8 @@ impl App {
             .get(self.autocomplete_selected)
         {
             self.input = s.clone();
-            self.cursor_position = self.input.len();
+            // Set cursor to end (character count, not byte length)
+            self.cursor_position = self.input.chars().count();
         }
         self.autocomplete_suggestions.clear();
         self.show_autocomplete = false;
@@ -966,6 +978,10 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Re
             if !app.running {
                 break;
             }
+        } else if crossterm::event::poll(std::time::Duration::from_millis(0))?
+            && let crossterm::event::Event::Paste(text) = crossterm::event::read()?
+        {
+            crate::tui::handler::handle_paste(&text, &mut app);
         }
     }
     // Ensure clean terminal state on exit — print newline so shell prompt

@@ -8,6 +8,13 @@ pub mod execution;
 pub mod executor;
 pub mod observability;
 pub mod orchestrator;
+pub mod prompt;
+
+#[deprecated(
+    since = "0.1.0",
+    note = "PromptBuilder has been merged into zen_memory::PromptAssembly. Use PromptAssembly instead."
+)]
+pub use prompt::{PromptBuilder, PromptTemplate};
 pub mod registry;
 pub mod review;
 pub mod safety_hook;

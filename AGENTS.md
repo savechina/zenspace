@@ -10,6 +10,69 @@ Zen is a Rust CLI productivity suite with agentic workspace architecture. Editio
 
 The system follows a binary/library split: `zen` (thin binary wrapper) delegates to `zen-cli` (the library), which orchestrates domain crates.
 
+## PROJECT CONSTITUTION
+
+**Reference:** `.specify/memory/constitution.md` — All development MUST adhere to these principles:
+
+### Core Principles Summary
+
+| Principle | Enforcement | Impact on Development |
+|-----------|-------------|----------------------|
+| **I. CLI-First** | Every feature via CLI subcommands | All agentic features exposed as `zen <subcommand>` |
+| **II. Robust Error Handling** | `thiserror` for types, `anyhow` for propagation | `ZenError` + `AgenticError` taxonomy |
+| **III. Observability** | Structured logging via `tracing` | Spans for agent execution, LLM calls |
+| **IV. Configuration** | `.env` via `dotenvy` | 5-layer config inheritance |
+| **V. Template-Driven** | Embedded templates via `include_dir` | `tera` for scaffold generation |
+| **VI. Code Quality** | `cargo clippy` + `cargo fmt` mandatory | Zero warnings, `unsafe` blocks justified |
+| **VII. Architecture** | Single responsibility, stable interfaces | 12 crates with clear boundaries |
+| **VIII. Testing** | Unit + integration tests required | ZenTest harness for CLI end-to-end |
+| **IX. UX Consistency** | Consistent output, conventional exit codes | JSON/human-readable dual output |
+| **X. Performance** | <500ms cold start, <50MB footprint | Async I/O for blocking ops |
+| **XI. Design-First & Reuse** | **MANDATORY**: Design before coding, reuse frameworks | **Prohibited**: Custom impl when library exists |
+
+### XI. Design-First & Reuse Priority (Critical for Agentic)
+
+**All agentic implementation MUST follow this sequence**:
+1. **Design before coding** — No implementation without documented design decisions
+2. **Reuse existing frameworks** — Search community best practices before custom solutions
+3. **Avoid reinventing the wheel** — Use established libraries, patterns, and frameworks
+4. **Simplicity over novelty** — Prefer proven solutions over clever implementations
+
+**Enforcement**:
+- Every PR MUST document design rationale (why this approach, alternatives considered)
+- Custom implementations MUST justify why existing solutions insufficient
+- Framework/library selection MUST reference community adoption metrics
+- "Simple reuse" is default; "Custom implementation" requires explicit approval
+
+**Prohibited patterns**:
+- Implementing from scratch when well-maintained library exists (e.g., custom orchestrator when `rig-compose` provides primitives)
+- Creating new abstractions without searching existing patterns
+- Preferring novel solutions without documented advantages
+- Skipping design phase and jumping to implementation
+
+**Reference Systems** (reuse patterns from):
+- `rig-compose` for agent orchestration (GenericAgent, CoordinatorAgent, DelegateTool)
+- `rig-memvid` for context management (vector store, prompt hooks, compaction)
+- `rig-model-meta` for model abstraction (traits, telemetry)
+- Claude Code's system prompt assembly (18-section architecture, cache boundary)
+- LangChain's ChatPromptTemplate (role-separated messages)
+- Semantic Kernel's IPromptTemplateFactory (template factory pattern)
+
+### Technology Stack
+
+- **Language**: Rust (edition 2024)
+- **CLI Framework**: clap 4.5
+- **Logging**: tracing with env-filter
+- **Database**: SQLite (FTS5 + sqlite-vec for agentic module)
+- **Error Handling**: thiserror + anyhow
+- **Agent Orchestration**: rig-compose 0.3
+- **LLM Abstraction**: rig-core 0.37
+- **Vector Store**: sqlite-vec + rig-sqlite 0.2
+- **Template Engine**: tera + include_dir
+- **Configuration**: dotenvy + 5-layer inheritance
+
+See `.specify/memory/constitution.md` for full principles, rationale, and governance process.
+
 ## AGENTIC ARCHITECTURE
 
 Zen routes operations through a layered agentic pipeline: notes -- consolidation -- knowledge graph -- search. Each crate handles one concern.

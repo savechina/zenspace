@@ -15,14 +15,20 @@ use zen_provider::DefaultRouter;
 use crate::delegate_tools;
 use crate::delegate_tools::ZenDelegateTools;
 use crate::execution::{AgentExecution, ExecutionMetadata};
+use crate::registry::AgentRegistry;
 use crate::review::QualityPipeline;
 use crate::wiring::ZenWiring;
 use crate::zen_agent::ZenAgent;
 use zen_core::paths::ZenPaths;
 
-/// T314-T316: Slim orchestrator — registry field removed (T314),
-/// router replaced by executor (T305).
+/// Orchestrator manages agent lifecycle, registry, and execution flow.
+///
+/// Architecture (ADR-011 + FR-TUI-012):
+/// - Registry: Manages AgentProfile by role/name
+/// - Executor: Executes with AgentContext (routing) + ZenAgent (instance)
+/// - FR-TUI-012: Agent preferences influence provider selection
 pub struct AgentOrchestrator {
+    registry: crate::registry::DefaultAgentRegistry,
     wiring: ZenWiring,
     delegates: ZenDelegateTools,
     executor: crate::executor::AgentExecutor,
@@ -33,11 +39,13 @@ pub struct AgentOrchestrator {
 
 impl AgentOrchestrator {
     pub fn new(router: DefaultRouter) -> Self {
+        let registry = crate::registry::DefaultAgentRegistry::new();
         let wiring = ZenWiring::new();
         let delegates = ZenDelegateTools::new(&wiring, &router);
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(100_000));
         Self {
+            registry,
             wiring,
             delegates,
             executor,
@@ -48,11 +56,13 @@ impl AgentOrchestrator {
     }
 
     pub fn with_token_budget(router: DefaultRouter, capacity: u64) -> Self {
+        let registry = crate::registry::DefaultAgentRegistry::new();
         let wiring = ZenWiring::new();
         let delegates = ZenDelegateTools::new(&wiring, &router);
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(capacity));
         Self {
+            registry,
             wiring,
             delegates,
             executor,
@@ -238,6 +248,18 @@ impl AgentOrchestrator {
 
         session.agent_name.clone_from(&agent_name);
 
+        // Architecture: Orchestrator → Registry → AgentProfile by name
+        let profile = self
+            .registry
+            .find_by_name(&agent_name)
+            .map_err(|e| anyhow::anyhow!("Agent not found: {}", e))?
+            .clone();
+
+        // FR-TUI-012: AgentContext with preferences from profile
+        let context =
+            crate::AgentContext::new(profile.clone(), user_query.to_string(), session.clone())
+                .with_preferences(profile.llm_preferences.clone());
+
         let estimated_tokens = user_query.len() / 4 + 512;
         let reservation = self
             .token_budget
@@ -252,9 +274,10 @@ impl AgentOrchestrator {
         }
         let reservation = reservation.unwrap();
 
-        let response = zen_agent.execute(user_query, session).await?;
+        // Execution: AgentContext (routing) + ZenAgent (instance) → Executor
+        let execution = self.executor.execute(&context, &zen_agent)?;
 
-        let actual_tokens = (response.len() / 4 + user_query.len() / 4) as u64;
+        let actual_tokens = (execution.response.len() / 4 + user_query.len() / 4) as u64;
         self.token_budget
             .record_usage(reservation, actual_tokens, actual_tokens)
             .await;
@@ -283,26 +306,27 @@ impl AgentOrchestrator {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        let execution = AgentExecution {
-            agent_name,
-            response,
+        // Build execution with sub-agent results
+        let final_execution = AgentExecution {
+            agent_name: execution.agent_name,
+            response: execution.response,
             metadata: ExecutionMetadata {
-                tokens_used: self.budget_consumed() as u32,
-                cost_estimate: 0.0,
-                model_used: "zen".to_string(),
+                tokens_used: execution.metadata.tokens_used,
+                cost_estimate: execution.metadata.cost_estimate,
+                model_used: execution.metadata.model_used,
                 duration_ms,
-                sensitivity: session.sensitivity_policy,
+                sensitivity: execution.metadata.sensitivity,
             },
-            tool_calls: Vec::new(),
+            tool_calls: execution.tool_calls,
             sub_agent_results,
         };
 
         // Append JSONL audit log
-        if let Err(e) = append_audit_log(&execution, &lower) {
+        if let Err(e) = append_audit_log(&final_execution, &lower) {
             tracing::warn!(error = %e, "failed to write audit log");
         }
 
-        Ok(execution)
+        Ok(final_execution)
     }
 
     /// Execute with backward compatibility — returns String for existing callers.

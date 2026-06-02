@@ -111,21 +111,161 @@ default_model = "command-r"
 # Agent task routing — which provider/model per task
 # =============================================================================
 
+# Knowledge pipeline tasks (legacy)
 [agents.entity_extraction]
 provider = "ollama"
 model = "qwen3.6:35b-mlx"
+fallbacks = [
+    { provider = "deepseek", model = "deepseek-v4-flash" },
+    { provider = "openai", model = "gpt-4o-mini" }
+]
 
 [agents.contradiction_detection]
 provider = "ollama"
 model = "qwen3.6:35b-mlx"
+fallbacks = [{ provider = "deepseek", model = "deepseek-v4-flash" }]
+sensitivity = "Private"
 
 [agents.synthesis]
 provider = "ollama"
 model = "qwen3.6:35b-mlx"
+fallbacks = [{ provider = "anthropic", model = "claude-3-5-sonnet-20241022" }]
 
 [agents.dispatch]
-provider = "openai"
-model = "gpt-4o-mini"
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o" },
+    { provider = "ollama", model = "qwen3.6:35b-mlx" }
+]
+
+# =============================================================================
+# Agent profile routing — 13 Silicon Olympus agents
+# =============================================================================
+
+# Orchestrator Tier (L0)
+[agents.Sisyphus]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o" },
+    { provider = "deepseek", model = "deepseek-v4-flash" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
+
+# Planner Tier (L1)
+[agents.Prometheus]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
+
+[agents.Metis]
+provider = "deepseek"
+model = "deepseek-v4-flash"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o-mini" },
+    { provider = "ollama", model = "qwen3.6:35b-mlx" }
+]
+llm_preferences = "Any"
+max_sensitivity = "Medium"
+
+[agents.Momus]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
+
+[agents.Zeus]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
+
+# Specialist Tier (consulting only)
+[agents.Oracle]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
+
+[agents.Explore]
+provider = "anthropic"
+model = "claude-3-5-sonnet-20241022"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o-mini" }
+]
+llm_preferences = "CloudOnly"
+max_sensitivity = "Low"
+
+[agents.Librarian]
+provider = "ollama"
+model = "qwen3.6:35b-mlx"
+fallbacks = [
+    { provider = "deepseek", model = "deepseek-v4-flash" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
+
+[agents.Argus]
+provider = "deepseek"
+model = "deepseek-v4-flash"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o-mini" },
+    { provider = "ollama", model = "qwen3.6:35b-mlx" }
+]
+llm_preferences = "Any"
+max_sensitivity = "Medium"
+
+# Worker Tier (L2 - execution)
+[agents.Hephaestus]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o" },
+    { provider = "deepseek", model = "deepseek-v4-flash" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
+
+[agents.Atlas]
+provider = "ollama"
+model = "qwen3.6:35b-mlx"
+fallbacks = [
+    { provider = "deepseek", model = "deepseek-v4-flash" }
+]
+llm_preferences = "Any"
+max_sensitivity = "Medium"
+
+[agents.Junior]
+provider = "ollama"
+model = "qwen3.6:35b-mlx"
+fallbacks = []
+llm_preferences = "Any"
+max_sensitivity = "Low"
+
+[agents.Hermes]
+provider = "deepseek"
+model = "deepseek-v4-flash"
+fallbacks = [
+    { provider = "openai", model = "gpt-4o-mini" },
+    { provider = "ollama", model = "qwen3.6:35b-mlx" }
+]
+llm_preferences = "Any"
+max_sensitivity = "High"
 
 # =============================================================================
 # Feature flags

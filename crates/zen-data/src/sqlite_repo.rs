@@ -1,5 +1,4 @@
 use rusqlite::Connection;
-use std::ffi::{c_char, c_int};
 use std::path::Path;
 use thiserror::Error;
 
@@ -347,7 +346,7 @@ pub fn load_vec_extension(lib_path: impl AsRef<Path>) -> Result<()> {
     // Safety: sqlite3_auto_extension registers a function pointer that
     // will be called at sqlite3_open time. The function is from a
     // well-known, stable extension (sqlite-vec).
-    use std::ffi::{CString, c_void};
+    use std::ffi::{CString, c_char, c_int, c_void};
 
     let path_c =
         CString::new(lib_path.as_ref().to_str().ok_or_else(|| {

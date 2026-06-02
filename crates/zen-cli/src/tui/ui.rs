@@ -4,6 +4,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let queue_height = if app.message_queue.is_empty() {
@@ -101,13 +102,19 @@ pub fn render(frame: &mut Frame, app: &App) {
     });
     let visible_width = input_area.width as usize;
 
-    let cursor_col = app.cursor_position.min(app.input.len());
-    let (scroll_start, display_text) = if visible_width < 2 || cursor_col <= visible_width {
-        (0, app.input.as_str())
+    let char_count = app.input.chars().count();
+    let cursor_col = app.cursor_position.min(char_count);
+
+    let scroll_start = if visible_width < 2 || cursor_col <= visible_width {
+        0
     } else {
-        let offset = cursor_col.saturating_sub(visible_width.saturating_sub(2));
-        let offset = offset.min(app.input.len());
-        (offset, &app.input[offset..])
+        cursor_col.saturating_sub(visible_width.saturating_sub(2))
+    };
+
+    let display_text = if scroll_start == 0 {
+        app.input.clone()
+    } else {
+        app.input.chars().skip(scroll_start).collect()
     };
 
     let input_display = format!("> {}", display_text);
@@ -116,7 +123,20 @@ pub fn render(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title(" Input (Enter=send, Ctrl+D=quit, Tab=complete) "),
     );
+
+    let cursor_prefix: String = app.input.chars().take(cursor_col).collect();
+    let cursor_visual_pos = UnicodeWidthStr::width(cursor_prefix.as_str()) as u16;
+    let scroll_visual_offset = if scroll_start == 0 {
+        0u16
+    } else {
+        let scrolled: String = app.input.chars().take(scroll_start).collect();
+        UnicodeWidthStr::width(scrolled.as_str()) as u16
+    };
+
+    let cursor_x = input_chunk.x + 2 + cursor_visual_pos - scroll_visual_offset;
     frame.render_widget(input, input_chunk);
+
+    frame.set_cursor_position((cursor_x, input_chunk.y + 1));
 
     if app.show_autocomplete && !app.autocomplete_suggestions.is_empty() {
         let max_suggestions = 5;
@@ -174,9 +194,4 @@ pub fn render(frame: &mut Frame, app: &App) {
             frame.render_widget(suggestions, popup_area);
         }
     }
-
-    frame.set_cursor_position((
-        input_area.x + (cursor_col.saturating_sub(scroll_start)) as u16 + 2,
-        input_area.y,
-    ));
 }

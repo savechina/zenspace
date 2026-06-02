@@ -287,16 +287,7 @@ impl Default for DailyLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
-
-    fn setup_test_dir(root: &Path, year: i32, filename: &str, content: &str) -> PathBuf {
-        let dir = root.join(year.to_string());
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(filename);
-        fs::write(&path, content).unwrap();
-        path
-    }
 
     #[test]
     fn test_extract_tags_english() {

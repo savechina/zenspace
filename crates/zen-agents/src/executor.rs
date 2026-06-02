@@ -131,11 +131,24 @@ impl AgentExecutor {
     }
 
     /// Execute a single agent request with retry and fallback.
-    pub fn execute(&self, context: &AgentContext) -> Result<AgentExecution> {
+    ///
+    /// # Architecture (ADR-011 + FR-TUI-012)
+    ///
+    /// - `context`: Routing context (preferences, session, agent_profile)
+    /// - `agent`: Agent instance (identity, skills, tools)
+    ///
+    /// FR-TUI-012: context.preferences激活route_with_preferences routing
+    /// Agent identity: agent.identity注入到system prompt assembly
+    pub fn execute(
+        &self,
+        context: &AgentContext,
+        agent: &crate::ZenAgent,
+    ) -> Result<AgentExecution> {
         let start = Instant::now();
         let agent_name = context.agent_profile.name.clone();
         let sensitivity = context.sensitivity;
 
+        // FR-TUI-012: Use context.preferences for routing
         let requirements = TaskRequirements {
             max_tokens: Some(context.max_tokens as u32),
             sensitivity,
@@ -155,7 +168,8 @@ impl AgentExecutor {
                 Provider::Mock
             });
 
-        let prompt = self.build_prompt(context);
+        // Build prompt with agent identity (SOUL.md/MEMORY.md/AGENTS.md)
+        let prompt = self.build_prompt_with_identity(context, agent);
         let response = self.execute_with_retry(&provider, &prompt, &agent_name)?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -175,47 +189,66 @@ impl AgentExecutor {
         })
     }
 
-    fn build_prompt(&self, context: &AgentContext) -> String {
-        let system_prompt = self.assemble_system_prompt(context);
+    fn build_prompt_with_identity(
+        &self,
+        context: &AgentContext,
+        agent: &crate::ZenAgent,
+    ) -> String {
+        let system_prompt = self.assemble_system_prompt_with_identity(context, agent);
         format!(
             "{}\n\nUser: {}\n\nAssistant:",
             system_prompt, context.user_query
         )
     }
 
-    fn assemble_system_prompt(&self, context: &AgentContext) -> String {
-        let mut parts = Vec::new();
+    // ADR-013: Using zen_memory::PromptAssembly 18-section tiered system
+    // Features: cache boundary, priority chain, section memoization, blast radius taxonomy
+    fn assemble_system_prompt_with_identity(
+        &self,
+        context: &AgentContext,
+        agent: &crate::ZenAgent,
+    ) -> String {
+        use zen_memory::PromptAssembly;
 
-        if let Some(def) = &context.agent_profile.definition
-            && !def.prompt_template.is_empty()
-        {
-            parts.push(def.prompt_template.clone());
+        // Build PromptAssembly from AgentContext and ZenAgent identity
+        let mut builder = PromptAssembly::builder().sensitivity(context.sensitivity);
+
+        // Priority 3: Agent definition (from AgentProfile)
+        if let Some(ref def) = context.agent_profile.definition {
+            builder = builder.agent_definition(def.clone());
         }
 
+        // Section 2: Intro (SOUL.md)
+        // Section 18: CLAUDE.md (AGENTS.md)
+        if let Some(identity) = agent.identity() {
+            if !identity.soul_content.is_empty() {
+                builder = builder.intro(identity.soul_content.clone());
+            }
+            if !identity.agents_content.is_empty() {
+                builder = builder.claude_md(identity.agents_content.clone());
+            }
+        }
+
+        // Section 17: Memory (retrieved knowledge + conversation history)
         let knowledge: Vec<String> = context
             .session
             .knowledge
             .iter()
             .map(|n| n.content.clone())
             .collect();
-        if !knowledge.is_empty() {
-            parts.push(format!(
-                "## Retrieved Knowledge\n{}",
-                knowledge.join("\n\n")
-            ));
-        }
-
-        let history: Vec<String> = context
+        let history: Vec<(String, String)> = context
             .session
             .conversation
             .iter()
-            .map(|t| format!("{}: {}", t.role, t.content))
+            .map(|turn| (turn.role.clone(), turn.content.clone()))
             .collect();
-        if !history.is_empty() {
-            parts.push(format!("## Conversation History\n{}", history.join("\n")));
-        }
+        builder = builder.memory_section(knowledge, history);
 
-        parts.join("\n\n---\n\n")
+        // Section 13: Env info (dynamic)
+        builder = builder.env_info(PromptAssembly::build_env_info(&context.session));
+
+        // Build and assemble with cache boundary
+        builder.build().assemble()
     }
 
     fn execute_with_retry(

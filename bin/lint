@@ -1,5 +1,12 @@
 #!/bin/bash
 set -euo pipefail
+set -x
 
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features "$@" -- -D warnings --allow dead_code
+cargo clippy --all-targets --all-features "$@" -- -D warnings
+
+if [ $# -gt 0 ] && [ "$1" = "--fix" ]
+then
+  cargo fmt --all
+else
+  cargo fmt --all -- --check
+fi

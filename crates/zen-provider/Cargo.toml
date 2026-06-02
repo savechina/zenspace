@@ -17,3 +17,4 @@ chrono = { workspace = true }
 futures-util = "0.3"
 reqwest = { workspace = true }
 rig = { version = "0.37", package = "rig-core" }
+rig-compose = { workspace = true }

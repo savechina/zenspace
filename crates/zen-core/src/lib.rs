@@ -13,5 +13,5 @@ pub mod types;
 pub mod validate;
 
 pub use config::LlmPreference;
-pub use definition::AgentDefinition;
+pub use definition::{AgentDefinition, ToolPermission};
 pub use secrets::SecretRef;

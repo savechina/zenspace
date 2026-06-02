@@ -2,6 +2,7 @@ use crate::providers::{
     AnthropicProvider, CohereProvider, GeminiProvider, MistralProvider, OllamaProvider,
     OpenAIProvider,
 };
+use rig_compose::reliability::RetryClass;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -55,6 +56,30 @@ pub enum LlmError {
 
     #[error("call failed: {reason}")]
     Call { reason: String },
+}
+
+impl LlmError {
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            LlmError::ProviderUnavailable { .. } | LlmError::Call { .. }
+        )
+    }
+}
+
+pub trait LlmRetryClassifier: Send + Sync {
+    fn classify(&self, error: &LlmError) -> RetryClass;
+}
+
+pub struct DefaultLlmRetryClassifier;
+
+impl LlmRetryClassifier for DefaultLlmRetryClassifier {
+    fn classify(&self, error: &LlmError) -> RetryClass {
+        match error {
+            LlmError::ProviderUnavailable { .. } | LlmError::Call { .. } => RetryClass::Transient,
+            LlmError::Routing { .. } => RetryClass::Permanent,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +817,34 @@ impl DefaultRouter {
 
         info!("route_with_preferences: no preference matched, falling back to standard route");
         self.route(requirements)
+    }
+
+    pub fn build_fallback_chain(&self, agent_name: &str) -> Vec<(Provider, Option<String>)> {
+        let mut chain = vec![];
+
+        let agent_config = self.config.agents.get(agent_name);
+
+        if let Some(agent) = agent_config
+            && let Some(ref provider_name) = agent.provider
+        {
+            chain.push((parse_provider_name(provider_name), agent.model.clone()));
+        }
+
+        if let Some(agent) = agent_config {
+            for step in &agent.fallbacks {
+                chain.push((parse_provider_name(&step.provider), step.model.clone()));
+            }
+        }
+
+        if chain.is_empty()
+            && let Some(ref name) = self.config.default_provider
+        {
+            chain.push((parse_provider_name(name), self.config.default_model.clone()));
+        }
+
+        chain.push((Provider::Mock, None));
+
+        chain
     }
 }
 

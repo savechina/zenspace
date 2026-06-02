@@ -30,7 +30,7 @@ pub struct AgenticConfig {
     pub providers: HashMap<String, ProviderConfig>,
     /// Agent task routing — which provider/model per task.
     #[serde(default)]
-    pub agents: HashMap<String, AgentTaskConfig>,
+    pub agents: HashMap<String, AgentConfig>,
     #[serde(default)]
     pub features: FeatureConfig,
     #[serde(default)]
@@ -74,15 +74,55 @@ pub struct ProviderConfig {
     pub wire_api: Option<String>,
 }
 
+/// Fallback step for sequential fallback chain.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FallbackStep {
+    /// Provider name (must match a key in `providers`).
+    pub provider: String,
+    /// Model override (optional, falls back to provider's default_model).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Timeout for this step in seconds (optional).
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
+}
+
+/// Retry policy for transient errors.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryPolicy {
+    /// Maximum retry attempts for transient errors (429, 5xx, timeout).
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// Timeout per attempt in seconds.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u32,
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_timeout_secs() -> u32 {
+    30
+}
+
 /// Agent task routing — references a provider by name with optional model override.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct AgentTaskConfig {
+pub struct AgentConfig {
     /// Provider name (must match a key in `providers`).
     #[serde(default)]
     pub provider: Option<String>,
     /// Model override for this task (falls back to provider's default_model).
     #[serde(default)]
     pub model: Option<String>,
+    /// Sequential fallback chain (tried in order if primary fails).
+    #[serde(default)]
+    pub fallbacks: Vec<FallbackStep>,
+    /// Retry policy for transient errors (optional).
+    #[serde(default)]
+    pub retry_policy: Option<RetryPolicy>,
+    /// Data sensitivity level (optional, enforces local-only if Private/Confidential).
+    #[serde(default)]
+    pub sensitivity: Option<crate::types::Sensitivity>,
 }
 
 /// Feature flags.
@@ -387,9 +427,9 @@ fn merge_providers(
 }
 
 fn merge_agents(
-    base: HashMap<String, AgentTaskConfig>,
-    ov: HashMap<String, AgentTaskConfig>,
-) -> HashMap<String, AgentTaskConfig> {
+    base: HashMap<String, AgentConfig>,
+    ov: HashMap<String, AgentConfig>,
+) -> HashMap<String, AgentConfig> {
     let mut merged = base;
     for (k, v) in ov {
         merged.entry(k).or_insert(v);
@@ -481,7 +521,7 @@ fn apply_env_overrides(mut config: AgenticConfig) -> AgenticConfig {
     config
 }
 
-fn apply_agent_env(agents: &mut HashMap<String, AgentTaskConfig>) {
+fn apply_agent_env(agents: &mut HashMap<String, AgentConfig>) {
     // Per-task env overrides: ZEN_AGENT_{TASK}_PROVIDER, ZEN_AGENT_{TASK}_MODEL
     for task in [
         "entity_extraction",
@@ -599,7 +639,7 @@ pub fn get_provider<'a>(config: &'a AgenticConfig, name: &str) -> Option<&'a Pro
 }
 
 /// Get an agent task config by name.
-pub fn get_agent_task<'a>(config: &'a AgenticConfig, name: &str) -> Option<&'a AgentTaskConfig> {
+pub fn get_agent_task<'a>(config: &'a AgenticConfig, name: &str) -> Option<&'a AgentConfig> {
     config.agents.get(name)
 }
 
