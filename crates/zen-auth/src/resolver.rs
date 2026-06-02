@@ -43,15 +43,11 @@ impl SecretResolver {
         // 1) Keychain
         match Keychain::retrieve(&self.keychain_service, "zen") {
             Ok(val) => return Ok(val),
-            Err(AuthError::KeychainAccessDenied { .. }) => {
+            Err(AuthError::KeychainAccessDenied { .. })
+            | Err(AuthError::CredentialNotFound { .. })
+            | Err(AuthError::KeychainUnavailable { .. }) => {
                 tracing::debug!(
-                    "keychain access denied for '{}', falling back to env var",
-                    self.keychain_service
-                );
-            }
-            Err(AuthError::CredentialNotFound { .. }) => {
-                tracing::debug!(
-                    "keychain credential not found for '{}', falling back to env var",
+                    "keychain unavailable for '{}', falling back to env var",
                     self.keychain_service
                 );
             }
