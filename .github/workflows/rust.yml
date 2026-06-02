@@ -22,6 +22,10 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+      - name: Install ripgrep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Install nextest
@@ -44,6 +48,10 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+      - name: Install ripgrep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Install nextest

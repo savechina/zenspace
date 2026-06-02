@@ -92,6 +92,11 @@ mod tests {
 
     #[test]
     fn test_tier1_search_finds_matches() {
+        if which::which("rg").is_err() {
+            eprintln!("Skipping test: ripgrep not installed");
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let file_path = tmp.path().join("test.txt");
         fs::write(&file_path, "hello world\nfoo bar\nhello again\n").unwrap();
@@ -106,6 +111,11 @@ mod tests {
 
     #[test]
     fn test_tier1_search_no_matches_returns_empty() {
+        if which::which("rg").is_err() {
+            eprintln!("Skipping test: ripgrep not installed");
+            return;
+        }
+
         let tmp = TempDir::new().unwrap();
         let file_path = tmp.path().join("test.txt");
         fs::write(&file_path, "nothing here\n").unwrap();
