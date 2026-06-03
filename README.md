@@ -1,194 +1,67 @@
 # Zenspace
 
-**Zen** 是一个本地优先的 Rust CLI 知识管理工具，支持多 LLM 提供商（Ollama、OpenAI、Anthropic、DeepSeek 等）。
+**Zen** is a local-first Rust CLI knowledge management tool with multi-LLM provider support (Ollama, OpenAI, Anthropic, DeepSeek, and more).
 
-## 产品定位
+[中文文档](README_zh.md)
 
-- **本地知识库** — Markdown 文件作为数据源，SQLite 索引加速搜索
-- **多协议 LLM 支持** — rig-core 原生客户端：Ollama、OpenAI、Anthropic、Gemini、Cohere、Mistral 及 OpenAI-compatible API
-- **实体提取管道** — 自动从笔记提取实体，生成 Wiki 页面
-- **Agentic Session** — 会话生命周期管理，13 种内置 Agent
+## Features
 
-## 安装
+- **Local Knowledge Base** — Markdown files as data source, SQLite FTS5 + vector search for fast retrieval
+- **Multi-Protocol LLM Routing** — Ollama, OpenAI, Anthropic, Gemini, Cohere, Mistral, and OpenAI-compatible APIs
+- **Entity Extraction Pipeline** — Automatic entity extraction from notes, auto-generated Wiki pages
+- **Agentic Sessions** — Session lifecycle management with 13 built-in agents across 4 tiers
+- **5-Tier Search** — ripgrep → FTS5 → vector embeddings → entity graph → LLM fallback
+- **macOS Keychain Integration** — Secure credential storage with automatic fallback
 
-### Homebrew（推荐 macOS）
+## Installation
+
+### Homebrew (macOS, recommended)
 
 ```bash
 brew tap savechina/zenspace
 brew install zenspace
 ```
 
-### 从源码构建
+### From Source
 
 ```bash
 git clone https://github.com/savechina/zenspace.git
 cd zenspace
-cargo build --release
+bin/build 
 ./target/release/zen --help
 ```
 
-### Cargo 安装（待发布）
+### Cargo Install (coming soon)
 
 ```bash
-cargo install zen-cli
+bin/install
 ```
 
-### 二进制下载
+### Binary Download
 
-从 [GitHub Releases](https://github.com/savechina/zenspace/releases) 下载 macOS 二进制文件。
+Download pre-built macOS binaries from [GitHub Releases](https://github.com/savechina/zenspace/releases).
 
-## 快速开始
+## Quick Start
 
 ```bash
-# 初始化工作空间
+# Initialize workspace
 zen workspace init
 
-# 创建笔记
-zen note create "设计文档" --tag project
+# Create a note
+zen note create "Design Doc" --tag project
 
-# 搜索知识库
-zen search run "设计"
+# Search knowledge base
+zen search run "design"
 
-# 查看配置
+# View configuration
 zen config show
 ```
 
-## LLM 提供商配置
+## Documentation
 
-Zen 支持多种 LLM 提供商，配置文件位于 `config/config.toml`（编译时嵌入）或 `~/.zen/config.toml`（用户覆盖）。
-
-### 支持的协议类型
-
-| 类型 | 描述 | 示例 |
-|------|------|------|
-| `ollama` | 本地 Ollama 服务 | 无需 API Key |
-| `openai` | OpenAI API | `api_key = { env = "OPENAI_API_KEY" }` |
-| `anthropic` | Anthropic Messages API | `api_key = { env = "ANTHROPIC_API_KEY" }` |
-| `gemini` | Google Gemini API | `api_key = { env = "GEMINI_API_KEY" }` |
-| `cohere` | Cohere API | `api_key = { env = "COHERE_API_KEY" }` |
-| `mistral` | Mistral API | `api_key = { env = "MISTRAL_API_KEY" }` |
-| `openai-compatible` | OpenAI 兼容 API | DeepSeek/Groq/Perplexity/阿里云等 |
-| `anthropic-compatible` | Anthropic 兼容 API | Moonshot/MiniMax 等 |
-
-### 配置示例
-
-```toml
-# 默认提供商
-default_provider = "ollama"
-default_model = "qwen3.6:35b-mlx"
-
-# 本地 Ollama（无 API Key）
-[providers.ollama]
-type = "ollama"
-base_url = "http://127.0.0.1:11434"
-
-# OpenAI 兼容 API（DeepSeek）
-[providers.deepseek]
-type = "openai-compatible"
-base_url = "https://api.deepseek.com"
-api_key = { env = "DEEPSEEK_API_KEY" }
-default_model = "deepseek-v4-flash"
-
-# Anthropic API
-[providers.anthropic]
-type = "anthropic"
-api_key = { env = "ANTHROPIC_API_KEY" }
-default_model = "claude-3-5-sonnet-20241022"
-```
-
-### 设置环境变量
-
-```bash
-# 设置 API Key
-export OPENAI_API_KEY="sk-..."
-export DEEPSEEK_API_KEY="sk-..."
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-## 命令列表
-
-| 命令 | 说明 |
-|------|------|
-| `zen` | 启动 TUI 交互界面 |
-| `zen version` | 显示版本 |
-| `zen workspace init` | 初始化 `.zen/` 工作空间 |
-| `zen config show` | 显示配置（嵌入式/用户/环境变量） |
-| `zen note create "标题"` | 创建笔记 |
-| `zen search run "关键词"` | 搜索知识库 |
-| `zen consolidate run` | 运行实体提取管道 |
-| `zen lint run` | 检查孤立页面、断裂 Wiki 链接 |
-| `zen session start` | 启动 Agentic 会话 |
-| `zen llm providers` | 列出可用 LLM 提供商 |
-| `zen llm test <provider>` | 测试提供商连接 |
-
-完整命令列表见 `zen --help`。
-
-## 项目结构
-
-```
-zenspace/
-├── crates/               # 10 个 Rust workspace crates
-│   ├── zen-cli/          # CLI 入口 + TUI
-│   ├── zen-provider/     # 多协议 LLM 路由（rig-core）
-│   ├── zen-knowledge/    # 笔记/Wiki/搜索/实体提取
-│   ├── zen-data/         # SQLite 实体 + Repository
-│   ├── zen-auth/         # macOS Keychain 凭证管理
-│   └── zen-core/         # 配置/错误/路径/常量
-├── config/               # 嵌入式 config.toml
-└── docs/specs/           # 架构规范文档
-```
-
-## 开发
-
-```bash
-# 构建
-cargo build
-
-# 测试
-cargo test
-
-# 代码检查
-cargo clippy -- -D warnings
-cargo fmt --all --check
-
-# 本地运行
-cargo run --bin zen -- --help
-```
-
-## 发布流程
-
-### 版本规范
-
-遵循 [Semantic Versioning](https://semver.org/)：MAJOR.MINOR.PATCH
-
-### 发布步骤
-
-```bash
-# 使用发布脚本（推荐）
-./bin/release patch    # 0.1.0 → 0.1.1
-./bin/release minor    # 0.1.0 → 0.2.0
-./bin/release major    # 0.1.0 → 1.0.0
-
-# 手动发布
-echo "0.1.2" > VERSION
-git commit -am "release: v0.1.2"
-git tag v0.1.2
-git push origin main --tags
-```
-
-### 发布产物（macOS）
-
-- `zen-{version}-aarch64-apple-darwin.tar.gz`（Apple Silicon）
-- `zen-{version}-x86_64-apple-darwin.tar.gz`（Intel）
-
-## 许可证
-
-MIT License — 见 [LICENSE.txt](LICENSE.txt)
-
-## 文档
-
-- [AGENTS.md](AGENTS.md) — 项目架构指南
-- [config/config.toml](config/config.toml) — 提供商配置示例
+- [README_zh.md](README_zh.md) — 中文文档
+- [AGENTS.md](AGENTS.md) — Architecture guide
+- [config/config.toml](config/config.toml) — Provider configuration examples
 
 ---
 

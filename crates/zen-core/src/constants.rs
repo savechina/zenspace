@@ -70,7 +70,7 @@ pub const QQBOT_BASE_URL: &str = "https://api.sgroup.qq.com";
 // ============================================
 pub const OLLAMA_DEFAULT_MODEL: &str = "qwen3-coder";
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-4o-mini";
-pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-haiku-4-5";
 pub const COHERE_DEFAULT_MODEL: &str = "command-r";
 pub const GEMINI_DEFAULT_MODEL: &str = "gemini-2.0-flash";
 pub const MISTRAL_DEFAULT_MODEL: &str = "mistral-large-latest";

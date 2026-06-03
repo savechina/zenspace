@@ -54,7 +54,7 @@ default_model = "gpt-4o-mini"
 [providers.anthropic]
 type = "anthropic"
 api_key = { env = "ANTHROPIC_API_KEY" }
-default_model = "claude-sonnet-4-6"
+default_model = "claude-haiku-4-5"
 
 [providers.aliyun]
 type = "openai-compatible"
@@ -129,7 +129,7 @@ sensitivity = "Private"
 [agents.synthesis]
 provider = "ollama"
 model = "qwen3.6:35b-mlx"
-fallbacks = [{ provider = "anthropic", model = "claude-3-5-sonnet-20241022" }]
+fallbacks = [{ provider = "anthropic", model = "claude-haiku-4-5" }]
 
 [agents.dispatch]
 provider = "anthropic"
@@ -204,7 +204,7 @@ max_sensitivity = "High"
 
 [agents.Explore]
 provider = "anthropic"
-model = "claude-3-5-sonnet-20241022"
+model = "claude-haiku-4-5"
 fallbacks = [
     { provider = "openai", model = "gpt-4o-mini" }
 ]
