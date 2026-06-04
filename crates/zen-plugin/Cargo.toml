@@ -21,3 +21,6 @@ wasmtime = { workspace = true }
 rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
 schemars = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

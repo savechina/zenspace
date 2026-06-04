@@ -32,7 +32,7 @@ pub use blackboard::{
     FeedbackErrorType, SystemEvent, ValidationStatus,
 };
 pub use context::AgentContext;
-pub use coordinator::ZenCoordinator;
+pub use coordinator::{EntropyConfig, ZenCoordinator};
 pub use execution::{AgentExecution, ExecutionMetadata, ToolCall};
 pub use executor::{AgentExecutor, ErrorCategory, RetryPolicy};
 pub use observability::create_telemetry_hook;

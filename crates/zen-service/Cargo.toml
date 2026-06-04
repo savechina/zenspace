@@ -21,3 +21,6 @@ rand = { workspace = true }
 typed-builder = { workspace = true }
 heck = { workspace = true }
 strum = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -7,7 +7,7 @@ pub use zen_core::review::{
 
 // Momus stays in zen-agents (depends on WasmSandbox/wasmtime)
 pub mod momus;
-pub use momus::MomusReviewer;
+pub use momus::{MomusFinding, MomusFindingType, MomusReview, MomusReviewer};
 
 // Pipeline orchestrator stays in zen-agents (composes Momus + pure reviewers)
 pub mod pipeline;

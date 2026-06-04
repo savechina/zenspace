@@ -41,7 +41,7 @@ impl ZenHook {
         self
     }
 
-    fn is_mutation_tool(tool_name: &str) -> bool {
+    pub fn is_mutation_tool(tool_name: &str) -> bool {
         let lower = tool_name.to_lowercase();
         lower.contains("write")
             || lower.contains("create")
@@ -51,7 +51,7 @@ impl ZenHook {
             || lower.contains("execute")
     }
 
-    fn is_strategy_tool(tool_name: &str) -> bool {
+    pub fn is_strategy_tool(tool_name: &str) -> bool {
         let lower = tool_name.to_lowercase();
         lower.contains("plan")
             || lower.contains("design")

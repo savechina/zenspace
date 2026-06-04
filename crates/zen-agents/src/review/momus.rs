@@ -1,3 +1,4 @@
+use std::fmt;
 use crate::sandbox::{ExecutionOutput, ResourceLimits, WasmSandbox};
 use zen_core::types::Task;
 
@@ -14,6 +15,17 @@ pub enum MomusFindingType {
     UntestableAcceptanceCriteria,
     MissingVerifiability,
     AmbiguousScope,
+}
+
+impl fmt::Display for MomusFindingType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanInconsistency => write!(f, "PlanInconsistency"),
+            Self::UntestableAcceptanceCriteria => write!(f, "UntestableAcceptanceCriteria"),
+            Self::MissingVerifiability => write!(f, "MissingVerifiability"),
+            Self::AmbiguousScope => write!(f, "AmbiguousScope"),
+        }
+    }
 }
 
 #[derive(Debug)]

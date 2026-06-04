@@ -25,3 +25,6 @@ tower-http = { workspace = true }
 uuid = { workspace = true }
 rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
