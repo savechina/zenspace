@@ -169,14 +169,8 @@ impl MockProvider {
             prompt.len(),
             self.response
         );
-        let words: Vec<&str> = reply.split_whitespace().collect();
-        let mut buf = String::new();
-        for word in words {
-            buf.push_str(word);
-            buf.push(' ');
-            let chunk = buf.clone();
-            buf.clear();
-            if token_tx.send(chunk).is_err() {
+        for chunk in reply.split_inclusive([' ', '\n']) {
+            if token_tx.send(chunk.to_string()).is_err() {
                 break;
             }
         }
@@ -997,4 +991,50 @@ fn parse_provider_name(name: &str) -> Provider {
 /// LLM availability without holding a concrete `DefaultRouter` reference.
 pub fn is_local_llm_available(router: &dyn LlmRouter) -> bool {
     router.is_local_llm_available()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mock_streaming_preserves_newlines_as_tokens() {
+        let mock = MockProvider {
+            response: "line one\nline two\nline three".into(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mock.complete_streaming("task", "prompt", tx).await.unwrap();
+        rx.close();
+        let mut tokens = Vec::new();
+        while let Some(t) = rx.recv().await {
+            tokens.push(t);
+        }
+        let joined: String = tokens.iter().cloned().collect();
+        assert!(
+            joined.contains('\n'),
+            "tokens should contain newlines, got {:?}",
+            tokens
+        );
+        assert!(
+            tokens.len() > 1,
+            "should produce multiple tokens, got {}",
+            tokens.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_streaming_tokens_preserve_word_boundaries() {
+        let mock = MockProvider::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mock.complete_streaming("task", "prompt", tx).await.unwrap();
+        rx.close();
+        let mut tokens = Vec::new();
+        while let Some(t) = rx.recv().await {
+            tokens.push(t);
+        }
+        assert!(
+            tokens.len() > 1,
+            "default mock should produce multiple word-level tokens"
+        );
+    }
 }
