@@ -28,7 +28,7 @@ jobs:
           tool: ripgrep
       - name: Install lld (required by aws-lc-sys / rustls)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Run lint
@@ -51,7 +51,7 @@ jobs:
           tool: ripgrep
       - name: Install lld (required by aws-lc-sys / rustls)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Install nextest
