@@ -35,3 +35,7 @@ test_data/
 
 # Development specs (local only, not for release)
 docs/specs/
+
+# Development directories (local dev tools)
+.context/
+.sisyphus/
