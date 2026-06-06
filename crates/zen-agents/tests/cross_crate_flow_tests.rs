@@ -71,14 +71,18 @@ async fn test_blackboard_push_pop_empty() {
 async fn test_blackboard_with_minimum_capacity() {
     let (mut bb, _handle) = Blackboard::new(1);
     let task = BlackboardTask::new("single task", 0.3, TaskType::Text);
-    bb.push_task(task).await.expect("push to capacity-1 should succeed");
+    bb.push_task(task)
+        .await
+        .expect("push to capacity-1 should succeed");
 
     // Pop to make room, then push another
     let popped = bb.pop_task().await;
     assert!(popped.is_some());
 
     let task2 = BlackboardTask::new("second", 0.3, TaskType::Text);
-    bb.push_task(task2).await.expect("second push should succeed after pop");
+    bb.push_task(task2)
+        .await
+        .expect("second push should succeed after pop");
     let popped2 = bb.pop_task().await;
     assert!(popped2.is_some());
 }
@@ -102,7 +106,9 @@ async fn test_blackboard_fill_to_capacity() {
 
     for i in 0..capacity {
         let task = BlackboardTask::new(&format!("task {i}"), 0.5, TaskType::Code);
-        bb.push_task(task).await.expect("push within capacity should succeed");
+        bb.push_task(task)
+            .await
+            .expect("push within capacity should succeed");
     }
 
     // Pop one to make room before pushing to avoid blocking on full channel
@@ -110,7 +116,9 @@ async fn test_blackboard_fill_to_capacity() {
     assert!(popped.is_some(), "should pop a task from filled blackboard");
 
     let overflow = BlackboardTask::new("overflow", 0.5, TaskType::Code);
-    bb.push_task(overflow).await.expect("push after pop should succeed");
+    bb.push_task(overflow)
+        .await
+        .expect("push after pop should succeed");
 }
 
 #[test]
@@ -128,10 +136,20 @@ fn test_feedback_with_max_retry_count() {
 fn test_system_event_all_task_events_constructable() {
     let task_id = Uuid::new_v4();
     let _enqueued = SystemEvent::TaskEnqueued { task_id };
-    let _started = SystemEvent::TaskStarted { task_id: task_id, agent: "test".into() };
-    let _completed = SystemEvent::TaskCompleted { task_id: Uuid::new_v4() };
-    let _failed = SystemEvent::TaskFailed { task_id: Uuid::new_v4(), error: "test error".into() };
-    let _feedback = SystemEvent::FeedbackIssued { deliverable_id: Uuid::new_v4() };
+    let _started = SystemEvent::TaskStarted {
+        task_id,
+        agent: "test".into(),
+    };
+    let _completed = SystemEvent::TaskCompleted {
+        task_id: Uuid::new_v4(),
+    };
+    let _failed = SystemEvent::TaskFailed {
+        task_id: Uuid::new_v4(),
+        error: "test error".into(),
+    };
+    let _feedback = SystemEvent::FeedbackIssued {
+        deliverable_id: Uuid::new_v4(),
+    };
 }
 
 #[test]

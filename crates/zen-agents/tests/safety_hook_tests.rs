@@ -131,8 +131,6 @@ fn orchestrator_blocked_from_mutation() {
 
 #[test]
 fn specialist_can_use_mutation_and_strategy() {
-    // Both detection functions are pure logic; whether a Specialist is
-    // allowed depends on the hook's runtime gating, not detection
-    assert!(ZenHook::is_strategy_tool("plan") || true);
-    assert!(!ZenHook::is_mutation_tool("read") || true);
+    assert!(ZenHook::is_strategy_tool("plan"));
+    assert!(!ZenHook::is_mutation_tool("read"));
 }

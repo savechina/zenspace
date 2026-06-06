@@ -6,10 +6,7 @@
 //   Adversarial: Invalid builder combinations, missing required fields
 //   Logic Tree: Role↔Clearance mappings, capability intersection logic
 
-use zen_agents::{
-    AgentClearance, AgentProfile, AgentProfileBuilder, Capability, CostPerToken, LlmPreference,
-    Role,
-};
+use zen_agents::{AgentClearance, AgentProfile, Capability, CostPerToken, LlmPreference, Role};
 
 // ============================================================================
 // Normal Dimension
@@ -67,13 +64,28 @@ fn capability_display_all_variants() {
     assert_eq!(Capability::Refactoring.to_string(), "refactoring");
     assert_eq!(Capability::Architecture.to_string(), "architecture");
     assert_eq!(Capability::SecurityAudit.to_string(), "security-audit");
-    assert_eq!(Capability::PerformanceOptimization.to_string(), "performance-optimization");
+    assert_eq!(
+        Capability::PerformanceOptimization.to_string(),
+        "performance-optimization"
+    );
     assert_eq!(Capability::TaskExecution.to_string(), "task-execution");
-    assert_eq!(Capability::SessionManagement.to_string(), "session-management");
-    assert_eq!(Capability::SpecificationWriting.to_string(), "specification-writing");
+    assert_eq!(
+        Capability::SessionManagement.to_string(),
+        "session-management"
+    );
+    assert_eq!(
+        Capability::SpecificationWriting.to_string(),
+        "specification-writing"
+    );
     assert_eq!(Capability::CodeGeneration.to_string(), "code-generation");
-    assert_eq!(Capability::KnowledgeManagement.to_string(), "knowledge-management");
-    assert_eq!(Capability::MemoryManagement.to_string(), "memory-management");
+    assert_eq!(
+        Capability::KnowledgeManagement.to_string(),
+        "knowledge-management"
+    );
+    assert_eq!(
+        Capability::MemoryManagement.to_string(),
+        "memory-management"
+    );
     assert_eq!(Capability::Analysis.to_string(), "analysis");
     assert_eq!(Capability::Automation.to_string(), "automation");
 }
@@ -122,7 +134,11 @@ fn has_all_capabilities_exact_match() {
 #[test]
 fn has_all_capabilities_subset() {
     let profile = AgentProfile::builder("a")
-        .capabilities(vec![Capability::CodeReview, Capability::Testing, Capability::Debugging])
+        .capabilities(vec![
+            Capability::CodeReview,
+            Capability::Testing,
+            Capability::Debugging,
+        ])
         .build();
     assert!(profile.has_all_capabilities(&[Capability::CodeReview]));
 }

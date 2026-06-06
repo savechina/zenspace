@@ -6,7 +6,6 @@
 //   Adversarial: Corrupt data, extreme entropy values, oversized content
 //   Logic Tree: Task complexity classification matrix
 
-use std::time::Duration;
 use futures::future::FutureExt;
 use uuid::Uuid;
 
@@ -93,11 +92,11 @@ fn feedback_increment_retry() {
 
 #[test]
 fn blackboard_channels_push_pop() {
-    let (mut bb, handle) = Blackboard::new(10);
+    let (bb, handle) = Blackboard::new(10);
 
     // Push and pop a task via handle
     let task = BlackboardTask::new("task1", 0.5, TaskType::Code);
-    let task_id = task.id;
+    let _task_id = task.id;
     bb.push_task(task).now_or_never();
     // Can't easily pop in sync test, but verify event was sent
     drop(bb);
@@ -127,10 +126,10 @@ fn deliverable_metadata_structure() {
 
 #[test]
 fn blackboard_new_with_min_capacity() {
-    let (mut bb, handle) = Blackboard::new(1);
+    let (bb, handle) = Blackboard::new(1);
     let task = BlackboardTask::new("overflow", 0.5, TaskType::Code);
     // With capacity 1, send should succeed
-    let result = bb.push_task(task).now_or_never();
+    let _result = bb.push_task(task).now_or_never();
     drop(bb);
     drop(handle);
 }
@@ -235,7 +234,10 @@ fn system_event_variants_have_correct_data() {
     }
 
     {
-        let event = SystemEvent::TaskStarted { task_id, agent: "agent".to_string() };
+        let event = SystemEvent::TaskStarted {
+            task_id,
+            agent: "agent".to_string(),
+        };
         match event {
             SystemEvent::TaskStarted { .. } => {}
             _ => panic!("wrong variant"),
@@ -259,7 +261,10 @@ fn system_event_variants_have_correct_data() {
     }
 
     {
-        let event = SystemEvent::Escalation { task_id, reason: "test".to_string() };
+        let event = SystemEvent::Escalation {
+            task_id,
+            reason: "test".to_string(),
+        };
         match event {
             SystemEvent::Escalation { .. } => {}
             _ => panic!("wrong variant"),

@@ -7,8 +7,8 @@
 //   Logic Tree: Role hierarchy counts, capability intersection, sensitivity filtering
 
 use zen_agents::{
-    AgentClearance, AgentProfile, Capability, CostPerToken, DefaultAgentRegistry, LlmPreference,
-    RegistryError, Role, AgentRegistry,
+    AgentClearance, AgentProfile, AgentRegistry, Capability, DefaultAgentRegistry, RegistryError,
+    Role,
 };
 
 // ============================================================================
@@ -24,7 +24,9 @@ fn has_thirteen_builtin_agents() {
 #[test]
 fn find_by_name_existing() {
     let registry = DefaultAgentRegistry::new();
-    let profile = registry.find_by_name("Sisyphus").expect("Sisyphus must exist");
+    let profile = registry
+        .find_by_name("Sisyphus")
+        .expect("Sisyphus must exist");
     assert_eq!(profile.role, Role::Orchestrator);
 }
 
@@ -115,7 +117,11 @@ fn builtin_agents_have_definitions() {
     let registry = DefaultAgentRegistry::new();
     let all = registry.list_all();
     let with_def: Vec<&&AgentProfile> = all.iter().filter(|p| p.definition.is_some()).collect();
-    assert_eq!(with_def.len(), 13, "all 13 built-in agents should have definitions");
+    assert_eq!(
+        with_def.len(),
+        13,
+        "all 13 built-in agents should have definitions"
+    );
 }
 
 // ============================================================================
@@ -161,9 +167,7 @@ fn register_after_lookup_consistent() {
     let mut registry = DefaultAgentRegistry::new();
     let initial = registry.list_all().len();
 
-    let agent = AgentProfile::builder("NewAgent")
-        .role(Role::Worker)
-        .build();
+    let agent = AgentProfile::builder("NewAgent").role(Role::Worker).build();
     registry.register(agent).unwrap();
 
     assert_eq!(registry.list_all().len(), initial + 1);

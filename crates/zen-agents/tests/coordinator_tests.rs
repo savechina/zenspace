@@ -7,7 +7,6 @@
 //   Logic Tree: All 18 routing rule branches, entropy/complexity thresholds
 
 use zen_agents::{EntropyConfig, ZenCoordinator};
-use zen_core::types::ComplexityLevel;
 
 // These tests test the PURE LOGIC of ZenCoordinator's intent classification
 // and entropy-based routing. They do NOT require a full wiring/registry setup
@@ -150,10 +149,7 @@ fn get_specialists_case_insensitive() {
         ZenCoordinator::get_specialists("DEEP_ANALYSIS"),
         vec!["Oracle"]
     );
-    assert_eq!(
-        ZenCoordinator::get_specialists("Research"),
-        vec!["Explore"]
-    );
+    assert_eq!(ZenCoordinator::get_specialists("Research"), vec!["Explore"]);
 }
 
 // ============================================================================
@@ -199,7 +195,11 @@ fn specialist_mapping_completeness() {
     ];
     for task_type in &known_types {
         let specialists = ZenCoordinator::get_specialists(task_type);
-        assert!(!specialists.is_empty(), "Task type '{}' should have at least one specialist", task_type);
+        assert!(
+            !specialists.is_empty(),
+            "Task type '{}' should have at least one specialist",
+            task_type
+        );
     }
 }
 

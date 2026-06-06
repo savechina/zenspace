@@ -107,7 +107,8 @@ fn momus_veto_on_create_and_delete() {
 fn momus_veto_on_no_verification() {
     let reviewer = MomusReviewer::new();
     let task = Task::new("big change", 0.6, TaskType::Code);
-    let plan = "Refactor the entire module to use a new pattern. Migrate all callers. Update configs.";
+    let plan =
+        "Refactor the entire module to use a new pattern. Migrate all callers. Update configs.";
     let review = reviewer.gate_review(&task, plan);
     // Long plan without verification keywords → blocking finding
     assert!(!review.approved);
@@ -119,7 +120,9 @@ fn momus_detects_circular_step_references() {
     let plan = "step 1: do thing\nstep 2: step 3\nstep 3: step 1\nstep 4: step 2\nstep 5: step 4\nstep 6: step 5\nstep 7: step 6";
     let findings = reviewer.check_plan_consistency(plan);
     assert!(
-        findings.iter().any(|f| f.finding_type.to_string().contains("Inconsistency")),
+        findings
+            .iter()
+            .any(|f| f.finding_type.to_string().contains("Inconsistency")),
         "Should detect circular step references"
     );
 }

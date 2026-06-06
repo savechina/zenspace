@@ -53,13 +53,16 @@ fn resource_limits_clone_and_debug() {
     assert_eq!(cloned.allowed_syscalls, limits.allowed_syscalls);
 
     let _debug = format!("{:?}", limits);
-    let _debug_output = format!("{:?}", ExecutionOutput {
-        stdout: "out".into(),
-        stderr: "err".into(),
-        exit_code: 0,
-        execution_time_ms: 10,
-        memory_used_bytes: 1024,
-    });
+    let _debug_output = format!(
+        "{:?}",
+        ExecutionOutput {
+            stdout: "out".into(),
+            stderr: "err".into(),
+            exit_code: 0,
+            execution_time_ms: 10,
+            memory_used_bytes: 1024,
+        }
+    );
 }
 
 // ============================================================================
@@ -86,7 +89,10 @@ fn wasm_sandbox_creation_with_zero_limits() {
         allowed_syscalls: Default::default(),
     };
     let sandbox = WasmSandbox::new(limits);
-    assert!(sandbox.is_ok(), "Sandbox should create even with zero limits");
+    assert!(
+        sandbox.is_ok(),
+        "Sandbox should create even with zero limits"
+    );
 }
 
 #[test]
@@ -135,9 +141,18 @@ fn sandbox_engine_accessible() {
 #[test]
 fn resource_limits_allowed_syscalls_default_includes_io() {
     let limits = ResourceLimits::default();
-    assert!(limits.allowed_syscalls.contains("fd_write"), "Default should allow fd_write");
-    assert!(limits.allowed_syscalls.contains("fd_read"), "Default should allow fd_read");
-    assert!(limits.allowed_syscalls.contains("proc_exit"), "Default should allow proc_exit");
+    assert!(
+        limits.allowed_syscalls.contains("fd_write"),
+        "Default should allow fd_write"
+    );
+    assert!(
+        limits.allowed_syscalls.contains("fd_read"),
+        "Default should allow fd_read"
+    );
+    assert!(
+        limits.allowed_syscalls.contains("proc_exit"),
+        "Default should allow proc_exit"
+    );
 }
 
 #[test]

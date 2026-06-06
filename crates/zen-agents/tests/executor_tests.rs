@@ -14,20 +14,50 @@ use zen_agents::{ErrorCategory, RetryPolicy};
 
 #[test]
 fn error_category_from_status_code_transient() {
-    assert_eq!(ErrorCategory::from_status_code(429), ErrorCategory::Transient);
-    assert_eq!(ErrorCategory::from_status_code(500), ErrorCategory::Transient);
-    assert_eq!(ErrorCategory::from_status_code(502), ErrorCategory::Transient);
-    assert_eq!(ErrorCategory::from_status_code(503), ErrorCategory::Transient);
-    assert_eq!(ErrorCategory::from_status_code(504), ErrorCategory::Transient);
+    assert_eq!(
+        ErrorCategory::from_status_code(429),
+        ErrorCategory::Transient
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(500),
+        ErrorCategory::Transient
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(502),
+        ErrorCategory::Transient
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(503),
+        ErrorCategory::Transient
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(504),
+        ErrorCategory::Transient
+    );
 }
 
 #[test]
 fn error_category_from_status_code_client_error() {
-    assert_eq!(ErrorCategory::from_status_code(400), ErrorCategory::ClientError);
-    assert_eq!(ErrorCategory::from_status_code(401), ErrorCategory::ClientError);
-    assert_eq!(ErrorCategory::from_status_code(403), ErrorCategory::ClientError);
-    assert_eq!(ErrorCategory::from_status_code(404), ErrorCategory::ClientError);
-    assert_eq!(ErrorCategory::from_status_code(422), ErrorCategory::ClientError);
+    assert_eq!(
+        ErrorCategory::from_status_code(400),
+        ErrorCategory::ClientError
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(401),
+        ErrorCategory::ClientError
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(403),
+        ErrorCategory::ClientError
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(404),
+        ErrorCategory::ClientError
+    );
+    assert_eq!(
+        ErrorCategory::from_status_code(422),
+        ErrorCategory::ClientError
+    );
 }
 
 #[test]
