@@ -80,7 +80,7 @@ fn test_resolver_all_sources_exhausted() {
     let result = resolver.resolve();
     assert!(result.is_err());
     match result.unwrap_err() {
-        AuthError::CredentialNotFound { .. } => {} // expected
+        AuthError::CredentialNotFound { .. } => {}  // expected
         AuthError::KeychainUnavailable { .. } => {} // acceptable on non-macOS
         other => panic!("expected CredentialNotFound or KeychainUnavailable, got: {other}"),
     }
