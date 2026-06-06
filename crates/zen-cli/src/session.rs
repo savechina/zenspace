@@ -85,6 +85,8 @@ impl SessionOrchestrator {
         let session = SessionEntity {
             id: id.clone(),
             agent_name: agent.to_string(),
+            title: None,
+            parent_id: None,
             sensitivity_policy: Sensitivity::Public,
             created_at: now,
             updated_at: now,
@@ -170,6 +172,8 @@ mod tests {
         let session = SessionEntity {
             id: "test-id".to_string(),
             agent_name: "Sisyphus-Junior".to_string(),
+            title: None,
+            parent_id: None,
             sensitivity_policy: Sensitivity::Public,
             created_at: Utc::now(),
             updated_at: Utc::now(),
