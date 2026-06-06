@@ -2,6 +2,7 @@ pub mod agent_command;
 pub mod audit_command;
 pub mod auth_command;
 pub mod brief_command;
+pub mod chat_command;
 pub mod cleanup_command;
 pub mod config_command;
 pub mod consolidate_command;

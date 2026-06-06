@@ -10,6 +10,7 @@ use crate::cmd::agent_command::{self, AgentCommands};
 use crate::cmd::audit_command::{self, AuditCommands};
 use crate::cmd::auth_command::{self, AuthCommands};
 use crate::cmd::brief_command::{self, BriefCommands};
+use crate::cmd::chat_command::{self, ChatArgs};
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::config_command::{self, ConfigCommands};
 use crate::cmd::consolidate_command::{self, ConsolidateCommands};
@@ -51,6 +52,10 @@ enum Commands {
         operation: Option<CleanupCommands>,
         #[arg(short, long, action, default_value = "false")]
         dry_run: bool,
+    },
+    Chat {
+        #[command(flatten)]
+        args: ChatArgs,
     },
     Starter {
         #[command(subcommand)]
@@ -220,6 +225,7 @@ pub async fn shell() -> Result<(), ZenError> {
             cleanup_command::execute_command(op)?;
             Ok(())
         }
+        Some(Commands::Chat { args }) => chat_command::execute_command(args).await,
 
         Some(Commands::Starter { operation }) => {
             starter_command::execute_command(operation)?;
