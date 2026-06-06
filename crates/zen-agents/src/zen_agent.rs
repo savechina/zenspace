@@ -159,7 +159,7 @@ impl ZenAgent {
 
         let request = CompletionRequest {
             model: None,
-            preamble: Some("You are a helpful Zen assistant. Answer concisely.".to_string()),
+            preamble: Some("You are a helpful Zen assistant. Answer concisely. Use proper markdown formatting with blank lines between headings, paragraphs, code blocks, and lists.".to_string()),
             chat_history: OneOrMany::one(Message::user(&prompt)),
             documents: Vec::new(),
             tools: Vec::new(),
@@ -250,7 +250,7 @@ impl ZenAgent {
 
         let request = CompletionRequest {
             model: None,
-            preamble: Some("You are a helpful Zen assistant. Answer concisely.".to_string()),
+            preamble: Some("You are a helpful Zen assistant. Answer concisely. Use proper markdown formatting with blank lines between headings, paragraphs, code blocks, and lists.".to_string()),
             chat_history: OneOrMany::one(Message::user(&prompt)),
             documents: Vec::new(),
             tools: Vec::new(),
