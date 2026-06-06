@@ -33,6 +33,11 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+tui-textarea-2 = { workspace = true }
+syntect = { workspace = true }
+two-face = { workspace = true }
+tui-markdown = { workspace = true }
+ansi-to-tui = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 libc = { workspace = true }
