@@ -22,7 +22,11 @@ fn agentic_llm_provider_unavailable_is_retryable() {
         provider: "openai".into(),
         reason: "connection refused".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::Retryable, "LlmProviderUnavailable should be Retryable");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::Retryable,
+        "LlmProviderUnavailable should be Retryable"
+    );
 }
 
 #[test]
@@ -31,7 +35,11 @@ fn agentic_llm_routing_failed_is_retryable() {
         provider: "ollama".into(),
         reason: "no available model".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::Retryable, "LlmRoutingFailed should be Retryable");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::Retryable,
+        "LlmRoutingFailed should be Retryable"
+    );
 }
 
 #[test]
@@ -40,7 +48,11 @@ fn agentic_llm_rate_limited_is_retryable() {
         provider: "anthropic".into(),
         retry_after_secs: 30,
     };
-    assert_eq!(e.category(), ErrorCategory::Retryable, "LlmRateLimited should be Retryable");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::Retryable,
+        "LlmRateLimited should be Retryable"
+    );
 }
 
 #[test]
@@ -49,7 +61,11 @@ fn agentic_llm_response_invalid_is_user_action() {
         expected: "json".into(),
         actual: "text/plain".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "LlmResponseInvalid should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "LlmResponseInvalid should be UserAction"
+    );
 }
 
 #[test]
@@ -58,7 +74,11 @@ fn agentic_llm_context_overflow_is_user_action() {
         tokens_used: 200_000,
         limit: 128_000,
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "LlmContextOverflow should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "LlmContextOverflow should be UserAction"
+    );
 }
 
 #[test]
@@ -66,7 +86,11 @@ fn agentic_knowledge_base_empty_is_system_error() {
     let e = AgenticError::KnowledgeBaseEmpty {
         path: "/data/knowledge".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::SystemError, "KnowledgeBaseEmpty should be SystemError");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SystemError,
+        "KnowledgeBaseEmpty should be SystemError"
+    );
 }
 
 #[test]
@@ -74,7 +98,11 @@ fn agentic_knowledge_search_failed_is_system_error() {
     let e = AgenticError::KnowledgeSearchFailed {
         reason: "index corrupted".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::SystemError, "KnowledgeSearchFailed should be SystemError");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SystemError,
+        "KnowledgeSearchFailed should be SystemError"
+    );
 }
 
 #[test]
@@ -82,7 +110,11 @@ fn agentic_knowledge_consolidate_failed_is_system_error() {
     let e = AgenticError::KnowledgeConsolidateFailed {
         error: "deadlock detected".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::SystemError, "KnowledgeConsolidateFailed should be SystemError");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SystemError,
+        "KnowledgeConsolidateFailed should be SystemError"
+    );
 }
 
 #[test]
@@ -91,7 +123,11 @@ fn agentic_knowledge_note_failed_is_system_error() {
         file: "note.md".into(),
         error: "parse error".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::SystemError, "KnowledgeNoteFailed should be SystemError");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SystemError,
+        "KnowledgeNoteFailed should be SystemError"
+    );
 }
 
 #[test]
@@ -99,7 +135,11 @@ fn agentic_qqbot_connection_failed_is_user_action() {
     let e = AgenticError::QqBotConnectionFailed {
         reason: "network unreachable".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "QqBotConnectionFailed should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "QqBotConnectionFailed should be UserAction"
+    );
 }
 
 #[test]
@@ -107,31 +147,59 @@ fn agentic_qqbot_auth_failed_is_user_action() {
     let e = AgenticError::QqBotAuthFailed {
         reason: "invalid token".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "QqBotAuthFailed should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "QqBotAuthFailed should be UserAction"
+    );
 }
 
 #[test]
 fn agentic_qqbot_rate_limited_is_retryable() {
-    let e = AgenticError::QqBotRateLimited { retry_after_secs: 60 };
-    assert_eq!(e.category(), ErrorCategory::Retryable, "QqBotRateLimited should be Retryable");
+    let e = AgenticError::QqBotRateLimited {
+        retry_after_secs: 60,
+    };
+    assert_eq!(
+        e.category(),
+        ErrorCategory::Retryable,
+        "QqBotRateLimited should be Retryable"
+    );
 }
 
 #[test]
 fn agentic_search_fts5_failed_is_system_error() {
-    let e = AgenticError::SearchFts5Failed { reason: "syntax error".into() };
-    assert_eq!(e.category(), ErrorCategory::SystemError, "SearchFts5Failed should be SystemError");
+    let e = AgenticError::SearchFts5Failed {
+        reason: "syntax error".into(),
+    };
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SystemError,
+        "SearchFts5Failed should be SystemError"
+    );
 }
 
 #[test]
 fn agentic_search_vector_failed_is_system_error() {
-    let e = AgenticError::SearchVectorFailed { reason: "dimension mismatch".into() };
-    assert_eq!(e.category(), ErrorCategory::SystemError, "SearchVectorFailed should be SystemError");
+    let e = AgenticError::SearchVectorFailed {
+        reason: "dimension mismatch".into(),
+    };
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SystemError,
+        "SearchVectorFailed should be SystemError"
+    );
 }
 
 #[test]
 fn agentic_search_graph_failed_is_system_error() {
-    let e = AgenticError::SearchGraphFailed { reason: "node not found".into() };
-    assert_eq!(e.category(), ErrorCategory::SystemError, "SearchGraphFailed should be SystemError");
+    let e = AgenticError::SearchGraphFailed {
+        reason: "node not found".into(),
+    };
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SystemError,
+        "SearchGraphFailed should be SystemError"
+    );
 }
 
 #[test]
@@ -139,7 +207,11 @@ fn agentic_macos_keychain_denied_is_user_action() {
     let e = AgenticError::MacosKeychainDenied {
         service: "zen-openai".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "MacosKeychainDenied should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "MacosKeychainDenied should be UserAction"
+    );
 }
 
 #[test]
@@ -147,7 +219,11 @@ fn agentic_macos_accessibility_denied_is_user_action() {
     let e = AgenticError::MacosAccessibilityDenied {
         feature: "screen recording".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "MacosAccessibilityDenied should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "MacosAccessibilityDenied should be UserAction"
+    );
 }
 
 #[test]
@@ -156,7 +232,11 @@ fn agentic_plugin_load_failed_is_user_action() {
         plugin_id: "my-plugin".into(),
         error: "binary not found".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "PluginLoadFailed should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "PluginLoadFailed should be UserAction"
+    );
 }
 
 #[test]
@@ -165,7 +245,11 @@ fn agentic_plugin_sandbox_violation_is_safety_block() {
         plugin_id: "rogue".into(),
         operation: "read /etc/passwd".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::SafetyBlock, "PluginSandboxViolation should be SafetyBlock");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::SafetyBlock,
+        "PluginSandboxViolation should be SafetyBlock"
+    );
 }
 
 #[test]
@@ -174,16 +258,25 @@ fn agentic_plugin_permission_denied_is_user_action() {
         plugin_id: "my-plugin".into(),
         permission: "network".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::UserAction, "PluginPermissionDenied should be UserAction");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::UserAction,
+        "PluginPermissionDenied should be UserAction"
+    );
 }
 
 // ── ConfigError Display (4 variants) ──
 
 #[test]
 fn config_error_missing_file_display() {
-    let e = ConfigError::MissingFile { path: "/tmp/zen/config.toml".into() };
+    let e = ConfigError::MissingFile {
+        path: "/tmp/zen/config.toml".into(),
+    };
     let msg = e.to_string();
-    assert!(msg.contains("/tmp/zen/config.toml"), "Display should contain path: {msg}");
+    assert!(
+        msg.contains("/tmp/zen/config.toml"),
+        "Display should contain path: {msg}"
+    );
 }
 
 #[test]
@@ -193,8 +286,14 @@ fn config_error_parse_error_display() {
         reason: "invalid TOML syntax".into(),
     };
     let msg = e.to_string();
-    assert!(msg.contains("config.toml"), "Display should contain path: {msg}");
-    assert!(msg.contains("invalid TOML syntax"), "Display should contain reason: {msg}");
+    assert!(
+        msg.contains("config.toml"),
+        "Display should contain path: {msg}"
+    );
+    assert!(
+        msg.contains("invalid TOML syntax"),
+        "Display should contain reason: {msg}"
+    );
 }
 
 #[test]
@@ -205,39 +304,55 @@ fn config_error_validation_error_display() {
     };
     let msg = e.to_string();
     assert!(msg.contains("model"), "Display should contain key: {msg}");
-    assert!(msg.contains("must be non-empty"), "Display should contain reason: {msg}");
+    assert!(
+        msg.contains("must be non-empty"),
+        "Display should contain reason: {msg}"
+    );
 }
 
 #[test]
 fn config_error_missing_env_var_display() {
-    let e = ConfigError::MissingEnvVar { variable: "ZEN_API_KEY".into() };
+    let e = ConfigError::MissingEnvVar {
+        variable: "ZEN_API_KEY".into(),
+    };
     let msg = e.to_string();
-    assert!(msg.contains("ZEN_API_KEY"), "Display should contain variable name: {msg}");
+    assert!(
+        msg.contains("ZEN_API_KEY"),
+        "Display should contain variable name: {msg}"
+    );
 }
 
 // ── PathError Display (5 variants) ──
 
 #[test]
 fn path_error_not_found_display() {
-    let e = PathError::NotFound { path: "/nonexistent".into() };
+    let e = PathError::NotFound {
+        path: "/nonexistent".into(),
+    };
     assert!(e.to_string().contains("/nonexistent"));
 }
 
 #[test]
 fn path_error_not_a_directory_display() {
-    let e = PathError::NotADirectory { path: "/tmp/file.txt".into() };
+    let e = PathError::NotADirectory {
+        path: "/tmp/file.txt".into(),
+    };
     assert!(e.to_string().contains("/tmp/file.txt"));
 }
 
 #[test]
 fn path_error_not_a_file_display() {
-    let e = PathError::NotAFile { path: "/tmp/dir".into() };
+    let e = PathError::NotAFile {
+        path: "/tmp/dir".into(),
+    };
     assert!(e.to_string().contains("/tmp/dir"));
 }
 
 #[test]
 fn path_error_permission_denied_display() {
-    let e = PathError::PermissionDenied { path: "/etc/shadow".into() };
+    let e = PathError::PermissionDenied {
+        path: "/etc/shadow".into(),
+    };
     assert!(e.to_string().contains("/etc/shadow"));
 }
 
@@ -251,7 +366,9 @@ fn path_error_home_dir_not_found_display() {
 
 #[test]
 fn parse_error_json_error_display() {
-    let e = ParseError::JsonError { reason: "unexpected token".into() };
+    let e = ParseError::JsonError {
+        reason: "unexpected token".into(),
+    };
     assert!(e.to_string().contains("JSON"));
     assert!(e.to_string().contains("unexpected token"));
 }
@@ -288,7 +405,9 @@ fn service_error_message_display() {
 
 #[test]
 fn zen_error_config_display() {
-    let err = ConfigError::MissingFile { path: "test.toml".into() };
+    let err = ConfigError::MissingFile {
+        path: "test.toml".into(),
+    };
     let e = ZenError::Config(err);
     assert!(e.to_string().contains("test.toml"));
 }
@@ -302,28 +421,43 @@ fn zen_error_path_display() {
 
 #[test]
 fn zen_error_agentic_display() {
-    let inner = AgenticError::LlmRateLimited { provider: "openai".into(), retry_after_secs: 10 };
+    let inner = AgenticError::LlmRateLimited {
+        provider: "openai".into(),
+        retry_after_secs: 10,
+    };
     let e = ZenError::Agentic(inner, ErrorCategory::Retryable);
     let msg = e.to_string();
-    assert!(msg.contains("openai"), "Display should contain provider: {msg}");
-    assert!(msg.contains("retryable"), "Display should contain category: {msg}");
+    assert!(
+        msg.contains("openai"),
+        "Display should contain provider: {msg}"
+    );
+    assert!(
+        msg.contains("retryable"),
+        "Display should contain category: {msg}"
+    );
 }
 
 #[test]
 fn zen_error_io_display() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file missing"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "file missing",
+    ));
     assert!(e.to_string().contains("file missing"));
 }
 
 #[test]
 fn zen_error_parse_display() {
-    let e = ZenError::Parse(ParseError::JsonError { reason: "bad json".into() });
+    let e = ZenError::Parse(ParseError::JsonError {
+        reason: "bad json".into(),
+    });
     assert!(e.to_string().contains("bad json"));
 }
 
 #[test]
 fn zen_error_serialization_display() {
-    let e = ZenError::Serialization(serde_json::from_str::<serde_json::Value>("invalid").unwrap_err());
+    let e =
+        ZenError::Serialization(serde_json::from_str::<serde_json::Value>("invalid").unwrap_err());
     assert!(e.to_string().contains("error"));
 }
 
@@ -367,7 +501,10 @@ fn error_category_display_safety_block() {
 
 #[test]
 fn agentic_error_into_zen_error_preserves_category() {
-    let original = AgenticError::LlmRateLimited { provider: "test".into(), retry_after_secs: 5 };
+    let original = AgenticError::LlmRateLimited {
+        provider: "test".into(),
+        retry_after_secs: 5,
+    };
     let cat = original.category();
     let zen: ZenError = original.into();
     match &zen {
@@ -379,14 +516,27 @@ fn agentic_error_into_zen_error_preserves_category() {
 #[test]
 fn agentic_error_into_zen_error_all_categories() {
     let variants: Vec<AgenticError> = vec![
-        AgenticError::LlmProviderUnavailable { provider: "p".into(), reason: "r".into() },
-        AgenticError::LlmResponseInvalid { expected: "e".into(), actual: "a".into() },
+        AgenticError::LlmProviderUnavailable {
+            provider: "p".into(),
+            reason: "r".into(),
+        },
+        AgenticError::LlmResponseInvalid {
+            expected: "e".into(),
+            actual: "a".into(),
+        },
         AgenticError::KnowledgeBaseEmpty { path: "p".into() },
         AgenticError::QqBotConnectionFailed { reason: "r".into() },
-        AgenticError::QqBotRateLimited { retry_after_secs: 1 },
+        AgenticError::QqBotRateLimited {
+            retry_after_secs: 1,
+        },
         AgenticError::SearchFts5Failed { reason: "r".into() },
-        AgenticError::MacosKeychainDenied { service: "s".into() },
-        AgenticError::PluginSandboxViolation { plugin_id: "p".into(), operation: "o".into() },
+        AgenticError::MacosKeychainDenied {
+            service: "s".into(),
+        },
+        AgenticError::PluginSandboxViolation {
+            plugin_id: "p".into(),
+            operation: "o".into(),
+        },
     ];
     for v in variants {
         let cat = v.category();
@@ -403,7 +553,10 @@ fn service_error_io_into_zen_error() {
     let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
     let svc_err = ServiceError::Io(io_err);
     let zen: ZenError = svc_err.into();
-    assert!(matches!(zen, ZenError::Io(_)), "ServiceError::Io should become ZenError::Io");
+    assert!(
+        matches!(zen, ZenError::Io(_)),
+        "ServiceError::Io should become ZenError::Io"
+    );
 }
 
 #[test]
@@ -418,23 +571,36 @@ fn service_error_message_into_zen_error() {
 
 #[test]
 fn config_error_into_zen_error() {
-    let cerr = ConfigError::MissingFile { path: "test.toml".into() };
+    let cerr = ConfigError::MissingFile {
+        path: "test.toml".into(),
+    };
     let zen: ZenError = cerr.into();
-    assert!(matches!(zen, ZenError::Config(_)), "ConfigError should become ZenError::Config");
+    assert!(
+        matches!(zen, ZenError::Config(_)),
+        "ConfigError should become ZenError::Config"
+    );
 }
 
 #[test]
 fn path_error_into_zen_error() {
     let perr = PathError::NotFound { path: "/x".into() };
     let zen: ZenError = perr.into();
-    assert!(matches!(zen, ZenError::Path(_)), "PathError should become ZenError::Path");
+    assert!(
+        matches!(zen, ZenError::Path(_)),
+        "PathError should become ZenError::Path"
+    );
 }
 
 #[test]
 fn parse_error_into_zen_error() {
-    let perr = ParseError::JsonError { reason: "bad".into() };
+    let perr = ParseError::JsonError {
+        reason: "bad".into(),
+    };
     let zen: ZenError = perr.into();
-    assert!(matches!(zen, ZenError::Parse(_)), "ParseError should become ZenError::Parse");
+    assert!(
+        matches!(zen, ZenError::Parse(_)),
+        "ParseError should become ZenError::Parse"
+    );
 }
 
 // ============================================================================
@@ -447,7 +613,11 @@ fn agentic_error_empty_strings() {
         provider: "".into(),
         reason: "".into(),
     };
-    assert_eq!(e.category(), ErrorCategory::Retryable, "Empty strings should not affect category");
+    assert_eq!(
+        e.category(),
+        ErrorCategory::Retryable,
+        "Empty strings should not affect category"
+    );
     let msg = e.to_string();
     // Should not panic or produce garbled output
     assert!(!msg.is_empty(), "Display should not be empty");
@@ -461,12 +631,18 @@ fn agentic_error_max_u64_values() {
     };
     assert_eq!(e.category(), ErrorCategory::UserAction);
     let msg = e.to_string();
-    assert!(msg.contains(&u64::MAX.to_string()), "Display should contain max u64: {msg}");
+    assert!(
+        msg.contains(&u64::MAX.to_string()),
+        "Display should contain max u64: {msg}"
+    );
 }
 
 #[test]
 fn agentic_error_zero_retry_after() {
-    let e = AgenticError::LlmRateLimited { provider: "test".into(), retry_after_secs: 0 };
+    let e = AgenticError::LlmRateLimited {
+        provider: "test".into(),
+        retry_after_secs: 0,
+    };
     assert_eq!(e.category(), ErrorCategory::Retryable);
     assert!(e.to_string().contains("0s"), "Display should include 0s");
 }
@@ -479,8 +655,14 @@ fn agentic_error_unicode_in_fields() {
     };
     assert_eq!(e.category(), ErrorCategory::SystemError);
     let msg = e.to_string();
-    assert!(msg.contains("文書.md"), "Display should contain unicode: {msg}");
-    assert!(msg.contains("解析エラー"), "Display should contain unicode: {msg}");
+    assert!(
+        msg.contains("文書.md"),
+        "Display should contain unicode: {msg}"
+    );
+    assert!(
+        msg.contains("解析エラー"),
+        "Display should contain unicode: {msg}"
+    );
 }
 
 #[test]
@@ -496,19 +678,28 @@ fn agentic_error_special_chars() {
 fn config_error_empty_path() {
     let e = ConfigError::MissingFile { path: "".into() };
     let msg = e.to_string();
-    assert!(msg.contains("missing configuration file"), "Even empty path should produce valid display");
+    assert!(
+        msg.contains("missing configuration file"),
+        "Even empty path should produce valid display"
+    );
 }
 
 #[test]
 fn path_error_empty_path() {
     let e = PathError::NotFound { path: "".into() };
     let msg = e.to_string();
-    assert!(msg.contains("path does not exist"), "Even empty path should produce valid display");
+    assert!(
+        msg.contains("path does not exist"),
+        "Even empty path should produce valid display"
+    );
 }
 
 #[test]
 fn zen_error_agentic_with_empty_agentic_error() {
-    let inner = AgenticError::LlmProviderUnavailable { provider: "".into(), reason: "".into() };
+    let inner = AgenticError::LlmProviderUnavailable {
+        provider: "".into(),
+        reason: "".into(),
+    };
     let e = ZenError::Agentic(inner, ErrorCategory::Retryable);
     // Should not panic
     let _ = e.to_string();
@@ -541,7 +732,10 @@ fn zen_error_io_not_found_is_user_action() {
 
 #[test]
 fn zen_error_io_permission_denied_is_user_action() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "denied",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::UserAction));
 }
 
@@ -553,19 +747,27 @@ fn zen_error_io_timed_out_is_retryable() {
 
 #[test]
 fn zen_error_io_interrupted_is_retryable() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "interrupted",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::Retryable));
 }
 
 #[test]
 fn zen_error_io_other_is_system_error() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "refused",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::SystemError));
 }
 
 #[test]
 fn zen_error_parse_category_is_user_action() {
-    let e = ZenError::Parse(ParseError::JsonError { reason: "bad".into() });
+    let e = ZenError::Parse(ParseError::JsonError {
+        reason: "bad".into(),
+    });
     assert_eq!(e.category(), Some(ErrorCategory::UserAction));
 }
 
@@ -591,7 +793,10 @@ fn zen_error_message_category_is_user_action() {
 
 #[test]
 fn zen_error_agentic_category_propagated() {
-    let inner = AgenticError::LlmRateLimited { provider: "p".into(), retry_after_secs: 5 };
+    let inner = AgenticError::LlmRateLimited {
+        provider: "p".into(),
+        retry_after_secs: 5,
+    };
     let cat = inner.category();
     let e = ZenError::Agentic(inner, cat);
     assert_eq!(e.category(), Some(cat));
@@ -601,19 +806,28 @@ fn zen_error_agentic_category_propagated() {
 
 #[test]
 fn zen_error_io_broken_pipe_is_system_error() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "broken",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::SystemError));
 }
 
 #[test]
 fn zen_error_io_connection_reset_is_system_error() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "reset",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::SystemError));
 }
 
 #[test]
 fn zen_error_io_connection_aborted_is_system_error() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "aborted"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "aborted",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::SystemError));
 }
 
@@ -625,13 +839,19 @@ fn zen_error_io_addr_in_use_is_system_error() {
 
 #[test]
 fn zen_error_io_write_zero_is_system_error() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::WriteZero, "write zero"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::WriteZero,
+        "write zero",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::SystemError));
 }
 
 #[test]
 fn zen_error_io_unexpected_eof_is_system_error() {
-    let e = ZenError::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"));
+    let e = ZenError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "eof",
+    ));
     assert_eq!(e.category(), Some(ErrorCategory::SystemError));
 }
 
@@ -641,30 +861,127 @@ fn zen_error_io_unexpected_eof_is_system_error() {
 fn agentic_error_all_variants_mapped() {
     // Every variant must return a valid ErrorCategory — no panic, no wildcard
     let variants: Vec<(AgenticError, ErrorCategory)> = vec![
-        (AgenticError::LlmProviderUnavailable { provider: "p".into(), reason: "r".into() }, ErrorCategory::Retryable),
-        (AgenticError::LlmRoutingFailed { provider: "p".into(), reason: "r".into() }, ErrorCategory::Retryable),
-        (AgenticError::LlmRateLimited { provider: "p".into(), retry_after_secs: 1 }, ErrorCategory::Retryable),
-        (AgenticError::LlmResponseInvalid { expected: "e".into(), actual: "a".into() }, ErrorCategory::UserAction),
-        (AgenticError::LlmContextOverflow { tokens_used: 1, limit: 1 }, ErrorCategory::UserAction),
-        (AgenticError::KnowledgeBaseEmpty { path: "p".into() }, ErrorCategory::SystemError),
-        (AgenticError::KnowledgeSearchFailed { reason: "r".into() }, ErrorCategory::SystemError),
-        (AgenticError::KnowledgeConsolidateFailed { error: "e".into() }, ErrorCategory::SystemError),
-        (AgenticError::KnowledgeNoteFailed { file: "f".into(), error: "e".into() }, ErrorCategory::SystemError),
-        (AgenticError::QqBotConnectionFailed { reason: "r".into() }, ErrorCategory::UserAction),
-        (AgenticError::QqBotAuthFailed { reason: "r".into() }, ErrorCategory::UserAction),
-        (AgenticError::QqBotRateLimited { retry_after_secs: 1 }, ErrorCategory::Retryable),
-        (AgenticError::SearchFts5Failed { reason: "r".into() }, ErrorCategory::SystemError),
-        (AgenticError::SearchVectorFailed { reason: "r".into() }, ErrorCategory::SystemError),
-        (AgenticError::SearchGraphFailed { reason: "r".into() }, ErrorCategory::SystemError),
-        (AgenticError::MacosKeychainDenied { service: "s".into() }, ErrorCategory::UserAction),
-        (AgenticError::MacosAccessibilityDenied { feature: "f".into() }, ErrorCategory::UserAction),
-        (AgenticError::PluginLoadFailed { plugin_id: "p".into(), error: "e".into() }, ErrorCategory::UserAction),
-        (AgenticError::PluginSandboxViolation { plugin_id: "p".into(), operation: "o".into() }, ErrorCategory::SafetyBlock),
-        (AgenticError::PluginPermissionDenied { plugin_id: "p".into(), permission: "p".into() }, ErrorCategory::UserAction),
+        (
+            AgenticError::LlmProviderUnavailable {
+                provider: "p".into(),
+                reason: "r".into(),
+            },
+            ErrorCategory::Retryable,
+        ),
+        (
+            AgenticError::LlmRoutingFailed {
+                provider: "p".into(),
+                reason: "r".into(),
+            },
+            ErrorCategory::Retryable,
+        ),
+        (
+            AgenticError::LlmRateLimited {
+                provider: "p".into(),
+                retry_after_secs: 1,
+            },
+            ErrorCategory::Retryable,
+        ),
+        (
+            AgenticError::LlmResponseInvalid {
+                expected: "e".into(),
+                actual: "a".into(),
+            },
+            ErrorCategory::UserAction,
+        ),
+        (
+            AgenticError::LlmContextOverflow {
+                tokens_used: 1,
+                limit: 1,
+            },
+            ErrorCategory::UserAction,
+        ),
+        (
+            AgenticError::KnowledgeBaseEmpty { path: "p".into() },
+            ErrorCategory::SystemError,
+        ),
+        (
+            AgenticError::KnowledgeSearchFailed { reason: "r".into() },
+            ErrorCategory::SystemError,
+        ),
+        (
+            AgenticError::KnowledgeConsolidateFailed { error: "e".into() },
+            ErrorCategory::SystemError,
+        ),
+        (
+            AgenticError::KnowledgeNoteFailed {
+                file: "f".into(),
+                error: "e".into(),
+            },
+            ErrorCategory::SystemError,
+        ),
+        (
+            AgenticError::QqBotConnectionFailed { reason: "r".into() },
+            ErrorCategory::UserAction,
+        ),
+        (
+            AgenticError::QqBotAuthFailed { reason: "r".into() },
+            ErrorCategory::UserAction,
+        ),
+        (
+            AgenticError::QqBotRateLimited {
+                retry_after_secs: 1,
+            },
+            ErrorCategory::Retryable,
+        ),
+        (
+            AgenticError::SearchFts5Failed { reason: "r".into() },
+            ErrorCategory::SystemError,
+        ),
+        (
+            AgenticError::SearchVectorFailed { reason: "r".into() },
+            ErrorCategory::SystemError,
+        ),
+        (
+            AgenticError::SearchGraphFailed { reason: "r".into() },
+            ErrorCategory::SystemError,
+        ),
+        (
+            AgenticError::MacosKeychainDenied {
+                service: "s".into(),
+            },
+            ErrorCategory::UserAction,
+        ),
+        (
+            AgenticError::MacosAccessibilityDenied {
+                feature: "f".into(),
+            },
+            ErrorCategory::UserAction,
+        ),
+        (
+            AgenticError::PluginLoadFailed {
+                plugin_id: "p".into(),
+                error: "e".into(),
+            },
+            ErrorCategory::UserAction,
+        ),
+        (
+            AgenticError::PluginSandboxViolation {
+                plugin_id: "p".into(),
+                operation: "o".into(),
+            },
+            ErrorCategory::SafetyBlock,
+        ),
+        (
+            AgenticError::PluginPermissionDenied {
+                plugin_id: "p".into(),
+                permission: "p".into(),
+            },
+            ErrorCategory::UserAction,
+        ),
     ];
 
     for (variant, expected_category) in variants {
-        assert_eq!(variant.category(), expected_category, "Failed for variant: {variant}");
+        assert_eq!(
+            variant.category(),
+            expected_category,
+            "Failed for variant: {variant}"
+        );
     }
 }
 

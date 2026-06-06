@@ -25,7 +25,7 @@ fn test_sanitize_removes_system_tags() {
     let sanitized = result.unwrap();
     assert!(!sanitized.sanitized.contains("<system>"));
     assert!(!sanitized.sanitized.contains("</system>"));
-    assert!(sanitized.stripped_patterns.len() > 0);
+    assert!(!sanitized.stripped_patterns.is_empty());
 }
 
 #[test]
@@ -92,7 +92,10 @@ fn test_sanitize_handles_empty_input() {
     assert!(result.is_ok());
     let sanitized = result.unwrap();
     // Sanitizer wraps content in [USER_CONTENT_START]...[USER_CONTENT_END] markers
-    assert_eq!(sanitized.sanitized, "[USER_CONTENT_START][USER_CONTENT_END]");
+    assert_eq!(
+        sanitized.sanitized,
+        "[USER_CONTENT_START][USER_CONTENT_END]"
+    );
     assert_eq!(sanitized.original, "");
 }
 
@@ -103,7 +106,7 @@ fn test_sanitize_handles_special_characters() {
     let result = sanitizer.sanitize(input);
     assert!(result.is_ok());
     let sanitized = result.unwrap();
-    assert!(sanitized.sanitized.len() > 0);
+    assert!(!sanitized.sanitized.is_empty());
 }
 
 #[test]

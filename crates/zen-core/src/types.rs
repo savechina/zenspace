@@ -96,6 +96,10 @@ pub struct SessionEntity {
     pub id: String,
     /// Agent name from zen-agents registry.
     pub agent_name: String,
+    /// User-assigned session title (optional).
+    pub title: Option<String>,
+    /// Parent session ID (for fork tracking).
+    pub parent_id: Option<String>,
     /// Computed max sensitivity across retrieved notes.
     pub sensitivity_policy: Sensitivity,
     /// Session creation time (ISO 8601).
@@ -115,12 +119,39 @@ impl SessionEntity {
         Self {
             id: Uuid::now_v7().to_string(),
             agent_name: agent_name.to_string(),
+            title: None,
+            parent_id: None,
             sensitivity_policy: Sensitivity::Private, // Safe default (FR-071)
             created_at: now,
             updated_at: now,
             status: SessionStatus::Active,
             workspace: workspace.to_string(),
         }
+    }
+
+    /// Create a fork of this session with a new ID.
+    pub fn fork(&self, title: Option<String>) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::now_v7().to_string(),
+            agent_name: self.agent_name.clone(),
+            title: title.or_else(|| self.title.as_ref().map(|t| format!("{} (fork)", t))),
+            parent_id: Some(self.id.clone()),
+            sensitivity_policy: self.sensitivity_policy,
+            created_at: now,
+            updated_at: now,
+            status: SessionStatus::Active,
+            workspace: self.workspace.clone(),
+        }
+    }
+
+    /// Rename this session.
+    pub fn rename(&mut self, title: String) -> Result<()> {
+        self.title = Some(title);
+        self.updated_at = Utc::now();
+        self.save()?;
+        info!(session_id = %self.id, title = %self.title.as_ref().unwrap(), "session renamed");
+        Ok(())
     }
 
     /// Save this session to `~/.zen/sessions/<id>.json`.

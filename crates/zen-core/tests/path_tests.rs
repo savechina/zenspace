@@ -23,7 +23,9 @@ fn setup_zen_home() -> (TempDir, PathBuf) {
     let home_path = tmp.path().join("home");
     std::fs::create_dir_all(&home_path).expect("Failed to create home dir");
     // SAFETY: nextest runs each test in its own process, so env var isolation is guaranteed
-    unsafe { std::env::set_var("ZEN_HOME", &home_path); }
+    unsafe {
+        std::env::set_var("ZEN_HOME", &home_path);
+    }
     (tmp, home_path)
 }
 
@@ -40,8 +42,10 @@ fn setup_workspace(base: &std::path::Path, name: &str) -> PathBuf {
 fn unset_home_env() {
     // SAFETY: nextest runs each test in its own process, so env var isolation is guaranteed
     unsafe {
-        unsafe { std::env::remove_var("ZEN_HOME"); }
-        unsafe { std::env::remove_var("HOME"); }
+        std::env::remove_var("ZEN_HOME");
+    }
+    unsafe {
+        std::env::remove_var("HOME");
     }
 }
 
@@ -53,35 +57,60 @@ fn unset_home_env() {
 fn detect_with_zen_home_succeeds() {
     let (_tmp, home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed with ZEN_HOME set");
-    assert_eq!(paths.global_root(), &home_path, "global_root should match ZEN_HOME");
-    assert!(paths.workspace_root().is_none(), "No workspace should be found in temp dir");
+    assert_eq!(
+        paths.global_root(),
+        &home_path,
+        "global_root should match ZEN_HOME"
+    );
+    assert!(
+        paths.workspace_root().is_none(),
+        "No workspace should be found in temp dir"
+    );
 }
 
 #[test]
 fn detect_with_workspace_sets_workspace_root() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "my-project");
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &ws); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
 
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert_eq!(paths.global_root(), &home_path);
-    assert_eq!(paths.workspace_root(), Some(&ws), "workspace_root should be set");
+    assert_eq!(
+        paths.workspace_root(),
+        Some(&ws),
+        "workspace_root should be set"
+    );
 
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn config_file_uses_workspace_when_present() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "project-a");
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &ws); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
 
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let cfg = paths.config_file();
-    assert!(cfg.starts_with(&ws), "config_file should be under workspace: {cfg:?}");
-    assert!(cfg.ends_with("config.toml"), "config_file should end with config.toml: {cfg:?}");
+    assert!(
+        cfg.starts_with(&ws),
+        "config_file should be under workspace: {cfg:?}"
+    );
+    assert!(
+        cfg.ends_with("config.toml"),
+        "config_file should end with config.toml: {cfg:?}"
+    );
 
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
@@ -90,27 +119,43 @@ fn config_file_uses_global_when_no_workspace() {
 
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let cfg = paths.config_file();
-    assert!(cfg.starts_with(&home_path), "config_file should be under global: {cfg:?}");
-    assert!(cfg.ends_with("config.toml"), "config_file should end with config.toml: {cfg:?}");
+    assert!(
+        cfg.starts_with(&home_path),
+        "config_file should be under global: {cfg:?}"
+    );
+    assert!(
+        cfg.ends_with("config.toml"),
+        "config_file should end with config.toml: {cfg:?}"
+    );
 }
 
 #[test]
 fn knowledge_path_is_under_user_data() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "project");
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &ws); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
 
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let kb = paths.knowledge();
-    assert!(kb.starts_with(&ws), "knowledge should be under workspace: {kb:?}");
-    assert!(kb.ends_with("knowledge"), "knowledge should end with 'knowledge': {kb:?}");
+    assert!(
+        kb.starts_with(&ws),
+        "knowledge should be under workspace: {kb:?}"
+    );
+    assert!(
+        kb.ends_with("knowledge"),
+        "knowledge should end with 'knowledge': {kb:?}"
+    );
 
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn inbox_is_under_knowledge() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let inbox = paths.inbox();
     assert!(inbox.ends_with("knowledge/inbox"), "inbox path: {inbox:?}");
@@ -118,7 +163,7 @@ fn inbox_is_under_knowledge() {
 
 #[test]
 fn raw_is_under_knowledge() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let raw = paths.raw();
     assert!(raw.ends_with("knowledge/raw"), "raw path: {raw:?}");
@@ -126,7 +171,7 @@ fn raw_is_under_knowledge() {
 
 #[test]
 fn wiki_is_under_knowledge() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let wiki = paths.wiki();
     assert!(wiki.ends_with("knowledge/wiki"), "wiki path: {wiki:?}");
@@ -134,7 +179,7 @@ fn wiki_is_under_knowledge() {
 
 #[test]
 fn skills_is_under_user_data() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let skills = paths.skills();
     assert!(skills.ends_with("skills"), "skills path: {skills:?}");
@@ -146,8 +191,14 @@ fn cache_is_under_global_root() {
     let paths = ZenPaths::detect().expect("detect() should succeed");
 
     let cache_path = paths.cache("embeddings");
-    assert!(cache_path.starts_with(&home_path), "cache should be under global: {cache_path:?}");
-    assert!(cache_path.ends_with("cache/embeddings"), "cache path: {cache_path:?}");
+    assert!(
+        cache_path.starts_with(&home_path),
+        "cache should be under global: {cache_path:?}"
+    );
+    assert!(
+        cache_path.ends_with("cache/embeddings"),
+        "cache path: {cache_path:?}"
+    );
 }
 
 #[test]
@@ -161,42 +212,42 @@ fn db_is_under_global_root() {
 
 #[test]
 fn sessions_is_under_global_root() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.sessions().ends_with("sessions"));
 }
 
 #[test]
 fn memory_is_under_global_root() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.memory().ends_with("memory"));
 }
 
 #[test]
 fn identity_is_under_global_root() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.identity().ends_with("identity"));
 }
 
 #[test]
 fn logs_is_under_global_root() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.logs().ends_with("logs"));
 }
 
 #[test]
 fn plugins_is_under_global_root() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.plugins().ends_with("plugins"));
 }
 
 #[test]
 fn finance_is_under_user_data() {
-    let (_tmp, home_path) = setup_zen_home();
+    let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.finance().ends_with("finance"));
 }
@@ -205,14 +256,21 @@ fn finance_is_under_user_data() {
 fn output_under_workspace_when_present() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "output-project");
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &ws); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
 
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let out = paths.output();
-    assert!(out.starts_with(&ws), "output should be under workspace: {out:?}");
+    assert!(
+        out.starts_with(&ws),
+        "output should be under workspace: {out:?}"
+    );
     assert!(out.ends_with("output"), "output path: {out:?}");
 
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
@@ -220,7 +278,10 @@ fn output_under_global_when_no_workspace() {
     let (_tmp, home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let out = paths.output();
-    assert!(out.starts_with(&home_path), "output should be under global: {out:?}");
+    assert!(
+        out.starts_with(&home_path),
+        "output should be under global: {out:?}"
+    );
     assert!(out.ends_with("output"), "output path: {out:?}");
 }
 
@@ -228,14 +289,21 @@ fn output_under_global_when_no_workspace() {
 fn user_data_under_workspace_when_present() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "ws");
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &ws); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
 
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let data_path = paths.user_data("custom-data");
-    assert!(data_path.starts_with(&ws), "user_data should be under workspace: {data_path:?}");
+    assert!(
+        data_path.starts_with(&ws),
+        "user_data should be under workspace: {data_path:?}"
+    );
     assert!(data_path.ends_with("custom-data"));
 
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
@@ -243,7 +311,10 @@ fn user_data_under_global_when_no_workspace() {
     let (_tmp, home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let data_path = paths.user_data("custom-data");
-    assert!(data_path.starts_with(&home_path), "user_data should be under global: {data_path:?}");
+    assert!(
+        data_path.starts_with(&home_path),
+        "user_data should be under global: {data_path:?}"
+    );
     assert!(data_path.ends_with("custom-data"));
 }
 
@@ -261,13 +332,20 @@ fn detect_without_home_env_does_not_panic() {
 
 #[test]
 fn detect_with_bogus_zen_workspace_ignores_it() {
-    let (_tmp, home_path) = setup_zen_home();
-    unsafe { std::env::set_var("ZEN_WORKSPACE", "/nonexistent/deadbeef"); }
+    let (_tmp, _home_path) = setup_zen_home();
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", "/nonexistent/deadbeef");
+    }
 
     let paths = ZenPaths::detect().expect("detect() should succeed even with bogus ZEN_WORKSPACE");
-    assert!(paths.workspace_root().is_none(), "Bogus workspace should be ignored");
+    assert!(
+        paths.workspace_root().is_none(),
+        "Bogus workspace should be ignored"
+    );
 
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 // ============================================================================
@@ -279,8 +357,14 @@ fn cache_with_empty_domain() {
     let (_tmp, home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let cache_path = paths.cache("");
-    assert!(cache_path.starts_with(&home_path), "cache should be under global: {cache_path:?}");
-    assert!(cache_path.ends_with("cache/"), "empty domain cache path: {cache_path:?}");
+    assert!(
+        cache_path.starts_with(&home_path),
+        "cache should be under global: {cache_path:?}"
+    );
+    assert!(
+        cache_path.ends_with("cache/"),
+        "empty domain cache path: {cache_path:?}"
+    );
 }
 
 #[test]
@@ -355,14 +439,18 @@ where
     {
         let (_tmp, home_path) = setup_zen_home();
         let ws = setup_workspace(&home_path, "ws-check");
-        unsafe { std::env::set_var("ZEN_WORKSPACE", &ws); }
+        unsafe {
+            std::env::set_var("ZEN_WORKSPACE", &ws);
+        }
         let paths = ZenPaths::detect().expect("detect() should succeed");
         let with_ws = method(&paths);
         assert!(
             with_ws.starts_with(&ws),
             "With workspace, path should start with workspace_root: {with_ws:?}"
         );
-        unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+        unsafe {
+            std::env::remove_var("ZEN_WORKSPACE");
+        }
     }
 }
 
@@ -416,64 +504,95 @@ fn finance_differs_by_workspace() {
 fn cache_always_global() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "ws");
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &ws); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
     let paths = ZenPaths::detect().expect("detect() should succeed");
-    assert!(paths.cache("x").starts_with(&home_path), "cache should always be under global");
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    assert!(
+        paths.cache("x").starts_with(&home_path),
+        "cache should always be under global"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn db_always_global() {
     let (_tmp, home_path) = setup_zen_home();
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &setup_workspace(&home_path, "ws")); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", setup_workspace(&home_path, "ws"));
+    }
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.db().starts_with(&home_path));
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn sessions_always_global() {
     let (_tmp, home_path) = setup_zen_home();
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &setup_workspace(&home_path, "ws")); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", setup_workspace(&home_path, "ws"));
+    }
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.sessions().starts_with(&home_path));
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn memory_always_global() {
     let (_tmp, home_path) = setup_zen_home();
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &setup_workspace(&home_path, "ws")); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", setup_workspace(&home_path, "ws"));
+    }
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.memory().starts_with(&home_path));
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn identity_always_global() {
     let (_tmp, home_path) = setup_zen_home();
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &setup_workspace(&home_path, "ws")); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", setup_workspace(&home_path, "ws"));
+    }
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.identity().starts_with(&home_path));
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn logs_always_global() {
     let (_tmp, home_path) = setup_zen_home();
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &setup_workspace(&home_path, "ws")); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", setup_workspace(&home_path, "ws"));
+    }
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.logs().starts_with(&home_path));
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
 fn plugins_always_global() {
     let (_tmp, home_path) = setup_zen_home();
-    unsafe { std::env::set_var("ZEN_WORKSPACE", &setup_workspace(&home_path, "ws")); }
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", setup_workspace(&home_path, "ws"));
+    }
     let paths = ZenPaths::detect().expect("detect() should succeed");
     assert!(paths.plugins().starts_with(&home_path));
-    unsafe { std::env::remove_var("ZEN_WORKSPACE"); }
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 // ── User_data domain variations ──
@@ -483,7 +602,10 @@ fn user_data_nested_domain() {
     let (_tmp, _) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let data = paths.user_data("a/b/c");
-    assert!(data.to_string_lossy().ends_with("a/b/c"), "Nested domain: {data:?}");
+    assert!(
+        data.to_string_lossy().ends_with("a/b/c"),
+        "Nested domain: {data:?}"
+    );
 }
 
 #[test]
