@@ -1,8 +1,19 @@
 mod app;
+pub mod cell;
 mod handler;
+mod highlight;
+pub mod render;
+pub mod session_picker;
+pub mod slash;
+pub mod stream;
+pub mod theme;
 mod ui;
 
 pub fn run() -> Result<(), anyhow::Error> {
+    use crossterm::event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
     use crossterm::execute;
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
     use ratatui::Terminal;
@@ -11,7 +22,15 @@ pub fn run() -> Result<(), anyhow::Error> {
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        ),
+    )?;
 
     let result = (|| {
         let backend = CrosstermBackend::new(stdout);
@@ -19,7 +38,12 @@ pub fn run() -> Result<(), anyhow::Error> {
         app::run_app(&mut terminal)
     })();
 
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
+    )?;
     crossterm::terminal::disable_raw_mode()?;
     result
 }

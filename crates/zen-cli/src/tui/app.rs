@@ -3,19 +3,23 @@
 use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::widgets::{Block, Borders};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
+use tui_textarea::TextArea;
 use zen_agents::AgentOrchestrator;
 use zen_core::config::load_config;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
-#[derive(Debug)]
-pub struct OutputLine {
-    pub text: String,
-    pub is_error: bool,
-}
+use super::cell::{ErrorCell, MarkdownCell, OutputCell, PlainCell};
+use super::render::normalize_compact_markdown;
+use super::session_picker::SessionPickerState;
+use super::slash::SlashState;
+use super::stream::MarkdownStreamCollector;
+use super::theme::{DefaultTheme, OutputTheme};
+use zen_memory::conversation::ConversationStore;
 
 pub struct PendingLlmCall {
     pub query: String,
@@ -34,11 +38,16 @@ pub enum PendingCallKind {
 }
 
 const MAX_HISTORY: usize = 100;
+const MAX_QUEUE_SIZE: usize = 10;
 
 pub const SLASH_COMMANDS: &[&str] = &[
     "help",
+    "h",
     "quit",
+    "q",
+    "exit",
     "clear",
+    "cls",
     "thinking",
     "export",
     "note",
@@ -80,19 +89,14 @@ pub const CLI_COMMANDS: &[&str] = &[
 ];
 
 pub struct App {
-    pub input: String,
-    /// Character position in the input string (not byte index).
-    /// UTF-8 characters may span multiple bytes, so this tracks the nth character,
-    /// not the nth byte. Use `char_indices()` to convert to byte position when needed.
-    pub cursor_position: usize,
-    pub output: VecDeque<OutputLine>,
+    pub input: TextArea<'static>,
+    pub output: Vec<OutputCell>,
     pub running: bool,
     pub workspace: String,
     pub session_id: Option<String>,
     pub model: String,
     pub memory_count: usize,
     pub show_thinking: bool,
-    pub streaming_buffer: String,
     pub is_streaming: bool,
     pub chat_history: Vec<(String, String)>,
     pub pending_calls: Vec<PendingCallKind>,
@@ -100,35 +104,53 @@ pub struct App {
     pub current_query: String,
     pub command_history: Vec<String>,
     pub history_position: Option<usize>,
-    pub autocomplete_suggestions: Vec<String>,
-    pub autocomplete_selected: usize,
-    pub autocomplete_scroll_offset: usize,
-    pub show_autocomplete: bool,
+    pub last_recalled_text: Option<String>,
     orchestrator: Option<Arc<AgentOrchestrator>>,
     session: Option<SessionContext>,
-    /// IME composition state - tracks preedit text during composition
-    pub ime_preedit: Option<String>,
-    /// IME composition start position (byte position when composition began)
-    pub ime_preedit_start: usize,
+    pub scroll_offset: usize,
+    pub auto_scroll: bool,
+    pub stream_collector: MarkdownStreamCollector,
+    pub theme: Box<dyn OutputTheme>,
+    pub slash_state: SlashState,
+    pub session_picker: SessionPickerState,
+    conversation_store: Option<ConversationStore>,
 }
 
 impl App {
+    fn create_input_textarea(text: impl Into<String>) -> TextArea<'static> {
+        let mut ta = TextArea::new(vec![text.into()]);
+        ta.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Input (Enter=send, Ctrl+D=quit) "),
+        );
+        ta
+    }
+
+    fn create_default_textarea() -> TextArea<'static> {
+        let mut ta = TextArea::default();
+        ta.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Input (Enter=send, Ctrl+D=quit) "),
+        );
+        ta
+    }
+
     pub fn new() -> Self {
-        let workspace = std::env::current_dir()
+        let workspace = zen_core::paths::ZenPaths::detect()
             .ok()
-            .and_then(|p| p.to_str().map(String::from))
+            .and_then(|paths| paths.workspace_root().map(|p| p.display().to_string()))
             .unwrap_or_else(|| ".".into());
-        Self {
-            input: String::new(),
-            cursor_position: 0,
-            output: VecDeque::new(),
+        let mut app = Self {
+            input: Self::create_default_textarea(),
+            output: Vec::new(),
             running: true,
             workspace,
             session_id: None,
-            model: "ollama/qwen3.6:35b-mlx".into(),
+            model: "mock".to_string(),
             memory_count: 0,
             show_thinking: false,
-            streaming_buffer: String::new(),
             is_streaming: false,
             chat_history: Vec::new(),
             pending_calls: Vec::new(),
@@ -136,14 +158,34 @@ impl App {
             current_query: String::new(),
             command_history: Vec::new(),
             history_position: None,
-            autocomplete_suggestions: Vec::new(),
-            autocomplete_selected: 0,
-            autocomplete_scroll_offset: 0,
-            show_autocomplete: false,
+            last_recalled_text: None,
             orchestrator: None,
             session: None,
-            ime_preedit: None,
-            ime_preedit_start: 0,
+            scroll_offset: 0,
+            auto_scroll: true,
+            stream_collector: MarkdownStreamCollector::new(),
+            theme: Box::new(DefaultTheme),
+            slash_state: SlashState::new(),
+            session_picker: SessionPickerState::new(),
+            conversation_store: ConversationStore::open("tui").ok(),
+        };
+        app.load_command_history();
+        app
+    }
+
+    fn load_command_history(&mut self) {
+        if let Some(store) = &self.conversation_store
+            && let Ok(entries) = store.load()
+        {
+            for (role, content) in entries {
+                if role == "user" && !content.is_empty() {
+                    self.command_history.push(content);
+                }
+            }
+            if self.command_history.len() > MAX_HISTORY {
+                let start = self.command_history.len() - MAX_HISTORY;
+                self.command_history = self.command_history[start..].to_vec();
+            }
         }
     }
 
@@ -161,14 +203,17 @@ impl App {
     }
 
     pub fn push_output(&mut self, text: String, is_error: bool) {
-        for line in text.lines() {
-            self.output.push_back(OutputLine {
-                text: line.to_string(),
-                is_error,
-            });
+        if is_error {
+            self.output
+                .push(OutputCell::Error(ErrorCell::new(text, self.theme.as_ref())));
+        } else {
+            for line in text.lines() {
+                self.output
+                    .push(OutputCell::Plain(PlainCell::new(line.to_string())));
+            }
         }
         while self.output.len() > 500 {
-            self.output.pop_front();
+            self.output.remove(0);
         }
     }
 
@@ -181,6 +226,9 @@ impl App {
             self.command_history.remove(0);
         }
         self.history_position = None;
+        if let Some(store) = &self.conversation_store {
+            let _ = store.append("user", cmd);
+        }
     }
 
     pub fn history_up(&mut self) {
@@ -194,9 +242,8 @@ impl App {
         };
         self.history_position = Some(new_pos);
         if let Some(entry) = self.command_history.get(new_pos) {
-            self.input = entry.clone();
-            // Set cursor to end (character count, not byte length)
-            self.cursor_position = self.input.chars().count();
+            self.last_recalled_text = Some(entry.clone());
+            self.input = Self::create_input_textarea(entry.clone());
         }
     }
 
@@ -205,90 +252,60 @@ impl App {
             None => {}
             Some(p) if p + 1 >= self.command_history.len() => {
                 self.history_position = None;
-                self.input.clear();
-                self.cursor_position = 0;
+                self.last_recalled_text = None;
+                self.input = Self::create_default_textarea();
             }
             Some(p) => {
                 self.history_position = Some(p + 1);
                 if let Some(entry) = self.command_history.get(p + 1) {
-                    self.input = entry.clone();
-                    // Set cursor to end (character count, not byte length)
-                    self.cursor_position = self.input.chars().count();
+                    self.last_recalled_text = Some(entry.clone());
+                    self.input = Self::create_input_textarea(entry.clone());
                 }
             }
         }
     }
 
-    pub fn update_autocomplete(&mut self) {
-        let input = self.input.trim_start();
-        if input.is_empty() || (!input.starts_with('/') && input.len() < 2) {
-            self.autocomplete_suggestions.clear();
-            self.show_autocomplete = false;
-            return;
+    /// Codex pattern: decide if Up/Down should navigate history or move cursor
+    pub fn should_navigate_history(&self) -> bool {
+        if self.command_history.is_empty() {
+            return false;
         }
-        let prefix = input.strip_prefix('/').unwrap_or(input);
-        let mut suggestions: Vec<String> = SLASH_COMMANDS
-            .iter()
-            .filter(|c| c.starts_with(prefix))
-            .map(|c| format!("/{}", c))
-            .collect();
-        if !input.starts_with('/') {
-            suggestions.extend(
-                CLI_COMMANDS
-                    .iter()
-                    .filter(|c| c.starts_with(prefix))
-                    .map(|c| c.to_string()),
-            );
+        let text = self.input.lines().join("\n");
+        // Empty text → always history mode
+        if text.is_empty() {
+            return true;
         }
-        suggestions.sort();
-        suggestions.dedup();
-        if suggestions.len() > 1 && suggestions != self.autocomplete_suggestions {
-            self.autocomplete_suggestions = suggestions;
-            self.autocomplete_selected = 0;
-            self.autocomplete_scroll_offset = 0;
-            self.show_autocomplete = true;
-        } else {
-            self.autocomplete_suggestions.clear();
-            self.show_autocomplete = false;
+        // Cursor must be at line boundary (start or end)
+        let cursor = self.input.cursor();
+        let at_boundary = cursor == (0, 0) || {
+            let lines = self.input.lines();
+            let last_line_idx = lines.len().saturating_sub(1);
+            let last_line_len = lines[last_line_idx].len();
+            cursor == (last_line_idx, last_line_len)
+        };
+        if !at_boundary {
+            return false;
         }
-    }
-
-    pub fn autocomplete_cycle(&mut self) {
-        if self.autocomplete_suggestions.is_empty() {
-            return;
-        }
-        self.autocomplete_selected =
-            (self.autocomplete_selected + 1) % self.autocomplete_suggestions.len();
-        let max_visible = 5;
-        if self.autocomplete_selected >= self.autocomplete_scroll_offset + max_visible {
-            self.autocomplete_scroll_offset =
-                self.autocomplete_selected.saturating_sub(max_visible - 1);
-        } else if self.autocomplete_selected < self.autocomplete_scroll_offset {
-            self.autocomplete_scroll_offset = self.autocomplete_selected;
-        }
-    }
-
-    pub fn autocomplete_accept(&mut self) {
-        if let Some(s) = self
-            .autocomplete_suggestions
-            .get(self.autocomplete_selected)
-        {
-            self.input = s.clone();
-            // Set cursor to end (character count, not byte length)
-            self.cursor_position = self.input.chars().count();
-        }
-        self.autocomplete_suggestions.clear();
-        self.show_autocomplete = false;
+        // Text must match last recalled entry (user hasn't edited)
+        self.last_recalled_text.as_deref() == Some(&text)
     }
 
     pub fn handle_command(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
         if cmd.is_empty() {
             return;
         }
         if let Some(stripped) = cmd.strip_prefix('/') {
             self.handle_slash_command(stripped);
         } else if self.is_streaming {
-            self.message_queue.push_back(cmd.to_string());
+            if self.message_queue.len() >= MAX_QUEUE_SIZE {
+                self.push_output(
+                    "Queue full. Please wait for current response to complete.".to_string(),
+                    true,
+                );
+            } else {
+                self.message_queue.push_back(cmd.to_string());
+            }
         } else {
             self.current_query = cmd.to_string();
             self.execute_chat(cmd);
@@ -302,7 +319,7 @@ impl App {
             "help" | "h" => self.show_help(),
             "clear" | "cls" => {
                 self.output.clear();
-                self.streaming_buffer.clear();
+                self.stream_collector.clear();
             }
             "thinking" => {
                 self.show_thinking = !self.show_thinking;
@@ -321,7 +338,11 @@ impl App {
             "export" => self.execute_export(),
             "note" => self.execute_note(parts.get(1).copied()),
             "search" => self.execute_search(parts.get(1).copied().unwrap_or("")),
-            "session" => self.execute_session(parts.get(1).copied()),
+            "session" => self.session_picker.show(),
+            "new" => self.execute_new_session(),
+            "fork" => self.execute_fork_session(parts.get(1).copied()),
+            "rename" => self.execute_rename_session(parts.get(1).copied()),
+            "archive" => self.execute_archive_session(),
             "serve" => self.execute_serve(parts.get(1).copied()),
             "config" => self.execute_config(),
             "model" => self.execute_model(parts.get(1).copied()),
@@ -344,7 +365,11 @@ impl App {
   /export        Export chat to Markdown
   /note <text>   Create a note
   /search <q>    Search knowledge base
-  /session       Start a new session
+  /session       List and select sessions
+  /new           Create new session
+  /fork [name]   Fork current session
+  /rename <name> Rename current session
+  /archive       Archive current session
   /serve start   Start gateway daemon
   /config        Show configuration
   /consolidate   Run consolidation pipeline
@@ -408,7 +433,7 @@ Use /thinking to show/hide thinking process."#;
             }));
         self.is_streaming = true;
         if self.pending_calls.len() == 1 {
-            self.streaming_buffer.clear();
+            self.stream_collector.clear();
         }
 
         let orchestrator = match &self.orchestrator {
@@ -542,30 +567,42 @@ Use /thinking to show/hide thinking process."#;
         for (idx, entry) in results {
             if let Some((_query, result)) = entry {
                 for token in &result.tokens {
-                    self.streaming_buffer.push_str(token);
+                    self.stream_collector.push_delta(token);
+                }
+
+                let (completed_lines, raw_text) = self.stream_collector.commit_complete_lines();
+                if !completed_lines.is_empty() {
+                    self.output
+                        .push(OutputCell::Markdown(super::cell::MarkdownCell::from_lines(
+                            completed_lines,
+                            raw_text,
+                        )));
                 }
 
                 if let Some(done_result) = result.done_result {
-                    if let Some(pos) = self
-                        .output
-                        .iter()
-                        .position(|line| line.text.contains("Thinking..."))
-                    {
+                    if let Some(pos) = self.output.iter().position(|cell| {
+                        matches!(cell, OutputCell::Plain(p) if p.text.contains("Thinking..."))
+                    }) {
                         self.output.remove(pos);
                     }
 
                     match done_result {
                         Ok(response) => {
                             completed_indices.push(idx);
-                            self.streaming_buffer.clear();
+                            let (remaining, raw_text) = self.stream_collector.finalize_and_drain();
+                            if !remaining.is_empty() {
+                                self.output.push(OutputCell::Markdown(
+                                    super::cell::MarkdownCell::from_lines(remaining, raw_text),
+                                ));
+                            }
                             self.chat_history.push((_query, response.clone()));
-                            for line in response.lines() {
-                                self.push_output(line.to_string(), false);
+                            if let Some(store) = &self.conversation_store {
+                                let _ = store.append("assistant", &response);
                             }
                         }
                         Err(e) => {
                             completed_indices.push(idx);
-                            self.streaming_buffer.clear();
+                            self.stream_collector.clear();
                             self.push_output(format!("[LLM] Error: {}", e), true);
                         }
                     }
@@ -579,7 +616,6 @@ Use /thinking to show/hide thinking process."#;
 
         if self.pending_calls.is_empty() {
             self.is_streaming = false;
-            self.streaming_buffer.clear();
             while let Some(queued) = self.message_queue.pop_front() {
                 self.current_query = queued.clone();
                 self.execute_chat(&queued);
@@ -663,7 +699,17 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_export(&mut self) {
-        let output_text: Vec<String> = self.output.iter().map(|l| l.text.clone()).collect();
+        let output_text: Vec<String> = self
+            .output
+            .iter()
+            .map(|cell| match cell {
+                OutputCell::Markdown(m) => m.content.clone(),
+                OutputCell::Code(c) => format!("```{}\n{}\n```", c.lang, c.code),
+                OutputCell::Error(e) => e.message.clone(),
+                OutputCell::Streaming(s) => s.buffer.clone(),
+                OutputCell::Plain(p) => p.text.clone(),
+            })
+            .collect();
         let content = output_text.join("\n");
         let timestamp = chrono::Utc::now().format("%Y-%m-%d-%H%M%S");
         let filename = format!("chat-{}.md", timestamp);
@@ -735,21 +781,168 @@ Use /thinking to show/hide thinking process."#;
         }
     }
 
-    fn execute_session(&mut self, _args: Option<&str>) {
+    fn execute_new_session(&mut self) {
         use zen_memory::session_manager::SessionManager;
         let manager = SessionManager::new();
         match manager.create_session("default", ".") {
             Ok(session) => {
                 self.session_id = Some(session.id.clone());
+                self.conversation_store = ConversationStore::open(&session.id).ok();
+                self.output.clear();
+                self.chat_history.clear();
+                self.push_output(format!("New session started: {}", session.id), false);
+            }
+            Err(e) => self.push_output(format!("Session error: {}", e), true),
+        }
+    }
+
+    fn execute_fork_session(&mut self, title: Option<&str>) {
+        use zen_memory::session_manager::SessionManager;
+        let current_id = match &self.session_id {
+            Some(id) => id.clone(),
+            None => {
+                self.push_output("No active session to fork".to_string(), true);
+                return;
+            }
+        };
+
+        let manager = SessionManager::new();
+        match manager.fork_session(&current_id, title.map(String::from)) {
+            Ok(forked) => {
+                self.session_id = Some(forked.id.clone());
+                if let Some(parent_store) = &self.conversation_store
+                    && let Ok(new_store) = parent_store.copy_to(&forked.id)
+                {
+                    self.conversation_store = Some(new_store);
+                }
+                if self.conversation_store.is_none() {
+                    self.conversation_store = ConversationStore::open(&forked.id).ok();
+                }
+                self.output.clear();
+                self.chat_history.clear();
                 self.push_output(
-                    format!(
-                        "Session started: {} (agent: {})",
-                        session.id, session.agent_name
-                    ),
+                    format!("Session forked: {} (from {})", forked.id, current_id),
                     false,
                 );
             }
-            Err(e) => self.push_output(format!("Session error: {}", e), true),
+            Err(e) => self.push_output(format!("Fork error: {}", e), true),
+        }
+    }
+
+    fn execute_rename_session(&mut self, title: Option<&str>) {
+        use zen_memory::session_manager::SessionManager;
+        let current_id = match &self.session_id {
+            Some(id) => id.clone(),
+            None => {
+                self.push_output("No active session to rename".to_string(), true);
+                return;
+            }
+        };
+
+        let title = match title {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => {
+                self.push_output("Usage: /rename <name>".to_string(), true);
+                return;
+            }
+        };
+
+        let manager = SessionManager::new();
+        match manager.rename_session(&current_id, title.clone()) {
+            Ok(()) => {
+                self.push_output(format!("Session renamed to: {}", title), false);
+            }
+            Err(e) => self.push_output(format!("Rename error: {}", e), true),
+        }
+    }
+
+    fn execute_archive_session(&mut self) {
+        use zen_memory::session_manager::SessionManager;
+        let current_id = match &self.session_id {
+            Some(id) => id.clone(),
+            None => {
+                self.push_output("No active session to archive".to_string(), true);
+                return;
+            }
+        };
+
+        let manager = SessionManager::new();
+        match manager.archive_session(&current_id) {
+            Ok(()) => {
+                self.push_output(format!("Session archived: {}", current_id), false);
+                self.session_id = None;
+                self.output.clear();
+                self.chat_history.clear();
+            }
+            Err(e) => self.push_output(format!("Archive error: {}", e), true),
+        }
+    }
+
+    pub fn resume_session(&mut self, session_id: &str) {
+        use zen_memory::session_manager::SessionManager;
+        let manager = SessionManager::new();
+        match manager.resume_session(session_id) {
+            Ok(session) => {
+                self.session_id = Some(session.id.clone());
+                self.conversation_store = ConversationStore::open(&session.id).ok();
+                self.output.clear();
+                self.chat_history.clear();
+                if let Some(store) = &self.conversation_store
+                    && let Ok(entries) = store.load()
+                {
+                    let mut i = 0;
+                    while i < entries.len() {
+                        if entries[i].0 == "user" {
+                            let user_content = entries[i].1.clone();
+                            self.push_output(format!("You: {}", user_content), false);
+                            if i + 1 < entries.len() && entries[i + 1].0 == "assistant" {
+                                let raw_assistant = entries[i + 1].1.clone();
+                                let normalized = normalize_compact_markdown(&raw_assistant);
+                                self.output.push(OutputCell::Markdown(MarkdownCell::new(
+                                    normalized.clone(),
+                                )));
+                                self.chat_history.push((user_content, normalized));
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                let title = session.title.as_deref().unwrap_or("(untitled)");
+                self.push_output(
+                    format!("Resumed session: {} ({})", session.id, title),
+                    false,
+                );
+                self.session_picker.dismiss();
+            }
+            Err(e) => self.push_output(format!("Resume error: {}", e), true),
+        }
+    }
+
+    pub fn archive_session(&mut self, session_id: &str) {
+        use zen_memory::session_manager::SessionManager;
+        let manager = SessionManager::new();
+        match manager.archive_session(session_id) {
+            Ok(()) => {
+                self.push_output(format!("Session archived: {}", session_id), false);
+                self.session_picker.load_sessions();
+            }
+            Err(e) => self.push_output(format!("Archive error: {}", e), true),
+        }
+    }
+
+    pub fn rename_session(&mut self, session_id: &str, title: &str) {
+        use zen_memory::session_manager::SessionManager;
+        let manager = SessionManager::new();
+        match manager.rename_session(session_id, title.to_string()) {
+            Ok(()) => {
+                self.push_output(format!("Session renamed to: {}", title), false);
+                self.session_picker.load_sessions();
+            }
+            Err(e) => self.push_output(format!("Rename error: {}", e), true),
         }
     }
 
@@ -964,10 +1157,12 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Re
         {
             match crate::tui::handler::handle_key(key, &mut app) {
                 crate::tui::handler::KeyAction::Submit => {
-                    let cmd = app.input.clone();
-                    app.push_history(&cmd);
-                    app.input.clear();
-                    app.cursor_position = 0;
+                    let cmd = app.input.lines().join("\n");
+                    let cmd = cmd.trim().to_string();
+                    if !cmd.is_empty() {
+                        app.push_history(&cmd);
+                    }
+                    app.input = App::create_default_textarea();
                     app.handle_command(&cmd);
                 }
                 crate::tui::handler::KeyAction::Quit => {

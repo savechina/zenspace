@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tui_textarea::{Input, Key};
 
 pub enum KeyAction {
     Submit,
@@ -7,203 +8,219 @@ pub enum KeyAction {
 }
 
 pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
-    match (key.code, key.modifiers) {
-        (KeyCode::Enter, _) => {
-            if app.show_autocomplete {
-                app.autocomplete_accept();
+    let input_before = app.input.lines().join("\n");
+
+    let action = match (key.code, key.modifiers) {
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+            if app.session_picker.visible && !app.session_picker.rename_mode {
+                if app.session_picker.archive_pending.is_some() {
+                    if let Some(session_id) = app.session_picker.confirm_archive() {
+                        app.archive_session(&session_id);
+                    }
+                } else {
+                    app.session_picker.start_archive();
+                }
                 return KeyAction::Continue;
             }
-            return KeyAction::Submit;
+            return KeyAction::Continue;
         }
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) => return KeyAction::Quit,
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            if app.session_picker.visible && !app.session_picker.rename_mode {
+                app.session_picker.start_rename();
+                return KeyAction::Continue;
+            }
+            return KeyAction::Continue;
+        }
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyAction::Quit,
         (KeyCode::Up, KeyModifiers::NONE) => {
-            app.history_up();
-            app.autocomplete_suggestions.clear();
-            app.show_autocomplete = false;
+            if app.session_picker.visible {
+                app.session_picker.move_up();
+                return KeyAction::Continue;
+            }
+            if app.slash_state.visible {
+                app.slash_state.move_up();
+                return KeyAction::Continue;
+            }
+            if app.should_navigate_history() {
+                app.history_up();
+            } else {
+                app.input.input(Input {
+                    key: Key::Up,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
+            }
             return KeyAction::Continue;
         }
         (KeyCode::Down, KeyModifiers::NONE) => {
-            app.history_down();
-            app.autocomplete_suggestions.clear();
-            app.show_autocomplete = false;
+            if app.session_picker.visible {
+                app.session_picker.move_down();
+                return KeyAction::Continue;
+            }
+            if app.slash_state.visible {
+                app.slash_state.move_down();
+                return KeyAction::Continue;
+            }
+            if app.should_navigate_history() {
+                app.history_down();
+            } else {
+                app.input.input(Input {
+                    key: Key::Down,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
+            }
             return KeyAction::Continue;
         }
         (KeyCode::Tab, KeyModifiers::NONE) => {
-            if app.show_autocomplete {
-                app.autocomplete_cycle();
-            } else {
-                app.update_autocomplete();
-                if app.autocomplete_suggestions.len() == 1 {
-                    app.autocomplete_accept();
+            if app.slash_state.visible {
+                if let Some(cmd) = app.slash_state.selected_command() {
+                    let text = format!("/{} ", cmd);
+                    app.input.select_all();
+                    app.input.cut();
+                    app.input.insert_str(&text);
+                    app.slash_state.dismiss();
                 }
+                return KeyAction::Continue;
+            }
+            app.input.input(Input {
+                key: Key::Tab,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+            return KeyAction::Continue;
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) => {
+            if app.session_picker.rename_mode {
+                app.session_picker.cancel_rename();
+                return KeyAction::Continue;
+            }
+            if app.session_picker.visible {
+                app.session_picker.cancel_archive();
+                app.session_picker.dismiss();
+                return KeyAction::Continue;
+            }
+            if app.slash_state.visible {
+                app.slash_state.dismiss();
+                return KeyAction::Continue;
             }
             return KeyAction::Continue;
         }
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            if app.session_picker.rename_mode {
+                if let Some((session_id, title)) = app.session_picker.confirm_rename() {
+                    app.rename_session(&session_id, &title);
+                }
+                return KeyAction::Continue;
+            }
+            if app.session_picker.visible {
+                if let Some(session) = app.session_picker.selected_session() {
+                    let session_id = session.id.clone();
+                    app.resume_session(&session_id);
+                }
+                return KeyAction::Continue;
+            }
+            if app.slash_state.visible {
+                if let Some(cmd) = app.slash_state.selected_command() {
+                    let text = format!("/{} ", cmd);
+                    app.input.select_all();
+                    app.input.cut();
+                    app.input.insert_str(&text);
+                    app.slash_state.dismiss();
+                }
+                return KeyAction::Continue;
+            }
+            let text = app.input.lines().join("\n");
+            let is_single_line = !text.contains('\n');
+            let is_empty = text.trim().is_empty();
+            app.input.input(Input {
+                key: Key::Enter,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+            if is_single_line && !is_empty {
+                return KeyAction::Submit;
+            }
+            return KeyAction::Continue;
+        }
+        (KeyCode::Enter, KeyModifiers::CONTROL) => {
+            let text = app.input.lines().join("\n");
+            if !text.trim().is_empty() {
+                return KeyAction::Submit;
+            }
+            return KeyAction::Continue;
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+            return KeyAction::Continue;
+        }
+        (KeyCode::PageDown, KeyModifiers::NONE) => {
+            app.scroll_offset = app.scroll_offset.saturating_add(10);
+            return KeyAction::Continue;
+        }
         (KeyCode::Char(c), KeyModifiers::NONE) => {
-            let is_cjk = ('\u{4E00}'..='\u{9FFF}').contains(&c)
-                || ('\u{3040}'..='\u{30FF}').contains(&c)
-                || ('\u{AC00}'..='\u{D7AF}').contains(&c);
-
-            if app.ime_preedit.is_some() {
-                if is_cjk {
-                    let preedit = app.ime_preedit.take().unwrap();
-                    let preedit_start = app.ime_preedit_start;
-                    let preedit_end = preedit_start + preedit.len();
-
-                    if preedit_end <= app.input.len()
-                        && app.input[preedit_start..preedit_end] == preedit
-                    {
-                        app.input.replace_range(preedit_start..preedit_end, "");
-                    }
-
-                    app.input.insert_str(preedit_start, &preedit);
-                    app.cursor_position = app.input.chars().count();
-
-                    let byte_pos = app.input.len();
-                    app.input.insert(byte_pos, c);
-                    app.cursor_position = app.input.chars().count();
-
-                    app.ime_preedit = None;
-                } else if !c.is_ascii_lowercase() {
-                    let preedit = app.ime_preedit.take().unwrap();
-                    let preedit_start = app.ime_preedit_start;
-
-                    app.input.insert_str(preedit_start, &preedit);
-                    app.cursor_position = app.input.chars().count();
-                    app.ime_preedit = None;
-
-                    let byte_pos = app
-                        .input
-                        .char_indices()
-                        .nth(app.cursor_position)
-                        .map(|(i, _)| i)
-                        .unwrap_or(app.input.len());
-                    app.input.insert(byte_pos, c);
-                    app.cursor_position += 1;
-                    app.update_autocomplete();
-                } else {
-                    app.ime_preedit.as_mut().unwrap().push(c);
-                }
-            } else {
-                let byte_pos = app
-                    .input
-                    .char_indices()
-                    .nth(app.cursor_position)
-                    .map(|(i, _)| i)
-                    .unwrap_or(app.input.len());
-                app.input.insert(byte_pos, c);
-                app.cursor_position += 1;
-                app.update_autocomplete();
+            if app.session_picker.rename_mode {
+                app.session_picker.rename_input_char(c);
+                return KeyAction::Continue;
             }
+            app.input.input(Input {
+                key: Key::Char(c),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+            KeyAction::Continue
         }
-        (KeyCode::Backspace, KeyModifiers::NONE) if app.cursor_position > 0 => {
-            // Handle IME composition backspace
-            if app.ime_preedit.is_some() {
-                let preedit = app.ime_preedit.as_mut().unwrap();
-                if !preedit.is_empty() {
-                    preedit.pop();
-                    if preedit.is_empty() {
-                        app.ime_preedit = None;
-                    }
-                }
-            } else {
-                app.cursor_position -= 1;
-                let byte_pos = app
-                    .input
-                    .char_indices()
-                    .nth(app.cursor_position)
-                    .map(|(i, _)| i)
-                    .unwrap_or(app.input.len());
-                app.input.remove(byte_pos);
-                app.update_autocomplete();
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            if app.session_picker.rename_mode {
+                app.session_picker.rename_input_backspace();
+                return KeyAction::Continue;
             }
+            app.input.input(Input {
+                key: Key::Backspace,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+            KeyAction::Continue
         }
-        (KeyCode::Delete, KeyModifiers::NONE)
-            if app.cursor_position < app.input.chars().count() =>
-        {
-            let byte_pos = app
-                .input
-                .char_indices()
-                .nth(app.cursor_position)
-                .map(|(i, _)| i)
-                .unwrap_or(app.input.len());
-            app.input.remove(byte_pos);
-            app.update_autocomplete();
+        _ => {
+            app.input.input(Input {
+                key: match key.code {
+                    KeyCode::Char(c) => Key::Char(c),
+                    KeyCode::Backspace => Key::Backspace,
+                    KeyCode::Delete => Key::Delete,
+                    KeyCode::Left => Key::Left,
+                    KeyCode::Right => Key::Right,
+                    KeyCode::Home => Key::Home,
+                    KeyCode::End => Key::End,
+                    KeyCode::Esc => Key::Esc,
+                    _ => Key::Null,
+                },
+                ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+                alt: key.modifiers.contains(KeyModifiers::ALT),
+                shift: key.modifiers.contains(KeyModifiers::SHIFT),
+            });
+            KeyAction::Continue
         }
-        (KeyCode::Left, KeyModifiers::CONTROL) => {
-            let char_count = app.cursor_position;
-            let before: String = app.input.chars().take(char_count).collect();
-            let new_char_pos = before
-                .trim_end_matches(|c: char| !c.is_alphanumeric())
-                .trim_end_matches(|c: char| c.is_alphanumeric())
-                .chars()
-                .count();
-            app.cursor_position = new_char_pos;
-        }
-        (KeyCode::Right, KeyModifiers::CONTROL) => {
-            let after: String = app.input.chars().skip(app.cursor_position).collect();
-            let skip_non_alpha = after
-                .find(|c: char| c.is_alphanumeric())
-                .map(|i| i + 1)
-                .unwrap_or(after.chars().count());
-            let rest: String = after.chars().skip(skip_non_alpha).collect();
-            let skip_alpha = rest
-                .find(|c: char| !c.is_alphanumeric())
-                .unwrap_or(rest.chars().count());
-            app.cursor_position += skip_non_alpha + skip_alpha;
-        }
-        (KeyCode::Left, KeyModifiers::NONE) if app.cursor_position > 0 => {
-            app.cursor_position -= 1;
-        }
-        (KeyCode::Right, KeyModifiers::NONE) if app.cursor_position < app.input.chars().count() => {
-            app.cursor_position += 1;
-        }
-        (KeyCode::Home, _) => app.cursor_position = 0,
-        (KeyCode::End, _) => app.cursor_position = app.input.chars().count(),
-        (KeyCode::Esc, _) => {
-            app.autocomplete_suggestions.clear();
-            app.show_autocomplete = false;
-            // Cancel IME composition on Escape
-            app.ime_preedit = None;
-        }
-        _ => {}
+    };
+
+    let input_after = app.input.lines().join("\n");
+    if input_before != input_after {
+        app.slash_state.on_input_change(&input_after);
     }
-    KeyAction::Continue
+
+    action
 }
 
-/// Handle Event::Paste (IME commit from terminal)
 pub fn handle_paste(pasted: &str, app: &mut super::app::App) {
-    // Detect CJK characters in pasted text (IME commit)
-    let has_cjk = pasted.chars().any(|c| {
-        ('\u{4E00}'..='\u{9FFF}').contains(&c) // CJK Unified Ideographs
-            || ('\u{3040}'..='\u{30FF}').contains(&c) // Hiragana/Katakana
-            || ('\u{AC00}'..='\u{D7AF}').contains(&c) // Hangul
-    });
-
-    if has_cjk && app.ime_preedit.is_some() {
-        // IME commit: replace preedit with committed text
-        let preedit = app.ime_preedit.take().unwrap();
-        let preedit_start = app.ime_preedit_start;
-
-        // Remove preedit text if it was inserted
-        let preedit_end = preedit_start + preedit.len();
-        if preedit_end <= app.input.len() && app.input[preedit_start..preedit_end] == preedit {
-            app.input.replace_range(preedit_start..preedit_end, "");
-        }
-
-        app.input.insert_str(preedit_start, pasted);
-
-        app.cursor_position = app.input.chars().count();
-    } else {
-        // Normal paste: insert at cursor position
-        let byte_pos = app
-            .input
-            .char_indices()
-            .nth(app.cursor_position)
-            .map(|(i, _)| i)
-            .unwrap_or(app.input.len());
-        app.input.insert_str(byte_pos, pasted);
-        app.cursor_position += pasted.chars().count();
-    }
+    let pasted = pasted.replace('\r', "\n");
+    app.input.insert_str(pasted);
+    let input = app.input.lines().join("\n");
+    app.slash_state.on_input_change(&input);
 }
