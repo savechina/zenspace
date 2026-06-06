@@ -137,7 +137,10 @@ fn test_zen_session_start_succeeds() {
     let output = test.zen(&["session", "start", "--agent=hermes"]);
     assert!(output.success(), "session start should succeed");
     let stdout = output.stdout().to_lowercase();
-    assert!(stdout.contains("hermes"), "session start should mention agent");
+    assert!(
+        stdout.contains("hermes"),
+        "session start should mention agent"
+    );
 }
 
 #[test]
