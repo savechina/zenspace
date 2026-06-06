@@ -1,6 +1,6 @@
 [package]
 name = "zen-agents"
-version = "0.1.0"
+version = "0.0.1"
 edition.workspace = true
 description = "Agent registry — WHO am I (agent definitions, tool permissions)"
 
