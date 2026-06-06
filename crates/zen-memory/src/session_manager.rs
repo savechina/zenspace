@@ -73,6 +73,27 @@ impl SessionManager {
     pub fn list_active_sessions(&self) -> Result<Vec<SessionEntity>> {
         SessionEntity::list_active()
     }
+
+    /// Fork an existing session (deep copy messages).
+    pub fn fork_session(&self, source_id: &str, title: Option<String>) -> Result<SessionEntity> {
+        let source = SessionEntity::load(source_id)?;
+        let forked = source.fork(title);
+        forked.save()?;
+
+        tracing::info!(
+            session_id = %forked.id,
+            parent_id = %source_id,
+            "session forked"
+        );
+
+        Ok(forked)
+    }
+
+    /// Rename an existing session.
+    pub fn rename_session(&self, session_id: &str, title: String) -> Result<()> {
+        let mut session = SessionEntity::load(session_id)?;
+        session.rename(title)
+    }
 }
 
 impl Default for SessionManager {

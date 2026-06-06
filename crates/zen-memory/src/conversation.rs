@@ -102,6 +102,15 @@ impl ConversationStore {
         Ok(all[start..].to_vec())
     }
 
+    pub fn copy_to(&self, target_session_id: &str) -> Result<Self> {
+        let entries = self.load()?;
+        let target = ConversationStore::open(target_session_id)?;
+        for (role, content) in &entries {
+            target.append(role, content)?;
+        }
+        Ok(target)
+    }
+
     /// Export conversation to Markdown format.
     pub fn export_markdown(&self) -> Result<String> {
         let entries = self.load()?;
