@@ -26,15 +26,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: ripgrep
-      - name: Set cargo linker config (Linux)
+      - name: Force bfd linker (Linux)
         if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml << 'EOF'
-          [target.x86_64-unknown-linux-gnu]
-          linker = "cc"
-          rustflags = ["-C", "linker-flavor=gnu-cc"]
-          EOF
+        run: echo "RUSTFLAGS=-D warnings -C link-arg=-fuse-ld=bfd" >> "$GITHUB_ENV"
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Run lint
@@ -55,15 +49,9 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: ripgrep
-      - name: Set cargo linker config (Linux)
+      - name: Force bfd linker (Linux)
         if: startsWith(matrix.os, 'ubuntu')
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml << 'EOF'
-          [target.x86_64-unknown-linux-gnu]
-          linker = "cc"
-          rustflags = ["-C", "linker-flavor=gnu-cc"]
-          EOF
+        run: echo "RUSTFLAGS=-D warnings -C link-arg=-fuse-ld=bfd" >> "$GITHUB_ENV"
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Install nextest
