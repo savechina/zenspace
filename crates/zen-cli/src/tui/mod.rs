@@ -10,7 +10,7 @@ pub mod stream;
 pub mod theme;
 mod ui;
 
-pub fn run(config: &'static zen_core::config::AgenticConfig) -> Result<(), anyhow::Error> {
+pub fn run(config: &'static zen_core::config::ZenConfig) -> Result<(), anyhow::Error> {
     use crossterm::event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,

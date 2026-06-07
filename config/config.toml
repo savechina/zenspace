@@ -307,26 +307,32 @@ dream_start_hour = 2
 dream_end_hour = 4
 
 # =============================================================================
-# Plugin system
+# Plugin system — flat [plugin.{id}] layout
+# =============================================================================
+#
+# Known fields under [plugin] are: base_path, wasm_cache_path.
+# All other [plugin.{id}] sections are treated as plugin instances.
+# Each plugin instance has `enabled` (default: true) and any additional fields
+# are folded into a flexible config JSON object.
+#
+# Layout:
+#   [plugin]                    ← global plugin config (known fields)
+#   [plugin.learning]           ← plugin "learning" instance config
+#   [plugin.finance]            ← plugin "finance" instance config
+#   [plugin.auto_proceed]       ← plugin "auto_proceed" instance config
 # =============================================================================
 
 [plugin]
-scan_dir = "~/.zen/plugins"
-wasm_cache_dir = "~/.zen/plugins/cache"
+base_path = "~/.zen/plugins"
+wasm_cache_path = "~/.zen/plugins/cache"
 
-# =============================================================================
-# Learning / auto-research
-# =============================================================================
-
-[learning]
+[plugin.learning]
+enabled = true
 auto_research = true
 interval = "daily"
 
-# =============================================================================
-# Finance aggregation
-# =============================================================================
-
-[finance]
+[plugin.finance]
+enabled = true
 base_currency = "CNY"
 disclaimer_acknowledged = false
 # tracked_categories = ["food", "transport", "entertainment"]

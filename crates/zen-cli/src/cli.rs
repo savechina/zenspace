@@ -154,7 +154,7 @@ enum Commands {
     },
 }
 
-pub async fn shell(config: &'static zen_core::config::AgenticConfig) -> Result<(), ZenError> {
+pub async fn shell(config: &'static zen_core::config::ZenConfig) -> Result<(), ZenError> {
     let cli = Cli::parse();
 
     let is_tui = cli.command.is_none();

@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use tracing::{debug, info};
 
-use zen_core::config::AgenticConfig;
+use zen_core::config::ZenConfig;
 use zen_core::paths::ZenPaths;
 use zen_memory::daily_log::DailyLog;
 use zen_memory::memory_service::IdentityContext;
@@ -23,11 +23,11 @@ pub enum MicroAction {
 /// workspace state and decide micro-actions.
 pub struct SubconsciousTick {
     zen_paths: ZenPaths,
-    config: AgenticConfig,
+    config: ZenConfig,
 }
 
 impl SubconsciousTick {
-    pub fn new(config: AgenticConfig) -> Result<Self> {
+    pub fn new(config: ZenConfig) -> Result<Self> {
         let zen_paths = ZenPaths::detect()?;
         Ok(Self { zen_paths, config })
     }
@@ -60,7 +60,7 @@ impl SubconsciousTick {
 
 fn evaluate_tick(
     zen_paths: &ZenPaths,
-    _config: &AgenticConfig,
+    _config: &ZenConfig,
     date: NaiveDate,
 ) -> Result<Vec<MicroAction>> {
     let mut actions = Vec::new();

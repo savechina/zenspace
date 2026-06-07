@@ -33,13 +33,13 @@ fn load_embedded_config_succeeds() {
 
 #[test]
 fn default_llm_provider_with_defaults() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert_eq!(default_llm_provider(&config), "ollama");
 }
 
 #[test]
 fn default_llm_provider_custom() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("openai".into()),
         ..Default::default()
     };
@@ -48,13 +48,13 @@ fn default_llm_provider_custom() {
 
 #[test]
 fn default_model_with_defaults() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert_eq!(default_model(&config), "qwen3-coder");
 }
 
 #[test]
 fn default_model_custom() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_model: Some("gpt-4".into()),
         ..Default::default()
     };
@@ -63,7 +63,7 @@ fn default_model_custom() {
 
 #[test]
 fn get_provider_returns_some_when_exists() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     let mut providers = HashMap::new();
     providers.insert(
         "my-provider".into(),
@@ -84,7 +84,7 @@ fn get_provider_returns_some_when_exists() {
 
 #[test]
 fn get_agent_task_returns_some_when_exists() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     let mut agents = HashMap::new();
     agents.insert(
         "research".into(),
@@ -103,7 +103,7 @@ fn get_agent_task_returns_some_when_exists() {
 
 #[test]
 fn resolve_task_provider_uses_task_provider_first() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     let mut agents = HashMap::new();
     agents.insert(
         "research".into(),
@@ -120,7 +120,7 @@ fn resolve_task_provider_uses_task_provider_first() {
 
 #[test]
 fn resolve_task_provider_falls_back_to_default() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("deepseek".into()),
         ..Default::default()
     };
@@ -133,13 +133,13 @@ fn resolve_task_provider_falls_back_to_default() {
 
 #[test]
 fn resolve_task_provider_falls_back_to_ollama() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert_eq!(resolve_task_provider(&config, "ghost"), "ollama");
 }
 
 #[test]
 fn resolve_task_model_uses_task_model_first() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     let mut agents = HashMap::new();
     agents.insert(
         "research".into(),
@@ -157,7 +157,7 @@ fn resolve_task_model_uses_task_model_first() {
 
 #[test]
 fn resolve_task_model_falls_back_to_provider_default_model() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     let mut agents = HashMap::new();
     agents.insert(
         "research".into(),
@@ -184,7 +184,7 @@ fn resolve_task_model_falls_back_to_provider_default_model() {
 
 #[test]
 fn resolve_task_model_falls_back_to_global_default_model() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     let mut agents = HashMap::new();
     agents.insert(
         "research".into(),
@@ -202,20 +202,20 @@ fn resolve_task_model_falls_back_to_global_default_model() {
 
 #[test]
 fn resolve_task_model_falls_back_to_hardcoded_default() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert_eq!(resolve_task_model(&config, "ghost"), "qwen3-coder");
 }
 
 #[test]
 fn consolidation_time_with_value() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     config.cron.consolidation_time = Some("03:30".into());
     assert_eq!(consolidation_time(&config), "03:30");
 }
 
 #[test]
 fn consolidation_time_default() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert_eq!(consolidation_time(&config), "02:00");
 }
 
@@ -249,25 +249,25 @@ fn load_embedded_config_has_providers() {
 
 #[test]
 fn get_provider_returns_none_when_missing() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert!(get_provider(&config, "nonexistent").is_none());
 }
 
 #[test]
 fn get_agent_task_returns_none_when_missing() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert!(get_agent_task(&config, "nonexistent").is_none());
 }
 
 #[test]
 fn get_provider_returns_none_when_providers_empty() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert!(get_provider(&config, "anything").is_none());
 }
 
 #[test]
 fn resolve_task_provider_chain_all_none() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: None,
         ..Default::default()
     };
@@ -276,7 +276,7 @@ fn resolve_task_provider_chain_all_none() {
 
 #[test]
 fn resolve_task_model_chain_all_none() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_model: None,
         ..Default::default()
     };
@@ -301,7 +301,7 @@ fn embedded_config_default_provider_is_set() {
 
 #[test]
 fn get_provider_with_empty_string() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert!(
         get_provider(&config, "").is_none(),
         "Empty string should get None"
@@ -310,7 +310,7 @@ fn get_provider_with_empty_string() {
 
 #[test]
 fn get_agent_task_with_empty_string() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert!(
         get_agent_task(&config, "").is_none(),
         "Empty string should get None"
@@ -319,7 +319,7 @@ fn get_agent_task_with_empty_string() {
 
 #[test]
 fn resolve_task_provider_with_empty_task_name() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     // Even with empty task name, should fall through to defaults
     let result = resolve_task_provider(&config, "");
     assert!(
@@ -330,14 +330,14 @@ fn resolve_task_provider_with_empty_task_name() {
 
 #[test]
 fn get_provider_with_very_long_name() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     let long_name = "a".repeat(10_000);
     assert!(get_provider(&config, &long_name).is_none());
 }
 
 #[test]
 fn resolve_task_model_with_non_existent_provider_in_chain() {
-    let mut config = AgenticConfig::default();
+    let mut config = ZenConfig::default();
     let mut agents = HashMap::new();
     agents.insert(
         "task".into(),
@@ -366,7 +366,7 @@ fn load_embedded_config_is_deterministic() {
 
 #[test]
 fn config_default_feature_flags() {
-    let config = AgenticConfig::default();
+    let config = ZenConfig::default();
     assert_eq!(config.features.multi_agent, Some(true));
     assert_eq!(config.features.auto_research, Some(true));
 }
@@ -379,7 +379,7 @@ fn config_default_feature_flags() {
 fn resolve_task_provider_logic_tree_exhaustive() {
     // Branch 1: task has provider → use it
     {
-        let mut config = AgenticConfig::default();
+        let mut config = ZenConfig::default();
         let mut agents = HashMap::new();
         agents.insert(
             "t1".into(),
@@ -399,7 +399,7 @@ fn resolve_task_provider_logic_tree_exhaustive() {
 
     // Branch 2: task has no provider, default_provider set → use default
     {
-        let config = AgenticConfig {
+        let config = ZenConfig {
             default_provider: Some("default-p".into()),
             ..Default::default()
         };
@@ -412,7 +412,7 @@ fn resolve_task_provider_logic_tree_exhaustive() {
 
     // Branch 3: neither task nor default → "ollama"
     {
-        let config = AgenticConfig {
+        let config = ZenConfig {
             default_provider: None,
             ..Default::default()
         };
@@ -428,7 +428,7 @@ fn resolve_task_provider_logic_tree_exhaustive() {
 fn resolve_task_model_logic_tree_exhaustive() {
     // Branch 1: task has model → use it
     {
-        let mut config = AgenticConfig::default();
+        let mut config = ZenConfig::default();
         let mut agents = HashMap::new();
         agents.insert(
             "t1".into(),
@@ -449,7 +449,7 @@ fn resolve_task_model_logic_tree_exhaustive() {
 
     // Branch 2: task has no model, provider has default_model → use provider default
     {
-        let mut config = AgenticConfig::default();
+        let mut config = ZenConfig::default();
         let mut agents = HashMap::new();
         agents.insert(
             "t2".into(),
@@ -479,7 +479,7 @@ fn resolve_task_model_logic_tree_exhaustive() {
 
     // Branch 3: task has no model, provider has no default_model, global default set → use global
     {
-        let mut config = AgenticConfig::default();
+        let mut config = ZenConfig::default();
         let mut agents = HashMap::new();
         agents.insert(
             "t3".into(),
@@ -500,7 +500,7 @@ fn resolve_task_model_logic_tree_exhaustive() {
 
     // Branch 4: nothing set → hardcoded "qwen3-coder"
     {
-        let config = AgenticConfig::default();
+        let config = ZenConfig::default();
         assert_eq!(
             resolve_task_model(&config, "t4"),
             "qwen3-coder",
@@ -513,13 +513,13 @@ fn resolve_task_model_logic_tree_exhaustive() {
 fn consolidation_time_logic_tree() {
     // Branch 1: configured time
     {
-        let mut config = AgenticConfig::default();
+        let mut config = ZenConfig::default();
         config.cron.consolidation_time = Some("12:00".into());
         assert_eq!(consolidation_time(&config), "12:00");
     }
     // Branch 2: default
     {
-        let config = AgenticConfig::default();
+        let config = ZenConfig::default();
         assert_eq!(consolidation_time(&config), "02:00");
     }
 }
@@ -532,8 +532,8 @@ fn consolidation_time_logic_tree() {
 fn agentic_config_is_send_sync() {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
-    assert_send::<AgenticConfig>();
-    assert_sync::<AgenticConfig>();
+    assert_send::<ZenConfig>();
+    assert_sync::<ZenConfig>();
 }
 
 #[test]

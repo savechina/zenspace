@@ -17,7 +17,7 @@ static CONFIGS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../config");
 // Global config cache (parse once per process)
 // ---------------------------------------------------------------------------
 
-static CONFIG_CACHE: OnceLock<AgenticConfig> = OnceLock::new();
+static CONFIG_CACHE: OnceLock<ZenConfig> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Config structs — Provider/Agent separation (FR-002)
@@ -25,7 +25,7 @@ static CONFIG_CACHE: OnceLock<AgenticConfig> = OnceLock::new();
 
 /// Root configuration for the Agentic module.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct AgenticConfig {
+pub struct ZenConfig {
     /// Default provider name (references a key in `providers`).
     #[serde(default)]
     pub default_provider: Option<String>,
@@ -48,10 +48,6 @@ pub struct AgenticConfig {
     pub plugin: PluginConfig,
     #[serde(default)]
     pub feeds: Vec<FeedConfig>,
-    #[serde(default)]
-    pub learning: LearningConfig,
-    #[serde(default)]
-    pub finance: FinanceConfig,
     #[serde(default)]
     pub tui: TuiConfig,
 }
@@ -246,32 +242,74 @@ pub struct CronConfig {
 }
 
 /// Plugin system config.
+///
+/// TOML layout:
+/// ```toml
+/// [plugin]
+/// base_path = "~/.zen/plugins"
+///
+/// [plugin.finance]
+/// enabled = true
+/// base_currency = "CNY"
+/// ```
+///
+/// Known fields (`base_path`, `wasm_cache_path`) are deserialized directly.
+/// All other `[plugin.{id}]` sections are collected into `plugins` via `#[serde(flatten)]`,
+/// where each value is parsed into a [`PluginInstanceConfig`] (extracting `enabled`,
+/// everything else into `config`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PluginConfig {
-    pub scan_dir: Option<String>,
-    pub wasm_cache_dir: Option<String>,
-    /// Per-plugin configuration keyed by plugin ID
-    pub plugins: HashMap<String, PluginInstance>,
+    pub base_path: Option<String>,
+    pub wasm_cache_path: Option<String>,
+    /// Per-plugin configuration keyed by plugin ID.
+    /// Collected via `#[serde(flatten)]` — any `[plugin.{id}]` section
+    /// that isn't a known field lands here.
+    #[serde(flatten)]
+    pub plugins: HashMap<String, PluginInstanceConfig>,
 }
 
 /// Individual plugin instance configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PluginInstance {
+///
+/// Deserialized from a TOML table with `enabled` extracted as a first-class
+/// field, and all remaining keys folded into `config` as a JSON object.
+#[derive(Debug, Clone)]
+pub struct PluginInstanceConfig {
     /// Whether this plugin is enabled
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Plugin-specific configuration (flexible schema)
-    #[serde(default)]
     pub config: serde_json::Value,
 }
 
-impl Default for PluginInstance {
+impl Default for PluginInstanceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             config: serde_json::Value::Null,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginInstanceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Helper struct: `enabled` is extracted, everything else is flattened
+        /// into the `rest` map, then folded into `config`.
+        #[derive(Deserialize)]
+        struct PluginInstanceConfigHelper {
+            #[serde(default = "default_true")]
+            enabled: bool,
+            #[serde(flatten)]
+            rest: HashMap<String, serde_json::Value>,
+        }
+
+        let helper = PluginInstanceConfigHelper::deserialize(deserializer)?;
+        Ok(PluginInstanceConfig {
+            enabled: helper.enabled,
+            config: serde_json::Value::Object(helper.rest.into_iter().collect()),
+        })
     }
 }
 
@@ -363,8 +401,8 @@ impl Default for PluginConfig {
             .map(|h| h.display().to_string())
             .unwrap_or_default();
         Self {
-            scan_dir: Some(format!("{home}/.zen/plugins")),
-            wasm_cache_dir: Some(format!("{home}/.zen/plugins/cache")),
+            base_path: Some(format!("{home}/.zen/plugins")),
+            wasm_cache_path: Some(format!("{home}/.zen/plugins/cache")),
             plugins: HashMap::new(),
         }
     }
@@ -405,7 +443,7 @@ impl Default for FinanceConfig {
 /// **Caching**: Config is parsed once per process and cached globally.
 /// Subsequent calls return a reference to the cached config.
 /// In test mode, caching is disabled to allow environment variable changes.
-pub fn load_config() -> Result<&'static AgenticConfig, ZenError> {
+pub fn load_config() -> Result<&'static ZenConfig, ZenError> {
     #[cfg(test)]
     {
         // In test mode, always load fresh config to allow env var changes
@@ -415,7 +453,7 @@ pub fn load_config() -> Result<&'static AgenticConfig, ZenError> {
         let global = load_file_config(paths.global_root().join("config.toml")).unwrap_or_default();
         let workspace = match paths.workspace_root() {
             Some(w) => load_file_config(w.join("config.toml")).unwrap_or_default(),
-            None => AgenticConfig::default(),
+            None => ZenConfig::default(),
         };
         let merged = merge_configs(embedded, global)?;
         let merged = merge_configs(merged, workspace)?;
@@ -443,7 +481,7 @@ pub fn load_config() -> Result<&'static AgenticConfig, ZenError> {
         // 3. Workspace config from .zen/config.toml (T025, upward search via ZenPaths)
         let workspace = match paths.workspace_root() {
             Some(w) => load_file_config(w.join("config.toml")).unwrap_or_default(),
-            None => AgenticConfig::default(),
+            None => ZenConfig::default(),
         };
 
         // 4. Merge: embedded ← global ← workspace
@@ -469,7 +507,7 @@ pub fn load_config() -> Result<&'static AgenticConfig, ZenError> {
     }
 }
 
-fn load_file_config(path: PathBuf) -> Result<AgenticConfig, ZenError> {
+fn load_file_config(path: PathBuf) -> Result<ZenConfig, ZenError> {
     if !path.exists() {
         return Err(ZenError::Config(ConfigError::MissingFile {
             path: path.display().to_string(),
@@ -483,7 +521,7 @@ fn load_file_config(path: PathBuf) -> Result<AgenticConfig, ZenError> {
         })
     })?;
 
-    let config: AgenticConfig = toml::from_str(&contents).map_err(|e| {
+    let config: ZenConfig = toml::from_str(&contents).map_err(|e| {
         ZenError::Config(ConfigError::ParseError {
             path: path.display().to_string(),
             reason: e.to_string(),
@@ -493,7 +531,7 @@ fn load_file_config(path: PathBuf) -> Result<AgenticConfig, ZenError> {
     Ok(config)
 }
 
-pub fn load_embedded_config() -> Result<AgenticConfig, ZenError> {
+pub fn load_embedded_config() -> Result<ZenConfig, ZenError> {
     let config_file = CONFIGS.get_file("config.toml").ok_or_else(|| {
         ZenError::Config(ConfigError::MissingFile {
             path: "embedded://config.toml".into(),
@@ -507,7 +545,7 @@ pub fn load_embedded_config() -> Result<AgenticConfig, ZenError> {
         })
     })?;
 
-    let config: AgenticConfig = toml::from_str(contents).map_err(|e| {
+    let config: ZenConfig = toml::from_str(contents).map_err(|e| {
         ZenError::Config(ConfigError::ParseError {
             path: "embedded://config.toml".into(),
             reason: e.to_string(),
@@ -521,11 +559,8 @@ pub fn load_embedded_config() -> Result<AgenticConfig, ZenError> {
 // Config inheritance / merge logic (T025)
 // ---------------------------------------------------------------------------
 
-fn merge_configs(
-    base: AgenticConfig,
-    override_cfg: AgenticConfig,
-) -> Result<AgenticConfig, ZenError> {
-    Ok(AgenticConfig {
+fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, ZenError> {
+    Ok(ZenConfig {
         default_provider: str_merge(base.default_provider, override_cfg.default_provider),
         default_model: str_merge(base.default_model, override_cfg.default_model),
         providers: merge_providers(base.providers, override_cfg.providers),
@@ -535,8 +570,6 @@ fn merge_configs(
         cron: merge_cron(base.cron, override_cfg.cron),
         plugin: merge_plugin(base.plugin, override_cfg.plugin),
         feeds: merge_feeds(base.feeds, override_cfg.feeds),
-        learning: merge_learning(base.learning, override_cfg.learning),
-        finance: merge_finance(base.finance, override_cfg.finance),
         tui: merge_tui(base.tui, override_cfg.tui),
     })
 }
@@ -596,10 +629,27 @@ fn merge_cron(base: CronConfig, ov: CronConfig) -> CronConfig {
 
 fn merge_plugin(base: PluginConfig, ov: PluginConfig) -> PluginConfig {
     let mut plugins = base.plugins;
-    plugins.extend(ov.plugins);
+    for (key, ov_entry) in ov.plugins {
+        plugins
+            .entry(key)
+            .and_modify(|base_entry| {
+                // enabled from override wins
+                base_entry.enabled = ov_entry.enabled;
+                // JSON field-level deep merge on config objects
+                if let (Some(base_obj), Some(ov_obj)) = (
+                    base_entry.config.as_object_mut(),
+                    ov_entry.config.as_object(),
+                ) {
+                    for (k, v) in ov_obj {
+                        base_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            })
+            .or_insert(ov_entry);
+    }
     PluginConfig {
-        scan_dir: str_merge(base.scan_dir, ov.scan_dir),
-        wasm_cache_dir: str_merge(base.wasm_cache_dir, ov.wasm_cache_dir),
+        base_path: str_merge(base.base_path, ov.base_path),
+        wasm_cache_path: str_merge(base.wasm_cache_path, ov.wasm_cache_path),
         plugins,
     }
 }
@@ -611,32 +661,9 @@ fn merge_feeds(mut base: Vec<FeedConfig>, ov: Vec<FeedConfig>) -> Vec<FeedConfig
     base
 }
 
-fn merge_learning(base: LearningConfig, ov: LearningConfig) -> LearningConfig {
-    LearningConfig {
-        auto_research: ov.auto_research.or(base.auto_research),
-        interval: str_merge(base.interval, ov.interval),
-    }
-}
-
 fn merge_tui(base: TuiConfig, ov: TuiConfig) -> TuiConfig {
     TuiConfig {
         theme: str_merge(base.theme, ov.theme),
-    }
-}
-
-fn merge_finance(base: FinanceConfig, ov: FinanceConfig) -> FinanceConfig {
-    FinanceConfig {
-        base_currency: str_merge(base.base_currency, ov.base_currency),
-        disclaimer_acknowledged: ov.disclaimer_acknowledged.or(base.disclaimer_acknowledged),
-        tracked_categories: match (base.tracked_categories, ov.tracked_categories) {
-            (None, None) => None,
-            (Some(b), None) => Some(b),
-            (None, Some(o)) => Some(o),
-            (Some(mut b), Some(mut o)) => {
-                b.append(&mut o);
-                Some(b)
-            }
-        },
     }
 }
 
@@ -648,7 +675,7 @@ fn str_merge(base: Option<String>, ov: Option<String>) -> Option<String> {
 // Environment variable overrides (T023 — dotenvy + ZEN_* env vars)
 // ---------------------------------------------------------------------------
 
-fn apply_env_overrides(mut config: AgenticConfig) -> AgenticConfig {
+fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     if let Some(v) = env_str("ZEN_DEFAULT_PROVIDER") {
         config.default_provider = Some(v);
     }
@@ -658,8 +685,6 @@ fn apply_env_overrides(mut config: AgenticConfig) -> AgenticConfig {
     apply_agent_env(&mut config.agents);
     apply_cron_env(&mut config.cron);
     apply_plugin_env(&mut config.plugin);
-    apply_learning_env(&mut config.learning);
-    apply_finance_env(&mut config.finance);
     apply_channels_env(&mut config.channels);
     config
 }
@@ -696,29 +721,43 @@ fn apply_cron_env(cron: &mut CronConfig) {
 }
 
 fn apply_plugin_env(plugin: &mut PluginConfig) {
-    if let Some(v) = env_str("ZEN_PLUGIN_SCAN_DIR") {
-        plugin.scan_dir = Some(v);
+    if let Some(v) = env_str("ZEN_PLUGIN_BASE_PATH") {
+        plugin.base_path = Some(v);
     }
-    if let Some(v) = env_str("ZEN_PLUGIN_WASM_CACHE_DIR") {
-        plugin.wasm_cache_dir = Some(v);
+    if let Some(v) = env_str("ZEN_PLUGIN_WASM_CACHE_PATH") {
+        plugin.wasm_cache_path = Some(v);
     }
+    // Plugin fields via env: write directly into plugins[id].config JSON
+    env_plugin_field(plugin, "learning", |obj| {
+        if let Some(v) = env_bool("ZEN_LEARNING_AUTO_RESEARCH") {
+            obj.insert("auto_research".into(), serde_json::Value::Bool(v));
+        }
+        if let Some(v) = env_str("ZEN_LEARNING_INTERVAL") {
+            obj.insert("interval".into(), serde_json::Value::String(v));
+        }
+    });
+    env_plugin_field(plugin, "finance", |obj| {
+        if let Some(v) = env_str("ZEN_FINANCE_BASE_CURRENCY") {
+            obj.insert("base_currency".into(), serde_json::Value::String(v));
+        }
+        if let Some(v) = env_bool("ZEN_FINANCE_DISCLAIMER_ACKNOWLEDGED") {
+            obj.insert("disclaimer_acknowledged".into(), serde_json::Value::Bool(v));
+        }
+    });
 }
 
-fn apply_learning_env(learning: &mut LearningConfig) {
-    if let Some(v) = env_bool("ZEN_LEARNING_AUTO_RESEARCH") {
-        learning.auto_research = Some(v);
+/// Helper: access (or create) a plugin's config JSON object for env var injection.
+fn env_plugin_field(
+    plugin: &mut PluginConfig,
+    id: &str,
+    f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let entry = plugin.plugins.entry(id.into()).or_default();
+    if entry.config.is_null() {
+        entry.config = serde_json::Value::Object(serde_json::Map::new());
     }
-    if let Some(v) = env_str("ZEN_LEARNING_INTERVAL") {
-        learning.interval = Some(v);
-    }
-}
-
-fn apply_finance_env(finance: &mut FinanceConfig) {
-    if let Some(v) = env_str("ZEN_FINANCE_BASE_CURRENCY") {
-        finance.base_currency = Some(v);
-    }
-    if let Some(v) = env_bool("ZEN_FINANCE_DISCLAIMER_ACKNOWLEDGED") {
-        finance.disclaimer_acknowledged = Some(v);
+    if let Some(obj) = entry.config.as_object_mut() {
+        f(obj);
     }
 }
 
@@ -797,7 +836,7 @@ fn env_bool(key: &str) -> Option<bool> {
 // Convenience helpers
 // ---------------------------------------------------------------------------
 
-impl AgenticConfig {
+impl ZenConfig {
     /// Resolve theme from TUI section.
     pub fn tui_theme(&self) -> Option<&str> {
         self.tui.theme.as_deref()
@@ -805,27 +844,27 @@ impl AgenticConfig {
 }
 
 /// Get the default LLM provider string.
-pub fn default_llm_provider(config: &AgenticConfig) -> &str {
+pub fn default_llm_provider(config: &ZenConfig) -> &str {
     config.default_provider.as_deref().unwrap_or("ollama")
 }
 
 /// Get the default model string.
-pub fn default_model(config: &AgenticConfig) -> &str {
+pub fn default_model(config: &ZenConfig) -> &str {
     config.default_model.as_deref().unwrap_or("qwen3-coder")
 }
 
 /// Get a provider definition by name.
-pub fn get_provider<'a>(config: &'a AgenticConfig, name: &str) -> Option<&'a ProviderConfig> {
+pub fn get_provider<'a>(config: &'a ZenConfig, name: &str) -> Option<&'a ProviderConfig> {
     config.providers.get(name)
 }
 
 /// Get an agent task config by name.
-pub fn get_agent_task<'a>(config: &'a AgenticConfig, name: &str) -> Option<&'a AgentConfig> {
+pub fn get_agent_task<'a>(config: &'a ZenConfig, name: &str) -> Option<&'a AgentConfig> {
     config.agents.get(name)
 }
 
 /// Resolve the effective provider for a task, falling back to default.
-pub fn resolve_task_provider<'a>(config: &'a AgenticConfig, task: &str) -> &'a str {
+pub fn resolve_task_provider<'a>(config: &'a ZenConfig, task: &str) -> &'a str {
     config
         .agents
         .get(task)
@@ -835,7 +874,7 @@ pub fn resolve_task_provider<'a>(config: &'a AgenticConfig, task: &str) -> &'a s
 }
 
 /// Resolve the effective model for a task, falling back through provider default → global default.
-pub fn resolve_task_model<'a>(config: &'a AgenticConfig, task: &str) -> &'a str {
+pub fn resolve_task_model<'a>(config: &'a ZenConfig, task: &str) -> &'a str {
     let provider_name = resolve_task_provider(config, task);
     config
         .agents
@@ -852,6 +891,6 @@ pub fn resolve_task_model<'a>(config: &'a AgenticConfig, task: &str) -> &'a str 
 }
 
 /// Get the consolidation cron schedule string (HH:MM).
-pub fn consolidation_time(config: &AgenticConfig) -> &str {
+pub fn consolidation_time(config: &ZenConfig) -> &str {
     config.cron.consolidation_time.as_deref().unwrap_or("02:00")
 }

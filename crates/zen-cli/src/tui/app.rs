@@ -335,7 +335,7 @@ impl App {
         InputCell::new(text)
     }
 
-    pub fn new(_config: &'static zen_core::config::AgenticConfig) -> Self {
+    pub fn new(_config: &'static zen_core::config::ZenConfig) -> Self {
         let workspace = zen_core::paths::ZenPaths::detect()
             .ok()
             .and_then(|paths| paths.workspace_root().map(|p| p.display().to_string()))
@@ -393,7 +393,7 @@ impl App {
                 self.current_toast = Some((msg, Instant::now()));
             }
         }
-        
+
         if let Some((ref msg, timestamp)) = self.current_toast {
             if timestamp.elapsed().as_secs() < TOAST_DURATION_SECS {
                 return Some(msg.clone());
@@ -536,7 +536,7 @@ impl App {
         self.output.push(OutputCell::Plain(PlainCell::new(info)));
     }
 
-    pub fn init_orchestrator(&mut self, config: &'static zen_core::config::AgenticConfig) {
+    pub fn init_orchestrator(&mut self, config: &'static zen_core::config::ZenConfig) {
         let router = DefaultRouter::from_agentic(config);
         self.orchestrator = Some(Arc::new(AgentOrchestrator::new(router)));
         self.session = Some(SessionContext::new("default".into(), String::new()));
@@ -1020,7 +1020,7 @@ Use /thinking to show/hide thinking process."#;
 
         if provider != "ollama" && provider != "mock" {
             let agentic = zen_core::config::load_embedded_config()
-                .unwrap_or_else(|_| zen_core::config::AgenticConfig::default());
+                .unwrap_or_else(|_| zen_core::config::ZenConfig::default());
 
             let env_var = agentic
                 .providers
@@ -1143,7 +1143,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_new_session(&mut self) {
-        use zen_memory::session_manager::SessionManager;
+        use zen_memory::session::SessionManager;
         let manager = SessionManager::new();
         match manager.create_session("default", ".") {
             Ok(session) => {
@@ -1158,7 +1158,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_fork_session(&mut self, title: Option<&str>) {
-        use zen_memory::session_manager::SessionManager;
+        use zen_memory::session::SessionManager;
         let current_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
@@ -1191,7 +1191,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_rename_session(&mut self, title: Option<&str>) {
-        use zen_memory::session_manager::SessionManager;
+        use zen_memory::session::SessionManager;
         let current_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
@@ -1218,7 +1218,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_archive_session(&mut self) {
-        use zen_memory::session_manager::SessionManager;
+        use zen_memory::session::SessionManager;
         let current_id = match &self.session_id {
             Some(id) => id.clone(),
             None => {
@@ -1240,7 +1240,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     pub fn resume_session(&mut self, session_id: &str) {
-        use zen_memory::session_manager::SessionManager;
+        use zen_memory::session::SessionManager;
         let manager = SessionManager::new();
         match manager.resume_session(session_id) {
             Ok(session) => {
@@ -1284,7 +1284,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     pub fn archive_session(&mut self, session_id: &str) {
-        use zen_memory::session_manager::SessionManager;
+        use zen_memory::session::SessionManager;
         let manager = SessionManager::new();
         match manager.archive_session(session_id) {
             Ok(()) => {
@@ -1296,7 +1296,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     pub fn rename_session(&mut self, session_id: &str, title: &str) {
-        use zen_memory::session_manager::SessionManager;
+        use zen_memory::session::SessionManager;
         let manager = SessionManager::new();
         match manager.rename_session(session_id, title.to_string()) {
             Ok(()) => {
@@ -1500,7 +1500,7 @@ Use /thinking to show/hide thinking process."#;
 
 pub fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    config: &'static zen_core::config::AgenticConfig,
+    config: &'static zen_core::config::ZenConfig,
 ) -> Result<()> {
     let mut app = App::new(config);
     if let Some(theme) = config.tui_theme() {

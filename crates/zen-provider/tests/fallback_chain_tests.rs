@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 
-use zen_core::config::{AgentConfig, AgenticConfig, FallbackStep};
+use zen_core::config::{AgentConfig, ZenConfig, FallbackStep};
 use zen_provider::{DefaultRouter, Provider};
 
 #[test]
 fn test_build_fallback_chain_with_fallbacks() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("ollama".into()),
         default_model: Some("qwen3.6:35b-mlx".into()),
         agents: {
@@ -50,7 +50,7 @@ fn test_build_fallback_chain_with_fallbacks() {
 
 #[test]
 fn test_build_fallback_chain_without_fallbacks() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("ollama".into()),
         agents: {
             let mut map = HashMap::new();
@@ -79,7 +79,7 @@ fn test_build_fallback_chain_without_fallbacks() {
 
 #[test]
 fn test_build_fallback_chain_unknown_agent() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("openai".into()),
         default_model: Some("gpt-4o-mini".into()),
         ..Default::default()

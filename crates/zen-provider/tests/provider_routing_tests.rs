@@ -9,7 +9,7 @@
 // ============================================================================
 
 use std::collections::HashMap;
-use zen_core::config::{AgentConfig, AgenticConfig, FallbackStep};
+use zen_core::config::{AgentConfig, ZenConfig, FallbackStep};
 use zen_provider::{DefaultRouter, ModelMetadata, Provider};
 
 // ============================================================================
@@ -18,7 +18,7 @@ use zen_provider::{DefaultRouter, ModelMetadata, Provider};
 
 #[test]
 fn test_default_router_creation_from_config() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("ollama".into()),
         default_model: Some("qwen3.6:35b-mlx".into()),
         ..Default::default()
@@ -30,7 +30,7 @@ fn test_default_router_creation_from_config() {
 
 #[test]
 fn test_router_selects_provider_for_known_agent() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("openai".into()),
         agents: {
             let mut map = HashMap::new();
@@ -75,7 +75,7 @@ fn test_model_metadata_creation() {
 
 #[test]
 fn test_router_handles_unknown_agent() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("ollama".into()),
         ..Default::default()
     };
@@ -87,7 +87,7 @@ fn test_router_handles_unknown_agent() {
 
 #[test]
 fn test_router_handles_default_only_config() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("ollama".into()),
         ..Default::default()
     };
@@ -100,7 +100,7 @@ fn test_router_handles_default_only_config() {
 
 #[test]
 fn test_router_handles_agent_without_provider() {
-    let config = AgenticConfig {
+    let config = ZenConfig {
         default_provider: Some("anthropic".into()),
         default_model: Some("claude-3-opus".into()),
         agents: {

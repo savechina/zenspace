@@ -10,7 +10,6 @@ pub mod memvid;
 pub mod prompt;
 pub mod sensitivity;
 pub mod session;
-pub mod session_manager;
 
 pub use context_budget::ContextBudget;
 pub use conversation::ConversationStore;
@@ -24,6 +23,6 @@ pub use memvid::{
 };
 pub use prompt::PromptAssembly;
 pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity};
+pub use session::SessionManager;
 pub use session::{ConversationTurn, RetrievedNote, SessionContext};
-pub use session_manager::SessionManager;
 pub use zen_core::types::{SessionEntity, SessionStatus};

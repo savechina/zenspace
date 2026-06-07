@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-pub use zen_core::config::{AgenticConfig, LlmConfig, ProviderConfig};
+pub use zen_core::config::{ZenConfig, LlmConfig, ProviderConfig};
 use zen_core::errors::ZenError;
 use zen_core::secrets::SecretRef;
 use zen_core::types::Sensitivity;
@@ -421,14 +421,14 @@ impl ProviderInstance {
 
 #[derive(Debug, Clone)]
 pub struct DefaultRouter {
-    config: zen_core::config::AgenticConfig,
+    config: zen_core::config::ZenConfig,
     mock: MockProvider,
     providers: std::collections::HashMap<String, ProviderInstance>,
 }
 
 impl DefaultRouter {
     /// Create from a full [`zen_core::config::AgenticConfig`].
-    pub fn from_agentic(agentic: &zen_core::config::AgenticConfig) -> Self {
+    pub fn from_agentic(agentic: &zen_core::config::ZenConfig) -> Self {
         let mut providers = std::collections::HashMap::new();
 
         for (name, cfg) in &agentic.providers {
@@ -608,7 +608,7 @@ impl DefaultRouter {
         }
 
         Self {
-            config: zen_core::config::AgenticConfig {
+            config: zen_core::config::ZenConfig {
                 default_provider: config.default_provider.clone(),
                 default_model: None,
                 providers: std::collections::HashMap::new(),
@@ -618,8 +618,6 @@ impl DefaultRouter {
                 cron: zen_core::config::CronConfig::default(),
                 plugin: zen_core::config::PluginConfig::default(),
                 feeds: Vec::new(),
-                learning: zen_core::config::LearningConfig::default(),
-                finance: zen_core::config::FinanceConfig::default(),
                 tui: zen_core::config::TuiConfig::default(),
             },
             mock: MockProvider::default(),
@@ -633,7 +631,7 @@ impl DefaultRouter {
     pub fn new_for_provider(provider_name: &str, model_name: &str) -> Self {
         // Load embedded config as source of truth
         let agentic =
-            zen_core::config::load_embedded_config().unwrap_or_else(|_| AgenticConfig::default());
+            zen_core::config::load_embedded_config().unwrap_or_else(|_| ZenConfig::default());
 
         // Override model in provider config if specified
         let mut providers = agentic.providers.clone();
@@ -656,7 +654,7 @@ impl DefaultRouter {
     // -- internal helpers --
 
     fn resolve_provider(
-        cfg: &zen_core::config::AgenticConfig,
+        cfg: &zen_core::config::ZenConfig,
         task_ctx: TaskContext,
     ) -> Option<Provider> {
         let task_name = task_ctx.config_key();
