@@ -103,7 +103,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 rig-core = "0.37"
 
 # Composable agent kernel: stateless skills, transport-agnostic tools, registry-driven agents
-rig-compose = "0.4"
+rig-compose = "0.5"
 
 # MCP bridge for rig-compose tools
 rig-mcp = "0.2"
@@ -131,6 +131,10 @@ sysinfo = "0.35"
 notify = "8"
 notify-rust = "4"
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
+
+# Clipboard (FR-TUI-021 — output auto-copy + paste)
+arboard = "3.6"
+base64 = "0.22"
 
 [profile.dist]
 inherits = "release"

@@ -3,22 +3,24 @@
 use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::symbols::border;
 use ratatui::widgets::{Block, Borders};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::Instant;
 use tui_textarea::TextArea;
 use zen_agents::AgentOrchestrator;
 use zen_core::config::load_config;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
-use super::cell::{ErrorCell, MarkdownCell, OutputCell, PlainCell};
+use super::cell::{BannerCell, ErrorCell, MarkdownCell, OutputCell, PlainCell};
 use super::render::normalize_compact_markdown;
 use super::session_picker::SessionPickerState;
-use super::slash::SlashState;
+use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::MarkdownStreamCollector;
-use super::theme::{DefaultTheme, OutputTheme};
+use super::theme::{OutputTheme, ZenTheme, from_name as theme_from_name};
 use zen_memory::conversation::ConversationStore;
 
 pub struct PendingLlmCall {
@@ -39,6 +41,100 @@ pub enum PendingCallKind {
 
 const MAX_HISTORY: usize = 100;
 const MAX_QUEUE_SIZE: usize = 10;
+const TOAST_DURATION_SECS: u64 = 3;
+const PASTE_MODE_SECS: u64 = 2;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    #[default]
+    Default,
+    Paste,
+    History,
+    Selection,
+}
+
+// Full ZENSPACE logo for wide terminals (≥90 cols)
+// const SPLASH_LOGO_FULL: &str = r#"
+//  ████████  ████████  ███     ██   ████████  ████████   ████████   ████████  ████████
+//       ██   ██        ████    ██   ██        ██    ██   ██    ██   ██        ██
+//      ██    ██████    ██ ██   ██   ████████  ████████   ████████   ██        ██████
+//     ██     ██        ██  ██  ██         ██  ██    ██   ██         ██        ██
+//  ████████  ████████  ██   █████   ████████  ██    ██   ██         ████████  ████████
+// "#;
+
+// 3D Shadow ZENSPACE logo for wide terminals (≥90 cols)
+const SPLASH_LOGO_FULL: &str = r#"
+ ███████▒ ███████▒ ███▒   ██▒  ███████▒ ███████▒  ███████▒  ███████▒ ███████▒
+   ▒▒▒██▒_██▒▒▒▒▒▒_████▒  ██▒__██▒▒▒▒▒▒_██▒▒▒▒██▒_██▒▒▒▒██▒_██▒▒▒▒▒▒_██▒▒▒▒▒▒
+     ██▒  ██████▒  ██▒██▒ ██▒  ███████▒ ███████▒  ███████▒  ██▒      ██████▒
+   ██▒    ██▒▒▒▒   ██▒▒██▒██▒  ▒▒▒▒▒██▒ ██▒▒▒▒██▒_██▒▒▒▒▒▒  ██▒      ██▒▒▒▒
+ ███████▒ ███████▒ ██▒ ▒████▒  ███████▒ ██▒   ██▒_██▒       ▒██████▒ ███████▒
+ ▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒  ▒▒   ▒▒▒▒   ▒▒▒▒▒▒▒  ▒▒    ▒▒  ▒▒         ▒▒▒▒▒▒  ▒▒▒▒▒▒▒
+"#;
+
+// Optimized 3D ZENSPACE Logo for Ratatui (Strict 100% Alignment)
+const SPLASH_LOGO_3D: &str = r#"
+ ███████░ ███████░ ███░   ██░  ███████░ ███████░  ███████░  ███████░ ███████░
+    ███░  ██░      ████░  ██░  ██░      ██░   ██░ ██░   ██░ ██░      ██░
+   ███░   ██████░  ██░██░ ██░  ███████░ ███████░  ███████░  ██░      ██████░
+  ███░    ██░      ██░ ██░██░       ██░ ██░   ██░ ██░       ██░      ██░
+ ███████░ ███████░ ██░  ████░  ███████░ ██░   ██░ ██░       ░██████░ ███████░
+ ░░░░░░░  ░░░░░░░  ░░    ░░░░   ░░░░░░░  ░░    ░░  ░░         ░░░░░░  ░░░░░░░
+"#;
+
+// Front Entity: RGB(43, 160, 152) | Drop Shadow: RGB(6, 106, 143)
+const LOGO_ZENSPACE_HYBRID: &str = r#"
+ ███████░ ███████░ ███░   ██░  ███████░ ███████░  ███████░  ███████░ ███████░
+    ███░  ██░      ████░  ██░  ██░      ██░   ██░ ██░   ██░ ██░      ██░
+   ███░   ██████░  ██░██░ ██░  ███████░ ███████░  ███████░  ██░      ██████░
+  ███░    ██░      ██░ ██░██░       ██░ ██░   ██░ ██░       ██░      ██░
+ ███████░ ███████░ ██░  ████░  ███████░ ██░   ██░ ██░       ░██████░ ███████░
+ ░░░░░░░  ░░░░░░░  ░░    ░░░░   ░░░░░░░  ░░    ░░  ░░         ░░░░░░  ░░░░░░░
+"#;
+
+// const SPLASH_LOGO_FULL: &str = r#"
+//  __________ _   _    _____ _____   ___   _____ _____
+//  /___  /  __| \ | |  /  ___| ___ \ / _ \ /  __ \  ___|
+//     / /| |__|  \| |  \ `--.| |_/ // /_\ \| /  \/| |__
+//    / / |  __| . ` |   `--. \  __/ |  _  || |    |  __|
+//  ./ /__| |__| |\  |  /\__/ / |    | | | || \__/\| |____
+//  \_____/____\_| \_/  \____/\_|    \_| |_/ \____/\____/
+// "#;
+
+// Minimal ZEN for narrow terminals (50-69 cols)
+// const SPLASH_LOGO_MINIMAL: &str = r#"
+// ███████  ███████  ███    ██
+//     ██   ██       ████   ██
+//    ██    ███████  ██ ██  ██
+//  ██      ██       ██  ██ ██
+// ███████  ███████  ██   ████
+// "#;
+
+// Minimal ZEN for narrow terminals (50-69 cols)
+const SPLASH_LOGO_MINIMAL: &str = r#"
+ ███████▒ ███████▒ ███▒   ██▒
+   ▒▒▒██▒_██▒▒▒▒▒▒_████▒  ██▒
+     ██▒  ██████▒  ██▒██▒ ██▒
+   ██▒    ██▒▒▒▒   ██▒▒██▒██▒
+ ███████▒ ███████▒ ██▒ ▒████▒
+ ▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒  ▒▒   ▒▒▒▒
+"#;
+
+const SPLASH_PET: &str = "\
+   /\\_/\\\n\
+  ( o.o )\n\
+  ( >^< )\n\
+  /|   |\\\n\
+ (_|   |_)\n";
+
+const SPLASH_TAGLINE: &str = "\
+  Zen Agentic Workspace\n";
+
+const SPLASH_HELP: &str = "\
+  Commands: /help  /exit  /clear  /model <name>\n\
+            /note  /search  /session  /config\n\
+  Keys:     Enter=send  Ctrl+D=quit  ↑/↓=history\n\
+  Type `/` to see command suggestions.\n";
 
 pub const SLASH_COMMANDS: &[&str] = &[
     "help",
@@ -112,28 +208,30 @@ pub struct App {
     pub stream_collector: MarkdownStreamCollector,
     pub theme: Box<dyn OutputTheme>,
     pub slash_state: SlashState,
+    pub slash_registry: SlashCommandRegistry,
     pub session_picker: SessionPickerState,
+    pub toast_queue: VecDeque<String>,
+    pub current_toast: Option<(String, Instant)>,
+    pub input_mode: InputMode,
+    pub paste_timestamp: Option<Instant>,
+    pub selected_cell_idx: usize,
     conversation_store: Option<ConversationStore>,
 }
 
 impl App {
-    fn create_input_textarea(text: impl Into<String>) -> TextArea<'static> {
-        let mut ta = TextArea::new(vec![text.into()]);
-        ta.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Input (Enter=send, Ctrl+D=quit) "),
-        );
-        ta
+    fn input_block() -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::Set {
+                vertical_left: ">",
+                ..border::PLAIN
+            })
+            .title(" Input (Enter=send, Ctrl+D=exit) ")
     }
 
-    fn create_default_textarea() -> TextArea<'static> {
-        let mut ta = TextArea::default();
-        ta.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Input (Enter=send, Ctrl+D=quit) "),
-        );
+    fn create_input_textarea(text: impl Into<String>) -> TextArea<'static> {
+        let mut ta = TextArea::new(vec![text.into()]);
+        ta.set_block(Self::input_block());
         ta
     }
 
@@ -143,7 +241,7 @@ impl App {
             .and_then(|paths| paths.workspace_root().map(|p| p.display().to_string()))
             .unwrap_or_else(|| ".".into());
         let mut app = Self {
-            input: Self::create_default_textarea(),
+            input: Self::create_input_textarea(""),
             output: Vec::new(),
             running: true,
             workspace,
@@ -164,13 +262,145 @@ impl App {
             scroll_offset: 0,
             auto_scroll: true,
             stream_collector: MarkdownStreamCollector::new(),
-            theme: Box::new(DefaultTheme),
+            theme: Box::new(ZenTheme),
             slash_state: SlashState::new(),
+            slash_registry: create_default_registry(),
             session_picker: SessionPickerState::new(),
+            toast_queue: VecDeque::new(),
+            current_toast: None,
+            input_mode: InputMode::Default,
+            paste_timestamp: None,
+            selected_cell_idx: 0,
             conversation_store: ConversationStore::open("tui").ok(),
         };
         app.load_command_history();
         app
+    }
+
+    pub fn with_theme(&mut self, name: &str) -> &mut Self {
+        self.theme = theme_from_name(name);
+        let bg_color = self.theme.bg();
+        let bg_style = ratatui::style::Style::default().bg(bg_color);
+        self.input.set_style(bg_style);
+        self.refresh_input_border();
+        self
+    }
+
+    pub fn show_toast(&mut self, msg: impl Into<String>) {
+        self.toast_queue.push_back(msg.into());
+    }
+
+    pub fn get_active_toast(&mut self) -> Option<String> {
+        if self.current_toast.is_none() {
+            if let Some(msg) = self.toast_queue.pop_front() {
+                self.current_toast = Some((msg, Instant::now()));
+            }
+        }
+        
+        if let Some((ref msg, timestamp)) = self.current_toast {
+            if timestamp.elapsed().as_secs() < TOAST_DURATION_SECS {
+                return Some(msg.clone());
+            }
+            self.current_toast = None;
+            if let Some(msg) = self.toast_queue.pop_front() {
+                self.current_toast = Some((msg, Instant::now()));
+                return Some(self.current_toast.as_ref().unwrap().0.clone());
+            }
+        }
+        None
+    }
+
+    pub fn effective_input_mode(&self) -> InputMode {
+        match self.input_mode {
+            InputMode::Paste => {
+                if self.paste_timestamp.map_or(true, |t| t.elapsed().as_secs() >= PASTE_MODE_SECS) {
+                    InputMode::Default
+                } else {
+                    InputMode::Paste
+                }
+            }
+            other => other,
+        }
+    }
+
+    pub fn refresh_input_border(&mut self) {
+        let mode = self.effective_input_mode();
+        let cell_info = if mode == InputMode::Selection && !self.output.is_empty() {
+            format!(
+                " Select: {}/{} · ↑↓/jk nav · y yank · Esc exit ",
+                self.selected_cell_idx + 1,
+                self.output.len()
+            )
+        } else {
+            String::from(" Select: ↑↓/jk nav · y yank · Esc exit ")
+        };
+        let (border_char, title) = match mode {
+            InputMode::Default => (">", String::from(" Input (Enter=send, Ctrl+D=exit) ")),
+            InputMode::Paste => ("|", String::from(" Paste ")),
+            InputMode::History => ("←", String::from(" History (↑↓ browse, Enter=load) ")),
+            InputMode::Selection => ("▐", cell_info),
+        };
+        let bg_style = ratatui::style::Style::default().bg(self.theme.bg());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::Set {
+                vertical_left: border_char,
+                ..border::PLAIN
+            })
+            .title(title)
+            .style(bg_style);
+        self.input.set_block(block);
+    }
+
+    pub fn enter_selection(&mut self) {
+        if self.output.is_empty() {
+            self.show_toast("Nothing to select — chat empty");
+            return;
+        }
+        self.input_mode = InputMode::Selection;
+        self.selected_cell_idx = self.output.len().saturating_sub(1);
+        self.refresh_input_border();
+    }
+
+    pub fn exit_selection(&mut self) {
+        self.input_mode = InputMode::Default;
+        self.refresh_input_border();
+    }
+
+    pub fn selection_up(&mut self) {
+        if self.selected_cell_idx > 0 {
+            self.selected_cell_idx -= 1;
+        }
+        self.refresh_input_border();
+    }
+
+    pub fn selection_down(&mut self) {
+        if !self.output.is_empty() && self.selected_cell_idx + 1 < self.output.len() {
+            self.selected_cell_idx += 1;
+        }
+        self.refresh_input_border();
+    }
+
+    pub fn yank_selected_cell(&mut self) {
+        if let Some(cell) = self.output.get(self.selected_cell_idx) {
+            let text = cell.raw_text();
+            if text.is_empty() {
+                self.show_toast("Cell has no text to copy");
+            } else {
+                let prefix = text
+                    .chars()
+                    .take(30)
+                    .map(|c| if c == '\n' { '⏎' } else { c })
+                    .collect::<String>();
+                let suffix = if text.chars().count() > 30 { "…" } else { "" };
+                if crate::tui::clipboard::write_text(&text).is_ok() {
+                    self.show_toast(format!("✓ Copied: {}{}", prefix, suffix));
+                } else {
+                    self.show_toast("✗ Clipboard unavailable");
+                }
+            }
+        }
+        self.exit_selection();
     }
 
     fn load_command_history(&mut self) {
@@ -187,6 +417,33 @@ impl App {
                 self.command_history = self.command_history[start..].to_vec();
             }
         }
+    }
+
+    fn push_splash(&mut self) {
+        use crossterm::terminal::size;
+
+        let width = size().map(|(w, _)| w).unwrap_or(80);
+        let logo = match width {
+            w if w >= 90 => SPLASH_LOGO_FULL,
+            w if w >= 70 => SPLASH_LOGO_MINIMAL,
+            w if w >= 50 => SPLASH_LOGO_MINIMAL,
+            _ => "",
+        };
+
+        if !logo.is_empty() {
+            let banner = OutputCell::Banner(BannerCell::new(logo, self.theme.as_ref()));
+            self.output.push(banner);
+        }
+
+        let mut info = String::new();
+        info.push_str(SPLASH_PET);
+        info.push('\n');
+        info.push_str(SPLASH_TAGLINE);
+        info.push('\n');
+        info.push_str(&format!("  Zen v{}\n", env!("CARGO_PKG_VERSION")));
+        info.push('\n');
+        info.push_str(SPLASH_HELP);
+        self.output.push(OutputCell::Plain(PlainCell::new(info)));
     }
 
     pub fn init_orchestrator(&mut self) {
@@ -241,6 +498,7 @@ impl App {
             Some(p) => p - 1,
         };
         self.history_position = Some(new_pos);
+        self.input_mode = InputMode::History;
         if let Some(entry) = self.command_history.get(new_pos) {
             self.last_recalled_text = Some(entry.clone());
             self.input = Self::create_input_textarea(entry.clone());
@@ -253,10 +511,12 @@ impl App {
             Some(p) if p + 1 >= self.command_history.len() => {
                 self.history_position = None;
                 self.last_recalled_text = None;
-                self.input = Self::create_default_textarea();
+                self.input = Self::create_input_textarea("");
+                self.input_mode = InputMode::Default;
             }
             Some(p) => {
                 self.history_position = Some(p + 1);
+                self.input_mode = InputMode::History;
                 if let Some(entry) = self.command_history.get(p + 1) {
                     self.last_recalled_text = Some(entry.clone());
                     self.input = Self::create_input_textarea(entry.clone());
@@ -314,10 +574,16 @@ impl App {
 
     fn handle_slash_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-        match parts[0] {
-            "quit" | "q" | "exit" => self.running = false,
-            "help" | "h" => self.show_help(),
-            "clear" | "cls" => {
+        let command_name = self
+            .slash_registry
+            .get_by_name_or_alias(parts[0])
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| parts[0].to_string());
+
+        match command_name.as_str() {
+            "exit" => self.running = false,
+            "help" => self.show_help(),
+            "clear" => {
                 self.output.clear();
                 self.stream_collector.clear();
             }
@@ -357,23 +623,32 @@ impl App {
 
     fn show_help(&mut self) {
         let help = r#"Zen Agentic TUI - Commands:
-  /help          Show this help
-  /quit          Exit TUI
-  /clear         Clear output
-  /thinking      Toggle showing thinking process (default: OFF)
-  /model <p> [m] Switch provider [model], show current if omitted
-  /export        Export chat to Markdown
-  /note <text>   Create a note
-  /search <q>    Search knowledge base
-  /session       List and select sessions
-  /new           Create new session
-  /fork [name]   Fork current session
-  /rename <name> Rename current session
-  /archive       Archive current session
-  /serve start   Start gateway daemon
-  /config        Show configuration
-  /consolidate   Run consolidation pipeline
-  /lint          Run knowledge lint
+  /help (/h)             Show this help
+  /exit (/q)             Exit TUI
+  /clear                 Clear output
+  /thinking              Toggle showing thinking process (default: OFF)
+  /model <p> [m]         Switch provider [model], show current if omitted
+  /export (/e)           Export chat to Markdown
+  /note <text>           Create a note
+  /search <q> (/s <q>)   Search knowledge base
+  /session               List and select sessions
+  /new                   Create new session
+  /fork [name]           Fork current session
+  /rename <name>         Rename current session
+  /archive               Archive current session
+  /serve                 Start gateway daemon
+  /config                Show configuration
+  /consolidate           Run consolidation pipeline
+  /lint                  Run knowledge lint
+
+Keyboard shortcuts:
+  Tab          Switch between input modes
+  Ctrl+V       Paste from clipboard
+  Ctrl+L       Clear output (alias: /clear)
+  Ctrl+D       Exit TUI (alias: /exit)
+
+Aliases: Commands shown with (/<alias>) can be typed with the shorter form.
+Example: '/h' = '/help', '/q' = '/exit', '/s <query>' = '/search <query>'
 
 Chat mode is default — type questions to get LLM responses.
 Use /thinking to show/hide thinking process."#;
@@ -595,6 +870,9 @@ Use /thinking to show/hide thinking process."#;
                                     super::cell::MarkdownCell::from_lines(remaining, raw_text),
                                 ));
                             }
+                            if crate::tui::clipboard::write_text(&response).is_ok() {
+                                self.show_toast("✓ Copied to clipboard");
+                            }
                             self.chat_history.push((_query, response.clone()));
                             if let Some(store) = &self.conversation_store {
                                 let _ = store.append("assistant", &response);
@@ -703,6 +981,7 @@ Use /thinking to show/hide thinking process."#;
             .output
             .iter()
             .map(|cell| match cell {
+                OutputCell::Banner(b) => b.text.clone(),
                 OutputCell::Markdown(m) => m.content.clone(),
                 OutputCell::Code(c) => format!("```{}\n{}\n```", c.lang, c.code),
                 OutputCell::Error(e) => e.message.clone(),
@@ -1139,6 +1418,12 @@ Use /thinking to show/hide thinking process."#;
 
 pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
     let mut app = App::new();
+    if let Ok(config) = load_config()
+        && let Some(theme) = config.tui_theme()
+    {
+        app.with_theme(theme);
+    }
+    app.push_splash();
     app.init_orchestrator();
     app.push_output(
         "Zen Agentic TUI - type /help for commands, /thinking to show thinking, Ctrl+D to exit"
@@ -1149,34 +1434,41 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Re
 
     loop {
         app.poll_llm_response();
-        terminal.draw(|frame| crate::tui::ui::render(frame, &app))?;
+        app.refresh_input_border();
+        let active_toast = app.get_active_toast();
+        terminal.draw(|frame| crate::tui::ui::render(frame, &app, active_toast.as_deref()))?;
 
-        if crossterm::event::poll(std::time::Duration::from_millis(100))?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-            && key.kind == crossterm::event::KeyEventKind::Press
-        {
-            match crate::tui::handler::handle_key(key, &mut app) {
-                crate::tui::handler::KeyAction::Submit => {
-                    let cmd = app.input.lines().join("\n");
-                    let cmd = cmd.trim().to_string();
-                    if !cmd.is_empty() {
-                        app.push_history(&cmd);
+        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+            match crossterm::event::read()? {
+                crossterm::event::Event::Key(key)
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    match crate::tui::handler::handle_key(key, &mut app) {
+                        crate::tui::handler::KeyAction::Submit => {
+                            let cmd = app.input.lines().join("\n");
+                            let cmd = cmd.trim().to_string();
+                            if !cmd.is_empty() {
+                                app.push_history(&cmd);
+                            }
+                            app.input_mode = InputMode::Default;
+                            app.paste_timestamp = None;
+                            app.input = App::create_input_textarea("");
+                            app.handle_command(&cmd);
+                        }
+                        crate::tui::handler::KeyAction::Quit => {
+                            app.running = false;
+                        }
+                        crate::tui::handler::KeyAction::Continue => {}
                     }
-                    app.input = App::create_default_textarea();
-                    app.handle_command(&cmd);
+                    if !app.running {
+                        break;
+                    }
                 }
-                crate::tui::handler::KeyAction::Quit => {
-                    app.running = false;
+                crossterm::event::Event::Paste(text) => {
+                    crate::tui::handler::handle_paste(&text, &mut app);
                 }
-                crate::tui::handler::KeyAction::Continue => {}
+                _ => {} // Release, Repeat, Mouse, Focus — ignore
             }
-            if !app.running {
-                break;
-            }
-        } else if crossterm::event::poll(std::time::Duration::from_millis(0))?
-            && let crossterm::event::Event::Paste(text) = crossterm::event::read()?
-        {
-            crate::tui::handler::handle_paste(&text, &mut app);
         }
     }
     // Ensure clean terminal state on exit — print newline so shell prompt

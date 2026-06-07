@@ -11,6 +11,16 @@ default_provider = "ollama"
 default_model = "qwen3.6:35b-mlx"
 
 # =============================================================================
+# TUI presentation settings (terminal UI visual settings)
+# =============================================================================
+
+[tui]
+theme = "deep-ocean"
+# theme = "catppuccin"
+# theme = "eink"
+# theme = "cyber-purple"
+
+# =============================================================================
 # Provider definitions — connection settings (defined once, referenced by name)
 # =============================================================================
 #

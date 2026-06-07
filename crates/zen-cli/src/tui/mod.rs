@@ -1,5 +1,6 @@
 mod app;
 pub mod cell;
+mod clipboard;
 mod handler;
 mod highlight;
 pub mod render;

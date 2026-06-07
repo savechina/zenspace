@@ -1,3 +1,4 @@
+pub mod banner;
 pub mod code;
 pub mod error;
 pub mod markdown;
@@ -6,6 +7,7 @@ pub mod streaming;
 
 use ratatui::text::Line;
 
+pub use banner::BannerCell;
 pub use code::CodeCell;
 pub use error::ErrorCell;
 pub use markdown::MarkdownCell;
@@ -14,6 +16,7 @@ pub use streaming::StreamingCell;
 
 #[derive(Debug, Clone)]
 pub enum OutputCell {
+    Banner(BannerCell),
     Markdown(MarkdownCell),
     Code(CodeCell),
     Error(ErrorCell),
@@ -24,11 +27,22 @@ pub enum OutputCell {
 impl OutputCell {
     pub fn display_lines(&self) -> Vec<Line<'static>> {
         match self {
+            Self::Banner(b) => b.display_lines(),
             Self::Markdown(m) => m.display_lines(),
             Self::Code(c) => c.display_lines(),
             Self::Error(e) => e.display_lines(),
             Self::Streaming(s) => s.display_lines(),
             Self::Plain(p) => p.display_lines(),
+        }
+    }
+
+    pub fn raw_text(&self) -> String {
+        match self {
+            Self::Plain(p) => p.text.clone(),
+            Self::Markdown(m) => m.content.clone(),
+            Self::Code(c) => c.code.clone(),
+            Self::Error(e) => e.message.clone(),
+            Self::Banner(_) | Self::Streaming(_) => String::new(),
         }
     }
 
@@ -44,6 +58,12 @@ impl OutputCell {
 impl From<OutputCell> for Vec<Line<'static>> {
     fn from(cell: OutputCell) -> Self {
         cell.display_lines()
+    }
+}
+
+impl From<BannerCell> for OutputCell {
+    fn from(cell: BannerCell) -> Self {
+        Self::Banner(cell)
     }
 }
 

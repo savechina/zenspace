@@ -23,14 +23,14 @@ impl ErrorCell {
 
 impl From<String> for ErrorCell {
     fn from(s: String) -> Self {
-        use crate::tui::theme::DefaultTheme;
-        Self::new(s, &DefaultTheme)
+        use crate::tui::theme::ZenTheme;
+        Self::new(s, &ZenTheme)
     }
 }
 
 impl From<&str> for ErrorCell {
     fn from(s: &str) -> Self {
-        use crate::tui::theme::DefaultTheme;
-        Self::new(s, &DefaultTheme)
+        use crate::tui::theme::ZenTheme;
+        Self::new(s, &ZenTheme)
     }
 }

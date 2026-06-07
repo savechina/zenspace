@@ -13,9 +13,7 @@ impl StreamingCell {
     pub fn new(buffer: impl Into<String>, theme: &dyn OutputTheme) -> Self {
         Self {
             buffer: buffer.into(),
-            buffer_style: Style::default()
-                .fg(ratatui::style::Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
+            buffer_style: theme.text_muted().add_modifier(Modifier::ITALIC),
             cursor_style: theme.streaming_cursor(),
         }
     }
@@ -38,14 +36,14 @@ impl StreamingCell {
 
 impl From<String> for StreamingCell {
     fn from(s: String) -> Self {
-        use crate::tui::theme::DefaultTheme;
-        Self::new(s, &DefaultTheme)
+        use crate::tui::theme::ZenTheme;
+        Self::new(s, &ZenTheme)
     }
 }
 
 impl From<&str> for StreamingCell {
     fn from(s: &str) -> Self {
-        use crate::tui::theme::DefaultTheme;
-        Self::new(s, &DefaultTheme)
+        use crate::tui::theme::ZenTheme;
+        Self::new(s, &ZenTheme)
     }
 }

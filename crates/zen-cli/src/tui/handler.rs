@@ -1,5 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::Instant;
 use tui_textarea::{Input, Key};
+
+use super::app::InputMode;
 
 pub enum KeyAction {
     Submit,
@@ -8,6 +11,38 @@ pub enum KeyAction {
 }
 
 pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
+    if app.input_mode == InputMode::Selection {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Esc, KeyModifiers::NONE)
+            | (KeyCode::Char('v'), KeyModifiers::NONE) => {
+                app.exit_selection();
+                KeyAction::Continue
+            }
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                app.yank_selected_cell();
+                KeyAction::Continue
+            }
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                app.selection_up();
+                KeyAction::Continue
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                app.selection_down();
+                KeyAction::Continue
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => {
+                app.auto_scroll = false;
+                app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                KeyAction::Continue
+            }
+            (KeyCode::PageDown, KeyModifiers::NONE) => {
+                app.scroll_offset = app.scroll_offset.saturating_add(10);
+                KeyAction::Continue
+            }
+            _ => KeyAction::Continue,
+        };
+    }
+
     let input_before = app.input.lines().join("\n");
 
     let action = match (key.code, key.modifiers) {
@@ -32,6 +67,7 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             return KeyAction::Continue;
         }
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyAction::Quit,
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => return KeyAction::Quit,
         (KeyCode::Up, KeyModifiers::NONE) => {
             if app.session_picker.visible {
                 app.session_picker.move_up();
@@ -76,7 +112,7 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         }
         (KeyCode::Tab, KeyModifiers::NONE) => {
             if app.slash_state.visible {
-                if let Some(cmd) = app.slash_state.selected_command() {
+                if let Some(cmd) = app.slash_state.selected_command(&app.slash_registry) {
                     let text = format!("/{} ", cmd);
                     app.input.select_all();
                     app.input.cut();
@@ -124,7 +160,7 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 return KeyAction::Continue;
             }
             if app.slash_state.visible {
-                if let Some(cmd) = app.slash_state.selected_command() {
+                if let Some(cmd) = app.slash_state.selected_command(&app.slash_registry) {
                     let text = format!("/{} ", cmd);
                     app.input.select_all();
                     app.input.cut();
@@ -162,6 +198,19 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         (KeyCode::PageDown, KeyModifiers::NONE) => {
             app.scroll_offset = app.scroll_offset.saturating_add(10);
             return KeyAction::Continue;
+        }
+        (KeyCode::Char('v'), KeyModifiers::NONE) => {
+            if app.input.lines().join("\n").trim().is_empty() && !app.output.is_empty() {
+                app.enter_selection();
+                return KeyAction::Continue;
+            }
+            app.input.input(Input {
+                key: Key::Char('v'),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+            KeyAction::Continue
         }
         (KeyCode::Char(c), KeyModifiers::NONE) => {
             if app.session_picker.rename_mode {
@@ -212,7 +261,10 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
 
     let input_after = app.input.lines().join("\n");
     if input_before != input_after {
-        app.slash_state.on_input_change(&input_after);
+        app.slash_state.on_input_change(&input_after, &app.slash_registry);
+        if app.input_mode == InputMode::History {
+            app.input_mode = InputMode::Default;
+        }
     }
 
     action
@@ -222,5 +274,8 @@ pub fn handle_paste(pasted: &str, app: &mut super::app::App) {
     let pasted = pasted.replace('\r', "\n");
     app.input.insert_str(pasted);
     let input = app.input.lines().join("\n");
-    app.slash_state.on_input_change(&input);
+    app.slash_state.on_input_change(&input, &app.slash_registry);
+    app.input_mode = InputMode::Paste;
+    app.paste_timestamp = Some(Instant::now());
+    app.refresh_input_border();
 }

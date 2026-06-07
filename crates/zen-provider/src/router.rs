@@ -620,6 +620,7 @@ impl DefaultRouter {
                 feeds: Vec::new(),
                 learning: zen_core::config::LearningConfig::default(),
                 finance: zen_core::config::FinanceConfig::default(),
+                tui: zen_core::config::TuiConfig::default(),
             },
             mock: MockProvider::default(),
             providers,

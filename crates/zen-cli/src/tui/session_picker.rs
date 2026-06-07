@@ -1,3 +1,4 @@
+use crate::tui::theme::OutputTheme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -171,6 +172,7 @@ pub fn render_session_picker(
     frame: &mut ratatui::Frame,
     state: &SessionPickerState,
     current_session_id: Option<&str>,
+    theme: &dyn OutputTheme,
 ) {
     if !state.visible || state.sessions.is_empty() {
         return;
@@ -189,16 +191,23 @@ pub fn render_session_picker(
 
     frame.render_widget(Clear, popup_area);
 
-    let border_color = if state.archive_pending.is_some() {
-        Color::Red
+    let muted = theme.text_muted();
+    let accent_style = Style::default().fg(theme.info_accent());
+    let archive_red = Style::default().fg(Color::Red);
+    let bg_color = theme.bg();
+    let area_bg = Style::default().bg(bg_color);
+
+    let border_style = if state.archive_pending.is_some() {
+        archive_red
     } else {
-        Color::Cyan
+        accent_style
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(" Sessions ");
+        .border_style(border_style)
+        .title(" Sessions ")
+        .style(area_bg);
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -242,14 +251,10 @@ pub fn render_session_picker(
             let style = if is_archive_pending {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else if is_selected {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                accent_style.add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-
-            let meta_style = Style::default().fg(Color::DarkGray);
 
             let display_title = if is_archive_pending {
                 format!(" {} (press Ctrl+A again to confirm) ", title)
@@ -259,14 +264,18 @@ pub fn render_session_picker(
 
             let line = Line::from(vec![
                 Span::styled(display_title, style),
-                Span::styled(time_ago, meta_style),
+                Span::styled(time_ago, muted),
             ]);
 
             ListItem::new(line)
         })
         .collect();
 
-    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .fg(theme.info_accent())
+            .add_modifier(Modifier::BOLD),
+    );
 
     let mut list_state = ListState::default();
     list_state.select(Some(state.selected - state.scroll_offset));
@@ -277,12 +286,13 @@ pub fn render_session_picker(
         let rename_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
-            .title(" Rename Session ");
+            .title(" Rename Session ")
+            .style(area_bg);
         let rename_inner = rename_block.inner(chunks[1]);
         frame.render_widget(rename_block, chunks[1]);
 
         let rename_text = Line::from(vec![
-            Span::styled("Title: ", Style::default().fg(Color::White)),
+            Span::styled("Title: ", accent_style),
             Span::styled(
                 format!("{}_", state.rename_input),
                 Style::default().fg(Color::Yellow),
@@ -291,24 +301,24 @@ pub fn render_session_picker(
         frame.render_widget(Paragraph::new(rename_text), rename_inner);
 
         let help_text = Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::DarkGray)),
-            Span::styled(" confirm ", Style::default().fg(Color::Yellow)),
-            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
-            Span::styled(" cancel", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", muted),
+            Span::styled(" confirm ", accent_style),
+            Span::styled("Esc", muted),
+            Span::styled(" cancel", accent_style),
         ]);
         frame.render_widget(Paragraph::new(help_text), chunks[2]);
     } else {
         let help_text = Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(Color::DarkGray)),
-            Span::styled(" navigate ", Style::default().fg(Color::Cyan)),
-            Span::styled("↵", Style::default().fg(Color::DarkGray)),
-            Span::styled(" resume ", Style::default().fg(Color::Cyan)),
-            Span::styled("Ctrl+R", Style::default().fg(Color::DarkGray)),
-            Span::styled(" rename ", Style::default().fg(Color::Cyan)),
-            Span::styled("Ctrl+A", Style::default().fg(Color::DarkGray)),
-            Span::styled(" archive ", Style::default().fg(Color::Cyan)),
-            Span::styled("esc", Style::default().fg(Color::DarkGray)),
-            Span::styled(" close", Style::default().fg(Color::Cyan)),
+            Span::styled("↑↓", muted),
+            Span::styled(" navigate ", accent_style),
+            Span::styled("↵", muted),
+            Span::styled(" resume ", accent_style),
+            Span::styled("Ctrl+R", muted),
+            Span::styled(" rename ", accent_style),
+            Span::styled("Ctrl+A", muted),
+            Span::styled(" archive ", accent_style),
+            Span::styled("esc", muted),
+            Span::styled(" close", accent_style),
         ]);
         frame.render_widget(Paragraph::new(help_text), chunks[1]);
     }

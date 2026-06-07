@@ -1,81 +1,157 @@
-use ratatui::style::{Color, Modifier, Style};
+use crate::tui::theme::OutputTheme;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use std::collections::HashMap;
+
 pub struct SlashCommand {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub description: String,
 }
 
-pub const SLASH_COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        name: "help",
-        description: "Show available commands",
-    },
-    SlashCommand {
-        name: "quit",
-        description: "Exit TUI",
-    },
-    SlashCommand {
-        name: "clear",
-        description: "Clear output",
-    },
-    SlashCommand {
-        name: "thinking",
-        description: "Toggle thinking display",
-    },
-    SlashCommand {
-        name: "model",
-        description: "Switch provider/model",
-    },
-    SlashCommand {
-        name: "export",
-        description: "Export chat to Markdown",
-    },
-    SlashCommand {
-        name: "note",
-        description: "Create a note",
-    },
-    SlashCommand {
-        name: "search",
-        description: "Search knowledge base",
-    },
-    SlashCommand {
-        name: "session",
-        description: "List and select sessions",
-    },
-    SlashCommand {
-        name: "new",
-        description: "Create new session",
-    },
-    SlashCommand {
-        name: "fork",
-        description: "Fork current session",
-    },
-    SlashCommand {
-        name: "rename",
-        description: "Rename current session",
-    },
-    SlashCommand {
-        name: "archive",
-        description: "Archive current session",
-    },
-    SlashCommand {
-        name: "serve",
-        description: "Start gateway daemon",
-    },
-    SlashCommand {
-        name: "config",
-        description: "Show configuration",
-    },
-    SlashCommand {
-        name: "consolidate",
-        description: "Run consolidation pipeline",
-    },
-    SlashCommand {
-        name: "lint",
-        description: "Run knowledge lint",
-    },
-];
+pub struct SlashCommandRegistry {
+    commands: Vec<SlashCommand>,
+    alias_index: HashMap<String, usize>,
+}
+
+impl SlashCommandRegistry {
+    pub fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+            alias_index: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, name: String, aliases: Vec<String>, description: String) {
+        let idx = self.commands.len();
+        self.commands.push(SlashCommand {
+            name: name.clone(),
+            aliases: aliases.clone(),
+            description,
+        });
+
+        self.alias_index.insert(name, idx);
+        for alias in aliases {
+            self.alias_index.insert(alias, idx);
+        }
+    }
+
+    pub fn get_by_name_or_alias(&self, input: &str) -> Option<&SlashCommand> {
+        self.alias_index
+            .get(input)
+            .and_then(|&idx| self.commands.get(idx))
+    }
+
+    pub fn filter(&self, prefix: &str) -> Vec<&SlashCommand> {
+        self.commands
+            .iter()
+            .filter(|cmd| cmd.name.starts_with(prefix))
+            .collect()
+    }
+
+    pub fn all_commands(&self) -> &[SlashCommand] {
+        &self.commands
+    }
+}
+
+impl Default for SlashCommandRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn create_default_registry() -> SlashCommandRegistry {
+    let mut registry = SlashCommandRegistry::new();
+    
+    registry.register(
+        "help".to_string(),
+        vec!["h".to_string()],
+        "Show available commands".to_string(),
+    );
+    registry.register(
+        "exit".to_string(),
+        vec!["q".to_string(), "quit".to_string()],
+        "Exit TUI".to_string(),
+    );
+    registry.register(
+        "clear".to_string(),
+        vec!["cls".to_string()],
+        "Clear output".to_string(),
+    );
+    registry.register(
+        "thinking".to_string(),
+        vec![],
+        "Toggle thinking display".to_string(),
+    );
+    registry.register(
+        "model".to_string(),
+        vec![],
+        "Switch provider/model".to_string(),
+    );
+    registry.register(
+        "export".to_string(),
+        vec!["e".to_string()],
+        "Export chat to Markdown".to_string(),
+    );
+    registry.register(
+        "note".to_string(),
+        vec!["n".to_string()],
+        "Create a note".to_string(),
+    );
+    registry.register(
+        "search".to_string(),
+        vec!["s".to_string()],
+        "Search knowledge base".to_string(),
+    );
+    registry.register(
+        "session".to_string(),
+        vec!["ss".to_string()],
+        "List and select sessions".to_string(),
+    );
+    registry.register(
+        "new".to_string(),
+        vec![],
+        "Create new session".to_string(),
+    );
+    registry.register(
+        "fork".to_string(),
+        vec![],
+        "Fork current session".to_string(),
+    );
+    registry.register(
+        "rename".to_string(),
+        vec!["r".to_string()],
+        "Rename current session".to_string(),
+    );
+    registry.register(
+        "archive".to_string(),
+        vec!["a".to_string()],
+        "Archive current session".to_string(),
+    );
+    registry.register(
+        "serve".to_string(),
+        vec![],
+        "Start gateway daemon".to_string(),
+    );
+    registry.register(
+        "config".to_string(),
+        vec![],
+        "Show configuration".to_string(),
+    );
+    registry.register(
+        "consolidate".to_string(),
+        vec![],
+        "Run consolidation pipeline".to_string(),
+    );
+    registry.register(
+        "lint".to_string(),
+        vec![],
+        "Run knowledge lint".to_string(),
+    );
+    
+    registry
+}
 
 pub const MAX_POPUP_ROWS: usize = 8;
 
@@ -96,7 +172,7 @@ impl SlashState {
         }
     }
 
-    pub fn on_input_change(&mut self, input: &str) {
+    pub fn on_input_change(&mut self, input: &str, registry: &SlashCommandRegistry) {
         if let Some(stripped) = input.strip_prefix('/') {
             let has_space = stripped.contains(' ');
             if has_space {
@@ -106,7 +182,7 @@ impl SlashState {
 
             let token = stripped.split_whitespace().next().unwrap_or("");
             self.filter = token.to_lowercase();
-            self.recompute_filtered();
+            self.recompute_filtered(registry);
             self.selected = 0;
             self.visible = !self.filtered_indices.is_empty();
         } else {
@@ -114,12 +190,16 @@ impl SlashState {
         }
     }
 
-    fn recompute_filtered(&mut self) {
-        self.filtered_indices = SLASH_COMMANDS
-            .iter()
-            .enumerate()
-            .filter(|(_, cmd)| cmd.name.starts_with(&self.filter))
-            .map(|(i, _)| i)
+    fn recompute_filtered(&mut self, registry: &SlashCommandRegistry) {
+        let filtered = registry.filter(&self.filter);
+        self.filtered_indices = filtered
+            .into_iter()
+            .filter_map(|cmd| {
+                registry
+                    .all_commands()
+                    .iter()
+                    .position(|c| std::ptr::eq(c, cmd))
+            })
             .collect();
     }
 
@@ -141,10 +221,11 @@ impl SlashState {
         self.selected = (self.selected + 1) % self.filtered_indices.len();
     }
 
-    pub fn selected_command(&self) -> Option<&'static str> {
+    pub fn selected_command<'a>(&self, registry: &'a SlashCommandRegistry) -> Option<&'a str> {
         self.filtered_indices
             .get(self.selected)
-            .map(|&idx| SLASH_COMMANDS[idx].name)
+            .and_then(|&idx| registry.all_commands().get(idx))
+            .map(|cmd| cmd.name.as_str())
     }
 
     pub fn dismiss(&mut self) {
@@ -152,7 +233,7 @@ impl SlashState {
     }
 
     #[allow(dead_code)]
-    pub fn visible_rows(&self) -> impl Iterator<Item = &SlashCommand> {
+    pub fn visible_rows<'a>(&self, registry: &'a SlashCommandRegistry) -> Vec<&'a SlashCommand> {
         let start = if self.selected >= MAX_POPUP_ROWS {
             self.selected - MAX_POPUP_ROWS + 1
         } else {
@@ -161,7 +242,8 @@ impl SlashState {
         let end = (start + MAX_POPUP_ROWS).min(self.filtered_indices.len());
         self.filtered_indices[start..end]
             .iter()
-            .map(|&idx| &SLASH_COMMANDS[idx])
+            .filter_map(|&idx| registry.all_commands().get(idx))
+            .collect()
     }
 
     pub fn visible_count(&self) -> usize {
@@ -179,6 +261,8 @@ pub fn render_slash_popup(
     frame: &mut ratatui::Frame,
     state: &SlashState,
     input_area: ratatui::layout::Rect,
+    theme: &dyn OutputTheme,
+    registry: &SlashCommandRegistry,
 ) {
     if !state.visible || state.filtered_indices.is_empty() {
         return;
@@ -192,10 +276,12 @@ pub fn render_slash_popup(
 
     frame.render_widget(ratatui::widgets::Clear, popup_area);
 
+    let bg_color = theme.bg();
     let block = ratatui::widgets::Block::default()
         .borders(ratatui::widgets::Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(" Commands ");
+        .border_style(theme.text_muted())
+        .title(" Commands ")
+        .style(Style::default().bg(bg_color));
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -206,27 +292,48 @@ pub fn render_slash_popup(
         0
     };
 
+    let selected_style = Style::default()
+        .fg(theme.info_accent())
+        .add_modifier(Modifier::BOLD);
+    let unselected_style = Style::default();
+    let desc_style = theme.text_muted();
+    let row_bg = Style::default().bg(bg_color);
+
     for (row, &cmd_idx) in state.filtered_indices[start..start + visible_count]
         .iter()
         .enumerate()
     {
-        let cmd = &SLASH_COMMANDS[cmd_idx];
+        let cmd = &registry.all_commands()[cmd_idx];
         let is_selected = row + start == state.selected;
 
-        let style = if is_selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+        let name_style = if is_selected {
+            selected_style
         } else {
-            Style::default()
+            unselected_style
         };
 
-        let desc_style = Style::default().fg(Color::DarkGray);
+        let mut spans = vec![Span::styled(
+            format!("  /{}", cmd.name),
+            name_style.patch(row_bg),
+        )];
+        if !cmd.aliases.is_empty() {
+            let alias_str = cmd
+                .aliases
+                .iter()
+                .map(|a| format!("/{}", a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            spans.push(Span::styled(
+                format!(" ({})", alias_str),
+                desc_style.patch(row_bg),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("  {}", cmd.description),
+            desc_style.patch(row_bg),
+        ));
 
-        let line = Line::from(vec![
-            Span::styled(format!("  /{}", cmd.name), style),
-            Span::styled(format!("  {}", cmd.description), desc_style),
-        ]);
+        let line = Line::from(spans);
 
         let row_area = ratatui::layout::Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
         frame.render_widget(ratatui::widgets::Paragraph::new(line), row_area);

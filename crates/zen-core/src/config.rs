@@ -45,6 +45,8 @@ pub struct AgenticConfig {
     pub learning: LearningConfig,
     #[serde(default)]
     pub finance: FinanceConfig,
+    #[serde(default)]
+    pub tui: TuiConfig,
 }
 
 /// Provider definition — connection settings defined once, referenced by name.
@@ -237,6 +239,20 @@ pub struct FinanceConfig {
     pub tracked_categories: Option<Vec<String>>,
 }
 
+/// TUI presentation config. Holds visual settings for the terminal UI.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// Theme name: "zen", "classic", "catppuccin", "deep-ocean", "cyber-purple", "eink".
+    pub theme: Option<String>,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { theme: None }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Default values
 // ---------------------------------------------------------------------------
@@ -412,6 +428,7 @@ fn merge_configs(
         feeds: merge_feeds(base.feeds, override_cfg.feeds),
         learning: merge_learning(base.learning, override_cfg.learning),
         finance: merge_finance(base.finance, override_cfg.finance),
+        tui: merge_tui(base.tui, override_cfg.tui),
     })
 }
 
@@ -478,6 +495,12 @@ fn merge_learning(base: LearningConfig, ov: LearningConfig) -> LearningConfig {
     LearningConfig {
         auto_research: ov.auto_research.or(base.auto_research),
         interval: str_merge(base.interval, ov.interval),
+    }
+}
+
+fn merge_tui(base: TuiConfig, ov: TuiConfig) -> TuiConfig {
+    TuiConfig {
+        theme: str_merge(base.theme, ov.theme),
     }
 }
 
@@ -622,6 +645,13 @@ fn env_bool(key: &str) -> Option<bool> {
 // ---------------------------------------------------------------------------
 // Convenience helpers
 // ---------------------------------------------------------------------------
+
+impl AgenticConfig {
+    /// Resolve theme from TUI section.
+    pub fn tui_theme(&self) -> Option<&str> {
+        self.tui.theme.as_deref()
+    }
+}
 
 /// Get the default LLM provider string.
 pub fn default_llm_provider(config: &AgenticConfig) -> &str {
