@@ -50,16 +50,29 @@ pub fn execute_command(operation: &ConfigCommands) -> Result<(), ZenError> {
                     agent.model.as_deref().unwrap_or("(none)").cyan()
                 );
             }
-            if let Some(ref bot) = config.qqbot {
-                println!("\n{}", "─── QQ Bot ───".bright_white());
-                println!(
-                    "  app_id         = {}",
-                    bot.app_id.as_deref().unwrap_or("(none)").cyan()
-                );
-                println!(
-                    "  token_env      = {}",
-                    bot.token_env.as_deref().unwrap_or("(none)").cyan()
-                );
+            println!("\n{}", "─── Channels ───".bright_white());
+            if let Some(ref bot) = config.channels.qqbot {
+                println!("  QQ Bot:");
+                println!("    app_id         = {}", bot.app_id.cyan());
+                println!("    client_secret  = {}", "[set]".cyan());
+                if !bot.allowed_users.is_empty() {
+                    println!("    allowed_users  = {:?}", bot.allowed_users);
+                }
+            }
+            if let Some(ref wa) = config.channels.whatsapp {
+                println!("  WhatsApp:");
+                println!("    phone_number_id = {}", wa.phone_number_id.cyan());
+                println!("    access_token    = {}", "[set]".cyan());
+                if !wa.allowed_users.is_empty() {
+                    println!("    allowed_users   = {:?}", wa.allowed_users);
+                }
+            }
+            if let Some(ref tg) = config.channels.telegram {
+                println!("  Telegram:");
+                println!("    bot_token      = {}", "[set]".cyan());
+                if !tg.allowed_users.is_empty() {
+                    println!("    allowed_users  = {:?}", tg.allowed_users);
+                }
             }
             println!("\n{}", "─── Cron ───".bright_white());
             println!(

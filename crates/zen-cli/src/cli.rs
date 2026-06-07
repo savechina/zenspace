@@ -154,7 +154,7 @@ enum Commands {
     },
 }
 
-pub async fn shell() -> Result<(), ZenError> {
+pub async fn shell(config: &'static zen_core::config::AgenticConfig) -> Result<(), ZenError> {
     let cli = Cli::parse();
 
     let is_tui = cli.command.is_none();
@@ -208,7 +208,7 @@ pub async fn shell() -> Result<(), ZenError> {
     match &cli.command {
         None => {
             // TUI runs on main thread (ratatui requires it)
-            crate::tui::run().map_err(|e| ZenError::Message(format!("TUI error: {}", e)))
+            crate::tui::run(config).map_err(|e| ZenError::Message(format!("TUI error: {}", e)))
         }
 
         Some(Commands::Hello { name }) => {

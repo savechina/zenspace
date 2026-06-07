@@ -15,7 +15,17 @@ static USER_ROOT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
 });
 
 pub fn user_root() -> PathBuf {
-    USER_ROOT.clone()
+    // In test mode, read env var directly to allow test isolation
+    #[cfg(test)]
+    {
+        env::var(ZEN_HOME_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home::home_dir().map(|h| h.join(".zen")).unwrap_or_default())
+    }
+    #[cfg(not(test))]
+    {
+        USER_ROOT.clone()
+    }
 }
 
 pub struct ZenPaths {

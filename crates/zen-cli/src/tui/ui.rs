@@ -57,10 +57,10 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
     }
     status_spans.push(Span::styled(" | Workspace: ", muted));
     status_spans.push(Span::styled(app.workspace.clone(), accent_fg));
-    if app.input_mode == InputMode::Selection && !app.output.is_empty() {
+    if app.input.effective_mode() == InputMode::Selection && !app.output.is_empty() {
         let sel_text = format!(
             " | 🖱 SEL {}/{} ",
-            app.selected_cell_idx + 1,
+            app.input.selected_cell_idx() + 1,
             app.output.len()
         );
         status_spans.push(Span::styled(
@@ -82,7 +82,7 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
     for (cell_idx, cell) in app.output.iter().enumerate() {
         let cell_lines = cell.display_lines();
         if !cell_lines.is_empty() {
-            if cell_idx == app.selected_cell_idx && app.input_mode == InputMode::Selection {
+            if cell_idx == app.input.selected_cell_idx() && app.input.effective_mode() == InputMode::Selection {
                 selected_cell_line = Some(all_lines.len());
             }
             all_lines.extend(cell_lines);
@@ -170,7 +170,7 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
     }
 
     let input_chunk = chunks[3];
-    frame.render_widget(&app.input, input_chunk);
+    frame.render_widget(app.input.textarea(), input_chunk);
 
     render_slash_popup(frame, &app.slash_state, input_chunk, theme, &app.slash_registry);
     render_session_picker(frame, &app.session_picker, app.session_id.as_deref(), theme);

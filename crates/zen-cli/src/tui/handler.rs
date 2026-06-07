@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::time::Instant;
 use tui_textarea::{Input, Key};
 
 use super::app::InputMode;
@@ -11,7 +10,7 @@ pub enum KeyAction {
 }
 
 pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
-    if app.input_mode == InputMode::Selection {
+    if app.input.effective_mode() == InputMode::Selection {
         return match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE)
             | (KeyCode::Char('v'), KeyModifiers::NONE) => {
@@ -262,8 +261,8 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
     let input_after = app.input.lines().join("\n");
     if input_before != input_after {
         app.slash_state.on_input_change(&input_after, &app.slash_registry);
-        if app.input_mode == InputMode::History {
-            app.input_mode = InputMode::Default;
+        if app.input.effective_mode() == InputMode::History {
+            app.input.exit_mode();
         }
     }
 
@@ -275,7 +274,6 @@ pub fn handle_paste(pasted: &str, app: &mut super::app::App) {
     app.input.insert_str(pasted);
     let input = app.input.lines().join("\n");
     app.slash_state.on_input_change(&input, &app.slash_registry);
-    app.input_mode = InputMode::Paste;
-    app.paste_timestamp = Some(Instant::now());
+    app.input.enter_paste_mode();
     app.refresh_input_border();
 }

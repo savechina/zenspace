@@ -1,6 +1,10 @@
 // ============================================================================
 // 4D Test Suite: zen-core paths.rs
 //
+// IMPORTANT: These tests require `cargo nextest` for proper execution.
+// Regular `cargo test` does not provide process isolation, causing environment
+// variable leakage between tests. The CI uses nextest.
+//
 // Dimensions:
 //   NORMAL     — detect() works, all path methods return expected paths
 //   REVERSE    — No HOME / empty HOME produces correct errors

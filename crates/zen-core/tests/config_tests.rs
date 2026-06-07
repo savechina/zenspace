@@ -68,7 +68,7 @@ fn get_provider_returns_some_when_exists() {
     providers.insert(
         "my-provider".into(),
         ProviderConfig {
-            r#type: Some("openai".into()),
+            provider_type: Some("openai".into()),
             ..Default::default()
         },
     );
@@ -79,7 +79,7 @@ fn get_provider_returns_some_when_exists() {
         found.is_some(),
         "get_provider should find existing provider"
     );
-    assert_eq!(found.unwrap().r#type.as_deref(), Some("openai"));
+    assert_eq!(found.unwrap().provider_type.as_deref(), Some("openai"));
 }
 
 #[test]
@@ -539,7 +539,7 @@ fn agentic_config_is_send_sync() {
 #[test]
 fn provider_config_default_is_empty() {
     let pc = ProviderConfig::default();
-    assert!(pc.r#type.is_none());
+    assert!(pc.provider_type.is_none());
     assert!(pc.base_url.is_none());
     assert!(pc.api_key.is_none());
     assert!(pc.default_model.is_none());

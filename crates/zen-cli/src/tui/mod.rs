@@ -10,7 +10,7 @@ pub mod stream;
 pub mod theme;
 mod ui;
 
-pub fn run() -> Result<(), anyhow::Error> {
+pub fn run(config: &'static zen_core::config::AgenticConfig) -> Result<(), anyhow::Error> {
     use crossterm::event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -36,7 +36,7 @@ pub fn run() -> Result<(), anyhow::Error> {
     let result = (|| {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
-        app::run_app(&mut terminal)
+        app::run_app(&mut terminal, config)
     })();
 
     execute!(

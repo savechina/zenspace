@@ -2,6 +2,7 @@ use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::errors::{ConfigError, ZenError};
 use crate::paths::ZenPaths;
@@ -11,6 +12,12 @@ use crate::paths::ZenPaths;
 // ---------------------------------------------------------------------------
 
 static CONFIGS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../config");
+
+// ---------------------------------------------------------------------------
+// Global config cache (parse once per process)
+// ---------------------------------------------------------------------------
+
+static CONFIG_CACHE: OnceLock<AgenticConfig> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Config structs — Provider/Agent separation (FR-002)
@@ -34,7 +41,7 @@ pub struct AgenticConfig {
     #[serde(default)]
     pub features: FeatureConfig,
     #[serde(default)]
-    pub qqbot: Option<QqBotConfig>,
+    pub channels: ChannelsConfig,
     #[serde(default)]
     pub cron: CronConfig,
     #[serde(default)]
@@ -49,12 +56,53 @@ pub struct AgenticConfig {
     pub tui: TuiConfig,
 }
 
+/// IM channel configuration — supports multiple platforms.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub qqbot: Option<QqBotChannelConfig>,
+    #[serde(default)]
+    pub whatsapp: Option<WhatsAppChannelConfig>,
+    #[serde(default)]
+    pub telegram: Option<TelegramChannelConfig>,
+}
+
+/// QQ Bot channel configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QqBotChannelConfig {
+    pub app_id: String,
+    pub client_secret: String,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub home_channel: Option<String>,
+}
+
+/// WhatsApp channel configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhatsAppChannelConfig {
+    pub phone_number_id: String,
+    pub access_token: String,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+/// Telegram channel configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramChannelConfig {
+    pub bot_token: String,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub home_chat_id: Option<String>,
+}
+
 /// Provider definition — connection settings defined once, referenced by name.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProviderConfig {
     /// Provider type: "ollama", "openai", "anthropic", "deepseek", "mock".
-    #[serde(default)]
-    pub r#type: Option<String>,
+    #[serde(rename = "type", default)]
+    pub provider_type: Option<String>,
     /// Base URL for the provider API.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -186,15 +234,6 @@ impl std::fmt::Display for LlmPreference {
     }
 }
 
-/// QQ Bot integration config.
-#[derive(Debug, Clone, Deserialize)]
-pub struct QqBotConfig {
-    pub app_id: Option<String>,
-    pub token_env: Option<String>,
-    pub secret_env: Option<String>,
-    pub groups: Option<Vec<String>>,
-}
-
 /// Cron scheduling config.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -212,6 +251,32 @@ pub struct CronConfig {
 pub struct PluginConfig {
     pub scan_dir: Option<String>,
     pub wasm_cache_dir: Option<String>,
+    /// Per-plugin configuration keyed by plugin ID
+    pub plugins: HashMap<String, PluginInstance>,
+}
+
+/// Individual plugin instance configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginInstance {
+    /// Whether this plugin is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Plugin-specific configuration (flexible schema)
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+impl Default for PluginInstance {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            config: serde_json::Value::Null,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// RSS/Atom feed source config.
@@ -300,6 +365,7 @@ impl Default for PluginConfig {
         Self {
             scan_dir: Some(format!("{home}/.zen/plugins")),
             wasm_cache_dir: Some(format!("{home}/.zen/plugins/cache")),
+            plugins: HashMap::new(),
         }
     }
 }
@@ -327,7 +393,7 @@ impl Default for FinanceConfig {
 // Config loading (T023) — Priority: env → workspace → global → embedded
 // ---------------------------------------------------------------------------
 
-/// Load AgenticConfig with the full priority chain:
+/// Load AgenticConfig with the full priority chain (cached):
 /// 1. Environment variables (`ZEN_*`)
 /// 2. Workspace `.zen/config.toml` (upward search from cwd)
 /// 3. Global `~/.zen/config.toml`
@@ -335,29 +401,72 @@ impl Default for FinanceConfig {
 /// 5. Rust `Default` impl
 ///
 /// Keychain resolution (FR-061 `SecretRef`) is deferred to zen-auth (T033-T034).
-pub fn load_config() -> Result<AgenticConfig, ZenError> {
-    dotenvy::dotenv().ok();
+///
+/// **Caching**: Config is parsed once per process and cached globally.
+/// Subsequent calls return a reference to the cached config.
+/// In test mode, caching is disabled to allow environment variable changes.
+pub fn load_config() -> Result<&'static AgenticConfig, ZenError> {
+    #[cfg(test)]
+    {
+        // In test mode, always load fresh config to allow env var changes
+        dotenvy::dotenv().ok();
+        let paths = ZenPaths::detect().map_err(ZenError::Path)?;
+        let embedded = load_embedded_config()?;
+        let global = load_file_config(paths.global_root().join("config.toml")).unwrap_or_default();
+        let workspace = match paths.workspace_root() {
+            Some(w) => load_file_config(w.join("config.toml")).unwrap_or_default(),
+            None => AgenticConfig::default(),
+        };
+        let merged = merge_configs(embedded, global)?;
+        let merged = merge_configs(merged, workspace)?;
+        let config = apply_env_overrides(merged);
+        // Leak the config to get a 'static reference (acceptable for tests)
+        Ok(Box::leak(Box::new(config)))
+    }
 
-    let paths = ZenPaths::detect().map_err(ZenError::Path)?;
+    #[cfg(not(test))]
+    {
+        if let Some(config) = CONFIG_CACHE.get() {
+            return Ok(config);
+        }
 
-    // 1. Embedded defaults (T026)
-    let embedded = load_embedded_config()?;
+        dotenvy::dotenv().ok();
 
-    // 2. Global config from ~/.zen/config.toml (T025)
-    let global = load_file_config(paths.global_root().join("config.toml")).unwrap_or_default();
+        let paths = ZenPaths::detect().map_err(ZenError::Path)?;
 
-    // 3. Workspace config from .zen/config.toml (T025, upward search via ZenPaths)
-    let workspace = match paths.workspace_root() {
-        Some(w) => load_file_config(w.join("config.toml")).unwrap_or_default(),
-        None => AgenticConfig::default(),
-    };
+        // 1. Embedded defaults (T026)
+        let embedded = load_embedded_config()?;
 
-    // 4. Merge: embedded ← global ← workspace
-    let merged = merge_configs(embedded, global)?;
-    let merged = merge_configs(merged, workspace)?;
+        // 2. Global config from ~/.zen/config.toml (T025)
+        let global = load_file_config(paths.global_root().join("config.toml")).unwrap_or_default();
 
-    // 5. Environment overrides take highest priority
-    Ok(apply_env_overrides(merged))
+        // 3. Workspace config from .zen/config.toml (T025, upward search via ZenPaths)
+        let workspace = match paths.workspace_root() {
+            Some(w) => load_file_config(w.join("config.toml")).unwrap_or_default(),
+            None => AgenticConfig::default(),
+        };
+
+        // 4. Merge: embedded ← global ← workspace
+        let merged = merge_configs(embedded, global)?;
+        let merged = merge_configs(merged, workspace)?;
+
+        // 5. Environment overrides take highest priority
+        let config = apply_env_overrides(merged);
+
+        CONFIG_CACHE.set(config).map_err(|_| {
+            ZenError::Config(ConfigError::ParseError {
+                path: "global".to_string(),
+                reason: "Config already initialized".to_string(),
+            })
+        })?;
+
+        CONFIG_CACHE.get().ok_or_else(|| {
+            ZenError::Config(ConfigError::ParseError {
+                path: "global".to_string(),
+                reason: "Config initialization failed".to_string(),
+            })
+        })
+    }
 }
 
 fn load_file_config(path: PathBuf) -> Result<AgenticConfig, ZenError> {
@@ -422,7 +531,7 @@ fn merge_configs(
         providers: merge_providers(base.providers, override_cfg.providers),
         agents: merge_agents(base.agents, override_cfg.agents),
         features: merge_features(base.features, override_cfg.features),
-        qqbot: merge_option(base.qqbot, override_cfg.qqbot),
+        channels: merge_channels(base.channels, override_cfg.channels),
         cron: merge_cron(base.cron, override_cfg.cron),
         plugin: merge_plugin(base.plugin, override_cfg.plugin),
         feeds: merge_feeds(base.feeds, override_cfg.feeds),
@@ -461,6 +570,14 @@ fn merge_features(base: FeatureConfig, ov: FeatureConfig) -> FeatureConfig {
     }
 }
 
+fn merge_channels(base: ChannelsConfig, ov: ChannelsConfig) -> ChannelsConfig {
+    ChannelsConfig {
+        qqbot: merge_option(base.qqbot, ov.qqbot),
+        whatsapp: merge_option(base.whatsapp, ov.whatsapp),
+        telegram: merge_option(base.telegram, ov.telegram),
+    }
+}
+
 fn merge_option<T>(base: Option<T>, ov: Option<T>) -> Option<T> {
     ov.or(base)
 }
@@ -478,9 +595,12 @@ fn merge_cron(base: CronConfig, ov: CronConfig) -> CronConfig {
 }
 
 fn merge_plugin(base: PluginConfig, ov: PluginConfig) -> PluginConfig {
+    let mut plugins = base.plugins;
+    plugins.extend(ov.plugins);
     PluginConfig {
         scan_dir: str_merge(base.scan_dir, ov.scan_dir),
         wasm_cache_dir: str_merge(base.wasm_cache_dir, ov.wasm_cache_dir),
+        plugins,
     }
 }
 
@@ -540,7 +660,7 @@ fn apply_env_overrides(mut config: AgenticConfig) -> AgenticConfig {
     apply_plugin_env(&mut config.plugin);
     apply_learning_env(&mut config.learning);
     apply_finance_env(&mut config.finance);
-    apply_qqbot_env(&mut config.qqbot);
+    apply_channels_env(&mut config.channels);
     config
 }
 
@@ -602,28 +722,59 @@ fn apply_finance_env(finance: &mut FinanceConfig) {
     }
 }
 
-fn apply_qqbot_env(qqbot: &mut Option<QqBotConfig>) {
+fn apply_channels_env(channels: &mut ChannelsConfig) {
+    // QQ Bot env overrides
     let app_id = env_str("ZEN_QQBOT_APP_ID");
-    let token_env = env_str("ZEN_QQBOT_TOKEN_ENV");
-    let secret_env = env_str("ZEN_QQBOT_SECRET_ENV");
-    if app_id.is_some() || token_env.is_some() || secret_env.is_some() {
-        if qqbot.is_none() {
-            *qqbot = Some(QqBotConfig {
-                app_id: None,
-                token_env: None,
-                secret_env: None,
-                groups: None,
+    let client_secret = env_str("ZEN_QQBOT_CLIENT_SECRET");
+    if app_id.is_some() || client_secret.is_some() {
+        if channels.qqbot.is_none() {
+            channels.qqbot = Some(QqBotChannelConfig {
+                app_id: String::new(),
+                client_secret: String::new(),
+                allowed_users: Vec::new(),
+                home_channel: None,
             });
         }
-        let q = qqbot.as_mut().unwrap();
+        let q = channels.qqbot.as_mut().unwrap();
         if let Some(v) = app_id {
-            q.app_id = Some(v);
+            q.app_id = v;
         }
-        if let Some(v) = token_env {
-            q.token_env = Some(v);
+        if let Some(v) = client_secret {
+            q.client_secret = v;
         }
-        if let Some(v) = secret_env {
-            q.secret_env = Some(v);
+    }
+
+    // WhatsApp env overrides
+    let phone_id = env_str("ZEN_WHATSAPP_PHONE_ID");
+    let access_token = env_str("ZEN_WHATSAPP_ACCESS_TOKEN");
+    if phone_id.is_some() || access_token.is_some() {
+        if channels.whatsapp.is_none() {
+            channels.whatsapp = Some(WhatsAppChannelConfig {
+                phone_number_id: String::new(),
+                access_token: String::new(),
+                allowed_users: Vec::new(),
+            });
+        }
+        let w = channels.whatsapp.as_mut().unwrap();
+        if let Some(v) = phone_id {
+            w.phone_number_id = v;
+        }
+        if let Some(v) = access_token {
+            w.access_token = v;
+        }
+    }
+
+    // Telegram env overrides
+    let bot_token = env_str("ZEN_TELEGRAM_BOT_TOKEN");
+    if let Some(v) = bot_token {
+        if channels.telegram.is_none() {
+            channels.telegram = Some(TelegramChannelConfig {
+                bot_token: v,
+                allowed_users: Vec::new(),
+                home_chat_id: None,
+            });
+        } else {
+            channels.telegram.as_mut().unwrap().bot_token = v;
         }
     }
 }

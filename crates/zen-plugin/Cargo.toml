@@ -21,6 +21,9 @@ wasmtime = { workspace = true }
 rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
 schemars = "0.8"
+notify = { workspace = true }
+notify-rust = { workspace = true }
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

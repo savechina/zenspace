@@ -449,7 +449,7 @@ impl DefaultRouter {
         name: &str,
         cfg: &zen_core::config::ProviderConfig,
     ) -> Option<ProviderInstance> {
-        let provider_type = cfg.r#type.as_deref().unwrap_or("openai-compatible");
+        let provider_type = cfg.provider_type.as_deref().unwrap_or("openai-compatible");
 
         match provider_type {
             "ollama" => {
@@ -614,7 +614,7 @@ impl DefaultRouter {
                 providers: std::collections::HashMap::new(),
                 agents: std::collections::HashMap::new(),
                 features: zen_core::config::FeatureConfig::default(),
-                qqbot: None,
+                channels: zen_core::config::ChannelsConfig::default(),
                 cron: zen_core::config::CronConfig::default(),
                 plugin: zen_core::config::PluginConfig::default(),
                 feeds: Vec::new(),

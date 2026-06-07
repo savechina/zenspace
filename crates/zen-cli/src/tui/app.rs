@@ -11,7 +11,6 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tui_textarea::TextArea;
 use zen_agents::AgentOrchestrator;
-use zen_core::config::load_config;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
@@ -51,6 +50,112 @@ pub enum InputMode {
     Paste,
     History,
     Selection,
+}
+
+pub struct InputCell {
+    textarea: TextArea<'static>,
+    mode: InputMode,
+    paste_timestamp: Option<Instant>,
+    selected_cell_idx: usize,
+}
+
+impl InputCell {
+    pub fn new(text: impl Into<String>) -> Self {
+        let mut textarea = TextArea::new(vec![text.into()]);
+        textarea.set_block(Self::input_block());
+        Self {
+            textarea,
+            mode: InputMode::Default,
+            paste_timestamp: None,
+            selected_cell_idx: 0,
+        }
+    }
+
+    fn input_block() -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::Set {
+                vertical_left: ">",
+                ..border::PLAIN
+            })
+            .title(" Input (Enter=send, Ctrl+D=exit) ")
+    }
+
+    pub fn effective_mode(&self) -> InputMode {
+        if self.mode == InputMode::Paste {
+            if let Some(ts) = self.paste_timestamp {
+                if ts.elapsed().as_secs() >= PASTE_MODE_SECS {
+                    return InputMode::Default;
+                }
+            }
+        }
+        self.mode
+    }
+
+    pub fn enter_paste_mode(&mut self) {
+        self.mode = InputMode::Paste;
+        self.paste_timestamp = Some(Instant::now());
+    }
+
+    pub fn enter_history_mode(&mut self) {
+        self.mode = InputMode::History;
+    }
+
+    pub fn enter_selection_mode(&mut self, cell_count: usize) {
+        if cell_count > 0 {
+            self.mode = InputMode::Selection;
+            self.selected_cell_idx = cell_count - 1;
+        }
+    }
+
+    pub fn exit_selection_mode(&mut self) {
+        if self.mode == InputMode::Selection {
+            self.mode = InputMode::Default;
+        }
+    }
+
+    pub fn exit_mode(&mut self) {
+        self.mode = InputMode::Default;
+        self.paste_timestamp = None;
+    }
+
+    pub fn selected_cell_idx(&self) -> usize {
+        self.selected_cell_idx
+    }
+
+    pub fn set_selected_cell_idx(&mut self, idx: usize) {
+        self.selected_cell_idx = idx;
+    }
+
+    pub fn textarea(&self) -> &TextArea<'static> {
+        &self.textarea
+    }
+
+    pub fn textarea_mut(&mut self) -> &mut TextArea<'static> {
+        &mut self.textarea
+    }
+
+    pub fn refresh_border(&mut self) {
+        self.textarea.set_block(Self::input_block());
+    }
+
+    pub fn set_style(&mut self, style: ratatui::style::Style) {
+        self.textarea.set_style(style);
+    }
+}
+
+impl std::ops::Deref for InputCell {
+    type Target = TextArea<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.textarea
+    }
+}
+
+impl std::ops::DerefMut for InputCell {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.textarea
+    }
 }
 
 // Full ZENSPACE logo for wide terminals (≥90 cols)
@@ -185,7 +290,7 @@ pub const CLI_COMMANDS: &[&str] = &[
 ];
 
 pub struct App {
-    pub input: TextArea<'static>,
+    pub input: InputCell,
     pub output: Vec<OutputCell>,
     pub running: bool,
     pub workspace: String,
@@ -212,9 +317,6 @@ pub struct App {
     pub session_picker: SessionPickerState,
     pub toast_queue: VecDeque<String>,
     pub current_toast: Option<(String, Instant)>,
-    pub input_mode: InputMode,
-    pub paste_timestamp: Option<Instant>,
-    pub selected_cell_idx: usize,
     conversation_store: Option<ConversationStore>,
 }
 
@@ -229,19 +331,17 @@ impl App {
             .title(" Input (Enter=send, Ctrl+D=exit) ")
     }
 
-    fn create_input_textarea(text: impl Into<String>) -> TextArea<'static> {
-        let mut ta = TextArea::new(vec![text.into()]);
-        ta.set_block(Self::input_block());
-        ta
+    fn create_input_textarea(text: impl Into<String>) -> InputCell {
+        InputCell::new(text)
     }
 
-    pub fn new() -> Self {
+    pub fn new(_config: &'static zen_core::config::AgenticConfig) -> Self {
         let workspace = zen_core::paths::ZenPaths::detect()
             .ok()
             .and_then(|paths| paths.workspace_root().map(|p| p.display().to_string()))
             .unwrap_or_else(|| ".".into());
         let mut app = Self {
-            input: Self::create_input_textarea(""),
+            input: InputCell::new(""),
             output: Vec::new(),
             running: true,
             workspace,
@@ -268,9 +368,6 @@ impl App {
             session_picker: SessionPickerState::new(),
             toast_queue: VecDeque::new(),
             current_toast: None,
-            input_mode: InputMode::Default,
-            paste_timestamp: None,
-            selected_cell_idx: 0,
             conversation_store: ConversationStore::open("tui").ok(),
         };
         app.load_command_history();
@@ -311,24 +408,15 @@ impl App {
     }
 
     pub fn effective_input_mode(&self) -> InputMode {
-        match self.input_mode {
-            InputMode::Paste => {
-                if self.paste_timestamp.map_or(true, |t| t.elapsed().as_secs() >= PASTE_MODE_SECS) {
-                    InputMode::Default
-                } else {
-                    InputMode::Paste
-                }
-            }
-            other => other,
-        }
+        self.input.effective_mode()
     }
 
     pub fn refresh_input_border(&mut self) {
-        let mode = self.effective_input_mode();
+        let mode = self.input.effective_mode();
         let cell_info = if mode == InputMode::Selection && !self.output.is_empty() {
             format!(
                 " Select: {}/{} · ↑↓/jk nav · y yank · Esc exit ",
-                self.selected_cell_idx + 1,
+                self.input.selected_cell_idx() + 1,
                 self.output.len()
             )
         } else {
@@ -349,7 +437,7 @@ impl App {
             })
             .title(title)
             .style(bg_style);
-        self.input.set_block(block);
+        self.input.textarea_mut().set_block(block);
     }
 
     pub fn enter_selection(&mut self) {
@@ -357,32 +445,34 @@ impl App {
             self.show_toast("Nothing to select — chat empty");
             return;
         }
-        self.input_mode = InputMode::Selection;
-        self.selected_cell_idx = self.output.len().saturating_sub(1);
+        self.input.enter_selection_mode(self.output.len());
         self.refresh_input_border();
     }
 
     pub fn exit_selection(&mut self) {
-        self.input_mode = InputMode::Default;
+        self.input.exit_selection_mode();
         self.refresh_input_border();
     }
 
     pub fn selection_up(&mut self) {
-        if self.selected_cell_idx > 0 {
-            self.selected_cell_idx -= 1;
+        let idx = self.input.selected_cell_idx();
+        if idx > 0 {
+            self.input.set_selected_cell_idx(idx - 1);
         }
         self.refresh_input_border();
     }
 
     pub fn selection_down(&mut self) {
-        if !self.output.is_empty() && self.selected_cell_idx + 1 < self.output.len() {
-            self.selected_cell_idx += 1;
+        let idx = self.input.selected_cell_idx();
+        if !self.output.is_empty() && idx + 1 < self.output.len() {
+            self.input.set_selected_cell_idx(idx + 1);
         }
         self.refresh_input_border();
     }
 
     pub fn yank_selected_cell(&mut self) {
-        if let Some(cell) = self.output.get(self.selected_cell_idx) {
+        let idx = self.input.selected_cell_idx();
+        if let Some(cell) = self.output.get(idx) {
             let text = cell.raw_text();
             if text.is_empty() {
                 self.show_toast("Cell has no text to copy");
@@ -446,15 +536,8 @@ impl App {
         self.output.push(OutputCell::Plain(PlainCell::new(info)));
     }
 
-    pub fn init_orchestrator(&mut self) {
-        let config = match load_config() {
-            Ok(c) => c,
-            Err(e) => {
-                self.push_output(format!("Config load error (using defaults): {}", e), true);
-                return;
-            }
-        };
-        let router = DefaultRouter::from_agentic(&config);
+    pub fn init_orchestrator(&mut self, config: &'static zen_core::config::AgenticConfig) {
+        let router = DefaultRouter::from_agentic(config);
         self.orchestrator = Some(Arc::new(AgentOrchestrator::new(router)));
         self.session = Some(SessionContext::new("default".into(), String::new()));
     }
@@ -498,10 +581,11 @@ impl App {
             Some(p) => p - 1,
         };
         self.history_position = Some(new_pos);
-        self.input_mode = InputMode::History;
+        self.input.enter_history_mode();
         if let Some(entry) = self.command_history.get(new_pos) {
             self.last_recalled_text = Some(entry.clone());
             self.input = Self::create_input_textarea(entry.clone());
+            self.input.enter_history_mode();
         }
     }
 
@@ -512,14 +596,15 @@ impl App {
                 self.history_position = None;
                 self.last_recalled_text = None;
                 self.input = Self::create_input_textarea("");
-                self.input_mode = InputMode::Default;
+                self.input.exit_mode();
             }
             Some(p) => {
                 self.history_position = Some(p + 1);
-                self.input_mode = InputMode::History;
+                self.input.enter_history_mode();
                 if let Some(entry) = self.command_history.get(p + 1) {
                     self.last_recalled_text = Some(entry.clone());
                     self.input = Self::create_input_textarea(entry.clone());
+                    self.input.enter_history_mode();
                 }
             }
         }
@@ -869,9 +954,6 @@ Use /thinking to show/hide thinking process."#;
                                 self.output.push(OutputCell::Markdown(
                                     super::cell::MarkdownCell::from_lines(remaining, raw_text),
                                 ));
-                            }
-                            if crate::tui::clipboard::write_text(&response).is_ok() {
-                                self.show_toast("✓ Copied to clipboard");
                             }
                             self.chat_history.push((_query, response.clone()));
                             if let Some(store) = &self.conversation_store {
@@ -1416,15 +1498,16 @@ Use /thinking to show/hide thinking process."#;
     }
 }
 
-pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
-    let mut app = App::new();
-    if let Ok(config) = load_config()
-        && let Some(theme) = config.tui_theme()
-    {
+pub fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    config: &'static zen_core::config::AgenticConfig,
+) -> Result<()> {
+    let mut app = App::new(config);
+    if let Some(theme) = config.tui_theme() {
         app.with_theme(theme);
     }
     app.push_splash();
-    app.init_orchestrator();
+    app.init_orchestrator(config);
     app.push_output(
         "Zen Agentic TUI - type /help for commands, /thinking to show thinking, Ctrl+D to exit"
             .into(),
@@ -1450,8 +1533,7 @@ pub fn run_app(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Re
                             if !cmd.is_empty() {
                                 app.push_history(&cmd);
                             }
-                            app.input_mode = InputMode::Default;
-                            app.paste_timestamp = None;
+                            app.input.exit_mode();
                             app.input = App::create_input_textarea("");
                             app.handle_command(&cmd);
                         }
