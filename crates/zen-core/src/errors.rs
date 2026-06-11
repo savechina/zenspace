@@ -32,6 +32,12 @@ pub enum ConfigError {
 
     #[error("required environment variable not set: {variable}")]
     MissingEnvVar { variable: String },
+
+    #[error("plugin '{id}' not found in configuration")]
+    MissingPlugin { id: String },
+
+    #[error("failed to parse plugin '{id}' configuration: {reason}")]
+    PluginParseError { id: String, reason: String },
 }
 
 #[derive(Debug, Error)]

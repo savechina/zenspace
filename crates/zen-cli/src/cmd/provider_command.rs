@@ -26,7 +26,7 @@ pub enum ProviderCommands {
 
 pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
     let config = load_config()?;
-    let router = DefaultRouter::from_agentic(&config);
+    let router = DefaultRouter::from_agentic(config);
 
     match operation {
         ProviderCommands::Route { task } => {

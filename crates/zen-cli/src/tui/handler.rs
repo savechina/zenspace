@@ -12,8 +12,7 @@ pub enum KeyAction {
 pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
     if app.input.effective_mode() == InputMode::Selection {
         return match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE)
-            | (KeyCode::Char('v'), KeyModifiers::NONE) => {
+            (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 app.exit_selection();
                 KeyAction::Continue
             }
@@ -260,7 +259,8 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
 
     let input_after = app.input.lines().join("\n");
     if input_before != input_after {
-        app.slash_state.on_input_change(&input_after, &app.slash_registry);
+        app.slash_state
+            .on_input_change(&input_after, &app.slash_registry);
         if app.input.effective_mode() == InputMode::History {
             app.input.exit_mode();
         }

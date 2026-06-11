@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use zen_core::config::{AgentConfig, ZenConfig, FallbackStep};
+use zen_core::config::{AgentConfig, FallbackStep, ZenConfig};
 use zen_provider::{DefaultRouter, Provider};
 
 #[test]
@@ -22,15 +22,20 @@ fn test_build_fallback_chain_with_fallbacks() {
                             provider: "deepseek".into(),
                             model: Some("deepseek-v4-flash".into()),
                             timeout_secs: None,
+                            variant: None,
                         },
                         FallbackStep {
                             provider: "openai".into(),
                             model: Some("gpt-4o-mini".into()),
                             timeout_secs: None,
+                            variant: None,
                         },
                     ],
                     retry_policy: None,
                     sensitivity: None,
+                    variant: None,
+                    temperature: None,
+                    max_tokens: None,
                 },
             );
             map
@@ -62,6 +67,9 @@ fn test_build_fallback_chain_without_fallbacks() {
                     fallbacks: vec![],
                     retry_policy: None,
                     sensitivity: None,
+                    variant: None,
+                    temperature: None,
+                    max_tokens: None,
                 },
             );
             map

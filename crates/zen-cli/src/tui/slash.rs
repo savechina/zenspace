@@ -63,7 +63,7 @@ impl Default for SlashCommandRegistry {
 
 pub fn create_default_registry() -> SlashCommandRegistry {
     let mut registry = SlashCommandRegistry::new();
-    
+
     registry.register(
         "help".to_string(),
         vec!["h".to_string()],
@@ -90,6 +90,11 @@ pub fn create_default_registry() -> SlashCommandRegistry {
         "Switch provider/model".to_string(),
     );
     registry.register(
+        "variant".to_string(),
+        vec!["vc".to_string(), "variant_cycle".to_string()],
+        "Cycle through model variants".to_string(),
+    );
+    registry.register(
         "export".to_string(),
         vec!["e".to_string()],
         "Export chat to Markdown".to_string(),
@@ -109,11 +114,7 @@ pub fn create_default_registry() -> SlashCommandRegistry {
         vec!["ss".to_string()],
         "List and select sessions".to_string(),
     );
-    registry.register(
-        "new".to_string(),
-        vec![],
-        "Create new session".to_string(),
-    );
+    registry.register("new".to_string(), vec![], "Create new session".to_string());
     registry.register(
         "fork".to_string(),
         vec![],
@@ -144,12 +145,8 @@ pub fn create_default_registry() -> SlashCommandRegistry {
         vec![],
         "Run consolidation pipeline".to_string(),
     );
-    registry.register(
-        "lint".to_string(),
-        vec![],
-        "Run knowledge lint".to_string(),
-    );
-    
+    registry.register("lint".to_string(), vec![], "Run knowledge lint".to_string());
+
     registry
 }
 

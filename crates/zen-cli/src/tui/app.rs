@@ -82,12 +82,11 @@ impl InputCell {
     }
 
     pub fn effective_mode(&self) -> InputMode {
-        if self.mode == InputMode::Paste {
-            if let Some(ts) = self.paste_timestamp {
-                if ts.elapsed().as_secs() >= PASTE_MODE_SECS {
-                    return InputMode::Default;
-                }
-            }
+        if self.mode == InputMode::Paste
+            && let Some(ts) = self.paste_timestamp
+            && ts.elapsed().as_secs() >= PASTE_MODE_SECS
+        {
+            return InputMode::Default;
         }
         self.mode
     }
@@ -306,8 +305,10 @@ pub struct App {
     pub command_history: Vec<String>,
     pub history_position: Option<usize>,
     pub last_recalled_text: Option<String>,
+    config: &'static zen_core::config::ZenConfig,
     orchestrator: Option<Arc<AgentOrchestrator>>,
     session: Option<SessionContext>,
+    pub current_variant: Option<String>,
     pub scroll_offset: usize,
     pub auto_scroll: bool,
     pub stream_collector: MarkdownStreamCollector,
@@ -335,7 +336,7 @@ impl App {
         InputCell::new(text)
     }
 
-    pub fn new(_config: &'static zen_core::config::ZenConfig) -> Self {
+    pub fn new(config: &'static zen_core::config::ZenConfig) -> Self {
         let workspace = zen_core::paths::ZenPaths::detect()
             .ok()
             .and_then(|paths| paths.workspace_root().map(|p| p.display().to_string()))
@@ -346,7 +347,11 @@ impl App {
             running: true,
             workspace,
             session_id: None,
-            model: "mock".to_string(),
+            model: format!(
+                "{}/{}",
+                config.default_provider.as_deref().unwrap_or("mock"),
+                config.default_model.as_deref().unwrap_or("default")
+            ),
             memory_count: 0,
             show_thinking: false,
             is_streaming: false,
@@ -357,8 +362,10 @@ impl App {
             command_history: Vec::new(),
             history_position: None,
             last_recalled_text: None,
+            config,
             orchestrator: None,
             session: None,
+            current_variant: None,
             scroll_offset: 0,
             auto_scroll: true,
             stream_collector: MarkdownStreamCollector::new(),
@@ -388,10 +395,10 @@ impl App {
     }
 
     pub fn get_active_toast(&mut self) -> Option<String> {
-        if self.current_toast.is_none() {
-            if let Some(msg) = self.toast_queue.pop_front() {
-                self.current_toast = Some((msg, Instant::now()));
-            }
+        if self.current_toast.is_none()
+            && let Some(msg) = self.toast_queue.pop_front()
+        {
+            self.current_toast = Some((msg, Instant::now()));
         }
 
         if let Some((ref msg, timestamp)) = self.current_toast {
@@ -697,6 +704,7 @@ impl App {
             "serve" => self.execute_serve(parts.get(1).copied()),
             "config" => self.execute_config(),
             "model" => self.execute_model(parts.get(1).copied()),
+            "variant" | "vc" | "variant_cycle" => self.execute_variant_cycle(),
             "consolidate" => self.execute_consolidate(),
             "lint" => self.execute_lint(),
             _ => self.push_output(
@@ -713,6 +721,7 @@ impl App {
   /clear                 Clear output
   /thinking              Toggle showing thinking process (default: OFF)
   /model <p> [m]         Switch provider [model], show current if omitted
+  /variant (/vc)          Cycle through model variants (reasoning levels)
   /export (/e)           Export chat to Markdown
   /note <text>           Create a note
   /search <q> (/s <q>)   Search knowledge base
@@ -1019,10 +1028,8 @@ Use /thinking to show/hide thinking process."#;
         }
 
         if provider != "ollama" && provider != "mock" {
-            let agentic = zen_core::config::load_embedded_config()
-                .unwrap_or_else(|_| zen_core::config::ZenConfig::default());
-
-            let env_var = agentic
+            let env_var = self
+                .config
                 .providers
                 .get(provider)
                 .and_then(|cfg| {
@@ -1048,7 +1055,7 @@ Use /thinking to show/hide thinking process."#;
             }
         }
 
-        let router = DefaultRouter::new_for_provider(provider, model);
+        let router = DefaultRouter::from_config_override(self.config, provider, model);
         let new_model = format!("{}/{}", provider, model);
         let orchestrator = Arc::new(AgentOrchestrator::new(router));
 
@@ -1056,6 +1063,55 @@ Use /thinking to show/hide thinking process."#;
         self.model = new_model.clone();
 
         self.push_output(format!("Model switched to: {}", new_model), false);
+    }
+
+    fn execute_variant_cycle(&mut self) {
+        let (provider, model_name) = match self.model.split_once('/') {
+            Some((p, m)) => (p.to_string(), m.to_string()),
+            None => {
+                // Single-word model — treat as provider, use its default_model
+                let provider = self.model.clone();
+                let model_name = self
+                    .config
+                    .providers
+                    .get(&provider)
+                    .and_then(|p| p.default_model.clone())
+                    .unwrap_or_else(|| "default".into());
+                (provider, model_name)
+            }
+        };
+
+        let variants = self
+            .config
+            .providers
+            .get(&provider)
+            .and_then(|p| p.models.get(&model_name))
+            .map(|m| m.variants.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        if variants.is_empty() {
+            self.push_output(
+                format!(
+                    "Model {}/{} has no variants configured.",
+                    provider, model_name
+                ),
+                false,
+            );
+            return;
+        }
+
+        let current = self.current_variant.as_deref().unwrap_or("");
+        let idx = variants
+            .iter()
+            .position(|v| v == current)
+            .unwrap_or(variants.len() - 1);
+        let next = variants[(idx + 1) % variants.len()].clone();
+
+        self.current_variant = Some(next.clone());
+        self.push_output(
+            format!("Variant: {} ({}/{})", next, next, variants.join(", ")),
+            false,
+        );
     }
 
     fn execute_export(&mut self) {
@@ -1448,15 +1504,15 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_config(&mut self) {
-        use zen_core::config::load_config;
-        match load_config() {
-            Ok(cfg) => {
-                self.push_output("Configuration:".into(), false);
-                self.push_output(format!("  LLM default: {:?}", cfg.default_provider), false);
-                self.push_output(format!("  Cron: {:?}", cfg.cron.consolidation_time), false);
-            }
-            Err(e) => self.push_output(format!("Config error: {}", e), true),
-        }
+        self.push_output("Configuration:".into(), false);
+        self.push_output(
+            format!("  LLM default: {:?}", self.config.default_provider),
+            false,
+        );
+        self.push_output(
+            format!("  Cron: {:?}", self.config.cron.consolidation_time),
+            false,
+        );
     }
 
     fn execute_consolidate(&mut self) {

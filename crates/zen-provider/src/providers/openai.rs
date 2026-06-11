@@ -31,7 +31,11 @@ impl OpenAIProvider {
         }
     }
 
-    pub async fn complete_async(&self, prompt: &str) -> Result<String, LlmError> {
+    pub async fn complete_async(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<String, LlmError> {
         let mut builder = openai::Client::builder().api_key(&self.api_key);
 
         if self.base_url != zen_core::constants::OPENAI_API_URL {
@@ -43,7 +47,14 @@ impl OpenAIProvider {
         })?;
 
         let model = client.completion_model(&self.model);
-        let agent = AgentBuilder::new(model).build();
+        let mut agent_builder = AgentBuilder::new(model);
+        if let Some(t) = options.temperature {
+            agent_builder = agent_builder.temperature(t);
+        }
+        if let Some(m) = options.max_tokens {
+            agent_builder = agent_builder.max_tokens(m);
+        }
+        let agent = agent_builder.build();
 
         let response = agent.prompt(prompt).await.map_err(|e| LlmError::Call {
             reason: format!("OpenAI completion failed: {}", e),
@@ -57,11 +68,16 @@ impl OpenAIProvider {
         Ok(response)
     }
 
-    pub fn complete(&self, prompt: &str) -> Result<String, LlmError> {
+    pub fn complete(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<String, LlmError> {
         let api_key = self.api_key.clone();
         let model = self.model.clone();
         let base_url = self.base_url.clone();
         let prompt = prompt.to_string();
+        let options = options.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -70,7 +86,7 @@ impl OpenAIProvider {
                 model,
                 base_url,
             };
-            rt.block_on(provider.complete_async(&prompt))
+            rt.block_on(provider.complete_async(&prompt, &options))
         })
         .join()
         .map_err(|e| LlmError::Call {
@@ -82,8 +98,9 @@ impl OpenAIProvider {
         &self,
         prompt: &str,
         token_tx: mpsc::UnboundedSender<String>,
+        options: &zen_core::config::ModelOptions,
     ) -> Result<(), LlmError> {
-        let response = self.complete_async(prompt).await?;
+        let response = self.complete_async(prompt, options).await?;
 
         let words: Vec<&str> = response.split_whitespace().collect();
         let mut buf = String::new();

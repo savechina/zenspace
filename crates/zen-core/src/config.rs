@@ -2,6 +2,7 @@ use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(not(test))]
 use std::sync::OnceLock;
 
 use crate::errors::{ConfigError, ZenError};
@@ -17,6 +18,7 @@ static CONFIGS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../config");
 // Global config cache (parse once per process)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 static CONFIG_CACHE: OnceLock<ZenConfig> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,13 @@ pub struct ProviderConfig {
     /// API wire protocol: "completions" (default) or "responses".
     #[serde(rename = "wire_api", default)]
     pub wire_api: Option<String>,
+    /// Per-model catalog — model entries with parameters and variants.
+    ///
+    /// When present, `default_model` selects a key into this map.
+    /// When absent, `default_model` is used directly as the API model name
+    /// (backward compatible).
+    #[serde(default)]
+    pub models: HashMap<String, ModelEntry>,
 }
 
 /// Fallback step for sequential fallback chain.
@@ -131,6 +140,9 @@ pub struct FallbackStep {
     /// Timeout for this step in seconds (optional).
     #[serde(default)]
     pub timeout_secs: Option<u32>,
+    /// Variant name for this fallback step's model.
+    #[serde(default)]
+    pub variant: Option<String>,
 }
 
 /// Retry policy for transient errors.
@@ -169,6 +181,15 @@ pub struct AgentConfig {
     /// Data sensitivity level (optional, enforces local-only if Private/Confidential).
     #[serde(default)]
     pub sensitivity: Option<crate::types::Sensitivity>,
+    /// Variant name for the selected model (e.g. "high", "low").
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Override model temperature (inherits from model catalog if None).
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Override max tokens (inherits from model catalog if None).
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
 }
 
 /// Feature flags.
@@ -255,7 +276,7 @@ pub struct CronConfig {
 ///
 /// Known fields (`base_path`, `wasm_cache_path`) are deserialized directly.
 /// All other `[plugin.{id}]` sections are collected into `plugins` via `#[serde(flatten)]`,
-/// where each value is parsed into a [`PluginInstanceConfig`] (extracting `enabled`,
+/// where each value is parsed into a [`PluginEntry`] (extracting `enabled`,
 /// everything else into `config`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -266,7 +287,7 @@ pub struct PluginConfig {
     /// Collected via `#[serde(flatten)]` — any `[plugin.{id}]` section
     /// that isn't a known field lands here.
     #[serde(flatten)]
-    pub plugins: HashMap<String, PluginInstanceConfig>,
+    pub plugins: HashMap<String, PluginEntry>,
 }
 
 /// Individual plugin instance configuration.
@@ -274,14 +295,14 @@ pub struct PluginConfig {
 /// Deserialized from a TOML table with `enabled` extracted as a first-class
 /// field, and all remaining keys folded into `config` as a JSON object.
 #[derive(Debug, Clone)]
-pub struct PluginInstanceConfig {
+pub struct PluginEntry {
     /// Whether this plugin is enabled
     pub enabled: bool,
     /// Plugin-specific configuration (flexible schema)
     pub config: serde_json::Value,
 }
 
-impl Default for PluginInstanceConfig {
+impl Default for PluginEntry {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -290,7 +311,7 @@ impl Default for PluginInstanceConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for PluginInstanceConfig {
+impl<'de> Deserialize<'de> for PluginEntry {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -298,15 +319,15 @@ impl<'de> Deserialize<'de> for PluginInstanceConfig {
         /// Helper struct: `enabled` is extracted, everything else is flattened
         /// into the `rest` map, then folded into `config`.
         #[derive(Deserialize)]
-        struct PluginInstanceConfigHelper {
+        struct PluginEntryHelper {
             #[serde(default = "default_true")]
             enabled: bool,
             #[serde(flatten)]
             rest: HashMap<String, serde_json::Value>,
         }
 
-        let helper = PluginInstanceConfigHelper::deserialize(deserializer)?;
-        Ok(PluginInstanceConfig {
+        let helper = PluginEntryHelper::deserialize(deserializer)?;
+        Ok(PluginEntry {
             enabled: helper.enabled,
             config: serde_json::Value::Object(helper.rest.into_iter().collect()),
         })
@@ -315,6 +336,47 @@ impl<'de> Deserialize<'de> for PluginInstanceConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Multi-model catalog entry — defines a model variant within a provider.
+///
+/// Each entry specifies the API model name, default generation parameters,
+/// and named variants for different inference configurations.
+///
+/// ```toml
+/// [providers.openai.models.gpt-4o]
+/// model = "gpt-4o"
+/// options = { temperature = 0.7, max_tokens = 4096 }
+///
+/// [providers.openai.models.gpt-4o.variants.high]
+/// reasoning_effort = "high"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelEntry {
+    pub model: String,
+    #[serde(default)]
+    pub options: Option<ModelOptions>,
+    #[serde(default)]
+    pub variants: HashMap<String, VariantConfig>,
+}
+
+/// Default generation parameters for a model.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ModelOptions {
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u64>,
+    pub reasoning_effort: Option<String>,
+    pub top_p: Option<f64>,
+}
+
+/// Named variant override for a model — same model, different params.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct VariantConfig {
+    pub reasoning_effort: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u64>,
 }
 
 /// RSS/Atom feed source config.
@@ -345,15 +407,10 @@ pub struct FinanceConfig {
 /// TUI presentation config. Holds visual settings for the terminal UI.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct TuiConfig {
     /// Theme name: "zen", "classic", "catppuccin", "deep-ocean", "cyber-purple", "eink".
     pub theme: Option<String>,
-}
-
-impl Default for TuiConfig {
-    fn default() -> Self {
-        Self { theme: None }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +462,35 @@ impl Default for PluginConfig {
             wasm_cache_path: Some(format!("{home}/.zen/plugins/cache")),
             plugins: HashMap::new(),
         }
+    }
+}
+
+impl PluginConfig {
+    /// Retrieve a typed plugin configuration.
+    ///
+    /// Deserializes the plugin's `config` JSON blob into the requested type `T`.
+    /// Returns `ConfigError::MissingPlugin` if the plugin ID is not found,
+    /// or `ConfigError::PluginParseError` if deserialization fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let finance: FinanceConfig = config.plugin.get_typed("finance")?;
+    /// ```
+    pub fn get_typed<T: serde::de::DeserializeOwned>(
+        &self,
+        id: &str,
+    ) -> Result<T, crate::errors::ConfigError> {
+        let instance = self
+            .plugins
+            .get(id)
+            .ok_or_else(|| crate::errors::ConfigError::MissingPlugin { id: id.into() })?;
+        serde_json::from_value(instance.config.clone()).map_err(|e| {
+            crate::errors::ConfigError::PluginParseError {
+                id: id.into(),
+                reason: e.to_string(),
+            }
+        })
     }
 }
 
@@ -578,6 +664,23 @@ fn merge_providers(
     base: HashMap<String, ProviderConfig>,
     ov: HashMap<String, ProviderConfig>,
 ) -> HashMap<String, ProviderConfig> {
+    let mut merged = base;
+    for (k, v) in ov {
+        merged
+            .entry(k)
+            .and_modify(|existing| {
+                existing.default_model = v.default_model.clone().or(existing.default_model.clone());
+                existing.models = merge_models(existing.models.clone(), v.models.clone());
+            })
+            .or_insert(v);
+    }
+    merged
+}
+
+fn merge_models(
+    base: HashMap<String, ModelEntry>,
+    ov: HashMap<String, ModelEntry>,
+) -> HashMap<String, ModelEntry> {
     let mut merged = base;
     for (k, v) in ov {
         merged.entry(k).or_insert(v);
@@ -806,14 +909,14 @@ fn apply_channels_env(channels: &mut ChannelsConfig) {
     // Telegram env overrides
     let bot_token = env_str("ZEN_TELEGRAM_BOT_TOKEN");
     if let Some(v) = bot_token {
-        if channels.telegram.is_none() {
+        if let Some(ref mut tg) = channels.telegram {
+            tg.bot_token = v;
+        } else {
             channels.telegram = Some(TelegramChannelConfig {
                 bot_token: v,
                 allowed_users: Vec::new(),
                 home_chat_id: None,
             });
-        } else {
-            channels.telegram.as_mut().unwrap().bot_token = v;
         }
     }
 }

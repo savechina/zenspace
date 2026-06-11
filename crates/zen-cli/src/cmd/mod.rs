@@ -9,6 +9,7 @@ pub mod consolidate_command;
 pub mod graph_command;
 pub mod ingest_command;
 pub mod lint_command;
+pub mod model_command;
 pub mod note_command;
 pub mod plugin_command;
 pub mod provider_command;

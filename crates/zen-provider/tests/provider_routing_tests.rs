@@ -9,7 +9,7 @@
 // ============================================================================
 
 use std::collections::HashMap;
-use zen_core::config::{AgentConfig, ZenConfig, FallbackStep};
+use zen_core::config::{AgentConfig, FallbackStep, ZenConfig};
 use zen_provider::{DefaultRouter, ModelMetadata, Provider};
 
 // ============================================================================
@@ -42,6 +42,9 @@ fn test_router_selects_provider_for_known_agent() {
                     fallbacks: vec![],
                     retry_policy: None,
                     sensitivity: None,
+                    variant: None,
+                    temperature: None,
+                    max_tokens: None,
                 },
             );
             map
@@ -113,6 +116,9 @@ fn test_router_handles_agent_without_provider() {
                     fallbacks: vec![],
                     retry_policy: None,
                     sensitivity: None,
+                    variant: None,
+                    temperature: None,
+                    max_tokens: None,
                 },
             );
             map
@@ -188,6 +194,7 @@ fn test_fallback_step_creation() {
         provider: "openai".to_string(),
         model: Some("gpt-4o-mini".to_string()),
         timeout_secs: None,
+        variant: None,
     };
     assert_eq!(step.provider, "openai");
     assert_eq!(step.model.as_deref(), Some("gpt-4o-mini"));
@@ -199,6 +206,7 @@ fn test_fallback_step_without_model() {
         provider: "ollama".to_string(),
         model: None,
         timeout_secs: Some(30),
+        variant: None,
     };
     assert_eq!(step.provider, "ollama");
     assert!(step.model.is_none());

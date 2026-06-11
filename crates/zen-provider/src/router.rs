@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-pub use zen_core::config::{ZenConfig, LlmConfig, ProviderConfig};
+pub use zen_core::config::{LlmConfig, ProviderConfig, ZenConfig};
 use zen_core::errors::ZenError;
 use zen_core::secrets::SecretRef;
 use zen_core::types::Sensitivity;
@@ -356,15 +356,19 @@ pub enum ProviderInstance {
 }
 
 impl ProviderInstance {
-    pub fn complete(&self, prompt: &str) -> Result<String, LlmError> {
+    pub fn complete(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<String, LlmError> {
         match self {
-            ProviderInstance::Anthropic(p) => p.complete(prompt),
-            ProviderInstance::AnthropicCompatible(p) => p.complete(prompt),
-            ProviderInstance::Cohere(p) => p.complete(prompt),
-            ProviderInstance::Gemini(p) => p.complete(prompt),
-            ProviderInstance::Mistral(p) => p.complete(prompt),
-            ProviderInstance::Ollama(p) => p.complete(prompt),
-            ProviderInstance::OpenAICompatible(p) => p.complete(prompt),
+            ProviderInstance::Anthropic(p) => p.complete(prompt, options),
+            ProviderInstance::AnthropicCompatible(p) => p.complete(prompt, options),
+            ProviderInstance::Cohere(p) => p.complete(prompt, options),
+            ProviderInstance::Gemini(p) => p.complete(prompt, options),
+            ProviderInstance::Mistral(p) => p.complete(prompt, options),
+            ProviderInstance::Ollama(p) => p.complete(prompt, options),
+            ProviderInstance::OpenAICompatible(p) => p.complete(prompt, options),
             ProviderInstance::Mock(p) => p.complete("call", prompt),
         }
     }
@@ -373,17 +377,20 @@ impl ProviderInstance {
         &self,
         prompt: &str,
         token_tx: mpsc::UnboundedSender<String>,
+        options: &zen_core::config::ModelOptions,
     ) -> Result<(), LlmError> {
         match self {
-            ProviderInstance::Anthropic(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::Anthropic(p) => p.complete_streaming(prompt, token_tx, options).await,
             ProviderInstance::AnthropicCompatible(p) => {
-                p.complete_streaming(prompt, token_tx).await
+                p.complete_streaming(prompt, token_tx, options).await
             }
-            ProviderInstance::Cohere(p) => p.complete_streaming(prompt, token_tx).await,
-            ProviderInstance::Gemini(p) => p.complete_streaming(prompt, token_tx).await,
-            ProviderInstance::Mistral(p) => p.complete_streaming(prompt, token_tx).await,
-            ProviderInstance::Ollama(p) => p.complete_streaming(prompt, token_tx).await,
-            ProviderInstance::OpenAICompatible(p) => p.complete_streaming(prompt, token_tx).await,
+            ProviderInstance::Cohere(p) => p.complete_streaming(prompt, token_tx, options).await,
+            ProviderInstance::Gemini(p) => p.complete_streaming(prompt, token_tx, options).await,
+            ProviderInstance::Mistral(p) => p.complete_streaming(prompt, token_tx, options).await,
+            ProviderInstance::Ollama(p) => p.complete_streaming(prompt, token_tx, options).await,
+            ProviderInstance::OpenAICompatible(p) => {
+                p.complete_streaming(prompt, token_tx, options).await
+            }
             ProviderInstance::Mock(p) => p.complete_streaming("call", prompt, token_tx).await,
         }
     }
@@ -424,6 +431,7 @@ pub struct DefaultRouter {
     config: zen_core::config::ZenConfig,
     mock: MockProvider,
     providers: std::collections::HashMap<String, ProviderInstance>,
+    current_variant: Option<String>,
 }
 
 impl DefaultRouter {
@@ -442,6 +450,7 @@ impl DefaultRouter {
             config: agentic.clone(),
             mock: MockProvider::default(),
             providers,
+            current_variant: None,
         }
     }
 
@@ -622,33 +631,75 @@ impl DefaultRouter {
             },
             mock: MockProvider::default(),
             providers,
+            current_variant: None,
         }
     }
 
     /// Create a [`DefaultRouter`] configured for a specific provider and model at runtime.
     ///
-    /// Loads provider config from embedded config.toml, overrides model if specified.
-    pub fn new_for_provider(provider_name: &str, model_name: &str) -> Self {
-        // Load embedded config as source of truth
-        let agentic =
-            zen_core::config::load_embedded_config().unwrap_or_else(|_| ZenConfig::default());
-
-        // Override model in provider config if specified
-        let mut providers = agentic.providers.clone();
+    /// Accepts an explicit [`ZenConfig`] (from `load_config()`) to preserve the full
+    /// 5-layer config merge chain (env → workspace → global → embedded). Overrides
+    /// the provider's `default_model` and sets it as the `default_provider`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = zen_core::config::load_config()?;
+    /// let router = DefaultRouter::from_config_override(config, "openai", "gpt-4o");
+    /// ```
+    pub fn from_config_override(config: &ZenConfig, provider_name: &str, model_name: &str) -> Self {
+        let mut providers = config.providers.clone();
         if let Some(cfg) = providers.get_mut(provider_name) {
             cfg.default_model = Some(model_name.into());
+        } else {
+            providers.insert(
+                provider_name.into(),
+                ProviderConfig {
+                    provider_type: Some(provider_name.into()),
+                    default_model: Some(model_name.into()),
+                    ..Default::default()
+                },
+            );
         }
 
-        let mut config = agentic.clone();
-        config.default_provider = Some(provider_name.into());
-        config.providers = providers;
+        let mut overridden = config.clone();
+        overridden.default_provider = Some(provider_name.into());
+        overridden.providers = providers;
 
-        Self::from_agentic(&config)
+        Self::from_agentic(&overridden)
     }
 
     /// Return the configured default provider name (e.g. "ollama", "openai").
     pub fn default_provider_name(&self) -> &str {
         self.config.default_provider.as_deref().unwrap_or("ollama")
+    }
+
+    /// Resolve effective [`ModelOptions`] for a provider by looking up its
+    /// model catalog entry and optionally applying a variant.
+    /// Returns `None` if the provider has no model catalog or the selected
+    /// model has no options.
+    fn resolve_effective_options(
+        &self,
+        provider_name: &str,
+    ) -> Option<zen_core::config::ModelOptions> {
+        let provider = self.config.providers.get(provider_name)?;
+        let model_name = provider.default_model.as_deref()?;
+        let entry = provider.models.get(model_name)?;
+        let mut base = entry.options.clone().unwrap_or_default();
+
+        // Merge variant params if one is selected
+        if let Some(ref variant_name) = self.current_variant
+            && let Some(variant) = entry.variants.get(variant_name)
+        {
+            if let Some(t) = variant.temperature {
+                base.temperature = Some(t);
+            }
+            if let Some(m) = variant.max_tokens {
+                base.max_tokens = Some(m);
+            }
+        }
+
+        Some(base)
     }
 
     // -- internal helpers --
@@ -869,6 +920,10 @@ impl LlmRouter for DefaultRouter {
             return self.mock.complete("call", prompt);
         }
 
+        let options = self
+            .resolve_effective_options(&provider_name)
+            .unwrap_or_default();
+
         if let Some(instance) = self.providers.get(&provider_name) {
             info!(
                 provider = provider_name,
@@ -880,7 +935,7 @@ impl LlmRouter for DefaultRouter {
                 prompt_len = prompt.len(),
                 "DefaultRouter: calling provider"
             );
-            instance.complete(prompt)
+            instance.complete(prompt, &options)
         } else {
             Err(LlmError::ProviderUnavailable {
                 provider: provider_name.clone(),
@@ -920,6 +975,9 @@ impl LlmRouter for DefaultRouter {
 
         if let Some(instance) = self.providers.get(&provider_name) {
             let prompt = prompt.to_string();
+            let options = self
+                .resolve_effective_options(&provider_name)
+                .unwrap_or_default();
             info!(
                 provider = provider_name,
                 model = instance.model_name(),
@@ -928,7 +986,9 @@ impl LlmRouter for DefaultRouter {
             );
             let instance = instance.clone();
             tokio::spawn(async move {
-                let result = instance.complete_streaming(&prompt, token_tx).await;
+                let result = instance
+                    .complete_streaming(&prompt, token_tx, &options)
+                    .await;
                 let _ = done_tx.send(result.map_err(|e| e.to_string()));
             });
         } else {

@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
 /// Color layer architecture for theme system.
-/// 
+///
 /// Deep Ocean 5-layer model:
 /// - Layer 0 (Canvas): Terminal bg - physical container (RGB 9,13,22)
 /// - Layer 1 (Deep Base): Container borders/shadows - structural elements (RGB 6,106,143)
@@ -11,40 +11,40 @@ use ratatui::style::{Color, Modifier, Style};
 pub trait OutputTheme {
     /// Layer 2: Heading hierarchy (level 1-6, higher = more prominent)
     fn heading(&self, level: u8) -> Style;
-    
+
     /// Layer 2: Bold emphasis for key content
     fn bold(&self) -> Style;
-    
+
     /// Layer 2: Italic for annotations/citations
     fn italic(&self) -> Style;
-    
+
     /// Layer 2: Inline code spans
     fn code_inline(&self) -> Style;
-    
+
     /// Layer 1: Code block border framing
     fn code_block_border(&self) -> Style;
-    
+
     /// Layer 2: Code block language label
     fn code_block_lang(&self) -> Style;
-    
+
     /// Layer 1: Table cell borders
     fn table_border(&self) -> Style;
-    
+
     /// Layer 2: Table header row (bold background highlight)
     fn table_header(&self) -> Style;
-    
+
     /// Layer 2: Blockquote vertical rule
     fn blockquote(&self) -> Style;
-    
+
     /// Layer 1: List bullet markers
     fn list_bullet(&self) -> Style;
-    
+
     /// Layer 2: Hyperlinks (underlined)
     fn link(&self) -> Style;
-    
+
     /// Layer 3: Error text (typically red/warm colors, high visibility)
     fn error(&self) -> Style;
-    
+
     /// Layer 3: Streaming cursor indicator (blinking/animated)
     fn streaming_cursor(&self) -> Style;
 
@@ -52,19 +52,19 @@ pub trait OutputTheme {
     fn bg(&self) -> Color {
         Color::Reset
     }
-    
+
     /// Layer 2: Banner gradient light endpoint (top of gradient)
     fn zen_core_light(&self) -> Color;
-    
+
     /// Layer 2: Banner gradient dark endpoint (bottom of gradient)
     fn zen_core_dark(&self) -> Color;
-    
+
     /// Layer 1: Shadow/projection color (typically darker than bg)
     fn shadow(&self) -> Color;
-    
+
     /// Layer 4: Dimmed auxiliary text (status labels, diagnostic prefixes, streaming buffers)
     fn text_muted(&self) -> Style;
-    
+
     /// Layer 2: Info accent color (tooltips, info boxes)
     fn info_accent(&self) -> Color;
 }

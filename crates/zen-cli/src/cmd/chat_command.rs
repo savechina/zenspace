@@ -24,7 +24,7 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
 
     let config = load_config().map_err(|e| ZenError::Message(format!("Config error: {}", e)))?;
 
-    let router = DefaultRouter::from_agentic(&config);
+    let router = DefaultRouter::from_agentic(config);
     let orchestrator = AgentOrchestrator::new(router);
     let mut session = SessionContext::new("default".to_string(), String::new());
 

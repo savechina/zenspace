@@ -72,8 +72,7 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
         ));
     }
     let status = Line::from(status_spans);
-    let status_bar = Paragraph::new(status)
-        .block(Block::default().bg(bg_color));
+    let status_bar = Paragraph::new(status).block(Block::default().bg(bg_color));
     frame.render_widget(status_bar, chunks[0]);
 
     let mut all_lines: Vec<Line<'static>> = Vec::new();
@@ -82,7 +81,9 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
     for (cell_idx, cell) in app.output.iter().enumerate() {
         let cell_lines = cell.display_lines();
         if !cell_lines.is_empty() {
-            if cell_idx == app.input.selected_cell_idx() && app.input.effective_mode() == InputMode::Selection {
+            if cell_idx == app.input.selected_cell_idx()
+                && app.input.effective_mode() == InputMode::Selection
+            {
                 selected_cell_line = Some(all_lines.len());
             }
             all_lines.extend(cell_lines);
@@ -135,14 +136,11 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
         if visible_y >= inner_area_y as i32
             && visible_y < (inner_area_y as i32 + visible_height as i32)
         {
-            let marker_area =
-                Rect::new(chunks[1].x + border_width, visible_y as u16, 1, 1);
+            let marker_area = Rect::new(chunks[1].x + border_width, visible_y as u16, 1, 1);
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     "▶",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(theme.info_accent()),
+                    Style::default().fg(Color::Black).bg(theme.info_accent()),
                 )),
                 marker_area,
             );
@@ -172,7 +170,13 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
     let input_chunk = chunks[3];
     frame.render_widget(app.input.textarea(), input_chunk);
 
-    render_slash_popup(frame, &app.slash_state, input_chunk, theme, &app.slash_registry);
+    render_slash_popup(
+        frame,
+        &app.slash_state,
+        input_chunk,
+        theme,
+        &app.slash_registry,
+    );
     render_session_picker(frame, &app.session_picker, app.session_id.as_deref(), theme);
     render_toast_banner(frame, active_toast, theme);
 }
@@ -195,7 +199,9 @@ fn render_toast_banner(frame: &mut Frame, active_toast: Option<&str>, theme: &dy
         };
         let toast_text = Paragraph::new(Line::from(Span::styled(
             format!(" {} ", msg),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )))
         .block(
             Block::default()

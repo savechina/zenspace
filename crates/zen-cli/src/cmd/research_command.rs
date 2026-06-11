@@ -181,7 +181,7 @@ fn build_research_prompt(topic: &str, existing: &[SearchResult]) -> String {
 
 fn generate_brief(topic: &str, prompt: &str) -> Result<String, ZenError> {
     let config = load_config()?;
-    let router = DefaultRouter::from_agentic(&config);
+    let router = DefaultRouter::from_agentic(config);
 
     let llm_content = router.complete("research", prompt, Sensitivity::Public)?;
 

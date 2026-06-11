@@ -8,6 +8,7 @@ use crate::constants::{
 };
 use crate::errors::PathError;
 
+#[allow(dead_code)]
 static USER_ROOT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
     env::var(ZEN_HOME_ENV)
         .map(PathBuf::from)
