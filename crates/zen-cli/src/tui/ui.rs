@@ -1,5 +1,6 @@
 use super::app::{App, InputMode};
 use super::cell::streaming::StreamingCell;
+use super::model_picker::render_model_picker;
 use super::session_picker::render_session_picker;
 use super::slash::render_slash_popup;
 use super::theme::OutputTheme;
@@ -178,6 +179,7 @@ pub fn render(frame: &mut Frame, app: &App, active_toast: Option<&str>) {
         &app.slash_registry,
     );
     render_session_picker(frame, &app.session_picker, app.session_id.as_deref(), theme);
+    render_model_picker(frame, &app.model_picker, theme);
     render_toast_banner(frame, active_toast, theme);
 }
 

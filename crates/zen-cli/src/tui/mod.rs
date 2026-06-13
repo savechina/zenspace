@@ -3,6 +3,7 @@ pub mod cell;
 mod clipboard;
 mod handler;
 mod highlight;
+pub mod model_picker;
 pub mod render;
 pub mod session_picker;
 pub mod slash;

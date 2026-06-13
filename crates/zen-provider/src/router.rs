@@ -16,13 +16,23 @@ use zen_core::types::Sensitivity;
 // API Key Resolution (FR-061c)
 // ---------------------------------------------------------------------------
 
-/// Resolve API key from ProviderConfig using SecretRef or legacy env var.
+/// Resolve API key from ProviderConfig using Keychain-first fallback chain.
 ///
 /// Resolution order:
-/// 1. `api_key` (SecretRef) — Keychain-first if `{ keychain: "..." }`, env if `{ env: "..." }`
-/// 2. `api_key_env` (legacy) — direct env var name
-/// 3. Default env var: `{PROVIDER}_API_KEY`
+/// 1. Keychain (default naming: `zen-{provider}-api-key`) → env fallback via SecretResolver
+/// 2. `api_key` (SecretRef) — explicit Keychain or env from config
+/// 3. `api_key_env` (legacy) — direct env var name
+/// 4. Default env var: `{PROVIDER}_API_KEY`
 fn resolve_api_key(p: &ProviderConfig, provider_name: &str) -> Option<String> {
+    // 1. Try Keychain-first with default naming (Keychain → env fallback)
+    let kc_name = format!("zen-{provider_name}-api-key");
+    let default_env = SecretRef::legacy_env_var(provider_name);
+    if let Ok(key) = zen_auth::SecretResolver::new(&kc_name, &default_env).resolve() {
+        info!(provider = provider_name, "resolved API key via Keychain resolver");
+        return Some(key);
+    }
+
+    // 2. Try explicitly configured SecretRef
     if let Some(ref secret_ref) = p.api_key {
         match zen_auth::resolve_secret_ref(secret_ref) {
             Ok(key) => {
@@ -30,15 +40,13 @@ fn resolve_api_key(p: &ProviderConfig, provider_name: &str) -> Option<String> {
                 return Some(key);
             }
             Err(e) => {
-                // Expected when provider not configured — downgrade to debug
-                tracing::debug!(provider = provider_name, secret_ref = %secret_ref, error = %e, "SecretRef not found, falling back to env var");
+                tracing::debug!(provider = provider_name, secret_ref = %secret_ref, error = %e, "SecretRef not found, falling back");
             }
         }
     }
 
-    let default_env = SecretRef::legacy_env_var(provider_name);
+    // 3. Legacy api_key_env or default {PROVIDER}_API_KEY
     let env_name = p.api_key_env.as_deref().unwrap_or(&default_env);
-
     std::env::var(env_name).ok()
 }
 

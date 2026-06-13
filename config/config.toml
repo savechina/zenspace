@@ -70,7 +70,7 @@ default_model = "claude-haiku-4-5"
 type = "openai-compatible"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 api_key = { env = "DASHSCOPE_API_KEY" }
-default_model = "qwen3.5-plus"
+default_model = "qwen3.6-plus"
 
 [providers.deepseek]
 type = "openai-compatible"

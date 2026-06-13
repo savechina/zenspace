@@ -43,6 +43,37 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
 
     let input_before = app.input.lines().join("\n");
 
+    if app.model_picker.visible {
+        return match key.code {
+            KeyCode::Up => {
+                app.model_picker.move_up();
+                KeyAction::Continue
+            }
+            KeyCode::Down => {
+                app.model_picker.move_down();
+                KeyAction::Continue
+            }
+            KeyCode::Enter => {
+                if let Some((provider, model, variant)) = app.model_picker.advance(app.config) {
+                    app.set_model(&provider, &model);
+                    if let Some(v) = variant {
+                        app.current_variant = Some(v.clone());
+                    }
+                }
+                KeyAction::Continue
+            }
+            KeyCode::Left | KeyCode::Backspace => {
+                app.model_picker.go_back();
+                KeyAction::Continue
+            }
+            KeyCode::Esc => {
+                app.model_picker.dismiss();
+                KeyAction::Continue
+            }
+            _ => KeyAction::Continue,
+        };
+    }
+
     let action = match (key.code, key.modifiers) {
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
             if app.session_picker.visible && !app.session_picker.rename_mode {

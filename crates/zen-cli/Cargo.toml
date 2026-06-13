@@ -11,11 +11,11 @@ description = "Zenspace CLI — productivity suite"
 zen-service = { path = "../zen-service" }
 zen-gateway = { path = "../zen-gateway" }
 zen-core = { path = "../zen-core" }
+zen-auth = { path = "../zen-auth" }
 zen-knowledge = { path = "../zen-knowledge" }
 zen-agents = { path = "../zen-agents" }
 zen-memory = { path = "../zen-memory" }
 zen-provider = { path = "../zen-provider" }
-zen-auth = { path = "../zen-auth" }
 zen-plugin = { path = "../zen-plugin" }
 clap = { workspace = true }
 clap-verbosity-flag = { workspace = true }

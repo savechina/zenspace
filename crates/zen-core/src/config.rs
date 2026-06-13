@@ -997,3 +997,52 @@ pub fn resolve_task_model<'a>(config: &'a ZenConfig, task: &str) -> &'a str {
 pub fn consolidation_time(config: &ZenConfig) -> &str {
     config.cron.consolidation_time.as_deref().unwrap_or("02:00")
 }
+
+/// Persist model selection to workspace config file.
+///
+/// Writes `default_provider` and `default_model` to the workspace `.zen/config.toml`.
+/// Falls back to global `~/.zen/config.toml` if no workspace is detected.
+/// Existing lines for these keys are replaced; new keys are appended.
+pub fn save_model_selection(provider: &str, model: &str) -> Result<(), ZenError> {
+    let paths = ZenPaths::detect().map_err(ZenError::Path)?;
+    let config_dir = paths
+        .workspace_root()
+        .unwrap_or_else(|| paths.global_root())
+        .clone();
+    std::fs::create_dir_all(&config_dir).ok();
+    let config_path = config_dir.join("config.toml");
+
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    let mut output = String::new();
+    let mut seen_provider = false;
+    let mut seen_model = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("default_provider") && !seen_provider {
+            output.push_str(&format!("default_provider = \"{provider}\"\n"));
+            seen_provider = true;
+        } else if trimmed.starts_with("default_model") && !seen_model {
+            output.push_str(&format!("default_model = \"{model}\"\n"));
+            seen_model = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    if !seen_provider {
+        output.push_str(&format!("default_provider = \"{provider}\"\n"));
+    }
+    if !seen_model {
+        output.push_str(&format!("default_model = \"{model}\"\n"));
+    }
+
+    std::fs::write(&config_path, output).map_err(|e| {
+        ZenError::Config(ConfigError::ParseError {
+            path: config_path.display().to_string(),
+            reason: e.to_string(),
+        })
+    })
+}

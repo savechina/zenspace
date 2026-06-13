@@ -16,6 +16,7 @@ use zen_provider::DefaultRouter;
 
 use super::cell::{BannerCell, ErrorCell, MarkdownCell, OutputCell, PlainCell};
 use super::render::normalize_compact_markdown;
+use super::model_picker::ModelPickerState;
 use super::session_picker::SessionPickerState;
 use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::MarkdownStreamCollector;
@@ -305,7 +306,7 @@ pub struct App {
     pub command_history: Vec<String>,
     pub history_position: Option<usize>,
     pub last_recalled_text: Option<String>,
-    config: &'static zen_core::config::ZenConfig,
+    pub config: &'static zen_core::config::ZenConfig,
     orchestrator: Option<Arc<AgentOrchestrator>>,
     session: Option<SessionContext>,
     pub current_variant: Option<String>,
@@ -316,6 +317,7 @@ pub struct App {
     pub slash_state: SlashState,
     pub slash_registry: SlashCommandRegistry,
     pub session_picker: SessionPickerState,
+    pub model_picker: ModelPickerState,
     pub toast_queue: VecDeque<String>,
     pub current_toast: Option<(String, Instant)>,
     conversation_store: Option<ConversationStore>,
@@ -373,6 +375,7 @@ impl App {
             slash_state: SlashState::new(),
             slash_registry: create_default_registry(),
             session_picker: SessionPickerState::new(),
+            model_picker: ModelPickerState::new(),
             toast_queue: VecDeque::new(),
             current_toast: None,
             conversation_store: ConversationStore::open("tui").ok(),
@@ -948,6 +951,14 @@ Use /thinking to show/hide thinking process."#;
                         )));
                 }
 
+                let partial = self.stream_collector.buffer().to_string();
+                if !partial.is_empty() {
+                    self.output.retain(|c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")));
+                    self.output.push(OutputCell::Plain(super::cell::PlainCell::new(
+                        format!("[streaming] {}", partial),
+                    )));
+                }
+
                 if let Some(done_result) = result.done_result {
                     if let Some(pos) = self.output.iter().position(|cell| {
                         matches!(cell, OutputCell::Plain(p) if p.text.contains("Thinking..."))
@@ -998,18 +1009,64 @@ Use /thinking to show/hide thinking process."#;
     fn execute_model(&mut self, args: Option<&str>) {
         match args {
             None => {
-                self.push_output(format!("Current model: {}", self.model), false);
+                self.model_picker.show(self.config);
             }
             Some(arg) => {
-                let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+                let parts: Vec<&str> = arg.splitn(3, ' ').collect();
                 let provider = parts[0];
-                let model = parts.get(1).copied().unwrap_or("default");
-                self.set_model(provider, model);
+                match self.config.providers.get(provider) {
+                    None => {
+                        self.push_output(format!("Unknown provider: {provider}"), true);
+                    }
+                    Some(pc) if parts.len() == 1 => {
+                        self.push_output(format!("Provider: {provider}"), false);
+                        if pc.models.is_empty() {
+                            let d = pc.default_model.as_deref().unwrap_or("-");
+                            self.push_output(format!("  (no catalog; default: {d})"), false);
+                            self.push_output(
+                                format!("  Use: /model {provider} {d}"),
+                                false,
+                            );
+                        } else {
+                            for (mid, e) in &pc.models {
+                                let tag = if Some(mid.as_str()) == pc.default_model.as_deref()
+                                {
+                                    " (default)"
+                                } else {
+                                    ""
+                                };
+                                let vi = if !e.variants.is_empty() {
+                                    let ns: Vec<_> = e.variants.keys().cloned().collect();
+                                    format!("  variants: [{}]", ns.join(", "))
+                                } else {
+                                    String::new()
+                                };
+                                self.push_output(
+                                    format!("  {mid}{tag}{vi}"),
+                                    false,
+                                );
+                            }
+                            self.push_output(
+                                format!("Usage: /model {provider} <model> [variant]"),
+                                false,
+                            );
+                        }
+                    }
+                    _ => {
+                        let model_name = parts[1];
+                        let variant = parts.get(2).copied();
+                        self.set_model(provider, model_name);
+                        if let Some(v) = variant {
+                            self.current_variant = Some(v.to_string());
+                            self.push_output(format!("Variant: {v}"), false);
+                        }
+                    }
+                }
             }
         }
     }
 
-    fn set_model(&mut self, provider: &str, model: &str) {
+    pub fn set_model(&mut self, provider: &str, model: &str) {
         use zen_core::constants::SUPPORTED_LLM_PROVIDERS;
 
         let valid_providers = SUPPORTED_LLM_PROVIDERS;
@@ -1028,26 +1085,43 @@ Use /thinking to show/hide thinking process."#;
         }
 
         if provider != "ollama" && provider != "mock" {
-            let env_var = self
-                .config
-                .providers
-                .get(provider)
+            let provider_cfg = self.config.providers.get(provider);
+            let default_env = format!("{}_API_KEY", provider.to_uppercase());
+            let hint = provider_cfg
                 .and_then(|cfg| {
-                    cfg.api_key
-                        .as_ref()
-                        .and_then(|sr| match sr {
+                    cfg.api_key_env.clone().or_else(|| {
+                        cfg.api_key.as_ref().and_then(|sr| match sr {
                             zen_core::secrets::SecretRef::Env { env } => Some(env.clone()),
                             _ => None,
                         })
-                        .or_else(|| cfg.api_key_env.clone())
+                    })
                 })
-                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()));
+                .unwrap_or_else(|| default_env.clone());
 
-            if std::env::var(&env_var).is_err() {
+            let has_key = provider_cfg.and_then(|cfg| {
+                // 1. Try Keychain → Env via SecretResolver (Keychain first)
+                let kc_name = format!("zen-{provider}-api-key");
+                zen_auth::SecretResolver::new(&kc_name, &default_env)
+                    .resolve()
+                    .ok()
+                    // 2. Try explicitly configured SecretRef (Keychain or Env)
+                    .or_else(|| {
+                        cfg.api_key
+                            .as_ref()
+                            .and_then(|sr| zen_auth::resolve_secret_ref(sr).ok())
+                    })
+                    // 3. Try legacy api_key_env
+                    .or_else(|| {
+                        cfg.api_key_env
+                            .as_ref()
+                            .and_then(|name| std::env::var(name).ok())
+                    })
+            });
+
+            if has_key.is_none() {
                 self.push_output(
                     format!(
-                        "Provider '{}' needs API key. Set {} or use: /model ollama (running)",
-                        provider, env_var
+                        "Provider '{provider}' needs API key. Set {hint} or use: /model ollama (running)",
                     ),
                     true,
                 );
@@ -1063,6 +1137,10 @@ Use /thinking to show/hide thinking process."#;
         self.model = new_model.clone();
 
         self.push_output(format!("Model switched to: {}", new_model), false);
+
+        if let Err(e) = zen_core::config::save_model_selection(provider, model) {
+            self.push_output(format!("Warning: failed to persist model: {e}"), true);
+        }
     }
 
     fn execute_variant_cycle(&mut self) {
