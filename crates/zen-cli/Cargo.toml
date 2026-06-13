@@ -1,6 +1,6 @@
 [package]
 name = "zen-cli"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -19,9 +19,9 @@ zen-provider = { path = "../zen-provider" }
 zen-plugin = { path = "../zen-plugin" }
 clap = { workspace = true }
 clap-verbosity-flag = { workspace = true }
-colored = "2"
+colored = { workspace = true }
 dotenvy = { workspace = true }
-rpassword = "7"
+rpassword = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
@@ -44,7 +44,7 @@ libc = { workspace = true }
 time = { workspace = true }
 arboard = { workspace = true }
 base64 = { workspace = true }
-unicode-width = "0.2.2"
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

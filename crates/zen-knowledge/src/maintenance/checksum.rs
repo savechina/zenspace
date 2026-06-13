@@ -12,7 +12,7 @@ use tracing::info;
 pub fn compute_file_checksum(file_path: &Path) -> Result<String> {
     let bytes = fs::read(file_path)?;
     let hash = Sha256::digest(&bytes);
-    let hex: String = format!("{:x}", hash);
+    let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
     Ok(hex)
 }
 
@@ -59,7 +59,7 @@ impl ChangeDetector {
     /// Prefer [`compute_file_checksum`] for on-disk files.
     pub fn compute_checksum(content: &str) -> String {
         let hash = Sha256::digest(content.as_bytes());
-        format!("{:x}", hash)
+        hash.iter().map(|b| format!("{:02x}", b)).collect()
     }
 
     /// Return `true` when `current_checksum` and `stored_checksum` differ.

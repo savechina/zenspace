@@ -1,6 +1,6 @@
 [package]
 name = "zen-provider"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 description = "Multi-model provider connections using rig-core for zenspace"
 
@@ -14,9 +14,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-futures-util = "0.3"
+futures-util = { workspace = true }
 reqwest = { workspace = true }
-rig = { version = "0.37", package = "rig-core" }
+rig = { workspace = true }
 rig-compose = { workspace = true }
 
 [dev-dependencies]

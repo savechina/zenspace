@@ -1,6 +1,6 @@
 [package]
 name = "zen-plugin"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 description = "Plugin system with WASM sandbox and registry for zenspace"
 
@@ -20,7 +20,7 @@ home = { workspace = true }
 wasmtime = { workspace = true }
 rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
-schemars = "0.8"
+schemars = { workspace = true }
 notify = { workspace = true }
 notify-rust = { workspace = true }
 sysinfo = { workspace = true }

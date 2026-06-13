@@ -128,7 +128,7 @@ impl PromptAuditLogger {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         let result = hasher.finalize();
-        let hex = format!("{:x}", result);
+        let hex: String = result.iter().map(|b| format!("{:02x}", b)).collect();
         hex[..8.min(hex.len())].to_string()
     }
 

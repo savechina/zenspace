@@ -1,6 +1,6 @@
 [package]
 name = "zen-memory"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 description = "Agent internal memory — SOUL.md, MEMORY.md, session context, conversation history"
 

@@ -1,6 +1,6 @@
 [package]
 name = "zen-agents"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 description = "Agent registry — WHO am I (agent definitions, tool permissions)"
 
@@ -16,7 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
-fastrand = "2"
+fastrand = { workspace = true }
 rig-core = { workspace = true }
 rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
@@ -25,7 +25,7 @@ rig-memvid = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
-schemars = "0.8"
+schemars = { workspace = true }
 wasmtime = { workspace = true }
 wasi-common = { workspace = true }
 arrow = { workspace = true }
