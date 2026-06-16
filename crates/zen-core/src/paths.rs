@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use std::env;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -93,6 +94,15 @@ impl ZenPaths {
 
     pub fn sessions(&self) -> PathBuf {
         self.global_root.join(SESSIONS_DIR)
+    }
+
+    /// Return the date-separated session directory for a given date.
+    /// `~/.zen/sessions/YYYY/MM/DD/`
+    pub fn session_dir_for_date(&self, date: DateTime<Utc>) -> PathBuf {
+        self.sessions()
+            .join(date.format("%Y").to_string())
+            .join(date.format("%m").to_string())
+            .join(date.format("%d").to_string())
     }
 
     pub fn finance(&self) -> PathBuf {

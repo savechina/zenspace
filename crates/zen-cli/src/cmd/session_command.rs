@@ -48,10 +48,6 @@ pub fn execute_command(operation: &SessionCommands) -> Result<(), ZenError> {
                 .start_session_with_agent(workspace_path, agent)
                 .map_err(|e| ZenError::Message(format!("failed to start session: {e}")))?;
 
-            session
-                .save()
-                .map_err(|e| ZenError::Message(format!("failed to save session: {e}")))?;
-
             println!(
                 "{} Session started: {}",
                 "▶".green().bold(),

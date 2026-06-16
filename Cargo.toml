@@ -107,6 +107,9 @@ rig = { version = "0.37", package = "rig-core" }
 # Composable agent kernel: stateless skills, transport-agnostic tools, registry-driven agents
 rig-compose = "0.5"
 
+rig-resources = "0.2.2"
+rig-memory = "0.38.2"
+
 # MCP bridge for rig-compose tools
 rig-mcp = "0.2"
 

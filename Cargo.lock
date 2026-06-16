@@ -9384,6 +9384,7 @@ dependencies = [
  "notify",
  "notify-rust",
  "rig-compose",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

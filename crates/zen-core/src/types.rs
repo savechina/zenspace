@@ -9,6 +9,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::paths::ZenPaths;
+use crate::session_index::SessionIndex;
 
 // ---------------------------------------------------------------------------
 // Sensitivity (FR-080)
@@ -154,64 +155,225 @@ impl SessionEntity {
         Ok(())
     }
 
-    /// Save this session to `~/.zen/sessions/<id>.json`.
+    /// Save this session to `~/.zen/sessions/YYYY/MM/DD/<id>.json`.
     pub fn save(&self) -> Result<PathBuf> {
-        let dir = Self::sessions_dir()?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create sessions directory: {}", dir.display()))?;
+        let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
+        let date_dir = paths.session_dir_for_date(self.created_at);
+        std::fs::create_dir_all(&date_dir)
+            .with_context(|| format!("failed to create sessions directory: {}", date_dir.display()))?;
 
-        let file_path = dir.join(format!("{}.json", self.id));
+        let file_path = date_dir.join(format!("{}.json", self.id));
         let json =
             serde_json::to_string_pretty(self).context("failed to serialize session entity")?;
         std::fs::write(&file_path, json)
             .with_context(|| format!("failed to write session file: {}", file_path.display()))?;
 
+        let relative_path = format!(
+            "{}/{}/{}/{}.json",
+            self.created_at.format("%Y"),
+            self.created_at.format("%m"),
+            self.created_at.format("%d"),
+            self.id,
+        );
+
+        if let Ok(index) = SessionIndex::open(&paths.db()) {
+            if let Err(e) = index.upsert(
+                &self.id,
+                &relative_path,
+                &self.agent_name,
+                &self.status.to_string(),
+                &self.created_at.to_rfc3339(),
+                &self.updated_at.to_rfc3339(),
+                &self.workspace,
+            ) {
+                debug!("failed to upsert session index: {}", e);
+            }
+        }
+
         debug!("saved session {} to {}", self.id, file_path.display());
         Ok(file_path)
     }
 
-    /// Load a session from `~/.zen/sessions/<id>.json`.
     pub fn load(id: &str) -> Result<SessionEntity> {
-        let dir = Self::sessions_dir()?;
-        let file_path = dir.join(format!("{}.json", id));
+        let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
 
-        let json = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("session not found: {id}"))?;
-        let session: SessionEntity = serde_json::from_str(&json)
-            .with_context(|| format!("failed to parse session file: {}", file_path.display()))?;
-
-        Ok(session)
-    }
-
-    /// List all sessions, sorted by updated_at descending.
-    pub fn list() -> Result<Vec<SessionEntity>> {
-        let dir = Self::sessions_dir()?;
-
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut sessions = Vec::new();
-        let entries = std::fs::read_dir(&dir)
-            .with_context(|| format!("failed to read sessions directory: {}", dir.display()))?;
-
-        for entry in entries {
-            let entry = entry.context("failed to read directory entry")?;
-            let path = entry.path();
-
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                match Self::load(&path.file_stem().expect("valid filename").to_string_lossy()) {
-                    Ok(session) => sessions.push(session),
-                    Err(e) => debug!("skipping invalid session file {}: {}", path.display(), e),
+        if let Ok(index) = SessionIndex::open(&paths.db()) {
+            if let Ok(Some(relative_path)) = index.find(id) {
+                let file_path = paths.sessions().join(&relative_path);
+                if file_path.exists() {
+                    let json = std::fs::read_to_string(&file_path)
+                        .with_context(|| format!("failed to read session file: {}", file_path.display()))?;
+                    let session: SessionEntity = serde_json::from_str(&json)
+                        .with_context(|| format!("failed to parse session file: {}", file_path.display()))?;
+                    return Ok(session);
                 }
             }
         }
 
-        // Sort by updated_at descending (most recent first)
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        let sessions_root = paths.sessions();
 
-        debug!("listed {} sessions from {}", sessions.len(), dir.display());
+        let date_dirs_result: Result<Vec<PathBuf>> = Self::scan_date_dirs(&sessions_root, id);
+        if let Ok(Some(session)) = date_dirs_result?.into_iter().next().map(|p| {
+            let json = std::fs::read_to_string(&p)?;
+            let s: SessionEntity = serde_json::from_str(&json)
+                .with_context(|| format!("failed to parse session file: {}", p.display()))?;
+            Ok::<SessionEntity, anyhow::Error>(s)
+        }).transpose() {
+            return Ok(session);
+        }
+
+        let flat_path = sessions_root.join(format!("{}.json", id));
+        if flat_path.exists() {
+            let json = std::fs::read_to_string(&flat_path)
+                .with_context(|| format!("failed to read session file: {}", flat_path.display()))?;
+            let session: SessionEntity = serde_json::from_str(&json)
+                .with_context(|| format!("failed to parse session file: {}", flat_path.display()))?;
+            return Ok(session);
+        }
+
+        anyhow::bail!("session not found: {id}")
+    }
+
+    fn scan_date_dirs(sessions_root: &PathBuf, id: &str) -> Result<Vec<PathBuf>> {
+        let mut results = Vec::new();
+
+        if !sessions_root.exists() {
+            return Ok(results);
+        }
+
+        for year_entry in std::fs::read_dir(sessions_root)
+            .with_context(|| format!("failed to read sessions directory: {}", sessions_root.display()))?
+        {
+            let year_entry = year_entry?;
+            let year_path = year_entry.path();
+            if !year_path.is_dir() {
+                continue;
+            }
+            for month_entry in std::fs::read_dir(&year_path)? {
+                let month_entry = month_entry?;
+                let month_path = month_entry.path();
+                if !month_path.is_dir() {
+                    continue;
+                }
+                for day_entry in std::fs::read_dir(&month_path)? {
+                    let day_entry = day_entry?;
+                    let day_path = day_entry.path();
+                    if !day_path.is_dir() {
+                        continue;
+                    }
+                    let candidate = day_path.join(format!("{}.json", id));
+                    if candidate.exists() {
+                        results.push(candidate);
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn list() -> Result<Vec<SessionEntity>> {
+        let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
+        let sessions_root = paths.sessions();
+        let mut sessions: Vec<SessionEntity> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        if let Ok(index) = SessionIndex::open(&paths.db()) {
+            if let Ok(indexed) = index.list_all() {
+                for row in indexed {
+                    let file_path = sessions_root.join(&row.file_path);
+                    if file_path.exists() {
+                        match std::fs::read_to_string(&file_path) {
+                            Ok(json) => {
+                                match serde_json::from_str::<SessionEntity>(&json) {
+                                    Ok(session) => {
+                                        seen_ids.insert(session.id.clone());
+                                        sessions.push(session);
+                                    }
+                                    Err(e) => debug!("skipping invalid session {}: {}", row.id, e),
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(repaired) = Self::repair_indexed_session(
+                                    &sessions_root, &row.id, &paths.db(),
+                                ) {
+                                    seen_ids.insert(repaired.id.clone());
+                                    sessions.push(repaired);
+                                }
+                            }
+                        }
+                    } else {
+                        if let Some(repaired) = Self::repair_indexed_session(
+                            &sessions_root, &row.id, &paths.db(),
+                        ) {
+                            seen_ids.insert(repaired.id.clone());
+                            sessions.push(repaired);
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::scan_filesystem_sessions(&sessions_root, &mut sessions, &mut seen_ids)?;
+
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        debug!("listed {} sessions", sessions.len());
         Ok(sessions)
+    }
+
+    fn repair_indexed_session(
+        sessions_root: &PathBuf,
+        id: &str,
+        db_dir: &PathBuf,
+    ) -> Option<SessionEntity> {
+        let found = Self::scan_date_dirs(sessions_root, id).ok()?;
+        let found_path = found.into_iter().next()?;
+        let json = std::fs::read_to_string(&found_path).ok()?;
+        let session: SessionEntity = serde_json::from_str(&json).ok()?;
+        let relative = found_path
+            .strip_prefix(sessions_root)
+            .unwrap_or(&found_path)
+            .to_string_lossy()
+            .to_string();
+        if let Ok(idx) = SessionIndex::open(db_dir) {
+            let _ = idx.reconcile(&session.id, &relative);
+        }
+        Some(session)
+    }
+
+    fn scan_filesystem_sessions(
+        sessions_root: &PathBuf,
+        sessions: &mut Vec<SessionEntity>,
+        seen_ids: &mut std::collections::HashSet<String>,
+    ) -> Result<()> {
+        Self::walk_sessions_dir(sessions_root, sessions, seen_ids)?;
+        Ok(())
+    }
+
+    fn walk_sessions_dir(
+        dir: &PathBuf,
+        sessions: &mut Vec<SessionEntity>,
+        seen_ids: &mut std::collections::HashSet<String>,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir).ok().into_iter().flatten().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::walk_sessions_dir(&path, sessions, seen_ids)?;
+            } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if seen_ids.contains(stem) {
+                        continue;
+                    }
+                    if let Ok(json) = std::fs::read_to_string(&path) {
+                        if let Ok(session) = serde_json::from_str::<SessionEntity>(&json) {
+                            seen_ids.insert(session.id.clone());
+                            sessions.push(session);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// List only active sessions.
@@ -250,11 +412,6 @@ impl SessionEntity {
         self.save()?;
         info!(session_id = %self.id, "session reactivated");
         Ok(())
-    }
-
-    fn sessions_dir() -> Result<PathBuf> {
-        let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
-        Ok(paths.sessions())
     }
 }
 
@@ -599,5 +756,126 @@ mod tests {
 
         // Archived cannot be reactivated
         assert!(session.reactivate().is_err());
+    }
+
+    /// Returns the global temp dir used by ALL session store tests.
+    /// SAFETY: Sets ZEN_HOME once per test process via atomic flag.
+    fn session_test_dir() -> &'static std::path::Path {
+
+        use std::sync::OnceLock;
+        static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let tmp = DIR.get_or_init(|| {
+            let t = tempfile::TempDir::new().expect("failed to create temp dir for session tests");
+            std::fs::create_dir_all(t.path().join("db")).unwrap();
+            std::fs::create_dir_all(t.path().join("sessions")).unwrap();
+            // SAFETY: test environment setup, set once per process
+            unsafe {
+                std::env::set_var("ZEN_HOME", t.path());
+            }
+            t
+        });
+        tmp.path()
+    }
+
+    #[test]
+    fn test_session_save_to_date_path() {
+        let root = session_test_dir();
+        let session = SessionEntity::new("agent-x", "/ws");
+        let path = session.save().unwrap();
+
+        let year = session.created_at.format("%Y").to_string();
+        let month = session.created_at.format("%m").to_string();
+        let day = session.created_at.format("%d").to_string();
+        let expected = root.join("sessions").join(&year).join(&month).join(&day).join(format!("{}.json", session.id));
+
+        assert_eq!(path, expected);
+        assert!(expected.exists());
+    }
+
+    #[test]
+    fn test_session_load_roundtrip() {
+        session_test_dir();
+        let session = SessionEntity::new("agent-y", "/ws2");
+        session.save().unwrap();
+
+        let loaded = SessionEntity::load(&session.id).unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.agent_name, "agent-y");
+        assert_eq!(loaded.workspace, "/ws2");
+    }
+
+    #[test]
+    fn test_session_list_with_both_layouts() {
+        let root = session_test_dir();
+        let sessions_root = root.join("sessions");
+
+        let flat_session = SessionEntity::new("flat-agent", "/flat-ws");
+        let flat_path = sessions_root.join(format!("{}.json", flat_session.id));
+        std::fs::write(&flat_path, serde_json::to_string_pretty(&flat_session).unwrap()).unwrap();
+
+        let date_session = SessionEntity::new("date-agent", "/date-ws");
+        date_session.save().unwrap();
+
+        let all = SessionEntity::list().unwrap();
+        let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&flat_session.id.as_str()), "flat session should be in list");
+    }
+
+    #[test]
+    fn test_session_sqlite_index_roundtrip() {
+        let root = session_test_dir();
+        let db_dir = root.join("db");
+        let index = crate::session_index::SessionIndex::open(&db_dir).unwrap();
+
+        let prefix = format!("sqlite-{}", Uuid::now_v7());
+        for i in 0..3 {
+            index.upsert(
+                &format!("{}-{}", prefix, i),
+                &format!("2025/06/{:02}/{}-{}.json", 15 + i, prefix, i),
+                &format!("agent-{}", i),
+                "Active",
+                &format!("2025-06-1{}T10:00:00Z", 5 + i),
+                &format!("2025-06-1{}T12:00:00Z", 5 + i),
+                "/ws",
+            ).unwrap();
+        }
+
+        let found = index.find(&format!("{}-1", prefix)).unwrap();
+        let expected_path = format!("2025/06/16/{}-1.json", prefix);
+        assert_eq!(found.as_deref(), Some(expected_path.as_str()));
+
+        let missing = index.find(&format!("{}-no-such", prefix)).unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_session_load_legacy_flat() {
+        let root = session_test_dir();
+        let sessions_root = root.join("sessions");
+
+        let mut session = SessionEntity::new("legacy-agent", "/legacy-ws");
+        session.title = Some("Legacy Session".to_string());
+        let flat_path = sessions_root.join(format!("{}.json", session.id));
+        std::fs::write(&flat_path, serde_json::to_string_pretty(&session).unwrap()).unwrap();
+
+        let loaded = SessionEntity::load(&session.id).unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.agent_name, "legacy-agent");
+        assert_eq!(loaded.title.as_deref(), Some("Legacy Session"));
+    }
+
+    #[test]
+    fn test_session_read_repair() {
+        let root = session_test_dir();
+        let db_dir = root.join("db");
+
+        let session = SessionEntity::new("repair-agent", "/repair-ws");
+        session.save().unwrap();
+
+        let index = crate::session_index::SessionIndex::open(&db_dir).unwrap();
+        index.reconcile(&session.id, "wrong/path.json").unwrap();
+
+        let all = SessionEntity::list().unwrap();
+        assert!(all.iter().any(|s| s.id == session.id), "repaired session should be in list");
     }
 }

@@ -27,6 +27,8 @@ pub struct ConversationStore {
 
 impl ConversationStore {
     /// Create or open a conversation store for the given session.
+    ///
+    /// Uses the legacy flat layout: `~/.zen/sessions/<session_id>/chat.jsonl`.
     pub fn open(session_id: &str) -> Result<Self> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
         let dir = paths.sessions().join(session_id);
@@ -34,6 +36,38 @@ impl ConversationStore {
             .with_context(|| format!("failed to create session directory: {}", dir.display()))?;
 
         let file_path = dir.join("chat.jsonl");
+
+        Ok(Self {
+            session_id: session_id.to_string(),
+            file_path,
+        })
+    }
+
+    /// Create a conversation store using an explicit directory path.
+    ///
+    /// This is the preferred constructor for date-based session layouts where
+    /// the caller already knows the directory (e.g., `sessions/YYYY/MM/DD/`).
+    /// The chat file will be placed at `<dir>/chat.jsonl`.
+    pub fn with_dir(dir: PathBuf, session_id: &str) -> Result<Self> {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create session directory: {}", dir.display()))?;
+
+        let file_path = dir.join("chat.jsonl");
+
+        Ok(Self {
+            session_id: session_id.to_string(),
+            file_path,
+        })
+    }
+
+    /// Create a conversation store from a specific file path.
+    ///
+    /// Useful when the exact chat.jsonl location is known (e.g., tests, forking).
+    pub fn with_file(file_path: PathBuf, session_id: &str) -> Result<Self> {
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create parent directory: {}", parent.display()))?;
+        }
 
         Ok(Self {
             session_id: session_id.to_string(),
@@ -105,6 +139,15 @@ impl ConversationStore {
     pub fn copy_to(&self, target_session_id: &str) -> Result<Self> {
         let entries = self.load()?;
         let target = ConversationStore::open(target_session_id)?;
+        for (role, content) in &entries {
+            target.append(role, content)?;
+        }
+        Ok(target)
+    }
+
+    pub fn copy_to_dir(&self, target_dir: PathBuf, target_session_id: &str) -> Result<Self> {
+        let entries = self.load()?;
+        let target = ConversationStore::with_dir(target_dir, target_session_id)?;
         for (role, content) in &entries {
             target.append(role, content)?;
         }

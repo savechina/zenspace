@@ -676,7 +676,10 @@ impl App {
             .unwrap_or_else(|| parts[0].to_string());
 
         match command_name.as_str() {
-            "exit" => self.running = false,
+            "exit" => {
+                self.save_session_state();
+                self.running = false;
+            }
             "help" => self.show_help(),
             "clear" => {
                 self.output.clear();
@@ -1276,6 +1279,15 @@ Use /thinking to show/hide thinking process."#;
         }
     }
 
+    fn save_session_state(&mut self) {
+        if let Some(ref id) = self.session_id {
+            if let Ok(mut entity) = zen_core::types::SessionEntity::load(id) {
+                entity.updated_at = chrono::Utc::now();
+                let _ = entity.save();
+            }
+        }
+    }
+
     fn execute_new_session(&mut self) {
         use zen_memory::session::SessionManager;
         let manager = SessionManager::new();
@@ -1300,6 +1312,8 @@ Use /thinking to show/hide thinking process."#;
                 return;
             }
         };
+
+        self.save_session_state();
 
         let manager = SessionManager::new();
         match manager.fork_session(&current_id, title.map(String::from)) {
@@ -1375,6 +1389,7 @@ Use /thinking to show/hide thinking process."#;
 
     pub fn resume_session(&mut self, session_id: &str) {
         use zen_memory::session::SessionManager;
+        self.save_session_state();
         let manager = SessionManager::new();
         match manager.resume_session(session_id) {
             Ok(session) => {
@@ -1672,6 +1687,7 @@ pub fn run_app(
                             app.handle_command(&cmd);
                         }
                         crate::tui::handler::KeyAction::Quit => {
+                            app.save_session_state();
                             app.running = false;
                         }
                         crate::tui::handler::KeyAction::Continue => {}

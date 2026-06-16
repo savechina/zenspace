@@ -33,11 +33,15 @@ impl Default for PromptAuditLogger {
 
 impl PromptAuditLogger {
     pub fn new() -> Self {
-        let log_dir = home::home_dir()
-            .unwrap_or_default()
-            .join(".zen")
-            .join("logs");
-        let log_path = log_dir.join("safety-audit.jsonl");
+        let log_path = crate::paths::ZenPaths::detect()
+            .map(|p| p.logs().join("safety-audit.jsonl"))
+            .unwrap_or_else(|_| {
+                home::home_dir()
+                    .unwrap_or_default()
+                    .join(".zen")
+                    .join("logs")
+                    .join("safety-audit.jsonl")
+            });
         Self { log_path }
     }
 

@@ -398,20 +398,33 @@ impl AgentOrchestrator {
 /// Appends a JSONL audit line to ~/.zen/logs/agent-session.jsonl.
 /// T297: Replace with rig-tap TelemetryHook integration.
 fn append_audit_log(execution: &AgentExecution, query: &str) -> Result<()> {
-    let home: PathBuf = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("HOME not set"))?
-        .into();
-    let log_dir = home.join(".zen").join("logs");
+    let log_dir = zen_core::paths::ZenPaths::detect()
+        .map(|p| p.logs())
+        .map_err(|e| anyhow::anyhow!("failed to resolve logs directory: {e}"))?;
     std::fs::create_dir_all(&log_dir)?;
 
     let log_file = log_dir.join("agent-session.jsonl");
+
+    let tool_names: Vec<String> = execution
+        .tool_calls
+        .iter()
+        .map(|tc| tc.tool_name.clone())
+        .collect();
+
+    let response_snippet: String = execution.response.chars().take(500).collect();
+
     let line = json!({
         "timestamp": Utc::now().to_rfc3339(),
         "agent": execution.agent_name,
+        "session_id": "",  // placeholder: orchestrator doesn't track session_id yet
         "query_len": query.len(),
         "response_len": execution.response.len(),
         "duration_ms": execution.metadata.duration_ms,
         "sensitivity": execution.metadata.sensitivity.to_string(),
+        "tokens_used": execution.metadata.tokens_used,
+        "model_used": execution.metadata.model_used,
+        "tool_calls": tool_names,
+        "response_snippet": response_snippet,
     });
 
     let mut file = std::fs::OpenOptions::new()
@@ -421,4 +434,53 @@ fn append_audit_log(execution: &AgentExecution, query: &str) -> Result<()> {
     use std::io::Write;
     writeln!(file, "{line}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::{AgentExecution, ExecutionMetadata, ToolCall};
+    use zen_core::types::Sensitivity;
+
+    #[test]
+    fn test_append_audit_log_full_execution() {
+        let execution = AgentExecution {
+            agent_name: "TestAgent".to_string(),
+            response: "Hello, this is a test response with sufficient length to verify the snippet truncation works correctly.".to_string(),
+            metadata: ExecutionMetadata {
+                tokens_used: 1234,
+                cost_estimate: 0.002,
+                model_used: "gpt-4o-mini".to_string(),
+                duration_ms: 567,
+                sensitivity: Sensitivity::Public,
+            },
+            tool_calls: vec![
+                ToolCall {
+                    tool_name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                    result: "ok".to_string(),
+                },
+                ToolCall {
+                    tool_name: "grep".to_string(),
+                    arguments: "{}".to_string(),
+                    result: "found".to_string(),
+                },
+            ],
+            sub_agent_results: vec![],
+        };
+
+        let result = append_audit_log(&execution, "test query");
+        assert!(result.is_ok());
+
+        let paths = ZenPaths::detect().unwrap();
+        let log_file = paths.logs().join("agent-session.jsonl");
+        let content = std::fs::read_to_string(&log_file).unwrap();
+        assert!(content.contains(r#""agent":"TestAgent""#));
+        assert!(content.contains(r#""tokens_used":1234"#));
+        assert!(content.contains(r#""model_used":"gpt-4o-mini""#));
+        assert!(content.contains(r#""tool_calls":["read_file","grep"]"#));
+        assert!(content.contains(r#""response_snippet""#));
+
+        std::fs::remove_file(&log_file).ok();
+    }
 }

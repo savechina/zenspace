@@ -17,6 +17,7 @@ use crate::cmd::consolidate_command::{self, ConsolidateCommands};
 use crate::cmd::graph_command::{self, GraphCommands};
 use crate::cmd::ingest_command::{self, IngestCommands};
 use crate::cmd::lint_command::{self, LintCommands};
+use crate::cmd::logs_command::{self, LogCommands};
 use crate::cmd::model_command::{self, ModelCommands};
 use crate::cmd::note_command::{self, NoteCommands};
 use crate::cmd::plugin_command::{self, PluginCommands};
@@ -128,6 +129,23 @@ enum Commands {
     Lint {
         #[command(subcommand)]
         operation: LintCommands,
+    },
+    Logs {
+        /// Number of lines to display (default: 50)
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Filter by sensitivity level (public, private, confidential)
+        #[arg(short = 'l', long)]
+        level: Option<String>,
+        /// Follow log output in real time (like tail -f)
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Optional subcommand: agent, session, search
+        #[command(subcommand)]
+        operation: Option<LogCommands>,
     },
     Ingest {
         #[command(subcommand)]
@@ -261,6 +279,12 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Research { ref operation } => research_command::execute_command(operation),
         Commands::Consolidate { ref operation } => consolidate_command::execute_command(operation),
         Commands::Lint { ref operation } => lint_command::execute_command(operation),
+        Commands::Logs { lines, level, follow, json, ref operation } => {
+            match operation {
+                Some(cmd) => logs_command::execute_command(cmd),
+                None => logs_command::execute_show(lines, level.as_deref(), follow, json),
+            }
+        }
         Commands::Ingest { ref operation } => ingest_command::execute_command(operation),
         Commands::Task { ref operation } => task_command::execute_command(operation),
         Commands::Routine { ref operation } => routine_command::execute_command(operation),
