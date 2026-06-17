@@ -107,7 +107,6 @@ rig = { version = "0.37", package = "rig-core" }
 # Composable agent kernel: stateless skills, transport-agnostic tools, registry-driven agents
 rig-compose = "0.5"
 
-rig-resources = "0.2.2"
 rig-memory = "0.38.2"
 
 # MCP bridge for rig-compose tools
@@ -117,7 +116,7 @@ rig-mcp = "0.2"
 rig-tap = "0.3"
 
 # Persistent memory and vector store for Rig agents
-rig-memvid = "0.4.2"
+rig-memvid = { version = "0.4.2", features = ["context-projection", "compaction"] }
 rig-sqlite = "0.2.6"
 
 # Utility crates — shared across workspace

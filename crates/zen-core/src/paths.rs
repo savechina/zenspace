@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use crate::constants::{
     CACHE_DIR, CONFIG_FILE, DB_DIR, FINANCE_DIR, IDENTITY_DIR, INBOX_DIR, KNOWLEDGE_DIR, LOGS_DIR,
-    MEMORY_DIR, OUTPUT_DIR, PLUGINS_DIR, RAW_DIR, SESSIONS_DIR, SKILLS_DIR, WIKI_DIR, ZEN_HOME_ENV,
+    MEMORY_DIR, MEMVID_DIR, OUTPUT_DIR, PLUGINS_DIR, RAW_DIR, SESSIONS_DIR, SKILLS_DIR, WIKI_DIR, ZEN_HOME_ENV,
 };
 use crate::errors::PathError;
 
@@ -111,6 +111,10 @@ impl ZenPaths {
 
     pub fn memory(&self) -> PathBuf {
         self.global_root.join(MEMORY_DIR)
+    }
+
+    pub fn memvid_dir(&self) -> PathBuf {
+        self.global_root.join(MEMVID_DIR)
     }
 
     pub fn identity(&self) -> PathBuf {

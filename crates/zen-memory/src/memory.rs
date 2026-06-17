@@ -1,7 +1,10 @@
 //! In-memory store for Zen agent memories.
 //!
-//! Provides basic memory storage and retrieval for agent conversation history
-//! and knowledge retention. Will be replaced by rig-memvid in Phase 7.
+//! **DEPRECATED**: Will be refactored into `MemoryStoreTrait` for multi-strategy extensibility.
+//! Current built-in: `ZenMemvidStore` (memvid + sqlite3/vec).
+//! Future external: openviking, supermemory, cortex-mem, mem0 (see D10).
+//! Migration: `MemoryStore::write_memory()` → trait method on `MemoryStoreTrait`
+//!            `MemoryStore::search_memories()` → trait method on `MemoryStoreTrait`
 
 use std::cmp::Reverse;
 use std::sync::{Arc, Mutex};
@@ -9,6 +12,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 /// Memory entry stored in the in-memory store.
+///
+/// **DEPRECATED**: Will be replaced by `MemoryStoreTrait` associated types for multi-strategy extensibility.
+/// Current equivalent: `memvid_core::MemoryCard` (entity/slot/value/kind structured model).
+#[deprecated(
+    since = "0.0.1",
+    note = "Will be refactored into MemoryStoreTrait associated type. Use memvid_core::MemoryCard for built-in memvid path."
+)]
 #[derive(Debug, Clone)]
 pub struct MemoryEntry {
     pub text: String,
@@ -18,11 +28,19 @@ pub struct MemoryEntry {
 }
 
 /// In-memory store for Zen agent memories.
+///
+/// **DEPRECATED**: Will be refactored into `MemoryStoreTrait` for multi-strategy extensibility (D10).
+/// Built-in: `ZenMemvidStore` (memvid + sqlite3/vec). External: openviking, supermemory, cortex-mem, mem0.
+#[deprecated(
+    since = "0.0.1",
+    note = "Will be refactored into MemoryStoreTrait for multi-strategy extensibility. Use ZenMemvidStore for built-in memvid path."
+)]
 pub struct MemoryStore {
     entries: Arc<Mutex<Vec<MemoryEntry>>>,
     max_entries: usize,
 }
 
+#[allow(deprecated)]
 impl MemoryStore {
     pub fn new(max_entries: usize) -> Self {
         Self {
@@ -81,6 +99,10 @@ impl MemoryStore {
     }
 }
 
+#[deprecated(
+    since = "0.0.1",
+    note = "Will be refactored into MemoryStoreTrait associated type. Use ZenMemvidStore for built-in memvid path."
+)]
 #[derive(Debug, Clone)]
 pub struct MemoryStats {
     pub entry_count: usize,
@@ -88,6 +110,7 @@ pub struct MemoryStats {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

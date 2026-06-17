@@ -1,4 +1,5 @@
 pub mod context_budget;
+pub mod context_projection;
 pub mod conversation;
 pub mod daily_log;
 pub mod dream;
@@ -11,16 +12,26 @@ pub mod prompt;
 pub mod sensitivity;
 pub mod session;
 
+#[deprecated(
+    since = "0.0.1",
+    note = "Will be refactored into CompactionStrategyTrait for multi-strategy extensibility. \
+            Use rig_compose::ContextPack + rig_memvid::MemoryContextPack for built-in path."
+)]
+#[allow(deprecated)]
 pub use context_budget::ContextBudget;
+pub use context_projection::evidence_to_context_items;
 pub use conversation::ConversationStore;
 pub use dream::ZenDream;
+#[allow(deprecated)]
 pub use memory::{MemoryEntry, MemoryStats, MemoryStore};
 pub use memory_flush::MemoryFlush;
 pub use memory_service::IdentityContext;
+#[allow(deprecated)]
 pub use memvid::{
     CompactionResult, CompactionStrategy, ContextProjector, ZenMemvidStore, create_persist_hook,
     default_memory_config,
 };
+pub use memvid::TRIPLET_MIN_CONFIDENCE;
 pub use prompt::PromptAssembly;
 pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity};
 pub use session::SessionManager;

@@ -44,6 +44,3 @@ pub use sandbox::{ExecutionOutput, ResourceLimits, WasmSandbox};
 pub use wiring::ZenWiring;
 pub use zen_agent::{IdentityContext, ZenAgent, ZenAgentBuilder, load_identity_files};
 pub use zen_skill::{ZenSkill, ZenTool};
-
-// Re-export memory types from zen-memory
-pub use zen_memory::{MemoryEntry, MemoryStats, MemoryStore};

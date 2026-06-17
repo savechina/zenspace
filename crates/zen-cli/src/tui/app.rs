@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tui_textarea::TextArea;
 use zen_agents::AgentOrchestrator;
+use zen_core::paths::ZenPaths;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
@@ -548,7 +549,33 @@ impl App {
 
     pub fn init_orchestrator(&mut self, config: &'static zen_core::config::ZenConfig) {
         let router = DefaultRouter::from_agentic(config);
-        self.orchestrator = Some(Arc::new(AgentOrchestrator::new(router)));
+        let orch = AgentOrchestrator::new(router);
+
+        let orch = match ZenPaths::detect() {
+            Ok(paths) => {
+                let memvid_path = paths.memvid_dir();
+                if let Err(e) = std::fs::create_dir_all(&memvid_path) {
+                    tracing::warn!(path = ?memvid_path, error = %e, "Failed to create memvid directory");
+                }
+                match orch.with_memory(memvid_path) {
+                    Ok(o) => {
+                        tracing::info!("Memvid store wired successfully");
+                        o
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to initialize memvid store, continuing without memory");
+                        let router = DefaultRouter::from_agentic(config);
+                        AgentOrchestrator::new(router)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to detect Zen paths, continuing without memory");
+                orch
+            }
+        };
+
+        self.orchestrator = Some(Arc::new(orch));
         self.session = Some(SessionContext::new("default".into(), String::new()));
     }
 

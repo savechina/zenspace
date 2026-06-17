@@ -5486,6 +5486,21 @@ dependencies = [
 
 [[package]]
 name = "rig-compose"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78bdff250637d2dafca60c1118358303f05f900e160365e9e458497789b1c726"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rig-compose"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21e5f5676f84ad6d0ac8e351c8a1dc922a52ba0e14ec60270b241ab3c8305f11"
@@ -5534,6 +5549,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "rig-core"
+version = "0.38.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "557f11c26c2c2ea61d9cb843ce5adff138cc5785f58ff4b87d779de8acaa32ae"
+dependencies = [
+ "as-any",
+ "async-stream",
+ "base64 0.22.1",
+ "bytes",
+ "eventsource-stream",
+ "fastrand",
+ "futures",
+ "futures-timer",
+ "glob",
+ "http",
+ "mime 0.3.17",
+ "mime_guess",
+ "nanoid",
+ "ordered-float 5.3.0",
+ "pin-project-lite",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+ "url 2.5.8",
+]
+
+[[package]]
 name = "rig-derive"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5556,11 +5603,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7ebcbba1e5f9ce07cdb171e32278cab6a8e249642e38bcc8b1273571652a300"
 dependencies = [
  "async-trait",
- "rig-compose",
+ "rig-compose 0.5.0",
  "rmcp",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rig-memory"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eccdf77b80fcddc6b99c57df0759da788397d9be129c2e63c7242f2803c771d4"
+dependencies = [
+ "rig-core 0.38.2",
  "tracing",
 ]
 
@@ -5585,7 +5642,9 @@ checksum = "0478bbe6c26c38dccad87636468888c513892f3a6f584591a1f22ea4cd6872a5"
 dependencies = [
  "futures",
  "memvid-core",
- "rig-core",
+ "rig-compose 0.4.3",
+ "rig-core 0.37.0",
+ "rig-memory",
  "rig-memory-policy",
  "serde",
  "serde_json",
@@ -5600,7 +5659,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "010e28dfce1d266591991181a23b5d8168f90bc2ba18ccd54e0ba53742c39d5c"
 dependencies = [
  "chrono 0.4.45",
- "rig-core",
+ "rig-core 0.37.0",
  "rusqlite",
  "serde",
  "serde_json",
@@ -5616,7 +5675,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85a5354ddca67090e11298176a0b07c6cb6555c4100028296cda6f0d388ea3f2"
 dependencies = [
- "rig-core",
+ "rig-core 0.37.0",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -9292,8 +9351,8 @@ dependencies = [
  "chrono 0.4.45",
  "fastrand",
  "futures",
- "rig-compose",
- "rig-core",
+ "rig-compose 0.5.0",
+ "rig-core 0.37.0",
  "rig-mcp",
  "rig-memvid",
  "rig-tap",
@@ -9344,7 +9403,7 @@ dependencies = [
  "libc",
  "ratatui",
  "reqwest",
- "rig-compose",
+ "rig-compose 0.5.0",
  "rpassword",
  "serde",
  "serde_json",
@@ -9383,7 +9442,7 @@ dependencies = [
  "libc",
  "notify",
  "notify-rust",
- "rig-compose",
+ "rig-compose 0.5.0",
  "rusqlite",
  "serde",
  "serde_json",
@@ -9424,7 +9483,7 @@ dependencies = [
  "chrono 0.4.45",
  "futures-util",
  "reqwest",
- "rig-compose",
+ "rig-compose 0.5.0",
  "rig-mcp",
  "serde",
  "serde_json",
@@ -9454,8 +9513,8 @@ dependencies = [
  "html2md",
  "ort",
  "reqwest",
- "rig-compose",
- "rig-core",
+ "rig-compose 0.5.0",
+ "rig-core 0.37.0",
  "rig-sqlite",
  "rusqlite",
  "schemars",
@@ -9482,7 +9541,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono 0.4.45",
- "rig-core",
+ "rig-compose 0.5.0",
+ "rig-core 0.37.0",
  "rig-memvid",
  "serde",
  "serde_json",
@@ -9504,7 +9564,7 @@ dependencies = [
  "home",
  "notify",
  "notify-rust",
- "rig-compose",
+ "rig-compose 0.5.0",
  "rig-mcp",
  "schemars",
  "serde",
@@ -9528,8 +9588,8 @@ dependencies = [
  "chrono 0.4.45",
  "futures-util",
  "reqwest",
- "rig-compose",
- "rig-core",
+ "rig-compose 0.5.0",
+ "rig-core 0.37.0",
  "serde",
  "serde_json",
  "tempfile",

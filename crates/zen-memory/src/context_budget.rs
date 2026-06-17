@@ -1,8 +1,18 @@
+#[deprecated(
+    since = "0.0.1",
+    note = "Use rig_memvid::projection::MemoryContextPack + rig_compose::ContextPack instead. \
+            ContextBudget will be removed in a future release."
+)]
 pub struct ContextBudget {
     pub max_tokens: usize,
 }
 
+#[allow(deprecated)]
 impl ContextBudget {
+    #[deprecated(
+        since = "0.0.1",
+        note = "Use rig_compose::ContextPackConfig for budget configuration instead."
+    )]
     pub fn new(max_tokens: usize) -> Self {
         Self { max_tokens }
     }
@@ -11,6 +21,11 @@ impl ContextBudget {
         text.len() / 4 + 1
     }
 
+    #[deprecated(
+        since = "0.0.1",
+        note = "Use rig_compose::ContextPack::pack() with ContextPackConfig instead. \
+                ContextPack applies priority-based progressive compression."
+    )]
     pub fn truncate_messages(
         messages: &mut Vec<(String, String)>,
         max_tokens: usize,
@@ -59,6 +74,7 @@ impl ContextBudget {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

@@ -17,6 +17,7 @@ pub const SKILLS_DIR: &str = "skills/";
 pub const FINANCE_DIR: &str = "finance/";
 pub const CACHE_DIR: &str = "cache/";
 pub const MEMORY_DIR: &str = "memory/";
+pub const MEMVID_DIR: &str = "memory/memvid/";
 pub const IDENTITY_DIR: &str = "identity/";
 pub const LOGS_DIR: &str = "logs/";
 pub const OUTPUT_DIR: &str = "output/";

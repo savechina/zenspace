@@ -607,6 +607,7 @@ Current sensitivity level: {}"#,
 // ---------------------------------------------------------------------------
 
 /// Build the dynamic session context section (Tier 4).
+/// Active context is budget-managed via ContextPack; full history is preserved in .mv2 archive.
 ///
 /// Includes agent name, session ID, turn count, timestamp.
 pub fn build_context_section(session: &SessionContext) -> String {

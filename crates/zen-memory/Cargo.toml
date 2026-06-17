@@ -16,4 +16,5 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 rig-core = { workspace = true }
 rig-memvid = { workspace = true }
+rig-compose = { workspace = true }
 tempfile = { workspace = true }

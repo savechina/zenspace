@@ -34,6 +34,7 @@ pub struct AgentOrchestrator {
     executor: crate::executor::AgentExecutor,
     token_budget: Arc<AtomicTokenBudget>,
     memvid_store: Option<rig_memvid::MemvidStore>,
+    demotion_hook: Option<rig_memvid::MemvidDemotionHook>,
     quality_pipeline: QualityPipeline,
 }
 
@@ -51,6 +52,7 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store: None,
+            demotion_hook: None,
             quality_pipeline: QualityPipeline::new(),
         }
     }
@@ -68,13 +70,16 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store: None,
+            demotion_hook: None,
             quality_pipeline: QualityPipeline::new(),
         }
     }
 
     pub fn with_memory(mut self, memory_path: PathBuf) -> Result<Self> {
         let store = ZenMemvidStore::new(memory_path)?;
-        self.memvid_store = Some(store.into_inner());
+        let store_inner = store.into_inner();
+        self.demotion_hook = Some(rig_memvid::MemvidDemotionHook::with_defaults(store_inner.clone()));
+        self.memvid_store = Some(store_inner);
         Ok(self)
     }
 
@@ -326,6 +331,10 @@ impl AgentOrchestrator {
             tracing::warn!(error = %e, "failed to write audit log");
         }
 
+        session.add_turn("user", user_query);
+        session.add_turn("assistant", &final_execution.response);
+        zen_agent.persist_turn(&session.session_id.to_string(), user_query, &final_execution.response);
+
         Ok(final_execution)
     }
 
@@ -349,7 +358,7 @@ impl AgentOrchestrator {
         user_query: &str,
         mut on_token: impl FnMut(&str),
     ) -> Result<String> {
-        let start = Instant::now();
+        let _start = Instant::now();
         let agent_name = self.classify_agent(user_query);
         info!(
             agent = agent_name,
@@ -378,7 +387,7 @@ impl AgentOrchestrator {
                 .await;
         }
 
-        let _duration_ms = start.elapsed().as_millis() as u64;
+        zen_agent.persist_turn(&session.session_id.to_string(), user_query, &response);
 
         Ok(response)
     }
