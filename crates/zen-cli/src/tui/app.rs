@@ -32,7 +32,7 @@ pub struct PendingLlmCall {
 pub struct PendingLlmCallStream {
     pub query: String,
     pub tokens_rx: mpsc::Receiver<String>,
-    pub done_rx: mpsc::Receiver<Result<String, String>>,
+    pub done_rx: mpsc::Receiver<(Result<String, String>, Option<zen_core::types::SessionContext>)>,
 }
 
 pub enum PendingCallKind {
@@ -841,7 +841,7 @@ Use /thinking to show/hide thinking process."#;
         let orchestrator = match &self.orchestrator {
             Some(o) => o.clone(),
             None => {
-                let _ = done_tx.send(Err("Orchestrator not initialized".to_string()));
+                let _ = done_tx.send((Err("Orchestrator not initialized".to_string()), None));
                 return;
             }
         };
@@ -849,7 +849,7 @@ Use /thinking to show/hide thinking process."#;
         let mut session = match &self.session {
             Some(s) => s.clone(),
             None => {
-                let _ = done_tx.send(Err("Session not initialized".to_string()));
+                let _ = done_tx.send((Err("Session not initialized".to_string()), None));
                 return;
             }
         };
@@ -876,13 +876,13 @@ Use /thinking to show/hide thinking process."#;
                     .await
                     .map_err(|e| e.to_string())
             });
-            let _ = done_tx.send(result);
+            let _ = done_tx.send((result, Some(session)));
         });
     }
 
     pub fn poll_llm_response(&mut self) {
         struct StreamResult {
-            done_result: Option<Result<String, String>>,
+            done_result: Option<(Result<String, String>, Option<zen_core::types::SessionContext>)>,
             tokens: Vec<String>,
         }
 
@@ -926,7 +926,7 @@ Use /thinking to show/hide thinking process."#;
                                 Some((
                                     s.query.clone(),
                                     StreamResult {
-                                        done_result: Some(Err("disconnected".into())),
+                                        done_result: Some((Err("disconnected".into()), None)),
                                         tokens,
                                     },
                                 )),
@@ -941,7 +941,7 @@ Use /thinking to show/hide thinking process."#;
                             Some((
                                 ss.query.clone(),
                                 StreamResult {
-                                    done_result: Some(result),
+                                    done_result: Some((result, None)),
                                     tokens: Vec::new(),
                                 },
                             )),
@@ -954,7 +954,7 @@ Use /thinking to show/hide thinking process."#;
                             Some((
                                 ss.query.clone(),
                                 StreamResult {
-                                    done_result: Some(Err("disconnected".into())),
+                                    done_result: Some((Err("disconnected".into()), None)),
                                     tokens: Vec::new(),
                                 },
                             )),
@@ -997,7 +997,10 @@ Use /thinking to show/hide thinking process."#;
                     }
 
                     match done_result {
-                        Ok(response) => {
+                        (Ok(response), returned_session) => {
+                            if let Some(s) = returned_session {
+                                self.session = Some(s);
+                            }
                             completed_indices.push(idx);
                             let (remaining, raw_text) = self.stream_collector.finalize_and_drain();
                             if !remaining.is_empty() {
@@ -1010,7 +1013,7 @@ Use /thinking to show/hide thinking process."#;
                                 let _ = store.append("assistant", &response);
                             }
                         }
-                        Err(e) => {
+                        (Err(e), _) => {
                             completed_indices.push(idx);
                             self.stream_collector.clear();
                             self.push_output(format!("[LLM] Error: {}", e), true);
@@ -1161,7 +1164,24 @@ Use /thinking to show/hide thinking process."#;
 
         let router = DefaultRouter::from_config_override(self.config, provider, model);
         let new_model = format!("{}/{}", provider, model);
-        let orchestrator = Arc::new(AgentOrchestrator::new(router));
+        let orchestrator = match ZenPaths::detect() {
+            Ok(paths) => {
+                let memvid_path = paths.memvid_dir();
+                std::fs::create_dir_all(&memvid_path).ok();
+                match AgentOrchestrator::new(router).with_memory(memvid_path) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to re-wire memvid after model switch");
+                        AgentOrchestrator::new(DefaultRouter::from_config_override(self.config, provider, model))
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to detect Zen paths after model switch");
+                AgentOrchestrator::new(router)
+            }
+        };
+        let orchestrator = Arc::new(orchestrator);
 
         self.orchestrator = Some(orchestrator);
         self.model = new_model.clone();

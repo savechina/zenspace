@@ -40,12 +40,25 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         }
     };
 
-    let agents_path = root.join("AGENTS.md");
-    let agents_content = match read_to_string(&agents_path) {
-        Ok(content) => content,
-        Err(e) => {
-            tracing::warn!(path = ?agents_path, error = %e, "AGENTS.md not found or unreadable");
-            String::new()
+    let agents_content = {
+        let agents_path = root.join("AGENTS.md");
+        match read_to_string(&agents_path) {
+            Ok(content) => content,
+            Err(_) => {
+                if let Some(ws) = zen_paths.workspace_root() {
+                    let ws_agents = ws.join("AGENTS.md");
+                    match read_to_string(&ws_agents) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            tracing::warn!(path = ?ws_agents, error = %e, "AGENTS.md not found in workspace root either");
+                            String::new()
+                        }
+                    }
+                } else {
+                    tracing::warn!(path = ?agents_path, "AGENTS.md not found (no workspace root detected)");
+                    String::new()
+                }
+            }
         }
     };
 
@@ -183,6 +196,13 @@ impl ZenAgent {
             );
         }
 
+        for note in &session.knowledge {
+            ctx.evidence.push(
+                Evidence::new("knowledge", "wiki")
+                    .with_detail(json!({ "content": note.content, "path": note.path })),
+            );
+        }
+
         let memories = self
             .retrieve_memories_structured(&session_id, query)
             .or_else(|| self.retrieve_memories(&session_id));
@@ -206,7 +226,7 @@ impl ZenAgent {
             "ZenAgent::execute: skills completed"
         );
 
-        let response = self.call_llm(query, &ctx).await?;
+        let response = self.call_llm(query, &ctx, session).await?;
 
         tracing::info!(
             response_len = response.len(),
@@ -223,41 +243,49 @@ impl ZenAgent {
         match (source_skill, label) {
             ("identity", _) => 0.95,
             ("retrieved-memory", _) => 0.80,
+            ("knowledge", _) => 0.70,
             ("user-input", _) => 1.00,
             _ => 0.50,
         }
     }
 
-    fn build_prompt(&self, query: &str, ctx: &InvestigationContext) -> String {
-        let mut items = Vec::new();
+    fn build_chat_history(prompt: &str, session: &SessionContext) -> rig_core::OneOrMany<rig_core::message::Message> {
+        use rig_core::message::Message;
 
-        items.push(
+        if session.conversation.is_empty() {
+            return rig_core::OneOrMany::one(Message::user(prompt));
+        }
+
+        let mut messages: Vec<Message> = session
+            .conversation
+            .iter()
+            .filter_map(|turn| match turn.role.as_str() {
+                "user" => Some(Message::user(&turn.content)),
+                "assistant" => Some(Message::assistant(&turn.content)),
+                _ => None,
+            })
+            .collect();
+
+        messages.push(Message::user(prompt));
+        rig_core::OneOrMany::many(messages).unwrap_or_else(|_| rig_core::OneOrMany::one(Message::user(prompt)))
+    }
+
+    fn build_prompt(&self, query: &str, ctx: &InvestigationContext) -> String {
+        let mut items = vec![
             ContextItem::new(ContextSourceKind::UserInput, "user-query", query)
                 .with_rank(0)
                 .with_score(1.0),
-        );
+        ];
 
-        for (rank, ev) in ctx.evidence.iter().enumerate() {
-            let text = ev
-                .detail
-                .get("content")
-                .and_then(|v| v.as_str())
-                .or_else(|| ev.detail.get("text").and_then(|v| v.as_str()));
-
-            let Some(text) = text else { continue };
-            if text.is_empty() {
-                continue;
+        let mut evidence_items = zen_memory::evidence_to_context_items(&ctx.evidence);
+        for (i, item) in evidence_items.iter_mut().enumerate() {
+            item.rank = i.saturating_add(1);
+            let parts: Vec<&str> = item.source_id.splitn(3, '/').collect();
+            if parts.len() == 3 {
+                item.score = Self::tier_score(parts[1], parts[2]);
             }
-
-            let source_id = format!("evidence/{}/{}", ev.source_skill, ev.label);
-            let score = Self::tier_score(&ev.source_skill, &ev.label);
-
-            items.push(
-                ContextItem::new(ContextSourceKind::Memory, source_id, text)
-                    .with_rank(rank.saturating_add(1))
-                    .with_score(score),
-            );
         }
+        items.extend(evidence_items);
 
         let config = ContextPackConfig::new(4096)
             .with_max_items(20)
@@ -277,17 +305,20 @@ impl ZenAgent {
         prompt
     }
 
-    async fn call_llm(&self, query: &str, ctx: &InvestigationContext) -> Result<String> {
-        use rig_core::OneOrMany;
+    async fn call_llm(
+        &self,
+        query: &str,
+        ctx: &InvestigationContext,
+        session: &SessionContext,
+    ) -> Result<String> {
         use rig_core::completion::CompletionRequest;
-        use rig_core::message::Message;
 
         let prompt = self.build_prompt(query, ctx);
 
         let request = CompletionRequest {
             model: None,
             preamble: Some("You are a helpful Zen assistant. Answer concisely. Use proper markdown formatting with blank lines between headings, paragraphs, code blocks, and lists.".to_string()),
-            chat_history: OneOrMany::one(Message::user(&prompt)),
+            chat_history: Self::build_chat_history(&prompt, session),
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -332,6 +363,13 @@ impl ZenAgent {
             );
         }
 
+        for note in &session.knowledge {
+            ctx.evidence.push(
+                Evidence::new("knowledge", "wiki")
+                    .with_detail(json!({ "content": note.content, "path": note.path })),
+            );
+        }
+
         let memories = self
             .retrieve_memories_structured(&session_id, query)
             .or_else(|| self.retrieve_memories(&session_id));
@@ -348,7 +386,7 @@ impl ZenAgent {
 
         let _step_result = self.generic.step(&mut ctx).await?;
 
-        let response = self.call_llm_stream(query, &ctx, on_token).await?;
+        let response = self.call_llm_stream(query, &ctx, session, on_token).await?;
 
         session.add_turn("user", query);
         session.add_turn("assistant", &response);
@@ -360,18 +398,17 @@ impl ZenAgent {
         &self,
         query: &str,
         ctx: &InvestigationContext,
+        session: &SessionContext,
         mut on_token: impl FnMut(&str),
     ) -> Result<String> {
-        use rig_core::OneOrMany;
         use rig_core::completion::{CompletionModel, CompletionRequest};
-        use rig_core::message::Message;
 
         let prompt = self.build_prompt(query, ctx);
 
         let request = CompletionRequest {
             model: None,
             preamble: Some("You are a helpful Zen assistant. Answer concisely. Use proper markdown formatting with blank lines between headings, paragraphs, code blocks, and lists.".to_string()),
-            chat_history: OneOrMany::one(Message::user(&prompt)),
+            chat_history: Self::build_chat_history(&prompt, session),
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -460,5 +497,42 @@ impl ZenAgentBuilder {
             identity,
             memvid_store: self.memvid_store,
         })
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use zen_core::types::{ConversationTurn, RetrievedNote, Sensitivity, SessionContext};
+
+    fn dummy_session_with_history() -> SessionContext {
+        let mut session = SessionContext::new("test-agent".to_string(), String::new());
+        session.add_turn("user", "I prefer Rust");
+        session.add_turn("assistant", "Got it, Rust is great");
+        session
+    }
+
+    #[test]
+    fn build_chat_history_includes_prior_turns() {
+        let session = dummy_session_with_history();
+        let history = ZenAgent::build_chat_history("what did I say?", &session);
+        let msgs: Vec<_> = history.iter().collect();
+        assert_eq!(msgs.len(), 3, "Should have 2 prior turns + 1 current");
+    }
+
+    #[test]
+    fn build_chat_history_empty_session_single_message() {
+        let session = SessionContext::new("test".to_string(), String::new());
+        let history = ZenAgent::build_chat_history("hello", &session);
+        let msgs: Vec<_> = history.iter().collect();
+        assert_eq!(msgs.len(), 1, "Empty session should produce single message");
+    }
+
+    #[test]
+    fn tier_score_includes_knowledge() {
+        let score = ZenAgent::tier_score("knowledge", "wiki");
+        assert_eq!(score, 0.70);
+        assert!(score < ZenAgent::tier_score("identity", "soul"));
+        assert!(score > ZenAgent::tier_score("skills", "other"));
     }
 }

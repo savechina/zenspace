@@ -25,7 +25,23 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
     let config = load_config().map_err(|e| ZenError::Message(format!("Config error: {}", e)))?;
 
     let router = DefaultRouter::from_agentic(config);
-    let orchestrator = AgentOrchestrator::new(router);
+    let orchestrator = match zen_core::paths::ZenPaths::detect() {
+        Ok(paths) => {
+            let memvid_path = paths.memvid_dir();
+            std::fs::create_dir_all(&memvid_path).ok();
+            match AgentOrchestrator::new(router).with_memory(memvid_path) {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to init memvid for CLI chat, continuing without memory");
+                    AgentOrchestrator::new(DefaultRouter::from_agentic(config))
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to detect Zen paths for CLI chat");
+            AgentOrchestrator::new(router)
+        }
+    };
     let mut session = SessionContext::new("default".to_string(), String::new());
 
     if let Some(name) = agent {

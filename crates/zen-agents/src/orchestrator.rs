@@ -34,7 +34,6 @@ pub struct AgentOrchestrator {
     executor: crate::executor::AgentExecutor,
     token_budget: Arc<AtomicTokenBudget>,
     memvid_store: Option<rig_memvid::MemvidStore>,
-    demotion_hook: Option<rig_memvid::MemvidDemotionHook>,
     quality_pipeline: QualityPipeline,
 }
 
@@ -52,7 +51,6 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store: None,
-            demotion_hook: None,
             quality_pipeline: QualityPipeline::new(),
         }
     }
@@ -70,16 +68,13 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store: None,
-            demotion_hook: None,
             quality_pipeline: QualityPipeline::new(),
         }
     }
 
     pub fn with_memory(mut self, memory_path: PathBuf) -> Result<Self> {
         let store = ZenMemvidStore::new(memory_path)?;
-        let store_inner = store.into_inner();
-        self.demotion_hook = Some(rig_memvid::MemvidDemotionHook::with_defaults(store_inner.clone()));
-        self.memvid_store = Some(store_inner);
+        self.memvid_store = Some(store.into_inner());
         Ok(self)
     }
 

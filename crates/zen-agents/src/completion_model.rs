@@ -155,21 +155,34 @@ fn parse_provider_name(name: &str) -> zen_provider::Provider {
 }
 
 fn extract_last_user_prompt(request: &CompletionRequest) -> String {
-    let msgs: Vec<_> = request.chat_history.iter().collect();
-    for msg in msgs.into_iter().rev() {
-        if let Message::User { content } = msg {
-            let ucs: Vec<_> = content.iter().collect();
-            for uc in ucs.into_iter().rev() {
-                if let rig_core::message::UserContent::Text(t) = uc {
-                    return t.text.clone();
+    let user_prompt = {
+        let msgs: Vec<_> = request.chat_history.iter().collect();
+        let mut found: Option<String> = None;
+        for msg in msgs.into_iter().rev() {
+            if let Message::User { content } = msg {
+                let ucs: Vec<_> = content.iter().collect();
+                for uc in ucs.into_iter().rev() {
+                    if let rig_core::message::UserContent::Text(t) = uc {
+                        found = Some(t.text.clone());
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
                 }
             }
         }
+        found
+    };
+
+    let preamble = request.preamble.as_deref().unwrap_or("");
+
+    match (preamble.is_empty(), user_prompt) {
+        (true, Some(prompt)) => prompt,
+        (false, Some(prompt)) => format!("{preamble}\n\n{prompt}"),
+        (false, None) => preamble.to_string(),
+        (true, None) => "Hello".to_string(),
     }
-    request
-        .preamble
-        .clone()
-        .unwrap_or_else(|| "Hello".to_string())
 }
 
 #[cfg(test)]
@@ -211,5 +224,44 @@ mod tests {
         assert!(text.contains("mock"), "expected mock response, got: {text}");
         assert_eq!(response.usage.input_tokens, 0);
         assert_eq!(response.usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn extract_prompt_prepends_preamble() {
+        let request = CompletionRequest {
+            model: None,
+            preamble: Some("You are a test assistant.".to_string()),
+            chat_history: OneOrMany::one(Message::user("Hello")),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+
+        let prompt = extract_last_user_prompt(&request);
+        assert!(prompt.starts_with("You are a test assistant."));
+        assert!(prompt.contains("Hello"));
+    }
+
+    #[test]
+    fn extract_prompt_no_preamble_just_user() {
+        let request = CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::one(Message::user("Hello")),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+
+        let prompt = extract_last_user_prompt(&request);
+        assert_eq!(prompt, "Hello");
     }
 }

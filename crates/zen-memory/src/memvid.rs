@@ -73,7 +73,7 @@ impl ZenMemvidStore {
         role: &str,
         content: &str,
     ) -> Result<(u64, Option<memvid_core::MemoryCardId>)> {
-        let mut opts = memvid_core::PutOptions::builder()
+        let opts = memvid_core::PutOptions::builder()
             .uri(session_id)
             .push_tag("turn")
             .extract_triplets(true)
