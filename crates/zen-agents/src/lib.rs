@@ -17,6 +17,7 @@ pub mod prompt;
 pub use prompt::{PromptBuilder, PromptTemplate};
 pub mod registry;
 pub mod review;
+pub mod scheduler;
 pub mod safety_hook;
 pub mod sandbox;
 pub mod wiring;

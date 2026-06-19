@@ -17,7 +17,7 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use zen_provider::{DefaultRouter, LlmRouter, Provider, TaskRequirements};
 
@@ -139,6 +139,7 @@ impl AgentExecutor {
     ///
     /// FR-TUI-012: context.preferences激活route_with_preferences routing
     /// Agent identity: agent.identity注入到system prompt assembly
+    #[instrument(skip(self, context, agent), fields(agent_name = %context.agent_profile.name, sensitivity = ?context.sensitivity))]
     pub fn execute(
         &self,
         context: &AgentContext,
@@ -189,6 +190,7 @@ impl AgentExecutor {
         })
     }
 
+    #[instrument(skip(self, context, agent), fields(query_len = context.user_query.len()))]
     fn build_prompt_with_identity(
         &self,
         context: &AgentContext,
@@ -203,6 +205,7 @@ impl AgentExecutor {
 
     // ADR-013: Using zen_memory::PromptAssembly 18-section tiered system
     // Features: cache boundary, priority chain, section memoization, blast radius taxonomy
+    #[instrument(skip(self, context, agent), fields(sensitivity = ?context.sensitivity))]
     fn assemble_system_prompt_with_identity(
         &self,
         context: &AgentContext,
@@ -251,6 +254,7 @@ impl AgentExecutor {
         builder.build().assemble()
     }
 
+    #[instrument(skip(self), fields(agent_name, prompt_len = prompt.len(), provider = %provider))]
     fn execute_with_retry(
         &self,
         provider: &Provider,
@@ -321,6 +325,7 @@ impl AgentExecutor {
     ///
     /// Calls `on_token` for each token chunk received from the streaming
     /// response and returns the complete accumulated response.
+    #[instrument(skip(self, _context, on_token))]
     pub fn execute_with_retry_stream(
         &self,
         _context: &AgentContext,

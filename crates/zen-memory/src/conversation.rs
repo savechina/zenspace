@@ -2,24 +2,21 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::Utc;
 use tracing::debug;
 
 use zen_core::paths::ZenPaths;
+use zen_core::types::{ChatTurnEvent, SessionEvent, session_created_at_from_id};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatEntry {
-    role: String,
-    content: String,
-    timestamp: DateTime<Utc>,
-}
-
-/// Conversation history manager — persists and loads chat history per session.
+/// Conversation history manager — persists chat turns as typed events
+/// in the session's single `.jsonl` file (Codex-style).
 ///
-/// Storage: JSONL append to `~/.zen/sessions/<session_id>/chat.jsonl`.
-/// One JSON object per line: `{role, content, timestamp}`.
-/// Crash-safe, append-only (per spec.md ADR-003).
+/// Storage: each session has one `<uuid>.jsonl` file at
+/// `~/.zen/sessions/YYYY/MM/DD/<uuid>.jsonl`.
+/// Chat turns are appended as `{"type":"chat/turn","payload":{...}}` lines.
+///
+/// The first line is a `session/meta` event written by `SessionEntity::save()`.
+/// This store only appends `chat/turn` events to the same file.
 pub struct ConversationStore {
     session_id: String,
     file_path: PathBuf,
@@ -28,14 +25,20 @@ pub struct ConversationStore {
 impl ConversationStore {
     /// Create or open a conversation store for the given session.
     ///
-    /// Uses the legacy flat layout: `~/.zen/sessions/<session_id>/chat.jsonl`.
+    /// Constructs the path as `~/.zen/sessions/YYYY/MM/DD/<session_id>.jsonl`
+    /// using the session's created_at date (which must be extractable from the
+    /// UUID v7 session ID). For sessions where the date is unknown, use `with_file()`.
     pub fn open(session_id: &str) -> Result<Self> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
-        let dir = paths.sessions().join(session_id);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create session directory: {}", dir.display()))?;
 
-        let file_path = dir.join("chat.jsonl");
+        // Try to extract date from UUID v7 for path resolution
+        let date_dir = if let Some(created_at) = session_created_at_from_id(session_id) {
+            paths.session_dir_for_date(created_at)
+        } else {
+            paths.sessions().join(session_id)
+        };
+
+        let file_path = date_dir.join(format!("{}.jsonl", session_id));
 
         Ok(Self {
             session_id: session_id.to_string(),
@@ -43,16 +46,15 @@ impl ConversationStore {
         })
     }
 
-    /// Create a conversation store using an explicit directory path.
+    /// Create a conversation store using an explicit directory and session ID.
     ///
-    /// This is the preferred constructor for date-based session layouts where
-    /// the caller already knows the directory (e.g., `sessions/YYYY/MM/DD/`).
-    /// The chat file will be placed at `<dir>/chat.jsonl`.
+    /// The chat file will be placed at `<dir>/<session_id>.jsonl`.
+    /// Prefer this over `open()` when the date directory is already known.
     pub fn with_dir(dir: PathBuf, session_id: &str) -> Result<Self> {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create session directory: {}", dir.display()))?;
 
-        let file_path = dir.join("chat.jsonl");
+        let file_path = dir.join(format!("{}.jsonl", session_id));
 
         Ok(Self {
             session_id: session_id.to_string(),
@@ -61,8 +63,6 @@ impl ConversationStore {
     }
 
     /// Create a conversation store from a specific file path.
-    ///
-    /// Useful when the exact chat.jsonl location is known (e.g., tests, forking).
     pub fn with_file(file_path: PathBuf, session_id: &str) -> Result<Self> {
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)
@@ -75,61 +75,75 @@ impl ConversationStore {
         })
     }
 
-    /// Append a message to the conversation log.
+    /// Append a chat turn to the session's `.jsonl` file.
+    ///
+    /// Writes a `chat/turn` event line. The file is created on first write;
+    /// the `session/meta` event (written by `SessionEntity::save()`) must
+    /// already exist as the first line.
     pub fn append(&self, role: &str, content: &str) -> Result<()> {
-        let entry = ChatEntry {
+        let event = SessionEvent::Turn(ChatTurnEvent {
             role: role.to_string(),
             content: content.to_string(),
             timestamp: Utc::now(),
-        };
-        let line = serde_json::to_string(&entry).context("failed to serialize chat entry")?;
+        });
+        let line = serde_json::to_string(&event).context("failed to serialize chat/turn event")?;
 
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.file_path)
-            .with_context(|| format!("failed to open chat log: {}", self.file_path.display()))?
+            .with_context(|| format!("failed to open session file: {}", self.file_path.display()))?
             .write_all(format!("{}\n", line).as_bytes())
-            .with_context(|| format!("failed to write chat entry: {}", self.file_path.display()))?;
+            .with_context(|| format!("failed to write chat/turn event: {}", self.file_path.display()))?;
 
         debug!(
             session_id = %self.session_id,
             role,
             content_len = content.len(),
-            "chat entry appended"
+            "chat/turn appended to session file"
         );
         Ok(())
     }
 
-    /// Load all conversation entries for this session.
-    /// Returns vec of (role, content) pairs in chronological order.
+    /// Load all conversation turns from the session's `.jsonl` file.
+    ///
+    /// Reads every `chat/turn` event in order, skipping `session/meta` and
+    /// any other event types (future: tool/call, etc.).
+    /// Returns `Vec<(role, content)>` in chronological order.
     pub fn load(&self) -> Result<Vec<(String, String)>> {
         if !self.file_path.exists() {
             return Ok(Vec::new());
         }
 
         let content = std::fs::read_to_string(&self.file_path)
-            .with_context(|| format!("failed to read chat log: {}", self.file_path.display()))?;
+            .with_context(|| format!("failed to read session file: {}", self.file_path.display()))?;
 
         let mut entries = Vec::new();
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: ChatEntry = serde_json::from_str(line)
-                .with_context(|| format!("failed to parse chat entry: {line}"))?;
-            entries.push((entry.role, entry.content));
+            if let Ok(event) = serde_json::from_str::<SessionEvent>(line) {
+                match event {
+                    SessionEvent::Turn(turn) => {
+                        entries.push((turn.role, turn.content));
+                    }
+                    SessionEvent::Meta(_) => {
+                        // skip metadata event
+                    }
+                }
+            }
         }
 
         debug!(
             session_id = %self.session_id,
             count = entries.len(),
-            "chat entries loaded"
+            "chat turns loaded from session file"
         );
         Ok(entries)
     }
 
-    /// Load the last N conversation entries (for context window management).
+    /// Load the last N conversation turns (for context window management).
     pub fn load_recent(&self, n: usize) -> Result<Vec<(String, String)>> {
         let all = self.load()?;
         let start = all.len().saturating_sub(n);
@@ -137,21 +151,33 @@ impl ConversationStore {
     }
 
     pub fn copy_to(&self, target_session_id: &str) -> Result<Self> {
+        let target_path = Self::resolve_path_for_session(target_session_id)?;
+        self.copy_to_path(target_path, target_session_id)
+    }
+
+    pub fn copy_to_dir(&self, target_dir: PathBuf, target_session_id: &str) -> Result<Self> {
+        let target_path = target_dir.join(format!("{}.jsonl", target_session_id));
+        self.copy_to_path(target_path, target_session_id)
+    }
+
+    fn copy_to_path(&self, target_path: PathBuf, target_session_id: &str) -> Result<Self> {
         let entries = self.load()?;
-        let target = ConversationStore::open(target_session_id)?;
+        let target = ConversationStore::with_file(target_path, target_session_id)?;
         for (role, content) in &entries {
             target.append(role, content)?;
         }
         Ok(target)
     }
 
-    pub fn copy_to_dir(&self, target_dir: PathBuf, target_session_id: &str) -> Result<Self> {
-        let entries = self.load()?;
-        let target = ConversationStore::with_dir(target_dir, target_session_id)?;
-        for (role, content) in &entries {
-            target.append(role, content)?;
-        }
-        Ok(target)
+    /// Resolve the `.jsonl` path for a session ID (used by copy_to).
+    fn resolve_path_for_session(session_id: &str) -> Result<PathBuf> {
+        let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
+        let date_dir = if let Some(created_at) = session_created_at_from_id(session_id) {
+            paths.session_dir_for_date(created_at)
+        } else {
+            paths.sessions().join(session_id)
+        };
+        Ok(date_dir.join(format!("{}.jsonl", session_id)))
     }
 
     /// Export conversation to Markdown format.
@@ -179,11 +205,16 @@ impl ConversationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zen_core::types::SessionEntity;
 
     #[test]
     fn append_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("chat.jsonl");
+        let file_path = dir.path().join("test.jsonl");
+
+        // First write the meta event (as SessionEntity::save() would)
+        let session = SessionEntity::new("test-agent", "/ws");
+        SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {
             session_id: "test".to_string(),
@@ -213,11 +244,33 @@ mod tests {
     }
 
     #[test]
-    fn load_recent_returns_last_n() {
+    fn load_empty_file_with_only_meta_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.jsonl");
+        let session = SessionEntity::new("test-agent", "/ws");
+        SessionEvent::write_meta(&file_path, &session).unwrap();
+
         let store = ConversationStore {
             session_id: "test".to_string(),
-            file_path: dir.path().join("chat.jsonl"),
+            file_path,
+        };
+
+        // Only meta event, no chat turns
+        let entries = store.load().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn load_recent_returns_last_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.jsonl");
+
+        let session = SessionEntity::new("test-agent", "/ws");
+        SessionEvent::write_meta(&file_path, &session).unwrap();
+
+        let store = ConversationStore {
+            session_id: "test".to_string(),
+            file_path: file_path.clone(),
         };
 
         for i in 0..5 {
@@ -233,9 +286,14 @@ mod tests {
     #[test]
     fn export_markdown_format() {
         let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.jsonl");
+
+        let session = SessionEntity::new("test-agent", "/ws");
+        SessionEvent::write_meta(&file_path, &session).unwrap();
+
         let store = ConversationStore {
             session_id: "test".to_string(),
-            file_path: dir.path().join("chat.jsonl"),
+            file_path: file_path.clone(),
         };
 
         store.append("user", "Hello").unwrap();
@@ -245,5 +303,28 @@ mod tests {
         assert!(md.contains("# Chat Export"));
         assert!(md.contains("**You**: Hello"));
         assert!(md.contains("**Assistant**: Hi!"));
+    }
+
+    #[test]
+    fn with_dir_creates_session_file_not_shared() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let store1 = ConversationStore::with_dir(dir.path().to_path_buf(), "session-a").unwrap();
+        store1.append("user", "msg from A").unwrap();
+
+        let store2 = ConversationStore::with_dir(dir.path().to_path_buf(), "session-b").unwrap();
+        store2.append("user", "msg from B").unwrap();
+
+        // Each session has its own .jsonl file
+        assert!(dir.path().join("session-a.jsonl").exists());
+        assert!(dir.path().join("session-b.jsonl").exists());
+
+        let entries_a = store1.load().unwrap();
+        assert_eq!(entries_a.len(), 1);
+        assert_eq!(entries_a[0].1, "msg from A");
+
+        let entries_b = store2.load().unwrap();
+        assert_eq!(entries_b.len(), 1);
+        assert_eq!(entries_b[0].1, "msg from B");
     }
 }

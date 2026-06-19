@@ -1,4 +1,4 @@
-use crate::daily_log::DailyLog;
+use crate::journal::Journal;
 use chrono::NaiveDate;
 use tracing::{debug, info};
 
@@ -84,7 +84,7 @@ pub enum DreamError {
 /// Reads the daily log for `date`, extracts structured facts from
 /// entries, returns the count of durable facts identified.
 fn consolidate_daily_log(zen_paths: &ZenPaths, date: NaiveDate) -> Result<usize, DreamError> {
-    let entries = DailyLog::read_entries(zen_paths, date)
+        let entries = Journal::read_entries(zen_paths, date)
         .map_err(|e| DreamError::DailyLogRead(e.to_string()))?;
 
     let mut fact_count = 0;
@@ -108,8 +108,8 @@ fn consolidate_daily_log(zen_paths: &ZenPaths, date: NaiveDate) -> Result<usize,
 ///
 /// Appends a dated section if new facts were consolidated today.
 /// Returns `true` if the file was updated.
-fn update_memory(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
-    let memory_path = zen_paths.global_root().join("MEMORY.md");
+pub fn update_memory(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
+    let memory_path = zen_paths.identity().join("MEMORY.md");
 
     if !memory_path.exists() {
         debug!("MEMORY.md not found, skipping update");
@@ -126,7 +126,7 @@ fn update_memory(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
         return Ok(false);
     }
 
-    let daily_entries = DailyLog::read_entries(zen_paths, now)
+    let daily_entries = Journal::read_entries(zen_paths, now)
         .map_err(|e| DreamError::MemoryUpdate(e.to_string()))?;
 
     let new_facts: Vec<String> = daily_entries
@@ -241,7 +241,7 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
 ///
 /// Heuristic: lines that look like completed actions (past tense verbs,
 /// numeric changes, etc.).
-fn extract_durable_facts(content: &str) -> Vec<String> {
+pub fn extract_durable_facts(content: &str) -> Vec<String> {
     let mut facts = Vec::new();
 
     for line in content.lines() {

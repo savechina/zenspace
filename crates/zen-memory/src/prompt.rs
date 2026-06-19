@@ -15,6 +15,7 @@ use std::path::Path;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 use zen_core::AgentDefinition;
 use zen_core::paths::ZenPaths;
 use zen_core::types::{Sensitivity, SessionContext};
@@ -256,25 +257,39 @@ impl PromptAssembly {
     pub fn assemble(&self) -> String {
         // Priority 1: Override replaces everything
         if let Some(ref override_prompt) = self.override_prompt {
+            debug!(
+                prompt_len = override_prompt.len(),
+                "prompt assembly: priority 1 (override)"
+            );
             return override_prompt.clone();
         }
 
         // Priority 2: Coordinator mode (swarm/orchestration)
         if self.coordinator_mode {
+            debug!("prompt assembly: priority 2 (coordinator mode)");
             return self.build_coordinator_prompt();
         }
 
         // Priority 3: Agent definition (replacement chain)
         if let Some(ref def) = self.agent_definition {
+            debug!(
+                agent = %def.name,
+                "prompt assembly: priority 3 (agent definition)"
+            );
             return self.build_agent_prompt(def);
         }
 
         // Priority 4: Custom prompt (replacement chain)
         if let Some(ref custom) = self.custom_prompt {
+            debug!(
+                prompt_len = custom.len(),
+                "prompt assembly: priority 4 (custom prompt)"
+            );
             return self.build_custom_prompt(custom);
         }
 
         // Priority 5: Default 18-section assembly
+        debug!("prompt assembly: priority 5 (default 18-section)");
         self.build_default_18_sections()
     }
 
@@ -311,6 +326,13 @@ impl PromptAssembly {
         result.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
         result.push_str("\n\n");
         result.push_str(&dynamic_parts.join("\n\n"));
+
+        debug!(
+            static_sections = static_parts.len(),
+            dynamic_sections = dynamic_parts.len(),
+            prompt_len = result.len(),
+            "prompt: coordinator mode assembled"
+        );
 
         result
     }
@@ -367,6 +389,13 @@ impl PromptAssembly {
             result.push_str(&dynamic_parts.join("\n\n"));
         }
 
+        debug!(
+            static_sections = static_parts.len(),
+            dynamic_sections = dynamic_parts.len(),
+            prompt_len = result.len(),
+            "prompt: agent definition prompt assembled"
+        );
+
         result
     }
 
@@ -403,6 +432,13 @@ impl PromptAssembly {
             result.push_str("\n\n");
             result.push_str(&dynamic_parts.join("\n\n"));
         }
+
+        debug!(
+            static_sections = static_parts.len(),
+            dynamic_sections = dynamic_parts.len(),
+            prompt_len = result.len(),
+            "prompt: custom prompt assembled"
+        );
 
         result
     }
@@ -492,6 +528,13 @@ impl PromptAssembly {
             result.push_str(&dynamic_parts.join("\n\n"));
         }
 
+        debug!(
+            static_sections = static_parts.len(),
+            dynamic_sections = dynamic_parts.len(),
+            prompt_len = result.len(),
+            "prompt: default 18-section assembled"
+        );
+
         result
     }
 
@@ -573,11 +616,20 @@ Current sensitivity level: {}"#,
             }
         }
 
-        if parts.is_empty() {
+        let result = if parts.is_empty() {
             String::new()
         } else {
             parts.join("\n")
-        }
+        };
+
+        debug!(
+            knowledge_count = self.retrieved_knowledge.len(),
+            history_count = self.conversation_history.len(),
+            section_len = result.len(),
+            "prompt: memory section built"
+        );
+
+        result
     }
 
     /// Build CLAUDE.md section (Section 18).
@@ -700,21 +752,21 @@ Current sensitivity level: {}"#,
     // File loaders (legacy API compatibility)
     // -----------------------------------------------------------------------
 
-    /// Load SOUL.md content from the workspace.
+    /// Load SOUL.md content from the identity directory.
     pub fn load_soul_content(paths: &ZenPaths) -> String {
-        let path = paths.global_root().join("SOUL.md");
+        let path = paths.identity().join("SOUL.md");
         read_file_or_empty(&path)
     }
 
-    /// Load AGENTS.md content from the workspace.
+    /// Load AGENTS.md content from the identity directory.
     pub fn load_agents_content(paths: &ZenPaths) -> String {
-        let path = paths.global_root().join("AGENTS.md");
+        let path = paths.identity().join("AGENTS.md");
         read_file_or_empty(&path)
     }
 
-    /// Load MEMORY.md content from the workspace.
+    /// Load MEMORY.md content from the identity directory.
     pub fn load_memory_content(paths: &ZenPaths) -> String {
-        let path = paths.global_root().join("MEMORY.md");
+        let path = paths.identity().join("MEMORY.md");
         read_file_or_empty(&path)
     }
 

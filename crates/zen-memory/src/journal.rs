@@ -81,7 +81,7 @@ fn extract_tags(content: &str) -> HashSet<String> {
 /// Parse a daily log Markdown file into individual entries.
 ///
 /// Entry header format: `"## YYYY-MM-DD HH:MM:SS — optional title\n"`
-pub fn parse_daily_log(content: &str, base_date: NaiveDate) -> Vec<LogEntry> {
+pub fn parse_journal(content: &str, base_date: NaiveDate) -> Vec<LogEntry> {
     let mut entries = Vec::new();
     let mut current_entry: Option<String> = None;
     let mut current_time: Option<NaiveDateTime> = None;
@@ -147,14 +147,14 @@ fn parse_log_timestamp(line: &str, _base_date: NaiveDate) -> Result<NaiveDateTim
     Ok(chrono::Utc::now().naive_utc())
 }
 
-// ─── DailyLog struct ───────────────────────────────────────────────────
+// ─── Journal struct ───────────────────────────────────────────────────
 
 /// Manages the daily log directory (`~/.zen/memory/YYYY/`) and provides
 /// operations for creating and reading daily Markdown entries.
-pub struct DailyLog;
+pub struct Journal;
 
-impl DailyLog {
-    /// Create a new `DailyLog` instance.
+impl Journal {
+    /// Create a new `Journal` instance.
     pub fn new() -> Self {
         Self
     }
@@ -241,7 +241,7 @@ impl DailyLog {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read daily log: {}", path.display()))?;
 
-        Ok(parse_daily_log(&content, date))
+        Ok(parse_journal(&content, date))
     }
 
     /// List all log files for a given year.
@@ -278,7 +278,7 @@ impl DailyLog {
     }
 }
 
-impl Default for DailyLog {
+impl Default for Journal {
     fn default() -> Self {
         Self::new()
     }
@@ -316,18 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_daily_log_format() {
+    fn test_parse_journal_format() {
         let content = "# Daily Log — 2026-05-23\n\n## 2026-05-23 09:00:00 — Morning standup\n\nHad a standup meeting\n\n## 2026-05-23 14:30:00 — Afternoon coding\n\nWorked on #memory module\n";
-        let entries = parse_daily_log(content, NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
+        let entries = parse_journal(content, NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].content, "Had a standup meeting");
         assert_eq!(entries[1].content, "Worked on #memory module");
     }
 
     #[test]
-    fn test_parse_daily_log_empty() {
+    fn test_parse_journal_empty() {
         let content = "no entries here at all";
-        let entries = parse_daily_log(content, NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
+        let entries = parse_journal(content, NaiveDate::from_ymd_opt(2026, 5, 23).unwrap());
         assert!(entries.is_empty());
     }
 
@@ -367,7 +367,7 @@ mod tests {
 
         // Parse and verify
         let content = fs::read_to_string(&path).unwrap();
-        let entries = parse_daily_log(&content, date);
+        let entries = parse_journal(&content, date);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "Test content");
     }

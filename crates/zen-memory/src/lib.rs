@@ -1,6 +1,7 @@
 pub mod context_budget;
 pub mod conversation;
-pub mod daily_log;
+pub mod journal;
+pub mod history;
 pub mod dream;
 pub mod identity;
 pub mod memory;
@@ -20,6 +21,7 @@ pub mod session;
 pub use context_budget::ContextBudget;
 pub use conversation::ConversationStore;
 pub use dream::ZenDream;
+pub use history::HistoryStore;
 #[allow(deprecated)]
 pub use memory::{MemoryEntry, MemoryStats, MemoryStore};
 pub use memory_flush::MemoryFlush;

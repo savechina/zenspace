@@ -46,9 +46,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Hello {
-        name: String,
-    },
     Clean {
         #[command(subcommand)]
         operation: Option<CleanupCommands>,
@@ -231,11 +228,6 @@ fn init_tracing(filter: EnvFilter, use_file: bool) -> Result<(), ZenError> {
 
 async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
     match command {
-        Commands::Hello { ref name } => {
-            debug!("hello :");
-            println!("hello:\n{}", name);
-            Ok(())
-        }
         Commands::Clean {
             ref operation,
             ref dry_run,
@@ -287,7 +279,7 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         }
         Commands::Ingest { ref operation } => ingest_command::execute_command(operation),
         Commands::Task { ref operation } => task_command::execute_command(operation),
-        Commands::Routine { ref operation } => routine_command::execute_command(operation),
+        Commands::Routine { ref operation } => routine_command::execute_command(operation).await,
         Commands::Brief { ref operation } => brief_command::execute_command(operation),
         Commands::Model { ref operation } => model_command::execute_command(operation),
         Commands::Plugin { ref operation } => plugin_command::execute_command(operation),

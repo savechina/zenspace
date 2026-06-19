@@ -23,6 +23,7 @@ use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::MarkdownStreamCollector;
 use super::theme::{OutputTheme, ZenTheme, from_name as theme_from_name};
 use zen_memory::conversation::ConversationStore;
+use zen_memory::history::HistoryStore;
 
 pub struct PendingLlmCall {
     pub query: String,
@@ -322,6 +323,7 @@ pub struct App {
     pub toast_queue: VecDeque<String>,
     pub current_toast: Option<(String, Instant)>,
     conversation_store: Option<ConversationStore>,
+    history_store: HistoryStore,
 }
 
 impl App {
@@ -379,7 +381,14 @@ impl App {
             model_picker: ModelPickerState::new(),
             toast_queue: VecDeque::new(),
             current_toast: None,
-            conversation_store: ConversationStore::open("tui").ok(),
+            conversation_store: None,
+            history_store: HistoryStore::open(config.history.max_bytes.map(|b| b as u64))
+                .unwrap_or_else(|_| {
+                    HistoryStore::with_path(
+                        std::path::PathBuf::from("history.jsonl"),
+                        Some(1_048_576),
+                    )
+                }),
         };
         app.load_command_history();
         app
@@ -505,18 +514,8 @@ impl App {
     }
 
     fn load_command_history(&mut self) {
-        if let Some(store) = &self.conversation_store
-            && let Ok(entries) = store.load()
-        {
-            for (role, content) in entries {
-                if role == "user" && !content.is_empty() {
-                    self.command_history.push(content);
-                }
-            }
-            if self.command_history.len() > MAX_HISTORY {
-                let start = self.command_history.len() - MAX_HISTORY;
-                self.command_history = self.command_history[start..].to_vec();
-            }
+        if let Ok(entries) = self.history_store.load_recent(MAX_HISTORY) {
+            self.command_history = entries;
         }
     }
 
@@ -553,10 +552,11 @@ impl App {
 
         let orch = match ZenPaths::detect() {
             Ok(paths) => {
-                let memvid_path = paths.memvid_dir();
-                if let Err(e) = std::fs::create_dir_all(&memvid_path) {
-                    tracing::warn!(path = ?memvid_path, error = %e, "Failed to create memvid directory");
+                let memvid_dir = paths.memory();
+                if let Err(e) = std::fs::create_dir_all(&memvid_dir) {
+                    tracing::warn!(path = ?memvid_dir, error = %e, "Failed to create memory directory");
                 }
+                let memvid_path = memvid_dir.join("mem1.mv2");
                 match orch.with_memory(memvid_path) {
                     Ok(o) => {
                         tracing::info!("Memvid store wired successfully");
@@ -603,9 +603,7 @@ impl App {
             self.command_history.remove(0);
         }
         self.history_position = None;
-        if let Some(store) = &self.conversation_store {
-            let _ = store.append("user", cmd);
-        }
+        let _ = self.history_store.append(cmd, self.session_id.as_deref());
     }
 
     pub fn history_up(&mut self) {
@@ -689,6 +687,7 @@ impl App {
                 self.message_queue.push_back(cmd.to_string());
             }
         } else {
+            self.ensure_session(cmd);
             self.current_query = cmd.to_string();
             self.execute_chat(cmd);
         }
@@ -791,11 +790,19 @@ Use /thinking to show/hide thinking process."#;
 
         let context = self.auto_search_knowledge(query);
         if !context.is_empty() {
+            tracing::info!(count = context.len(), "TUI chat: knowledge context injected");
             self.push_output(
                 format!("[Knowledge] Found {} relevant notes", context.len()),
                 false,
             );
         }
+
+        tracing::debug!(
+            specialist,
+            query_len = query.len(),
+            knowledge_count = context.len(),
+            "TUI chat: dispatching"
+        );
 
         self.push_output(format!("You: {}", query), false);
         self.push_output(format!("[{}] Thinking...", specialist), false);
@@ -806,21 +813,35 @@ Use /thinking to show/hide thinking process."#;
         use zen_core::paths::ZenPaths;
         use zen_knowledge::search::{SearchService, TierSelector};
 
-        let tier = TierSelector::select_tier(query);
         let paths = match ZenPaths::detect() {
             Ok(p) => p,
             Err(_) => return Vec::new(),
         };
-        let base_dir = paths.inbox();
+        let service = SearchService::new();
+        let tier = TierSelector::select_tier(query);
 
-        match SearchService::new().search(query, &base_dir, Some(tier)) {
-            Ok(results) => results
-                .into_iter()
-                .take(3)
-                .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
-                .collect(),
-            Err(_) => Vec::new(),
+        let mut results = Vec::new();
+        for dir in [paths.inbox(), paths.wiki()] {
+            if let Ok(r) = service.search(query, &dir, Some(tier)) {
+                results.extend(r);
+            }
         }
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|r| seen.insert(r.file.clone()));
+        results.truncate(3);
+        let formatted: Vec<String> = results
+            .into_iter()
+            .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
+            .collect();
+
+        tracing::debug!(
+            query_len = query.len(),
+            tier,
+            results_count = formatted.len(),
+            "TUI auto_search_knowledge"
+        );
+
+        formatted
     }
 
     fn start_llm_call_via_orchestrator(&mut self, query: &str, context: &[String]) {
@@ -841,6 +862,7 @@ Use /thinking to show/hide thinking process."#;
         let orchestrator = match &self.orchestrator {
             Some(o) => o.clone(),
             None => {
+                tracing::warn!("TUI chat: orchestrator not initialized");
                 let _ = done_tx.send((Err("Orchestrator not initialized".to_string()), None));
                 return;
             }
@@ -849,10 +871,21 @@ Use /thinking to show/hide thinking process."#;
         let mut session = match &self.session {
             Some(s) => s.clone(),
             None => {
+                tracing::warn!("TUI chat: session not initialized");
                 let _ = done_tx.send((Err("Session not initialized".to_string()), None));
                 return;
             }
         };
+
+        let session_id = session.session_id.to_string();
+        let context_count = context.len();
+
+        tracing::info!(
+            session_id,
+            query_len = query.len(),
+            context_count,
+            "TUI chat: starting LLM call via orchestrator"
+        );
 
         if !context.is_empty() {
             for (i, note_content) in context.iter().enumerate() {
@@ -1002,19 +1035,25 @@ Use /thinking to show/hide thinking process."#;
                                 self.session = Some(s);
                             }
                             completed_indices.push(idx);
+                            tracing::info!(
+                                response_len = response.len(),
+                                "TUI chat: LLM response complete"
+                            );
                             let (remaining, raw_text) = self.stream_collector.finalize_and_drain();
                             if !remaining.is_empty() {
                                 self.output.push(OutputCell::Markdown(
                                     super::cell::MarkdownCell::from_lines(remaining, raw_text),
                                 ));
                             }
-                            self.chat_history.push((_query, response.clone()));
+                            self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {
+                                let _ = store.append("user", &_query);
                                 let _ = store.append("assistant", &response);
                             }
                         }
                         (Err(e), _) => {
                             completed_indices.push(idx);
+                            tracing::warn!(error = %e, "TUI chat: LLM response error");
                             self.stream_collector.clear();
                             self.push_output(format!("[LLM] Error: {}", e), true);
                         }
@@ -1166,12 +1205,13 @@ Use /thinking to show/hide thinking process."#;
         let new_model = format!("{}/{}", provider, model);
         let orchestrator = match ZenPaths::detect() {
             Ok(paths) => {
-                let memvid_path = paths.memvid_dir();
-                std::fs::create_dir_all(&memvid_path).ok();
+                let memvid_dir = paths.memory();
+                std::fs::create_dir_all(&memvid_dir).ok();
+                let memvid_path = memvid_dir.join("mem1.mv2");
                 match AgentOrchestrator::new(router).with_memory(memvid_path) {
                     Ok(o) => o,
                     Err(e) => {
-                        tracing::warn!(error = %e, "Failed to re-wire memvid after model switch");
+                        tracing::warn!(error = %e, "Failed to re-wire memory store after model switch");
                         AgentOrchestrator::new(DefaultRouter::from_config_override(self.config, provider, model))
                     }
                 }
@@ -1326,11 +1366,66 @@ Use /thinking to show/hide thinking process."#;
         }
     }
 
+    /// Auto-create a session on first chat message if none exists.
+    /// Sets the session title from the first user message.
+    fn ensure_session(&mut self, first_message: &str) {
+        if self.session_id.is_some() {
+            return;
+        }
+
+        use zen_memory::session::SessionManager;
+        let manager = SessionManager::new();
+        match manager.create_session("tui", ".") {
+            Ok(mut session) => {
+                let title = if first_message.len() > 60 {
+                    format!("{}...", &first_message[..60])
+                } else {
+                    first_message.to_string()
+                };
+                session.title = Some(title);
+                let _ = session.save();
+
+                self.session_id = Some(session.id.clone());
+                if let Ok(paths) = ZenPaths::detect() {
+                    let date_dir = paths.session_dir_for_date(session.created_at);
+                    self.conversation_store =
+                        ConversationStore::with_dir(date_dir, &session.id).ok();
+                }
+                tracing::info!(
+                    session_id = %session.id,
+                    "auto-created session on first message"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to auto-create session");
+            }
+        }
+    }
+
     fn save_session_state(&mut self) {
         if let Some(ref id) = self.session_id {
             if let Ok(mut entity) = zen_core::types::SessionEntity::load(id) {
                 entity.updated_at = chrono::Utc::now();
+                entity.status = zen_core::types::SessionStatus::Completed;
                 let _ = entity.save();
+
+                // Write daily log entry: skip zero-turn sessions
+                if self.chat_history.is_empty() {
+                    return;
+                }
+                let turn_count = self.chat_history.len();
+                let summary = format!(
+                    "{}",
+                    if entity.title.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+                        format!("Closed {} session ({} turns) — \"{}\".", entity.agent_name, turn_count, entity.title.as_ref().unwrap())
+                    } else {
+                        format!("Closed {} session ({} turns).", entity.agent_name, turn_count)
+                    }
+                );
+                tracing::debug!(session_id = %id, turns = turn_count, "writing daily log entry for session end");
+                if let Ok(paths) = ZenPaths::detect() {
+                    let _ = zen_memory::journal::Journal::create_entry(&paths, &summary);
+                }
             }
         }
     }
@@ -1341,7 +1436,11 @@ Use /thinking to show/hide thinking process."#;
         match manager.create_session("default", ".") {
             Ok(session) => {
                 self.session_id = Some(session.id.clone());
-                self.conversation_store = ConversationStore::open(&session.id).ok();
+                if let Ok(paths) = ZenPaths::detect() {
+                    let date_dir = paths.session_dir_for_date(session.created_at);
+                    self.conversation_store =
+                        ConversationStore::with_dir(date_dir, &session.id).ok();
+                }
                 self.output.clear();
                 self.chat_history.clear();
                 self.push_output(format!("New session started: {}", session.id), false);
@@ -1366,13 +1465,18 @@ Use /thinking to show/hide thinking process."#;
         match manager.fork_session(&current_id, title.map(String::from)) {
             Ok(forked) => {
                 self.session_id = Some(forked.id.clone());
-                if let Some(parent_store) = &self.conversation_store
-                    && let Ok(new_store) = parent_store.copy_to(&forked.id)
-                {
-                    self.conversation_store = Some(new_store);
-                }
-                if self.conversation_store.is_none() {
-                    self.conversation_store = ConversationStore::open(&forked.id).ok();
+                if let Ok(paths) = ZenPaths::detect() {
+                    let date_dir = paths.session_dir_for_date(forked.created_at);
+                    if let Some(parent_store) = &self.conversation_store
+                        && let Ok(new_store) =
+                            parent_store.copy_to_dir(date_dir.clone(), &forked.id)
+                    {
+                        self.conversation_store = Some(new_store);
+                    }
+                    if self.conversation_store.is_none() {
+                        self.conversation_store =
+                            ConversationStore::with_dir(date_dir, &forked.id).ok();
+                    }
                 }
                 self.output.clear();
                 self.chat_history.clear();
@@ -1441,7 +1545,11 @@ Use /thinking to show/hide thinking process."#;
         match manager.resume_session(session_id) {
             Ok(session) => {
                 self.session_id = Some(session.id.clone());
-                self.conversation_store = ConversationStore::open(&session.id).ok();
+                if let Ok(paths) = ZenPaths::detect() {
+                    let date_dir = paths.session_dir_for_date(session.created_at);
+                    self.conversation_store =
+                        ConversationStore::with_dir(date_dir, &session.id).ok();
+                }
                 self.output.clear();
                 self.chat_history.clear();
                 if let Some(store) = &self.conversation_store
@@ -1710,6 +1818,12 @@ pub fn run_app(
         false,
     );
     app.push_output(format!("Workspace: {}", app.workspace), false);
+
+    // Spawn the background scheduler (auto-cancelled when TUI exits).
+    let scheduler = zen_agents::scheduler::create_configured_scheduler(&config.cron);
+    tokio::spawn(async move {
+        scheduler.run().await;
+    });
 
     loop {
         app.poll_llm_response();

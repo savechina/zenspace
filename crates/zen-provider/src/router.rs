@@ -636,6 +636,7 @@ impl DefaultRouter {
                 plugin: zen_core::config::PluginConfig::default(),
                 feeds: Vec::new(),
                 tui: zen_core::config::TuiConfig::default(),
+                history: zen_core::config::HistoryConfig::default(),
             },
             mock: MockProvider::default(),
             providers,

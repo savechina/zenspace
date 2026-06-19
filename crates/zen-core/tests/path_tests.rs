@@ -211,7 +211,7 @@ fn db_is_under_global_root() {
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let db = paths.db();
     assert!(db.starts_with(&home_path));
-    assert!(db.ends_with("db"), "db path: {db:?}");
+    assert!(db.ends_with("data"), "db path: {db:?}");
 }
 
 #[test]
@@ -225,14 +225,14 @@ fn sessions_is_under_global_root() {
 fn memory_is_under_global_root() {
     let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
-    assert!(paths.memory().ends_with("memory"));
+    assert!(paths.memory().ends_with("memories"));
 }
 
 #[test]
 fn identity_is_under_global_root() {
     let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
-    assert!(paths.identity().ends_with("identity"));
+    assert!(paths.identity().ends_with("memories"));
 }
 
 #[test]

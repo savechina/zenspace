@@ -6,7 +6,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, instrument};
 
 use zen_core::types::SessionContext;
 use zen_memory::ZenMemvidStore;
@@ -231,6 +231,7 @@ impl AgentOrchestrator {
         "Sisyphus".to_string()
     }
 
+    #[instrument(skip(self, session), fields(session_id = %session.session_id))]
     pub async fn execute(
         &self,
         session: &mut SessionContext,
@@ -347,6 +348,7 @@ impl AgentOrchestrator {
     ///
     /// Calls `on_token` for each token chunk as it arrives, then returns the
     /// complete response string.
+    #[instrument(skip(self, session, on_token), fields(session_id = %session.session_id))]
     pub async fn execute_stream(
         &self,
         session: &mut SessionContext,

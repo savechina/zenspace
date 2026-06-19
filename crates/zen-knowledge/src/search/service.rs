@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use tracing::info;
 
 use super::{
     GraphResult, SearchResult, Tier1Search, Tier2Search, Tier3Search, Tier4Search, Tier5Search,
@@ -38,12 +39,18 @@ impl SearchService {
     ) -> Result<Vec<SearchResult>> {
         let selected = tier.unwrap_or_else(|| TierSelector::select_tier(query));
 
+        info!(
+            query_len = query.len(),
+            tier = selected,
+            "SearchService: routing query"
+        );
+
         let db_dir = base_dir.parent().unwrap_or(base_dir);
         let kb_db = db_dir.join("kb.db");
         let vec_db = db_dir.join("vec.db");
         let graph_db = db_dir.join("graph.db");
 
-        match selected {
+        let results = match selected {
             1 => Tier1Search::search(query, base_dir),
             2 => self.tier2.search(query, &kb_db, 20).map(|r| {
                 r.into_iter()
@@ -69,7 +76,16 @@ impl SearchService {
                     .collect()
             }),
             _ => anyhow::bail!("unknown tier: {selected}"),
-        }
+        }?;
+
+        info!(
+            query_len = query.len(),
+            tier = selected,
+            results_count = results.len(),
+            "SearchService: search complete"
+        );
+
+        Ok(results)
     }
 
     /// Synthesize search results into a natural language answer.

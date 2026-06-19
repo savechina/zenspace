@@ -84,12 +84,105 @@ impl fmt::Display for SessionStatus {
 }
 
 // ---------------------------------------------------------------------------
+// SessionEvent — single-file event stream (Codex-style)
+// ---------------------------------------------------------------------------
+
+/// A single event in a session's `.jsonl` file.
+///
+/// Each session is a single `<uuid>.jsonl` file containing ordered events:
+///   - `session/meta` (first event) — replaces SessionEntity metadata JSON
+///   - `chat/turn` — conversation turns (replaces separate chat.jsonl)
+///   - future: `tool/call`, `session/status`, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum SessionEvent {
+    #[serde(rename = "session/meta")]
+    Meta(SessionEntity),
+    #[serde(rename = "chat/turn")]
+    Turn(ChatTurnEvent),
+}
+
+/// Payload for a `chat/turn` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurnEvent {
+    pub role: String,
+    pub content: String,
+    /// Unix timestamp seconds (i64, Codex-compatible via chrono::serde::ts_seconds).
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub timestamp: DateTime<Utc>,
+}
+
+impl SessionEvent {
+    /// Read the first (meta) event from a `.jsonl` file.
+    pub fn read_meta(path: &std::path::Path) -> Result<SessionEntity> {
+        let line = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read session file: {}", path.display()))?
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty session file: {}", path.display()))?
+            .to_string();
+        match serde_json::from_str::<SessionEvent>(&line)
+            .with_context(|| format!("failed to parse session event: {}", path.display()))?
+        {
+            SessionEvent::Meta(entity) => Ok(entity),
+            _ => anyhow::bail!("expected session/meta event as first line in {}", path.display()),
+        }
+    }
+
+    /// Write a `session/meta` event as the first line of a `.jsonl` file.
+    /// If the file already exists, the meta line is overwritten (line 1).
+    pub fn write_meta(path: &std::path::Path, entity: &SessionEntity) -> Result<()> {
+        let meta_line = serde_json::to_string(&SessionEvent::Meta(entity.clone()))
+            .context("failed to serialize session/meta event")?;
+
+        if path.exists() {
+            // Overwrite first line only, preserve conversation events
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read: {}", path.display()))?;
+            let mut lines: Vec<&str> = content.lines().collect();
+            if lines.is_empty() {
+                lines.push(&meta_line);
+            } else {
+                lines[0] = &meta_line;
+            }
+            let new_content = lines.join("\n") + "\n";
+            std::fs::write(path, new_content)
+                .with_context(|| format!("failed to write: {}", path.display()))?;
+        } else {
+            // New file — write meta event
+            let mut file = std::fs::File::create(path)
+                .with_context(|| format!("failed to create: {}", path.display()))?;
+            use std::io::Write;
+            writeln!(file, "{}", meta_line)
+                .with_context(|| format!("failed to write meta event: {}", path.display()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Read a SessionEntity from a file, detecting format by extension.
+///
+/// - `.jsonl` → parse first line as `session/meta` event
+/// - `.json` → legacy format, parse whole file as `SessionEntity`
+pub fn load_session_from_file(path: &std::path::Path) -> Result<SessionEntity> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("jsonl") => SessionEvent::read_meta(path),
+        _ => {
+            let json = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read session file: {}", path.display()))?;
+            serde_json::from_str::<SessionEntity>(&json)
+                .with_context(|| format!("failed to parse session file: {}", path.display()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SessionEntity (FR-078, FR-081) — canonical definition
 // ---------------------------------------------------------------------------
 
-/// Session entity persisted to `~/.zen/sessions/<id>.json`.
+/// Session entity persisted as the first `session/meta` event in `<id>.jsonl`.
 ///
-/// Per data-model.md §3.9: JSON file is primary storage (Tier 2 derived cache).
+/// Per data-model.md §3.9: JSONL file is primary storage (Tier 2 derived cache).
 /// SQLite table is derived from these files for fast queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntity {
@@ -103,9 +196,11 @@ pub struct SessionEntity {
     pub parent_id: Option<String>,
     /// Computed max sensitivity across retrieved notes.
     pub sensitivity_policy: Sensitivity,
-    /// Session creation time (ISO 8601).
+    /// Session creation time (Unix timestamp seconds).
+    #[serde(with = "chrono::serde::ts_seconds")]
     pub created_at: DateTime<Utc>,
-    /// Last session activity (ISO 8601).
+    /// Last session activity (Unix timestamp seconds).
+    #[serde(with = "chrono::serde::ts_seconds")]
     pub updated_at: DateTime<Utc>,
     /// Session lifecycle state.
     pub status: SessionStatus,
@@ -155,21 +250,22 @@ impl SessionEntity {
         Ok(())
     }
 
-    /// Save this session to `~/.zen/sessions/YYYY/MM/DD/<id>.json`.
+    /// Save this session to `<id>.jsonl` with a `session/meta` event.
+    ///
+    /// The file is stored at `~/.zen/sessions/YYYY/MM/DD/<id>.jsonl`.
+    /// If the file already exists (from a previous save), only the first line
+    /// (the `session/meta` event) is updated — conversation events are preserved.
     pub fn save(&self) -> Result<PathBuf> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
         let date_dir = paths.session_dir_for_date(self.created_at);
         std::fs::create_dir_all(&date_dir)
             .with_context(|| format!("failed to create sessions directory: {}", date_dir.display()))?;
 
-        let file_path = date_dir.join(format!("{}.json", self.id));
-        let json =
-            serde_json::to_string_pretty(self).context("failed to serialize session entity")?;
-        std::fs::write(&file_path, json)
-            .with_context(|| format!("failed to write session file: {}", file_path.display()))?;
+        let file_path = date_dir.join(format!("{}.jsonl", self.id));
+        SessionEvent::write_meta(&file_path, self)?;
 
         let relative_path = format!(
-            "{}/{}/{}/{}.json",
+            "{}/{}/{}/{}.jsonl",
             self.created_at.format("%Y"),
             self.created_at.format("%m"),
             self.created_at.format("%d"),
@@ -197,29 +293,39 @@ impl SessionEntity {
     pub fn load(id: &str) -> Result<SessionEntity> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
 
+        // Fast path: SessionIndex → .jsonl
         if let Ok(index) = SessionIndex::open(&paths.db()) {
             if let Ok(Some(relative_path)) = index.find(id) {
                 let file_path = paths.sessions().join(&relative_path);
                 if file_path.exists() {
-                    let json = std::fs::read_to_string(&file_path)
-                        .with_context(|| format!("failed to read session file: {}", file_path.display()))?;
-                    let session: SessionEntity = serde_json::from_str(&json)
-                        .with_context(|| format!("failed to parse session file: {}", file_path.display()))?;
-                    return Ok(session);
+                    return SessionEvent::read_meta(&file_path);
                 }
             }
         }
 
+        // Fallback: brute-force date-dir scan for .jsonl
         let sessions_root = paths.sessions();
-
-        let date_dirs_result: Result<Vec<PathBuf>> = Self::scan_date_dirs(&sessions_root, id);
+        let date_dirs_result: Result<Vec<PathBuf>> = Self::scan_date_dirs(&sessions_root, id, "jsonl");
         if let Ok(Some(session)) = date_dirs_result?.into_iter().next().map(|p| {
-            let json = std::fs::read_to_string(&p)?;
-            let s: SessionEntity = serde_json::from_str(&json)
-                .with_context(|| format!("failed to parse session file: {}", p.display()))?;
-            Ok::<SessionEntity, anyhow::Error>(s)
+            SessionEvent::read_meta(&p)
         }).transpose() {
             return Ok(session);
+        }
+
+        // Legacy fallback: .json metadata file (pre-JSONL format)
+        let date_dirs_result: Result<Vec<PathBuf>> = Self::scan_date_dirs(&sessions_root, id, "json");
+        if let Ok(Some(session)) = date_dirs_result?.into_iter().next().map(|p| {
+            let json = std::fs::read_to_string(&p)
+                .with_context(|| format!("failed to read session file: {}", p.display()))?;
+            serde_json::from_str::<SessionEntity>(&json)
+                .with_context(|| format!("failed to parse session file: {}", p.display()))
+        }).transpose() {
+            return Ok(session);
+        }
+
+        let flat_path = sessions_root.join(format!("{}.jsonl", id));
+        if flat_path.exists() {
+            return SessionEvent::read_meta(&flat_path);
         }
 
         let flat_path = sessions_root.join(format!("{}.json", id));
@@ -234,7 +340,7 @@ impl SessionEntity {
         anyhow::bail!("session not found: {id}")
     }
 
-    fn scan_date_dirs(sessions_root: &PathBuf, id: &str) -> Result<Vec<PathBuf>> {
+    fn scan_date_dirs(sessions_root: &PathBuf, id: &str, ext: &str) -> Result<Vec<PathBuf>> {
         let mut results = Vec::new();
 
         if !sessions_root.exists() {
@@ -261,7 +367,7 @@ impl SessionEntity {
                     if !day_path.is_dir() {
                         continue;
                     }
-                    let candidate = day_path.join(format!("{}.json", id));
+                    let candidate = day_path.join(format!("{}.{}", id, ext));
                     if candidate.exists() {
                         results.push(candidate);
                     }
@@ -283,25 +389,15 @@ impl SessionEntity {
                 for row in indexed {
                     let file_path = sessions_root.join(&row.file_path);
                     if file_path.exists() {
-                        match std::fs::read_to_string(&file_path) {
-                            Ok(json) => {
-                                match serde_json::from_str::<SessionEntity>(&json) {
-                                    Ok(session) => {
-                                        seen_ids.insert(session.id.clone());
-                                        sessions.push(session);
-                                    }
-                                    Err(e) => debug!("skipping invalid session {}: {}", row.id, e),
-                                }
+                        let session = match load_session_from_file(&file_path) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                debug!("skipping invalid session {}: {}", row.id, e);
+                                continue;
                             }
-                            Err(_) => {
-                                if let Some(repaired) = Self::repair_indexed_session(
-                                    &sessions_root, &row.id, &paths.db(),
-                                ) {
-                                    seen_ids.insert(repaired.id.clone());
-                                    sessions.push(repaired);
-                                }
-                            }
-                        }
+                        };
+                        seen_ids.insert(session.id.clone());
+                        sessions.push(session);
                     } else {
                         if let Some(repaired) = Self::repair_indexed_session(
                             &sessions_root, &row.id, &paths.db(),
@@ -326,10 +422,18 @@ impl SessionEntity {
         id: &str,
         db_dir: &PathBuf,
     ) -> Option<SessionEntity> {
-        let found = Self::scan_date_dirs(sessions_root, id).ok()?;
-        let found_path = found.into_iter().next()?;
+        let result = Self::scan_date_dirs(sessions_root, id, "jsonl").ok()
+            .and_then(|paths| paths.into_iter().next());
+        let found_path = result.or_else(|| {
+            Self::scan_date_dirs(sessions_root, id, "json").ok()
+                .and_then(|paths| paths.into_iter().next())
+        })?;
         let json = std::fs::read_to_string(&found_path).ok()?;
-        let session: SessionEntity = serde_json::from_str(&json).ok()?;
+        let session = if found_path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            SessionEvent::read_meta(&found_path).ok()?
+        } else {
+            serde_json::from_str::<SessionEntity>(&json).ok()?
+        };
         let relative = found_path
             .strip_prefix(sessions_root)
             .unwrap_or(&found_path)
@@ -359,16 +463,18 @@ impl SessionEntity {
             let path = entry.path();
             if path.is_dir() {
                 Self::walk_sessions_dir(&path, sessions, seen_ids)?;
-            } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+            } else if path.is_file() {
+                let ext = path.extension().and_then(|e| e.to_str());
+                if ext != Some("jsonl") && ext != Some("json") {
+                    continue;
+                }
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if seen_ids.contains(stem) {
                         continue;
                     }
-                    if let Ok(json) = std::fs::read_to_string(&path) {
-                        if let Ok(session) = serde_json::from_str::<SessionEntity>(&json) {
-                            seen_ids.insert(session.id.clone());
-                            sessions.push(session);
-                        }
+                    if let Ok(session) = load_session_from_file(&path) {
+                        seen_ids.insert(session.id.clone());
+                        sessions.push(session);
                     }
                 }
             }
@@ -413,6 +519,18 @@ impl SessionEntity {
         info!(session_id = %self.id, "session reactivated");
         Ok(())
     }
+}
+
+/// Parse the creation datetime from a UUID v7 session ID string.
+///
+/// UUID v7 embeds a Unix millisecond timestamp in its first 48 bits.
+/// This extracts it without needing the `SessionEntity.created_at` field.
+///
+/// Returns `None` if the string is not a valid UUID v7.
+pub fn session_created_at_from_id(session_id: &str) -> Option<DateTime<Utc>> {
+    let uuid = Uuid::parse_str(session_id).ok()?;
+    let (secs, nanos) = uuid.get_timestamp()?.to_unix();
+    DateTime::from_timestamp(secs as i64, nanos)
 }
 
 // ---------------------------------------------------------------------------
@@ -766,7 +884,7 @@ mod tests {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         let tmp = DIR.get_or_init(|| {
             let t = tempfile::TempDir::new().expect("failed to create temp dir for session tests");
-            std::fs::create_dir_all(t.path().join("db")).unwrap();
+            std::fs::create_dir_all(t.path().join("data")).unwrap();
             std::fs::create_dir_all(t.path().join("sessions")).unwrap();
             // SAFETY: test environment setup, set once per process
             unsafe {
@@ -786,7 +904,7 @@ mod tests {
         let year = session.created_at.format("%Y").to_string();
         let month = session.created_at.format("%m").to_string();
         let day = session.created_at.format("%d").to_string();
-        let expected = root.join("sessions").join(&year).join(&month).join(&day).join(format!("{}.json", session.id));
+        let expected = root.join("sessions").join(&year).join(&month).join(&day).join(format!("{}.jsonl", session.id));
 
         assert_eq!(path, expected);
         assert!(expected.exists());
@@ -809,29 +927,32 @@ mod tests {
         let root = session_test_dir();
         let sessions_root = root.join("sessions");
 
+        // Legacy flat .json file
         let flat_session = SessionEntity::new("flat-agent", "/flat-ws");
         let flat_path = sessions_root.join(format!("{}.json", flat_session.id));
         std::fs::write(&flat_path, serde_json::to_string_pretty(&flat_session).unwrap()).unwrap();
 
+        // New .jsonl file via save()
         let date_session = SessionEntity::new("date-agent", "/date-ws");
         date_session.save().unwrap();
 
         let all = SessionEntity::list().unwrap();
         let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&flat_session.id.as_str()), "flat session should be in list");
+        assert!(ids.contains(&flat_session.id.as_str()), "flat .json session should be in list");
+        assert!(ids.contains(&date_session.id.as_str()), ".jsonl session should be in list");
     }
 
     #[test]
     fn test_session_sqlite_index_roundtrip() {
         let root = session_test_dir();
-        let db_dir = root.join("db");
+        let db_dir = root.join("data");
         let index = crate::session_index::SessionIndex::open(&db_dir).unwrap();
 
         let prefix = format!("sqlite-{}", Uuid::now_v7());
         for i in 0..3 {
             index.upsert(
                 &format!("{}-{}", prefix, i),
-                &format!("2025/06/{:02}/{}-{}.json", 15 + i, prefix, i),
+                &format!("2025/06/{:02}/{}-{}.jsonl", 15 + i, prefix, i),
                 &format!("agent-{}", i),
                 "Active",
                 &format!("2025-06-1{}T10:00:00Z", 5 + i),
@@ -841,7 +962,7 @@ mod tests {
         }
 
         let found = index.find(&format!("{}-1", prefix)).unwrap();
-        let expected_path = format!("2025/06/16/{}-1.json", prefix);
+        let expected_path = format!("2025/06/16/{}-1.jsonl", prefix);
         assert_eq!(found.as_deref(), Some(expected_path.as_str()));
 
         let missing = index.find(&format!("{}-no-such", prefix)).unwrap();
@@ -867,13 +988,13 @@ mod tests {
     #[test]
     fn test_session_read_repair() {
         let root = session_test_dir();
-        let db_dir = root.join("db");
+        let db_dir = root.join("data");
 
         let session = SessionEntity::new("repair-agent", "/repair-ws");
         session.save().unwrap();
 
         let index = crate::session_index::SessionIndex::open(&db_dir).unwrap();
-        index.reconcile(&session.id, "wrong/path.json").unwrap();
+        index.reconcile(&session.id, "wrong/path.jsonl").unwrap();
 
         let all = SessionEntity::list().unwrap();
         assert!(all.iter().any(|s| s.id == session.id), "repaired session should be in list");

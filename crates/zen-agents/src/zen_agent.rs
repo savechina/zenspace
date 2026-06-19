@@ -9,6 +9,7 @@ use rig_core::completion::CompletionModel;
 use rig_core::streaming::StreamedAssistantContent;
 use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
+use tracing::instrument;
 use zen_core::paths::ZenPaths;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
@@ -29,9 +30,9 @@ pub struct IdentityContext {
 /// Each file is optional — missing or unreadable files yield empty strings
 /// with a warning logged.
 pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
-    let root = zen_paths.global_root();
+    let identity_dir = zen_paths.identity();
 
-    let soul_path = root.join("SOUL.md");
+    let soul_path = identity_dir.join("SOUL.md");
     let soul_content = match read_to_string(&soul_path) {
         Ok(content) => content,
         Err(e) => {
@@ -41,7 +42,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
     };
 
     let agents_content = {
-        let agents_path = root.join("AGENTS.md");
+        let agents_path = identity_dir.join("AGENTS.md");
         match read_to_string(&agents_path) {
             Ok(content) => content,
             Err(_) => {
@@ -62,7 +63,7 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         }
     };
 
-    let memory_path = root.join("MEMORY.md");
+    let memory_path = identity_dir.join("MEMORY.md");
     let memory_content = match read_to_string(&memory_path) {
         Ok(content) => content,
         Err(e) => {
@@ -102,6 +103,7 @@ impl ZenAgent {
     ///
     /// Uses per-session scoping (D7): the session_id from SessionContext
     /// isolates each conversation's memory namespace.
+    #[instrument(skip(self), fields(session_id))]
     fn retrieve_memories(&self, session_id: &str) -> Option<Vec<String>> {
         self.memvid_store.as_ref().and_then(|store| {
             let mut all_cards = Vec::new();
@@ -128,6 +130,7 @@ impl ZenAgent {
         })
     }
 
+    #[instrument(skip(self), fields(session_id, query_len = query.len()))]
     fn retrieve_memories_structured(&self, session_id: &str, query: &str) -> Option<Vec<String>> {
         self.memvid_store.as_ref().and_then(|store| {
             let ctx = MemoryCardContext::new(
@@ -162,6 +165,7 @@ impl ZenAgent {
     /// this after execution completes, keeping the write concern at the
     /// orchestrator level (D2). Uses `uri = session_id` for scope isolation
     /// (D7) and `extract_triplets(false)` for Phase 1 (D9).
+    #[instrument(skip(self), fields(session_id, response_len = assistant_response.len()))]
     pub fn persist_turn(&self, session_id: &str, user_query: &str, assistant_response: &str) {
         if let Some(ref store) = self.memvid_store {
             let zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
@@ -174,6 +178,7 @@ impl ZenAgent {
     }
 
     /// Execute a user query. Async-native, no nested runtime creation.
+    #[instrument(skip(self, session), fields(session_id = %session.session_id, query_len = query.len()))]
     pub async fn execute(&self, query: &str, session: &mut SessionContext) -> Result<String> {
         let session_id = session.session_id.to_string();
         let mut ctx = InvestigationContext::new(&session_id, "query");
@@ -300,6 +305,7 @@ impl ZenAgent {
             .join("\n\n")
     }
 
+    #[instrument(skip(self, ctx, session), fields(session_id = %session.session_id, query_len = query.len()))]
     async fn call_llm(
         &self,
         query: &str,
@@ -331,6 +337,7 @@ impl ZenAgent {
         }
     }
 
+    #[instrument(skip(self, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
     pub async fn execute_stream(
         &self,
         query: &str,
@@ -389,6 +396,7 @@ impl ZenAgent {
         Ok(response)
     }
 
+    #[instrument(skip(self, ctx, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
     async fn call_llm_stream(
         &self,
         query: &str,

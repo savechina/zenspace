@@ -1,49 +1,78 @@
 use clap::Subcommand;
 use tracing::info;
 
+use zen_agents::scheduler::create_default_scheduler;
 use zen_core::errors::ZenError;
 
 #[derive(Subcommand)]
 pub enum RoutineCommands {
-    /// List all routines
+    /// List all registered scheduler workers
     List,
-    /// Trigger a routine by name
+    /// Trigger a worker by name immediately (e.g. "dream", "daily-log", "subconscious")
     Trigger {
-        /// Routine name
+        /// Worker name
         name: String,
     },
-    /// Enable a routine
+    /// Enable a routine (not yet implemented)
     Enable {
         /// Routine name
         name: String,
     },
-    /// Disable a routine
+    /// Disable a routine (not yet implemented)
     Disable {
         /// Routine name
         name: String,
     },
 }
 
-pub fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
+pub async fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
     match cmd {
         RoutineCommands::List => {
-            info!("routine list stub");
-            println!("routine list (stub) - no routines registered yet");
+            let scheduler = create_default_scheduler();
+            let workers = scheduler.list();
+
+            if workers.is_empty() {
+                println!("No workers registered.");
+                return Ok(());
+            }
+
+            println!(
+                "{:<15} {:<22} {}",
+                "WORKER", "SCHEDULE", "DESCRIPTION"
+            );
+            println!("{}", "-".repeat(70));
+            for w in &workers {
+                println!("{:<15} {:<22} {}", w.id, w.schedule, w.description);
+            }
+            println!("\n{} worker(s) registered.", workers.len());
             Ok(())
         }
+
         RoutineCommands::Trigger { name } => {
-            info!(routine_trigger = name.as_str(), "routine trigger stub");
-            println!("routine trigger stub: name=\"{}\"", name);
-            Ok(())
+            info!(worker = name.as_str(), "routine: manual trigger");
+            let scheduler = create_default_scheduler();
+
+            match scheduler.trigger(name).await {
+                Ok(report) => {
+                    println!(
+                        "Worker '{}' completed — success={}, facts={}, duration={}ms",
+                        report.worker_id, report.success, report.fact_count, report.duration_ms
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(ZenError::Message(format!(
+                    "failed to trigger worker '{name}': {e}"
+                ))),
+            }
         }
+
         RoutineCommands::Enable { name } => {
-            info!(routine_enable = name.as_str(), "routine enable stub");
-            println!("routine enable stub: name=\"{}\"", name);
+            println!("enable not yet implemented for worker '{name}'");
             Ok(())
         }
+
         RoutineCommands::Disable { name } => {
-            info!(routine_disable = name.as_str(), "routine disable stub");
-            println!("routine disable stub: name=\"{}\"", name);
+            println!("disable not yet implemented for worker '{name}'");
             Ok(())
         }
     }

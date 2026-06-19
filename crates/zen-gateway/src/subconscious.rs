@@ -7,7 +7,7 @@ use tracing::{debug, info};
 
 use zen_core::config::ZenConfig;
 use zen_core::paths::ZenPaths;
-use zen_memory::daily_log::DailyLog;
+use zen_memory::journal::Journal;
 use zen_memory::memory_service::IdentityContext;
 
 /// Micro-action type decided by the subconscious tick.
@@ -65,7 +65,7 @@ fn evaluate_tick(
 ) -> Result<Vec<MicroAction>> {
     let mut actions = Vec::new();
 
-    let today_entries = DailyLog::read_entries(zen_paths, date)?;
+    let today_entries = Journal::read_entries(zen_paths, date)?;
 
     if today_entries.is_empty() {
         actions.push(MicroAction::Remind(

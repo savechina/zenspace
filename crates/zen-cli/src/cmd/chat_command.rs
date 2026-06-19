@@ -27,12 +27,13 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
     let router = DefaultRouter::from_agentic(config);
     let orchestrator = match zen_core::paths::ZenPaths::detect() {
         Ok(paths) => {
-            let memvid_path = paths.memvid_dir();
-            std::fs::create_dir_all(&memvid_path).ok();
-            match AgentOrchestrator::new(router).with_memory(memvid_path) {
+            let mem_dir = paths.memory();
+            std::fs::create_dir_all(&mem_dir).ok();
+            let store_path = mem_dir.join("mem1.mv2");
+            match AgentOrchestrator::new(router).with_memory(store_path) {
                 Ok(o) => o,
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to init memvid for CLI chat, continuing without memory");
+                    tracing::warn!(error = %e, "Failed to init memory store for CLI chat, continuing without memory");
                     AgentOrchestrator::new(DefaultRouter::from_agentic(config))
                 }
             }
@@ -46,6 +47,32 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
 
     if let Some(name) = agent {
         session.agent_name = name.clone();
+    }
+
+    if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+        use zen_knowledge::search::{SearchService, TierSelector};
+        let service = SearchService::new();
+        let tier = TierSelector::select_tier(message);
+        let mut seen = std::collections::HashSet::new();
+
+        for dir in [paths.inbox(), paths.wiki()] {
+            if let Ok(results) = service.search(message, &dir, Some(tier)) {
+                for r in results {
+                    if seen.insert(r.file.clone()) {
+                        session.knowledge.push(zen_core::types::RetrievedNote {
+                            path: r.file.display().to_string(),
+                            content: r.content,
+                            sensitivity: zen_core::types::Sensitivity::Public,
+                            relevance: 1.0,
+                        });
+                    }
+                }
+            }
+        }
+
+        if !session.knowledge.is_empty() {
+            tracing::info!(count = session.knowledge.len(), "Knowledge context injected for CLI chat");
+        }
     }
 
     let agent_label = session.agent_name.clone();
@@ -70,6 +97,17 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
                 "\u{2713}".green().bold(),
                 response.len() / 4
             );
+
+            if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+                let summary = format!(
+                    "Chat with {} agent — {} tokens.",
+                    session.agent_name,
+                    response.len() / 4
+                );
+                tracing::debug!(agent = %session.agent_name, "writing daily log entry for CLI chat");
+                let _ = zen_memory::journal::Journal::create_entry(&paths, &summary);
+            }
+
             Ok(())
         }
         Err(e) => {

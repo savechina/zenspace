@@ -52,6 +52,8 @@ pub struct ZenConfig {
     pub feeds: Vec<FeedConfig>,
     #[serde(default)]
     pub tui: TuiConfig,
+    #[serde(default)]
+    pub history: HistoryConfig,
 }
 
 /// IM channel configuration — supports multiple platforms.
@@ -413,6 +415,14 @@ pub struct TuiConfig {
     pub theme: Option<String>,
 }
 
+/// Global command history config (history.jsonl).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct HistoryConfig {
+    pub max_bytes: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // Default values
 // ---------------------------------------------------------------------------
@@ -657,6 +667,7 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         plugin: merge_plugin(base.plugin, override_cfg.plugin),
         feeds: merge_feeds(base.feeds, override_cfg.feeds),
         tui: merge_tui(base.tui, override_cfg.tui),
+        history: merge_history(base.history, override_cfg.history),
     })
 }
 
@@ -770,6 +781,12 @@ fn merge_tui(base: TuiConfig, ov: TuiConfig) -> TuiConfig {
     }
 }
 
+fn merge_history(base: HistoryConfig, ov: HistoryConfig) -> HistoryConfig {
+    HistoryConfig {
+        max_bytes: ov.max_bytes.or(base.max_bytes),
+    }
+}
+
 fn str_merge(base: Option<String>, ov: Option<String>) -> Option<String> {
     ov.or(base)
 }
@@ -789,6 +806,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_cron_env(&mut config.cron);
     apply_plugin_env(&mut config.plugin);
     apply_channels_env(&mut config.channels);
+    apply_history_env(&mut config.history);
     config
 }
 
@@ -861,6 +879,12 @@ fn env_plugin_field(
     }
     if let Some(obj) = entry.config.as_object_mut() {
         f(obj);
+    }
+}
+
+fn apply_history_env(history: &mut HistoryConfig) {
+    if let Some(v) = env_u32("ZEN_HISTORY_MAX_BYTES") {
+        history.max_bytes = Some(v);
     }
 }
 
@@ -998,9 +1022,45 @@ pub fn consolidation_time(config: &ZenConfig) -> &str {
     config.cron.consolidation_time.as_deref().unwrap_or("02:00")
 }
 
-/// Persist model selection to workspace config file.
+/// Generate a cron expression for the daily-log worker from [`CronConfig`].
 ///
-/// Writes `default_provider` and `default_model` to the workspace `.zen/config.toml`.
+/// Uses `subconscious_interval_minutes` to produce `"0 */N * * * *"`, falling
+/// back to `"0 */5 * * * *"` when the field is unset or invalid.
+impl CronConfig {
+     /// Generate a cron expression for the daily-log worker.
+    pub fn daily_log_schedule(&self) -> Option<String> {
+        self.subconscious_interval_minutes.map(|mins| format!("0 */{mins} * * * *"))
+     }
+
+     /// Generate a cron expression for the dream (nightly consolidation) worker.
+     /// Produces `"0 0 {start}-{end} * * *"` from start and end hours, or `None` if invalid.
+    pub fn night_dream_schedule(&self) -> Option<String> {
+        let Some(start) = self.dream_start_hour else { return None };
+        if start < 1 || start >= 24 {
+            return None;
+         }
+        let Some(end) = self.dream_end_hour else { return None };
+        if end <= start || end > 24 {
+            return None;
+         }
+        Some(format!("0 0 {start}-{end} * * *"))
+     }
+}
+
+/// Generate the default daily-log schedule expression.
+///
+/// This is the fallback used when no config-driven value is available.
+pub fn default_daily_log_schedule() -> &'static str {
+     "0 */5 * * * *"
+}
+
+/// Generate the default night-dream schedule expression.
+pub fn default_night_dream_schedule() -> &'static str {
+     "0 0 2-4 * * *"
+}
+
+// ---------------------------------------------------------------------------
+/// Persist model selection to workspace config file.
 /// Falls back to global `~/.zen/config.toml` if no workspace is detected.
 /// Existing lines for these keys are replaced; new keys are appended.
 pub fn save_model_selection(provider: &str, model: &str) -> Result<(), ZenError> {

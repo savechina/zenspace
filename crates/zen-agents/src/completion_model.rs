@@ -65,13 +65,28 @@ impl CompletionModel for ZenCompletionModel {
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let prompt = extract_last_user_prompt(&request);
+        let prompt_len = prompt.len();
+
+        tracing::debug!(
+            provider = %self.model_name,
+            prompt_len,
+            "completion_model: starting LLM completion"
+        );
 
         let response_text = self
             .router
             .call(self.provider.clone(), &prompt)
             .map_err(|e| {
-                CompletionError::ProviderError(format!("zen-provider call failed: {e}"))
+                let err_msg = format!("zen-provider call failed: {e}");
+                tracing::error!(provider = %self.model_name, error = %err_msg, "completion_model: LLM completion failed");
+                CompletionError::ProviderError(err_msg)
             })?;
+
+        tracing::info!(
+            provider = %self.model_name,
+            response_len = response_text.len(),
+            "completion_model: LLM completion succeeded"
+        );
 
         Ok(CompletionResponse {
             choice: OneOrMany::one(AssistantContent::text(response_text.clone())),
@@ -88,15 +103,26 @@ impl CompletionModel for ZenCompletionModel {
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         let prompt = extract_last_user_prompt(&request);
+        let prompt_len = prompt.len();
+
+        tracing::debug!(
+            provider = %self.model_name,
+            prompt_len,
+            "completion_model: starting LLM stream"
+        );
 
         let stream_resp = self
             .router
             .call_stream(self.provider.clone(), &prompt)
             .map_err(|e| {
-                CompletionError::ProviderError(format!("zen-provider call_stream failed: {e}"))
+                let err_msg = format!("zen-provider call_stream failed: {e}");
+                tracing::error!(provider = %self.model_name, error = %err_msg, "completion_model: LLM stream setup failed");
+                CompletionError::ProviderError(err_msg)
             })?;
 
-        let state = (stream_resp.token_rx, stream_resp.done_rx, String::new());
+        tracing::info!(provider = %self.model_name, "completion_model: LLM stream initialized");
+
+        let state = (stream_resp.token_rx, stream_resp.done_rx, String::new(), 0usize, self.model_name.clone());
 
         #[allow(clippy::type_complexity)]
         let boxed: std::pin::Pin<
@@ -107,31 +133,49 @@ impl CompletionModel for ZenCompletionModel {
             >,
         > = Box::pin(futures::stream::unfold(
             state,
-            |(mut token_rx, mut done_rx, mut collected)| async {
+            |(mut token_rx, mut done_rx, mut collected, mut token_count, provider_name)| async move {
                 match token_rx.recv().await {
                     Some(token) => {
                         collected.push_str(&token);
+                        token_count += 1;
                         Some((
                             Ok(RawStreamingChoice::Message(token.clone())),
-                            (token_rx, done_rx, collected),
+                            (token_rx, done_rx, collected, token_count, provider_name),
                         ))
                     }
                     None => {
                         let result = done_rx.try_recv().unwrap_or(Ok(()));
                         let text = std::mem::take(&mut collected);
                         match result {
-                            Ok(()) => Some((
-                                Ok(RawStreamingChoice::FinalResponse(MockResponse {
-                                    _text: text,
-                                })),
-                                (token_rx, done_rx, collected),
-                            )),
-                            Err(e) => Some((
-                                Err(CompletionError::ProviderError(format!(
-                                    "streaming error: {e}"
-                                ))),
-                                (token_rx, done_rx, collected),
-                            )),
+                            Ok(()) => {
+                                tracing::info!(
+                                    provider = %provider_name,
+                                    token_count,
+                                    response_len = text.len(),
+                                    "completion_model: LLM stream completed"
+                                );
+                                Some((
+                                    Ok(RawStreamingChoice::FinalResponse(MockResponse {
+                                        _text: text,
+                                    })),
+                                    (token_rx, done_rx, collected, token_count, provider_name),
+                                ))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    provider = %provider_name,
+                                    token_count,
+                                    response_len = text.len(),
+                                    error = %e,
+                                    "completion_model: LLM stream ended with error"
+                                );
+                                Some((
+                                    Err(CompletionError::ProviderError(format!(
+                                        "streaming error: {e}"
+                                    ))),
+                                    (token_rx, done_rx, collected, token_count, provider_name),
+                                ))
+                            }
                         }
                     }
                 }
