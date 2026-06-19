@@ -5653,6 +5653,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rig-resources"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5756f70e3ddec45144d4b56518d42c5a5f2265161ad2373da0907a0db749583d"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "rig-compose 0.5.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "rig-sqlite"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9355,6 +9370,7 @@ dependencies = [
  "rig-core 0.37.0",
  "rig-mcp",
  "rig-memvid",
+ "rig-resources",
  "rig-tap",
  "schemars",
  "serde",

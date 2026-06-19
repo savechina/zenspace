@@ -19,6 +19,7 @@ uuid = { workspace = true }
 fastrand = { workspace = true }
 rig-core = { workspace = true }
 rig-compose = { workspace = true }
+rig-resources = { workspace = true }
 rig-mcp = { workspace = true }
 rig-tap = { workspace = true }
 rig-memvid = { workspace = true }

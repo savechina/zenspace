@@ -1,5 +1,4 @@
 pub mod context_budget;
-pub mod context_projection;
 pub mod conversation;
 pub mod daily_log;
 pub mod dream;
@@ -19,7 +18,6 @@ pub mod session;
 )]
 #[allow(deprecated)]
 pub use context_budget::ContextBudget;
-pub use context_projection::evidence_to_context_items;
 pub use conversation::ConversationStore;
 pub use dream::ZenDream;
 #[allow(deprecated)]

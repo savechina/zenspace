@@ -4,7 +4,7 @@ use anyhow::Result;
 use futures::stream::StreamExt;
 use rig_compose::agent::{Agent, GenericAgent};
 use rig_compose::context::{Evidence, InvestigationContext, Signal};
-use rig_compose::{ContextItem, ContextPack, ContextPackConfig, ContextSourceKind};
+use rig_compose::ContextPackConfig;
 use rig_core::completion::CompletionModel;
 use rig_core::streaming::StreamedAssistantContent;
 use rig_memvid::{CardSelection, MemoryCardContext};
@@ -179,27 +179,27 @@ impl ZenAgent {
         let mut ctx = InvestigationContext::new(&session_id, "query");
 
         ctx.evidence
-            .push(Evidence::new("user-input", "query").with_detail(json!({ "text": query })));
+            .push(Evidence::new("user-input", "query").with_detail(json!({ "summary": query })));
 
         if let Some(ref identity) = self.identity {
             ctx.evidence.push(
                 Evidence::new("identity", "soul")
-                    .with_detail(json!({ "content": identity.soul_content })),
+                    .with_detail(json!({ "summary": identity.soul_content })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "agents")
-                    .with_detail(json!({ "content": identity.agents_content })),
+                    .with_detail(json!({ "summary": identity.agents_content })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "memory")
-                    .with_detail(json!({ "content": identity.memory_content })),
+                    .with_detail(json!({ "summary": identity.memory_content })),
             );
         }
 
         for note in &session.knowledge {
             ctx.evidence.push(
                 Evidence::new("knowledge", "wiki")
-                    .with_detail(json!({ "content": note.content, "path": note.path })),
+                    .with_detail(json!({ "summary": note.content, "path": note.path })),
             );
         }
 
@@ -211,7 +211,7 @@ impl ZenAgent {
             let memory_text = memories.join("\n");
             ctx.evidence.push(
                 Evidence::new("retrieved-memory", "memvid")
-                    .with_detail(json!({ "content": memory_text })),
+                    .with_detail(json!({ "summary": memory_text })),
             );
         }
 
@@ -249,6 +249,11 @@ impl ZenAgent {
         }
     }
 
+    fn tier_score_from_source_id(source_id: &str) -> f64 {
+        let (skill, label) = source_id.split_once('/').unwrap_or(("_", "_"));
+        Self::tier_score(skill, label)
+    }
+
     fn build_chat_history(prompt: &str, session: &SessionContext) -> rig_core::OneOrMany<rig_core::message::Message> {
         use rig_core::message::Message;
 
@@ -271,38 +276,28 @@ impl ZenAgent {
     }
 
     fn build_prompt(&self, query: &str, ctx: &InvestigationContext) -> String {
-        let mut items = vec![
-            ContextItem::new(ContextSourceKind::UserInput, "user-query", query)
-                .with_rank(0)
-                .with_score(1.0),
-        ];
+        let mut items = rig_resources::projection::evidence_to_context_items(ctx);
 
-        let mut evidence_items = zen_memory::evidence_to_context_items(&ctx.evidence);
-        for (i, item) in evidence_items.iter_mut().enumerate() {
-            item.rank = i.saturating_add(1);
-            let parts: Vec<&str> = item.source_id.splitn(3, '/').collect();
-            if parts.len() == 3 {
-                item.score = Self::tier_score(parts[1], parts[2]);
-            }
+        items.sort_by(|a, b| {
+            let ta = Self::tier_score_from_source_id(&a.source_id);
+            let tb = Self::tier_score_from_source_id(&b.source_id);
+            tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (rank, item) in items.iter_mut().enumerate() {
+            item.rank = rank;
         }
-        items.extend(evidence_items);
 
         let config = ContextPackConfig::new(4096)
             .with_max_items(20)
             .with_reserve_chars(query.chars().count());
 
-        let pack = ContextPack::pack(items, config);
+        let pack = rig_resources::projection::pack_resource_context(items, config);
 
-        let mut prompt = String::new();
-        for item in &pack.selected {
-            if matches!(item.source, ContextSourceKind::UserInput) {
-                prompt.push_str(&item.text);
-            } else {
-                prompt.push_str(&format!("\n\n{}", item.text));
-            }
-        }
-
-        prompt
+        pack.selected
+            .iter()
+            .map(|i| i.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     async fn call_llm(
@@ -346,27 +341,27 @@ impl ZenAgent {
         let mut ctx = InvestigationContext::new(&session_id, "query");
 
         ctx.evidence
-            .push(Evidence::new("user-input", "query").with_detail(json!({ "text": query })));
+            .push(Evidence::new("user-input", "query").with_detail(json!({ "summary": query })));
 
         if let Some(ref identity) = self.identity {
             ctx.evidence.push(
                 Evidence::new("identity", "soul")
-                    .with_detail(json!({ "content": identity.soul_content })),
+                    .with_detail(json!({ "summary": identity.soul_content })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "agents")
-                    .with_detail(json!({ "content": identity.agents_content })),
+                    .with_detail(json!({ "summary": identity.agents_content })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "memory")
-                    .with_detail(json!({ "content": identity.memory_content })),
+                    .with_detail(json!({ "summary": identity.memory_content })),
             );
         }
 
         for note in &session.knowledge {
             ctx.evidence.push(
                 Evidence::new("knowledge", "wiki")
-                    .with_detail(json!({ "content": note.content, "path": note.path })),
+                    .with_detail(json!({ "summary": note.content, "path": note.path })),
             );
         }
 
@@ -378,7 +373,7 @@ impl ZenAgent {
             let memory_text = memories.join("\n");
             ctx.evidence.push(
                 Evidence::new("retrieved-memory", "memvid")
-                    .with_detail(json!({ "content": memory_text })),
+                    .with_detail(json!({ "summary": memory_text })),
             );
         }
 
