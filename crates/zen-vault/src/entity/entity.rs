@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::relationship::RelationType;
+
 /// Types of entities that can be extracted from workspace content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EntityType {
@@ -44,4 +46,11 @@ impl Entity {
             metadata: HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityData {
+    pub entity: Entity,
+    pub facts: Vec<String>,
+    pub relationships: Vec<(String, RelationType)>,
 }

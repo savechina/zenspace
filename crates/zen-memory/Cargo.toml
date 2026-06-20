@@ -6,6 +6,8 @@ description = "Agent internal memory — SOUL.md, MEMORY.md, session context, co
 
 [dependencies]
 zen-core = { path = "../zen-core" }
+zen-data = { path = "../zen-data" }
+zen-vault = { path = "../zen-vault" }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

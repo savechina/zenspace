@@ -13,7 +13,7 @@ use zen_core::paths::ZenPaths;
 use zen_core::types::Sensitivity;
 use zen_provider::{DefaultRouter, LlmRouterExt};
 
-use zen_knowledge::search::{SearchResult, SearchService};
+use zen_vault::search::{SearchResult, SearchService};
 
 #[derive(Subcommand)]
 pub enum ResearchCommands {

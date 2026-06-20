@@ -4,7 +4,7 @@ use serde::Serialize;
 use tracing::debug;
 
 use zen_core::errors::ZenError;
-use zen_knowledge::note::NoteService;
+use zen_vault::note::NoteService;
 
 #[derive(Subcommand)]
 pub enum NoteCommands {

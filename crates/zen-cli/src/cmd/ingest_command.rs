@@ -5,7 +5,7 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_knowledge::consolidate::SourceIngester;
+use zen_vault::consolidate::SourceIngester;
 
 #[derive(Subcommand)]
 pub enum IngestCommands {

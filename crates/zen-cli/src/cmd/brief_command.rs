@@ -4,7 +4,7 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_knowledge::brief::{generate_briefing, render_briefing_md, save_briefing};
+use zen_vault::brief::{generate_briefing, render_briefing_md, save_briefing};
 
 #[derive(Subcommand)]
 pub enum BriefCommands {
@@ -40,7 +40,7 @@ pub fn execute_command(cmd: &BriefCommands) -> Result<(), ZenError> {
     }
 }
 
-fn format_summary(briefing: &zen_knowledge::brief::Briefing) -> String {
+fn format_summary(briefing: &zen_vault::brief::Briefing) -> String {
     let summary = format!(
         "Briefing — {}\n  Inbox: {} notes pending\n  Today: {} log entries\n  Habits: {}\n  Goals: {}\n  Contradictions: {}",
         briefing.date.format("%Y-%m-%d"),

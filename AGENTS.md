@@ -86,7 +86,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | zen-core | Config layers, error taxonomy, path scoping, constants (13 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
 | zen-data | Dual API: sqlx repository + rusqlite schema (FTS5, vec0) | `crates/zen-data/` |
-| zen-knowledge | 10+ services: note, wiki, 5-tier search, consolidation, lint | `crates/zen-knowledge/` |
+| zen-vault | 10+ services: note, wiki, 5-tier search, consolidation, lint | `crates/zen-vault/` |
 | zen-memory | Identity context (SOUL.md, MEMORY.md, store, stats) | `crates/zen-memory/` |
 | zen-agents | 13 agents, 4-tier registry, blackboard, QualityPipeline | `crates/zen-agents/` |
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
@@ -101,11 +101,11 @@ zen (binary)            -- 13-line main.rs -- loads .env, config, calls zen_cli:
  └── zen-cli (library)  -- clap Parser, TUI (ratatui), command dispatcher
       ├── zen-service   → zen-core
       ├── zen-gateway   → zen-core
-      ├── zen-knowledge → zen-data   → zen-core
+      ├── zen-vault → zen-data   → zen-core
       │                 └── zen-provider → zen-auth → zen-core
       ├── zen-agents    → zen-memory → zen-core
       │                 └── zen-provider
-      │                 └── zen-knowledge
+      │                 └── zen-vault
       ├── zen-core      (13 public modules: audit, config, constants, definition,
       │                 errors, paths, platform, review, sandbox, sanitize,
       │                 secrets, types, validate)
@@ -125,15 +125,15 @@ zen-provider → zen-core
 ### Data Flow
 
 ```
-zen note create → zen-knowledge (note service) → zen-data (sqlx repository)
-zen search run  → zen-knowledge (SearchService) → tier routing → ripgrep/FTS5/vec0/graph/LLM
-zen ingest      → zen-knowledge (raw directory) → IngestResult → consolidation
-zen consolidate → zen-knowledge (ConsolidationPipeline) → zen-provider (entity extraction)
+zen note create → zen-vault (note service) → zen-data (sqlx repository)
+zen search run  → zen-vault (SearchService) → tier routing → ripgrep/FTS5/vec0/graph/LLM
+zen ingest      → zen-vault (raw directory) → IngestResult → consolidation
+zen consolidate → zen-vault (ConsolidationPipeline) → zen-provider (entity extraction)
 zen session start → zen-agents (ZenCoordinator) → blackboard → executor
-zen similar find → zen-knowledge (tier3, vec0 embeddings) → zen-provider (embeddings)
-zen graph query → zen-knowledge (tier4, graph.db) → entity graph
-zen reindex run → zen-knowledge (Reindexer, checksums, embeddings)
-zen lint run    → zen-knowledge (Linter, orphan pages, broken wikilinks)
+zen similar find → zen-vault (tier3, vec0 embeddings) → zen-provider (embeddings)
+zen graph query → zen-vault (tier4, graph.db) → entity graph
+zen reindex run → zen-vault (Reindexer, checksums, embeddings)
+zen lint run    → zen-vault (Linter, orphan pages, broken wikilinks)
 ```
 
 ## STRUCTURE
@@ -171,7 +171,7 @@ zenspace/
 │   │       ├── repo_impl.rs    # sqlx implementations (SqliteNoteRepository)
 │   │       ├── sqlite_repo.rs  # rusqlite wrapper + FTS5/vec0/graph schema
 │   │       └── models.rs       # Note, AgentProfile, AuditLog entities
-│   ├── zen-knowledge/          # 10+ knowledge services
+│   ├── zen-vault/          # 10+ knowledge services
 │   │   └── src/
 │   │       ├── note.rs         # Note, NoteService, frontmatter parsing
 │   │       ├── wiki.rs         # WikiPage, WikiIndex, AtomicWikiWriter
@@ -247,10 +247,10 @@ zenspace/
 
 | Task | Location | Notes |
 |------|----------|-------|
-| Add search tier | `crates/zen-knowledge/src/search/tierN.rs` | + register in search/service.rs |
-| Modify consolidation | `crates/zen-knowledge/src/consolidate/mod.rs` | 4-stage pipeline |
-| Add lint rule | `crates/zen-knowledge/src/maintenance/mod.rs` | Linter trait |
-| Note format change | `crates/zen-knowledge/src/note.rs` | frontmatter, Domain, write_note |
+| Add search tier | `crates/zen-vault/src/search/tierN.rs` | + register in search/service.rs |
+| Modify consolidation | `crates/zen-vault/src/consolidate/mod.rs` | 4-stage pipeline |
+| Add lint rule | `crates/zen-vault/src/maintenance/mod.rs` | Linter trait |
+| Note format change | `crates/zen-vault/src/note.rs` | frontmatter, Domain, write_note |
 
 ### Agent System
 

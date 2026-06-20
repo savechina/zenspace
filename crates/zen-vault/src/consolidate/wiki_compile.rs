@@ -7,6 +7,7 @@ use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
 use tracing::info;
 
+use crate::entity::EntityData;
 use crate::note::Note;
 use crate::wiki::{WikiIndex, WikiLog, WikiPage, WikiStructure};
 
@@ -151,6 +152,141 @@ impl WikiCompiler {
             notes.len()
         );
         Ok(pages)
+    }
+
+    /// Compile entity data into wiki pages under `wiki/entities/`.
+    /// Relationships rendered as `[[wikilinks]]` for cross-linking.
+    pub fn compile_from_entities(
+        &self,
+        entities: &[EntityData],
+        wiki_dir: &Path,
+    ) -> Result<usize> {
+        let structure = WikiStructure::new(wiki_dir);
+        structure.ensure_directories()?;
+
+        let log = WikiLog::new(wiki_dir);
+        log.append(
+            "entity_compile_start",
+            &format!("compiling {} entity pages", entities.len()),
+        )?;
+
+        let mut written = 0usize;
+
+        for data in entities {
+            let slug = slugify(&data.entity.name);
+            let rel_path = format!("entities/{slug}.md");
+            let full_path = wiki_dir.join(&rel_path);
+
+            if let Some(parent) = full_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create dir: {}", parent.display()))?;
+            }
+
+            let md = self.render_entity_page(data);
+            std::fs::write(&full_path, &md)
+                .with_context(|| format!("write entity wiki: {}", full_path.display()))?;
+
+            info!(entity = %data.entity.name, path = %rel_path, "entity wiki page written");
+            written += 1;
+        }
+
+        log.append(
+            "entity_compile_complete",
+            &format!("{written} entity pages compiled"),
+        )?;
+
+        self.generate_entity_index(entities, wiki_dir)?;
+
+        Ok(written)
+    }
+
+    /// Generate OKF v0.1 §6 compliant `index.md` — no frontmatter,
+    /// standard markdown links with descriptions for progressive disclosure.
+    fn generate_entity_index(&self, entities: &[EntityData], wiki_dir: &Path) -> Result<()> {
+        let index_path = wiki_dir.join("index.md");
+        let mut md = String::new();
+
+        // OKF §6: index files contain no frontmatter.
+        md.push_str("# Knowledge Index\n\n## Entities\n\n");
+
+        let mut sorted: Vec<&EntityData> = entities.iter().collect();
+        sorted.sort_by(|a, b| a.entity.name.to_lowercase().cmp(&b.entity.name.to_lowercase()));
+
+        for data in &sorted {
+            let slug = slugify(&data.entity.name);
+            let desc = data
+                .facts
+                .first()
+                .map(|f| truncate_for_description(f))
+                .unwrap_or_else(|| format!("{:?} entity", data.entity.entity_type));
+            // OKF §6: "* [Title](relative-url) - description"
+            md.push_str(&format!("* [{}]({}.md) - {}\n", data.entity.name, slug, desc));
+        }
+
+        std::fs::write(&index_path, &md)
+            .with_context(|| format!("write entity index: {}", index_path.display()))?;
+        Ok(())
+    }
+
+    /// Render an entity page as OKF v0.1 compliant markdown.
+    ///
+    /// Frontmatter follows §4.1: `type` is required; `title`, `description`,
+    /// `tags`, `timestamp` are recommended. `created_at` is a zen extension
+    /// (§4.1 allows producer-defined keys).
+    ///
+    /// Cross-links use standard markdown `[text](/path.md)` per §5.1 (absolute,
+    /// bundle-relative), not `[[wikilinks]]`.
+    fn render_entity_page(&self, data: &EntityData) -> String {
+        let mut md = String::new();
+
+        let type_str = format!("{:?}", data.entity.entity_type);
+        let now = chrono::Utc::now();
+
+        let description = data
+            .facts
+            .first()
+            .map(|f| truncate_for_description(f))
+            .unwrap_or_else(|| format!("{} entity", data.entity.name));
+
+        // OKF §4.1 frontmatter
+        md.push_str(&format!(
+            "---\n\
+             type: {type_str}\n\
+             title: {name}\n\
+             description: {description}\n\
+             tags: [{tag}]\n\
+             timestamp: {ts}\n\
+             created_at: {created}\n\
+             ---\n\n",
+            name = data.entity.name,
+            tag = type_str.to_lowercase(),
+            ts = now.to_rfc3339(),
+            created = data.entity.created_at.to_rfc3339(),
+        ));
+
+        md.push_str(&format!("# {}\n\n", data.entity.name));
+
+        if !data.facts.is_empty() {
+            md.push_str("## Facts\n\n");
+            for fact in &data.facts {
+                md.push_str(&format!("- {fact}\n"));
+            }
+            md.push('\n');
+        }
+
+        if !data.relationships.is_empty() {
+            md.push_str("## Relationships\n\n");
+            for (target, rel) in &data.relationships {
+                let rel_str = format!("{rel:?}");
+                let target_slug = slugify(target);
+                // OKF §5.1: absolute bundle-relative links
+                md.push_str(&format!(
+                    "- [{target}](/entities/{target_slug}.md) — {rel_str}\n"
+                ));
+            }
+        }
+
+        md
     }
 
     // ── Internal helpers ─────────────────────────────────────────
@@ -391,6 +527,18 @@ fn classify_note(content: &str, tags: &[String]) -> NoteCategory {
     }
 
     NoteCategory::Concept
+}
+
+fn truncate_for_description(s: &str) -> String {
+    const MAX: usize = 100;
+    if s.len() <= MAX {
+        s.replace('"', "'").replace('\n', " ")
+    } else {
+        let truncated = s[..s.char_indices().take(MAX).last().map(|(i, _)| i).unwrap_or(MAX)]
+            .replace('"', "'")
+            .replace('\n', " ");
+        format!("{truncated}…")
+    }
 }
 
 fn slugify(title: &str) -> String {

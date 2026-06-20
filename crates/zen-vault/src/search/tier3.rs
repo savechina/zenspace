@@ -146,6 +146,40 @@ impl Tier3Search {
 
         Ok(())
     }
+
+    pub fn insert_entity_embedding(
+        &self,
+        db_path: &Path,
+        entity_id: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
+        if embedding.is_empty() {
+            anyhow::bail!("Cannot insert empty embedding for entity {entity_id}");
+        }
+
+        if !db_path.exists() {
+            anyhow::bail!(
+                "Vector database not found at {}. \
+                 Initialize the database with init_vec_schema() first.",
+                db_path.display()
+            );
+        }
+
+        let conn = Connection::open(db_path)?;
+        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        conn.execute(
+            "INSERT OR REPLACE INTO entity_embeddings (entity_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![entity_id, blob],
+        )?;
+
+        debug!(
+            "Tier3Search: stored entity embedding for {entity_id} ({}-dim)",
+            embedding.len()
+        );
+
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Tier3Search {

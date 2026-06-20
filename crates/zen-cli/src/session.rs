@@ -18,7 +18,7 @@ use zen_memory::memory_service::IdentityContext;
 pub struct SessionContext {
     pub agent_name: String,
     pub memory_context: IdentityContext,
-    pub retrieved_notes: Vec<zen_knowledge::Note>,
+    pub retrieved_notes: Vec<zen_vault::Note>,
     pub sensitivity_policy: Sensitivity,
     pub session_id: Uuid,
 }
@@ -37,7 +37,7 @@ impl SessionContext {
     pub fn assemble(
         agent_name: &str,
         zen_paths: &ZenPaths,
-        retrieved_notes: Vec<zen_knowledge::Note>,
+        retrieved_notes: Vec<zen_vault::Note>,
     ) -> Result<Self> {
         // Load agent definition from zen-agents
         let registry = DefaultAgentRegistry::default();
@@ -127,7 +127,7 @@ impl Default for SessionOrchestrator {
 ///
 /// Returns [`Sensitivity::Private`] when the list is empty
 /// (per FR-080: unknown/absent notes default to private).
-pub fn compute_max_sensitivity(notes: &[zen_knowledge::Note]) -> Sensitivity {
+pub fn compute_max_sensitivity(notes: &[zen_vault::Note]) -> Sensitivity {
     if notes.is_empty() {
         return Sensitivity::Private;
     }
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_compute_max_sensitivity_single_note() {
-        let note = zen_knowledge::Note::default();
+        let note = zen_vault::Note::default();
         assert_eq!(compute_max_sensitivity(&[note]), Sensitivity::Private);
     }
 

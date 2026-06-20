@@ -169,7 +169,7 @@ impl Workflow for ConsolidationPipeline {
             });
         }
 
-        let _ctx = InvestigationContext::new("consolidation", "zen-knowledge")
+        let _ctx = InvestigationContext::new("consolidation", "zen-vault")
             .with_block(uuid::Uuid::now_v7());
 
         let tools = ToolRegistry::new();
@@ -187,7 +187,7 @@ impl Workflow for ConsolidationPipeline {
             "wiki_dir": wiki_dir.to_string_lossy(),
         });
 
-        let ctx_with_notes = InvestigationContext::new("consolidation", "zen-knowledge")
+        let ctx_with_notes = InvestigationContext::new("consolidation", "zen-vault")
             .with_block(uuid::Uuid::now_v7());
 
         let mut ctx = ctx_with_notes;
@@ -213,7 +213,7 @@ impl Workflow for ConsolidationPipeline {
             0
         };
 
-        let mut ctx = InvestigationContext::new("consolidation-wiki", "zen-knowledge")
+        let mut ctx = InvestigationContext::new("consolidation-wiki", "zen-vault")
             .with_block(uuid::Uuid::now_v7());
 
         ctx.evidence.push(rig_compose::context::Evidence {
@@ -254,7 +254,7 @@ impl Workflow for ConsolidationPipeline {
             }
             count
         } else {
-            let mut ctx = InvestigationContext::new("consolidation-contradiction", "zen-knowledge")
+            let mut ctx = InvestigationContext::new("consolidation-contradiction", "zen-vault")
                 .with_block(uuid::Uuid::now_v7());
 
             ctx.evidence.push(rig_compose::context::Evidence {

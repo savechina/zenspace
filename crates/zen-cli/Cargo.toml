@@ -12,7 +12,7 @@ zen-service = { path = "../zen-service" }
 zen-gateway = { path = "../zen-gateway" }
 zen-core = { path = "../zen-core" }
 zen-auth = { path = "../zen-auth" }
-zen-knowledge = { path = "../zen-knowledge" }
+zen-vault = { path = "../zen-vault" }
 zen-agents = { path = "../zen-agents" }
 zen-memory = { path = "../zen-memory" }
 zen-provider = { path = "../zen-provider" }

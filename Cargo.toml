@@ -5,7 +5,7 @@ members = [
     "crates/zen-core",
     "crates/zen-data",
     "crates/zen-auth",
-    "crates/zen-knowledge",
+    "crates/zen-vault",
     "crates/zen-memory",
     "crates/zen-agents",
     "crates/zen-gateway",
@@ -140,7 +140,8 @@ arrow = "59"
 
 futures = "0.3"
 
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["cuda"] }
+# Fast embed: local ONNX inference for async batch embedding + Rerank pipeline
+fastembed = { version = "5.17" }
 
 # Plugin system: WASM sandbox + MCP server
 wasmtime = "24"

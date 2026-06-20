@@ -4,7 +4,7 @@ use tracing::info;
 
 use zen_core::paths::ZenPaths;
 use zen_memory::journal::Journal;
-use zen_memory::dream::{extract_durable_facts, update_memory};
+use zen_memory::dream::{extract_durable_facts_from_entry, update_memory_from_facts};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
@@ -57,14 +57,16 @@ impl ZenWorker for DailyLogWorker {
          }
 
         let new_entries = &entries[self.last_entry_count.load(std::sync::atomic::Ordering::Relaxed)..];
-        let mut total_facts = 0;
+        let mut all_facts: Vec<String> = Vec::new();
         for entry in new_entries {
-            let facts = extract_durable_facts(&entry.content);
-            total_facts += facts.len();
+            let facts = extract_durable_facts_from_entry(&entry.content);
+            all_facts.extend(facts);
          }
 
+        let total_facts = all_facts.len();
+
         if total_facts > 0 {
-            update_memory(&paths)?;
+            update_memory_from_facts(&paths, &all_facts)?;
             info!(facts = total_facts, "MEMORY.md updated via light tick");
          }
 

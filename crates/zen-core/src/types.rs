@@ -644,7 +644,7 @@ impl SemanticEntropy {
 /// Composes three independent peer crate outputs:
 /// - zen-agents: agent definition (WHO am I?)
 /// - zen-memory: internal context (WHAT do I know about myself?)
-/// - zen-knowledge: external memory (WHAT do I know about the world?)
+/// - zen-vault: external memory (WHAT do I know about the world?)
 ///
 /// Per FR-076: The orchestrator (zen-agents) is responsible for calling each
 /// crate independently and constructing this composed context.
@@ -656,7 +656,7 @@ pub struct SessionContext {
     pub agent_name: String,
     /// Assembled system prompt (SOUL.md + AGENTS.md + agent instructions)
     pub system_prompt: String,
-    /// Retrieved knowledge from zen-knowledge (search results, wiki pages)
+    /// Retrieved knowledge from zen-vault (search results, wiki pages)
     pub knowledge: Vec<RetrievedNote>,
     /// Computed sensitivity policy from retrieved notes
     pub sensitivity_policy: Sensitivity,

@@ -4,6 +4,7 @@ pub mod relationship;
 pub mod service;
 
 pub use entity::Entity;
+pub use entity::EntityData;
 pub use entity::EntityType;
 pub use relationship::RelationType;
 pub use relationship::Relationship;

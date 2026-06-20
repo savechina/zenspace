@@ -811,7 +811,7 @@ Use /thinking to show/hide thinking process."#;
 
     fn auto_search_knowledge(&self, query: &str) -> Vec<String> {
         use zen_core::paths::ZenPaths;
-        use zen_knowledge::search::{SearchService, TierSelector};
+        use zen_vault::search::{SearchService, TierSelector};
 
         let paths = match ZenPaths::detect() {
             Ok(p) => p,
@@ -1315,7 +1315,7 @@ Use /thinking to show/hide thinking process."#;
             return;
         }
         use zen_core::paths::ZenPaths;
-        use zen_knowledge::search::{SearchService, TierSelector};
+        use zen_vault::search::{SearchService, TierSelector};
 
         let tier = TierSelector::select_tier(query);
         let paths = match ZenPaths::detect() {
@@ -1356,7 +1356,7 @@ Use /thinking to show/hide thinking process."#;
                 return;
             }
         };
-        use zen_knowledge::note::NoteService;
+        use zen_vault::note::NoteService;
         match NoteService::new().create_note(content, vec![], "tui") {
             Ok(note) => self.push_output(
                 format!("Note created: {} ({})", note.id, note.source),
@@ -1765,7 +1765,7 @@ Use /thinking to show/hide thinking process."#;
 
     fn execute_consolidate(&mut self) {
         use zen_core::paths::ZenPaths;
-        use zen_knowledge::consolidate::ConsolidationPipeline;
+        use zen_vault::consolidate::ConsolidationPipeline;
         if let Ok(paths) = ZenPaths::detect() {
             match ConsolidationPipeline::new().run(&paths.inbox(), &paths.wiki()) {
                 Ok(report) => {
@@ -1782,7 +1782,7 @@ Use /thinking to show/hide thinking process."#;
 
     fn execute_lint(&mut self) {
         use zen_core::paths::ZenPaths;
-        use zen_knowledge::maintenance::Linter;
+        use zen_vault::maintenance::Linter;
         if let Ok(paths) = ZenPaths::detect() {
             match Linter::new().run(&paths.wiki()) {
                 Ok(result) => {

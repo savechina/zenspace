@@ -1,5 +1,5 @@
 [package]
-name = "zen-knowledge"
+name = "zen-vault"
 version.workspace = true
 edition.workspace = true
 description = "Knowledge domain — note, wiki, search, consolidation"
@@ -28,9 +28,9 @@ rusqlite = { workspace = true }
 reqwest = { workspace = true }
 feed = { workspace = true }
 html2md = { workspace = true }
-ort = { workspace = true }
 schemars = { workspace = true }
 toml = { workspace = true }
+fastembed = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

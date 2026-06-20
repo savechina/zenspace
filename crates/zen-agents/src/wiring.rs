@@ -2,7 +2,7 @@
 //!
 //! Provides a single [`ZenWiring`] struct that creates and populates
 //! `SkillRegistry`, `ToolRegistry`, and `DelegateRegistry` with all
-//! existing implementations from `zen_knowledge`.
+//! existing implementations from `zen_vault`.
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use rig_compose::skill::{Skill, SkillOutcome};
 use rig_compose::tool::Tool;
 use serde_json::Value;
 
-use zen_knowledge::tools::{ZenTool, ZenToolError};
+use zen_vault::tools::{ZenTool, ZenToolError};
 
 // Re-exports for consumers
 pub use rig_compose::delegate::DelegateRegistry as _DelegateRegistry;
@@ -26,7 +26,7 @@ pub use rig_compose::registry::ToolRegistry as _ToolRegistry;
 // Adapter: ZenTool → rig_compose::tool::Tool
 // ---------------------------------------------------------------------------
 
-/// Bridges `zen_knowledge::tools::ZenTool` (used by Tier2Search, Tier4Search,
+/// Bridges `zen_vault::tools::ZenTool` (used by Tier2Search, Tier4Search,
 /// ComputeEmbeddings) into `rig_compose::tool::Tool` so they can be registered
 /// in the rig-compose `ToolRegistry`.
 pub struct ZenToolToolAdapter<T: ZenTool> {
@@ -68,7 +68,7 @@ impl<T: ZenTool + Send + Sync> Tool for ZenToolToolAdapter<T> {
 // Adapter: ConsolidationPipeline → rig_compose::skill::Skill
 // ---------------------------------------------------------------------------
 
-/// Wraps `zen_knowledge::ConsolidationPipeline` (which implements `Workflow`
+/// Wraps `zen_vault::ConsolidationPipeline` (which implements `Workflow`
 /// but not `Skill`) into a `rig_compose::skill::Skill` so it can be registered
 /// in the rig-compose `SkillRegistry`.
 pub struct ConsolidationPipelineSkillAdapter;
@@ -118,7 +118,7 @@ impl Skill for ConsolidationPipelineSkillAdapter {
                 KernelError::InvalidArgument("missing wiki_dir in context".to_string())
             })?;
 
-        let pipeline = zen_knowledge::ConsolidationPipeline::new();
+        let pipeline = zen_vault::ConsolidationPipeline::new();
         let report = pipeline
             .run(&inbox_dir, &wiki_dir)
             .map_err(|e| KernelError::SkillFailed(e.to_string()))?;
@@ -177,22 +177,22 @@ impl ZenWiring {
 
         // --- Register skills -------------------------------------------
 
-        skills.register(Arc::new(zen_knowledge::WikiCompiler::new()));
-        skills.register(Arc::new(zen_knowledge::LearningLoop::new()));
-        skills.register(Arc::new(zen_knowledge::EntityExtractor::new()));
-        skills.register(Arc::new(zen_knowledge::ContradictionDetector::new()));
+        skills.register(Arc::new(zen_vault::WikiCompiler::new()));
+        skills.register(Arc::new(zen_vault::LearningLoop::new()));
+        skills.register(Arc::new(zen_vault::EntityExtractor::new()));
+        skills.register(Arc::new(zen_vault::ContradictionDetector::new()));
         skills.register(Arc::new(ConsolidationPipelineSkillAdapter));
 
         // --- Register tools --------------------------------------------
 
         tools.register(Arc::new(ZenToolToolAdapter::new(
-            zen_knowledge::Tier2Search,
+            zen_vault::Tier2Search,
         )));
         tools.register(Arc::new(ZenToolToolAdapter::new(
-            zen_knowledge::Tier4Search,
+            zen_vault::Tier4Search,
         )));
         tools.register(Arc::new(ZenToolToolAdapter::new(
-            zen_knowledge::ComputeEmbeddings,
+            zen_vault::ComputeEmbeddings,
         )));
 
         // --- DelegateRegistry (empty — Phase 4 populates) ---------------
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(wiring.skills.len(), 5);
 
         assert!(wiring.skills.get("zen-wiki-compilation").is_ok());
-        assert!(wiring.skills.get("zen-knowledge-learning-loop").is_ok());
+        assert!(wiring.skills.get("zen-vault-learning-loop").is_ok());
         assert!(wiring.skills.get("zen-entity-extraction").is_ok());
         assert!(wiring.skills.get("zen-contradiction-detection").is_ok());
         assert!(wiring.skills.get("zen-consolidation-pipeline").is_ok());
@@ -260,8 +260,8 @@ mod tests {
         let wiki = wiring.skills.get("zen-wiki-compilation").unwrap();
         assert_eq!(wiki.id(), "zen-wiki-compilation");
 
-        let learning = wiring.skills.get("zen-knowledge-learning-loop").unwrap();
-        assert_eq!(learning.id(), "zen-knowledge-learning-loop");
+        let learning = wiring.skills.get("zen-vault-learning-loop").unwrap();
+        assert_eq!(learning.id(), "zen-vault-learning-loop");
 
         let entity = wiring.skills.get("zen-entity-extraction").unwrap();
         assert_eq!(entity.id(), "zen-entity-extraction");

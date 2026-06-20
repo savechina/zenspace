@@ -17,7 +17,7 @@
 //! | knowledge-query     | researcher     | zen-entity-extraction         |
 //! | wiki-compile        | coder          | zen-wiki-compilation           |
 //! | analysis            | analyst        | zen-contradiction-detection,   |
-//! |                     |                |   zen-knowledge-learning-loop  |
+//! |                     |                |   zen-vault-learning-loop  |
 //! | consolidate        | consolidator   | zen-consolidation-pipeline     |
 //! | conversation       | conversation   | zen-conversational-assistant   |
 //! | system             | system         | zen-system-operations           |
@@ -127,7 +127,7 @@ impl ZenCoordinator {
             .expect("coder build");
 
         let analyst = GenericAgent::builder("analyst")
-            .with_skills(["zen-contradiction-detection", "zen-knowledge-learning-loop"])
+            .with_skills(["zen-contradiction-detection", "zen-vault-learning-loop"])
             .with_tools(["tier2_search"])
             .build(&wiring.skills, &wiring.tools)
             .expect("analyst build");
@@ -719,7 +719,7 @@ mod tests {
             "zen-entity-extraction",
             "zen-wiki-compilation",
             "zen-contradiction-detection",
-            "zen-knowledge-learning-loop",
+            "zen-vault-learning-loop",
             "zen-consolidation-pipeline",
         ] {
             skills.register(Arc::new(NoopSkill(id)));

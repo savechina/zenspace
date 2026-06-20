@@ -5,7 +5,7 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_knowledge::maintenance::Reindexer;
+use zen_vault::maintenance::Reindexer;
 
 #[derive(Subcommand)]
 pub enum ReindexCommands {

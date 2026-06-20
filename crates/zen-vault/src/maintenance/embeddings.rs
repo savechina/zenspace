@@ -127,6 +127,7 @@ pub fn compute_embeddings(text: &str) -> Result<EmbeddingResult> {
 
     let embedding = call_ollama_embeddings(text)
         .or_else(|| call_openai_embeddings(text))
+        .or_else(|| super::local_embedder::try_local_embed(text))
         .unwrap_or_else(|| {
             info!("ComputeEmbeddings: falling back to hash-based embedding");
             hash_embedding(text)
@@ -169,6 +170,7 @@ fn aggregate_chunks(chunks: &[String]) -> Vec<f32> {
     for chunk in chunks {
         let embedding = call_ollama_embeddings(chunk)
             .or_else(|| call_openai_embeddings(chunk))
+            .or_else(|| super::local_embedder::try_local_embed(chunk))
             .unwrap_or_else(|| hash_embedding(chunk));
 
         let len = embedding.len().min(dim);

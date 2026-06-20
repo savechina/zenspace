@@ -585,7 +585,7 @@ use rig_compose::skill::{Skill, SkillOutcome};
 #[async_trait]
 impl Skill for LearningLoop {
     fn id(&self) -> &str {
-        "zen-knowledge-learning-loop"
+        "zen-vault-learning-loop"
     }
 
     fn description(&self) -> &str {

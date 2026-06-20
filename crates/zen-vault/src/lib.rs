@@ -14,7 +14,7 @@ pub use consolidate::{
     ConsolidationReport, Contradiction, ContradictionDetector, EntityExtractor, RecoveryManager,
     SourceIngester, TransactionScope, WikiCompiler,
 };
-pub use entity::{Entity, EntityService, EntityType, RelationType, Relationship};
+pub use entity::{Entity, EntityData, EntityService, EntityType, RelationType, Relationship};
 pub use ingest::{
     FeedEntry, IngestResult, RssFetcher, extract_readable_content, fetch_feed, ingest_local_file,
     ingest_url,

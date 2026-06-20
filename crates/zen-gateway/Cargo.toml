@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 zen-core = { path = "../zen-core" }
-zen-knowledge = { path = "../zen-knowledge" }
+zen-vault = { path = "../zen-vault" }
 zen-agents = { path = "../zen-agents" }
 zen-provider = { path = "../zen-provider" }
 zen-memory = { path = "../zen-memory" }

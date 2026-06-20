@@ -1,5 +1,5 @@
 use anyhow::Result;
-use zen_knowledge::note::{Note, NoteService};
+use zen_vault::note::{Note, NoteService};
 
 pub struct QqBotIntegration {
     note_service: NoteService,

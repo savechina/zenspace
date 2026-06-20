@@ -64,7 +64,7 @@ zenspace/
 │   │   ├── errors.rs        # ZenError, ServiceError, AgenticError
 │   │   ├── paths.rs         # ZenPaths (global + workspace detection)
 │   │   └── constants.rs     # APP_NAME, VERSION, etc.
-│   ├── zen-knowledge/src/
+│   ├── zen-vault/src/
 │   │   ├── note.rs          # NoteService (create notes)
 │   │   ├── search.rs        # SearchService (tier-aware search)
 │   │   ├── consolidation.rs # ConsolidationPipeline

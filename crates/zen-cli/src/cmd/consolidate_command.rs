@@ -3,7 +3,7 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_knowledge::consolidate::ConsolidationPipeline;
+use zen_vault::consolidate::ConsolidationPipeline;
 
 #[derive(Subcommand)]
 pub enum ConsolidateCommands {

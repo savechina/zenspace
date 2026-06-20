@@ -29,12 +29,12 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
         "Metis",
         &["zen-entity-extraction", "zen-contradiction-detection"],
     ),
-    ("Momus", &["zen-knowledge-learning-loop"]),
+    ("Momus", &["zen-vault-learning-loop"]),
     (
         "Oracle",
         &[
             "zen-entity-extraction",
-            "zen-knowledge-learning-loop",
+            "zen-vault-learning-loop",
             "zen-contradiction-detection",
         ],
     ),
@@ -42,12 +42,12 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
         "Prometheus",
         &["zen-wiki-compilation", "zen-entity-extraction"],
     ),
-    ("Explore", &["zen-knowledge-learning-loop"]),
+    ("Explore", &["zen-vault-learning-loop"]),
     (
         "Librarian",
-        &["zen-wiki-compilation", "zen-knowledge-learning-loop"],
+        &["zen-wiki-compilation", "zen-vault-learning-loop"],
     ),
-    ("Argus", &["zen-knowledge-learning-loop"]),
+    ("Argus", &["zen-vault-learning-loop"]),
     (
         "Hephaestus",
         &[

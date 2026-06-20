@@ -50,7 +50,7 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
     }
 
     if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
-        use zen_knowledge::search::{SearchService, TierSelector};
+        use zen_vault::search::{SearchService, TierSelector};
         let service = SearchService::new();
         let tier = TierSelector::select_tier(message);
         let mut seen = std::collections::HashSet::new();

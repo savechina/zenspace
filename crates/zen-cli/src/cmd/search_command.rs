@@ -6,7 +6,7 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_knowledge::search::{SearchResult, SearchService};
+use zen_vault::search::{SearchResult, SearchService};
 
 #[derive(Subcommand)]
 pub enum SearchCommands {
