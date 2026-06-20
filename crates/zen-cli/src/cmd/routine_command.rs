@@ -8,7 +8,7 @@ use zen_core::errors::ZenError;
 pub enum RoutineCommands {
     /// List all registered scheduler workers
     List,
-    /// Trigger a worker by name immediately (e.g. "dream", "daily-log", "subconscious")
+    /// Trigger a worker by name immediately (e.g. "dream", "journal-worker", "subconscious")
     Trigger {
         /// Worker name
         name: String,

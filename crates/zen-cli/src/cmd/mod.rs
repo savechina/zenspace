@@ -23,5 +23,6 @@ pub mod session_command;
 pub mod similar_command;
 pub mod starter_command;
 pub mod task_command;
+pub mod wiki_command;
 pub mod workspace_command;
 pub mod wps_command;

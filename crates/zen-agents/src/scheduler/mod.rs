@@ -63,7 +63,7 @@ pub struct WorkerReport {
 /// in the agent system — every "thing that does work" gets a `Zen` prefix.
 #[async_trait::async_trait]
 pub trait ZenWorker: Send + Sync {
-    /// Unique identifier for this worker (e.g. `"daily-log"`, `"dream"`).
+    /// Unique identifier for this worker (e.g. `"journal-worker"`, `"dream"`).
     fn id(&self) -> &'static str;
 
     /// Human-readable description of what this worker does.
@@ -106,11 +106,11 @@ type RegisteredWorker = (String, Schedule, Arc<dyn ZenWorker>);
 /// # Example
 ///
 /// ```no_run
-/// use zen_agents::scheduler::{ZenScheduler, DailyLogWorker, DreamWorker};
+/// use zen_agents::scheduler::{ZenScheduler, JournalWorker, DreamWorker};
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let mut scheduler = ZenScheduler::new();
-/// scheduler.register(DailyLogWorker::new())?;
+/// scheduler.register(JournalWorker::new())?;
 /// scheduler.register(DreamWorker::new())?;
 ///
 /// // Run the event loop in a background task
@@ -271,20 +271,28 @@ pub struct WorkerSummary {
 /// TUI.
 ///
 /// Registers:
-/// - `daily-log`: runs every 5 minutes, checks daily log, updates MEMORY.md
+/// - `journal-worker` (JournalWorker): runs every 5 minutes, checks daily log, updates MEMORY.md
 /// - `subconscious`: runs every 5 minutes, evaluates workspace state
 /// - `dream`: runs 2-4AM, executes the nightly consolidation cycle
+/// - `session-journaler`: runs every 5 minutes, extracts journal entries from session conversations
+/// - `entity-extractor`: runs every 10 minutes, extracts entities from journal entries into graph.db
 pub fn create_default_scheduler() -> ZenScheduler {
     let mut scheduler = ZenScheduler::new();
 
-    if let Err(e) = scheduler.register(DailyLogWorker::new()) {
-        warn!("scheduler: failed to register daily-log worker: {e}");
+    if let Err(e) = scheduler.register(JournalWorker::new()) {
+        warn!("scheduler: failed to register journal-worker: {e}");
      }
     if let Err(e) = scheduler.register(SubconsciousWorker::new()) {
         warn!("scheduler: failed to register subconscious worker: {e}");
      }
     if let Err(e) = scheduler.register(DreamWorker::new()) {
         warn!("scheduler: failed to register dream worker: {e}");
+     }
+    if let Err(e) = scheduler.register(SessionJournaler::new()) {
+        warn!("scheduler: failed to register session-journaler worker: {e}");
+     }
+    if let Err(e) = scheduler.register(EntityExtractorWorker::new()) {
+        warn!("scheduler: failed to register entity-extractor worker: {e}");
      }
 
     scheduler
@@ -300,8 +308,8 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
     let dl_schedule = config
         .daily_log_schedule()
         .unwrap_or_else(|| default_daily_log_schedule().to_string());
-    if let Err(e) = scheduler.register(DailyLogWorker::new().with_schedule(&dl_schedule)) {
-        warn!("scheduler: failed to register daily-log worker: {e}");
+    if let Err(e) = scheduler.register(JournalWorker::new().with_schedule(&dl_schedule)) {
+        warn!("scheduler: failed to register journal-worker: {e}");
     }
 
     let sc_schedule = config
@@ -317,6 +325,14 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
         .unwrap_or_else(|| default_night_dream_schedule().to_string());
     if let Err(e) = scheduler.register(DreamWorker::new().with_schedule(&dream_schedule)) {
         warn!("scheduler: failed to register dream worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(SessionJournaler::new()) {
+        warn!("scheduler: failed to register session-journaler worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(EntityExtractorWorker::new()) {
+        warn!("scheduler: failed to register entity-extractor worker: {e}");
     }
 
     scheduler
@@ -406,9 +422,11 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 3);
-        assert!(items.iter().any(|w| w.id == "daily-log"));
+        assert_eq!(items.len(), 5);
+        assert!(items.iter().any(|w| w.id == "journal-worker"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
+        assert!(items.iter().any(|w| w.id == "session-journaler"));
+        assert!(items.iter().any(|w| w.id == "entity-extractor"));
     }
 }

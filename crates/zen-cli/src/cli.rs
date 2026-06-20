@@ -31,6 +31,7 @@ use crate::cmd::session_command::{self, SessionCommands};
 use crate::cmd::similar_command::{self, SimilarCommands};
 use crate::cmd::starter_command::{self, StarterCommands};
 use crate::cmd::task_command::{self, TaskCommands};
+use crate::cmd::wiki_command::{self, WikiCommands};
 use crate::cmd::workspace_command::{self, WorkspaceCommands};
 use crate::cmd::wps_command::{self, WpsCommands};
 
@@ -156,6 +157,10 @@ enum Commands {
         #[command(subcommand)]
         operation: TaskCommands,
     },
+    Wiki {
+        #[command(subcommand)]
+        operation: WikiCommands,
+    },
     Brief {
         #[command(subcommand)]
         operation: BriefCommands,
@@ -279,6 +284,7 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         }
         Commands::Ingest { ref operation } => ingest_command::execute_command(operation),
         Commands::Task { ref operation } => task_command::execute_command(operation),
+        Commands::Wiki { ref operation } => wiki_command::execute_command(operation),
         Commands::Routine { ref operation } => routine_command::execute_command(operation).await,
         Commands::Brief { ref operation } => brief_command::execute_command(operation),
         Commands::Model { ref operation } => model_command::execute_command(operation),

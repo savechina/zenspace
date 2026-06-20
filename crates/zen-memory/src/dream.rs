@@ -46,16 +46,16 @@ impl ZenDream {
 
         info!(fact_count = facts.len(), "extracted {} durable fact(s) for {date}", facts.len());
 
-        let memory_updated = update_memory_from_facts(zen_paths, &facts)?;
-
-        if memory_updated {
-            info!("MEMORY.md updated with {} new fact(s)", facts.len());
-        }
-
         let (knowledge_updated, wiki_pages_created) = update_knowledge(zen_paths, &facts);
         
         if knowledge_updated {
             info!(wiki_pages = wiki_pages_created, "Knowledge graph updated for {date}");
+        }
+
+        let memory_updated = update_memory_from_facts(zen_paths, &facts)?;
+
+        if memory_updated {
+            info!("MEMORY.md updated with {} new fact(s)", facts.len());
         }
 
         let report = DreamReport {
@@ -281,7 +281,10 @@ pub fn update_memory_from_facts(zen_paths: &ZenPaths, facts: &[String]) -> Resul
         update.push_str(&format!("- {fact}\n"));
     }
 
-    fs::write(&memory_path, format!("{content}{update}"))?;
+    let new_content = format!("{content}{update}");
+    let tmp_path = memory_path.with_extension("md.tmp");
+    fs::write(&tmp_path, &new_content)?;
+    fs::rename(&tmp_path, &memory_path)?;
 
     info!("MEMORY.md updated with {} new fact(s)", unique_facts.len());
     Ok(true)
@@ -299,11 +302,11 @@ fn dedupe_facts(facts: &[String]) -> Vec<String> {
 // ─── Step 3: Knowledge Graph Writes + Wiki Generation ───────────────────
 
 const TECH_KEYWORDS: &[&str] = &[
-    "Rust", "Python", "TypeScript", "JavaScript",
-    "CLIP", "LLM", "GPT", "OpenAI",
-    "Anthropic", "DeepSeek", "Gemini",
-    "Tokio", "async", "sqlite", "SQLite",
-    "FTS5", "vector", "embedding",
+    "rust", "python", "typescript", "javascript",
+    "clip", "llm", "gpt", "openai",
+    "anthropic", "deepseek", "gemini",
+    "tokio", "async", "sqlite",
+    "fts5", "vector", "embedding",
 ];
 
 /// Promote entity-aware facts to graph.db + generate wiki pages via WikiCompiler.
@@ -349,20 +352,21 @@ fn update_knowledge(zen_paths: &ZenPaths, facts: &[String]) -> (bool, usize) {
     let mut entity_index: HashMap<String, usize> = HashMap::new();
 
     for (name, fact_list) in &entity_facts {
-        let entity = Entity::new(name.clone(), EntityType::Technology, "dream-cycle");
+        let canonical = name.to_lowercase();
+        let entity = Entity::new(canonical.clone(), EntityType::Technology, "dream-cycle");
         if let Err(e) = svc.upsert_entity(&graph_db, &entity) {
-            error!(entity = %name, error = %e, "failed to upsert entity to graph.db");
+            error!(entity = %canonical, error = %e, "failed to upsert entity to graph.db");
             continue;
         }
-        entity_ids.insert(name.clone(), entity.id.clone());
-        debug!(entity = %name, fact_count = fact_list.len(), "upserted entity to graph.db");
+        entity_ids.insert(canonical.clone(), entity.id.clone());
+        debug!(entity = %canonical, fact_count = fact_list.len(), "upserted entity to graph.db");
 
         let entity_text = format!("{name}: {}", fact_list.join(" "));
         if let Err(e) = svc.store_entity_embedding(&vec_db, &entity.id, &entity_text) {
             debug!(entity = %name, error = %e, "failed to store entity embedding (non-fatal)");
         }
 
-        entity_index.insert(name.clone(), entity_data_list.len());
+        entity_index.insert(canonical.clone(), entity_data_list.len());
         entity_data_list.push(EntityData {
             entity,
             facts: fact_list.clone(),

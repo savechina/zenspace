@@ -126,6 +126,12 @@ impl ZenPaths {
         self.global_root.join(LOGS_DIR)
     }
 
+    /// Journal entries directory under memories.
+    /// `~/.zen/memories/journal/`
+    pub fn journal_entries(&self) -> PathBuf {
+        self.memory().join("journal")
+    }
+
     pub fn output(&self) -> PathBuf {
         self.workspace_root
             .as_ref()

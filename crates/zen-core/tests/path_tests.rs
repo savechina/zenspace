@@ -134,7 +134,7 @@ fn config_file_uses_global_when_no_workspace() {
 }
 
 #[test]
-fn knowledge_path_is_under_user_data() {
+fn vault_path_is_under_user_data() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "project");
     unsafe {
@@ -145,11 +145,11 @@ fn knowledge_path_is_under_user_data() {
     let kb = paths.vault();
     assert!(
         kb.starts_with(&ws),
-        "knowledge should be under workspace: {kb:?}"
+        "vault should be under workspace: {kb:?}"
     );
     assert!(
-        kb.ends_with("knowledge"),
-        "knowledge should end with 'knowledge': {kb:?}"
+        kb.ends_with("vault"),
+        "vault should end with 'knowledge': {kb:?}"
     );
 
     unsafe {
@@ -158,27 +158,27 @@ fn knowledge_path_is_under_user_data() {
 }
 
 #[test]
-fn inbox_is_under_knowledge() {
+fn inbox_is_under_vault() {
     let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let inbox = paths.inbox();
-    assert!(inbox.ends_with("knowledge/inbox"), "inbox path: {inbox:?}");
+    assert!(inbox.ends_with("vault/inbox"), "inbox path: {inbox:?}");
 }
 
 #[test]
-fn raw_is_under_knowledge() {
+fn raw_is_under_vault() {
     let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let raw = paths.raw();
-    assert!(raw.ends_with("knowledge/raw"), "raw path: {raw:?}");
+    assert!(raw.ends_with("vault/raw"), "raw path: {raw:?}");
 }
 
 #[test]
-fn wiki_is_under_knowledge() {
+fn wiki_is_under_vault() {
     let (_tmp, _home_path) = setup_zen_home();
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let wiki = paths.wiki();
-    assert!(wiki.ends_with("knowledge/wiki"), "wiki path: {wiki:?}");
+    assert!(wiki.ends_with("vault/wiki"), "wiki path: {wiki:?}");
 }
 
 #[test]
