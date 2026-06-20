@@ -138,7 +138,7 @@ zenspace/
 │   ├── zen-core/         # 配置/错误/路径/常量（13 个模块）
 │   ├── zen-provider/     # 多协议 LLM 路由（13 个提供商）
 │   ├── zen-vault/    # 笔记/Wiki/5 层搜索/实体提取
-│   ├── zen-data/         # SQLite 双 API（sqlx + rusqlite）
+│   ├── zen-repo/         # SQLite 双 API（sqlx + rusqlite）
 │   ├── zen-agents/       # 13 个 Agent/4 层架构/黑板系统
 │   ├── zen-memory/       # 身份上下文（SOUL.md/MEMORY.md）
 │   ├── zen-auth/         # macOS Keychain 凭证管理

@@ -6,7 +6,7 @@ description = "Knowledge domain — note, wiki, search, consolidation"
 
 [dependencies]
 zen-core = { path = "../zen-core" }
-zen-data = { path = "../zen-data" }
+zen-repo = { path = "../zen-repo" }
 zen-provider = { path = "../zen-provider" }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

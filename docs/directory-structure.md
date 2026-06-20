@@ -71,7 +71,7 @@ zenspace/
 │   │   ├── linter.rs        # Linter (orphans, broken wikilinks)
 │   │   ├── ingester.rs      # SourceIngester
 │   │   └── wiki.rs          # Wiki page management
-│   ├── zen-data/src/
+│   ├── zen-repo/src/
 │   │   ├── entity.rs        # SQLite entities (Note, Session, etc.)
 │   │   └── repository.rs    # SQLite repositories
 │   ├── zen-memory/src/

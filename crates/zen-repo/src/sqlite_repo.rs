@@ -160,7 +160,7 @@ pub fn init_vec_schema(repo: &SqliteRepo) -> Result<()> {
             SqliteError::VecExtensionMissing(
                 "sqlite-vec extension not loaded. \
                  Call load_vec_extension() before init_vec_schema(), \
-                 or see crates/zen-data/src/sqlite_repo.rs for setup instructions."
+                 or see crates/zen-repo/src/sqlite_repo.rs for setup instructions."
                     .into(),
             )
         } else {

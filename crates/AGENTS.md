@@ -10,14 +10,14 @@ crates/
 ├── zen-core/      # Domain primitives
 ├── zen-service/   # Business logic
 ├── zen-gateway/   # API gateway (placeholder)
-├── zen-data/      # Data layer (placeholder)
+├── zen-repo/      # Data layer (placeholder)
 └── zen-provider/       # LLM transport (placeholder)
 ```
 
 ## DEPENDENCY GRAPH
 
 ```
-zen-cli → zen-service → zen-gateway → zen-data
+zen-cli → zen-service → zen-gateway → zen-repo
     ↓           ↓            ↓
 zen-core ← zen-core ← zen-core
 ```
@@ -53,7 +53,7 @@ zen-core ← zen-core ← zen-core
 - Current: 27-line stub (`Gateway::start/stop`)
 - Planned: Async API gateway for HTTP/WebSocket
 
-### zen-data (Placeholder)
+### zen-repo (Placeholder)
 - Current: 3 files (lib.rs, entity.rs, starter_repository.rs)
 - Planned: SQLx repositories, entity definitions
 

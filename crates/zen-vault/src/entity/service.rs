@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rusqlite::params;
 
-use zen_data::sqlite_repo::{SqliteRepo, init_graph_schema};
+use zen_repo::sqlite_repo::{SqliteRepo, init_graph_schema};
 
 use crate::maintenance::compute_embeddings_for_text;
 use crate::search::Tier3Search;

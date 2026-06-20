@@ -85,7 +85,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | zen-cli | CLI library (24 commands, TUI, dispatch) | `crates/zen-cli/` |
 | zen-core | Config layers, error taxonomy, path scoping, constants (13 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
-| zen-data | Dual API: sqlx repository + rusqlite schema (FTS5, vec0) | `crates/zen-data/` |
+| zen-repo | Dual API: sqlx repository + rusqlite schema (FTS5, vec0) | `crates/zen-repo/` |
 | zen-vault | 10+ services: note, wiki, 5-tier search, consolidation, lint | `crates/zen-vault/` |
 | zen-memory | Identity context (SOUL.md, MEMORY.md, store, stats) | `crates/zen-memory/` |
 | zen-agents | 13 agents, 4-tier registry, blackboard, QualityPipeline | `crates/zen-agents/` |
@@ -101,7 +101,7 @@ zen (binary)            -- 13-line main.rs -- loads .env, config, calls zen_cli:
  └── zen-cli (library)  -- clap Parser, TUI (ratatui), command dispatcher
       ├── zen-service   → zen-core
       ├── zen-gateway   → zen-core
-      ├── zen-vault → zen-data   → zen-core
+      ├── zen-vault → zen-repo   → zen-core
       │                 └── zen-provider → zen-auth → zen-core
       ├── zen-agents    → zen-memory → zen-core
       │                 └── zen-provider
@@ -125,7 +125,7 @@ zen-provider → zen-core
 ### Data Flow
 
 ```
-zen note create → zen-vault (note service) → zen-data (sqlx repository)
+zen note create → zen-vault (note service) → zen-repo (sqlx repository)
 zen search run  → zen-vault (SearchService) → tier routing → ripgrep/FTS5/vec0/graph/LLM
 zen ingest      → zen-vault (raw directory) → IngestResult → consolidation
 zen consolidate → zen-vault (ConsolidationPipeline) → zen-provider (entity extraction)
@@ -163,7 +163,7 @@ zenspace/
 │   │       ├── sanitize.rs     # Output sanitization
 │   │       └── definition.rs   # AgentDefinition
 │   ├── zen-service/            # Business logic (starter, wps, cleanup)
-│   ├── zen-data/               # Dual API data layer
+│   ├── zen-repo/               # Dual API data layer
 │   │   └── src/
 │   │       ├── pool.rs         # sqlx SqlitePool + create_pool()
 │   │       ├── schema.rs       # sqlx migrations (notes, agent_profiles, audit_logs)
@@ -236,12 +236,12 @@ zenspace/
 
 | Task | Location | Notes |
 |------|----------|-------|
-| Add sqlx model | `crates/zen-data/src/models.rs` + `schema.rs` | Then implement repository trait |
-| Add repository trait | `crates/zen-data/src/repositories.rs` | Define async trait interface |
-| Implement repository | `crates/zen-data/src/repo_impl.rs` | SqliteXxxRepository impl |
-| Modify FTS5 schema | `crates/zen-data/src/sqlite_repo.rs` | init_kb_schema() |
-| Modify vec0 schema | `crates/zen-data/src/sqlite_repo.rs` | init_vec_schema() |
-| Modify graph schema | `crates/zen-data/src/sqlite_repo.rs` | init_graph_schema() |
+| Add sqlx model | `crates/zen-repo/src/models.rs` + `schema.rs` | Then implement repository trait |
+| Add repository trait | `crates/zen-repo/src/repositories.rs` | Define async trait interface |
+| Implement repository | `crates/zen-repo/src/repo_impl.rs` | SqliteXxxRepository impl |
+| Modify FTS5 schema | `crates/zen-repo/src/sqlite_repo.rs` | init_kb_schema() |
+| Modify vec0 schema | `crates/zen-repo/src/sqlite_repo.rs` | init_vec_schema() |
+| Modify graph schema | `crates/zen-repo/src/sqlite_repo.rs` | init_graph_schema() |
 
 ### Knowledge Services
 
@@ -417,7 +417,7 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 ## NOTES
 
 - Project uses Rust edition 2024 (stable toolchain, MSRV 1.80+)
-- Gateway/Data crates are active: zen-data has full sqlx + rusqlite dual API; zen-gateway is still a placeholder
+- Gateway/Data crates are active: zen-repo has full sqlx + rusqlite dual API; zen-gateway is still a placeholder
 - `docs/specs/001-agentic-foundation/` has extensive architecture docs (~400KB)
 - Karpathy guidelines skill installed at `.opencode/skills/karpathy-guidelines/`
 - zen-llm exists in directory but is not a workspace member (staged for integration)

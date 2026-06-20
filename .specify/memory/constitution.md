@@ -111,7 +111,7 @@ Rationale: Selected for CLI tool suitability, runtime performance, and developer
 - All code changes MUST pass `cargo clippy` and `cargo fmt`
 - All public APIs MUST include documentation comments
 - Integration tests MUST cover CLI command execution
-- **Workspace structure**: zen-cli is the binary crate (no lib.rs). Domain crates (zen-core, zen-service, zen-data, zen-gateway, zen-provider) are library crates with lib.rs for DDD architecture. This separation enables reusable domain logic while maintaining a single CLI entry point.
+- **Workspace structure**: zen-cli is the binary crate (no lib.rs). Domain crates (zen-core, zen-service, zen-repo, zen-gateway, zen-provider) are library crates with lib.rs for DDD architecture. This separation enables reusable domain logic while maintaining a single CLI entry point.
 
 Rationale: Enforces code quality and maintains project structure conventions. DDD architecture requires domain separation via library crates.
 

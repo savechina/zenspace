@@ -1,6 +1,6 @@
 use sqlx::sqlite::SqlitePool;
 
-/// All table creation SQL for the zen-data Phase 2 repository layer.
+/// All table creation SQL for the zen-repo Phase 2 repository layer.
 /// Run on first connection via `migrate(pool)`.
 pub static NOTES_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS notes (

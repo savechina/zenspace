@@ -1,5 +1,5 @@
 // ============================================================================
-// 4D Test Suite: zen-data repository integration
+// 4D Test Suite: zen-repo repository integration
 //
 // Dimensions:
 //   NORMAL       — Create, read, list operations with valid data
@@ -9,7 +9,7 @@
 // ============================================================================
 
 use zen_core::types::Sensitivity;
-use zen_data::{Note, NoteRepository, SqliteNoteRepository};
+use zen_repo::{Note, NoteRepository, SqliteNoteRepository};
 
 async fn setup_test_db() -> sqlx::SqlitePool {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -17,7 +17,7 @@ async fn setup_test_db() -> sqlx::SqlitePool {
         .connect("sqlite://:memory:")
         .await
         .expect("Failed to create in-memory pool");
-    zen_data::schema::migrate(&pool)
+    zen_repo::schema::migrate(&pool)
         .await
         .expect("Failed to migrate schema");
     pool

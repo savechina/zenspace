@@ -1,5 +1,5 @@
 [package]
-name = "zen-data"
+name = "zen-repo"
 version.workspace = true
 edition.workspace = true
 

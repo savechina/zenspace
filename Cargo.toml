@@ -3,7 +3,7 @@ members = [
     "crates/zen",
     "crates/zen-cli",
     "crates/zen-core",
-    "crates/zen-data",
+    "crates/zen-repo",
     "crates/zen-auth",
     "crates/zen-vault",
     "crates/zen-memory",
