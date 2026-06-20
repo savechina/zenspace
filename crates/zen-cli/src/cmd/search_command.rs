@@ -68,7 +68,7 @@ pub fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
             );
 
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let base_dir = paths.knowledge();
+            let base_dir = paths.vault();
             let service = SearchService::new();
 
             let results = service

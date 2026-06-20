@@ -142,7 +142,7 @@ fn knowledge_path_is_under_user_data() {
     }
 
     let paths = ZenPaths::detect().expect("detect() should succeed");
-    let kb = paths.knowledge();
+    let kb = paths.vault();
     assert!(
         kb.starts_with(&ws),
         "knowledge should be under workspace: {kb:?}"
@@ -475,7 +475,7 @@ fn user_data_differs_by_workspace() {
 
 #[test]
 fn knowledge_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.knowledge());
+    assert_path_differs_by_workspace(|p| p.vault());
 }
 
 #[test]

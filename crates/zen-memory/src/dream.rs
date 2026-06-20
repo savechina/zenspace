@@ -311,7 +311,7 @@ const TECH_KEYWORDS: &[&str] = &[
 fn update_knowledge(zen_paths: &ZenPaths, facts: &[String]) -> (bool, usize) {
     let graph_db = zen_paths.db().join("graph.db");
     let vec_db = zen_paths.db().join("vec.db");
-    let wiki_dir = zen_paths.knowledge().join("wiki");
+    let wiki_dir = zen_paths.vault().join("wiki");
     let svc = EntityService::new();
 
     let mut known: HashSet<String> = svc
