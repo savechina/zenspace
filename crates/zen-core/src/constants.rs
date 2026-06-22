@@ -9,20 +9,29 @@ pub const ASSETS_DIR: &str = "assets/";
 pub const TEMPLATES_DIR: &str = "templates/";
 pub const DB_DIR: &str = "data/";
 pub const SESSIONS_DIR: &str = "sessions/";
+
 pub const VAULT_DIR: &str = "vault/";
 pub const INBOX_DIR: &str = "inbox/";
 pub const RAW_DIR: &str = "raw/";
 pub const WIKI_DIR: &str = "wiki/";
 pub const SKILLS_DIR: &str = "skills/";
 pub const FINANCE_DIR: &str = "finance/";
+
 pub const CACHE_DIR: &str = "cache/";
 pub const MEMORY_DIR: &str = "memories/";
 pub const IDENTITY_DIR: &str = "memories/";
+pub const PROMPTS_DIR: &str = "prompts/";
+
 pub const LOGS_DIR: &str = "logs/";
 pub const OUTPUT_DIR: &str = "output/";
 pub const PLUGINS_DIR: &str = "plugins/";
+pub const TODOS_DIR: &str = "todos/";
+pub const PLANS_DIR: &str = "plans/";
+
 pub const CONFIG_FILE: &str = "config.toml";
 pub const HISTORY_FILE: &str = "history.jsonl";
+
+pub const AGENTS_FILE: &str = "AGENTS.md";
 
 pub const HISTORY_DEFAULT_MAX_BYTES: u64 = 1_048_576; // 1MB
 pub const HISTORY_SOFT_CAP_RATIO: f64 = 0.8; // trim to 80% when exceeded
