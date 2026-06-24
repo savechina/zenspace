@@ -12,6 +12,7 @@ use zen_provider::{DefaultRouter, LlmRouterExt};
 use zen_vault::entity::{Entity, EntityService, EntityType};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
+use super::marker_state::JournalEntryState;
 
 const TECH_KEYWORDS: &[&str] = &[
     "Rust", "Python", "TypeScript", "JavaScript",
@@ -21,7 +22,6 @@ const TECH_KEYWORDS: &[&str] = &[
     "FTS5", "vector", "embedding",
 ];
 
-const MARKER_PREFIX: &str = "extracted_at:";
 const MIN_CONTENT_LEN: usize = 20;
 
 pub struct EntityExtractorWorker {
@@ -352,38 +352,19 @@ fn scan_journal_entries(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>
 }
 
 fn has_extracted_marker(entry_path: &std::path::Path) -> bool {
-    let content = match fs::read_to_string(entry_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    for line in content.lines().take(15) {
-        if line.trim().starts_with(MARKER_PREFIX) {
-            return true;
-        }
+    if JournalEntryState::has_extracted(entry_path) {
+        return true;
     }
-    false
+    JournalEntryState::migrate_from_frontmatter(entry_path) && JournalEntryState::has_extracted(entry_path)
 }
 
 fn append_extracted_marker(entry_path: &std::path::Path, source: &str) -> Result<()> {
-    let content = fs::read_to_string(entry_path)
-        .with_context(|| format!("failed to read journal entry: {}", entry_path.display()))?;
-
-    let now = Utc::now().to_rfc3339();
-    let marker_line = format!("extracted_at: {now}\nextraction_source: {source}\n");
-
-    let new_content = if let Some(end) = content.find("\n---\n") {
-        let insert_pos = end + 5;
-        let (before, after) = content.split_at(insert_pos);
-        format!("{}{}{}", before, marker_line, after)
-    } else {
-        format!("{marker_line}{content}")
+    let state = JournalEntryState {
+        extracted_at: Some(Utc::now().to_rfc3339()),
+        extraction_source: Some(source.to_string()),
+        ..Default::default()
     };
-
-    fs::write(entry_path, new_content)
-        .with_context(|| format!("failed to write extracted marker: {}", entry_path.display()))?;
-
-    Ok(())
+    state.save(entry_path)
 }
 
 fn append_llm_entities_to_journal(
@@ -457,8 +438,15 @@ mod tests {
     fn test_has_extracted_marker_found() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.md");
-        let content = "---\nsession_id: test\ndate: 2026-06-20\nextracted_at: 2026-06-20T14:30:00Z\n---\n\ncontent\n";
-        fs::write(&path, content).unwrap();
+        fs::write(&path, "---\nsession_id: test\ndate: 2026-06-20\n---\n\ncontent\n").unwrap();
+
+        let state = JournalEntryState {
+            extracted_at: Some("2026-06-20T14:30:00Z".to_string()),
+            extraction_source: Some("llm".to_string()),
+            ..Default::default()
+        };
+        state.save(&path).unwrap();
+
         assert!(has_extracted_marker(&path));
     }
 
@@ -497,8 +485,8 @@ mod tests {
 
         append_extracted_marker(&path, "llm").unwrap();
 
-        let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("extracted_at:"));
-        assert!(content.contains("extraction_source: llm"));
+        let state = JournalEntryState::load(&path);
+        assert!(state.extracted_at.is_some());
+        assert_eq!(state.extraction_source.as_deref(), Some("llm"));
     }
 }

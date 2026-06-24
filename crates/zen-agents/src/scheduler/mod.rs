@@ -276,6 +276,7 @@ pub struct WorkerSummary {
 /// - `dream`: runs 2-4AM, executes the nightly consolidation cycle
 /// - `session-journaler`: runs every 5 minutes, extracts journal entries from session conversations
 /// - `entity-extractor`: runs every 10 minutes, extracts entities from journal entries into graph.db
+/// - `wiki-compiler`: runs every 30 minutes, compiles wiki pages from graph.db entities
 pub fn create_default_scheduler() -> ZenScheduler {
     let mut scheduler = ZenScheduler::new();
 
@@ -293,6 +294,9 @@ pub fn create_default_scheduler() -> ZenScheduler {
      }
     if let Err(e) = scheduler.register(EntityExtractorWorker::new()) {
         warn!("scheduler: failed to register entity-extractor worker: {e}");
+     }
+    if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
+        warn!("scheduler: failed to register wiki-compiler worker: {e}");
      }
 
     scheduler
@@ -333,6 +337,10 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
 
     if let Err(e) = scheduler.register(EntityExtractorWorker::new()) {
         warn!("scheduler: failed to register entity-extractor worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
+        warn!("scheduler: failed to register wiki-compiler worker: {e}");
     }
 
     scheduler
@@ -422,11 +430,12 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 5);
+        assert_eq!(items.len(), 6);
         assert!(items.iter().any(|w| w.id == "journal-worker"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
         assert!(items.iter().any(|w| w.id == "session-journaler"));
         assert!(items.iter().any(|w| w.id == "entity-extractor"));
+        assert!(items.iter().any(|w| w.id == "wiki-compiler"));
     }
 }

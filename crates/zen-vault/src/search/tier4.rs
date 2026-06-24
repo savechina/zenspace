@@ -53,7 +53,15 @@ impl Tier4Search {
                 CHECK(source_entity_id != target_entity_id)
             );
             CREATE INDEX IF NOT EXISTS idx_rel_source ON relationships(source_entity_id);
-            CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_entity_id);",
+            CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_entity_id);
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                alias TEXT NOT NULL,
+                canonical_entity_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (alias, canonical_entity_id),
+                FOREIGN KEY (canonical_entity_id) REFERENCES entities(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_aliases_lookup ON entity_aliases(alias);",
         )?;
         Ok(conn)
     }
@@ -160,6 +168,7 @@ impl Tier4Search {
         Ok(graph_results)
     }
 
+    // TODO: route through EntityService::upsert_entity for alias normalization
     pub fn insert_entity(
         &self,
         db_path: &Path,

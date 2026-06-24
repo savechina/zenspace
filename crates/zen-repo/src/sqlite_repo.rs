@@ -227,6 +227,16 @@ pub fn init_graph_schema(repo: &SqliteRepo) -> Result<()> {
         -- Indexes for dispatch task queries
         CREATE INDEX IF NOT EXISTS idx_dispatch_status ON dispatch_tasks(status);
         CREATE INDEX IF NOT EXISTS idx_dispatch_created ON dispatch_tasks(created_at);
+
+        -- Entity alias resolution (Phase A.1): maps normalized names to canonical entities
+        CREATE TABLE IF NOT EXISTS entity_aliases (
+            alias TEXT NOT NULL,
+            canonical_entity_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (alias, canonical_entity_id),
+            FOREIGN KEY (canonical_entity_id) REFERENCES entities(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_aliases_lookup ON entity_aliases(alias);
         "#,
     )
 }

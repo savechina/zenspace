@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -9,13 +8,12 @@ use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
 use zen_core::types::Sensitivity;
 use zen_memory::conversation::ConversationStore;
-use zen_memory::dream::extract_durable_facts_from_entry;
+use zen_memory::dream::{ExtractedSignals, extract_durable_facts_from_entry};
 use zen_provider::{DefaultRouter, LlmRouterExt};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
+use super::marker_state::SessionState;
 
-const MARKER_PREFIX: &str = r#"{"type":"system/journaled""#;
-const MARKER_SEARCH_BYTES: usize = 200;
 const MIN_TURNS: usize = 3;
 
 pub struct SessionJournaler {
@@ -142,37 +140,37 @@ async fn process_session(
 
     let conversation_text = build_conversation_text(&turns);
 
-    let (facts, source) = if let Some(router) = router {
-        match extract_facts_via_llm(&conversation_text, router).await {
-            Ok(llm_facts) if !llm_facts.is_empty() => {
-                info!(session_id = %session_id, count = llm_facts.len(), "LLM fact extraction succeeded");
-                (llm_facts, "llm")
+    let (signals, source) = if let Some(router) = router {
+        match extract_signals_via_llm(&conversation_text, router).await {
+            Ok(llm_signals) if !llm_signals.is_empty() => {
+                info!(session_id = %session_id, total = llm_signals.total(), "LLM signal extraction succeeded");
+                (llm_signals, "llm")
             }
             Ok(_) => {
-                debug!(session_id = %session_id, "LLM returned no facts, falling back to keyword");
-                (extract_durable_facts_from_entry(&conversation_text), "keyword")
+                debug!(session_id = %session_id, "LLM returned no signals, falling back to keyword");
+                (extract_signals_via_keyword(&conversation_text), "keyword")
             }
             Err(e) => {
                 warn!(session_id = %session_id, error = %e, "LLM extraction failed, falling back to keyword");
-                (extract_durable_facts_from_entry(&conversation_text), "keyword")
+                (extract_signals_via_keyword(&conversation_text), "keyword")
             }
         }
     } else {
-        (extract_durable_facts_from_entry(&conversation_text), "keyword")
+        (extract_signals_via_keyword(&conversation_text), "keyword")
     };
 
-    let journal_content = build_journal_entry(session_id, turns.len(), &facts, source);
+    let journal_content = build_journal_entry(session_id, turns.len(), &signals, source);
     write_journal_entry(paths, session_id, &journal_content)?;
 
     append_journaled_marker(jsonl_path, source)?;
 
-    Ok(facts.len())
+    Ok(signals.total())
 }
 
-async fn extract_facts_via_llm(
+async fn extract_signals_via_llm(
     conversation_text: &str,
     router: DefaultRouter,
-) -> Result<Vec<String>> {
+) -> Result<ExtractedSignals> {
     let truncated = if conversation_text.len() > 12000 {
         let end = conversation_text
             .char_indices()
@@ -185,7 +183,7 @@ async fn extract_facts_via_llm(
     };
 
     let prompt = format!(
-        r#"Extract durable facts from this development session conversation. Durable facts are insights, decisions, problems solved, techniques learned, or architectural choices that remain useful after 6 months.
+        r#"Extract typed signals from this development session conversation.
 
 Conversation:
 {truncated}
@@ -194,24 +192,32 @@ Respond with ONLY a JSON object:
 {{
   "facts": [
     "Implemented JWT authentication with refresh token rotation",
-    "Decided to use SQLite for local storage instead of PostgreSQL",
-    "Fixed race condition in the session journaler marker check",
-    "Learned that floor_char_boundary() prevents UTF-8 slice panics"
+    "Decided to use SQLite for local storage instead of PostgreSQL"
+  ],
+  "reflections": [
+    "The login flow is too complex — users get confused at step 3",
+    "Should have tested the migration on a copy first"
+  ],
+  "commitments": [
+    "Simplify login to 2 steps by 2026-07-01",
+    "Write integration tests for the auth module this week"
   ]
 }}
 
 Rules:
-- Facts MUST be past-tense, specific, and durable — useful after 6 months
+- **Facts**: past-tense, specific, durable — useful after 6 months. Technical decisions, bug fixes, learnings.
+- **Reflections**: what went wrong, what could be better, what surprised you. Self-critical, honest.
+- **Commitments**: what you (the user) plan to do next. Include a rough timeframe if mentioned.
 - Do NOT include transient mechanics ("user asked about X", "assistant replied")
-- Include technical decisions, bug fixes, architectural choices, and learnings
-- If nothing durable happened, return empty array"#
+- If a category is empty, return an empty array for it
+- If nothing of value happened in any category, return all empty arrays"#
     );
 
     let response = tokio::task::spawn_blocking(move || {
-        router.complete("fact_extraction", &prompt, Sensitivity::Private)
+        router.complete("signal_extraction", &prompt, Sensitivity::Private)
     })
     .await
-    .context("LLM fact extraction task panicked")??;
+    .context("LLM signal extraction task panicked")??;
 
     let json_str = if let Some(start) = response.find("```json") {
         let after = &response[start + 7..];
@@ -223,21 +229,53 @@ Rules:
     };
 
     let parsed: serde_json::Value = serde_json::from_str(json_str.trim())
-        .context("failed to parse LLM fact extraction response")?;
+        .context("failed to parse LLM signal extraction response")?;
 
-    let mut facts = Vec::new();
+    let mut signals = ExtractedSignals::default();
+
     if let Some(arr) = parsed["facts"].as_array() {
         for item in arr {
-            if let Some(fact) = item.as_str() {
-                let f = fact.trim().to_string();
-                if !f.is_empty() && f != "No durable facts extracted." {
-                    facts.push(f);
+            if let Some(s) = item.as_str() {
+                let s = s.trim();
+                if !s.is_empty() && s != "No durable facts extracted." {
+                    signals.facts.push(s.to_string());
                 }
             }
         }
     }
 
-    Ok(facts)
+    if let Some(arr) = parsed["reflections"].as_array() {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let s = s.trim();
+                if !s.is_empty() {
+                    signals.reflections.push(s.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(arr) = parsed["commitments"].as_array() {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let s = s.trim();
+                if !s.is_empty() {
+                    signals.commitments.push(s.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(signals)
+}
+
+fn extract_signals_via_keyword(conversation_text: &str) -> ExtractedSignals {
+    let facts = extract_durable_facts_from_entry(conversation_text);
+    ExtractedSignals {
+        facts,
+        reflections: Vec::new(),
+        commitments: Vec::new(),
+    }
 }
 
 fn build_conversation_text(turns: &[(String, String)]) -> String {
@@ -248,21 +286,41 @@ fn build_conversation_text(turns: &[(String, String)]) -> String {
     text
 }
 
-fn build_journal_entry(session_id: &str, turn_count: usize, facts: &[String], source: &str) -> String {
+fn build_journal_entry(session_id: &str, turn_count: usize, signals: &ExtractedSignals, source: &str) -> String {
     let now = Utc::now();
     let date_str = now.format("%Y-%m-%d").to_string();
     let timestamp_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let mut entry = format!(
-        "---\nsession_id: {session_id}\ndate: {date_str}\nturn_count: {turn_count}\njournaled_at: {timestamp_str}\nsource: {source}\n---\n\n# Session Journal — {timestamp_str}\n\n"
+        "---\nsession_id: {session_id}\ndate: {date_str}\nturn_count: {turn_count}\nsource: {source}\n---\n\n# Session Journal — {timestamp_str}\n\n"
     );
 
     entry.push_str("## Facts\n\n");
-    if facts.is_empty() {
-        entry.push_str("_(no durable facts extracted)_\n");
+    if signals.facts.is_empty() {
+        entry.push_str("_(no durable facts extracted)_\n\n");
     } else {
-        for fact in facts {
+        for fact in &signals.facts {
             entry.push_str(&format!("- {fact}\n"));
+        }
+        entry.push('\n');
+    }
+
+    entry.push_str("## Reflections\n\n");
+    if signals.reflections.is_empty() {
+        entry.push_str("_(no reflections extracted)_\n\n");
+    } else {
+        for refl in &signals.reflections {
+            entry.push_str(&format!("- {refl}\n"));
+        }
+        entry.push('\n');
+    }
+
+    entry.push_str("## Commitments\n\n");
+    if signals.commitments.is_empty() {
+        entry.push_str("_(no commitments extracted)_\n");
+    } else {
+        for comm in &signals.commitments {
+            entry.push_str(&format!("- {comm}\n"));
         }
     }
 
@@ -286,34 +344,16 @@ fn write_journal_entry(paths: &ZenPaths, session_id: &str, content: &str) -> Res
 }
 
 fn append_journaled_marker(jsonl_path: &std::path::Path, source: &str) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    let marker = format!(
-        r#"{{"type":"system/journaled","payload":{{"timestamp":"{now}","source":"{source}"}}}}"#
-    );
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(jsonl_path)
-        .with_context(|| format!("failed to open session file for marker: {}", jsonl_path.display()))?;
-
-    writeln!(file, "{marker}")?;
-    Ok(())
+    let state = SessionState {
+        journaled: true,
+        journaled_at: Some(Utc::now().to_rfc3339()),
+        journaled_source: Some(source.to_string()),
+    };
+    state.save(jsonl_path)
 }
 
 fn has_journaled_marker(jsonl_path: &std::path::Path) -> bool {
-    let content = match fs::read_to_string(jsonl_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    if content.len() <= MARKER_SEARCH_BYTES {
-        return content.contains(MARKER_PREFIX);
-    }
-
-    let tail_start = content
-        .floor_char_boundary(content.len().saturating_sub(MARKER_SEARCH_BYTES));
-    content[tail_start..].contains(MARKER_PREFIX)
+    SessionState::is_journaled(jsonl_path)
 }
 
 fn scan_jsonl_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
@@ -354,22 +394,20 @@ fn extract_session_id(jsonl_path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[allow(unused_imports)]
     use std::io::Write as _;
 
-    fn write_marker(path: &std::path::Path) {
-        let marker = r#"{"type":"system/journaled","payload":{"timestamp":"2026-06-20T14:30:00Z","source":"keyword"}}"#;
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
-        writeln!(file, "{marker}").unwrap();
-    }
-
     #[test]
-    fn test_has_journaled_marker_found() {
+    fn test_has_journaled_marker_via_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
-
         fs::write(&path, "{\"type\":\"session/meta\"}\n").unwrap();
-        write_marker(&path);
+
+        let state = SessionState {
+            journaled: true,
+            journaled_at: Some("2026-06-20T14:30:00Z".to_string()),
+            journaled_source: Some("keyword".to_string()),
+        };
+        state.save(&path).unwrap();
 
         assert!(has_journaled_marker(&path));
     }
@@ -378,7 +416,6 @@ mod tests {
     fn test_has_journaled_marker_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
-
         fs::write(&path, "{\"type\":\"session/meta\"}\n{\"type\":\"chat/turn\"}\n").unwrap();
 
         assert!(!has_journaled_marker(&path));
@@ -388,7 +425,6 @@ mod tests {
     fn test_has_journaled_marker_empty_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
-
         fs::write(&path, "").unwrap();
 
         assert!(!has_journaled_marker(&path));
@@ -404,24 +440,63 @@ mod tests {
     fn test_build_journal_entry() {
         let session_id = "01JX0TEST000000000000000000";
         let turn_count = 5;
-        let facts = vec!["completed auth module".to_string(), "fixed login bug".to_string()];
+        let signals = ExtractedSignals {
+            facts: vec!["completed auth module".to_string(), "fixed login bug".to_string()],
+            reflections: vec![],
+            commitments: vec![],
+        };
 
-        let entry = build_journal_entry(session_id, turn_count, &facts, "keyword");
+        let entry = build_journal_entry(session_id, turn_count, &signals, "keyword");
 
         assert!(entry.contains("session_id: 01JX0TEST000000000000000000"));
         assert!(entry.contains("turn_count: 5"));
         assert!(entry.contains("source: keyword"));
+        assert!(!entry.contains("journaled_at:"));
         assert!(entry.contains("completed auth module"));
         assert!(entry.contains("fixed login bug"));
         assert!(entry.contains("## Facts"));
+        assert!(entry.contains("## Reflections"));
+        assert!(entry.contains("## Commitments"));
     }
 
     #[test]
-    fn test_build_journal_entry_empty_facts() {
+    fn test_build_journal_entry_empty_signals() {
         let session_id = "01JX0TEST000000000000000000";
-        let entry = build_journal_entry(session_id, 3, &[], "keyword");
+        let signals = ExtractedSignals::default();
+        let entry = build_journal_entry(session_id, 3, &signals, "keyword");
 
         assert!(entry.contains("_(no durable facts extracted)_"));
+        assert!(entry.contains("_(no reflections extracted)_"));
+        assert!(entry.contains("_(no commitments extracted)_"));
+    }
+
+    #[test]
+    fn test_build_journal_entry_all_sections() {
+        let session_id = "01JX0TEST000000000000000000";
+        let signals = ExtractedSignals {
+            facts: vec!["implemented auth".to_string()],
+            reflections: vec!["login flow too complex".to_string()],
+            commitments: vec!["simplify login by July".to_string()],
+        };
+        let entry = build_journal_entry(session_id, 10, &signals, "llm");
+
+        assert!(entry.contains("## Facts"));
+        assert!(entry.contains("- implemented auth"));
+        assert!(entry.contains("## Reflections"));
+        assert!(entry.contains("- login flow too complex"));
+        assert!(entry.contains("## Commitments"));
+        assert!(entry.contains("- simplify login by July"));
+        assert!(entry.contains("source: llm"));
+    }
+
+    #[test]
+    fn test_keyword_fallback_returns_facts_only() {
+        let conversation = "user: completed the auth module\nassistant: great";
+        let signals = extract_signals_via_keyword(conversation);
+
+        assert!(!signals.facts.is_empty(), "keyword should extract facts");
+        assert!(signals.reflections.is_empty(), "keyword returns no reflections");
+        assert!(signals.commitments.is_empty(), "keyword returns no commitments");
     }
 
     #[test]

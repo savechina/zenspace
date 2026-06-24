@@ -50,6 +50,10 @@ impl ZenPaths {
         })
     }
 
+    pub fn for_testing(global_root: PathBuf) -> Self {
+        Self { global_root, workspace_root: None }
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.workspace_root
             .as_ref()
