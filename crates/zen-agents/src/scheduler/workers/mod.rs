@@ -7,6 +7,7 @@ pub mod reflection;
 pub mod session_journaler;
 pub mod subconscious;
 pub mod wiki_compiler;
+pub mod wisdom_synth;
 
 pub use commitment_tracker::CommitmentTracker;
 pub use dream::DreamWorker;
@@ -17,3 +18,4 @@ pub use reflection::ReflectionWorker;
 pub use session_journaler::SessionJournaler;
 pub use subconscious::SubconsciousWorker;
 pub use wiki_compiler::WikiCompilerWorker;
+pub use wisdom_synth::WisdomSynthesizer;

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// - `extracted_at` / `extraction_source`: EntityExtractorWorker
 /// - `commitment_tracked_at`: CommitmentTracker
 /// - `reflection_extracted_at`: ReflectionWorker
+/// - `wisdom_synthesized_at`: WisdomSynthesizer
 ///
 /// `save()` uses read-merge-write to prevent one worker from clobbering another's fields.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
@@ -22,6 +23,7 @@ pub struct JournalEntryState {
     pub extraction_source: Option<String>,
     pub commitment_tracked_at: Option<String>,
     pub reflection_extracted_at: Option<String>,
+    pub wisdom_synthesized_at: Option<String>,
 }
 
 /// Sidecar state for session `.jsonl` files.
@@ -78,6 +80,9 @@ impl JournalEntryState {
         if self.reflection_extracted_at.is_some() {
             existing.reflection_extracted_at = self.reflection_extracted_at.clone();
         }
+        if self.wisdom_synthesized_at.is_some() {
+            existing.wisdom_synthesized_at = self.wisdom_synthesized_at.clone();
+        }
 
         let json = serde_json::to_string_pretty(&existing)
             .context("failed to serialize journal entry state")?;
@@ -114,6 +119,11 @@ impl JournalEntryState {
     pub fn has_reflection_extracted(md_path: &Path) -> bool {
         let state = Self::load(md_path);
         state.reflection_extracted_at.is_some() || Self::scan_frontmatter(md_path, "reflection_extracted_at:")
+    }
+
+    pub fn has_wisdom_synthesized(md_path: &Path) -> bool {
+        let state = Self::load(md_path);
+        state.wisdom_synthesized_at.is_some() || Self::scan_frontmatter(md_path, "wisdom_synthesized_at:")
     }
 
     fn scan_frontmatter(path: &Path, prefix: &str) -> bool {
@@ -164,6 +174,12 @@ impl JournalEntryState {
         if state.reflection_extracted_at.is_none() {
             if let Some(val) = Self::extract_frontmatter_value(md_path, "reflection_extracted_at:") {
                 state.reflection_extracted_at = Some(val);
+                migrated = true;
+            }
+        }
+        if state.wisdom_synthesized_at.is_none() {
+            if let Some(val) = Self::extract_frontmatter_value(md_path, "wisdom_synthesized_at:") {
+                state.wisdom_synthesized_at = Some(val);
                 migrated = true;
             }
         }

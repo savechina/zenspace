@@ -16,6 +16,40 @@ use super::marker_state::SessionState;
 
 const MIN_TURNS: usize = 3;
 
+struct PromptContext {
+    commitments_section: String,
+    beliefs_section: String,
+}
+
+impl PromptContext {
+    fn is_empty(&self) -> bool {
+        self.commitments_section.is_empty() && self.beliefs_section.is_empty()
+    }
+
+    fn to_prompt_section(&self) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("\n--- Context ---\n");
+        if !self.commitments_section.is_empty() {
+            s.push_str(&self.commitments_section);
+            s.push('\n');
+        }
+        if !self.beliefs_section.is_empty() {
+            s.push_str(&self.beliefs_section);
+            s.push('\n');
+        }
+        s
+    }
+}
+
+struct CommitmentSummary {
+    text: String,
+    #[allow(dead_code)]
+    status: String,
+    review_at: String,
+}
+
 pub struct SessionJournaler {
     scheduled: Option<&'static str>,
 }
@@ -140,8 +174,10 @@ async fn process_session(
 
     let conversation_text = build_conversation_text(&turns);
 
+    let prompt_context = load_prompt_context(paths).await;
+
     let (signals, source) = if let Some(router) = router {
-        match extract_signals_via_llm(&conversation_text, router).await {
+        match extract_signals_via_llm(&conversation_text, &prompt_context, router).await {
             Ok(llm_signals) if !llm_signals.is_empty() => {
                 info!(session_id = %session_id, total = llm_signals.total(), "LLM signal extraction succeeded");
                 (llm_signals, "llm")
@@ -169,6 +205,7 @@ async fn process_session(
 
 async fn extract_signals_via_llm(
     conversation_text: &str,
+    prompt_context: &PromptContext,
     router: DefaultRouter,
 ) -> Result<ExtractedSignals> {
     let truncated = if conversation_text.len() > 12000 {
@@ -182,11 +219,14 @@ async fn extract_signals_via_llm(
         conversation_text.to_string()
     };
 
+    let context_section = prompt_context.to_prompt_section();
+
     let prompt = format!(
         r#"Extract typed signals from this development session conversation.
 
 Conversation:
 {truncated}
+{context_section}
 
 Respond with ONLY a JSON object:
 {{
@@ -391,6 +431,95 @@ fn extract_session_id(jsonl_path: &std::path::Path) -> String {
         .to_string()
 }
 
+async fn load_prompt_context(paths: &ZenPaths) -> PromptContext {
+    let commitments_section = load_top_commitments(paths, 5);
+    let beliefs_section = load_top_beliefs(paths, 5);
+    PromptContext {
+        commitments_section,
+        beliefs_section,
+    }
+}
+
+fn load_top_commitments(paths: &ZenPaths, n: usize) -> String {
+    let dir = paths.vault().join("memories/commitments");
+    let items = scan_commitments(&dir);
+    if items.is_empty() {
+        return String::new();
+    }
+    let top: Vec<&CommitmentSummary> = items.iter().take(n).collect();
+    let mut s = String::from("User's active commitments (prioritize signals relevant to these):\n");
+    for item in top {
+        s.push_str(&format!("- {}\n", item.text));
+    }
+    s
+}
+
+fn load_top_beliefs(paths: &ZenPaths, n: usize) -> String {
+    let dir = paths.vault().join("memories/beliefs");
+    let beliefs = match zen_memory::belief::Belief::load_all(&dir) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    if beliefs.is_empty() {
+        return String::new();
+    }
+    let top = zen_memory::belief::top_by_priority(&beliefs, n);
+    let mut s = String::from("User's current beliefs (by confidence):\n");
+    for b in top {
+        s.push_str(&format!(
+            "- {} ({:.0}% confident)\n",
+            b.proposition,
+            b.posterior * 100.0
+        ));
+    }
+    s
+}
+
+fn scan_commitments(dir: &std::path::Path) -> Vec<CommitmentSummary> {
+    let mut items = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return items,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "md") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let text = parse_frontmatter_field(&content, "text").unwrap_or_default();
+        let status =
+            parse_frontmatter_field(&content, "status").unwrap_or_else(|| "open".to_string());
+        let review_at = parse_frontmatter_field(&content, "review_at").unwrap_or_default();
+        if status == "open" && !text.is_empty() {
+            items.push(CommitmentSummary {
+                text,
+                status,
+                review_at,
+            });
+        }
+    }
+    items.sort_by(|a, b| a.review_at.cmp(&b.review_at));
+    items
+}
+
+fn parse_frontmatter_field(content: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    for line in content.lines().take(15) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let val = rest.trim().trim_matches('"').to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,5 +644,88 @@ mod tests {
     fn test_extract_session_id() {
         let path = std::path::PathBuf::from("/tmp/sessions/2026/06/20/test-session-id.jsonl");
         assert_eq!(extract_session_id(&path), "test-session-id");
+    }
+
+    #[test]
+    fn test_load_top_commitments_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::detect().unwrap_or_else(|_| {
+            panic!("ZenPaths::detect failed");
+        });
+        let result = load_top_commitments(&paths, 5);
+        assert!(result.is_empty() || result.contains("active commitments"));
+    }
+
+    #[test]
+    fn test_load_top_beliefs_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::detect().unwrap_or_else(|_| {
+            panic!("ZenPaths::detect failed");
+        });
+        let result = load_top_beliefs(&paths, 5);
+        assert!(result.is_empty() || result.contains("beliefs"));
+    }
+
+    #[test]
+    fn test_prompt_context_empty_to_prompt_section() {
+        let ctx = PromptContext {
+            commitments_section: String::new(),
+            beliefs_section: String::new(),
+        };
+        assert!(ctx.is_empty());
+        assert!(ctx.to_prompt_section().is_empty());
+    }
+
+    #[test]
+    fn test_prompt_context_nonempty_has_sections() {
+        let ctx = PromptContext {
+            commitments_section: "commitments here\n".to_string(),
+            beliefs_section: "beliefs here\n".to_string(),
+        };
+        assert!(!ctx.is_empty());
+        let section = ctx.to_prompt_section();
+        assert!(section.contains("--- Context ---"));
+        assert!(section.contains("commitments here"));
+        assert!(section.contains("beliefs here"));
+    }
+
+    #[test]
+    fn test_parse_frontmatter_field_found() {
+        let content = "---\ntext: Do the thing\nstatus: open\n---\n\nbody";
+        assert_eq!(
+            parse_frontmatter_field(content, "text"),
+            Some("Do the thing".to_string())
+        );
+        assert_eq!(
+            parse_frontmatter_field(content, "status"),
+            Some("open".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_frontmatter_field_missing() {
+        let content = "---\ntext: Do the thing\n---\n\nbody";
+        assert_eq!(parse_frontmatter_field(content, "status"), None);
+    }
+
+    #[test]
+    fn test_scan_commitments_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = scan_commitments(dir.path());
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_scan_commitments_filters_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "---\ntext: Open task\nstatus: open\nreview_at: 2026-07-01T00:00:00Z\n---\n\n# Commitment\n\nOpen task\n";
+        fs::write(dir.path().join("open.md"), content).unwrap();
+
+        let closed = "---\ntext: Done task\nstatus: done\nreview_at: 2026-06-01T00:00:00Z\n---\n\n# Commitment\n\nDone task\n";
+        fs::write(dir.path().join("closed.md"), closed).unwrap();
+
+        let items = scan_commitments(dir.path());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "Open task");
     }
 }
