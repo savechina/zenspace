@@ -1,0 +1,328 @@
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use tracing::{debug, info, warn};
+
+use zen_core::paths::ZenPaths;
+
+use super::super::{WorkerContext, WorkerReport, ZenWorker};
+use super::marker_state::JournalEntryState;
+
+pub struct CommitmentTracker {
+    scheduled: Option<&'static str>,
+}
+
+impl CommitmentTracker {
+    pub fn new() -> Self {
+        Self { scheduled: None }
+    }
+
+    pub fn with_schedule(mut self, expr: &str) -> Self {
+        self.scheduled = Some(Box::leak(expr.to_string().into_boxed_str()));
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl ZenWorker for CommitmentTracker {
+    fn id(&self) -> &'static str {
+        "commitment-tracker"
+    }
+
+    fn description(&self) -> &'static str {
+        "Track commitments from journal entries, manage lifecycle and due-date review"
+    }
+
+    fn schedule(&self) -> &'static str {
+        self.scheduled.unwrap_or("0 0 8 * * *")
+    }
+
+    async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
+        let start = std::time::Instant::now();
+        let paths = ZenPaths::detect()?;
+
+        let journal_dir = paths.journal_entries();
+        if !journal_dir.is_dir() {
+            debug!("journal entries directory does not exist, skipping commitment tracking");
+            return Ok(WorkerReport {
+                worker_id: self.id().to_string(),
+                success: true,
+                fact_count: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let commitments_dir = paths.vault().join("memories/commitments");
+        fs::create_dir_all(&commitments_dir)
+            .with_context(|| format!("failed to create commitments dir: {}", commitments_dir.display()))?;
+
+        let mut total_tracked = 0usize;
+        let mut due_count = 0usize;
+        let mut slugs_used: Vec<String> = Vec::new();
+
+        for entry in fs::read_dir(&journal_dir)
+            .with_context(|| format!("failed to read journal dir: {}", journal_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+                continue;
+            }
+
+            if !is_journaled(&path) {
+                continue;
+            }
+            if JournalEntryState::has_commitment_tracked(&path) {
+                continue;
+            }
+
+            match extract_commitments_from_journal(&path) {
+                Ok(items) if !items.is_empty() => {
+                    for item in &items {
+                        let slug = unique_slug(&item.text, &slugs_used);
+                        slugs_used.push(slug.clone());
+
+                        let commitment_path = commitments_dir.join(format!("{slug}.md"));
+                        if commitment_path.exists() {
+                            continue;
+                        }
+
+                        let date_str = item.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                        let review_at = (item.created_at + chrono::Duration::days(7))
+                            .format("%Y-%m-%dT%H:%M:%SZ")
+                            .to_string();
+
+                        let content = format!(
+                            "---\ntext: {}\ncreated_at: {}\nreview_at: {}\nstatus: open\nsource_session: {}\n---\n\n# Commitment\n\n{}\n",
+                            item.text, date_str, review_at, item.session_id, item.text
+                        );
+                        fs::write(&commitment_path, content)
+                            .with_context(|| format!("failed to write commitment: {}", commitment_path.display()))?;
+                        total_tracked += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to extract commitments from journal entry");
+                }
+            }
+
+            let now = Utc::now();
+            let state = JournalEntryState {
+                commitment_tracked_at: Some(now.to_rfc3339()),
+                ..Default::default()
+            };
+            if let Err(e) = state.save(&path) {
+                warn!(path = %path.display(), error = %e, "failed to mark journal entry as commitment-tracked");
+            }
+        }
+
+        let now = Utc::now();
+        if commitments_dir.is_dir() {
+            for entry in fs::read_dir(&commitments_dir).unwrap_or_else(|_| {
+                return fs::read_dir(".").expect("impossible");
+            }) {
+                if let Ok(entry) = entry {
+                    let p = entry.path();
+                    if p.is_file() && p.extension().is_some_and(|ext| ext == "md") {
+                        if let Ok(content) = fs::read_to_string(&p) {
+                            let mut status = String::new();
+                            let mut review_at_str = String::new();
+                            for line in content.lines().take(10) {
+                                if let Some(v) = line.strip_prefix("status: ") {
+                                    status = v.trim().to_string();
+                                }
+                                if let Some(v) = line.strip_prefix("review_at: ") {
+                                    review_at_str = v.trim().to_string();
+                                }
+                            }
+                            if status == "open" {
+                                if let Ok(review_at) = DateTime::parse_from_rfc3339(&review_at_str) {
+                                    if review_at.with_timezone(&Utc) < now {
+                                        if let Some(text_line) = content.lines().find(|l| l.starts_with("text: ")) {
+                                            let text = text_line.strip_prefix("text: ").unwrap_or("");
+                                            warn!(commitment = %text, "commitment review due");
+                                            due_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if due_count > 0 {
+            info!(due_count, "commitments due for review");
+        }
+
+        if total_tracked > 0 {
+            info!(tracked = total_tracked, "commitments extracted from journal entries");
+        }
+
+        Ok(WorkerReport {
+            worker_id: self.id().to_string(),
+            success: true,
+            fact_count: total_tracked,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CommitmentItem {
+    text: String,
+    session_id: String,
+    created_at: DateTime<Utc>,
+}
+
+fn extract_commitments_from_journal(path: &Path) -> Result<Vec<CommitmentItem>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read journal entry: {}", path.display()))?;
+
+    let mut items = Vec::new();
+    let mut in_commitments = false;
+    let mut session_id = "unknown".to_string();
+    let mut date_str = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("session_id:") {
+            if let Some(val) = trimmed.strip_prefix("session_id:") {
+                session_id = val.trim().to_string();
+            }
+        } else if trimmed.starts_with("date:") {
+            if let Some(val) = trimmed.strip_prefix("date:") {
+                date_str = Some(val.trim().to_string());
+            }
+        } else if trimmed == "## Commitments" {
+            in_commitments = true;
+            continue;
+        } else if trimmed.starts_with("## ") {
+            in_commitments = false;
+            continue;
+        }
+
+        if in_commitments {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let text = item.trim().to_string();
+                if !text.is_empty() && !text.starts_with("_(no ") {
+                    let created_at = date_str
+                        .as_ref()
+                        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                        .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+                        .unwrap_or_else(Utc::now);
+                    items.push(CommitmentItem {
+                        text,
+                        session_id: session_id.clone(),
+                        created_at,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+fn slugify(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+        .chars()
+        .take(60)
+        .collect()
+}
+
+fn unique_slug(text: &str, used: &[String]) -> String {
+    let base = slugify(text);
+    if !used.contains(&base) {
+        return base;
+    }
+    let mut counter = 2;
+    loop {
+        let candidate = format!("{base}-{counter}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+fn is_journaled(path: &Path) -> bool {
+    if JournalEntryState::is_journaled(path) {
+        return true;
+    }
+    JournalEntryState::migrate_from_frontmatter(path) && JournalEntryState::is_journaled(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_extract_commitments_from_journal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.md");
+        let content = "---\nsession_id: 01JX001\ndate: 2026-06-26\n---\n\n# Session Journal\n\n## Commitments\n\n- simplify login by July\n- write integration tests this week\n";
+        fs::write(&path, content).unwrap();
+
+        let items = extract_commitments_from_journal(&path).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "simplify login by July");
+        assert_eq!(items[0].session_id, "01JX001");
+        assert_eq!(items[1].text, "write integration tests this week");
+    }
+
+    #[test]
+    fn test_extract_commitments_empty_section() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.md");
+        let content = "---\nsession_id: test\n---\n\n## Commitments\n\n_(no commitments extracted)_\n";
+        fs::write(&path, content).unwrap();
+
+        let items = extract_commitments_from_journal(&path).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_extract_commitments_no_section() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.md");
+        let content = "---\nsession_id: test\n---\n\n## Facts\n\n- some fact\n";
+        fs::write(&path, content).unwrap();
+
+        let items = extract_commitments_from_journal(&path).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_slugify_basic() {
+        assert_eq!(slugify("Hello World!"), "hello-world");
+        assert_eq!(slugify("test-case-123"), "test-case-123");
+        assert_eq!(slugify("  trimmed  "), "trimmed");
+    }
+
+    #[test]
+    fn test_slugify_truncates_long_text() {
+        let long = "a".repeat(100);
+        let result = slugify(&long);
+        assert!(result.len() <= 60);
+    }
+
+    #[test]
+    fn test_slugify_handles_unicode() {
+        let result = slugify("实现登录功能");
+        assert_eq!(result, "实现登录功能");
+    }
+}

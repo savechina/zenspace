@@ -277,6 +277,8 @@ pub struct WorkerSummary {
 /// - `session-journaler`: runs every 5 minutes, extracts journal entries from session conversations
 /// - `entity-extractor`: runs every 10 minutes, extracts entities from journal entries into graph.db
 /// - `wiki-compiler`: runs every 30 minutes, compiles wiki pages from graph.db entities
+/// - `commitment-tracker` (CommitmentTracker): runs daily 8AM, tracks commitments from journal entries
+/// - `reflection-worker` (ReflectionWorker): runs daily 6AM, aggregates reflections into wiki/wisdom/
 pub fn create_default_scheduler() -> ZenScheduler {
     let mut scheduler = ZenScheduler::new();
 
@@ -298,6 +300,12 @@ pub fn create_default_scheduler() -> ZenScheduler {
     if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
         warn!("scheduler: failed to register wiki-compiler worker: {e}");
      }
+    if let Err(e) = scheduler.register(CommitmentTracker::new()) {
+        warn!("scheduler: failed to register commitment-tracker worker: {e}");
+    }
+    if let Err(e) = scheduler.register(ReflectionWorker::new()) {
+        warn!("scheduler: failed to register reflection-worker worker: {e}");
+    }
 
     scheduler
 }
@@ -341,6 +349,14 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
 
     if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
         warn!("scheduler: failed to register wiki-compiler worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(CommitmentTracker::new()) {
+        warn!("scheduler: failed to register commitment-tracker worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(ReflectionWorker::new()) {
+        warn!("scheduler: failed to register reflection-worker worker: {e}");
     }
 
     scheduler
@@ -430,12 +446,14 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 6);
+        assert_eq!(items.len(), 8);
         assert!(items.iter().any(|w| w.id == "journal-worker"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
         assert!(items.iter().any(|w| w.id == "session-journaler"));
         assert!(items.iter().any(|w| w.id == "entity-extractor"));
         assert!(items.iter().any(|w| w.id == "wiki-compiler"));
+        assert!(items.iter().any(|w| w.id == "commitment-tracker"));
+        assert!(items.iter().any(|w| w.id == "reflection-worker"));
     }
 }

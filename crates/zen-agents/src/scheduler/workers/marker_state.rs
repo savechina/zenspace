@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 /// - `journaled_at`: SessionJournaler
 /// - `memory_updated_at`: JournalWorker
 /// - `extracted_at` / `extraction_source`: EntityExtractorWorker
+/// - `commitment_tracked_at`: CommitmentTracker
+/// - `reflection_extracted_at`: ReflectionWorker
 ///
 /// `save()` uses read-merge-write to prevent one worker from clobbering another's fields.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
@@ -18,6 +20,8 @@ pub struct JournalEntryState {
     pub memory_updated_at: Option<String>,
     pub extracted_at: Option<String>,
     pub extraction_source: Option<String>,
+    pub commitment_tracked_at: Option<String>,
+    pub reflection_extracted_at: Option<String>,
 }
 
 /// Sidecar state for session `.jsonl` files.
@@ -68,6 +72,12 @@ impl JournalEntryState {
             existing.extracted_at = self.extracted_at.clone();
             existing.extraction_source = self.extraction_source.clone();
         }
+        if self.commitment_tracked_at.is_some() {
+            existing.commitment_tracked_at = self.commitment_tracked_at.clone();
+        }
+        if self.reflection_extracted_at.is_some() {
+            existing.reflection_extracted_at = self.reflection_extracted_at.clone();
+        }
 
         let json = serde_json::to_string_pretty(&existing)
             .context("failed to serialize journal entry state")?;
@@ -94,6 +104,16 @@ impl JournalEntryState {
     pub fn has_extracted(md_path: &Path) -> bool {
         let state = Self::load(md_path);
         state.extracted_at.is_some() || Self::scan_frontmatter(md_path, "extracted_at:")
+    }
+
+    pub fn has_commitment_tracked(md_path: &Path) -> bool {
+        let state = Self::load(md_path);
+        state.commitment_tracked_at.is_some() || Self::scan_frontmatter(md_path, "commitment_tracked_at:")
+    }
+
+    pub fn has_reflection_extracted(md_path: &Path) -> bool {
+        let state = Self::load(md_path);
+        state.reflection_extracted_at.is_some() || Self::scan_frontmatter(md_path, "reflection_extracted_at:")
     }
 
     fn scan_frontmatter(path: &Path, prefix: &str) -> bool {
@@ -132,6 +152,18 @@ impl JournalEntryState {
                 if let Some(src) = Self::extract_frontmatter_value(md_path, "extraction_source:") {
                     state.extraction_source = Some(src);
                 }
+                migrated = true;
+            }
+        }
+        if state.commitment_tracked_at.is_none() {
+            if let Some(val) = Self::extract_frontmatter_value(md_path, "commitment_tracked_at:") {
+                state.commitment_tracked_at = Some(val);
+                migrated = true;
+            }
+        }
+        if state.reflection_extracted_at.is_none() {
+            if let Some(val) = Self::extract_frontmatter_value(md_path, "reflection_extracted_at:") {
+                state.reflection_extracted_at = Some(val);
                 migrated = true;
             }
         }
@@ -236,9 +268,7 @@ mod tests {
 
         let state = JournalEntryState {
             journaled_at: Some("2026-06-24T10:00:00Z".to_string()),
-            memory_updated_at: None,
-            extracted_at: None,
-            extraction_source: None,
+            ..Default::default()
         };
         state.save(&md_path).unwrap();
 
