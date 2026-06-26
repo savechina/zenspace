@@ -14,6 +14,37 @@ const MARKET_KEYWORDS: &[&str] = &[
 ];
 const PROCEED_KEYWORDS: &[&str] = &["proceed", "继续", "推进", "go ahead", "all in", "坚持"];
 
+/// Urgency keywords indicating time pressure (bilingual EN/ZH)
+const URGENCY_KEYWORDS: &[&str] = &[
+    "now", "immediately", "right now", "asap", "urgent",
+    "act now", "final notice", "last chance", "don't wait",
+    "limited time", "must decide", "no time to waste",
+    "立即", "马上", "赶紧", "赶快", "紧急", "最后机会", "限时",
+];
+
+/// Emotional intensity markers — absolutist/extreme language
+const EMOTION_INTENSITY: &[&str] = &[
+    "absolutely", "never", "always", "everyone", "nobody",
+    "completely", "totally", "insane", "crazy", "amazing",
+    "terrible", "worst", "best", "love", "hate",
+    "绝对", "从不", "总是", "完全", "彻底", "疯狂", "太棒了", "太糟了",
+];
+
+/// Cooling-off language — presence indicates deliberation (reduces impulse score)
+const COOLING_LANGUAGE: &[&str] = &[
+    "sleep on", "think about", "tomorrow", "next week",
+    "revisit", "consider", "maybe later", "wait",
+    "明天再说", "考虑一下", "再想想", "不急", "等等",
+];
+
+/// Alternative-consideration language — presence indicates deliberation
+const ALTERNATIVE_MARKERS: &[&str] = &[
+    "alternatives", "options", "instead", "could also",
+    "pros and cons", "trade-offs", "on the other hand",
+    "alternative", "comparison",
+    "备选", "选项", "权衡", "利弊", "另一方面",
+];
+
 /// Run all 10 anti-pattern checks and return aggregated report.
 pub fn check_all(d: &Decision) -> AntiPatternReport {
     let mut violations = Vec::new();
@@ -109,9 +140,84 @@ fn check_loss_aversion(d: &Decision) -> Option<AntiPatternViolation> {
     }
 }
 
-/// DEFERRED: requires first_considered_at timestamp to check <1h decision time.
-fn check_emotional_impulse(_d: &Decision) -> Option<AntiPatternViolation> {
-    None
+/// Compute an emotional impulse score (0.0 = calm, 1.0 = highly impulsive)
+/// based on VADER sentiment analysis rules and behavioral economics research.
+fn emotional_impulse_score(text: &str) -> f64 {
+    let lower = text.to_lowercase();
+    let mut score = 0.0f64;
+
+    // ALL-CAPS ratio > 30% → boost (VADER: ALL-CAPS boosts polarity)
+    let alpha_count = text.chars().filter(|c| c.is_alphabetic()).count();
+    if alpha_count > 0 {
+        let upper_count = text.chars().filter(|c| c.is_uppercase()).count();
+        let caps_ratio = upper_count as f64 / alpha_count as f64;
+        if caps_ratio > 0.3 {
+            score += 0.2;
+        }
+    }
+
+    // Exclamation marks (>2) → +0.05 each, max +0.20
+    let excl_count = text.matches('!').count().min(4);
+    score += excl_count as f64 * 0.05;
+
+    // Urgency keyword hits → +0.10 each, max +0.30
+    let urgency_hits = URGENCY_KEYWORDS
+        .iter()
+        .filter(|kw| lower.contains(*kw))
+        .count();
+    score += (urgency_hits as f64 * 0.1).min(0.3);
+
+    // No cooling-off language → +0.15
+    let has_cooling = COOLING_LANGUAGE.iter().any(|kw| lower.contains(*kw));
+    if !has_cooling {
+        score += 0.15;
+    }
+
+    // No alternative markers → +0.15
+    let has_alternatives = ALTERNATIVE_MARKERS.iter().any(|kw| lower.contains(*kw));
+    if !has_alternatives {
+        score += 0.15;
+    }
+
+    // Emotional intensity markers → +0.08 each, max +0.20
+    let intensity_hits = EMOTION_INTENSITY
+        .iter()
+        .filter(|kw| lower.contains(*kw))
+        .count();
+    score += (intensity_hits as f64 * 0.08).min(0.2);
+
+    score.min(1.0)
+}
+
+fn check_emotional_impulse(d: &Decision) -> Option<AntiPatternViolation> {
+    let mut text = String::new();
+    text.push_str(&d.goal);
+    text.push(' ');
+    text.push_str(&d.choice);
+    text.push(' ');
+    text.push_str(&d.core_pursuit);
+    for fact in &d.facts {
+        text.push(' ');
+        text.push_str(fact);
+    }
+    if let Some(plan) = &d.execution_plan {
+        text.push(' ');
+        text.push_str(plan);
+    }
+
+    let score = emotional_impulse_score(&text);
+
+    if score > 0.6 {
+        Some(AntiPatternViolation {
+            pattern_id: "emotional-impulse".to_string(),
+            severity: Severity::High,
+            message: format!(
+                "Emotional decision detected (impulse score {score:.2}): high urgency/intensity markers without cooling-off or alternatives"
+            ),
+        })
+    } else {
+        None
+    }
 }
 
 /// Check for proceeding despite known legal/compliance risk.
@@ -433,10 +539,60 @@ mod tests {
     }
 
     #[test]
-    fn test_three_deferred_checks_return_none() {
+    fn test_two_deferred_checks_return_none() {
         let d = make_decision();
         assert!(check_misplaced_priority(&d).is_none());
         assert!(check_inertia_thinking(&d).is_none());
-        assert!(check_emotional_impulse(&d).is_none());
+    }
+
+    #[test]
+    fn test_emotional_impulse_score_calm_text() {
+        let text = "I should sleep on this. Let me consider the alternatives and trade-offs tomorrow.";
+        let score = emotional_impulse_score(text);
+        assert!(score < 0.3, "calm text should have low score, got {score}");
+    }
+
+    #[test]
+    fn test_emotional_impulse_score_urgent_text() {
+        let text = "We must decide NOW!!! This is URGENT!!! Act immediately, no time to waste!!!";
+        let score = emotional_impulse_score(text);
+        assert!(score > 0.6, "urgent text should have high score, got {score}");
+    }
+
+    #[test]
+    fn test_emotional_impulse_score_chinese_urgent() {
+        let text = "立即决定！马上行动！紧急情况！赶紧！最后机会！";
+        let score = emotional_impulse_score(text);
+        assert!(score > 0.4, "Chinese urgent text should score high, got {score}");
+    }
+
+    #[test]
+    fn test_emotional_impulse_triggers() {
+        let mut d = Decision::new("test-1".into(), "Urgent choice".into(), "work".into());
+        d.goal = "Must decide NOW!!! URGENT!!!".into();
+        d.choice = "Act immediately, no time to waste".into();
+        d.facts = vec!["Everyone agrees this is crazy".into()];
+        let result = check_emotional_impulse(&d);
+        assert!(result.is_some(), "should trigger for emotional text");
+        let v = result.unwrap();
+        assert_eq!(v.pattern_id, "emotional-impulse");
+        assert_eq!(v.severity, Severity::High);
+    }
+
+    #[test]
+    fn test_emotional_impulse_passes_calm() {
+        let mut d = Decision::new("test-2".into(), "Calm choice".into(), "work".into());
+        d.goal = "Consider this carefully".into();
+        d.choice = "Let's think about the alternatives and trade-offs".into();
+        d.facts = vec!["We can sleep on it and revisit tomorrow".into()];
+        let result = check_emotional_impulse(&d);
+        assert!(result.is_none(), "should not trigger for calm text");
+    }
+
+    #[test]
+    fn test_emotional_impulse_score_caps_at_1() {
+        let text = "NOW!!! URGENT!!! ACT NOW!!! absolutely never always completely totally insane!!!";
+        let score = emotional_impulse_score(text);
+        assert!(score <= 1.0, "score should not exceed 1.0, got {score}");
     }
 }
