@@ -55,8 +55,12 @@ impl ZenWorker for CommitmentTracker {
         }
 
         let commitments_dir = paths.vault().join("memories/commitments");
-        fs::create_dir_all(&commitments_dir)
-            .with_context(|| format!("failed to create commitments dir: {}", commitments_dir.display()))?;
+        fs::create_dir_all(&commitments_dir).with_context(|| {
+            format!(
+                "failed to create commitments dir: {}",
+                commitments_dir.display()
+            )
+        })?;
 
         let mut total_tracked = 0usize;
         let mut due_count = 0usize;
@@ -99,8 +103,9 @@ impl ZenWorker for CommitmentTracker {
                             "---\ntext: {}\ncreated_at: {}\nreview_at: {}\nstatus: open\nsource_session: {}\n---\n\n# Commitment\n\n{}\n",
                             item.text, date_str, review_at, item.session_id, item.text
                         );
-                        fs::write(&commitment_path, content)
-                            .with_context(|| format!("failed to write commitment: {}", commitment_path.display()))?;
+                        fs::write(&commitment_path, content).with_context(|| {
+                            format!("failed to write commitment: {}", commitment_path.display())
+                        })?;
                         total_tracked += 1;
                     }
                 }
@@ -140,10 +145,14 @@ impl ZenWorker for CommitmentTracker {
                                 }
                             }
                             if status == "open" {
-                                if let Ok(review_at) = DateTime::parse_from_rfc3339(&review_at_str) {
+                                if let Ok(review_at) = DateTime::parse_from_rfc3339(&review_at_str)
+                                {
                                     if review_at.with_timezone(&Utc) < now {
-                                        if let Some(text_line) = content.lines().find(|l| l.starts_with("text: ")) {
-                                            let text = text_line.strip_prefix("text: ").unwrap_or("");
+                                        if let Some(text_line) =
+                                            content.lines().find(|l| l.starts_with("text: "))
+                                        {
+                                            let text =
+                                                text_line.strip_prefix("text: ").unwrap_or("");
                                             warn!(commitment = %text, "commitment review due");
                                             due_count += 1;
                                         }
@@ -161,7 +170,10 @@ impl ZenWorker for CommitmentTracker {
         }
 
         if total_tracked > 0 {
-            info!(tracked = total_tracked, "commitments extracted from journal entries");
+            info!(
+                tracked = total_tracked,
+                "commitments extracted from journal entries"
+            );
         }
 
         Ok(WorkerReport {
@@ -288,7 +300,8 @@ mod tests {
     fn test_extract_commitments_empty_section() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.md");
-        let content = "---\nsession_id: test\n---\n\n## Commitments\n\n_(no commitments extracted)_\n";
+        let content =
+            "---\nsession_id: test\n---\n\n## Commitments\n\n_(no commitments extracted)_\n";
         fs::write(&path, content).unwrap();
 
         let items = extract_commitments_from_journal(&path).unwrap();

@@ -15,11 +15,24 @@ use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
 
 const TECH_KEYWORDS: &[&str] = &[
-    "Rust", "Python", "TypeScript", "JavaScript",
-    "CLIP", "LLM", "GPT", "OpenAI",
-    "Anthropic", "DeepSeek", "Gemini",
-    "Tokio", "async", "sqlite", "SQLite",
-    "FTS5", "vector", "embedding",
+    "Rust",
+    "Python",
+    "TypeScript",
+    "JavaScript",
+    "CLIP",
+    "LLM",
+    "GPT",
+    "OpenAI",
+    "Anthropic",
+    "DeepSeek",
+    "Gemini",
+    "Tokio",
+    "async",
+    "sqlite",
+    "SQLite",
+    "FTS5",
+    "vector",
+    "embedding",
 ];
 
 const MIN_CONTENT_LEN: usize = 20;
@@ -117,7 +130,11 @@ impl ZenWorker for EntityExtractorWorker {
         }
 
         if processed > 0 {
-            info!(processed, entities = total_entities, "entity-extractor tick complete");
+            info!(
+                processed,
+                entities = total_entities,
+                "entity-extractor tick complete"
+            );
         }
 
         Ok(WorkerReport {
@@ -205,7 +222,8 @@ fn extract_entities_via_llm(
     facts: &[String],
     router: DefaultRouter,
 ) -> Result<Vec<(String, EntityType)>> {
-    let facts_text = facts.iter()
+    let facts_text = facts
+        .iter()
         .map(|f| format!("- {f}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -232,9 +250,17 @@ Only include entities explicitly mentioned in the facts. If nothing meaningful, 
 
     let json_str = if let Some(start) = response.find("```json") {
         let after = &response[start + 7..];
-        if let Some(end) = after.find("```") { &after[..end] } else { after }
+        if let Some(end) = after.find("```") {
+            &after[..end]
+        } else {
+            after
+        }
     } else if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') { &response[start..=end] } else { &response }
+        if let Some(end) = response.rfind('}') {
+            &response[start..=end]
+        } else {
+            &response
+        }
     } else {
         &response
     };
@@ -289,10 +315,7 @@ fn upsert_entities(
     Ok(upserted)
 }
 
-fn match_entities(
-    facts: &[String],
-    known: &HashSet<String>,
-) -> HashMap<String, Vec<String>> {
+fn match_entities(facts: &[String], known: &HashSet<String>) -> HashMap<String, Vec<String>> {
     let mut matched: HashMap<String, Vec<String>> = HashMap::new();
 
     for fact in facts {
@@ -338,9 +361,12 @@ fn extract_facts_from_journal(content: &str) -> Vec<String> {
 
 fn scan_journal_entries(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("failed to read journal entries directory: {}", dir.display()))?
-    {
+    for entry in fs::read_dir(dir).with_context(|| {
+        format!(
+            "failed to read journal entries directory: {}",
+            dir.display()
+        )
+    })? {
         let entry = entry?;
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
@@ -355,7 +381,8 @@ fn has_extracted_marker(entry_path: &std::path::Path) -> bool {
     if JournalEntryState::has_extracted(entry_path) {
         return true;
     }
-    JournalEntryState::migrate_from_frontmatter(entry_path) && JournalEntryState::has_extracted(entry_path)
+    JournalEntryState::migrate_from_frontmatter(entry_path)
+        && JournalEntryState::has_extracted(entry_path)
 }
 
 fn append_extracted_marker(entry_path: &std::path::Path, source: &str) -> Result<()> {
@@ -438,7 +465,11 @@ mod tests {
     fn test_has_extracted_marker_found() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.md");
-        fs::write(&path, "---\nsession_id: test\ndate: 2026-06-20\n---\n\ncontent\n").unwrap();
+        fs::write(
+            &path,
+            "---\nsession_id: test\ndate: 2026-06-20\n---\n\ncontent\n",
+        )
+        .unwrap();
 
         let state = JournalEntryState {
             extracted_at: Some("2026-06-20T14:30:00Z".to_string()),

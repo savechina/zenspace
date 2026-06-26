@@ -25,7 +25,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 pub use workers::*;
@@ -285,22 +285,22 @@ pub fn create_default_scheduler() -> ZenScheduler {
 
     if let Err(e) = scheduler.register(JournalWorker::new()) {
         warn!("scheduler: failed to register journal-worker: {e}");
-     }
+    }
     if let Err(e) = scheduler.register(SubconsciousWorker::new()) {
         warn!("scheduler: failed to register subconscious worker: {e}");
-     }
+    }
     if let Err(e) = scheduler.register(DreamWorker::new()) {
         warn!("scheduler: failed to register dream worker: {e}");
-     }
+    }
     if let Err(e) = scheduler.register(SessionJournaler::new()) {
         warn!("scheduler: failed to register session-journaler worker: {e}");
-     }
+    }
     if let Err(e) = scheduler.register(EntityExtractorWorker::new()) {
         warn!("scheduler: failed to register entity-extractor worker: {e}");
-     }
+    }
     if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
         warn!("scheduler: failed to register wiki-compiler worker: {e}");
-     }
+    }
     if let Err(e) = scheduler.register(CommitmentTracker::new()) {
         warn!("scheduler: failed to register commitment-tracker worker: {e}");
     }
@@ -310,6 +310,10 @@ pub fn create_default_scheduler() -> ZenScheduler {
 
     if let Err(e) = scheduler.register(WisdomSynthesizer::new()) {
         warn!("scheduler: failed to register wisdom-synth worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(DecisionTracker::new()) {
+        warn!("scheduler: failed to register decision-tracker worker: {e}");
     }
 
     scheduler
@@ -366,6 +370,10 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
 
     if let Err(e) = scheduler.register(WisdomSynthesizer::new()) {
         warn!("scheduler: failed to register wisdom-synth worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(DecisionTracker::new()) {
+        warn!("scheduler: failed to register decision-tracker worker: {e}");
     }
 
     scheduler
@@ -455,7 +463,7 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 9);
+        assert_eq!(items.len(), 10);
         assert!(items.iter().any(|w| w.id == "journal-worker"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
@@ -465,5 +473,6 @@ mod tests {
         assert!(items.iter().any(|w| w.id == "commitment-tracker"));
         assert!(items.iter().any(|w| w.id == "reflection-worker"));
         assert!(items.iter().any(|w| w.id == "wisdom-synth"));
+        assert!(items.iter().any(|w| w.id == "decision-tracker"));
     }
 }

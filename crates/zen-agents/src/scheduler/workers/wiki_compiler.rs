@@ -68,16 +68,17 @@ impl ZenWorker for WikiCompilerWorker {
             });
         }
 
-        let pages_written = match WikiCompiler::new().compile_from_entities(&entity_data_list, &wiki_dir) {
-            Ok(n) => {
-                info!(pages = n, "wiki pages compiled from graph.db entities");
-                n
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "WikiCompiler failed");
-                0
-            }
-        };
+        let pages_written =
+            match WikiCompiler::new().compile_from_entities(&entity_data_list, &wiki_dir) {
+                Ok(n) => {
+                    info!(pages = n, "wiki pages compiled from graph.db entities");
+                    n
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "WikiCompiler failed");
+                    0
+                }
+            };
 
         Ok(WorkerReport {
             worker_id: self.id().to_string(),

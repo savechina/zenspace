@@ -1,5 +1,5 @@
-use std::fs;
 use anyhow::{Context, Result};
+use std::fs;
 use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
@@ -244,7 +244,11 @@ mod tests {
     fn test_has_memory_updated_marker_not_found() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.md");
-        fs::write(&path, "---\nsession_id: test\njournaled_at: 2026-06-20T14:30:00Z\n---\n\n").unwrap();
+        fs::write(
+            &path,
+            "---\nsession_id: test\njournaled_at: 2026-06-20T14:30:00Z\n---\n\n",
+        )
+        .unwrap();
         assert!(!has_memory_updated_marker(&path));
     }
 
@@ -283,7 +287,15 @@ mod tests {
         assert_eq!(signals.reflections.len(), 2);
         assert_eq!(signals.commitments.len(), 2);
         assert!(signals.facts.contains(&"implemented JWT auth".to_string()));
-        assert!(signals.reflections.contains(&"login flow too complex".to_string()));
-        assert!(signals.commitments.contains(&"simplify login by July".to_string()));
+        assert!(
+            signals
+                .reflections
+                .contains(&"login flow too complex".to_string())
+        );
+        assert!(
+            signals
+                .commitments
+                .contains(&"simplify login by July".to_string())
+        );
     }
 }

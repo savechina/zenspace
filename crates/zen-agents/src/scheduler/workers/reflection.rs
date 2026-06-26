@@ -79,23 +79,31 @@ impl ZenWorker for ReflectionWorker {
                     let filename = format!("{date_str}.md");
                     let file_path = reflections_dir.join(&filename);
 
-                    fs::create_dir_all(&reflections_dir)
-                        .with_context(|| format!("failed to create reflections dir: {}", reflections_dir.display()))?;
+                    fs::create_dir_all(&reflections_dir).with_context(|| {
+                        format!(
+                            "failed to create reflections dir: {}",
+                            reflections_dir.display()
+                        )
+                    })?;
 
                     let session_header = format!("## From Session {session_id}");
                     let mut existing_content = String::new();
                     if file_path.exists() {
-                        existing_content = fs::read_to_string(&file_path)
-                            .with_context(|| format!("failed to read existing reflections: {}", file_path.display()))?;
+                        existing_content = fs::read_to_string(&file_path).with_context(|| {
+                            format!(
+                                "failed to read existing reflections: {}",
+                                file_path.display()
+                            )
+                        })?;
                         if existing_content.contains(&session_header) {
-                    let now = chrono::Utc::now();
-                    let mark_state = JournalEntryState {
-                        reflection_extracted_at: Some(now.to_rfc3339()),
-                        ..Default::default()
-                    };
-                    if let Err(e) = mark_state.save(&path) {
-                        warn!(path = %path.display(), error = %e, "failed to mark journal entry as reflection-extracted");
-                    }
+                            let now = chrono::Utc::now();
+                            let mark_state = JournalEntryState {
+                                reflection_extracted_at: Some(now.to_rfc3339()),
+                                ..Default::default()
+                            };
+                            if let Err(e) = mark_state.save(&path) {
+                                warn!(path = %path.display(), error = %e, "failed to mark journal entry as reflection-extracted");
+                            }
                             continue;
                         }
                     }
@@ -103,17 +111,26 @@ impl ZenWorker for ReflectionWorker {
                     let content = if existing_content.is_empty() {
                         format!(
                             "---\ndate: {date_str}\nsource: journal\n---\n\n# Reflections — {date_str}\n\n{session_header}\n{}\n",
-                            reflections.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n")
+                            reflections
+                                .iter()
+                                .map(|r| format!("- {r}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         )
                     } else {
                         format!(
                             "{existing_content}\n{session_header}\n{}\n",
-                            reflections.iter().map(|r| format!("- {r}")).collect::<Vec<_>>().join("\n")
+                            reflections
+                                .iter()
+                                .map(|r| format!("- {r}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         )
                     };
 
-                    fs::write(&file_path, content)
-                        .with_context(|| format!("failed to write reflections: {}", file_path.display()))?;
+                    fs::write(&file_path, content).with_context(|| {
+                        format!("failed to write reflections: {}", file_path.display())
+                    })?;
                     total_reflections += reflections.len();
                 }
                 Ok(_) => {}
@@ -133,7 +150,10 @@ impl ZenWorker for ReflectionWorker {
         }
 
         if total_reflections > 0 {
-            info!(reflections = total_reflections, "reflections aggregated from journal entries");
+            info!(
+                reflections = total_reflections,
+                "reflections aggregated from journal entries"
+            );
         }
 
         Ok(WorkerReport {
@@ -229,7 +249,8 @@ mod tests {
     fn test_extract_reflections_empty() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.md");
-        let content = "---\nsession_id: test\n---\n\n## Reflections\n\n_(no reflections extracted)_\n";
+        let content =
+            "---\nsession_id: test\n---\n\n## Reflections\n\n_(no reflections extracted)_\n";
         fs::write(&path, content).unwrap();
 
         let reflections = extract_reflections_from_journal(&path).unwrap();
@@ -262,7 +283,9 @@ mod tests {
         let file_path = reflections_dir.join("2026-06-26.md");
 
         let session_header = "## From Session 01JX001";
-        let existing = format!("---\ndate: 2026-06-26\nsource: journal\n---\n\n# Reflections — 2026-06-26\n\n{session_header}\n- login flow too complex\n");
+        let existing = format!(
+            "---\ndate: 2026-06-26\nsource: journal\n---\n\n# Reflections — 2026-06-26\n\n{session_header}\n- login flow too complex\n"
+        );
         fs::write(&file_path, existing).unwrap();
 
         let reflections = extract_reflections_from_journal(&journal_path).unwrap();

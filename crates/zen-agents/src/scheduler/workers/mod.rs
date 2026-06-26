@@ -1,4 +1,5 @@
 pub mod commitment_tracker;
+pub mod decision_tracker;
 pub mod dream;
 pub mod entity_extractor_worker;
 pub mod journal_worker;
@@ -10,6 +11,7 @@ pub mod wiki_compiler;
 pub mod wisdom_synth;
 
 pub use commitment_tracker::CommitmentTracker;
+pub use decision_tracker::DecisionTracker;
 pub use dream::DreamWorker;
 pub use entity_extractor_worker::EntityExtractorWorker;
 pub use journal_worker::JournalWorker;

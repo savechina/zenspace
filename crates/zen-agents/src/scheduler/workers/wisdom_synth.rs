@@ -206,7 +206,9 @@ Respond with ONLY a JSON object:
             let note = update["note"].as_str().map(|s| s.to_string());
 
             if let Some(belief) = beliefs.iter_mut().find(|b| {
-                b.proposition.to_lowercase().contains(&proposition.to_lowercase())
+                b.proposition
+                    .to_lowercase()
+                    .contains(&proposition.to_lowercase())
                     || zen_memory::belief::slugify_proposition(&b.proposition)
                         == zen_memory::belief::slugify_proposition(proposition)
             }) {
@@ -226,8 +228,12 @@ Respond with ONLY a JSON object:
 
         let date_str = Utc::now().format("%Y-%m-%d").to_string();
         let suggestions_dir = paths.vault().join("wiki/wisdom/suggestions");
-        fs::create_dir_all(&suggestions_dir)
-            .with_context(|| format!("failed to create suggestions dir: {}", suggestions_dir.display()))?;
+        fs::create_dir_all(&suggestions_dir).with_context(|| {
+            format!(
+                "failed to create suggestions dir: {}",
+                suggestions_dir.display()
+            )
+        })?;
         let suggestions_path = suggestions_dir.join(format!("{date_str}.md"));
         write_suggestions(&suggestions_path, &models, &anti_patterns, &belief_updates)?;
 
@@ -371,7 +377,11 @@ fn write_suggestions(
             let proposition = u["proposition"].as_str().unwrap_or("?");
             let supports = u["supports"].as_bool().unwrap_or(true);
             let source = u["source"].as_str().unwrap_or("unknown");
-            let status = if supports { "supported" } else { "contradicted" };
+            let status = if supports {
+                "supported"
+            } else {
+                "contradicted"
+            };
             content.push_str(&format!("- {proposition}: {status} ({source})\n"));
         }
     }
@@ -387,14 +397,23 @@ mod tests {
 
     #[test]
     fn test_parse_source_type_known() {
-        assert_eq!(parse_source_type("self_observation"), SourceType::SelfObservation);
+        assert_eq!(
+            parse_source_type("self_observation"),
+            SourceType::SelfObservation
+        );
         assert_eq!(parse_source_type("trusted_peer"), SourceType::TrustedPeer);
-        assert_eq!(parse_source_type("authority_book"), SourceType::AuthorityBook);
+        assert_eq!(
+            parse_source_type("authority_book"),
+            SourceType::AuthorityBook
+        );
     }
 
     #[test]
     fn test_parse_source_type_unknown_defaults_anonymous() {
-        assert_eq!(parse_source_type("random_stuff"), SourceType::AnonymousInternet);
+        assert_eq!(
+            parse_source_type("random_stuff"),
+            SourceType::AnonymousInternet
+        );
         assert_eq!(parse_source_type(""), SourceType::AnonymousInternet);
     }
 
@@ -427,8 +446,16 @@ mod tests {
     #[test]
     fn test_load_all_reflections_concatenates() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("refl1.md"), "---\ntitle: r1\n---\nReflection one\n").unwrap();
-        fs::write(dir.path().join("refl2.md"), "---\ntitle: r2\n---\nReflection two\n").unwrap();
+        fs::write(
+            dir.path().join("refl1.md"),
+            "---\ntitle: r1\n---\nReflection one\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("refl2.md"),
+            "---\ntitle: r2\n---\nReflection two\n",
+        )
+        .unwrap();
 
         let result = load_all_reflections(dir.path());
         assert!(result.contains("Reflection one"));

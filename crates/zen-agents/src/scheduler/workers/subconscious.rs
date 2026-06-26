@@ -37,17 +37,17 @@ impl SubconsciousWorker {
 #[async_trait::async_trait]
 impl ZenWorker for SubconsciousWorker {
     fn id(&self) -> &'static str {
-          "subconscious"
-      }
+        "subconscious"
+    }
 
-     /// Human-readable description of what this worker does.
+    /// Human-readable description of what this worker does.
     fn description(&self) -> &'static str {
-          "Evaluate workspace state, log micro-actions (remind, suggest, organize)"
-      }
+        "Evaluate workspace state, log micro-actions (remind, suggest, organize)"
+    }
 
     fn schedule(&self) -> &'static str {
         self.scheduled.unwrap_or("0 */5 * * * *")
-      }
+    }
 
     async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
         let start = std::time::Instant::now();
@@ -59,15 +59,15 @@ impl ZenWorker for SubconsciousWorker {
         if !actions.is_empty() {
             append_subconscious_log(&paths, &actions)?;
             info!("subconscious tick: {} actions decided", actions.len());
-         }
+        }
 
         Ok(WorkerReport {
             worker_id: self.id().to_string(),
             success: true,
             fact_count: actions.len(),
             duration_ms: start.elapsed().as_millis() as u64,
-         })
-     }
+        })
+    }
 }
 
 fn evaluate_tick(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<MicroAction>> {
@@ -77,38 +77,38 @@ fn evaluate_tick(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<MicroActio
 
     if today_entries.is_empty() {
         actions.push(MicroAction::Remind(
-             "No log entries today. Consider recording your activities.".to_string(),
-         ));
-     }
+            "No log entries today. Consider recording your activities.".to_string(),
+        ));
+    }
 
     match load_identity(zen_paths) {
         Ok(ctx) if ctx.has_content() => {
             actions.push(MicroAction::Log(format!(
-                 "Identity loaded: {} files",
+                "Identity loaded: {} files",
                 ctx.file_count()
-             )));
-         }
+            )));
+        }
         Ok(_) => {
             actions.push(MicroAction::Suggest(
-                 "No identity context found. Consider creating SOUL.md / MEMORY.md.".to_string(),
-             ));
-         }
+                "No identity context found. Consider creating SOUL.md / MEMORY.md.".to_string(),
+            ));
+        }
         Err(e) => {
             actions.push(MicroAction::Log(format!("Identity load note: {e}")));
-         }
-     }
+        }
+    }
 
     let pending_notes = count_inbox_notes(zen_paths);
     if pending_notes > 0 {
         actions.push(MicroAction::Organize(format!(
-             "{pending_notes} inbox notes are pending consolidation"
-         )));
-     }
+            "{pending_notes} inbox notes are pending consolidation"
+        )));
+    }
 
     actions.push(MicroAction::Log(format!(
-         "Tick complete at {date}: {} log entries, {pending_notes} inbox notes",
+        "Tick complete at {date}: {} log entries, {pending_notes} inbox notes",
         today_entries.len()
-     )));
+    )));
 
     Ok(actions)
 }
@@ -121,19 +121,19 @@ fn count_inbox_notes(zen_paths: &ZenPaths) -> usize {
     let inbox = zen_paths.inbox();
     if !inbox.is_dir() {
         return 0;
-     }
+    }
     std::fs::read_dir(&inbox)
-         .map(|entries| {
+        .map(|entries| {
             entries
-                 .filter_map(|e| e.ok())
-                 .filter(|e| {
+                .filter_map(|e| e.ok())
+                .filter(|e| {
                     e.path()
-                         .extension()
-                         .is_some_and(|ext| ext == "md" || ext == "txt")
-                 })
-                 .count()
-         })
-         .unwrap_or(0)
+                        .extension()
+                        .is_some_and(|ext| ext == "md" || ext == "txt")
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn subconscious_log_path(zen_paths: &ZenPaths) -> PathBuf {
@@ -145,29 +145,29 @@ fn append_subconscious_log(zen_paths: &ZenPaths, actions: &[MicroAction]) -> Res
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-     }
+    }
 
     let now = chrono::Utc::now().naive_utc();
     let header = format!(
-         "\n## {} — Subconscious Tick\n\n",
+        "\n## {} — Subconscious Tick\n\n",
         now.format("%Y-%m-%d %H:%M:%S")
-     );
+    );
 
     let body: String = actions
-         .iter()
-         .map(|a| match a {
+        .iter()
+        .map(|a| match a {
             MicroAction::Remind(msg) => format!("- **Remind**: {msg}"),
             MicroAction::Suggest(msg) => format!("- **Suggest**: {msg}"),
             MicroAction::Log(msg) => format!("- **Log**: {msg}"),
             MicroAction::Organize(msg) => format!("- **Organize**: {msg}"),
-         })
-         .collect::<Vec<_>>()
-         .join("\n");
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut file = std::fs::OpenOptions::new()
-         .create(true)
-         .append(true)
-         .open(&path)?;
+        .create(true)
+        .append(true)
+        .open(&path)?;
     writeln!(file, "{header}{body}")?;
 
     debug!("subconscious log appended to {}", path.display());

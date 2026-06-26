@@ -3,6 +3,8 @@ pub mod conversation;
 pub mod journal;
 pub mod history;
 pub mod belief;
+pub mod decision;
+pub mod decision_check;
 pub mod dream;
 pub mod identity;
 pub mod memory;
@@ -38,4 +40,8 @@ pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity
 pub use session::SessionManager;
 pub use session::{ConversationTurn, RetrievedNote, SessionContext};
 pub use belief::{Belief, EvidenceEntry, SourceType};
+pub use decision::{
+    AntiPatternReport, AntiPatternViolation, CostBreakdown, Decision, ExpectedValue, Outcome,
+    OutcomeResult, Severity,
+};
 pub use zen_core::types::{SessionEntity, SessionStatus};

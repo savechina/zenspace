@@ -261,9 +261,17 @@ Rules:
 
     let json_str = if let Some(start) = response.find("```json") {
         let after = &response[start + 7..];
-        if let Some(end) = after.find("```") { &after[..end] } else { after }
+        if let Some(end) = after.find("```") {
+            &after[..end]
+        } else {
+            after
+        }
     } else if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') { &response[start..=end] } else { &response }
+        if let Some(end) = response.rfind('}') {
+            &response[start..=end]
+        } else {
+            &response
+        }
     } else {
         &response
     };
@@ -326,7 +334,12 @@ fn build_conversation_text(turns: &[(String, String)]) -> String {
     text
 }
 
-fn build_journal_entry(session_id: &str, turn_count: usize, signals: &ExtractedSignals, source: &str) -> String {
+fn build_journal_entry(
+    session_id: &str,
+    turn_count: usize,
+    signals: &ExtractedSignals,
+    source: &str,
+) -> String {
     let now = Utc::now();
     let date_str = now.format("%Y-%m-%d").to_string();
     let timestamp_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -369,8 +382,12 @@ fn build_journal_entry(session_id: &str, turn_count: usize, signals: &ExtractedS
 
 fn write_journal_entry(paths: &ZenPaths, session_id: &str, content: &str) -> Result<()> {
     let dir = paths.journal_entries();
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create journal entries directory: {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create journal entries directory: {}",
+            dir.display()
+        )
+    })?;
 
     let date_str = Utc::now().format("%Y-%m-%d").to_string();
     let filename = format!("{date_str}-{session_id}.md");
@@ -545,7 +562,11 @@ mod tests {
     fn test_has_journaled_marker_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
-        fs::write(&path, "{\"type\":\"session/meta\"}\n{\"type\":\"chat/turn\"}\n").unwrap();
+        fs::write(
+            &path,
+            "{\"type\":\"session/meta\"}\n{\"type\":\"chat/turn\"}\n",
+        )
+        .unwrap();
 
         assert!(!has_journaled_marker(&path));
     }
@@ -570,7 +591,10 @@ mod tests {
         let session_id = "01JX0TEST000000000000000000";
         let turn_count = 5;
         let signals = ExtractedSignals {
-            facts: vec!["completed auth module".to_string(), "fixed login bug".to_string()],
+            facts: vec![
+                "completed auth module".to_string(),
+                "fixed login bug".to_string(),
+            ],
             reflections: vec![],
             commitments: vec![],
         };
@@ -624,8 +648,14 @@ mod tests {
         let signals = extract_signals_via_keyword(conversation);
 
         assert!(!signals.facts.is_empty(), "keyword should extract facts");
-        assert!(signals.reflections.is_empty(), "keyword returns no reflections");
-        assert!(signals.commitments.is_empty(), "keyword returns no commitments");
+        assert!(
+            signals.reflections.is_empty(),
+            "keyword returns no reflections"
+        );
+        assert!(
+            signals.commitments.is_empty(),
+            "keyword returns no commitments"
+        );
     }
 
     #[test]

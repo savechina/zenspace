@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// - `commitment_tracked_at`: CommitmentTracker
 /// - `reflection_extracted_at`: ReflectionWorker
 /// - `wisdom_synthesized_at`: WisdomSynthesizer
+/// - `decision_tracked_at`: DecisionTracker
 ///
 /// `save()` uses read-merge-write to prevent one worker from clobbering another's fields.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,6 +25,7 @@ pub struct JournalEntryState {
     pub commitment_tracked_at: Option<String>,
     pub reflection_extracted_at: Option<String>,
     pub wisdom_synthesized_at: Option<String>,
+    pub decision_tracked_at: Option<String>,
 }
 
 /// Sidecar state for session `.jsonl` files.
@@ -83,6 +85,9 @@ impl JournalEntryState {
         if self.wisdom_synthesized_at.is_some() {
             existing.wisdom_synthesized_at = self.wisdom_synthesized_at.clone();
         }
+        if self.decision_tracked_at.is_some() {
+            existing.decision_tracked_at = self.decision_tracked_at.clone();
+        }
 
         let json = serde_json::to_string_pretty(&existing)
             .context("failed to serialize journal entry state")?;
@@ -113,17 +118,26 @@ impl JournalEntryState {
 
     pub fn has_commitment_tracked(md_path: &Path) -> bool {
         let state = Self::load(md_path);
-        state.commitment_tracked_at.is_some() || Self::scan_frontmatter(md_path, "commitment_tracked_at:")
+        state.commitment_tracked_at.is_some()
+            || Self::scan_frontmatter(md_path, "commitment_tracked_at:")
     }
 
     pub fn has_reflection_extracted(md_path: &Path) -> bool {
         let state = Self::load(md_path);
-        state.reflection_extracted_at.is_some() || Self::scan_frontmatter(md_path, "reflection_extracted_at:")
+        state.reflection_extracted_at.is_some()
+            || Self::scan_frontmatter(md_path, "reflection_extracted_at:")
     }
 
     pub fn has_wisdom_synthesized(md_path: &Path) -> bool {
         let state = Self::load(md_path);
-        state.wisdom_synthesized_at.is_some() || Self::scan_frontmatter(md_path, "wisdom_synthesized_at:")
+        state.wisdom_synthesized_at.is_some()
+            || Self::scan_frontmatter(md_path, "wisdom_synthesized_at:")
+    }
+
+    pub fn has_decision_tracked(md_path: &Path) -> bool {
+        let state = Self::load(md_path);
+        state.decision_tracked_at.is_some()
+            || Self::scan_frontmatter(md_path, "decision_tracked_at:")
     }
 
     fn scan_frontmatter(path: &Path, prefix: &str) -> bool {
@@ -172,7 +186,8 @@ impl JournalEntryState {
             }
         }
         if state.reflection_extracted_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "reflection_extracted_at:") {
+            if let Some(val) = Self::extract_frontmatter_value(md_path, "reflection_extracted_at:")
+            {
                 state.reflection_extracted_at = Some(val);
                 migrated = true;
             }
@@ -180,6 +195,12 @@ impl JournalEntryState {
         if state.wisdom_synthesized_at.is_none() {
             if let Some(val) = Self::extract_frontmatter_value(md_path, "wisdom_synthesized_at:") {
                 state.wisdom_synthesized_at = Some(val);
+                migrated = true;
+            }
+        }
+        if state.decision_tracked_at.is_none() {
+            if let Some(val) = Self::extract_frontmatter_value(md_path, "decision_tracked_at:") {
+                state.decision_tracked_at = Some(val);
                 migrated = true;
             }
         }
@@ -234,8 +255,8 @@ impl SessionState {
             existing.journaled_source = self.journaled_source.clone();
         }
 
-        let json = serde_json::to_string_pretty(&existing)
-            .context("failed to serialize session state")?;
+        let json =
+            serde_json::to_string_pretty(&existing).context("failed to serialize session state")?;
 
         let tmp_path = path.with_extension("state.json.tmp");
         fs::write(&tmp_path, &json)
@@ -265,8 +286,7 @@ impl SessionState {
             return content.contains(MARKER_PREFIX);
         }
 
-        let tail_start = content
-            .floor_char_boundary(content.len().saturating_sub(SEARCH_BYTES));
+        let tail_start = content.floor_char_boundary(content.len().saturating_sub(SEARCH_BYTES));
         content[tail_start..].contains(MARKER_PREFIX)
     }
 }
@@ -321,7 +341,10 @@ mod tests {
 
         let loaded = JournalEntryState::load(&md_path);
         assert_eq!(loaded.journaled_at.as_deref(), Some("2026-06-24T10:00:00Z"));
-        assert_eq!(loaded.memory_updated_at.as_deref(), Some("2026-06-24T10:05:00Z"));
+        assert_eq!(
+            loaded.memory_updated_at.as_deref(),
+            Some("2026-06-24T10:05:00Z")
+        );
         assert_eq!(loaded.extracted_at.as_deref(), Some("2026-06-24T10:10:00Z"));
         assert_eq!(loaded.extraction_source.as_deref(), Some("llm"));
     }
@@ -380,7 +403,10 @@ mod tests {
 
         let state = JournalEntryState::load(&md_path);
         assert_eq!(state.journaled_at.as_deref(), Some("2026-06-24T10:00:00Z"));
-        assert_eq!(state.memory_updated_at.as_deref(), Some("2026-06-24T10:05:00Z"));
+        assert_eq!(
+            state.memory_updated_at.as_deref(),
+            Some("2026-06-24T10:05:00Z")
+        );
     }
 
     #[test]
@@ -416,7 +442,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let jsonl_path = dir.path().join("conversation.jsonl");
         let marker = r#"{"type":"system/journaled","payload":{"timestamp":"2026-06-20T14:30:00Z","source":"keyword"}}"#;
-        fs::write(&jsonl_path, format!("{{\"type\":\"session/meta\"}}\n{marker}\n")).unwrap();
+        fs::write(
+            &jsonl_path,
+            format!("{{\"type\":\"session/meta\"}}\n{marker}\n"),
+        )
+        .unwrap();
 
         assert!(SessionState::is_journaled(&jsonl_path));
     }

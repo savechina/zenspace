@@ -25,16 +25,16 @@ impl DreamWorker {
 #[async_trait::async_trait]
 impl ZenWorker for DreamWorker {
     fn id(&self) -> &'static str {
-         "dream"
-     }
+        "dream"
+    }
 
     fn description(&self) -> &'static str {
-         "Nightly consolidation: extract facts, update memory, compress logs, recompute entities"
-     }
+        "Nightly consolidation: extract facts, update memory, compress logs, recompute entities"
+    }
 
     fn schedule(&self) -> &'static str {
         self.scheduled.unwrap_or("0 0 2-4 * * *")
-     }
+    }
 
     async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
         let start = std::time::Instant::now();
@@ -44,18 +44,18 @@ impl ZenWorker for DreamWorker {
         let report = ZenDream::new().run_cycle(&paths, today)?;
 
         info!(
-             "dream cycle: facts={}, memory={}, logs={}, entities={}",
+            "dream cycle: facts={}, memory={}, logs={}, entities={}",
             report.facts_extracted,
             report.memory_updated,
             report.logs_compressed,
             report.entities_recomputed
-         );
+        );
 
         Ok(WorkerReport {
             worker_id: self.id().to_string(),
             success: true,
             fact_count: report.facts_extracted,
             duration_ms: start.elapsed().as_millis() as u64,
-         })
-     }
+        })
+    }
 }
