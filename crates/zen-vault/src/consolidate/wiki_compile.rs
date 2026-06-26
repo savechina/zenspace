@@ -308,6 +308,8 @@ impl WikiCompiler {
             updated_at: note.updated_at,
             tags: note.tags.clone(),
             wikilinks,
+            para: note.para.clone(),
+            okf_type: note.okf_type.clone(),
             content,
         })
     }
@@ -340,15 +342,26 @@ impl WikiCompiler {
             )
         };
 
-        format!(
-            "---\ntitle: \"{}\"\ntags: {}\nwikilinks: {}\ncreated_at: \"{}\"\nupdated_at: \"{}\"\n---\n\n{}",
-            page.title,
-            tags_str,
-            links_str,
+        let mut fm = format!(
+            "---\ntitle: \"{}\"\ntags: {}\nwikilinks: {}",
+            page.title, tags_str, links_str,
+        );
+
+        if let Some(ref para) = page.para {
+            fm.push_str(&format!("\npara: \"{}\"", para));
+        }
+        if let Some(ref okf_type) = page.okf_type {
+            fm.push_str(&format!("\ntype: \"{}\"", okf_type));
+        }
+
+        fm.push_str(&format!(
+            "\ncreated_at: \"{}\"\nupdated_at: \"{}\"\n---\n\n{}",
             page.created_at.to_rfc3339(),
             page.updated_at.to_rfc3339(),
             page.content,
-        )
+        ));
+
+        fm
     }
 }
 
@@ -575,6 +588,8 @@ mod tests {
             updated_at: now,
             domain: vec![],
             project: None,
+            para: None,
+            okf_type: None,
             content: content.to_string(),
             file_path: None,
         }
@@ -592,6 +607,8 @@ mod tests {
             updated_at: now,
             domain: vec![],
             project: None,
+            para: None,
+            okf_type: None,
             content: content.to_string(),
             file_path: None,
         }
@@ -673,6 +690,8 @@ mod tests {
             updated_at: now,
             domain: vec![],
             project: None,
+            para: None,
+            okf_type: None,
             content: "# TS Note\n\nBody".to_string(),
             file_path: None,
         };
@@ -945,6 +964,8 @@ mod tests {
             updated_at: chrono::Utc::now(),
             tags: vec!["tag1".into()],
             wikilinks: vec!["Link1".into()],
+            para: None,
+            okf_type: None,
             content: "Body content".to_string(),
         };
 

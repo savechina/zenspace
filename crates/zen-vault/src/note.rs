@@ -72,6 +72,10 @@ pub struct Note {
     pub updated_at: DateTime<Utc>,
     pub domain: Vec<Domain>,
     pub project: Option<String>,
+    /// PARA category: "projects" | "areas" | "resources" | "archive" (None = unclassified)
+    pub para: Option<String>,
+    /// OKF type field for Open Knowledge Format alignment (None = not set)
+    pub okf_type: Option<String>,
     pub content: String,
     pub file_path: Option<PathBuf>,
 }
@@ -89,9 +93,19 @@ impl Default for Note {
             updated_at: now,
             domain: Vec::new(),
             project: None,
+            para: None,
+            okf_type: None,
             content: String::new(),
             file_path: None,
         }
+    }
+}
+
+/// Validate PARA category value. Returns true if valid or None.
+pub fn validate_para(para: &Option<String>) -> bool {
+    match para {
+        None => true,
+        Some(p) => matches!(p.as_str(), "projects" | "areas" | "resources" | "archive"),
     }
 }
 
@@ -206,6 +220,12 @@ pub fn parse_frontmatter(content: &str) -> Result<Note, anyhow::Error> {
             "project" if !value.is_empty() && value != "null" && value != "~" => {
                 note.project = Some(value);
             }
+            "para" if !value.is_empty() && value != "null" && value != "~" => {
+                note.para = Some(value);
+            }
+            "type" if !value.is_empty() && value != "null" && value != "~" => {
+                note.okf_type = Some(value);
+            }
             "tags" => note.tags = parse_array(&value),
             "sensitivity" => {
                 note.sensitivity = parse_sensitivity(&value)
@@ -310,6 +330,13 @@ pub fn write_note(note: &Note, base_dir: &Path) -> Result<PathBuf, anyhow::Error
         front_matter.push_str("project: null\n");
     }
 
+    if let Some(ref para) = note.para {
+        front_matter.push_str(&format!("para: \"{}\"\n", para));
+    }
+    if let Some(ref okf_type) = note.okf_type {
+        front_matter.push_str(&format!("type: \"{}\"\n", okf_type));
+    }
+
     let full_content = format!("---\n{}---\n\n{}", front_matter, note.content);
 
     std::fs::write(&file_path, full_content)?;
@@ -348,6 +375,8 @@ impl NoteService {
             updated_at: now,
             domain: Vec::new(),
             project: None,
+            para: None,
+            okf_type: None,
             content: content.to_string(),
             file_path: None,
         };
@@ -470,6 +499,8 @@ Body
             updated_at: "2026-05-23T15:00:00+08:00".parse().unwrap(),
             domain: vec![Domain::Personal],
             project: Some("proj".to_string()),
+            para: None,
+            okf_type: None,
             content: "Hello world".to_string(),
             file_path: None,
         };
@@ -544,5 +575,129 @@ Body
         assert_eq!(note.content, "content");
         assert!(!note.id.is_empty());
         assert_eq!(note.sensitivity, Sensitivity::Private);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_with_para() {
+        let input = r#"---
+id: "para-test"
+tags: []
+source: "test"
+sensitivity: private
+created_at: "2026-01-01T00:00:00+00:00"
+updated_at: "2026-01-01T00:00:00+00:00"
+para: "projects"
+---
+
+Body
+"#;
+        let note = parse_frontmatter(input).unwrap();
+        assert_eq!(note.para, Some("projects".to_string()));
+    }
+
+    #[test]
+    fn test_parse_frontmatter_with_okf_type() {
+        let input = r#"---
+id: "type-test"
+tags: []
+source: "test"
+sensitivity: private
+created_at: "2026-01-01T00:00:00+00:00"
+updated_at: "2026-01-01T00:00:00+00:00"
+type: "concept"
+---
+
+Body
+"#;
+        let note = parse_frontmatter(input).unwrap();
+        assert_eq!(note.okf_type, Some("concept".to_string()));
+    }
+
+    #[test]
+    fn test_write_note_with_para_and_type() {
+        let note = Note {
+            id: "wt-test".to_string(),
+            tags: vec![],
+            source: "test".to_string(),
+            source_id: None,
+            sensitivity: Sensitivity::Private,
+            created_at: "2026-01-01T00:00:00+00:00".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00+00:00".parse().unwrap(),
+            domain: vec![],
+            project: None,
+            para: Some("areas".to_string()),
+            okf_type: Some("reference".to_string()),
+            content: "test content".to_string(),
+            file_path: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_note(&note, dir.path()).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+
+        assert!(raw.contains("para: \"areas\""));
+        assert!(raw.contains("type: \"reference\""));
+    }
+
+    #[test]
+    fn test_roundtrip_para_type() {
+        let note = Note {
+            id: "rt-test".to_string(),
+            tags: vec!["tag1".to_string()],
+            source: "test".to_string(),
+            source_id: None,
+            sensitivity: Sensitivity::Private,
+            created_at: "2026-01-01T00:00:00+00:00".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00+00:00".parse().unwrap(),
+            domain: vec![],
+            project: None,
+            para: Some("resources".to_string()),
+            okf_type: Some("tool".to_string()),
+            content: "roundtrip content".to_string(),
+            file_path: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_note(&note, dir.path()).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_frontmatter(&raw).unwrap();
+
+        assert_eq!(parsed.para, Some("resources".to_string()));
+        assert_eq!(parsed.okf_type, Some("tool".to_string()));
+        assert_eq!(parsed.content, "roundtrip content");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_without_para_type() {
+        let input = r#"---
+id: "old-note"
+tags: []
+source: "test"
+sensitivity: private
+created_at: "2026-01-01T00:00:00+00:00"
+updated_at: "2026-01-01T00:00:00+00:00"
+---
+
+Old note content
+"#;
+        let note = parse_frontmatter(input).unwrap();
+        assert!(note.para.is_none());
+        assert!(note.okf_type.is_none());
+    }
+
+    #[test]
+    fn test_validate_para_valid() {
+        assert!(validate_para(&None));
+        assert!(validate_para(&Some("projects".to_string())));
+        assert!(validate_para(&Some("areas".to_string())));
+        assert!(validate_para(&Some("resources".to_string())));
+        assert!(validate_para(&Some("archive".to_string())));
+    }
+
+    #[test]
+    fn test_validate_para_invalid() {
+        assert!(!validate_para(&Some("random".to_string())));
+        assert!(!validate_para(&Some("Projects".to_string())));
+        assert!(!validate_para(&Some("".to_string())));
     }
 }

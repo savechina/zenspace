@@ -16,6 +16,8 @@ pub struct WikiPage {
     pub updated_at: chrono::DateTime<Utc>,
     pub tags: Vec<String>,
     pub wikilinks: Vec<String>,
+    pub para: Option<String>,
+    pub okf_type: Option<String>,
     pub content: String,
 }
 

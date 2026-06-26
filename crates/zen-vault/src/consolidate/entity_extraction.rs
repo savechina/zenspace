@@ -216,6 +216,8 @@ mod tests {
             updated_at: Utc::now(),
             domain: vec![],
             project: None,
+            para: None,
+            okf_type: None,
             content: content.to_string(),
             file_path: None,
         }

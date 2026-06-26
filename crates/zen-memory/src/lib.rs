@@ -13,6 +13,7 @@ pub mod memory_service;
 pub mod memvid;
 pub mod prompt;
 pub mod sensitivity;
+pub mod self_model;
 pub mod session;
 
 #[deprecated(
@@ -44,4 +45,5 @@ pub use decision::{
     AntiPatternReport, AntiPatternViolation, CostBreakdown, Decision, ExpectedValue, Outcome,
     OutcomeResult, Severity,
 };
+pub use self_model::{SelfModelItem, SelfModelLayer};
 pub use zen_core::types::{SessionEntity, SessionStatus};

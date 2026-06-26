@@ -27,6 +27,8 @@ pub struct CompiledWikiPage {
     pub content: String,
     pub wikilinks: Vec<String>,
     pub tags: Vec<String>,
+    pub para: Option<String>,
+    pub okf_type: Option<String>,
 }
 
 pub struct WikiCompilerSkill {
@@ -71,7 +73,18 @@ impl WikiCompilerSkill {
             let slug = self.slugify(&title);
             let path = PathBuf::from(format!("{category}/{slug}.md"));
 
-            self.write_page(&title, &stripped_content, &wikilinks, &tags, &path)?;
+            let para = note_val
+                .get("para")
+                .and_then(|p| p.as_str())
+                .filter(|s| !s.is_empty() && *s != "null")
+                .map(String::from);
+            let okf_type = note_val
+                .get("okf_type")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty() && *s != "null")
+                .map(String::from);
+
+            self.write_page(&title, &stripped_content, &wikilinks, &tags, &para, &okf_type, &path)?;
 
             pages.push(CompiledWikiPage {
                 title,
@@ -79,6 +92,8 @@ impl WikiCompilerSkill {
                 content: stripped_content,
                 wikilinks,
                 tags,
+                para: None,
+                okf_type: None,
             });
         }
 
@@ -143,6 +158,8 @@ impl WikiCompilerSkill {
         content: &str,
         wikilinks: &[String],
         tags: &[String],
+        para: &Option<String>,
+        okf_type: &Option<String>,
         path: &PathBuf,
     ) -> Result<()> {
         let full_path = self.wiki_dir.join(path);
@@ -178,17 +195,28 @@ impl WikiCompilerSkill {
         };
 
         let now = Utc::now();
-        let rendered = format!(
-            "---\ntitle: \"{title}\"\ntags: {tags_str}\nwikilinks: {links_str}\ncreated_at: \"{created}\"\nupdated_at: \"{updated}\"\n---\n\n{content}",
+        let mut fm = format!(
+            "---\ntitle: \"{title}\"\ntags: {tags_str}\nwikilinks: {links_str}",
             title = title,
             tags_str = tags_str,
             links_str = links_str,
+        );
+
+        if let Some(ref para) = para {
+            fm.push_str(&format!("\npara: \"{}\"", para));
+        }
+        if let Some(ref okf_type) = okf_type {
+            fm.push_str(&format!("\ntype: \"{}\"", okf_type));
+        }
+
+        fm.push_str(&format!(
+            "\ncreated_at: \"{created}\"\nupdated_at: \"{updated}\"\n---\n\n{content}",
             created = now.to_rfc3339(),
             updated = now.to_rfc3339(),
             content = content,
-        );
+        ));
 
-        std::fs::write(&full_path, rendered)
+        std::fs::write(&full_path, fm)
             .with_context(|| format!("write wiki page: {}", full_path.display()))?;
 
         Ok(())
