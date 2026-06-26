@@ -1,6 +1,7 @@
 pub mod commitment_tracker;
 pub mod decision_tracker;
 pub mod dream;
+pub mod express;
 pub mod entity_extractor_worker;
 pub mod journal_worker;
 pub mod marker_state;
@@ -13,6 +14,7 @@ pub mod wisdom_synth;
 pub use commitment_tracker::CommitmentTracker;
 pub use decision_tracker::DecisionTracker;
 pub use dream::DreamWorker;
+pub use express::ExpressWorker;
 pub use entity_extractor_worker::EntityExtractorWorker;
 pub use journal_worker::JournalWorker;
 pub use marker_state::{JournalEntryState, SessionState};

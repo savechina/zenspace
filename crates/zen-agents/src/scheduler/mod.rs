@@ -280,6 +280,7 @@ pub struct WorkerSummary {
 /// - `commitment-tracker` (CommitmentTracker): runs daily 8AM, tracks commitments from journal entries
 /// - `reflection-worker` (ReflectionWorker): runs daily 6AM, aggregates reflections into wiki/wisdom/
 /// - `wisdom-synth` (WisdomSynthesizer): runs weekly Sun 2AM (cron: `0 0 2 * * 7`), synthesizes reflections + beliefs into wisdom candidates
+/// - `express` (ExpressWorker): runs weekly Sat 3PM (cron: `0 0 15 * * 6`), LLM expression of insights into publishable review and blog drafts
 pub fn create_default_scheduler() -> ZenScheduler {
     let mut scheduler = ZenScheduler::new();
 
@@ -314,6 +315,10 @@ pub fn create_default_scheduler() -> ZenScheduler {
 
     if let Err(e) = scheduler.register(DecisionTracker::new()) {
         warn!("scheduler: failed to register decision-tracker worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(ExpressWorker::new()) {
+        warn!("scheduler: failed to register express worker: {e}");
     }
 
     scheduler
@@ -374,6 +379,10 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
 
     if let Err(e) = scheduler.register(DecisionTracker::new()) {
         warn!("scheduler: failed to register decision-tracker worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(ExpressWorker::new()) {
+        warn!("scheduler: failed to register express worker: {e}");
     }
 
     scheduler
@@ -463,7 +472,7 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 10);
+        assert_eq!(items.len(), 11);
         assert!(items.iter().any(|w| w.id == "journal-worker"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
@@ -474,5 +483,6 @@ mod tests {
         assert!(items.iter().any(|w| w.id == "reflection-worker"));
         assert!(items.iter().any(|w| w.id == "wisdom-synth"));
         assert!(items.iter().any(|w| w.id == "decision-tracker"));
+        assert!(items.iter().any(|w| w.id == "express"));
     }
 }

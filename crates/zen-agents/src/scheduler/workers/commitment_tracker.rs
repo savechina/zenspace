@@ -107,6 +107,17 @@ impl ZenWorker for CommitmentTracker {
                             format!("failed to write commitment: {}", commitment_path.display())
                         })?;
                         total_tracked += 1;
+
+                        let base = base_slug_of(&slug);
+                        let prior_count = count_similar_commitments(&commitments_dir, &base);
+                        if prior_count >= 3 {
+                            warn!(
+                                commitment = %item.text,
+                                base_slug = %base,
+                                occurrences = prior_count,
+                                "anti-talk pattern detected: commitment repeatedly created without closure"
+                            );
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -255,6 +266,42 @@ fn slugify(text: &str) -> String {
         .collect()
 }
 
+/// Strip a trailing `-{N}` numeric suffix from a slug stem.
+/// `write-tests` → `write-tests`
+/// `write-tests-2` → `write-tests`
+/// `write-tests-10` → `write-tests`
+/// `实现登录功能` → `实现登录功能` (no ASCII digit suffix, unchanged)
+fn base_slug_of(stem: &str) -> String {
+    if let Some(idx) = stem.rfind('-') {
+        let suffix = &stem[idx + 1..];
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return stem[..idx].to_string();
+        }
+    }
+    stem.to_string()
+}
+
+/// Count existing commitment files in `dir` whose stem shares the same `base_slug`
+/// (ignoring `-N` numeric suffixes). Does NOT count the file currently being created.
+fn count_similar_commitments(dir: &Path, base_slug: &str) -> usize {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if base_slug_of(stem) == base_slug {
+            count += 1;
+        }
+    }
+    count
+}
+
 fn unique_slug(text: &str, used: &[String]) -> String {
     let base = slugify(text);
     if !used.contains(&base) {
@@ -337,5 +384,52 @@ mod tests {
     fn test_slugify_handles_unicode() {
         let result = slugify("实现登录功能");
         assert_eq!(result, "实现登录功能");
+    }
+
+    #[test]
+    fn test_base_slug_of_no_suffix() {
+        assert_eq!(base_slug_of("write-tests"), "write-tests");
+        assert_eq!(base_slug_of("实现登录功能"), "实现登录功能");
+    }
+
+    #[test]
+    fn test_base_slug_of_with_numeric_suffix() {
+        assert_eq!(base_slug_of("write-tests-2"), "write-tests");
+        assert_eq!(base_slug_of("write-tests-10"), "write-tests");
+    }
+
+    #[test]
+    fn test_base_slug_of_suffix_only_digits_stripped() {
+        assert_eq!(base_slug_of("fix-bug-123"), "fix-bug");
+    }
+
+    #[test]
+    fn test_base_slug_of_trailing_dash_no_digits() {
+        assert_eq!(base_slug_of("foo-"), "foo-");
+    }
+
+    #[test]
+    fn test_count_similar_commitments_empty_dir() {
+        let dir = tempdir().unwrap();
+        assert_eq!(count_similar_commitments(dir.path(), "anything"), 0);
+    }
+
+    #[test]
+    fn test_count_similar_commitments_matches_base() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("write-tests.md"), "").unwrap();
+        fs::write(dir.path().join("write-tests-2.md"), "").unwrap();
+        fs::write(dir.path().join("write-tests-3.md"), "").unwrap();
+        fs::write(dir.path().join("other-thing.md"), "").unwrap();
+        assert_eq!(count_similar_commitments(dir.path(), "write-tests"), 3);
+    }
+
+    #[test]
+    fn test_count_similar_commitments_ignores_non_md() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("task.md"), "").unwrap();
+        fs::write(dir.path().join("task.txt"), "").unwrap();
+        fs::write(dir.path().join("task-2.md"), "").unwrap();
+        assert_eq!(count_similar_commitments(dir.path(), "task"), 2);
     }
 }
