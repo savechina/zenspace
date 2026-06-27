@@ -1,9 +1,11 @@
+pub mod anti_pattern;
 pub mod belief;
 pub mod commitment;
 pub mod okr;
 pub mod context_budget;
 pub mod conversation;
 pub mod correction;
+pub mod fact;
 pub mod decision;
 pub mod decision_check;
 pub mod dream;
@@ -16,9 +18,11 @@ pub mod memory_flush;
 pub mod memory_service;
 pub mod memvid;
 pub mod memvid_index;
+pub mod mental_model;
 pub mod prompt;
 pub mod priority;
 pub mod quality_gate;
+pub mod reflection_signal;
 pub mod seed;
 pub mod self_model;
 pub mod sensitivity;
@@ -51,7 +55,7 @@ pub use seed::{copy_seeds_to, seed_file_paths, SEED_FILE_COUNT};
 pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity};
 pub use session::SessionManager;
 pub use session::{ConversationTurn, RetrievedNote, SessionContext};
-pub use belief::{Belief, EvidenceEntry, SourceType};
+pub use belief::{Belief, EvidenceEntry, ResearchMethod, SourceType};
 pub use decision::{
     AntiPatternReport, AntiPatternViolation, CostBreakdown, Decision, ExpectedValue, Outcome,
     OutcomeResult, Severity,
@@ -60,10 +64,14 @@ pub use self_model::{SelfModelItem, SelfModelLayer};
 pub use commitment::{Commitment, CommitmentState, ExecutionChecklist, Milestone, StopLossLine};
 pub use okr::{CommitmentOkr, compute_commitment_completion_rate};
 pub use correction::Correction;
+pub use fact::Fact;
 pub use feedback_signal::{Feedback, FeedbackDisposition, FeedbackProperties};
 pub use quality_gate::{
-    Bias, DecisionPromotionReport, InformationQualityGate, DECISION_PRINCIPLES,
-    EXTRACTION_GUARDRAILS,
+    Bias, DecisionPrincipleReport, DecisionPromotionReport, InformationQualityGate,
+    check_decision_principles, DECISION_PRINCIPLES, EXTRACTION_GUARDRAILS,
 };
+pub use anti_pattern::AntiPatternSignal;
+pub use mental_model::MentalModelSignal;
+pub use reflection_signal::ReflectionSignal;
 pub use virtue_log::{VirtueDomain, VirtueLog, VirtueStatus};
 pub use zen_core::types::{SessionEntity, SessionStatus};

@@ -14,8 +14,11 @@ use super::relationship::{RelationType, Relationship};
 
 /// Normalize an entity name for canonical matching.
 /// Rules: lowercase, trim, strip common suffixes (.js, .rs, .py, -lang, " language").
+use unicode_normalization::UnicodeNormalization;
+
 fn normalize_entity_name(name: &str) -> String {
-    let mut s = name.trim().to_lowercase();
+    let nfc: String = name.nfc().collect();
+    let mut s = nfc.trim().to_lowercase();
     for suffix in [".js", ".rs", ".py", ".ts", "-lang", " lang", " language"] {
         if s.ends_with(suffix) {
             s = s[..s.len() - suffix.len()].trim_end().to_string();
@@ -407,6 +410,14 @@ mod tests {
         assert_eq!(normalize_entity_name("Go-lang"), "go");
         assert_eq!(normalize_entity_name("C Language"), "c");
         assert_eq!(normalize_entity_name("rust language"), "rust");
+    }
+
+    #[test]
+    fn test_normalize_entity_name_nfc() {
+        // Combining accent (U+0301) vs precomposed (U+00E9) → same NFC output
+        let combining = "cafe\u{0301}";
+        let precomposed = "caf\u{00E9}";
+        assert_eq!(normalize_entity_name(combining), normalize_entity_name(precomposed));
     }
 
     #[test]

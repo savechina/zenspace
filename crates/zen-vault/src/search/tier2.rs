@@ -13,7 +13,8 @@ use crate::tools::{
 pub struct Tier2Search;
 
 impl Tier2Search {
-    fn ensure_fts(db_path: &Path) -> Result<rusqlite::Connection> {
+    /// Ensure the database has the required schema (notes_fts + notes_meta).
+    fn ensure_db(db_path: &Path) -> Result<rusqlite::Connection> {
         if !db_path.exists() {
             anyhow::bail!(
                 "Database not found at {}. Initialize with init_kb_schema() first.",
@@ -22,9 +23,33 @@ impl Tier2Search {
         }
         let conn = rusqlite::Connection::open(db_path)?;
         conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(
-                id, title, content, tags, file_path, source
-            );",
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+                id UNINDEXED,
+                title,
+                content,
+                tags,
+                tokenize='porter'
+            );
+
+            CREATE TABLE IF NOT EXISTS notes_meta (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                source TEXT NOT NULL,
+                domain TEXT,
+                project TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                content_hash TEXT
+            );
+
+            CREATE TRIGGER IF NOT EXISTS notes_fts_after_insert
+            AFTER INSERT ON notes_meta
+            BEGIN
+                INSERT INTO notes_fts(rowid, id, title, content, tags)
+                VALUES (new.rowid, new.id, '', '', '');
+            END;
+            "#,
         )?;
         Ok(conn)
     }
@@ -34,11 +59,16 @@ impl Tier2Search {
             return Ok(Vec::new());
         }
 
-        let conn = Self::ensure_fts(db_path)?;
+        let conn = Self::ensure_db(db_path)?;
         let limit = limit.max(1);
 
+        // Join with notes_meta to get file_path (not stored in notes_fts)
         let mut stmt = conn.prepare(
-            "SELECT title, content, bm25(note_fts) as score, file_path FROM note_fts WHERE note_fts MATCH ?1 ORDER BY score LIMIT ?2",
+            "SELECT nf.title, nf.content, bm25(notes_fts) as score, nm.file_path \
+             FROM notes_fts nf \
+             JOIN notes_meta nm ON nf.rowid = nm.rowid \
+             WHERE notes_fts MATCH ?1 \
+             ORDER BY score LIMIT ?2",
         )?;
 
         let results: Vec<FTSResult> = stmt
@@ -79,10 +109,20 @@ impl Tier2Search {
             );
         }
 
-        let conn = Self::ensure_fts(db_path)?;
+        let conn = Self::ensure_db(db_path)?;
+
+        // Insert metadata row (trigger creates empty notes_fts entry)
         conn.execute(
-            "INSERT OR REPLACE INTO note_fts (id, title, content, tags, file_path, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![title, title, content, tags, file_path, source],
+            "INSERT OR REPLACE INTO notes_meta (id, file_path, source, domain, project, created_at, updated_at, content_hash) \
+             VALUES (?1, ?2, ?3, '', '', datetime('now'), datetime('now'), '')",
+            rusqlite::params![id, file_path, source],
+        )?;
+
+        // Overwrite the auto-inserted FTS entry with actual content
+        conn.execute(
+            "INSERT OR REPLACE INTO notes_fts (rowid, id, title, content, tags) \
+             VALUES (last_insert_rowid(), ?1, ?2, ?3, ?4)",
+            rusqlite::params![id, title, content, tags],
         )?;
 
         debug!("Tier2Search: indexed note '{id}' (title='{title}', tags='{tags}')");

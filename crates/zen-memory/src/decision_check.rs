@@ -74,10 +74,49 @@ pub fn check_all(d: &Decision) -> AntiPatternReport {
     }
 }
 
-/// DEFERRED: requires LLM semantic analysis to compare decision vs core_pursuit.
-/// WisdomSynthesizer handles this.
-fn check_misplaced_priority(_d: &Decision) -> Option<AntiPatternViolation> {
-    None
+/// Check if decision focus diverges from stated core pursuit.
+///
+/// Rule-based heuristic: tokenize core_pursuit into keywords, check if any
+/// keyword appears in goal/choice/facts. If no overlap → misplaced priority.
+fn check_misplaced_priority(d: &Decision) -> Option<AntiPatternViolation> {
+    let core = d.core_pursuit.trim();
+    if core.is_empty() {
+        return None; // Can't check without a stated core pursuit
+    }
+
+    let core_keywords: Vec<&str> = core
+        .split_whitespace()
+        .filter(|w| w.len() > 2) // Skip short stopwords
+        .collect();
+
+    if core_keywords.is_empty() {
+        return None;
+    }
+
+    let decision_text = format!(
+        "{} {} {}",
+        d.goal,
+        d.choice,
+        d.facts.join(" ")
+    )
+    .to_lowercase();
+
+    let has_overlap = core_keywords.iter().any(|kw| {
+        let kw_lower = kw.to_lowercase();
+        decision_text.contains(&kw_lower)
+    });
+
+    if has_overlap {
+        None
+    } else {
+        Some(AntiPatternViolation {
+            pattern_id: "misplaced_priority".into(),
+            severity: Severity::High,
+            message: format!(
+                "Decision focus appears disconnected from stated core pursuit: '{core}'"
+            ),
+        })
+    }
 }
 
 /// Check if legal/compliance risk is present without risk assessment.
@@ -116,10 +155,37 @@ fn check_legal_risk_blind(d: &Decision) -> Option<AntiPatternViolation> {
     }
 }
 
-/// DEFERRED: requires LLM to analyze reasoning basis.
-/// WisdomSynthesizer handles this.
-fn check_inertia_thinking(_d: &Decision) -> Option<AntiPatternViolation> {
-    None
+/// Check if decision relies solely on past experience without current environment analysis.
+///
+/// Rule-based: flags when facts are non-empty but information_sources is empty,
+/// or when facts contain "past success" markers without external validation.
+fn check_inertia_thinking(d: &Decision) -> Option<AntiPatternViolation> {
+    if d.facts.is_empty() {
+        return None; // No facts to analyze
+    }
+
+    let has_sources = !d.information_sources.is_empty();
+    if has_sources {
+        return None; // External sources present — not pure inertia
+    }
+
+    let inertia_markers = [
+        "past success", "previously worked", "last time", "always worked",
+        "used to", "before it was", "上次", "之前成功", "以前都", "历来",
+    ];
+
+    let facts_text = d.facts.join(" ").to_lowercase();
+    let has_inertia_marker = inertia_markers.iter().any(|m| facts_text.contains(m));
+
+    if has_inertia_marker || !has_sources {
+        Some(AntiPatternViolation {
+            pattern_id: "inertia_thinking".into(),
+            severity: Severity::High,
+            message: "Decision based solely on past experience without current environment analysis".into(),
+        })
+    } else {
+        None
+    }
 }
 
 /// Check for sunk cost trap with unaffordable loss.

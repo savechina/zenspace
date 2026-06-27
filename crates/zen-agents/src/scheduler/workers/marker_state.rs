@@ -2,13 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Sidecar state for journal `.md` entries.
 ///
 /// Each field is owned by a specific worker:
 /// - `journaled_at`: SessionJournaler
-/// - `memory_updated_at`: JournalWorker
+/// - `memory_updated_at`: MemoryCurator
 /// - `extracted_at` / `extraction_source`: EntityExtractorWorker
 /// - `commitment_tracked_at`: CommitmentTracker
 /// - `reflection_extracted_at`: ReflectionWorker
@@ -56,10 +57,22 @@ impl JournalEntryState {
         }
     }
 
-    /// Atomic save via read-merge-write: loads existing sidecar, merges only
-    /// `Some` fields from `self`, writes tmp + rename.
+    /// Atomic save via read-merge-write with advisory file lock.
+    ///
+    /// Acquires an exclusive lock on a `.lock` sidecar to prevent concurrent
+    /// workers from clobbering each other's fields during the merge.
     pub fn save(&self, md_path: &Path) -> Result<()> {
         let path = sidecar_path(md_path);
+        let lock_path = path.with_extension("state.json.lock");
+
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;
+        lock_file
+            .lock_exclusive()
+            .with_context(|| format!("failed to acquire exclusive lock: {}", lock_path.display()))?;
 
         let mut existing: Self = match fs::read_to_string(&path) {
             Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
@@ -98,6 +111,7 @@ impl JournalEntryState {
         fs::rename(&tmp_path, &path)
             .with_context(|| format!("failed to rename sidecar: {}", path.display()))?;
 
+        drop(lock_file);
         Ok(())
     }
 
@@ -236,9 +250,19 @@ impl SessionState {
         }
     }
 
-    /// Atomic save via read-merge-write.
+    /// Atomic save via read-merge-write with advisory file lock.
     pub fn save(&self, jsonl_path: &Path) -> Result<()> {
         let path = sidecar_path(jsonl_path);
+        let lock_path = path.with_extension("state.json.lock");
+
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;
+        lock_file
+            .lock_exclusive()
+            .with_context(|| format!("failed to acquire exclusive lock: {}", lock_path.display()))?;
 
         let mut existing: Self = match fs::read_to_string(&path) {
             Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
@@ -264,6 +288,7 @@ impl SessionState {
         fs::rename(&tmp_path, &path)
             .with_context(|| format!("failed to rename sidecar: {}", path.display()))?;
 
+        drop(lock_file);
         Ok(())
     }
 

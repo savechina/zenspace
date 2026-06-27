@@ -8,11 +8,11 @@ use zen_memory::dream::{ExtractedSignals, update_memory_from_facts};
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
 
-pub struct JournalWorker {
+pub struct MemoryCurator {
     scheduled: Option<&'static str>,
 }
 
-impl JournalWorker {
+impl MemoryCurator {
     pub fn new() -> Self {
         Self { scheduled: None }
     }
@@ -24,9 +24,9 @@ impl JournalWorker {
 }
 
 #[async_trait::async_trait]
-impl ZenWorker for JournalWorker {
+impl ZenWorker for MemoryCurator {
     fn id(&self) -> &'static str {
-        "journal-worker"
+        "memory-curator"
     }
 
     fn description(&self) -> &'static str {

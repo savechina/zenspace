@@ -60,6 +60,8 @@ pub struct EvidenceEntry {
     pub source_weight: f64,
     /// Source type for audit trail.
     pub source_type: SourceType,
+    /// Research method used to gather this evidence (§4.11).
+    pub research_method: Option<ResearchMethod>,
     /// Optional note describing the evidence context.
     pub note: Option<String>,
 }
@@ -86,6 +88,49 @@ impl SourceType {
             SourceType::TrustedPeer => 0.7,
             SourceType::AuthorityBook => 0.8,
             SourceType::AnonymousInternet => 0.2,
+        }
+    }
+}
+
+/// Research method used to gather evidence (§4.11).
+///
+/// Tracks how evidence was obtained for audit trail and quality assessment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchMethod {
+    /// Evidence from social engineering (e.g., asking people, surveys).
+    SocialEngineering,
+    /// Evidence from ecommerce data (e.g., sales, transactions).
+    EcommerceData,
+    /// Evidence from third-party data sources (e.g., APIs, datasets).
+    ThirdPartyData,
+    /// Evidence from Q&A search (e.g., Stack Overflow, forums).
+    QaSearch,
+    /// Evidence from direct observation (e.g., monitoring, testing).
+    Observation,
+}
+
+impl ResearchMethod {
+    /// Get the string representation for serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SocialEngineering => "social_engineering",
+            Self::EcommerceData => "ecommerce_data",
+            Self::ThirdPartyData => "third_party_data",
+            Self::QaSearch => "qa_search",
+            Self::Observation => "observation",
+        }
+    }
+
+    /// Parse from string representation.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "social_engineering" => Some(Self::SocialEngineering),
+            "ecommerce_data" => Some(Self::EcommerceData),
+            "third_party_data" => Some(Self::ThirdPartyData),
+            "qa_search" => Some(Self::QaSearch),
+            "observation" => Some(Self::Observation),
+            _ => None,
         }
     }
 }
@@ -120,6 +165,30 @@ impl Belief {
             supports,
             source_weight,
             source_type: source,
+            research_method: None,
+            note,
+        });
+        self.evidence_count += 1;
+        self.last_updated = Utc::now();
+    }
+
+    /// Apply Bayesian update with binary evidence and a research method.
+    pub fn update_with_method(
+        &mut self,
+        supports: bool,
+        source: SourceType,
+        method: ResearchMethod,
+        note: Option<String>,
+    ) {
+        let source_weight = source.default_weight();
+        self.bayesian_update_weighted(supports, source_weight);
+
+        self.evidence.push(EvidenceEntry {
+            timestamp: Utc::now(),
+            supports,
+            source_weight,
+            source_type: source,
+            research_method: Some(method),
             note,
         });
         self.evidence_count += 1;
@@ -236,12 +305,17 @@ impl Belief {
                 let src = format!("{:?}", e.source_type)
                     .to_lowercase()
                     .replace('_', "-");
+                let method_str = e
+                    .research_method
+                    .map(|m| format!(" [{}]", m.as_str()))
+                    .unwrap_or_default();
                 md.push_str(&format!(
-                    "- {} [{}] {} (weight: {:.1})",
+                    "- {} [{}] {} (weight: {:.1}){}",
                     arrow,
                     e.timestamp.format("%Y-%m-%d"),
                     src,
-                    e.source_weight
+                    e.source_weight,
+                    method_str
                 ));
                 if let Some(note) = &e.note {
                     md.push_str(&format!(" — {}", note));
@@ -664,5 +738,62 @@ mod tests {
     fn test_from_markdown_missing_frontmatter_close() {
         let result = Belief::from_markdown("---\nno closing");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_research_method_serialization_roundtrip() {
+        let methods = [
+            ResearchMethod::SocialEngineering,
+            ResearchMethod::EcommerceData,
+            ResearchMethod::ThirdPartyData,
+            ResearchMethod::QaSearch,
+            ResearchMethod::Observation,
+        ];
+        for method in methods {
+            let s = method.as_str();
+            let parsed = ResearchMethod::from_str(s);
+            assert_eq!(parsed, Some(method), "roundtrip failed for {:?}", method);
+        }
+    }
+
+    #[test]
+    fn test_research_method_from_str_unknown() {
+        assert_eq!(ResearchMethod::from_str("unknown_method"), None);
+        assert_eq!(ResearchMethod::from_str(""), None);
+    }
+
+    #[test]
+    fn test_evidence_entry_with_research_method() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update_with_method(
+            true,
+            SourceType::SelfObservation,
+            ResearchMethod::Observation,
+            Some("direct observation".into()),
+        );
+        assert_eq!(b.evidence.len(), 1);
+        assert_eq!(b.evidence[0].research_method, Some(ResearchMethod::Observation));
+        assert_eq!(b.evidence[0].note.as_deref(), Some("direct observation"));
+    }
+
+    #[test]
+    fn test_evidence_entry_without_research_method() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::SelfObservation, None);
+        assert_eq!(b.evidence.len(), 1);
+        assert_eq!(b.evidence[0].research_method, None);
+    }
+
+    #[test]
+    fn test_markdown_includes_research_method() {
+        let mut b = Belief::new("md-test".into(), "test prop".into(), "arch".into());
+        b.update_with_method(
+            true,
+            SourceType::SelfObservation,
+            ResearchMethod::QaSearch,
+            None,
+        );
+        let md = b.to_markdown();
+        assert!(md.contains("[qa_search]"), "expected research method in markdown");
     }
 }

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Critical Memory System Gap Fixes (2026-06-27)
+
+Second audit pass identified and fixed 7 critical implementation gaps across the self-learning memory system:
+
+#### Signal Persistence & Data Model
+
+- **Fact struct implementation (G1)**: DESIGN.md §4 Phase C specified `Fact` as the core extracted knowledge type, but the struct was missing. Created `fact.rs` with full markdown persistence (`save()`/`load()`/`load_all()`), YAML frontmatter + body format, UUID-based IDs, entity associations, and 12 unit tests. Exported as `pub use fact::Fact` from zen-memory.
+- **Signal persistence wiring (G3)**: Three signal types had `to_markdown()`/`from_markdown()` but no file persistence. Added `save(dir)`/`load(path)`/`load_all(dir)` methods to `ReflectionSignal`, `AntiPatternSignal`, and `MentalModelSignal`, following the exact pattern from `correction.rs`. Signals can now be written to and loaded from disk.
+
+#### Search Tier Consistency
+
+- **Tier3 table name fix (G2)**: `tier3.rs` queried `note_meta` but schema creates `notes_meta` (plural). Fixed table name and added JOIN with `notes_fts` to retrieve the `content` column (which exists in FTS5 table but not in metadata table).
+- **FTS5 table name unification (G5)**: `tier2.rs` created its own `note_fts` table (6 columns) but `init_kb_schema` creates `notes_fts` (4 columns). Aligned Tier2 to use `notes_fts` + `notes_meta` matching the schema, with proper JOIN for file_path retrieval.
+
+#### Dead Code Cleanup & Naming
+
+- **Dead code removal (G6)**: Removed `update_knowledge()` function (~120 lines including `TECH_KEYWORDS` constant and `find_entity_match()` helper) from `dream.rs`. Cleaned up unused imports (`HashMap`, `EntityData`, `RelationType`, `Relationship`, `WikiCompiler`). Updated doc comments to reference `recompute_entities()` instead.
+- **JournalWorker → MemoryCurator rename (G7)**: DESIGN.md §10.1 specifies `MemoryCurator` name. Renamed struct, file (`journal_worker.rs` → `memory_curator.rs`), worker ID (`journal-worker` → `memory-curator`), and all references in `workers/mod.rs`, `scheduler/mod.rs`, `dream.rs`, and `marker_state.rs`.
+- **recompute_entities doc fix (G8)**: Doc comment incorrectly stated function was a no-op stub returning `Ok(0)`. Implementation was already correct (scans `wiki/entities/*.md` and upserts to graph.db). Fixed doc to accurately describe the real behavior.
+
 ### Added — Self-Learning Memory Integration Audit Fixes (2026-06-27)
 
 Reverse audit of self-learning memory system against DESIGN.md identified 15 issues across 3 review lenses (Engineering, CEO, Memory Design). All fixable issues addressed.

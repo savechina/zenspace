@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::decision::Decision;
+
 // §9.1 — Extraction guardrails
 
 pub const EXTRACTION_GUARDRAILS: &str = r#"
@@ -153,9 +155,59 @@ pub fn check_decision_promotion(
     }
 }
 
+// §9.4 — Decision Principle Enforcement (7 principles from DESIGN.md §7.2)
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DecisionPrincipleReport {
+    pub first_principles: bool,
+    pub competence_circle: bool,
+    pub inversion: bool,
+    pub second_order: bool,
+    pub keep_chips: bool,
+    pub cost_awareness: bool,
+    pub occams_razor: bool,
+    pub all_passed: bool,
+    pub failed_count: usize,
+}
+
+pub fn check_decision_principles(d: &Decision) -> DecisionPrincipleReport {
+    let first_principles = !d.facts.is_empty();
+    let competence_circle = !d.domain.is_empty();
+    let inversion = !d.alternatives.is_empty();
+    let second_order = d.execution_plan.is_some();
+    let keep_chips = d.cost_analysis.is_recoverable || d.alternatives.len() >= 2;
+    let cost_awareness = d.cost_analysis.economic > 0.0 || d.cost_analysis.time_hours > 0.0;
+    let occams_razor = d.alternatives.len() <= 3;
+
+    let checks = [
+        first_principles,
+        competence_circle,
+        inversion,
+        second_order,
+        keep_chips,
+        cost_awareness,
+        occams_razor,
+    ];
+    let failed_count = checks.iter().filter(|&&c| !c).count();
+    let all_passed = failed_count == 0;
+
+    DecisionPrincipleReport {
+        first_principles,
+        competence_circle,
+        inversion,
+        second_order,
+        keep_chips,
+        cost_awareness,
+        occams_razor,
+        all_passed,
+        failed_count,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision::CostBreakdown;
 
     #[test]
     fn guardrails_const_not_empty() {
@@ -317,5 +369,77 @@ mod tests {
         let report = check_decision_promotion(false, false, true, false, true);
         assert!(!report.can_promote);
         assert_eq!(report.fail_reasons.len(), 4);
+    }
+
+    fn minimal_decision() -> Decision {
+        Decision {
+            id: "test".into(),
+            title: "test".into(),
+            domain: String::new(),
+            goal: String::new(),
+            is_path_not_goal: false,
+            core_pursuit: String::new(),
+            facts: vec![],
+            information_sources: vec![],
+            choice: String::new(),
+            alternatives: vec![],
+            controllability: None,
+            expected_value: None,
+            confidence: None,
+            cost_analysis: CostBreakdown::default(),
+            execution_plan: None,
+            low_cost_validation: None,
+            outcome: None,
+            retrospective: None,
+            decided_at: chrono::Utc::now(),
+            closed_at: None,
+        }
+    }
+
+    #[test]
+    fn dpr_minimal_decision_fails_most() {
+        let d = minimal_decision();
+        let report = check_decision_principles(&d);
+        assert!(!report.all_passed);
+        assert!(report.failed_count >= 4);
+        assert!(!report.first_principles);
+        assert!(!report.competence_circle);
+        assert!(!report.inversion);
+        assert!(!report.second_order);
+        assert!(!report.cost_awareness);
+    }
+
+    #[test]
+    fn dpr_full_decision_passes_all() {
+        let mut d = minimal_decision();
+        d.domain = "career".into();
+        d.facts = vec!["fact1".into()];
+        d.alternatives = vec!["alt1".into(), "alt2".into()];
+        d.execution_plan = Some("step1".into());
+        d.cost_analysis = CostBreakdown {
+            economic: 100.0,
+            time_hours: 10.0,
+            credit: 0.0,
+            sunk: 0.0,
+            is_recoverable: true,
+        };
+        let report = check_decision_principles(&d);
+        assert!(report.all_passed);
+        assert_eq!(report.failed_count, 0);
+        assert!(report.first_principles);
+        assert!(report.competence_circle);
+        assert!(report.inversion);
+        assert!(report.second_order);
+        assert!(report.keep_chips);
+        assert!(report.cost_awareness);
+        assert!(report.occams_razor);
+    }
+
+    #[test]
+    fn dpr_too_many_alternatives_fails_occams() {
+        let mut d = minimal_decision();
+        d.alternatives = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let report = check_decision_principles(&d);
+        assert!(!report.occams_razor);
     }
 }

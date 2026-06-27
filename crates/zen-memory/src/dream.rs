@@ -1,19 +1,17 @@
 use crate::journal::Journal;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 
 use chrono::NaiveDate;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
-use zen_vault::{
-    Entity, EntityData, EntityService, EntityType, RelationType, Relationship, WikiCompiler,
-};
+use zen_vault::{Entity, EntityService, EntityType};
 
 // ─── ExtractedSignals — Typed signals from session conversations ─────────
 
 /// Signals extracted from a session conversation, grouped by type.
-/// Used by SessionJournaler (extraction) and JournalWorker (routing).
+/// Used by SessionJournaler (extraction) and MemoryCurator (routing).
 #[derive(Debug, Clone, Default)]
 pub struct ExtractedSignals {
     /// Past-tense durable facts: what happened, decisions made, things learned.
@@ -77,7 +75,7 @@ impl ZenDream {
     /// Execute the full dream cycle for a given date.
     ///
     /// Refactored: fact extraction is the single shared bridge for both
-    /// MEMORY.md and knowledge-graph update_knowledge().
+    /// MEMORY.md and knowledge-graph recompute_entities().
     pub fn run_cycle(&self, zen_paths: &ZenPaths, date: NaiveDate) -> Result<DreamReport, DreamError> {
         info!("dream cycle started for {date}");
 
@@ -293,7 +291,7 @@ pub(crate) fn parse_facts_section(content: &str) -> Vec<String> {
 ///
 /// Reads the daily log for `date`, extracts structured facts from entries,
 /// returns the full Vec<String> as a **shared bridge** — consumed by both
-/// MEMORY.md and knowledge-graph update_knowledge().
+/// MEMORY.md and knowledge-graph recompute_entities().
 #[allow(dead_code)]
 fn extract_durable_facts(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<String>, DreamError> {
     let entries = Journal::read_entries(zen_paths, date)
@@ -448,129 +446,7 @@ fn dedupe_facts(facts: &[String]) -> Vec<String> {
         .collect()
 }
 
-// ─── Step 3: Knowledge Graph Writes + Wiki Generation ───────────────────
-
-const TECH_KEYWORDS: &[&str] = &[
-    "rust", "python", "typescript", "javascript",
-    "clip", "llm", "gpt", "openai",
-    "anthropic", "deepseek", "gemini",
-    "tokio", "async", "sqlite",
-    "fts5", "vector", "embedding",
-];
-
-/// Promote entity-aware facts to graph.db + generate wiki pages via WikiCompiler.
-/// Personal-only facts (no known entity match) are skipped — they go to MEMORY.md only.
-#[allow(dead_code)]
-fn update_knowledge(zen_paths: &ZenPaths, facts: &[String]) -> (bool, usize) {
-    let graph_db = zen_paths.db().join("graph.db");
-    let vec_db = zen_paths.db().join("vec.db");
-    let wiki_dir = zen_paths.vault().join("wiki");
-    let svc = EntityService::new();
-
-    let mut known: HashSet<String> = svc
-        .load_known_entity_names(&graph_db)
-        .unwrap_or_default();
-    for kw in TECH_KEYWORDS {
-        known.insert((*kw).to_string());
-    }
-
-    if known.is_empty() && facts.is_empty() {
-        debug!("no entities nor facts to process, skipping update_knowledge");
-        return (false, 0);
-    }
-
-    let mut entity_facts: HashMap<String, Vec<String>> = HashMap::new();
-    let mut personal_only = 0usize;
-
-    for fact in facts {
-        match find_entity_match(fact, &known) {
-            Some(entity) => entity_facts.entry(entity).or_default().push(fact.clone()),
-            None => personal_only += 1,
-        }
-    }
-
-    if personal_only > 0 {
-        debug!(count = personal_only, "personal-only facts skip knowledge graph");
-    }
-
-    if entity_facts.is_empty() {
-        return (false, 0);
-    }
-
-    let mut entity_data_list: Vec<EntityData> = Vec::new();
-    let mut entity_ids: HashMap<String, String> = HashMap::new();
-    let mut entity_index: HashMap<String, usize> = HashMap::new();
-
-    for (name, fact_list) in &entity_facts {
-        let canonical = name.to_lowercase();
-        let entity = Entity::new(canonical.clone(), EntityType::Technology, "dream-cycle");
-        if let Err(e) = svc.upsert_entity(&graph_db, &entity) {
-            error!(entity = %canonical, error = %e, "failed to upsert entity to graph.db");
-            continue;
-        }
-        entity_ids.insert(canonical.clone(), entity.id.clone());
-        debug!(entity = %canonical, fact_count = fact_list.len(), "upserted entity to graph.db");
-
-        let entity_text = format!("{name}: {}", fact_list.join(" "));
-        if let Err(e) = svc.store_entity_embedding(&vec_db, &entity.id, &entity_text) {
-            debug!(entity = %name, error = %e, "failed to store entity embedding (non-fatal)");
-        }
-
-        entity_index.insert(canonical.clone(), entity_data_list.len());
-        entity_data_list.push(EntityData {
-            entity,
-            facts: fact_list.clone(),
-            relationships: Vec::new(),
-        });
-    }
-
-    for fact in facts {
-        let mentioned: Vec<String> = entity_ids.keys()
-            .filter(|e| fact.to_lowercase().contains(&e.to_lowercase()))
-            .cloned()
-            .collect();
-
-        if mentioned.len() >= 2 {
-            let source = &mentioned[0];
-            let target = &mentioned[1];
-            let rel = Relationship::new(
-                entity_ids[source].clone(),
-                entity_ids[target].clone(),
-                RelationType::RelatedTo,
-                "dream-cycle",
-            );
-            if let Err(e) = svc.insert_relationship(&graph_db, &rel) {
-                debug!(error = %e, "failed to insert relationship (non-fatal)");
-            }
-            if let Some(&idx) = entity_index.get(source) {
-                entity_data_list[idx].relationships
-                    .push((target.clone(), RelationType::RelatedTo));
-            }
-        }
-    }
-
-    let wiki_pages = match WikiCompiler::new().compile_from_entities(&entity_data_list, &wiki_dir) {
-        Ok(n) => n,
-        Err(e) => {
-            error!(error = %e, "WikiCompiler::compile_from_entities failed");
-            0
-        }
-    };
-
-    (true, wiki_pages)
-}
-
-fn find_entity_match(fact: &str, entities: &HashSet<String>) -> Option<String> {
-    let lower = fact.to_lowercase();
-    for entity in entities {
-        if lower.contains(&entity.to_lowercase()) {
-            return Some(entity.clone());
-        }
-    }
-    None
-}
-
-// ─── Post-Pipeline Helpers (deferred — not Phase 0 scope) ───────────────
+// ─── Post-Pipeline Helpers ────────────────────────────────────────────
 
 /// Compress old subconscious logs beyond the retention window.
 ///
@@ -634,10 +510,10 @@ fn compress_old_logs(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
     Ok(true)
 }
 
-/// Recompute entity relationships by scanning the wiki directory.
+/// Recompute entity relationships by scanning the wiki/entities/ directory.
 ///
-/// TODO(phase-1): implement graph rebuild from `wiki/entities/*.md`
-/// frontmatter + cross-references. Returns `0` (no-op) until then.
+/// Reads each `.md` file in `wiki/entities/`, parses frontmatter for name,
+/// entity_type, and aliases, then upserts each entity into graph.db.
 fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
     let entities_dir = zen_paths.vault().join("wiki/entities");
 

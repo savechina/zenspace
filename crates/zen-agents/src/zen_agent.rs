@@ -186,7 +186,7 @@ fn load_beliefs(
     dir: &std::path::Path,
     tracker: &mut zen_memory::priority::ReinforcementTracker,
 ) -> String {
-    let beliefs = match zen_memory::Belief::load_all(dir) {
+    let mut beliefs = match zen_memory::Belief::load_all(dir) {
         Ok(b) => b,
         Err(e) => {
             warn!(dir = %dir.display(), error = %e, "failed to load beliefs");
@@ -198,8 +198,15 @@ fn load_beliefs(
         return String::new();
     }
 
-    for b in &beliefs {
+    for b in &mut beliefs {
         let _ = tracker.record_retrieval(&b.id);
+        b.reinforce();
+    }
+
+    for b in &beliefs {
+        if let Err(e) = b.save(dir) {
+            warn!(belief_id = %b.id, error = %e, "failed to save reinforced belief");
+        }
     }
 
     let mut sorted = beliefs;

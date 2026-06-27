@@ -88,10 +88,11 @@ impl Tier3Search {
 
         let placeholders: Vec<String> = (1..=rowids.len()).map(|i| format!("?{i}")).collect();
         let query = format!(
-            "SELECT s.file_path, s.content \
-             FROM note_meta s \
-             WHERE s.id IN ({}) \
-             ORDER BY s.rowid",
+            "SELECT nm.file_path, nf.content \
+             FROM notes_meta nm \
+             JOIN notes_fts nf ON nf.rowid = nm.rowid \
+             WHERE nm.id IN ({}) \
+             ORDER BY nm.rowid",
             placeholders.join(","),
         );
 
