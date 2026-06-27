@@ -421,6 +421,144 @@ impl EntityService {
         Ok(())
     }
 
+    /// Loads all SelfNodes from the self_nodes table.
+    pub fn load_self_nodes(&self, db_path: &Path) -> Result<Vec<super::self_node::SelfNode>> {
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+
+        let mut stmt = repo.conn().prepare(
+            "SELECT id, name, layer, description, domain,
+                    is_explicit, sufficient_for, necessary_for, controllability,
+                    humility_score, optionality_count, core_pursuit,
+                    source, confidence, evidence_refs, created_at, updated_at
+             FROM self_nodes ORDER BY name"
+        )?;
+
+        let nodes = stmt.query_map([], |row| {
+            let layer_str: String = row.get(2)?;
+            let layer = layer_str.parse().unwrap_or(super::self_node::SelfModelLayer::Knowledge);
+
+            let is_explicit_i32: Option<i32> = row.get(5)?;
+            let is_explicit = is_explicit_i32.map(|b| b != 0);
+
+            let sufficient_for_str: String = row.get(6)?;
+            let sufficient_for: Vec<String> = serde_json::from_str(&sufficient_for_str).unwrap_or_default();
+
+            let necessary_for_str: String = row.get(7)?;
+            let necessary_for: Vec<String> = serde_json::from_str(&necessary_for_str).unwrap_or_default();
+
+            let evidence_refs_str: String = row.get(14)?;
+            let evidence_refs: Vec<String> = serde_json::from_str(&evidence_refs_str).unwrap_or_default();
+
+            let created_at_str: String = row.get(15)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            let updated_at_str: String = row.get(16)?;
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            Ok(super::self_node::SelfNode {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                layer,
+                description: row.get(3)?,
+                domain: row.get(4)?,
+                is_explicit,
+                sufficient_for,
+                necessary_for,
+                controllability: row.get(8)?,
+                humility_score: row.get(9)?,
+                optionality_count: row.get(10)?,
+                core_pursuit: row.get(11)?,
+                source: row.get(12)?,
+                confidence: row.get(13)?,
+                evidence_refs,
+                created_at,
+                updated_at,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for node in nodes {
+            result.push(node?);
+        }
+        Ok(result)
+    }
+
+    /// Loads SelfNodes filtered by layer from the self_nodes table.
+    pub fn load_self_nodes_by_layer(
+        &self,
+        db_path: &Path,
+        layer: &super::self_node::SelfModelLayer,
+    ) -> Result<Vec<super::self_node::SelfNode>> {
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+
+        let mut stmt = repo.conn().prepare(
+            "SELECT id, name, layer, description, domain,
+                    is_explicit, sufficient_for, necessary_for, controllability,
+                    humility_score, optionality_count, core_pursuit,
+                    source, confidence, evidence_refs, created_at, updated_at
+             FROM self_nodes WHERE layer = ?1 ORDER BY name"
+        )?;
+
+        let nodes = stmt.query_map([layer.to_string().as_str()], |row| {
+            let layer_str: String = row.get(2)?;
+            let layer = layer_str.parse().unwrap_or(super::self_node::SelfModelLayer::Knowledge);
+
+            let is_explicit_i32: Option<i32> = row.get(5)?;
+            let is_explicit = is_explicit_i32.map(|b| b != 0);
+
+            let sufficient_for_str: String = row.get(6)?;
+            let sufficient_for: Vec<String> = serde_json::from_str(&sufficient_for_str).unwrap_or_default();
+
+            let necessary_for_str: String = row.get(7)?;
+            let necessary_for: Vec<String> = serde_json::from_str(&necessary_for_str).unwrap_or_default();
+
+            let evidence_refs_str: String = row.get(14)?;
+            let evidence_refs: Vec<String> = serde_json::from_str(&evidence_refs_str).unwrap_or_default();
+
+            let created_at_str: String = row.get(15)?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            let updated_at_str: String = row.get(16)?;
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            Ok(super::self_node::SelfNode {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                layer,
+                description: row.get(3)?,
+                domain: row.get(4)?,
+                is_explicit,
+                sufficient_for,
+                necessary_for,
+                controllability: row.get(8)?,
+                humility_score: row.get(9)?,
+                optionality_count: row.get(10)?,
+                core_pursuit: row.get(11)?,
+                source: row.get(12)?,
+                confidence: row.get(13)?,
+                evidence_refs,
+                created_at,
+                updated_at,
+            })
+        })?;
+
+        let mut result = Vec::new();
+        for node in nodes {
+            result.push(node?);
+        }
+        Ok(result)
+    }
+
     pub fn upsert_goal_node(
         &self,
         db_path: &Path,
