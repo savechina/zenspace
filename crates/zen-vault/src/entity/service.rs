@@ -581,7 +581,19 @@ impl EntityService {
                 .metadata
                 .insert("deadline".to_string(), d.to_string());
         }
-        self.upsert_entity(db_path, &entity)
+        self.upsert_entity(db_path, &entity)?;
+
+        // Also write to dedicated goal_nodes table
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        repo.conn().execute(
+            "INSERT OR REPLACE INTO goal_nodes (id, name, controllability, core_pursuit, deadline, created_at, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id, name, controllability, core_pursuit, deadline, now],
+        )?;
+
+        Ok(())
     }
 
     pub fn upsert_decision_node(
@@ -615,6 +627,7 @@ impl EntityService {
         id: &str,
         name: &str,
         proposition: &str,
+        prior: f64,
         posterior: f64,
         evidence_count: usize,
     ) -> Result<()> {
@@ -625,11 +638,26 @@ impl EntityService {
             .insert("proposition".to_string(), proposition.to_string());
         entity
             .metadata
+            .insert("prior".to_string(), prior.to_string());
+        entity
+            .metadata
             .insert("posterior".to_string(), posterior.to_string());
         entity
             .metadata
             .insert("evidence_count".to_string(), evidence_count.to_string());
-        self.upsert_entity(db_path, &entity)
+        self.upsert_entity(db_path, &entity)?;
+
+        // Also write to dedicated belief_nodes table
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        repo.conn().execute(
+            "INSERT OR REPLACE INTO belief_nodes (id, name, proposition, prior, posterior, evidence_count, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, name, proposition, prior, posterior, evidence_count, now],
+        )?;
+
+        Ok(())
     }
 
     pub fn upsert_path_node(
@@ -640,6 +668,7 @@ impl EntityService {
         serves_goal: &str,
         is_default: bool,
         crowdedness: f64,
+        alternatives: &str,
     ) -> Result<()> {
         let mut entity = Entity::new(name, EntityType::Path, "path-model");
         entity.id = id.to_string();
@@ -652,7 +681,20 @@ impl EntityService {
         entity
             .metadata
             .insert("crowdedness".to_string(), crowdedness.to_string());
+        entity
+            .metadata
+            .insert("alternatives".to_string(), alternatives.to_string());
         self.upsert_entity(db_path, &entity)?;
+
+        // Also write to dedicated path_nodes table
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        repo.conn().execute(
+            "INSERT OR REPLACE INTO path_nodes (id, name, serves_goal_id, is_default, crowdedness, alternatives, created_at, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![id, name, serves_goal, is_default as i32, crowdedness, alternatives, now],
+        )?;
 
         // Create ServesGoal relationship from this path to the goal
         let goal_entities = self.load_all_entities(db_path)?;
@@ -973,7 +1015,7 @@ mod tests {
             .unwrap();
 
         service
-            .upsert_path_node(&db_path, "p-1", "Online Courses", "Learn Rust", true, 0.3)
+            .upsert_path_node(&db_path, "p-1", "Online Courses", "Learn Rust", true, 0.3, "")
             .unwrap();
 
         let entities = service.load_all_entities(&db_path).unwrap();
@@ -993,7 +1035,7 @@ mod tests {
             .upsert_goal_node(&db_path, "g-6", "Master Cooking", 0.7, "hobby", None)
             .unwrap();
         service
-            .upsert_path_node(&db_path, "p-2", "Cooking Classes", "Master Cooking", false, 0.8)
+            .upsert_path_node(&db_path, "p-2", "Cooking Classes", "Master Cooking", false, 0.8, "")
             .unwrap();
 
         let rels = service.load_relationships_for_entity(&db_path, "p-2").unwrap();
@@ -1009,7 +1051,7 @@ mod tests {
         let service = EntityService::new();
 
         service
-            .upsert_path_node(&db_path, "p-3", "Mentorship", "Nonexistent Goal", true, 0.5)
+            .upsert_path_node(&db_path, "p-3", "Mentorship", "Nonexistent Goal", true, 0.5, "")
             .unwrap();
 
         let entities = service.load_all_entities(&db_path).unwrap();
@@ -1030,10 +1072,10 @@ mod tests {
             .upsert_goal_node(&db_path, "g-7", "Get Fit", 0.9, "health", None)
             .unwrap();
         service
-            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6)
+            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6, "")
             .unwrap();
         service
-            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6)
+            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6, "")
             .unwrap();
 
         let repo = SqliteRepo::open(&db_path).unwrap();
@@ -1183,10 +1225,10 @@ mod tests {
         let service = EntityService::new();
 
         service
-            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.8, 5)
+            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
             .unwrap();
         service
-            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.8, 5)
+            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
             .unwrap();
 
         let repo = SqliteRepo::open(&db_path).unwrap();
