@@ -51,18 +51,7 @@ impl ZenWorker for DecisionTracker {
         let start = std::time::Instant::now();
         let paths = ZenPaths::detect()?;
 
-        let decisions_dir = match paths.workspace_root() {
-            Some(root) => root.join("decisions"),
-            None => {
-                debug!("no workspace root configured, skipping decision tracking");
-                return Ok(WorkerReport {
-                    worker_id: self.id().to_string(),
-                    success: true,
-                    fact_count: 0,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-        };
+        let decisions_dir = paths.vault().join("wiki/wisdom/decisions");
         if !decisions_dir.exists() {
             debug!("decisions directory does not exist, skipping decision tracking");
             return Ok(WorkerReport {

@@ -41,6 +41,7 @@ fn parse_entity_type(s: &str) -> EntityType {
         "Belief" => EntityType::Belief,
         "Goal" => EntityType::Goal,
         "Path" => EntityType::Path,
+        "Decision" => EntityType::Decision,
         _ => EntityType::Other,
     }
 }
@@ -236,6 +237,8 @@ impl EntityService {
                     "AlternativeTo" => RelationType::AlternativeTo,
                     "DecidedAbout" => RelationType::DecidedAbout,
                     "CorrectedBy" => RelationType::CorrectedBy,
+                    "ExtractedFrom" => RelationType::ExtractedFrom,
+                    "Supports" => RelationType::Supports,
                     _ => RelationType::RelatedTo,
                 };
                 Ok((target_id, rt))
@@ -305,6 +308,54 @@ impl EntityService {
                 .metadata
                 .insert("deadline".to_string(), d.to_string());
         }
+        self.upsert_entity(db_path, &entity)
+    }
+
+    pub fn upsert_decision_node(
+        &self,
+        db_path: &Path,
+        id: &str,
+        name: &str,
+        goal: &str,
+        choice: &str,
+        outcome_status: Option<&str>,
+    ) -> Result<()> {
+        let mut entity = Entity::new(name, EntityType::Decision, "decision-model");
+        entity.id = id.to_string();
+        entity
+            .metadata
+            .insert("goal".to_string(), goal.to_string());
+        entity
+            .metadata
+            .insert("choice".to_string(), choice.to_string());
+        if let Some(status) = outcome_status {
+            entity
+                .metadata
+                .insert("outcome_status".to_string(), status.to_string());
+        }
+        self.upsert_entity(db_path, &entity)
+    }
+
+    pub fn upsert_belief_node(
+        &self,
+        db_path: &Path,
+        id: &str,
+        name: &str,
+        proposition: &str,
+        posterior: f64,
+        evidence_count: usize,
+    ) -> Result<()> {
+        let mut entity = Entity::new(name, EntityType::Belief, "belief-model");
+        entity.id = id.to_string();
+        entity
+            .metadata
+            .insert("proposition".to_string(), proposition.to_string());
+        entity
+            .metadata
+            .insert("posterior".to_string(), posterior.to_string());
+        entity
+            .metadata
+            .insert("evidence_count".to_string(), evidence_count.to_string());
         self.upsert_entity(db_path, &entity)
     }
 
@@ -748,5 +799,154 @@ mod tests {
         assert_eq!(EntityType::Path.to_string(), "path");
         assert_eq!(parse_entity_type("path"), Some(EntityType::Path));
         assert_eq!(parse_entity_type("bogus"), None);
+    }
+
+    #[test]
+    fn test_upsert_decision_node() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_decision_node(
+                &db_path,
+                "d-1",
+                "Choose Framework",
+                "Build web app",
+                "React",
+                Some("executed"),
+            )
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].id, "d-1");
+        assert_eq!(entities[0].name, "choose framework");
+        assert_eq!(entities[0].entity_type, EntityType::Decision);
+    }
+
+    #[test]
+    fn test_upsert_decision_node_without_outcome() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_decision_node(
+                &db_path,
+                "d-2",
+                "Pick Language",
+                "Write CLI",
+                "Rust",
+                None,
+            )
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_type, EntityType::Decision);
+    }
+
+    #[test]
+    fn test_upsert_decision_node_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_decision_node(&db_path, "d-3", "Deploy", "Ship", "AWS", Some("done"))
+            .unwrap();
+        service
+            .upsert_decision_node(&db_path, "d-3", "Deploy", "Ship", "AWS", Some("done"))
+            .unwrap();
+
+        let repo = SqliteRepo::open(&db_path).unwrap();
+        let count: i32 = repo
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'd-3'",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_upsert_belief_node() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_belief_node(
+                &db_path,
+                "b-1",
+                "Rust is fast",
+                "Rust has zero-cost abstractions",
+                0.95,
+                12,
+            )
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].id, "b-1");
+        assert_eq!(entities[0].name, "rust is fast");
+        assert_eq!(entities[0].entity_type, EntityType::Belief);
+    }
+
+    #[test]
+    fn test_upsert_belief_node_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.8, 5)
+            .unwrap();
+        service
+            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.8, 5)
+            .unwrap();
+
+        let repo = SqliteRepo::open(&db_path).unwrap();
+        let count: i32 = repo
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'b-2'",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_new_relation_types_extracted_from_and_supports() {
+        use crate::entity::relationship::{parse_relation_type, RelationType};
+
+        assert_eq!(
+            RelationType::ExtractedFrom.to_string(),
+            "extracted_from"
+        );
+        assert_eq!(RelationType::Supports.to_string(), "supports");
+
+        assert_eq!(
+            parse_relation_type("extracted_from"),
+            Some(RelationType::ExtractedFrom)
+        );
+        assert_eq!(
+            parse_relation_type("supports"),
+            Some(RelationType::Supports)
+        );
+
+        assert_eq!(RelationType::ExtractedFrom.as_verb(), "extracted from");
+        assert_eq!(RelationType::Supports.as_verb(), "supports");
+    }
+
+    #[test]
+    fn test_entity_type_decision_display_and_parse() {
+        use crate::entity::entity::{EntityType, parse_entity_type};
+
+        assert_eq!(EntityType::Decision.to_string(), "decision");
+        assert_eq!(parse_entity_type("decision"), Some(EntityType::Decision));
     }
 }

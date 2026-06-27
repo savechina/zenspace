@@ -48,7 +48,7 @@ impl ZenWorker for WisdomSynthesizer {
         let paths = ZenPaths::detect()?;
 
         let reflections_dir = paths.vault().join("wiki/wisdom/reflections");
-        let beliefs_dir = paths.vault().join("memories/beliefs");
+        let beliefs_dir = paths.vault().join("wiki/wisdom/beliefs");
 
         let reflections_text = load_all_reflections(&reflections_dir);
         if reflections_text.is_empty() {

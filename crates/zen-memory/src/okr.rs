@@ -131,6 +131,7 @@ mod tests {
             stop_loss: StopLossLine::default(),
             discipline_streak: 0,
             sustained_value_plan: None,
+            retrospective: None,
             execution_checklist: Default::default(),
             source_journal: None,
             created_at: created,

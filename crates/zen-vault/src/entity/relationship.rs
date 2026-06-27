@@ -19,6 +19,8 @@ pub enum RelationType {
     AlternativeTo,
     DecidedAbout,
     CorrectedBy,
+    ExtractedFrom,
+    Supports,
 }
 
 impl std::fmt::Display for RelationType {
@@ -40,6 +42,8 @@ impl std::fmt::Display for RelationType {
             RelationType::AlternativeTo => "alternative_to",
             RelationType::DecidedAbout => "decided_about",
             RelationType::CorrectedBy => "corrected_by",
+            RelationType::ExtractedFrom => "extracted_from",
+            RelationType::Supports => "supports",
         };
         write!(f, "{s}")
     }
@@ -63,6 +67,8 @@ pub fn parse_relation_type(s: &str) -> Option<RelationType> {
         "alternative_to" => Some(RelationType::AlternativeTo),
         "decided_about" => Some(RelationType::DecidedAbout),
         "corrected_by" => Some(RelationType::CorrectedBy),
+        "extracted_from" => Some(RelationType::ExtractedFrom),
+        "supports" => Some(RelationType::Supports),
         _ => None,
     }
 }
@@ -86,6 +92,8 @@ impl RelationType {
             RelationType::AlternativeTo => "alternative to",
             RelationType::DecidedAbout => "decided about",
             RelationType::CorrectedBy => "corrected by",
+            RelationType::ExtractedFrom => "extracted from",
+            RelationType::Supports => "supports",
         }
     }
 }

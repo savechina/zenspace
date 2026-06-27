@@ -262,7 +262,7 @@ fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
         let id = Decision::slugify_title(text);
         let mut decision = Decision::new(id, text.to_string(), "session".to_string());
         decision.goal = context.to_string();
-        if let Err(e) = decision.save(&vault.join("memories/decisions")) {
+        if let Err(e) = decision.save(&vault.join("wiki/wisdom/decisions")) {
             warn!(error = %e, text = %text, "failed to save decision");
         }
     }
@@ -277,7 +277,7 @@ fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
         let _cost_str = parts.get(2).map(|s| s.trim()).unwrap_or("");
 
         let correction = Correction::new(error_ref, fix, CostBreakdown::default());
-        if let Err(e) = correction.save(&vault.join("memories/corrections")) {
+        if let Err(e) = correction.save(&vault.join("wiki/wisdom/corrections")) {
             warn!(error = %e, error_ref = %error_ref, "failed to save correction");
         }
     }
@@ -292,7 +292,7 @@ fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
         let _sentiment = parts.get(2).map(|s| s.trim()).unwrap_or("");
 
         let feedback = Feedback::new(target, content);
-        if let Err(e) = feedback.save(&vault.join("memories/feedback")) {
+        if let Err(e) = feedback.save(&vault.join("wiki/wisdom/feedback")) {
             warn!(error = %e, target = %target, "failed to save feedback");
         }
     }
@@ -308,7 +308,7 @@ fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
         let id = zen_memory::belief::slugify_proposition(statement);
         let mut belief = Belief::new(id, statement.to_string(), "session".to_string());
         belief.posterior = confidence.clamp(0.01, 0.99);
-        if let Err(e) = belief.save(&vault.join("memories/beliefs")) {
+        if let Err(e) = belief.save(&vault.join("wiki/wisdom/beliefs")) {
             warn!(error = %e, statement = %statement, "failed to save belief candidate");
         }
     }
@@ -732,7 +732,7 @@ fn load_top_commitments(paths: &ZenPaths, n: usize) -> String {
 }
 
 fn load_top_beliefs(paths: &ZenPaths, n: usize) -> String {
-    let dir = paths.vault().join("memories/beliefs");
+    let dir = paths.vault().join("wiki/wisdom/beliefs");
     let beliefs = match zen_memory::belief::Belief::load_all(&dir) {
         Ok(b) => b,
         Err(_) => return String::new(),

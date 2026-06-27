@@ -59,8 +59,12 @@ pub enum TransitionError {
     MissingStopLoss,
     #[error("insufficient milestones ({0}/3 required) for validated→executing")]
     InsufficientMilestones(u32),
+    #[error("missing milestone data feedback for executing→reviewing")]
+    MissingMilestoneDataFeedback,
     #[error("missing retrospective for reviewing→completed")]
     MissingRetrospective,
+    #[error("missing stop-loss extraction for any→abandoned")]
+    MissingStopLossExtraction,
     #[error("missing sustained value plan for reviewing→pivoted")]
     MissingSustainedValue,
     #[error("invalid transition from {from} to {to}")]
@@ -174,6 +178,7 @@ pub struct Commitment {
     pub stop_loss: StopLossLine,
     pub discipline_streak: u32,
     pub sustained_value_plan: Option<String>,
+    pub retrospective: Option<String>,
     pub execution_checklist: ExecutionChecklist,
     pub source_journal: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -196,6 +201,7 @@ impl Commitment {
             stop_loss: StopLossLine::default(),
             discipline_streak: 0,
             sustained_value_plan: None,
+            retrospective: None,
             execution_checklist: ExecutionChecklist::default(),
             source_journal: None,
             created_at: now,
@@ -237,15 +243,37 @@ impl Commitment {
                 }
                 Ok(())
             }
-            (Executing, Reviewing) => Ok(()),
-            (Reviewing, Completed) => Ok(()),
+            (Executing, Reviewing) => {
+                // DESIGN.md §5.3: each milestone has quantitative data feedback
+                let all_have_data = self
+                    .milestones
+                    .iter()
+                    .all(|m| m.completed && m.completed_at.is_some());
+                if !all_have_data {
+                    return Err(TransitionError::MissingMilestoneDataFeedback);
+                }
+                Ok(())
+            }
+            (Reviewing, Completed) => {
+                // DESIGN.md §5.3: retrospective written (自己多找问题)
+                match &self.retrospective {
+                    Some(r) if !r.trim().is_empty() => Ok(()),
+                    _ => Err(TransitionError::MissingRetrospective),
+                }
+            }
             (Reviewing, Pivoted) => {
                 if self.sustained_value_plan.is_none() {
                     return Err(TransitionError::MissingSustainedValue);
                 }
                 Ok(())
             }
-            (_, to) if *to == Abandoned => Ok(()),
+            (_, to) if *to == Abandoned => {
+                // DESIGN.md §5.3: stop-loss trigger OR sustained_value extraction
+                if !self.stop_loss.triggered && self.sustained_value_plan.is_none() {
+                    return Err(TransitionError::MissingStopLossExtraction);
+                }
+                Ok(())
+            }
             (Completed | Abandoned | Pivoted, _) => Err(TransitionError::InvalidTransition {
                 from: self.state.to_string(),
                 to: target.to_string(),
@@ -481,6 +509,7 @@ impl Commitment {
         let milestones = parse_milestones(&body);
         let stop_loss = parse_stop_loss(&body);
         let sustained_value_plan = parse_body_section(&body, "## Sustained Value Plan");
+        let retrospective = parse_body_section(&body, "## Retrospective");
 
         Ok(Self {
             id,
@@ -494,6 +523,7 @@ impl Commitment {
             stop_loss,
             discipline_streak,
             sustained_value_plan,
+            retrospective,
             execution_checklist: ExecutionChecklist::default(),
             source_journal,
             created_at,
@@ -922,6 +952,11 @@ mod tests {
             c.add_milestone(&format!("m{i}"), None);
         }
         c.transition(CommitmentState::Executing).unwrap();
+        
+        // Complete all milestones before transitioning to Reviewing
+        for i in 0..3 {
+            c.complete_milestone(i).unwrap();
+        }
         c.transition(CommitmentState::Reviewing).unwrap();
 
         let err = c.transition(CommitmentState::Pivoted).unwrap_err();
@@ -929,5 +964,131 @@ mod tests {
 
         c.sustained_value_plan = Some("keep the learnings".into());
         assert!(c.transition(CommitmentState::Pivoted).is_ok());
+    }
+
+    #[test]
+    fn test_transition_executing_to_reviewing_requires_completed_milestones() {
+        let mut c = Commitment::new("test");
+        c.execution_checklist.low_cost_validation = Some("proto".into());
+        c.stop_loss.time_hours = Some(5.0);
+        c.transition(CommitmentState::Validated).unwrap();
+        for i in 0..3 {
+            c.add_milestone(&format!("m{i}"), None);
+        }
+        c.transition(CommitmentState::Executing).unwrap();
+
+        // Should fail because milestones are not completed
+        let err = c.transition(CommitmentState::Reviewing).unwrap_err();
+        assert!(matches!(err, TransitionError::MissingMilestoneDataFeedback));
+
+        // Complete all milestones
+        for i in 0..3 {
+            c.complete_milestone(i).unwrap();
+        }
+        assert!(c.transition(CommitmentState::Reviewing).is_ok());
+    }
+
+    #[test]
+    fn test_transition_reviewing_to_completed_requires_retrospective() {
+        let mut c = Commitment::new("test");
+        c.execution_checklist.low_cost_validation = Some("proto".into());
+        c.stop_loss.time_hours = Some(5.0);
+        c.transition(CommitmentState::Validated).unwrap();
+        for i in 0..3 {
+            c.add_milestone(&format!("m{i}"), None);
+        }
+        c.transition(CommitmentState::Executing).unwrap();
+        for i in 0..3 {
+            c.complete_milestone(i).unwrap();
+        }
+        c.transition(CommitmentState::Reviewing).unwrap();
+
+        // Should fail because retrospective is not set
+        let err = c.transition(CommitmentState::Completed).unwrap_err();
+        assert!(matches!(err, TransitionError::MissingRetrospective));
+
+        c.retrospective = Some("reflected on the project".into());
+        assert!(c.transition(CommitmentState::Completed).is_ok());
+    }
+
+    #[test]
+    fn test_transition_any_to_abandoned_requires_stop_loss_triggered() {
+        let mut c = Commitment::new("test");
+        c.execution_checklist.low_cost_validation = Some("proto".into());
+        c.stop_loss.time_hours = Some(5.0);
+        c.transition(CommitmentState::Validated).unwrap();
+        for i in 0..3 {
+            c.add_milestone(&format!("m{i}"), None);
+        }
+        c.transition(CommitmentState::Executing).unwrap();
+
+        // Should fail because stop-loss is not triggered
+        let err = c.transition(CommitmentState::Abandoned).unwrap_err();
+        assert!(matches!(err, TransitionError::MissingStopLossExtraction));
+
+        c.stop_loss.triggered = true;
+        assert!(c.transition(CommitmentState::Abandoned).is_ok());
+    }
+
+    #[test]
+    fn test_transition_executing_to_reviewing_fails_without_completed_at() {
+        let mut c = Commitment::new("test");
+        c.execution_checklist.low_cost_validation = Some("proto".into());
+        c.stop_loss.time_hours = Some(5.0);
+        c.transition(CommitmentState::Validated).unwrap();
+        for i in 0..3 {
+            c.add_milestone(&format!("m{i}"), None);
+        }
+        c.transition(CommitmentState::Executing).unwrap();
+
+        let err = c.transition(CommitmentState::Reviewing).unwrap_err();
+        assert!(matches!(err, TransitionError::MissingMilestoneDataFeedback));
+
+        for i in 0..3 {
+            c.complete_milestone(i).unwrap();
+        }
+        assert!(c.transition(CommitmentState::Reviewing).is_ok());
+    }
+
+    #[test]
+    fn test_transition_reviewing_to_completed_fails_with_empty_retrospective() {
+        let mut c = Commitment::new("test");
+        c.execution_checklist.low_cost_validation = Some("proto".into());
+        c.stop_loss.time_hours = Some(5.0);
+        c.transition(CommitmentState::Validated).unwrap();
+        for i in 0..3 {
+            c.add_milestone(&format!("m{i}"), None);
+        }
+        c.transition(CommitmentState::Executing).unwrap();
+        for i in 0..3 {
+            c.complete_milestone(i).unwrap();
+        }
+        c.transition(CommitmentState::Reviewing).unwrap();
+
+        c.retrospective = Some("".into());
+        let err = c.transition(CommitmentState::Completed).unwrap_err();
+        assert!(matches!(err, TransitionError::MissingRetrospective));
+
+        c.retrospective = Some("   ".into());
+        let err = c.transition(CommitmentState::Completed).unwrap_err();
+        assert!(matches!(err, TransitionError::MissingRetrospective));
+
+        c.retrospective = Some("what went wrong".into());
+        assert!(c.transition(CommitmentState::Completed).is_ok());
+    }
+
+    #[test]
+    fn test_transition_any_to_abandoned_succeeds_with_sustained_value_plan() {
+        let mut c = Commitment::new("test");
+        c.execution_checklist.low_cost_validation = Some("proto".into());
+        c.stop_loss.time_hours = Some(5.0);
+        c.transition(CommitmentState::Validated).unwrap();
+        for i in 0..3 {
+            c.add_milestone(&format!("m{i}"), None);
+        }
+        c.transition(CommitmentState::Executing).unwrap();
+
+        c.sustained_value_plan = Some("preserve learnings as documentation".into());
+        assert!(c.transition(CommitmentState::Abandoned).is_ok());
     }
 }

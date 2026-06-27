@@ -80,7 +80,13 @@ impl ZenWorker for ReflectionWorker {
             match extract_reflections_from_journal(&path) {
                 Ok(reflections) if !reflections.is_empty() => {
                     let (date_str, session_id) = read_frontmatter_meta(&path);
-                    let filename = format!("{date_str}.md");
+                    // DESIGN.md §3.1: reflections use weekly format {YYYY-Www}.md
+                    let date = chrono::NaiveDate::parse_from_str(
+                        &date_str,
+                        "%Y-%m-%d"
+                    )
+                    .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+                    let filename = format!("{}.md", date.format("%G-W%V"));
                     let file_path = reflections_dir.join(&filename);
 
                     fs::create_dir_all(&reflections_dir).with_context(|| {
@@ -305,7 +311,67 @@ Rules:
         .cloned()
         .unwrap_or_default();
 
-    write_anti_patterns(reflections_dir, &anti_patterns)
+    let count = write_anti_patterns(reflections_dir, &anti_patterns)?;
+
+    if count > 0 {
+        if let Err(e) = update_stop_doing_ledger(&anti_patterns) {
+            warn!(error = %e, "failed to update MEMORY.md Stop-Doing Ledger (non-fatal)");
+        }
+    }
+
+    Ok(count)
+}
+
+/// Update MEMORY.md ## Stop-Doing Ledger section with latest anti-patterns.
+fn update_stop_doing_ledger(anti_patterns: &[Value]) -> Result<()> {
+    if anti_patterns.is_empty() {
+        return Ok(());
+    }
+
+    let paths = ZenPaths::detect()?;
+    let memory_md = paths.memory().join("MEMORY.md");
+
+    let content = fs::read_to_string(&memory_md).unwrap_or_default();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let section_marker = "## Stop-Doing Ledger";
+
+    let mut entries: Vec<String> = Vec::new();
+    for ap in anti_patterns.iter().take(10) {
+        let pattern = ap["pattern"].as_str().unwrap_or("unknown");
+        let trigger = ap["trigger"].as_str().unwrap_or("");
+        entries.push(format!(
+            "- **{pattern}** — detected {today}: {trigger}"
+        ));
+    }
+
+    let updated = if content.contains(section_marker) {
+        let before = content.split(section_marker).next().unwrap_or("");
+        let rest = content.split(section_marker).nth(1).unwrap_or("");
+        let next_section = rest.find("\n## ").unwrap_or(rest.len());
+        let after = &rest[next_section..];
+        format!(
+            "{before}{section_marker}\n\n{}\n{after}",
+            entries.join("\n")
+        )
+    } else {
+        format!(
+            "{}\n\n{section_marker}\n\n{}\n",
+            content.trim_end(),
+            entries.join("\n")
+        )
+    };
+
+    let tmp = memory_md.with_extension("md.tmp");
+    fs::write(&tmp, &updated)
+        .with_context(|| format!("failed to write tmp MEMORY.md: {}", tmp.display()))?;
+    fs::rename(&tmp, &memory_md)
+        .with_context(|| format!("failed to rename tmp MEMORY.md: {}", memory_md.display()))?;
+
+    info!(
+        count = anti_patterns.len(),
+        "updated MEMORY.md Stop-Doing Ledger"
+    );
+    Ok(())
 }
 
 fn load_all_reflections_text(dir: &Path) -> String {

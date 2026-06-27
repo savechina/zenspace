@@ -4,7 +4,7 @@
 //! markdown persistence (YAML frontmatter + body sections), and rule-based anti-pattern
 //! checking.
 //!
-//! Storage: `memories/decisions/{id}.md`
+//! Storage: `wiki/wisdom/decisions/{id}.md`
 
 use std::fs;
 use std::path::Path;
@@ -122,20 +122,12 @@ impl ExpectedValue {
             - (1.0 - self.success_probability) * self.loss_if_failure
     }
 
-    /// Compute flags based on EV calculation and economic capacity.
-    pub fn compute_flags(economic_capacity: f64) -> Self {
-        let success_probability = 0.5;
-        let payoff_if_success = 0.0;
-        let loss_if_failure = 0.0;
-        let ev = success_probability * payoff_if_success
-            - (1.0 - success_probability) * loss_if_failure;
-        Self {
-            success_probability,
-            payoff_if_success,
-            loss_if_failure,
-            is_positive_ev: ev > 0.0,
-            loss_affordable: loss_if_failure < economic_capacity,
-        }
+    /// Recompute `is_positive_ev` and `loss_affordable` flags from current field values.
+    pub fn compute_flags(&mut self) {
+        self.is_positive_ev = self.ev() > 0.0;
+        // Loss is affordable if zero or less than the payoff
+        self.loss_affordable = self.loss_if_failure >= 0.0
+            && (self.loss_if_failure == 0.0 || self.loss_if_failure < self.payoff_if_success);
     }
 }
 

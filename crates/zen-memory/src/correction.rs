@@ -3,7 +3,7 @@
 //! Records corrections applied to decisions or commitments,
 //! with cost breakdown reuse and verification tracking.
 //!
-//! Storage: `memories/corrections/{slug}.md`
+//! Storage: `wiki/wisdom/corrections/{slug}.md`
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -376,28 +376,66 @@ pub fn update_memory_from_facts(zen_paths: &ZenPaths, facts: &[String], source: 
         return Ok(false);
     }
 
-    let now = chrono::Utc::now().date_naive();
-    let section_marker = format!("## {source} Facts — {now}");
-
     let content = fs::read_to_string(&memory_path)?;
 
-    if content.contains(&section_marker) {
-        debug!("dream facts for {now} already present in MEMORY.md");
+    let section_header = "## Recent Wisdom";
+    let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let new_entries: Vec<String> = unique_facts
+        .iter()
+        .map(|fact| format!("- **[{source}]** {fact} ({now})"))
+        .collect();
+
+    let mut filtered_entries = Vec::new();
+    for entry in &new_entries {
+        if let Some(text) = entry.split("**] ").nth(1) {
+            let text_without_date = text.rsplit_once(" (").map(|(t, _)| t).unwrap_or(text);
+            if content.contains(text_without_date) {
+                debug!("fact already present in MEMORY.md, skipping: {text_without_date}");
+                continue;
+            }
+        }
+        filtered_entries.push(entry.clone());
+    }
+
+    if filtered_entries.is_empty() {
+        debug!("all facts already present in MEMORY.md, skipping write");
         return Ok(false);
     }
 
-    let mut update = String::new();
-    update.push_str(&format!("\n{section_marker}\n\n"));
-    for fact in &unique_facts {
-        update.push_str(&format!("- {fact}\n"));
-    }
+    let new_content = if let Some(start) = content.find(section_header) {
+        let after_header = &content[start + section_header.len()..];
+        let header_line_end = after_header.find('\n').map(|i| i + 1).unwrap_or(0);
+        let insert_pos = start + section_header.len() + header_line_end;
 
-    let new_content = format!("{content}{update}");
+        let rest = &content[insert_pos..];
+
+        let mut result = String::new();
+        result.push_str(&content[..insert_pos]);
+        for entry in &filtered_entries {
+            result.push_str(entry);
+            result.push('\n');
+        }
+        result.push_str(rest);
+        result
+    } else {
+        let mut result = content;
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(&format!("\n{section_header}\n\n"));
+        for entry in &filtered_entries {
+            result.push_str(entry);
+            result.push('\n');
+        }
+        result
+    };
+
     let tmp_path = memory_path.with_extension("md.tmp");
     fs::write(&tmp_path, &new_content)?;
     fs::rename(&tmp_path, &memory_path)?;
 
-    info!("MEMORY.md updated with {} new fact(s)", unique_facts.len());
+    info!("MEMORY.md updated with {} new fact(s)", filtered_entries.len());
     Ok(true)
 }
 
@@ -764,7 +802,7 @@ mod tests {
         let identity = paths.identity();
         fs::create_dir_all(&identity).unwrap();
         let memory_path = identity.join("MEMORY.md");
-        fs::write(&memory_path, "# Memory\n").unwrap();
+        fs::write(&memory_path, "# Memory\n\n## Recent Wisdom\n\n").unwrap();
 
         let facts = vec!["completed test feature".to_string()];
         let updated = update_memory_from_facts(&paths, &facts, "Session").unwrap();
@@ -772,12 +810,12 @@ mod tests {
 
         let content = fs::read_to_string(&memory_path).unwrap();
         assert!(
-            content.contains("## Session Facts"),
-            "should contain '## Session Facts', got: {content}"
+            content.contains("## Recent Wisdom"),
+            "should contain '## Recent Wisdom', got: {content}"
         );
         assert!(
-            !content.contains("## Dream Facts"),
-            "should NOT contain '## Dream Facts'"
+            content.contains("- **[Session]** completed test feature"),
+            "should contain session-tagged fact, got: {content}"
         );
     }
 
@@ -787,7 +825,7 @@ mod tests {
         let identity = paths.identity();
         fs::create_dir_all(&identity).unwrap();
         let memory_path = identity.join("MEMORY.md");
-        fs::write(&memory_path, "# Memory\n").unwrap();
+        fs::write(&memory_path, "# Memory\n\n## Recent Wisdom\n\n").unwrap();
 
         let dream_facts = vec!["completed dream task".to_string()];
         let session_facts = vec!["completed session task".to_string()];
@@ -797,15 +835,17 @@ mod tests {
 
         let content = fs::read_to_string(&memory_path).unwrap();
         assert!(
-            content.contains("## Dream Facts"),
-            "should contain Dream Facts section"
+            content.contains("## Recent Wisdom"),
+            "should contain Recent Wisdom section"
         );
         assert!(
-            content.contains("## Session Facts"),
-            "should contain Session Facts section"
+            content.contains("- **[Dream]** completed dream task"),
+            "should contain Dream-tagged fact"
         );
-        assert!(content.contains("completed dream task"));
-        assert!(content.contains("completed session task"));
+        assert!(
+            content.contains("- **[Session]** completed session task"),
+            "should contain Session-tagged fact"
+        );
     }
 
     #[test]

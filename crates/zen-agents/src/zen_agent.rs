@@ -61,21 +61,21 @@ impl SelfLearningSignals {
         use std::path::PathBuf;
         use zen_memory::priority::ReinforcementTracker;
 
-        let memories_dir = zen_paths.vault().join("memories");
         let wiki_dir = zen_paths.wiki();
+        let memories_dir = zen_paths.vault().join("memories");
         let reinforcement_path: PathBuf =
             zen_paths.global_root().join("memories/.reinforcement.json");
         let mut tracker = ReinforcementTracker::new(reinforcement_path);
 
-        let corrections = load_corrections(&memories_dir.join("corrections"), &mut tracker);
-        let feedback = load_feedback(&memories_dir.join("feedback"), &mut tracker);
-        let beliefs = load_beliefs(&memories_dir.join("beliefs"), &mut tracker);
+        let corrections = load_corrections(&wiki_dir.join("wisdom/corrections"), &mut tracker);
+        let feedback = load_feedback(&wiki_dir.join("wisdom/feedback"), &mut tracker);
+        let beliefs = load_beliefs(&wiki_dir.join("wisdom/beliefs"), &mut tracker);
         let virtue_logs = load_virtue_logs(&memories_dir.join("virtue_logs"));
-        let reflections = load_reflections(&wiki_dir.join("wisdom").join("reflections"));
-        let mental_models = load_mental_models(&wiki_dir.join("wisdom").join("models"));
-        let decisions = load_decisions(&memories_dir.join("decisions"), &mut tracker);
+        let reflections = load_reflections(&wiki_dir.join("wisdom/reflections"));
+        let mental_models = load_mental_models(&wiki_dir.join("wisdom/models"));
+        let decisions = load_decisions(&wiki_dir.join("wisdom/decisions"), &mut tracker);
         let priority_items = load_priority_items(
-            &memories_dir.join("beliefs"),
+            &wiki_dir.join("wisdom/beliefs"),
             &memories_dir.join("commitments"),
         );
 

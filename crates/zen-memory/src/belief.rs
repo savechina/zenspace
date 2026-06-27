@@ -4,7 +4,7 @@
 //! reinforcement/decay, promotion/demotion heuristics, and
 //! markdown-file-based persistence (YAML frontmatter + evidence log).
 //!
-//! Storage: `memories/beliefs/{slug}.md`
+//! Storage: `wiki/wisdom/beliefs/{slug}.md`
 
 use std::fs;
 use std::path::Path;

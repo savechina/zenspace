@@ -20,6 +20,7 @@ pub enum EntityType {
     Belief,
     Goal,
     Path,
+    Decision,
 }
 
 impl std::fmt::Display for EntityType {
@@ -39,6 +40,7 @@ impl std::fmt::Display for EntityType {
             EntityType::Belief => "belief",
             EntityType::Goal => "goal",
             EntityType::Path => "path",
+            EntityType::Decision => "decision",
         };
         write!(f, "{s}")
     }
@@ -60,6 +62,7 @@ pub fn parse_entity_type(s: &str) -> Option<EntityType> {
         "belief" => Some(EntityType::Belief),
         "goal" => Some(EntityType::Goal),
         "path" => Some(EntityType::Path),
+        "decision" => Some(EntityType::Decision),
         _ => None,
     }
 }

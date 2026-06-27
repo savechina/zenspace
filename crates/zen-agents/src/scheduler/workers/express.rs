@@ -48,7 +48,7 @@ impl ZenWorker for ExpressWorker {
         let paths = ZenPaths::detect()?;
 
         let reflections_dir = paths.vault().join("wiki/wisdom/reflections");
-        let beliefs_dir = paths.vault().join("memories/beliefs");
+        let beliefs_dir = paths.vault().join("wiki/wisdom/beliefs");
         let commitments_dir = paths.vault().join("memories/commitments");
         let suggestions_dir = paths.vault().join("wiki/wisdom/suggestions");
 
