@@ -4,8 +4,10 @@ use clap::Subcommand;
 use serde::Serialize;
 use tracing::debug;
 
+use zen_core::config::load_config;
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
+use zen_provider::DefaultRouter;
 use zen_vault::search::{SearchResult, SearchService};
 
 #[derive(Subcommand)]
@@ -69,7 +71,10 @@ pub fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
 
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
             let base_dir = paths.vault();
-            let service = SearchService::new();
+            let config =
+                load_config().map_err(|e| ZenError::Message(format!("Config error: {}", e)))?;
+            let router = DefaultRouter::from_agentic(&config);
+            let service = SearchService::new(router);
 
             let results = service
                 .search(query, &base_dir, *tier)

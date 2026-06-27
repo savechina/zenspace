@@ -76,6 +76,9 @@ pub struct Entity {
     pub description: String,
     pub source_note_id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    pub domain: Option<String>,
+    pub aliases: Vec<String>,
     pub metadata: HashMap<String, String>,
 }
 
@@ -85,13 +88,17 @@ impl Entity {
         entity_type: EntityType,
         source_note_id: impl Into<String>,
     ) -> Self {
+        let now = chrono::Utc::now();
         Self {
             id: uuid::Uuid::now_v7().to_string(),
             name: name.into(),
             entity_type,
             description: String::new(),
             source_note_id: source_note_id.into(),
-            created_at: chrono::Utc::now(),
+            created_at: now,
+            last_updated: now,
+            domain: None,
+            aliases: Vec::new(),
             metadata: HashMap::new(),
         }
     }

@@ -7,6 +7,7 @@ use super::{
     GraphResult, SearchResult, Tier1Search, Tier2Search, Tier3Search, Tier4Search, Tier5Search,
     TierSelector,
 };
+use zen_provider::DefaultRouter;
 
 /// Unified search service that routes queries to the appropriate tier.
 #[derive(Debug)]
@@ -18,12 +19,12 @@ pub struct SearchService {
 }
 
 impl SearchService {
-    pub fn new() -> Self {
+    pub fn new(router: DefaultRouter) -> Self {
         Self {
             tier2: Tier2Search,
             tier3: Tier3Search,
             tier4: Tier4Search,
-            tier5: Tier5Search,
+            tier5: Tier5Search::new(router),
         }
     }
 
@@ -66,15 +67,24 @@ impl SearchService {
                 .tier4
                 .search(query, &graph_db, 3)
                 .map(|graphs| graphs.into_iter().map(graph_to_search).collect()),
-            5 => self.tier2.search(query, &kb_db, 20).map(|r| {
-                r.into_iter()
-                    .map(|f| SearchResult {
-                        file: PathBuf::from(f.path),
-                        line: 0,
-                        content: f.snippet,
-                    })
-                    .collect()
-            }),
+            5 => {
+                // Get tier 2 results as context for LLM synthesis
+                let context = self.tier2.search(query, &kb_db, 20).map(|r| {
+                    r.into_iter()
+                        .map(|f| SearchResult {
+                            file: PathBuf::from(f.path),
+                            line: 0,
+                            content: f.snippet,
+                        })
+                        .collect::<Vec<_>>()
+                })?;
+                let synthesized = self.tier5.synthesize(query, &context)?;
+                Ok(vec![SearchResult {
+                    file: PathBuf::from("synthesis"),
+                    line: 0,
+                    content: synthesized,
+                }])
+            }
             _ => anyhow::bail!("unknown tier: {selected}"),
         }?;
 
@@ -95,12 +105,6 @@ impl SearchService {
         results: &[SearchResult],
     ) -> Result<String, anyhow::Error> {
         self.tier5.synthesize(query, results)
-    }
-}
-
-impl Default for SearchService {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

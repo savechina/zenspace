@@ -249,20 +249,37 @@ impl WikiCompiler {
             .unwrap_or_else(|| format!("{} entity", data.entity.name));
 
         // OKF §4.1 frontmatter
-        md.push_str(&format!(
+        let mut fm = format!(
             "---\n\
              type: {type_str}\n\
              title: {name}\n\
              description: {description}\n\
-             tags: [{tag}]\n\
-             timestamp: {ts}\n\
-             created_at: {created}\n\
-             ---\n\n",
+             tags: [{tag}]\n",
             name = data.entity.name,
             tag = type_str.to_lowercase(),
+        );
+
+        if let Some(ref domain) = data.entity.domain {
+            fm.push_str(&format!("domain: {domain}\n"));
+        }
+        if !data.entity.aliases.is_empty() {
+            let aliases_str = data
+                .entity
+                .aliases
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            fm.push_str(&format!("aliases: [{aliases_str}]\n"));
+        }
+        fm.push_str(&format!(
+            "timestamp: {ts}\n\
+             created_at: {created}\n\
+             ---\n\n",
             ts = now.to_rfc3339(),
             created = data.entity.created_at.to_rfc3339(),
         ));
+        md.push_str(&fm);
 
         md.push_str(&format!("# {}\n\n", data.entity.name));
 

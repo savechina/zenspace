@@ -1,10 +1,51 @@
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use zen_core::paths::ZenPaths;
 use zen_vault::{EntityData, EntityService, WikiCompiler};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
+
+const STATE_FILE: &str = ".wiki_compiler_state.json";
+
+/// Persistent state for incremental wiki compilation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompilerState {
+    last_compile_time: DateTime<Utc>,
+}
+
+impl CompilerState {
+    fn new() -> Self {
+        Self {
+            last_compile_time: DateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn load(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|e| {
+                debug!(error = %e, path = %path.display(), "failed to parse compiler state, resetting");
+                Self::new()
+            }),
+            Err(_) => Self::new(),
+        }
+    }
+
+    fn save(&self, path: &std::path::Path) -> Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create state dir: {}", parent.display()))?;
+        }
+        std::fs::write(path, &content)
+            .with_context(|| format!("write compiler state: {}", path.display()))?;
+        Ok(())
+    }
+}
 
 pub struct WikiCompilerWorker {
     scheduled: Option<&'static str>,
@@ -19,6 +60,35 @@ impl WikiCompilerWorker {
         self.scheduled = Some(Box::leak(expr.to_string().into_boxed_str()));
         self
     }
+
+    fn state_path(global_root: &PathBuf) -> PathBuf {
+        global_root.join("db").join(STATE_FILE)
+    }
+
+    fn build_entity_data(
+        svc: &EntityService,
+        graph_db: &std::path::Path,
+        entity: &zen_vault::Entity,
+    ) -> EntityData {
+        let relationships = svc
+            .load_relationships_for_entity(graph_db, &entity.id)
+            .unwrap_or_default();
+
+        let fact = format!(
+            "{} is a {} entity in the {} domain, first seen on {}, last updated on {}",
+            entity.name,
+            entity.entity_type,
+            entity.domain.as_deref().unwrap_or("unknown"),
+            entity.created_at.format("%Y-%m-%d"),
+            entity.last_updated.format("%Y-%m-%d"),
+        );
+
+        EntityData {
+            entity: entity.clone(),
+            facts: vec![fact],
+            relationships,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -28,7 +98,7 @@ impl ZenWorker for WikiCompilerWorker {
     }
 
     fn description(&self) -> &'static str {
-        "Compile wiki pages from graph.db entities"
+        "Compile wiki pages from graph.db entities (incremental)"
     }
 
     fn schedule(&self) -> &'static str {
@@ -38,15 +108,20 @@ impl ZenWorker for WikiCompilerWorker {
     async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
         let start = std::time::Instant::now();
         let paths = ZenPaths::detect()?;
+        let global_root = paths.global_root();
+
+        let state_path = Self::state_path(global_root);
+        let state = CompilerState::load(&state_path);
+        debug!(last_compile_time = %state.last_compile_time, "loaded compiler state");
 
         let graph_db = paths.db().join("graph.db");
         let wiki_dir = paths.vault().join("wiki");
 
         let svc = EntityService::new();
 
-        let entities = svc.load_all_entities(&graph_db)?;
+        let entities = svc.load_entities_updated_since(&graph_db, state.last_compile_time)?;
         if entities.is_empty() {
-            debug!("no entities in graph.db, skipping wiki compilation");
+            debug!("no entities updated since last compile, skipping");
             return Ok(WorkerReport {
                 worker_id: self.id().to_string(),
                 success: true,
@@ -55,17 +130,15 @@ impl ZenWorker for WikiCompilerWorker {
             });
         }
 
-        let mut entity_data_list: Vec<EntityData> = Vec::new();
-        for entity in &entities {
-            let relationships = svc
-                .load_relationships_for_entity(&graph_db, &entity.id)
-                .unwrap_or_default();
+        info!(
+            count = entities.len(),
+            since = %state.last_compile_time,
+            "incremental wiki compile"
+        );
 
-            entity_data_list.push(EntityData {
-                entity: entity.clone(),
-                facts: Vec::new(),
-                relationships,
-            });
+        let mut entity_data_list: Vec<EntityData> = Vec::with_capacity(entities.len());
+        for entity in &entities {
+            entity_data_list.push(Self::build_entity_data(&svc, &graph_db, entity));
         }
 
         let pages_written =
@@ -80,11 +153,163 @@ impl ZenWorker for WikiCompilerWorker {
                 }
             };
 
+        let new_state = CompilerState {
+            last_compile_time: Utc::now(),
+        };
+        if let Err(e) = new_state.save(&state_path) {
+            tracing::error!(error = %e, "failed to save compiler state");
+        }
+
         Ok(WorkerReport {
             worker_id: self.id().to_string(),
             success: true,
             fact_count: pages_written,
             duration_ms: start.elapsed().as_millis() as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup_state_dir() -> TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn test_state_default_is_epoch() {
+        let state = CompilerState::new();
+        assert_eq!(
+            state.last_compile_time,
+            DateTime::UNIX_EPOCH,
+            "default state should be UNIX_EPOCH"
+        );
+    }
+
+    #[test]
+    fn test_state_roundtrip() {
+        let dir = setup_state_dir();
+        let path = dir.path().join(STATE_FILE);
+
+        let now = Utc::now();
+        let state = CompilerState {
+            last_compile_time: now,
+        };
+        state.save(&path).unwrap();
+
+        let loaded = CompilerState::load(&path);
+        assert!(
+            (loaded.last_compile_time - now).num_seconds().abs() <= 1,
+            "loaded time should match saved time within 1 second"
+        );
+    }
+
+    #[test]
+    fn test_state_load_missing_file_returns_epoch() {
+        let dir = setup_state_dir();
+        let path = dir.path().join("nonexistent.json");
+        let state = CompilerState::load(&path);
+        assert_eq!(
+            state.last_compile_time,
+            DateTime::UNIX_EPOCH,
+            "missing state file should return epoch"
+        );
+    }
+
+    #[test]
+    fn test_state_load_corrupted_file_returns_epoch() {
+        let dir = setup_state_dir();
+        let path = dir.path().join(STATE_FILE);
+        std::fs::write(&path, "not json").unwrap();
+        let state = CompilerState::load(&path);
+        assert_eq!(
+            state.last_compile_time,
+            DateTime::UNIX_EPOCH,
+            "corrupted state should return epoch"
+        );
+    }
+
+    #[test]
+    fn test_build_entity_data_creates_synthetic_fact() {
+        let entity = zen_vault::Entity {
+            id: "test-1".to_string(),
+            name: "Rust".to_string(),
+            entity_type: zen_vault::EntityType::Technology,
+            description: String::new(),
+            source_note_id: "note-1".to_string(),
+            created_at: DateTime::UNIX_EPOCH,
+            last_updated: DateTime::UNIX_EPOCH,
+            domain: Some("programming".to_string()),
+            aliases: vec!["rust-lang".to_string(), "rs".to_string()],
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let svc = EntityService::new();
+        let dir = setup_state_dir();
+        let db_path = dir.path().join("graph.db");
+
+        let data = WikiCompilerWorker::build_entity_data(&svc, &db_path, &entity);
+
+        assert!(!data.facts.is_empty(), "should have at least one fact");
+        let fact = &data.facts[0];
+        assert!(fact.contains("Rust"), "fact should contain entity name");
+        assert!(
+            fact.contains("technology"),
+            "fact should contain entity type"
+        );
+        assert!(
+            fact.contains("programming"),
+            "fact should contain domain"
+        );
+        assert!(
+            fact.contains("1970-01-01"),
+            "fact should contain first_seen date"
+        );
+    }
+
+    #[test]
+    fn test_build_entity_data_without_domain() {
+        let entity = zen_vault::Entity {
+            id: "test-2".to_string(),
+            name: "Python".to_string(),
+            entity_type: zen_vault::EntityType::Technology,
+            description: String::new(),
+            source_note_id: "note-2".to_string(),
+            created_at: DateTime::UNIX_EPOCH,
+            last_updated: DateTime::UNIX_EPOCH,
+            domain: None,
+            aliases: Vec::new(),
+            metadata: std::collections::HashMap::new(),
+        };
+
+        let svc = EntityService::new();
+        let dir = setup_state_dir();
+        let db_path = dir.path().join("graph.db");
+
+        let data = WikiCompilerWorker::build_entity_data(&svc, &db_path, &entity);
+
+        assert!(!data.facts.is_empty(), "should have at least one fact");
+        let fact = &data.facts[0];
+        assert!(fact.contains("Python"), "fact should contain entity name");
+        assert!(
+            fact.contains("unknown"),
+            "fact should say unknown domain when none exists"
+        );
+    }
+
+    #[test]
+    fn test_state_path_ends_with_state_file() {
+        let path = PathBuf::from("/tmp/.zen");
+        let state_path = WikiCompilerWorker::state_path(&path);
+        assert!(
+            state_path.ends_with(STATE_FILE),
+            "state path should end with state file name"
+        );
+        assert!(
+            state_path.to_string_lossy().contains("/db/"),
+            "state path should be under db directory"
+        );
     }
 }

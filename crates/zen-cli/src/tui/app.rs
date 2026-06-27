@@ -309,6 +309,7 @@ pub struct App {
     pub history_position: Option<usize>,
     pub last_recalled_text: Option<String>,
     pub config: &'static zen_core::config::ZenConfig,
+    pub router: DefaultRouter,
     orchestrator: Option<Arc<AgentOrchestrator>>,
     session: Option<SessionContext>,
     pub current_variant: Option<String>,
@@ -346,6 +347,7 @@ impl App {
             .ok()
             .and_then(|paths| paths.workspace_root().map(|p| p.display().to_string()))
             .unwrap_or_else(|| ".".into());
+        let router = DefaultRouter::from_agentic(config);
         let mut app = Self {
             input: InputCell::new(""),
             output: Vec::new(),
@@ -368,6 +370,7 @@ impl App {
             history_position: None,
             last_recalled_text: None,
             config,
+            router,
             orchestrator: None,
             session: None,
             current_variant: None,
@@ -817,7 +820,7 @@ Use /thinking to show/hide thinking process."#;
             Ok(p) => p,
             Err(_) => return Vec::new(),
         };
-        let service = SearchService::new();
+        let service = SearchService::new(self.router.clone());
         let tier = TierSelector::select_tier(query);
 
         let mut results = Vec::new();
@@ -1327,7 +1330,7 @@ Use /thinking to show/hide thinking process."#;
         };
         let base_dir = paths.inbox();
 
-        match SearchService::new().search(query, &base_dir, Some(tier)) {
+        match SearchService::new(self.router.clone()).search(query, &base_dir, Some(tier)) {
             Ok(results) => {
                 if results.is_empty() {
                     self.push_output(format!("[tier {}] No results for '{}'", tier, query), false);

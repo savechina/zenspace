@@ -49,6 +49,27 @@ fn parse_entity_type(s: &str) -> EntityType {
     }
 }
 
+/// Parse the `aliases` TEXT column from graph.db into a `Vec<String>`.
+/// Accepts JSON array format `["a","b"]` or comma-separated `"a, b"`.
+/// Returns an empty vec for NULL or empty input.
+fn parse_aliases_column(raw: Option<&str>) -> Vec<String> {
+    let raw = match raw {
+        Some(s) if !s.is_empty() => s,
+        _ => return Vec::new(),
+    };
+
+    // Try JSON array first
+    if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
+        return arr;
+    }
+
+    // Fall back to comma-separated
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Service for extracting entities and relationships from workspace content.
 pub struct EntityService;
 
@@ -188,20 +209,85 @@ impl EntityService {
         }
         let repo = SqliteRepo::open(db_path)?;
         let rows = repo.query_map(
-            "SELECT id, name, entity_type, first_seen FROM entities ORDER BY name",
+            "SELECT id, name, entity_type, first_seen, domain, aliases, last_updated \
+             FROM entities ORDER BY name",
             &[],
             |row| {
                 let id: String = row.get(0)?;
                 let name: String = row.get(1)?;
                 let type_str: String = row.get(2)?;
                 let first_seen: String = row.get(3)?;
+                let domain: Option<String> = row.get(4)?;
+                let aliases_raw: Option<String> = row.get(5)?;
+                let last_updated: Option<String> = row.get(6)?;
+
                 let entity_type = parse_entity_type(&type_str);
                 let created_at = chrono::DateTime::parse_from_rfc3339(&first_seen)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| chrono::Utc::now());
+                let updated_at = last_updated
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(created_at);
+
+                let aliases = parse_aliases_column(aliases_raw.as_deref());
+
                 let mut entity = Entity::new(name, entity_type, "graph-db");
                 entity.id = id;
                 entity.created_at = created_at;
+                entity.last_updated = updated_at;
+                entity.domain = domain;
+                entity.aliases = aliases;
+                Ok(entity)
+            },
+        )?;
+        Ok(rows)
+    }
+
+    /// Load entities that have been updated since the given timestamp.
+    /// Used by incremental wiki compilation.
+    pub fn load_entities_updated_since(
+        &self,
+        db_path: &Path,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Entity>> {
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let repo = SqliteRepo::open(db_path)?;
+        let since_str = since.to_rfc3339();
+        let rows = repo.query_map(
+            "SELECT id, name, entity_type, first_seen, domain, aliases, last_updated \
+             FROM entities WHERE last_updated > ?1 ORDER BY name",
+            rusqlite::params![since_str],
+            |row| {
+                let id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let type_str: String = row.get(2)?;
+                let first_seen: String = row.get(3)?;
+                let domain: Option<String> = row.get(4)?;
+                let aliases_raw: Option<String> = row.get(5)?;
+                let last_updated: Option<String> = row.get(6)?;
+
+                let entity_type = parse_entity_type(&type_str);
+                let created_at = chrono::DateTime::parse_from_rfc3339(&first_seen)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let updated_at = last_updated
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(created_at);
+
+                let aliases = parse_aliases_column(aliases_raw.as_deref());
+
+                let mut entity = Entity::new(name, entity_type, "graph-db");
+                entity.id = id;
+                entity.created_at = created_at;
+                entity.last_updated = updated_at;
+                entity.domain = domain;
+                entity.aliases = aliases;
                 Ok(entity)
             },
         )?;

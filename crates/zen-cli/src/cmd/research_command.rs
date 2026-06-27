@@ -51,7 +51,10 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
             let wiki_dir = paths.wiki();
 
-            let existing_results = search_existing_content(topic, &wiki_dir);
+            let config = load_config()?;
+            let router = DefaultRouter::from_agentic(&config);
+
+            let existing_results = search_existing_content(topic, &wiki_dir, router.clone());
 
             let prompt = build_research_prompt(topic, &existing_results);
 
@@ -63,7 +66,7 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
                 })?;
             }
 
-            let brief = match generate_brief(topic, &prompt) {
+            let brief = match generate_brief(topic, &prompt, router) {
                 Ok(content) => content,
                 Err(e) => {
                     warn!("LLM research unavailable, generating stub: {e}");
@@ -112,12 +115,16 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
     }
 }
 
-fn search_existing_content(topic: &str, wiki_dir: &std::path::Path) -> Vec<SearchResult> {
+fn search_existing_content(
+    topic: &str,
+    wiki_dir: &std::path::Path,
+    router: DefaultRouter,
+) -> Vec<SearchResult> {
     if !wiki_dir.exists() {
         return Vec::new();
     }
 
-    let service = SearchService::new();
+    let service = SearchService::new(router);
     let results = service.search(topic, wiki_dir, None);
 
     match results {
@@ -179,10 +186,7 @@ fn build_research_prompt(topic: &str, existing: &[SearchResult]) -> String {
     )
 }
 
-fn generate_brief(topic: &str, prompt: &str) -> Result<String, ZenError> {
-    let config = load_config()?;
-    let router = DefaultRouter::from_agentic(config);
-
+fn generate_brief(topic: &str, prompt: &str, router: DefaultRouter) -> Result<String, ZenError> {
     let llm_content = router.complete("research", prompt, Sensitivity::Public)?;
 
     let now = Local::now().format("%Y-%m-%d");
