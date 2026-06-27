@@ -375,6 +375,52 @@ impl EntityService {
         self.upsert_entity(db_path, &entity)
     }
 
+    /// Upserts a SelfNode into the dedicated self_nodes table.
+    /// This is the Phase C3 implementation with typed columns for 6-layer introspective typing.
+    pub fn upsert_self_node(
+        &self,
+        db_path: &Path,
+        node: &super::self_node::SelfNode,
+    ) -> Result<()> {
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+
+        let is_explicit = node.is_explicit.map(|b| b as i32);
+        let sufficient_for = serde_json::to_string(&node.sufficient_for).unwrap_or_default();
+        let necessary_for = serde_json::to_string(&node.necessary_for).unwrap_or_default();
+        let evidence_refs = serde_json::to_string(&node.evidence_refs).unwrap_or_default();
+
+        repo.conn().execute(
+            "INSERT OR REPLACE INTO self_nodes (
+                id, name, layer, description, domain,
+                is_explicit, sufficient_for, necessary_for, controllability,
+                humility_score, optionality_count, core_pursuit,
+                source, confidence, evidence_refs, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                node.id,
+                node.name,
+                node.layer.to_string(),
+                node.description,
+                node.domain,
+                is_explicit,
+                sufficient_for,
+                necessary_for,
+                node.controllability,
+                node.humility_score,
+                node.optionality_count,
+                node.core_pursuit,
+                node.source,
+                node.confidence,
+                evidence_refs,
+                node.created_at.to_rfc3339(),
+                node.updated_at.to_rfc3339(),
+            ],
+        )?;
+
+        Ok(())
+    }
+
     pub fn upsert_goal_node(
         &self,
         db_path: &Path,
