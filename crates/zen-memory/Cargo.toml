@@ -20,3 +20,4 @@ rig-core = { workspace = true }
 rig-memvid = { workspace = true }
 rig-compose = { workspace = true }
 tempfile = { workspace = true }
+include_dir = { workspace = true }

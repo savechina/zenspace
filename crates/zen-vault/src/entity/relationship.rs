@@ -11,6 +11,10 @@ pub enum RelationType {
     Extends,
     Uses,
     Contains,
+    SelfBelieves,
+    SelfAims,
+    SelfCapableOf,
+    SelfPartOf,
 }
 
 /// A directed relationship between two entities.

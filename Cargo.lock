@@ -10438,6 +10438,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono 0.4.45",
+ "include_dir",
  "rig-compose 0.5.0",
  "rig-core 0.37.0",
  "rig-memvid",

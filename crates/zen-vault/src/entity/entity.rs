@@ -16,6 +16,9 @@ pub enum EntityType {
     Product,
     Technology,
     Other,
+    SelfModel,
+    Belief,
+    Goal,
 }
 
 /// A typed entity extracted from workspace content (notes, code, etc.).

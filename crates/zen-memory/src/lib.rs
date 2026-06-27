@@ -11,7 +11,9 @@ pub mod memory;
 pub mod memory_flush;
 pub mod memory_service;
 pub mod memvid;
+pub mod memvid_index;
 pub mod prompt;
+pub mod seed;
 pub mod sensitivity;
 pub mod self_model;
 pub mod session;
@@ -36,7 +38,9 @@ pub use memvid::{
     default_memory_config,
 };
 pub use memvid::TRIPLET_MIN_CONFIDENCE;
+pub use memvid_index::{MemvidIndexer, MemvidIndexReport};
 pub use prompt::PromptAssembly;
+pub use seed::{copy_seeds_to, seed_file_paths, SEED_FILE_COUNT};
 pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity};
 pub use session::SessionManager;
 pub use session::{ConversationTurn, RetrievedNote, SessionContext};

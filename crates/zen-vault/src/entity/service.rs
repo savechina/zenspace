@@ -37,6 +37,9 @@ fn parse_entity_type(s: &str) -> EntityType {
         "Event" => EntityType::Event,
         "Product" => EntityType::Product,
         "Technology" => EntityType::Technology,
+        "SelfModel" => EntityType::SelfModel,
+        "Belief" => EntityType::Belief,
+        "Goal" => EntityType::Goal,
         _ => EntityType::Other,
     }
 }
@@ -224,6 +227,10 @@ impl EntityService {
                     "Extends" => RelationType::Extends,
                     "Uses" => RelationType::Uses,
                     "Contains" => RelationType::Contains,
+                    "SelfBelieves" => RelationType::SelfBelieves,
+                    "SelfAims" => RelationType::SelfAims,
+                    "SelfCapableOf" => RelationType::SelfCapableOf,
+                    "SelfPartOf" => RelationType::SelfPartOf,
                     _ => RelationType::RelatedTo,
                 };
                 Ok((target_id, rt))
@@ -244,6 +251,31 @@ impl EntityService {
             result.push((target_name, rt));
         }
         Ok(result)
+    }
+
+    /// Upserts a Self-Model item as a graph entity.
+    /// This enables graph-based queries for self-knowledge.
+    ///
+    /// `layer` is one of: "Knowledge", "Skill", "SocialRole", "SelfConcept", "Trait", "Motivation"
+    pub fn upsert_self_model_entity(
+        &self,
+        db_path: &Path,
+        id: &str,
+        name: &str,
+        layer: &str,
+        domain: Option<&str>,
+    ) -> Result<()> {
+        let mut entity = Entity::new(name, EntityType::SelfModel, "self-model");
+        entity.id = id.to_string();
+        entity
+            .metadata
+            .insert("layer".to_string(), layer.to_string());
+        if let Some(d) = domain {
+            entity
+                .metadata
+                .insert("domain".to_string(), d.to_string());
+        }
+        self.upsert_entity(db_path, &entity)
     }
 }
 
@@ -305,5 +337,157 @@ mod tests {
         // Verify load_known_entity_names includes the canonical name
         let names = service.load_known_entity_names(&db_path).unwrap();
         assert!(names.contains("rust"));
+    }
+
+    #[test]
+    fn test_parse_entity_type_self_model() {
+        let parsed = parse_entity_type("SelfModel");
+        assert_eq!(parsed, EntityType::SelfModel);
+
+        let parsed_belief = parse_entity_type("Belief");
+        assert_eq!(parsed_belief, EntityType::Belief);
+
+        let parsed_goal = parse_entity_type("Goal");
+        assert_eq!(parsed_goal, EntityType::Goal);
+    }
+
+    #[test]
+    fn test_parse_entity_type_unknown_falls_back_to_other() {
+        let parsed = parse_entity_type("UnknownType");
+        assert_eq!(parsed, EntityType::Other);
+    }
+
+    #[test]
+    fn test_entity_type_self_model_debug_roundtrip() {
+        let et = EntityType::SelfModel;
+        let debug_str = format!("{:?}", et);
+        assert_eq!(debug_str, "SelfModel");
+        let reparsed = parse_entity_type(&debug_str);
+        assert_eq!(reparsed, et);
+    }
+
+    #[test]
+    fn test_relation_type_self_model_variants() {
+        let variants = [
+            RelationType::SelfBelieves,
+            RelationType::SelfAims,
+            RelationType::SelfCapableOf,
+            RelationType::SelfPartOf,
+        ];
+        let expected = ["SelfBelieves", "SelfAims", "SelfCapableOf", "SelfPartOf"];
+        for (variant, name) in variants.iter().zip(expected.iter()) {
+            assert_eq!(format!("{:?}", variant), *name);
+        }
+    }
+
+    #[test]
+    fn test_relation_type_self_believes_roundtrip() {
+        let rel = RelationType::SelfBelieves;
+        let s = format!("{:?}", rel);
+        assert_eq!(s, "SelfBelieves");
+
+        let roundtripped = match s.as_str() {
+            "SelfBelieves" => RelationType::SelfBelieves,
+            _ => panic!("unexpected relation type"),
+        };
+        assert_eq!(roundtripped, RelationType::SelfBelieves);
+    }
+
+    #[test]
+    fn test_upsert_self_model_entity() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_self_model_entity(
+                &db_path,
+                "sm-1",
+                "Rust Proficiency",
+                "Skill",
+                Some("programming"),
+            )
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].id, "sm-1");
+        assert_eq!(entities[0].name, "rust proficiency");
+        assert_eq!(entities[0].entity_type, EntityType::SelfModel);
+    }
+
+    #[test]
+    fn test_upsert_self_model_entity_without_domain() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_self_model_entity(
+                &db_path,
+                "sm-2",
+                "Curiosity",
+                "Trait",
+                None,
+            )
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_type, EntityType::SelfModel);
+        assert_eq!(entities[0].name, "curiosity");
+
+        let repo = SqliteRepo::open(&db_path).unwrap();
+        let stored_type: String = repo
+            .query_row(
+                "SELECT entity_type FROM entities WHERE id = 'sm-2'",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_type, "SelfModel");
+    }
+
+    #[test]
+    fn test_upsert_self_model_entity_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_self_model_entity(&db_path, "sm-3", "Writing", "Skill", None)
+            .unwrap();
+        service
+            .upsert_self_model_entity(&db_path, "sm-3", "Writing", "Skill", None)
+            .unwrap();
+
+        let repo = SqliteRepo::open(&db_path).unwrap();
+        let count: i32 = repo
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'sm-3'",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_self_model_entity_loads_correct_type() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_self_model_entity(&db_path, "sm-4", "Empathy", "Trait", Some("social"))
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        let entity = &entities[0];
+        assert_eq!(entity.entity_type, EntityType::SelfModel);
+
+        let type_str = format!("{:?}", entity.entity_type);
+        let reparsed = parse_entity_type(&type_str);
+        assert_eq!(reparsed, EntityType::SelfModel);
     }
 }
