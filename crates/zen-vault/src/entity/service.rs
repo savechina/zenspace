@@ -1230,4 +1230,96 @@ mod tests {
         assert_eq!(EntityType::Decision.to_string(), "decision");
         assert_eq!(parse_entity_type("decision"), Some(EntityType::Decision));
     }
+
+    #[test]
+    fn test_upsert_and_load_self_node() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        let mut node = crate::entity::self_node::SelfNode::new(
+            "sn-1".to_string(),
+            crate::entity::self_node::SelfModelLayer::Knowledge,
+            "knows GTD".to_string(),
+            "productivity".to_string(),
+        );
+        node.is_explicit = Some(true);
+        node.confidence = 0.9;
+        node.source = "fact".to_string();
+
+        service.upsert_self_node(&db_path, &node).unwrap();
+
+        let loaded = service.load_self_nodes(&db_path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "sn-1");
+        assert_eq!(loaded[0].name, "knows GTD");
+        assert_eq!(loaded[0].layer, crate::entity::self_node::SelfModelLayer::Knowledge);
+        assert_eq!(loaded[0].is_explicit, Some(true));
+        assert_eq!(loaded[0].confidence, 0.9);
+        assert_eq!(loaded[0].source, "fact");
+    }
+
+    #[test]
+    fn test_load_self_nodes_by_layer() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        let k1 = crate::entity::self_node::SelfNode::new(
+            "k-1".to_string(),
+            crate::entity::self_node::SelfModelLayer::Knowledge,
+            "knows Rust".to_string(),
+            "programming".to_string(),
+        );
+        let k2 = crate::entity::self_node::SelfNode::new(
+            "k-2".to_string(),
+            crate::entity::self_node::SelfModelLayer::Knowledge,
+            "knows SQL".to_string(),
+            "programming".to_string(),
+        );
+        let s1 = crate::entity::self_node::SelfNode::new(
+            "s-1".to_string(),
+            crate::entity::self_node::SelfModelLayer::Skill,
+            "writes async code".to_string(),
+            "programming".to_string(),
+        );
+
+        service.upsert_self_node(&db_path, &k1).unwrap();
+        service.upsert_self_node(&db_path, &k2).unwrap();
+        service.upsert_self_node(&db_path, &s1).unwrap();
+
+        let knowledge = service
+            .load_self_nodes_by_layer(&db_path, &crate::entity::self_node::SelfModelLayer::Knowledge)
+            .unwrap();
+        assert_eq!(knowledge.len(), 2);
+
+        let skills = service
+            .load_self_nodes_by_layer(&db_path, &crate::entity::self_node::SelfModelLayer::Skill)
+            .unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "writes async code");
+    }
+
+    #[test]
+    fn test_self_node_with_skill_fields() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        let mut node = crate::entity::self_node::SelfNode::new(
+            "skill-1".to_string(),
+            crate::entity::self_node::SelfModelLayer::Skill,
+            "writes Rust async".to_string(),
+            "programming".to_string(),
+        );
+        node.sufficient_for = vec!["architect".to_string(), "engineer".to_string()];
+        node.necessary_for = vec!["systems-engineer".to_string()];
+
+        service.upsert_self_node(&db_path, &node).unwrap();
+
+        let loaded = service.load_self_nodes(&db_path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].sufficient_for, vec!["architect", "engineer"]);
+        assert_eq!(loaded[0].necessary_for, vec!["systems-engineer"]);
+    }
 }
