@@ -40,6 +40,7 @@ fn parse_entity_type(s: &str) -> EntityType {
         "SelfModel" => EntityType::SelfModel,
         "Belief" => EntityType::Belief,
         "Goal" => EntityType::Goal,
+        "Path" => EntityType::Path,
         _ => EntityType::Other,
     }
 }
@@ -231,6 +232,10 @@ impl EntityService {
                     "SelfAims" => RelationType::SelfAims,
                     "SelfCapableOf" => RelationType::SelfCapableOf,
                     "SelfPartOf" => RelationType::SelfPartOf,
+                    "ServesGoal" => RelationType::ServesGoal,
+                    "AlternativeTo" => RelationType::AlternativeTo,
+                    "DecidedAbout" => RelationType::DecidedAbout,
+                    "CorrectedBy" => RelationType::CorrectedBy,
                     _ => RelationType::RelatedTo,
                 };
                 Ok((target_id, rt))
@@ -276,6 +281,63 @@ impl EntityService {
                 .insert("domain".to_string(), d.to_string());
         }
         self.upsert_entity(db_path, &entity)
+    }
+
+    pub fn upsert_goal_node(
+        &self,
+        db_path: &Path,
+        id: &str,
+        name: &str,
+        controllability: f64,
+        core_pursuit: &str,
+        deadline: Option<&str>,
+    ) -> Result<()> {
+        let mut entity = Entity::new(name, EntityType::Goal, "goal-model");
+        entity.id = id.to_string();
+        entity
+            .metadata
+            .insert("controllability".to_string(), controllability.to_string());
+        entity
+            .metadata
+            .insert("core_pursuit".to_string(), core_pursuit.to_string());
+        if let Some(d) = deadline {
+            entity
+                .metadata
+                .insert("deadline".to_string(), d.to_string());
+        }
+        self.upsert_entity(db_path, &entity)
+    }
+
+    pub fn upsert_path_node(
+        &self,
+        db_path: &Path,
+        id: &str,
+        name: &str,
+        serves_goal: &str,
+        is_default: bool,
+        crowdedness: f64,
+    ) -> Result<()> {
+        let mut entity = Entity::new(name, EntityType::Path, "path-model");
+        entity.id = id.to_string();
+        entity
+            .metadata
+            .insert("serves_goal".to_string(), serves_goal.to_string());
+        entity
+            .metadata
+            .insert("is_default".to_string(), is_default.to_string());
+        entity
+            .metadata
+            .insert("crowdedness".to_string(), crowdedness.to_string());
+        self.upsert_entity(db_path, &entity)?;
+
+        // Create ServesGoal relationship from this path to the goal
+        let goal_entities = self.load_all_entities(db_path)?;
+        if let Some(goal) = goal_entities.iter().find(|e| e.name == normalize_entity_name(serves_goal)) {
+            let rel = Relationship::new(id, goal.id.clone(), RelationType::ServesGoal, "path-model");
+            self.insert_relationship(db_path, &rel)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -489,5 +551,202 @@ mod tests {
         let type_str = format!("{:?}", entity.entity_type);
         let reparsed = parse_entity_type(&type_str);
         assert_eq!(reparsed, EntityType::SelfModel);
+    }
+
+    #[test]
+    fn test_upsert_goal_node() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_goal_node(&db_path, "g-1", "Learn Rust", 0.8, "mastery", Some("2026-12-31"))
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].id, "g-1");
+        assert_eq!(entities[0].name, "learn rust");
+        assert_eq!(entities[0].entity_type, EntityType::Goal);
+    }
+
+    #[test]
+    fn test_upsert_goal_node_without_deadline() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_goal_node(&db_path, "g-2", "Ship Feature", 0.5, "delivery", None)
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_type, EntityType::Goal);
+    }
+
+    #[test]
+    fn test_upsert_goal_node_metadata() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_goal_node(&db_path, "g-3", "Run Marathon", 0.9, "fitness", Some("2027-06-01"))
+            .unwrap();
+
+        let repo = SqliteRepo::open(&db_path).unwrap();
+        let stored_type: String = repo
+            .query_row(
+                "SELECT entity_type FROM entities WHERE id = 'g-3'",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_type, "Goal");
+    }
+
+    #[test]
+    fn test_upsert_goal_node_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_goal_node(&db_path, "g-4", "Write Book", 0.6, "creative", None)
+            .unwrap();
+        service
+            .upsert_goal_node(&db_path, "g-4", "Write Book", 0.6, "creative", None)
+            .unwrap();
+
+        let repo = SqliteRepo::open(&db_path).unwrap();
+        let count: i32 = repo
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'g-4'",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_upsert_path_node() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_goal_node(&db_path, "g-5", "Learn Rust", 0.8, "mastery", None)
+            .unwrap();
+
+        service
+            .upsert_path_node(&db_path, "p-1", "Online Courses", "Learn Rust", true, 0.3)
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 2);
+        let path = entities.iter().find(|e| e.id == "p-1").unwrap();
+        assert_eq!(path.entity_type, EntityType::Path);
+        assert_eq!(path.name, "online courses");
+    }
+
+    #[test]
+    fn test_upsert_path_node_creates_serves_goal_relationship() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_goal_node(&db_path, "g-6", "Master Cooking", 0.7, "hobby", None)
+            .unwrap();
+        service
+            .upsert_path_node(&db_path, "p-2", "Cooking Classes", "Master Cooking", false, 0.8)
+            .unwrap();
+
+        let rels = service.load_relationships_for_entity(&db_path, "p-2").unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].1, RelationType::ServesGoal);
+        assert_eq!(rels[0].0, "master cooking");
+    }
+
+    #[test]
+    fn test_upsert_path_node_without_existing_goal() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_path_node(&db_path, "p-3", "Mentorship", "Nonexistent Goal", true, 0.5)
+            .unwrap();
+
+        let entities = service.load_all_entities(&db_path).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_type, EntityType::Path);
+
+        let rels = service.load_relationships_for_entity(&db_path, "p-3").unwrap();
+        assert!(rels.is_empty());
+    }
+
+    #[test]
+    fn test_upsert_path_node_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let service = EntityService::new();
+
+        service
+            .upsert_goal_node(&db_path, "g-7", "Get Fit", 0.9, "health", None)
+            .unwrap();
+        service
+            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6)
+            .unwrap();
+        service
+            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6)
+            .unwrap();
+
+        let repo = SqliteRepo::open(&db_path).unwrap();
+        let count: i32 = repo
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = 'p-4'",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_new_relation_types_display() {
+        use crate::entity::relationship::{parse_relation_type, RelationType};
+
+        assert_eq!(RelationType::ServesGoal.to_string(), "serves_goal");
+        assert_eq!(RelationType::AlternativeTo.to_string(), "alternative_to");
+        assert_eq!(RelationType::DecidedAbout.to_string(), "decided_about");
+        assert_eq!(RelationType::CorrectedBy.to_string(), "corrected_by");
+
+        assert_eq!(parse_relation_type("serves_goal"), Some(RelationType::ServesGoal));
+        assert_eq!(parse_relation_type("alternative_to"), Some(RelationType::AlternativeTo));
+        assert_eq!(parse_relation_type("decided_about"), Some(RelationType::DecidedAbout));
+        assert_eq!(parse_relation_type("corrected_by"), Some(RelationType::CorrectedBy));
+        assert_eq!(parse_relation_type("bogus"), None);
+    }
+
+    #[test]
+    fn test_new_relation_types_as_verb() {
+        use crate::entity::relationship::RelationType;
+
+        assert_eq!(RelationType::ServesGoal.as_verb(), "serves goal");
+        assert_eq!(RelationType::AlternativeTo.as_verb(), "alternative to");
+        assert_eq!(RelationType::DecidedAbout.as_verb(), "decided about");
+        assert_eq!(RelationType::CorrectedBy.as_verb(), "corrected by");
+    }
+
+    #[test]
+    fn test_entity_type_path_display_and_parse() {
+        use crate::entity::entity::{EntityType, parse_entity_type};
+
+        assert_eq!(EntityType::Path.to_string(), "path");
+        assert_eq!(parse_entity_type("path"), Some(EntityType::Path));
+        assert_eq!(parse_entity_type("bogus"), None);
     }
 }

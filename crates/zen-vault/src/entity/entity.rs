@@ -19,6 +19,49 @@ pub enum EntityType {
     SelfModel,
     Belief,
     Goal,
+    Path,
+}
+
+impl std::fmt::Display for EntityType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            EntityType::Function => "function",
+            EntityType::Class => "class",
+            EntityType::Module => "module",
+            EntityType::Concept => "concept",
+            EntityType::Person => "person",
+            EntityType::Organization => "organization",
+            EntityType::Event => "event",
+            EntityType::Product => "product",
+            EntityType::Technology => "technology",
+            EntityType::Other => "other",
+            EntityType::SelfModel => "self_model",
+            EntityType::Belief => "belief",
+            EntityType::Goal => "goal",
+            EntityType::Path => "path",
+        };
+        write!(f, "{s}")
+    }
+}
+
+pub fn parse_entity_type(s: &str) -> Option<EntityType> {
+    match s {
+        "function" => Some(EntityType::Function),
+        "class" => Some(EntityType::Class),
+        "module" => Some(EntityType::Module),
+        "concept" => Some(EntityType::Concept),
+        "person" => Some(EntityType::Person),
+        "organization" => Some(EntityType::Organization),
+        "event" => Some(EntityType::Event),
+        "product" => Some(EntityType::Product),
+        "technology" => Some(EntityType::Technology),
+        "other" => Some(EntityType::Other),
+        "self_model" => Some(EntityType::SelfModel),
+        "belief" => Some(EntityType::Belief),
+        "goal" => Some(EntityType::Goal),
+        "path" => Some(EntityType::Path),
+        _ => None,
+    }
 }
 
 /// A typed entity extracted from workspace content (notes, code, etc.).

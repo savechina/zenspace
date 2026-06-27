@@ -1,14 +1,14 @@
 //! Seed knowledge library — embedded static content for initial knowledge base.
 //!
-//! Contains 27 markdown files: 9 mental models, 11 behavioral anti-patterns,
-//! 7 virtue domains. Embedded at compile time via `include_dir!`.
+//! Contains 37 markdown files: 9 mental models, 11 behavioral anti-patterns,
+//! 10 decision anti-patterns, 7 virtue domains. Embedded at compile time via `include_dir!`.
 
 use include_dir::{include_dir, Dir};
 use std::path::Path;
 
 static SEED_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/seeds");
 
-pub const SEED_FILE_COUNT: usize = 27;
+pub const SEED_FILE_COUNT: usize = 37;
 
 /// Copies all seed knowledge files to the target workspace directory.
 ///

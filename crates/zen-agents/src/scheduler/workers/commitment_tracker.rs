@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
+use zen_memory::commitment::Commitment;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
@@ -94,18 +95,19 @@ impl ZenWorker for CommitmentTracker {
                             continue;
                         }
 
-                        let date_str = item.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                        let review_at = (item.created_at + chrono::Duration::days(7))
-                            .format("%Y-%m-%dT%H:%M:%SZ")
-                            .to_string();
-
-                        let content = format!(
-                            "---\ntext: {}\ncreated_at: {}\nreview_at: {}\nstatus: open\nsource_session: {}\n---\n\n# Commitment\n\n{}\n",
-                            item.text, date_str, review_at, item.session_id, item.text
+                        let mut commitment = Commitment::from_raw(&item.text);
+                        commitment.review_at = Some(
+                            (item.created_at + chrono::Duration::days(7)).date_naive(),
                         );
-                        fs::write(&commitment_path, content).with_context(|| {
-                            format!("failed to write commitment: {}", commitment_path.display())
-                        })?;
+                        commitment.source_journal = Some(item.session_id.clone());
+                        if let Err(e) = commitment.save(&commitments_dir) {
+                            warn!(
+                                text = %item.text,
+                                error = %e,
+                                "failed to save commitment"
+                            );
+                            continue;
+                        }
                         total_tracked += 1;
 
                         let base = base_slug_of(&slug);
@@ -136,48 +138,31 @@ impl ZenWorker for CommitmentTracker {
             }
         }
 
-        let now = Utc::now();
-        if commitments_dir.is_dir() {
-            for entry in fs::read_dir(&commitments_dir).unwrap_or_else(|_| {
-                return fs::read_dir(".").expect("impossible");
-            }) {
-                if let Ok(entry) = entry {
-                    let p = entry.path();
-                    if p.is_file() && p.extension().is_some_and(|ext| ext == "md") {
-                        if let Ok(content) = fs::read_to_string(&p) {
-                            let mut status = String::new();
-                            let mut review_at_str = String::new();
-                            for line in content.lines().take(10) {
-                                if let Some(v) = line.strip_prefix("status: ") {
-                                    status = v.trim().to_string();
-                                }
-                                if let Some(v) = line.strip_prefix("review_at: ") {
-                                    review_at_str = v.trim().to_string();
-                                }
-                            }
-                            if status == "open" {
-                                if let Ok(review_at) = DateTime::parse_from_rfc3339(&review_at_str)
-                                {
-                                    if review_at.with_timezone(&Utc) < now {
-                                        if let Some(text_line) =
-                                            content.lines().find(|l| l.starts_with("text: "))
-                                        {
-                                            let text =
-                                                text_line.strip_prefix("text: ").unwrap_or("");
-                                            warn!(commitment = %text, "commitment review due");
-                                            due_count += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        let commitments = Commitment::load_all(&commitments_dir).unwrap_or_default();
+        let mut stop_loss_count = 0usize;
+        for c in &commitments {
+            if c.is_overdue() {
+                warn!(commitment = %c.what, "commitment review due");
+                due_count += 1;
+            }
+            if c.stop_loss.triggered {
+                warn!(
+                    commitment = %c.what,
+                    state = %c.state,
+                    "commitment has triggered stop-loss"
+                );
+                stop_loss_count += 1;
             }
         }
 
         if due_count > 0 {
             info!(due_count, "commitments due for review");
+        }
+        if stop_loss_count > 0 {
+            info!(
+                stop_loss_count,
+                "commitments with triggered stop-loss require attention"
+            );
         }
 
         if total_tracked > 0 {

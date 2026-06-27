@@ -15,6 +15,79 @@ pub enum RelationType {
     SelfAims,
     SelfCapableOf,
     SelfPartOf,
+    ServesGoal,
+    AlternativeTo,
+    DecidedAbout,
+    CorrectedBy,
+}
+
+impl std::fmt::Display for RelationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            RelationType::DependsOn => "depends_on",
+            RelationType::Implements => "implements",
+            RelationType::RelatedTo => "related_to",
+            RelationType::References => "references",
+            RelationType::Contradicts => "contradicts",
+            RelationType::Extends => "extends",
+            RelationType::Uses => "uses",
+            RelationType::Contains => "contains",
+            RelationType::SelfBelieves => "self_believes",
+            RelationType::SelfAims => "self_aims",
+            RelationType::SelfCapableOf => "self_capable_of",
+            RelationType::SelfPartOf => "self_part_of",
+            RelationType::ServesGoal => "serves_goal",
+            RelationType::AlternativeTo => "alternative_to",
+            RelationType::DecidedAbout => "decided_about",
+            RelationType::CorrectedBy => "corrected_by",
+        };
+        write!(f, "{s}")
+    }
+}
+
+pub fn parse_relation_type(s: &str) -> Option<RelationType> {
+    match s {
+        "depends_on" => Some(RelationType::DependsOn),
+        "implements" => Some(RelationType::Implements),
+        "related_to" => Some(RelationType::RelatedTo),
+        "references" => Some(RelationType::References),
+        "contradicts" => Some(RelationType::Contradicts),
+        "extends" => Some(RelationType::Extends),
+        "uses" => Some(RelationType::Uses),
+        "contains" => Some(RelationType::Contains),
+        "self_believes" => Some(RelationType::SelfBelieves),
+        "self_aims" => Some(RelationType::SelfAims),
+        "self_capable_of" => Some(RelationType::SelfCapableOf),
+        "self_part_of" => Some(RelationType::SelfPartOf),
+        "serves_goal" => Some(RelationType::ServesGoal),
+        "alternative_to" => Some(RelationType::AlternativeTo),
+        "decided_about" => Some(RelationType::DecidedAbout),
+        "corrected_by" => Some(RelationType::CorrectedBy),
+        _ => None,
+    }
+}
+
+impl RelationType {
+    pub fn as_verb(&self) -> &str {
+        match self {
+            RelationType::DependsOn => "depends on",
+            RelationType::Implements => "implements",
+            RelationType::RelatedTo => "related to",
+            RelationType::References => "references",
+            RelationType::Contradicts => "contradicts",
+            RelationType::Extends => "extends",
+            RelationType::Uses => "uses",
+            RelationType::Contains => "contains",
+            RelationType::SelfBelieves => "self believes",
+            RelationType::SelfAims => "self aims",
+            RelationType::SelfCapableOf => "self capable of",
+            RelationType::SelfPartOf => "self part of",
+            RelationType::ServesGoal => "serves goal",
+            RelationType::AlternativeTo => "alternative to",
+            RelationType::DecidedAbout => "decided about",
+            RelationType::CorrectedBy => "corrected by",
+        }
+    }
 }
 
 /// A directed relationship between two entities.

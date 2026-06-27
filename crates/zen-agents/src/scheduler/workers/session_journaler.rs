@@ -9,6 +9,7 @@ use zen_core::paths::ZenPaths;
 use zen_core::types::Sensitivity;
 use zen_memory::conversation::ConversationStore;
 use zen_memory::dream::{ExtractedSignals, extract_durable_facts_from_entry};
+use zen_memory::quality_gate::{DECISION_PRINCIPLES, EXTRACTION_GUARDRAILS};
 use zen_provider::{DefaultRouter, LlmRouterExt};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
@@ -174,10 +175,20 @@ async fn process_session(
 
     let conversation_text = build_conversation_text(&turns);
 
+    let anti_patterns_dir = paths.vault().join("wiki/wisdom/anti-patterns");
+    let matched_anti_patterns = check_anti_pattern_match(&conversation_text, &anti_patterns_dir);
+    if !matched_anti_patterns.is_empty() {
+        info!(
+            session_id = %session_id,
+            anti_patterns = ?matched_anti_patterns,
+            "anti-patterns detected, forcing reflection extraction"
+        );
+    }
+
     let prompt_context = load_prompt_context(paths).await;
 
     let (signals, source) = if let Some(router) = router {
-        match extract_signals_via_llm(&conversation_text, &prompt_context, router).await {
+        match extract_signals_via_llm(&conversation_text, &prompt_context, router, &matched_anti_patterns).await {
             Ok(llm_signals) if !llm_signals.is_empty() => {
                 info!(session_id = %session_id, total = llm_signals.total(), "LLM signal extraction succeeded");
                 (llm_signals, "llm")
@@ -207,6 +218,7 @@ async fn extract_signals_via_llm(
     conversation_text: &str,
     prompt_context: &PromptContext,
     router: DefaultRouter,
+    matched_anti_patterns: &[String],
 ) -> Result<ExtractedSignals> {
     let truncated = if conversation_text.len() > 12000 {
         let end = conversation_text
@@ -221,13 +233,24 @@ async fn extract_signals_via_llm(
 
     let context_section = prompt_context.to_prompt_section();
 
+    let anti_pattern_warning = if matched_anti_patterns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nWARNING: Detected anti-patterns: {}. Force reflection extraction for these patterns.\n",
+            matched_anti_patterns.join(", ")
+        )
+    };
+
     let prompt = format!(
         r#"Extract typed signals from this development session conversation.
 
 Conversation:
 {truncated}
 {context_section}
-
+{anti_pattern_warning}
+{EXTRACTION_GUARDRAILS}
+{DECISION_PRINCIPLES}
 Respond with ONLY a JSON object:
 {{
   "facts": [
@@ -446,6 +469,56 @@ fn extract_session_id(jsonl_path: &std::path::Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+fn check_anti_pattern_match(session_text: &str, anti_patterns_dir: &std::path::Path) -> Vec<String> {
+    let mut matched = Vec::new();
+    if !anti_patterns_dir.is_dir() {
+        return matched;
+    }
+
+    let entries = match fs::read_dir(anti_patterns_dir) {
+        Ok(e) => e,
+        Err(_) => return matched,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "md") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let id = parse_frontmatter_field(&content, "id").unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+
+        let trigger = parse_frontmatter_field(&content, "trigger").unwrap_or_default();
+        if trigger.is_empty() {
+            continue;
+        }
+
+        let trigger_lower = trigger.to_lowercase();
+        let session_lower = session_text.to_lowercase();
+
+        let keywords: Vec<&str> = trigger_lower
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .filter(|w| w.len() > 3)
+            .collect();
+
+        let match_count = keywords.iter().filter(|kw| session_lower.contains(*kw)).count();
+        let threshold = (keywords.len() / 2).max(1);
+
+        if match_count >= threshold {
+            matched.push(id);
+        }
+    }
+
+    matched
 }
 
 async fn load_prompt_context(paths: &ZenPaths) -> PromptContext {
@@ -757,5 +830,53 @@ mod tests {
         let items = scan_commitments(dir.path());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "Open task");
+    }
+
+    #[test]
+    fn test_check_anti_pattern_match_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let matched = check_anti_pattern_match("some session text", dir.path());
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_check_anti_pattern_match_nonexistent_dir() {
+        let matched = check_anti_pattern_match("text", std::path::Path::new("/nonexistent"));
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_check_anti_pattern_match_with_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let ap_content = "---\nid: confirmation-bias\ntype: anti-pattern\ntrigger: \"Selectively gathering evidence that supports existing beliefs\"\nseverity: high\n---\n\n# Confirmation Bias\n\nBody\n";
+        fs::write(dir.path().join("confirmation-bias.md"), ap_content).unwrap();
+
+        let session = "I only looked for evidence that supports my existing beliefs about the architecture";
+        let matched = check_anti_pattern_match(session, dir.path());
+        assert!(matched.contains(&"confirmation-bias".to_string()));
+    }
+
+    #[test]
+    fn test_check_anti_pattern_match_no_trigger_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let ap_content = "---\nid: anchoring-effect\ntype: anti-pattern\ntrigger: \"First number or estimate disproportionately influencing judgment\"\nseverity: med\n---\n\n# Anchoring\n\nBody\n";
+        fs::write(dir.path().join("anchoring-effect.md"), ap_content).unwrap();
+
+        let session = "We discussed the project timeline and decided on a different approach entirely";
+        let matched = check_anti_pattern_match(session, dir.path());
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_check_anti_pattern_match_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ap1 = "---\nid: pattern-a\ntype: anti-pattern\ntrigger: \"selectively gathering evidence supporting beliefs\"\nseverity: high\n---\n\nBody\n";
+        let ap2 = "---\nid: pattern-b\ntype: anti-pattern\ntrigger: \"generating face-saving excuses instead honest assessment\"\nseverity: high\n---\n\nBody\n";
+        fs::write(dir.path().join("a.md"), ap1).unwrap();
+        fs::write(dir.path().join("b.md"), ap2).unwrap();
+
+        let session = "I was selectively gathering evidence supporting my beliefs and also generating face-saving excuses instead honest assessment";
+        let matched = check_anti_pattern_match(session, dir.path());
+        assert!(matched.len() >= 2);
     }
 }

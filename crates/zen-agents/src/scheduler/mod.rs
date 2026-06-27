@@ -281,6 +281,8 @@ pub struct WorkerSummary {
 /// - `reflection-worker` (ReflectionWorker): runs daily 6AM, aggregates reflections into wiki/wisdom/
 /// - `wisdom-synth` (WisdomSynthesizer): runs weekly Sun 2AM (cron: `0 0 2 * * 7`), synthesizes reflections + beliefs into wisdom candidates
 /// - `express` (ExpressWorker): runs weekly Sat 3PM (cron: `0 0 15 * * 6`), LLM expression of insights into publishable review and blog drafts
+/// - `memvid-indexer` (MemvidIndexerWorker): runs nightly 1AM (cron: `0 0 1 * * *`), ingests journal, wiki, wisdom into memvid store
+/// - `evidence-gatherer` (EvidenceGatherer): runs weekly Mon 6AM (cron: `0 0 6 * * 1`), scans beliefs with low evidence count, generates research suggestions
 pub fn create_default_scheduler() -> ZenScheduler {
     let mut scheduler = ZenScheduler::new();
 
@@ -319,6 +321,14 @@ pub fn create_default_scheduler() -> ZenScheduler {
 
     if let Err(e) = scheduler.register(ExpressWorker::new()) {
         warn!("scheduler: failed to register express worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(MemvidIndexerWorker::new()) {
+        warn!("scheduler: failed to register memvid-indexer worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(EvidenceGatherer::new()) {
+        warn!("scheduler: failed to register evidence-gatherer worker: {e}");
     }
 
     scheduler
@@ -383,6 +393,14 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
 
     if let Err(e) = scheduler.register(ExpressWorker::new()) {
         warn!("scheduler: failed to register express worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(MemvidIndexerWorker::new()) {
+        warn!("scheduler: failed to register memvid-indexer worker: {e}");
+    }
+
+    if let Err(e) = scheduler.register(EvidenceGatherer::new()) {
+        warn!("scheduler: failed to register evidence-gatherer worker: {e}");
     }
 
     scheduler
@@ -472,7 +490,7 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 11);
+        assert_eq!(items.len(), 13);
         assert!(items.iter().any(|w| w.id == "journal-worker"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
@@ -484,5 +502,7 @@ mod tests {
         assert!(items.iter().any(|w| w.id == "wisdom-synth"));
         assert!(items.iter().any(|w| w.id == "decision-tracker"));
         assert!(items.iter().any(|w| w.id == "express"));
+        assert!(items.iter().any(|w| w.id == "memvid-indexer"));
+        assert!(items.iter().any(|w| w.id == "evidence-gatherer"));
     }
 }
