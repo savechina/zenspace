@@ -271,6 +271,50 @@ pub fn init_graph_schema(repo: &SqliteRepo) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_self_nodes_layer ON self_nodes(layer);
         CREATE INDEX IF NOT EXISTS idx_self_nodes_humility ON self_nodes(humility_score);
         CREATE INDEX IF NOT EXISTS idx_self_nodes_confidence ON self_nodes(confidence);
+
+        -- Goal nodes for decision tracking (Phase C4)
+        CREATE TABLE IF NOT EXISTS goal_nodes (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            controllability REAL NOT NULL CHECK(controllability >= 0.0 AND controllability <= 1.0),
+            core_pursuit TEXT NOT NULL,
+            deadline TEXT,
+            created_at TEXT NOT NULL,
+            last_updated TEXT NOT NULL,
+            FOREIGN KEY (id) REFERENCES entities(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_goal_nodes_name ON goal_nodes(name);
+        CREATE INDEX IF NOT EXISTS idx_goal_nodes_controllability ON goal_nodes(controllability);
+
+        -- Path nodes for alternative paths (Phase C4)
+        CREATE TABLE IF NOT EXISTS path_nodes (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            serves_goal_id TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            crowdedness REAL NOT NULL DEFAULT 0.5 CHECK(crowdedness >= 0.0 AND crowdedness <= 1.0),
+            alternatives TEXT,
+            created_at TEXT NOT NULL,
+            last_updated TEXT NOT NULL,
+            FOREIGN KEY (id) REFERENCES entities(id),
+            FOREIGN KEY (serves_goal_id) REFERENCES goal_nodes(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_path_nodes_name ON path_nodes(name);
+        CREATE INDEX IF NOT EXISTS idx_path_nodes_goal ON path_nodes(serves_goal_id);
+
+        -- Belief nodes for Bayesian updating (Phase C4)
+        CREATE TABLE IF NOT EXISTS belief_nodes (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            proposition TEXT NOT NULL,
+            prior REAL NOT NULL DEFAULT 0.5 CHECK(prior >= 0.01 AND prior <= 0.99),
+            posterior REAL NOT NULL DEFAULT 0.5 CHECK(posterior >= 0.01 AND posterior <= 0.99),
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            last_updated TEXT NOT NULL,
+            FOREIGN KEY (id) REFERENCES entities(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_belief_nodes_name ON belief_nodes(name);
+        CREATE INDEX IF NOT EXISTS idx_belief_nodes_posterior ON belief_nodes(posterior);
         "#,
     )
 }
