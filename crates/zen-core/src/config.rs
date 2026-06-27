@@ -262,6 +262,7 @@ pub struct CronConfig {
     pub subconscious_interval_minutes: Option<u32>,
     pub dream_start_hour: Option<u32>,
     pub dream_end_hour: Option<u32>,
+    pub wisdom_synthesis_schedule: Option<String>,
 }
 
 /// Plugin system config.
@@ -458,6 +459,7 @@ impl Default for CronConfig {
             subconscious_interval_minutes: Some(5),
             dream_start_hour: Some(2),
             dream_end_hour: Some(4),
+            wisdom_synthesis_schedule: Some("0 0 2 * * 7".into()),
         }
     }
 }
@@ -738,6 +740,10 @@ fn merge_cron(base: CronConfig, ov: CronConfig) -> CronConfig {
             .or(base.subconscious_interval_minutes),
         dream_start_hour: ov.dream_start_hour.or(base.dream_start_hour),
         dream_end_hour: ov.dream_end_hour.or(base.dream_end_hour),
+        wisdom_synthesis_schedule: str_merge(
+            base.wisdom_synthesis_schedule,
+            ov.wisdom_synthesis_schedule,
+        ),
     }
 }
 
@@ -838,6 +844,9 @@ fn apply_cron_env(cron: &mut CronConfig) {
     }
     if let Some(v) = env_u32("ZEN_CRON_SUBCONSCIOUS_INTERVAL_MINUTES") {
         cron.subconscious_interval_minutes = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_CRON_WISDOM_SYNTHESIS") {
+        cron.wisdom_synthesis_schedule = Some(v);
     }
 }
 
@@ -1035,11 +1044,11 @@ impl CronConfig {
      /// Generate a cron expression for the dream (nightly consolidation) worker.
      /// Produces `"0 0 {start}-{end} * * *"` from start and end hours, or `None` if invalid.
     pub fn night_dream_schedule(&self) -> Option<String> {
-        let Some(start) = self.dream_start_hour else { return None };
-        if start < 1 || start >= 24 {
+        let start = self.dream_start_hour?;
+        if !(1..24).contains(&start) {
             return None;
          }
-        let Some(end) = self.dream_end_hour else { return None };
+        let end = self.dream_end_hour?;
         if end <= start || end > 24 {
             return None;
          }
@@ -1057,6 +1066,10 @@ pub fn default_daily_log_schedule() -> &'static str {
 /// Generate the default night-dream schedule expression.
 pub fn default_night_dream_schedule() -> &'static str {
      "0 0 2-4 * * *"
+}
+
+pub fn default_wisdom_synthesis_schedule() -> &'static str {
+     "0 0 2 * * 7"
 }
 
 // ---------------------------------------------------------------------------

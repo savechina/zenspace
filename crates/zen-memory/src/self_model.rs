@@ -467,10 +467,10 @@ pub fn compute_humility_score(decisions_dir: &Path, min_decisions: usize) -> Opt
 // ─── Aggregation helpers ───────────────────────────────────────────────
 
 /// Filter self-model items by layer.
-pub fn items_by_layer<'a>(
-    items: &'a [SelfModelItem],
+pub fn items_by_layer(
+    items: &[SelfModelItem],
     layer: SelfModelLayer,
-) -> Vec<&'a SelfModelItem> {
+) -> Vec<&SelfModelItem> {
     items.iter().filter(|i| i.layer == layer).collect()
 }
 

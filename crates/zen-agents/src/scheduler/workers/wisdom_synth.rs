@@ -29,6 +29,12 @@ impl WisdomSynthesizer {
     }
 }
 
+impl Default for WisdomSynthesizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for WisdomSynthesizer {
     fn id(&self) -> &'static str {
@@ -257,7 +263,7 @@ fn load_all_reflections(dir: &Path) -> String {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         if let Ok(content) = fs::read_to_string(&path) {
@@ -419,6 +425,7 @@ fn promote_anti_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
     Ok(count)
 }
 
+#[allow(dead_code)]
 fn write_suggestions(
     path: &Path,
     models: &[Value],

@@ -34,6 +34,12 @@ impl SubconsciousWorker {
     }
 }
 
+impl Default for SubconsciousWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for SubconsciousWorker {
     fn id(&self) -> &'static str {

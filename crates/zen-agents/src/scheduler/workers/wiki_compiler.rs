@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -51,6 +51,12 @@ pub struct WikiCompilerWorker {
     scheduled: Option<&'static str>,
 }
 
+impl Default for WikiCompilerWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WikiCompilerWorker {
     pub fn new() -> Self {
         Self { scheduled: None }
@@ -61,7 +67,7 @@ impl WikiCompilerWorker {
         self
     }
 
-    fn state_path(global_root: &PathBuf) -> PathBuf {
+    fn state_path(global_root: &Path) -> PathBuf {
         global_root.join("db").join(STATE_FILE)
     }
 

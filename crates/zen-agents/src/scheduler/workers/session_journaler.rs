@@ -79,6 +79,12 @@ impl SessionJournaler {
     }
 }
 
+impl Default for SessionJournaler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for SessionJournaler {
     fn id(&self) -> &'static str {
@@ -463,14 +469,14 @@ Rules:
 
     if let Some(arr) = parsed["decisions"].as_array() {
         for item in arr {
-            if let Some(obj) = item.as_object() {
-                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                    let text = text.trim().to_string();
-                    if !text.is_empty() {
-                        let context = obj.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let ev = obj.get("expected_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        signals.decisions.push(format!("{text}|||{context}|||{ev}"));
-                    }
+            if let Some(obj) = item.as_object()
+                && let Some(text) = obj.get("text").and_then(|v| v.as_str())
+            {
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    let context = obj.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let ev = obj.get("expected_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    signals.decisions.push(format!("{text}|||{context}|||{ev}"));
                 }
             }
         }
@@ -478,14 +484,14 @@ Rules:
 
     if let Some(arr) = parsed["corrections"].as_array() {
         for item in arr {
-            if let Some(obj) = item.as_object() {
-                if let Some(error) = obj.get("error").and_then(|v| v.as_str()) {
-                    let error = error.trim().to_string();
-                    if !error.is_empty() {
-                        let correct = obj.get("correct_answer").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let cost = obj.get("cost").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        signals.corrections.push(format!("{error}|||{correct}|||{cost}"));
-                    }
+            if let Some(obj) = item.as_object()
+                && let Some(error) = obj.get("error").and_then(|v| v.as_str())
+            {
+                let error = error.trim().to_string();
+                if !error.is_empty() {
+                    let correct = obj.get("correct_answer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let cost = obj.get("cost").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    signals.corrections.push(format!("{error}|||{correct}|||{cost}"));
                 }
             }
         }
@@ -493,14 +499,14 @@ Rules:
 
     if let Some(arr) = parsed["feedback"].as_array() {
         for item in arr {
-            if let Some(obj) = item.as_object() {
-                if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
-                    let content = content.trim().to_string();
-                    if !content.is_empty() {
-                        let target = obj.get("target").and_then(|v| v.as_str()).unwrap_or("session").to_string();
-                        let sentiment = obj.get("sentiment").and_then(|v| v.as_str()).unwrap_or("neutral").to_string();
-                        signals.feedback.push(format!("{target}|||{content}|||{sentiment}"));
-                    }
+            if let Some(obj) = item.as_object()
+                && let Some(content) = obj.get("content").and_then(|v| v.as_str())
+            {
+                let content = content.trim().to_string();
+                if !content.is_empty() {
+                    let target = obj.get("target").and_then(|v| v.as_str()).unwrap_or("session").to_string();
+                    let sentiment = obj.get("sentiment").and_then(|v| v.as_str()).unwrap_or("neutral").to_string();
+                    signals.feedback.push(format!("{target}|||{content}|||{sentiment}"));
                 }
             }
         }
@@ -508,13 +514,13 @@ Rules:
 
     if let Some(arr) = parsed["beliefs"].as_array() {
         for item in arr {
-            if let Some(obj) = item.as_object() {
-                if let Some(statement) = obj.get("statement").and_then(|v| v.as_str()) {
-                    let statement = statement.trim().to_string();
-                    if !statement.is_empty() {
-                        let confidence = obj.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5);
-                        signals.beliefs.push(format!("{statement}|||{confidence}"));
-                    }
+            if let Some(obj) = item.as_object()
+                && let Some(statement) = obj.get("statement").and_then(|v| v.as_str())
+            {
+                let statement = statement.trim().to_string();
+                if !statement.is_empty() {
+                    let confidence = obj.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                    signals.beliefs.push(format!("{statement}|||{confidence}"));
                 }
             }
         }
@@ -671,7 +677,7 @@ fn check_anti_pattern_match(session_text: &str, anti_patterns_dir: &std::path::P
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         let content = match fs::read_to_string(&path) {
@@ -760,7 +766,7 @@ fn scan_commitments(dir: &std::path::Path) -> Vec<CommitmentSummary> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         let content = match fs::read_to_string(&path) {

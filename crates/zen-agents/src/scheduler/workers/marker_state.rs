@@ -67,6 +67,7 @@ impl JournalEntryState {
 
         let lock_file = fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;
@@ -172,51 +173,50 @@ impl JournalEntryState {
         let mut state = Self::load(md_path);
         let mut migrated = false;
 
-        if state.journaled_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "journaled_at:") {
-                state.journaled_at = Some(val);
-                migrated = true;
-            }
+        if state.journaled_at.is_none()
+            && let Some(val) = Self::extract_frontmatter_value(md_path, "journaled_at:")
+        {
+            state.journaled_at = Some(val);
+            migrated = true;
         }
-        if state.memory_updated_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "memory_updated_at:") {
-                state.memory_updated_at = Some(val);
-                migrated = true;
-            }
+        if state.memory_updated_at.is_none()
+            && let Some(val) = Self::extract_frontmatter_value(md_path, "memory_updated_at:")
+        {
+            state.memory_updated_at = Some(val);
+            migrated = true;
         }
-        if state.extracted_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "extracted_at:") {
-                state.extracted_at = Some(val);
-                if let Some(src) = Self::extract_frontmatter_value(md_path, "extraction_source:") {
-                    state.extraction_source = Some(src);
-                }
-                migrated = true;
+        if state.extracted_at.is_none()
+            && let Some(val) = Self::extract_frontmatter_value(md_path, "extracted_at:")
+        {
+            state.extracted_at = Some(val);
+            if let Some(src) = Self::extract_frontmatter_value(md_path, "extraction_source:") {
+                state.extraction_source = Some(src);
             }
+            migrated = true;
         }
-        if state.commitment_tracked_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "commitment_tracked_at:") {
-                state.commitment_tracked_at = Some(val);
-                migrated = true;
-            }
+        if state.commitment_tracked_at.is_none()
+            && let Some(val) = Self::extract_frontmatter_value(md_path, "commitment_tracked_at:")
+        {
+            state.commitment_tracked_at = Some(val);
+            migrated = true;
         }
-        if state.reflection_extracted_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "reflection_extracted_at:")
-            {
-                state.reflection_extracted_at = Some(val);
-                migrated = true;
-            }
+        if state.reflection_extracted_at.is_none()
+            && let Some(val) = Self::extract_frontmatter_value(md_path, "reflection_extracted_at:")
+        {
+            state.reflection_extracted_at = Some(val);
+            migrated = true;
         }
-        if state.wisdom_synthesized_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "wisdom_synthesized_at:") {
-                state.wisdom_synthesized_at = Some(val);
-                migrated = true;
-            }
+        if state.wisdom_synthesized_at.is_none()
+            && let Some(val) = Self::extract_frontmatter_value(md_path, "wisdom_synthesized_at:")
+        {
+            state.wisdom_synthesized_at = Some(val);
+            migrated = true;
         }
-        if state.decision_tracked_at.is_none() {
-            if let Some(val) = Self::extract_frontmatter_value(md_path, "decision_tracked_at:") {
-                state.decision_tracked_at = Some(val);
-                migrated = true;
-            }
+        if state.decision_tracked_at.is_none()
+            && let Some(val) = Self::extract_frontmatter_value(md_path, "decision_tracked_at:")
+        {
+            state.decision_tracked_at = Some(val);
+            migrated = true;
         }
 
         if migrated {
@@ -257,6 +257,7 @@ impl SessionState {
 
         let lock_file = fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;

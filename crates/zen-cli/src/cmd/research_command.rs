@@ -52,7 +52,7 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
             let wiki_dir = paths.wiki();
 
             let config = load_config()?;
-            let router = DefaultRouter::from_agentic(&config);
+            let router = DefaultRouter::from_agentic(config);
 
             let existing_results = search_existing_content(topic, &wiki_dir, router.clone());
 

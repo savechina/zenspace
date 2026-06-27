@@ -19,8 +19,10 @@ use tracing::warn;
 /// A Bayesian belief tracked through the evolution engine.
 ///
 /// Uses simplified binary evidence model (post-critique revision):
+///
 /// - `supports=true` → +1 evidence for the proposition
 /// - `supports=false` → -1 evidence against
+///
 /// Weighted by source credibility (0.0-1.0).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Belief {
@@ -123,6 +125,7 @@ impl ResearchMethod {
     }
 
     /// Parse from string representation.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "social_engineering" => Some(Self::SocialEngineering),

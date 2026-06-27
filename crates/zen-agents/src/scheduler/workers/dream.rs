@@ -22,6 +22,12 @@ impl DreamWorker {
     }
 }
 
+impl Default for DreamWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for DreamWorker {
     fn id(&self) -> &'static str {

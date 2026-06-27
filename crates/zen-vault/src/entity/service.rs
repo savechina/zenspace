@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use zen_repo::sqlite_repo::{SqliteRepo, init_graph_schema};
 
@@ -621,6 +621,7 @@ impl EntityService {
         self.upsert_entity(db_path, &entity)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_belief_node(
         &self,
         db_path: &Path,
@@ -660,6 +661,7 @@ impl EntityService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_path_node(
         &self,
         db_path: &Path,
@@ -687,23 +689,109 @@ impl EntityService {
         self.upsert_entity(db_path, &entity)?;
 
         // Also write to dedicated path_nodes table
+        let goal_entities = self.load_all_entities(db_path)?;
+        let goal_id = goal_entities
+            .iter()
+            .find(|e| e.name == normalize_entity_name(serves_goal) && e.entity_type == EntityType::Goal)
+            .map(|e| e.id.clone());
+
         let repo = SqliteRepo::open(db_path)?;
         init_graph_schema(&repo)?;
         let now = chrono::Utc::now().to_rfc3339();
         repo.conn().execute(
             "INSERT OR REPLACE INTO path_nodes (id, name, serves_goal_id, is_default, crowdedness, alternatives, created_at, last_updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![id, name, serves_goal, is_default as i32, crowdedness, alternatives, now],
+            params![id, name, goal_id, is_default as i32, crowdedness, alternatives, now],
         )?;
 
         // Create ServesGoal relationship from this path to the goal
-        let goal_entities = self.load_all_entities(db_path)?;
         if let Some(goal) = goal_entities.iter().find(|e| e.name == normalize_entity_name(serves_goal)) {
             let rel = Relationship::new(id, goal.id.clone(), RelationType::ServesGoal, "path-model");
             self.insert_relationship(db_path, &rel)?;
         }
 
         Ok(())
+    }
+
+    /// Loads a goal node from the goal_nodes table.
+    #[allow(clippy::type_complexity)]
+    pub fn load_goal_node(
+        &self,
+        db_path: &Path,
+        id: &str,
+    ) -> Result<Option<(String, f64, String, Option<String>)>> {
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+
+        let mut stmt = repo.conn().prepare(
+            "SELECT name, controllability, core_pursuit, deadline FROM goal_nodes WHERE id = ?1"
+        )?;
+
+        let result = stmt.query_row(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        }).optional()?;
+
+        Ok(result)
+    }
+
+    /// Loads a path node from the path_nodes table.
+    #[allow(clippy::type_complexity)]
+    pub fn load_path_node(
+        &self,
+        db_path: &Path,
+        id: &str,
+    ) -> Result<Option<(String, String, bool, f64, String)>> {
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+
+        let mut stmt = repo.conn().prepare(
+            "SELECT name, serves_goal_id, is_default, crowdedness, alternatives FROM path_nodes WHERE id = ?1"
+        )?;
+
+        let result = stmt.query_row(params![id], |row| {
+            let is_default_i32: i32 = row.get(2)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                is_default_i32 != 0,
+                row.get::<_, f64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        }).optional()?;
+
+        Ok(result)
+    }
+
+    /// Loads a belief node from the belief_nodes table.
+    #[allow(clippy::type_complexity)]
+    pub fn load_belief_node(
+        &self,
+        db_path: &Path,
+        id: &str,
+    ) -> Result<Option<(String, String, f64, f64, usize)>> {
+        let repo = SqliteRepo::open(db_path)?;
+        init_graph_schema(&repo)?;
+
+        let mut stmt = repo.conn().prepare(
+            "SELECT name, proposition, prior, posterior, evidence_count FROM belief_nodes WHERE id = ?1"
+        )?;
+
+        let result = stmt.query_row(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, usize>(4)?,
+            ))
+        }).optional()?;
+
+        Ok(result)
     }
 }
 
@@ -1206,6 +1294,7 @@ mod tests {
                 "b-1",
                 "Rust is fast",
                 "Rust has zero-cost abstractions",
+                0.8,
                 0.95,
                 12,
             )

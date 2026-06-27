@@ -126,7 +126,7 @@ pub fn check_decision_promotion(
     let anti_patterns_passed = !anti_pattern_has_crit;
     let cost_analysis_present = has_cost;
     let ev_calculated = has_ev;
-    let goal_path_resolved = !is_path_not_goal || (is_path_not_goal && has_goal_link);
+    let goal_path_resolved = !is_path_not_goal || has_goal_link;
 
     let can_promote =
         anti_patterns_passed && cost_analysis_present && ev_calculated && goal_path_resolved;

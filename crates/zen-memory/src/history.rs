@@ -32,7 +32,7 @@ impl HistoryStore {
         let file_path = paths.global_root().join(HISTORY_FILE);
         Ok(Self {
             file_path,
-            max_bytes: max_bytes.unwrap_or(HISTORY_DEFAULT_MAX_BYTES) as u64,
+            max_bytes: max_bytes.unwrap_or(HISTORY_DEFAULT_MAX_BYTES),
         })
     }
 
@@ -40,7 +40,7 @@ impl HistoryStore {
     pub fn with_path(path: PathBuf, max_bytes: Option<u64>) -> Self {
         Self {
             file_path: path,
-            max_bytes: max_bytes.unwrap_or(HISTORY_DEFAULT_MAX_BYTES) as u64,
+            max_bytes: max_bytes.unwrap_or(HISTORY_DEFAULT_MAX_BYTES),
         }
     }
 
@@ -52,10 +52,8 @@ impl HistoryStore {
         }
 
         // Dedup: skip if same as last entry
-        if let Ok(last) = self.last_entry() {
-            if last.text == text {
-                return Ok(());
-            }
+        if self.last_entry().is_ok_and(|last| last.text == text) {
+            return Ok(());
         }
 
         let entry = HistoryEntry {
@@ -128,10 +126,10 @@ impl HistoryStore {
 
         for line in reader.lines() {
             let line = line?;
-            if !line.trim().is_empty() {
-                if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
-                    last = Some(entry);
-                }
+            if !line.trim().is_empty()
+                && let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line)
+            {
+                last = Some(entry);
             }
         }
 
@@ -156,29 +154,7 @@ impl HistoryStore {
             return Ok(());
         }
 
-        // Drop oldest entries until below target
-        let mut drop_count = 0;
-        let mut file = tempfile::tempfile()?;
-        for (text, session_id) in &entries {
-            let entry = HistoryEntry {
-                text: text.clone(),
-                ts: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                session_id: session_id.clone(),
-            };
-            let line = serde_json::to_string(&entry)?;
-            writeln!(file, "{}", line)?;
-
-            if file.metadata()?.len() >= target && drop_count == 0 {
-                // Once we've written enough to reach target, stop counting drops
-                // Everything before the current entry was an "old" entry we kept
-            }
-            drop_count += 1;
-        }
-
-        // Simpler approach: keep last N entries that fit in target
+        // Keep last N entries that fit in target
         // Walk from end, building up until we hit target, then discard everything before
         let mut kept: Vec<&(String, Option<String>)> = Vec::new();
         let mut size: u64 = 0;

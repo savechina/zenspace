@@ -174,7 +174,7 @@ impl VirtueLog {
             .iter()
             .filter(|l| l.virtue == virtue)
             .collect();
-        sorted.sort_by(|a, b| b.date.cmp(&a.date));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.date));
 
         let mut streak = 0u32;
         for log in sorted {
@@ -259,7 +259,7 @@ impl VirtueLog {
                 }
             }
         }
-        logs.sort_by(|a, b| a.date.cmp(&b.date));
+        logs.sort_by_key(|a| a.date);
         Ok(logs)
     }
 

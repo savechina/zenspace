@@ -52,6 +52,12 @@ impl EntityExtractorWorker {
     }
 }
 
+impl Default for EntityExtractorWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for EntityExtractorWorker {
     fn id(&self) -> &'static str {
@@ -348,10 +354,10 @@ fn extract_facts_from_journal(content: &str) -> Vec<String> {
             if trimmed.starts_with("## ") {
                 break;
             }
-            if let Some(fact) = trimmed.strip_prefix("- ") {
-                if !fact.is_empty() && fact != "_(no durable facts extracted)_" {
-                    facts.push(fact.to_string());
-                }
+            if let Some(fact) = trimmed.strip_prefix("- ")
+                && !fact.is_empty() && fact != "_(no durable facts extracted)_"
+            {
+                facts.push(fact.to_string());
             }
         }
     }

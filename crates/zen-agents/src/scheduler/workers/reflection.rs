@@ -28,6 +28,12 @@ impl ReflectionWorker {
     }
 }
 
+impl Default for ReflectionWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for ReflectionWorker {
     fn id(&self) -> &'static str {
@@ -66,7 +72,7 @@ impl ZenWorker for ReflectionWorker {
             let entry = entry?;
             let path = entry.path();
 
-            if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
 
@@ -203,12 +209,12 @@ fn extract_reflections_from_journal(path: &Path) -> Result<Vec<String>> {
             continue;
         }
 
-        if in_reflections {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                let text = item.trim().to_string();
-                if !text.is_empty() && !text.starts_with("_(no ") {
-                    reflections.push(text);
-                }
+        if in_reflections
+            && let Some(item) = trimmed.strip_prefix("- ")
+        {
+            let text = item.trim().to_string();
+            if !text.is_empty() && !text.starts_with("_(no ") {
+                reflections.push(text);
             }
         }
     }
@@ -313,10 +319,10 @@ Rules:
 
     let count = write_anti_patterns(reflections_dir, &anti_patterns)?;
 
-    if count > 0 {
-        if let Err(e) = update_stop_doing_ledger(&anti_patterns) {
-            warn!(error = %e, "failed to update MEMORY.md Stop-Doing Ledger (non-fatal)");
-        }
+    if count > 0
+        && let Err(e) = update_stop_doing_ledger(&anti_patterns)
+    {
+        warn!(error = %e, "failed to update MEMORY.md Stop-Doing Ledger (non-fatal)");
     }
 
     Ok(count)
@@ -385,7 +391,7 @@ fn load_all_reflections_text(dir: &Path) -> String {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         if let Ok(content) = fs::read_to_string(&path) {

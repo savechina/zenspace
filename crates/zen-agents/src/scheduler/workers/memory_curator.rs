@@ -23,6 +23,12 @@ impl MemoryCurator {
     }
 }
 
+impl Default for MemoryCurator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for MemoryCurator {
     fn id(&self) -> &'static str {
@@ -61,7 +67,7 @@ impl ZenWorker for MemoryCurator {
             let entry = entry?;
             let path = entry.path();
 
-            if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
 
@@ -155,17 +161,17 @@ fn extract_signals_from_journal(path: &std::path::Path) -> Result<ExtractedSigna
             continue;
         }
 
-        if let Some(section) = current_section {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                let item = item.trim().to_string();
-                let is_placeholder = item.starts_with("_(no ");
-                if !item.is_empty() && !is_placeholder {
-                    match section {
-                        "facts" => signals.facts.push(item),
-                        "reflections" => signals.reflections.push(item),
-                        "commitments" => signals.commitments.push(item),
-                        _ => {}
-                    }
+        if let Some(section) = current_section
+            && let Some(item) = trimmed.strip_prefix("- ")
+        {
+            let item = item.trim().to_string();
+            let is_placeholder = item.starts_with("_(no ");
+            if !item.is_empty() && !is_placeholder {
+                match section {
+                    "facts" => signals.facts.push(item),
+                    "reflections" => signals.reflections.push(item),
+                    "commitments" => signals.commitments.push(item),
+                    _ => {}
                 }
             }
         }

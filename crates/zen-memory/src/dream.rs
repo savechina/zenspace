@@ -547,7 +547,7 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+        if !(path.is_file() && path.extension().is_some_and(|ext| ext == "md")) {
             continue;
         }
 
@@ -566,16 +566,14 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
                     continue;
                 }
 
-                if !aliases.is_empty() {
-                    if let Ok(repo) = zen_repo::sqlite_repo::SqliteRepo::open(&graph_db) {
-                        for alias in &aliases {
-                            let sql = format!(
-                                "INSERT OR IGNORE INTO entity_aliases (alias, canonical_entity_id) VALUES ('{}', '{}')",
-                                alias.replace('\'', "''"),
-                                entity.id.replace('\'', "''")
-                            );
-                            let _ = repo.execute_batch(&sql);
-                        }
+                if let Ok(repo) = zen_repo::sqlite_repo::SqliteRepo::open(&graph_db) {
+                    for alias in &aliases {
+                        let sql = format!(
+                            "INSERT OR IGNORE INTO entity_aliases (alias, canonical_entity_id) VALUES ('{}', '{}')",
+                            alias.replace('\'', "''"),
+                            entity.id.replace('\'', "''")
+                        );
+                        let _ = repo.execute_batch(&sql);
                     }
                 }
 
@@ -594,7 +592,7 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
 
 fn parse_entity_file(path: &std::path::Path) -> Result<(String, EntityType, Vec<String>), DreamError> {
     let content = fs::read_to_string(path)
-        .map_err(|e| DreamError::Io(e))?;
+        .map_err(DreamError::Io)?;
 
     let mut in_frontmatter = false;
     let mut name: Option<String> = None;

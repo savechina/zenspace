@@ -35,6 +35,7 @@ pub struct MemoryEntry {
     since = "0.0.1",
     note = "Will be refactored into MemoryStoreTrait for multi-strategy extensibility. Use ZenMemvidStore for built-in memvid path."
 )]
+#[allow(deprecated)]
 pub struct MemoryStore {
     entries: Arc<Mutex<Vec<MemoryEntry>>>,
     max_entries: usize,

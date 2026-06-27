@@ -19,25 +19,13 @@ pub enum FeedbackError {
     MissingField(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct FeedbackProperties {
     pub timely: bool,
     pub reasonable: bool,
     pub actionable: bool,
     pub constructive: bool,
     pub interactive: bool,
-}
-
-impl Default for FeedbackProperties {
-    fn default() -> Self {
-        Self {
-            timely: false,
-            reasonable: false,
-            actionable: false,
-            constructive: false,
-            interactive: false,
-        }
-    }
 }
 
 impl FeedbackProperties {

@@ -210,7 +210,7 @@ impl WikiCompiler {
         md.push_str("# Knowledge Index\n\n## Entities\n\n");
 
         let mut sorted: Vec<&EntityData> = entities.iter().collect();
-        sorted.sort_by(|a, b| a.entity.name.to_lowercase().cmp(&b.entity.name.to_lowercase()));
+        sorted.sort_by_key(|data| data.entity.name.to_lowercase());
 
         for data in &sorted {
             let slug = slugify(&data.entity.name);

@@ -272,8 +272,8 @@ impl SessionEntity {
             self.id,
         );
 
-        if let Ok(index) = SessionIndex::open(&paths.db()) {
-            if let Err(e) = index.upsert(
+        if let Ok(index) = SessionIndex::open(&paths.db())
+            && let Err(e) = index.upsert(
                 &self.id,
                 &relative_path,
                 &self.agent_name,
@@ -281,9 +281,9 @@ impl SessionEntity {
                 &self.created_at.to_rfc3339(),
                 &self.updated_at.to_rfc3339(),
                 &self.workspace,
-            ) {
-                debug!("failed to upsert session index: {}", e);
-            }
+            )
+        {
+            debug!("failed to upsert session index: {}", e);
         }
 
         debug!("saved session {} to {}", self.id, file_path.display());
@@ -294,12 +294,12 @@ impl SessionEntity {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
 
         // Fast path: SessionIndex → .jsonl
-        if let Ok(index) = SessionIndex::open(&paths.db()) {
-            if let Ok(Some(relative_path)) = index.find(id) {
-                let file_path = paths.sessions().join(&relative_path);
-                if file_path.exists() {
-                    return SessionEvent::read_meta(&file_path);
-                }
+        if let Ok(index) = SessionIndex::open(&paths.db())
+            && let Ok(Some(relative_path)) = index.find(id)
+        {
+            let file_path = paths.sessions().join(&relative_path);
+            if file_path.exists() {
+                return SessionEvent::read_meta(&file_path);
             }
         }
 
@@ -384,28 +384,26 @@ impl SessionEntity {
         let mut sessions: Vec<SessionEntity> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        if let Ok(index) = SessionIndex::open(&paths.db()) {
-            if let Ok(indexed) = index.list_all() {
-                for row in indexed {
-                    let file_path = sessions_root.join(&row.file_path);
-                    if file_path.exists() {
-                        let session = match load_session_from_file(&file_path) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                debug!("skipping invalid session {}: {}", row.id, e);
-                                continue;
-                            }
-                        };
-                        seen_ids.insert(session.id.clone());
-                        sessions.push(session);
-                    } else {
-                        if let Some(repaired) = Self::repair_indexed_session(
-                            &sessions_root, &row.id, &paths.db(),
-                        ) {
-                            seen_ids.insert(repaired.id.clone());
-                            sessions.push(repaired);
+        if let Ok(index) = SessionIndex::open(&paths.db())
+            && let Ok(indexed) = index.list_all()
+        {
+            for row in indexed {
+                let file_path = sessions_root.join(&row.file_path);
+                if file_path.exists() {
+                    let session = match load_session_from_file(&file_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            debug!("skipping invalid session {}: {}", row.id, e);
+                            continue;
                         }
-                    }
+                    };
+                    seen_ids.insert(session.id.clone());
+                    sessions.push(session);
+                } else if let Some(repaired) = Self::repair_indexed_session(
+                    &sessions_root, &row.id, &paths.db(),
+                ) {
+                    seen_ids.insert(repaired.id.clone());
+                    sessions.push(repaired);
                 }
             }
         }

@@ -1406,49 +1406,48 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn save_session_state(&mut self) {
-        if let Some(ref id) = self.session_id {
-            if let Ok(mut entity) = zen_core::types::SessionEntity::load(id) {
-                entity.updated_at = chrono::Utc::now();
-                entity.status = zen_core::types::SessionStatus::Completed;
-                let _ = entity.save();
+        if let Some(ref id) = self.session_id
+            && let Ok(mut entity) = zen_core::types::SessionEntity::load(id)
+        {
+            entity.updated_at = chrono::Utc::now();
+            entity.status = zen_core::types::SessionStatus::Completed;
+            let _ = entity.save();
 
-                // Write daily log entry with conversation content
-                if self.chat_history.is_empty() {
-                    return;
-                }
-                let turn_count = self.chat_history.len();
+            // Write daily log entry with conversation content
+            if self.chat_history.is_empty() {
+                return;
+            }
+            let turn_count = self.chat_history.len();
 
-                let mut summary = if entity.title.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
-                    format!(
-                        "Agent session: {} agent ({} turns) — \"{}\"\n",
-                        entity.agent_name, turn_count,
-                        entity.title.as_ref().unwrap()
-                    )
-                } else {
-                    format!(
-                        "Agent session: {} agent ({} turns)\n",
-                        entity.agent_name, turn_count
-                    )
-                };
+            let mut summary = if entity.title.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+                format!(
+                    "Agent session: {} agent ({} turns) — \"{}\"\n",
+                    entity.agent_name, turn_count,
+                    entity.title.as_ref().unwrap()
+                )
+            } else {
+                format!(
+                    "Agent session: {} agent ({} turns)\n",
+                    entity.agent_name, turn_count
+                )
+            };
 
-                let start = turn_count.saturating_sub(10);
-                for (role, content) in &self.chat_history[start..] {
-                    let preview: String = content
-                        .chars()
-                        .take(200)
-                        .collect();
-                    let ellipsis = if content.len() > 200 { "…" } else { "" };
-                    summary.push_str(&format!("  {role}: {preview}{ellipsis}\n"));
-                }
+            let start = turn_count.saturating_sub(10);
+            for (role, content) in &self.chat_history[start..] {
+                let preview: String = content
+                    .chars()
+                    .take(200)
+                    .collect();
+                let ellipsis = if content.len() > 200 { "…" } else { "" };
+                summary.push_str(&format!("  {role}: {preview}{ellipsis}\n"));
+            }
 
-                tracing::debug!(session_id = %id, turns = turn_count, "writing daily log entry for session end");
-                if let Ok(paths) = ZenPaths::detect() {
-                    let _ = zen_memory::journal::Journal::create_entry(&paths, &summary);
-                }
+            tracing::debug!(session_id = %id, turns = turn_count, "writing daily log entry for session end");
+            if let Ok(paths) = ZenPaths::detect() {
+                let _ = zen_memory::journal::Journal::create_entry(&paths, &summary);
             }
         }
     }
-
     fn execute_new_session(&mut self) {
         use zen_memory::session::SessionManager;
         let manager = SessionManager::new();

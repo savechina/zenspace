@@ -29,7 +29,10 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 pub use workers::*;
-use zen_core::config::{CronConfig, default_daily_log_schedule, default_night_dream_schedule};
+use zen_core::config::{
+    CronConfig, default_daily_log_schedule, default_night_dream_schedule,
+    default_wisdom_synthesis_schedule,
+};
 
 // ─── Core types ────────────────────────────────────────────────────────
 
@@ -383,7 +386,13 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
         warn!("scheduler: failed to register reflection-worker worker: {e}");
     }
 
-    if let Err(e) = scheduler.register(WisdomSynthesizer::new()) {
+    let wisdom_schedule = config
+        .wisdom_synthesis_schedule
+        .clone()
+        .unwrap_or_else(|| default_wisdom_synthesis_schedule().to_string());
+    if let Err(e) =
+        scheduler.register(WisdomSynthesizer::new().with_schedule(&wisdom_schedule))
+    {
         warn!("scheduler: failed to register wisdom-synth worker: {e}");
     }
 

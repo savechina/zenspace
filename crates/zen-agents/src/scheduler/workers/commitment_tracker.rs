@@ -51,6 +51,12 @@ impl CommitmentTracker {
     }
 }
 
+impl Default for CommitmentTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for CommitmentTracker {
     fn id(&self) -> &'static str {
@@ -98,7 +104,7 @@ impl ZenWorker for CommitmentTracker {
             let entry = entry?;
             let path = entry.path();
 
-            if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
 
@@ -263,22 +269,22 @@ fn extract_commitments_from_journal(path: &Path) -> Result<Vec<CommitmentItem>> 
             continue;
         }
 
-        if in_commitments {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                let text = item.trim().to_string();
-                if !text.is_empty() && !text.starts_with("_(no ") {
-                    let created_at = date_str
-                        .as_ref()
-                        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
-                        .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
-                        .unwrap_or_else(Utc::now);
-                    items.push(CommitmentItem {
-                        text,
-                        session_id: session_id.clone(),
-                        created_at,
-                    });
-                }
+        if in_commitments
+            && let Some(item) = trimmed.strip_prefix("- ")
+        {
+            let text = item.trim().to_string();
+            if !text.is_empty() && !text.starts_with("_(no ") {
+                let created_at = date_str
+                    .as_ref()
+                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+                    .unwrap_or_else(Utc::now);
+                items.push(CommitmentItem {
+                    text,
+                    session_id: session_id.clone(),
+                    created_at,
+                });
             }
         }
     }
@@ -323,7 +329,7 @@ fn count_similar_commitments(dir: &Path, base_slug: &str) -> usize {
     let mut count = 0usize;
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+        if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -370,7 +376,7 @@ fn compute_anti_talk_indicator(
         {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
             let content = match fs::read_to_string(&path) {

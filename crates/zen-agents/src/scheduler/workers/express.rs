@@ -29,6 +29,12 @@ impl ExpressWorker {
     }
 }
 
+impl Default for ExpressWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ZenWorker for ExpressWorker {
     fn id(&self) -> &'static str {
@@ -236,7 +242,7 @@ fn load_all_reflections(dir: &Path) -> String {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         if let Ok(content) = fs::read_to_string(&path) {
@@ -280,7 +286,7 @@ fn load_commitments_text(dir: &Path) -> String {
     let mut result = String::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         if let Ok(content) = fs::read_to_string(&path) {
@@ -313,7 +319,7 @@ fn load_suggestions_text(dir: &Path) -> String {
     let mut combined = String::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "md") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         if let Ok(content) = fs::read_to_string(&path) {

@@ -290,7 +290,7 @@ pub fn init_graph_schema(repo: &SqliteRepo) -> Result<()> {
         CREATE TABLE IF NOT EXISTS path_nodes (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            serves_goal_id TEXT NOT NULL,
+            serves_goal_id TEXT,
             is_default INTEGER NOT NULL DEFAULT 0,
             crowdedness REAL NOT NULL DEFAULT 0.5 CHECK(crowdedness >= 0.0 AND crowdedness <= 1.0),
             alternatives TEXT,

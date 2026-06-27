@@ -26,10 +26,7 @@ pub fn try_local_embed(text: &str) -> Option<Vec<f32>> {
 
     let input = vec![text.to_string()];
     let mut guard = model.lock().unwrap();
-    let embed_inner = match guard.as_mut() {
-        Some(e) => e,
-        None => return None,
-     };
+    let embed_inner = guard.as_mut()?;
 
     let vecs = match embed_inner.embed(input, None) {
         Ok(v) => v,

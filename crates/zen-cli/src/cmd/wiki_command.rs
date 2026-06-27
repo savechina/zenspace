@@ -45,10 +45,11 @@ fn list_wiki_pages(wiki_dir: &std::path::Path) -> Result<(), ZenError> {
             ZenError::Message(format!("failed to read wiki entry: {e}"))
         })?;
         let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                pages.push(name.to_string());
-            }
+        if path.is_file()
+            && path.extension().is_some_and(|ext| ext == "md")
+            && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+        {
+            pages.push(name.to_string());
         }
     }
 

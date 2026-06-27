@@ -73,7 +73,7 @@ pub fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
             let base_dir = paths.vault();
             let config =
                 load_config().map_err(|e| ZenError::Message(format!("Config error: {}", e)))?;
-            let router = DefaultRouter::from_agentic(&config);
+            let router = DefaultRouter::from_agentic(config);
             let service = SearchService::new(router);
 
             let results = service

@@ -252,10 +252,10 @@ fn tail_logs(lines: usize, level_filter: Option<&str>) -> Result<(), ZenError> {
                 continue;
             }
             Ok(_) => {
-                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                    if should_show_entry(&entry, level_filter) {
-                        print_log_entry(&entry);
-                    }
+                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim())
+                    && should_show_entry(&entry, level_filter)
+                {
+                    print_log_entry(&entry);
                 }
             }
             Err(_) => {
@@ -408,7 +408,7 @@ fn list_log_files() -> Result<(), ZenError> {
     }
 
     let mut files: Vec<_> = std::fs::read_dir(&log_dir)
-        .map_err(|e| ZenError::Io(e))?
+        .map_err(ZenError::Io)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
         .collect();
@@ -431,7 +431,7 @@ fn list_log_files() -> Result<(), ZenError> {
             .unwrap_or_else(|| "?".to_string());
         let modified = metadata
             .and_then(|m| m.modified().ok())
-            .map(|t| format_relative_time(t))
+            .map(format_relative_time)
             .unwrap_or_else(|| "unknown".to_string());
 
         println!(

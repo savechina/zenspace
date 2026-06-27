@@ -70,7 +70,7 @@ impl ZenMemvidStore {
     pub fn persist_structured_turn(
         &self,
         session_id: &str,
-        role: &str,
+        _role: &str,
         content: &str,
     ) -> Result<(u64, Option<memvid_core::MemoryCardId>)> {
         let opts = memvid_core::PutOptions::builder()

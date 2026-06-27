@@ -127,7 +127,7 @@ fn load_corrections(
     }
 
     let mut sorted = corrections;
-    sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     let top: Vec<_> = sorted.into_iter().take(3).collect();
 
     let mut out = String::from("⚠️ Past errors to avoid:\n");
@@ -169,7 +169,7 @@ fn load_feedback(
     }
 
     let mut sorted = feedbacks;
-    sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     let top: Vec<_> = sorted.into_iter().take(3).collect();
 
     let mut out = String::from("📋 Recent feedback:\n");
@@ -379,7 +379,7 @@ fn load_decisions(
         .into_iter()
         .filter(|d| d.closed_at.is_none())
         .collect();
-    open.sort_by(|a, b| b.decided_at.cmp(&a.decided_at));
+    open.sort_by_key(|b| std::cmp::Reverse(b.decided_at));
     let top: Vec<_> = open.into_iter().take(3).collect();
 
     if top.is_empty() {

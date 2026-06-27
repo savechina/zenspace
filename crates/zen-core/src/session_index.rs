@@ -43,6 +43,7 @@ impl SessionIndex {
         Ok(Self { conn })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert(
         &self,
         id: &str,
