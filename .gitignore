@@ -39,3 +39,4 @@ docs/specs/
 # Development directories (local dev tools)
 .context/
 .sisyphus/
+.fastembed_cache

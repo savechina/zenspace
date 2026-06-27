@@ -193,6 +193,10 @@ Respond with ONLY a JSON object:
             .cloned()
             .unwrap_or_default();
 
+        let vault = paths.vault();
+        let models_promoted = promote_mental_models(&vault, &models)?;
+        let anti_patterns_promoted = promote_anti_patterns(&vault, &anti_patterns)?;
+
         let mut total_updates_applied = 0usize;
 
         for update in &belief_updates {
@@ -226,20 +230,9 @@ Respond with ONLY a JSON object:
             }
         }
 
-        let date_str = Utc::now().format("%Y-%m-%d").to_string();
-        let suggestions_dir = paths.vault().join("wiki/wisdom/suggestions");
-        fs::create_dir_all(&suggestions_dir).with_context(|| {
-            format!(
-                "failed to create suggestions dir: {}",
-                suggestions_dir.display()
-            )
-        })?;
-        let suggestions_path = suggestions_dir.join(format!("{date_str}.md"));
-        write_suggestions(&suggestions_path, &models, &anti_patterns, &belief_updates)?;
-
         info!(
-            models = models.len(),
-            anti_patterns = anti_patterns.len(),
+            models = models_promoted,
+            anti_patterns = anti_patterns_promoted,
             belief_updates = total_updates_applied,
             "wisdom synthesis complete"
         );
@@ -320,6 +313,110 @@ pub(crate) fn parse_source_type(s: &str) -> SourceType {
         "authority_book" => SourceType::AuthorityBook,
         _ => SourceType::AnonymousInternet,
     }
+}
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else if c.is_whitespace() {
+                '-'
+            } else {
+                '\0'
+            }
+        })
+        .filter(|c| *c != '\0')
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn promote_mental_models(vault: &Path, candidates: &[Value]) -> Result<usize> {
+    let models_dir = vault.join("wiki/wisdom/models");
+    fs::create_dir_all(&models_dir).with_context(|| {
+        format!("failed to create models dir: {}", models_dir.display())
+    })?;
+
+    let mut count = 0usize;
+    let date_str = Utc::now().format("%Y-%m-%d").to_string();
+
+    for m in candidates {
+        let model_name = m["model"].as_str().unwrap_or("unknown-model");
+        let pattern = m["pattern"].as_str().unwrap_or("unknown pattern");
+        let refs = m["evidence_refs"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        let slug = slugify(model_name);
+        let file_path = models_dir.join(format!("{slug}.md"));
+
+        let content = if file_path.exists() {
+            let existing = fs::read_to_string(&file_path).unwrap_or_default();
+            let entry = format!(
+                "\n\n## Application — {date_str}\n\n- **Pattern**: {pattern}\n- Evidence: {refs}\n"
+            );
+            format!("{existing}{entry}")
+        } else {
+            format!(
+                "---\nmodel: {model_name}\ndomain: wisdom-synth\nsource: self-observation\npromoted_at: {date_str}\n---\n\n# {model_name}\n\n**Pattern**: {pattern}\n\n**Evidence**: {refs}\n"
+            )
+        };
+
+        fs::write(&file_path, &content)
+            .with_context(|| format!("failed to write mental model: {}", file_path.display()))?;
+        count += 1;
+        debug!(model = model_name, path = %file_path.display(), "promoted mental model");
+    }
+
+    Ok(count)
+}
+
+fn promote_anti_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
+    let ap_dir = vault.join("wiki/wisdom/anti-patterns");
+    fs::create_dir_all(&ap_dir).with_context(|| {
+        format!("failed to create anti-patterns dir: {}", ap_dir.display())
+    })?;
+
+    let mut count = 0usize;
+    let date_str = Utc::now().format("%Y-%m-%d").to_string();
+
+    for ap in candidates {
+        let pattern_name = ap["pattern"].as_str().unwrap_or("unknown-pattern");
+        let trigger = ap["trigger"].as_str().unwrap_or("unknown trigger");
+        let avoidance = ap["avoidance"].as_str().unwrap_or("unknown avoidance");
+
+        let slug = slugify(pattern_name);
+        let file_path = ap_dir.join(format!("{slug}.md"));
+
+        let content = if file_path.exists() {
+            let existing = fs::read_to_string(&file_path).unwrap_or_default();
+            let entry = format!(
+                "\n\n## Observation — {date_str}\n\n- **Trigger**: {trigger}\n- **Avoidance**: {avoidance}\n"
+            );
+            format!("{existing}{entry}")
+        } else {
+            format!(
+                "---\npattern: {pattern_name}\ntrigger: {trigger}\navoidance: {avoidance}\npromoted_at: {date_str}\n---\n\n# {pattern_name}\n\n**Trigger**: {trigger}\n\n**Avoidance**: {avoidance}\n"
+            )
+        };
+
+        fs::write(&file_path, &content)
+            .with_context(|| format!("failed to write anti-pattern: {}", file_path.display()))?;
+        count += 1;
+        debug!(pattern = pattern_name, path = %file_path.display(), "promoted anti-pattern");
+    }
+
+    Ok(count)
 }
 
 fn write_suggestions(
@@ -474,5 +571,111 @@ mod tests {
         let content = "Just plain content";
         let stripped = strip_frontmatter(content);
         assert_eq!(stripped, "Just plain content");
+    }
+
+    #[test]
+    fn test_slugify_basic() {
+        assert_eq!(slugify("Loss Aversion"), "loss-aversion");
+        assert_eq!(slugify("Confirmation Bias"), "confirmation-bias");
+    }
+
+    #[test]
+    fn test_slugify_special_chars() {
+        assert_eq!(slugify("Sunk Cost (Fallacy)"), "sunk-cost-fallacy");
+        assert_eq!(slugify("Dunning-Kruger Effect"), "dunning-kruger-effect");
+    }
+
+    #[test]
+    fn test_slugify_multiple_spaces() {
+        assert_eq!(slugify("  Some   Weird   Name  "), "some-weird-name");
+    }
+
+    #[test]
+    fn test_promote_mental_models_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidates = vec![serde_json::json!({
+            "pattern": "recurring planning failure",
+            "model": "Loss Aversion",
+            "evidence_refs": ["refl1", "belief2"]
+        })];
+        let count = promote_mental_models(dir.path(), &candidates).unwrap();
+        assert_eq!(count, 1);
+
+        let file = dir.path().join("wiki/wisdom/models/loss-aversion.md");
+        assert!(file.exists());
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("model: Loss Aversion"));
+        assert!(content.contains("recurring planning failure"));
+    }
+
+    #[test]
+    fn test_promote_mental_models_appends_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("wiki/wisdom/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("loss-aversion.md"),
+            "---\nmodel: Loss Aversion\ndomain: test\nsource: seed\n---\n\n# Loss Aversion\n\nOriginal content\n",
+        )
+        .unwrap();
+
+        let candidates = vec![serde_json::json!({
+            "pattern": "new observation",
+            "model": "Loss Aversion",
+            "evidence_refs": ["refl3"]
+        })];
+        let count = promote_mental_models(dir.path(), &candidates).unwrap();
+        assert_eq!(count, 1);
+
+        let content = fs::read_to_string(models_dir.join("loss-aversion.md")).unwrap();
+        assert!(content.contains("Original content"));
+        assert!(content.contains("new observation"));
+        assert!(content.contains("## Application"));
+    }
+
+    #[test]
+    fn test_promote_anti_patterns_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidates = vec![serde_json::json!({
+            "pattern": "Premature Optimization",
+            "trigger": "when performance is mentioned",
+            "avoidance": "measure first, optimize second",
+            "evidence_refs": ["refl1"]
+        })];
+        let count = promote_anti_patterns(dir.path(), &candidates).unwrap();
+        assert_eq!(count, 1);
+
+        let file = dir
+            .path()
+            .join("wiki/wisdom/anti-patterns/premature-optimization.md");
+        assert!(file.exists());
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("pattern: Premature Optimization"));
+        assert!(content.contains("measure first, optimize second"));
+    }
+
+    #[test]
+    fn test_promote_anti_patterns_appends_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ap_dir = dir.path().join("wiki/wisdom/anti-patterns");
+        fs::create_dir_all(&ap_dir).unwrap();
+        fs::write(
+            ap_dir.join("premature-optimization.md"),
+            "---\npattern: Premature Optimization\n---\n\n# Premature Optimization\n\nOriginal\n",
+        )
+        .unwrap();
+
+        let candidates = vec![serde_json::json!({
+            "pattern": "Premature Optimization",
+            "trigger": "coding session",
+            "avoidance": "profile first"
+        })];
+        let count = promote_anti_patterns(dir.path(), &candidates).unwrap();
+        assert_eq!(count, 1);
+
+        let content = fs::read_to_string(ap_dir.join("premature-optimization.md")).unwrap();
+        assert!(content.contains("Original"));
+        assert!(content.contains("## Observation"));
+        assert!(content.contains("profile first"));
     }
 }

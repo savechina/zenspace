@@ -18,19 +18,39 @@ use zen_vault::{
 pub struct ExtractedSignals {
     /// Past-tense durable facts: what happened, decisions made, things learned.
     pub facts: Vec<String>,
-    /// Self-assessments of what went wrong or could be better (思危).
+    /// Self-assessments of what went wrong or could be better.
     pub reflections: Vec<String>,
-    /// Forward-looking promises: what the user committed to do (思变).
+    /// Forward-looking promises: what the user committed to do.
     pub commitments: Vec<String>,
+    /// Structured decision records (text, context, expected_value).
+    pub decisions: Vec<String>,
+    /// Corrections to prior errors: error + correct answer + cost.
+    pub corrections: Vec<String>,
+    /// Feedback signals: target, content, sentiment.
+    pub feedback: Vec<String>,
+    /// Candidate beliefs with confidence scores.
+    pub beliefs: Vec<String>,
 }
 
 impl ExtractedSignals {
     pub fn is_empty(&self) -> bool {
-        self.facts.is_empty() && self.reflections.is_empty() && self.commitments.is_empty()
+        self.facts.is_empty()
+            && self.reflections.is_empty()
+            && self.commitments.is_empty()
+            && self.decisions.is_empty()
+            && self.corrections.is_empty()
+            && self.feedback.is_empty()
+            && self.beliefs.is_empty()
     }
 
     pub fn total(&self) -> usize {
-        self.facts.len() + self.reflections.len() + self.commitments.len()
+        self.facts.len()
+            + self.reflections.len()
+            + self.commitments.len()
+            + self.decisions.len()
+            + self.corrections.len()
+            + self.feedback.len()
+            + self.beliefs.len()
     }
 }
 
@@ -580,9 +600,151 @@ fn compress_old_logs(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
 ///
 /// TODO(phase-1): implement graph rebuild from `wiki/entities/*.md`
 /// frontmatter + cross-references. Returns `0` (no-op) until then.
-fn recompute_entities(_zen_paths: &ZenPaths) -> Result<usize, DreamError> {
-    debug!("recompute_entities: stubbed, no entities recomputed");
-    Ok(0)
+fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
+    let entities_dir = zen_paths.vault().join("wiki/entities");
+
+    if !entities_dir.exists() {
+        debug!("recompute_entities: wiki/entities/ does not exist, nothing to recompute");
+        return Ok(0);
+    }
+
+    let graph_db = zen_paths.db().join("graph.db");
+
+    if !graph_db.exists() {
+        return Err(DreamError::KnowledgeGraphPersist(
+            "graph.db does not exist; cannot recompute entities".into(),
+        ));
+    }
+
+    let svc = EntityService::new();
+    let mut upserted = 0usize;
+
+    let entries = match std::fs::read_dir(&entities_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %entities_dir.display(),
+                "recompute_entities: failed to read entities directory"
+            );
+            return Ok(0);
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+            continue;
+        }
+
+        match parse_entity_file(&path) {
+            Ok((name, entity_type, aliases)) => {
+                let md5_input = format!("{}:{:?}", name, entity_type);
+                let mut entity = Entity::new(name, entity_type, "wiki-recompute");
+                entity.id = format!("wiki-{}", md5_hex(&md5_input));
+
+                if let Err(e) = svc.upsert_entity(&graph_db, &entity) {
+                    warn!(
+                        file = %path.display(),
+                        error = %e,
+                        "recompute_entities: failed to upsert entity"
+                    );
+                    continue;
+                }
+
+                if !aliases.is_empty() {
+                    if let Ok(repo) = zen_repo::sqlite_repo::SqliteRepo::open(&graph_db) {
+                        for alias in &aliases {
+                            let sql = format!(
+                                "INSERT OR IGNORE INTO entity_aliases (alias, canonical_entity_id) VALUES ('{}', '{}')",
+                                alias.replace('\'', "''"),
+                                entity.id.replace('\'', "''")
+                            );
+                            let _ = repo.execute_batch(&sql);
+                        }
+                    }
+                }
+
+                upserted += 1;
+                debug!(file = %path.display(), name = %entity.name, "recompute_entities: upserted");
+            }
+            Err(e) => {
+                warn!(file = %path.display(), error = %e, "recompute_entities: skipping malformed entity file");
+            }
+        }
+    }
+
+    info!(upserted, "recompute_entities: complete");
+    Ok(upserted)
+}
+
+fn parse_entity_file(path: &std::path::Path) -> Result<(String, EntityType, Vec<String>), DreamError> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| DreamError::Io(e))?;
+
+    let mut in_frontmatter = false;
+    let mut name: Option<String> = None;
+    let mut entity_type_str: Option<String> = None;
+    let mut aliases_str: Option<String> = None;
+
+    for line in content.lines().take(20) {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if !in_frontmatter {
+            break;
+        }
+        if let Some(val) = trimmed.strip_prefix("name:") {
+            name = Some(val.trim().trim_matches('"').to_string());
+        } else if let Some(val) = trimmed.strip_prefix("entity_type:") {
+            entity_type_str = Some(val.trim().trim_matches('"').to_string());
+        } else if let Some(val) = trimmed.strip_prefix("aliases:") {
+            aliases_str = Some(val.trim().trim_matches('"').to_string());
+        }
+    }
+
+    let name = name.ok_or_else(|| {
+        DreamError::WikiCompile(format!("missing 'name' in frontmatter: {}", path.display()))
+    })?;
+    let type_str = entity_type_str.ok_or_else(|| {
+        DreamError::WikiCompile(format!("missing 'entity_type' in frontmatter: {}", path.display()))
+    })?;
+
+    let entity_type = match type_str.as_str() {
+        "Technology" => EntityType::Technology,
+        "Concept" => EntityType::Concept,
+        "Person" => EntityType::Person,
+        "Organization" => EntityType::Organization,
+        "Event" => EntityType::Event,
+        "Product" => EntityType::Product,
+        "Function" => EntityType::Function,
+        "Class" => EntityType::Class,
+        "Module" => EntityType::Module,
+        "SelfModel" => EntityType::SelfModel,
+        "Belief" => EntityType::Belief,
+        "Goal" => EntityType::Goal,
+        "Path" => EntityType::Path,
+        _ => EntityType::Other,
+    };
+
+    let aliases: Vec<String> = aliases_str
+        .unwrap_or_default()
+        .split(',')
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+
+    Ok((name, entity_type, aliases))
+}
+
+fn md5_hex(input: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 #[cfg(test)]
@@ -714,5 +876,61 @@ mod tests {
         let content2 = "## Facts\n\n## Other\n\n- something\n";
         let facts2 = parse_facts_section(content2);
         assert!(facts2.is_empty(), "no facts section means no facts");
+    }
+
+    #[test]
+    fn test_recompute_entities_empty_dir() {
+        let (_dir, paths) = setup_test_paths();
+        let entities_dir = paths.vault().join("wiki/entities");
+        fs::create_dir_all(&entities_dir).unwrap();
+
+        let db_dir = paths.db();
+        fs::create_dir_all(&db_dir).unwrap();
+        let graph_db = db_dir.join("graph.db");
+        zen_repo::sqlite_repo::SqliteRepo::open(&graph_db)
+            .and_then(|repo| zen_repo::sqlite_repo::init_graph_schema(&repo))
+            .unwrap();
+
+        let count = recompute_entities(&paths).unwrap();
+        assert_eq!(count, 0, "empty entities dir should return 0");
+    }
+
+    #[test]
+    fn test_recompute_entities_valid_entity() {
+        let (_dir, paths) = setup_test_paths();
+        let entities_dir = paths.vault().join("wiki/entities");
+        fs::create_dir_all(&entities_dir).unwrap();
+
+        let entity_content = "---\nname: Rust\nentity_type: Technology\naliases: rust-lang, rustlang\n---\n\n# Rust\n\nA systems programming language.\n";
+        fs::write(entities_dir.join("rust.md"), entity_content).unwrap();
+
+        let db_dir = paths.db();
+        fs::create_dir_all(&db_dir).unwrap();
+        let graph_db = db_dir.join("graph.db");
+        zen_repo::sqlite_repo::SqliteRepo::open(&graph_db)
+            .and_then(|repo| zen_repo::sqlite_repo::init_graph_schema(&repo))
+            .unwrap();
+
+        let count = recompute_entities(&paths).unwrap();
+        assert_eq!(count, 1, "should upsert 1 entity");
+    }
+
+    #[test]
+    fn test_recompute_entities_malformed_file_skipped() {
+        let (_dir, paths) = setup_test_paths();
+        let entities_dir = paths.vault().join("wiki/entities");
+        fs::create_dir_all(&entities_dir).unwrap();
+
+        fs::write(entities_dir.join("bad.md"), "---\ntitle: no entity_type\n---\n\nBody\n").unwrap();
+
+        let db_dir = paths.db();
+        fs::create_dir_all(&db_dir).unwrap();
+        let graph_db = db_dir.join("graph.db");
+        zen_repo::sqlite_repo::SqliteRepo::open(&graph_db)
+            .and_then(|repo| zen_repo::sqlite_repo::init_graph_schema(&repo))
+            .unwrap();
+
+        let count = recompute_entities(&paths).unwrap();
+        assert_eq!(count, 0, "malformed file should be skipped, returning 0");
     }
 }

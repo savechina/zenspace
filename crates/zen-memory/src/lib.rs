@@ -1,5 +1,6 @@
 pub mod belief;
 pub mod commitment;
+pub mod okr;
 pub mod context_budget;
 pub mod conversation;
 pub mod correction;
@@ -16,6 +17,7 @@ pub mod memory_service;
 pub mod memvid;
 pub mod memvid_index;
 pub mod prompt;
+pub mod priority;
 pub mod quality_gate;
 pub mod seed;
 pub mod self_model;
@@ -56,6 +58,7 @@ pub use decision::{
 };
 pub use self_model::{SelfModelItem, SelfModelLayer};
 pub use commitment::{Commitment, CommitmentState, ExecutionChecklist, Milestone, StopLossLine};
+pub use okr::{CommitmentOkr, compute_commitment_completion_rate};
 pub use correction::Correction;
 pub use feedback_signal::{Feedback, FeedbackDisposition, FeedbackProperties};
 pub use quality_gate::{

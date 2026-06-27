@@ -11,6 +11,31 @@ use zen_memory::commitment::Commitment;
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
 
+#[derive(Debug, Clone)]
+pub struct AntiTalkIndicator {
+    pub commitment_slug: String,
+    pub mention_count: usize,
+    pub milestone_count: usize,
+    pub ratio: f64,
+    pub is_warning: bool,
+}
+
+impl AntiTalkIndicator {
+    pub fn display_summary(&self) -> String {
+        if self.is_warning {
+            format!(
+                "空谈警报: {} (mentions={}, milestones={}, ratio={:.1})",
+                self.commitment_slug, self.mention_count, self.milestone_count, self.ratio
+            )
+        } else {
+            format!(
+                "{}: mentions={}, milestones={}, ratio={:.1}",
+                self.commitment_slug, self.mention_count, self.milestone_count, self.ratio
+            )
+        }
+    }
+}
+
 pub struct CommitmentTracker {
     scheduled: Option<&'static str>,
 }
@@ -140,6 +165,7 @@ impl ZenWorker for CommitmentTracker {
 
         let commitments = Commitment::load_all(&commitments_dir).unwrap_or_default();
         let mut stop_loss_count = 0usize;
+        let mut anti_talk_warnings = 0usize;
         for c in &commitments {
             if c.is_overdue() {
                 warn!(commitment = %c.what, "commitment review due");
@@ -155,6 +181,21 @@ impl ZenWorker for CommitmentTracker {
             }
         }
 
+        let journal_entries_dir = paths.journal_entries();
+        let anti_talks = compute_all_anti_talk(&commitments, &journal_entries_dir);
+        for at in &anti_talks {
+            if at.is_warning {
+                warn!(
+                    slug = %at.commitment_slug,
+                    mentions = at.mention_count,
+                    milestones = at.milestone_count,
+                    ratio = at.ratio,
+                    "anti-talk warning: talk-to-achievement ratio exceeds threshold"
+                );
+                anti_talk_warnings += 1;
+            }
+        }
+
         if due_count > 0 {
             info!(due_count, "commitments due for review");
         }
@@ -162,6 +203,12 @@ impl ZenWorker for CommitmentTracker {
             info!(
                 stop_loss_count,
                 "commitments with triggered stop-loss require attention"
+            );
+        }
+        if anti_talk_warnings > 0 {
+            info!(
+                anti_talk_warnings,
+                "commitments with excessive talk-to-achievement ratio detected"
             );
         }
 
@@ -309,6 +356,73 @@ fn is_journaled(path: &Path) -> bool {
     JournalEntryState::migrate_from_frontmatter(path) && JournalEntryState::is_journaled(path)
 }
 
+fn compute_anti_talk_indicator(
+    commitment: &Commitment,
+    journal_dir: &Path,
+) -> Result<AntiTalkIndicator> {
+    let slug = commitment.slug();
+    let what_lower = commitment.what.to_lowercase();
+
+    let mut mention_count = 0usize;
+    if journal_dir.is_dir() {
+        for entry in fs::read_dir(journal_dir)
+            .with_context(|| format!("failed to read journal dir: {}", journal_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+                continue;
+            }
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for line in content.lines() {
+                if line.to_lowercase().contains(&what_lower) {
+                    mention_count += 1;
+                }
+            }
+        }
+    }
+
+    let milestone_count = commitment
+        .milestones
+        .iter()
+        .filter(|m| m.completed)
+        .count();
+
+    let denominator = std::cmp::max(milestone_count, 1) as f64;
+    let ratio = mention_count as f64 / denominator;
+    let is_warning = ratio > 5.0;
+
+    Ok(AntiTalkIndicator {
+        commitment_slug: slug,
+        mention_count,
+        milestone_count,
+        ratio,
+        is_warning,
+    })
+}
+
+fn compute_all_anti_talk(
+    commitments: &[Commitment],
+    journal_dir: &Path,
+) -> Vec<AntiTalkIndicator> {
+    let mut indicators: Vec<AntiTalkIndicator> = commitments
+        .iter()
+        .filter_map(|c| match compute_anti_talk_indicator(c, journal_dir) {
+            Ok(indicator) => Some(indicator),
+            Err(e) => {
+                warn!(commitment = %c.what, error = %e, "failed to compute anti-talk indicator");
+                None
+            }
+        })
+        .collect();
+
+    indicators.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
+    indicators
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +530,107 @@ mod tests {
         fs::write(dir.path().join("task.txt"), "").unwrap();
         fs::write(dir.path().join("task-2.md"), "").unwrap();
         assert_eq!(count_similar_commitments(dir.path(), "task"), 2);
+    }
+
+    #[test]
+    fn test_compute_anti_talk_indicator_no_mentions() {
+        let dir = tempdir().unwrap();
+        let journal_dir = dir.path().join("memories/journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+        fs::write(
+            journal_dir.join("2026-06-01.md"),
+            "# Journal\n\nNo relevant content.\n",
+        )
+        .unwrap();
+
+        let mut commitment = Commitment::new("ship feature X");
+        commitment.add_milestone("done", None);
+        commitment.milestones[0].completed = true;
+
+        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir).unwrap();
+        assert_eq!(indicator.mention_count, 0);
+        assert_eq!(indicator.milestone_count, 1);
+        assert!(!indicator.is_warning);
+    }
+
+    #[test]
+    fn test_compute_anti_talk_indicator_warning() {
+        let dir = tempdir().unwrap();
+        let journal_dir = dir.path().join("memories/journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+
+        let journal_content = "Talk about ship feature X a lot\n".repeat(10);
+        fs::write(journal_dir.join("2026-06-01.md"), &journal_content).unwrap();
+
+        let mut commitment = Commitment::new("ship feature X");
+        commitment.add_milestone("done", None);
+
+        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir).unwrap();
+        assert_eq!(indicator.mention_count, 10);
+        assert_eq!(indicator.milestone_count, 0);
+        assert!(indicator.is_warning);
+        assert!(indicator.ratio > 5.0);
+    }
+
+    #[test]
+    fn test_compute_anti_talk_indicator_no_warning_balanced() {
+        let dir = tempdir().unwrap();
+        let journal_dir = dir.path().join("memories/journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+
+        let journal_content = "ship feature X mentioned here\n".repeat(3);
+        fs::write(journal_dir.join("2026-06-01.md"), &journal_content).unwrap();
+
+        let mut commitment = Commitment::new("ship feature X");
+        for i in 0..3 {
+            commitment.add_milestone(&format!("m{i}"), None);
+            commitment.milestones[i].completed = true;
+        }
+
+        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir).unwrap();
+        assert_eq!(indicator.mention_count, 3);
+        assert_eq!(indicator.milestone_count, 3);
+        assert!(!indicator.is_warning);
+    }
+
+    #[test]
+    fn test_compute_all_anti_talk_sorted_by_ratio_desc() {
+        let dir = tempdir().unwrap();
+        let journal_dir = dir.path().join("memories/journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+
+        let mut c1 = Commitment::new("low talk");
+        c1.add_milestone("m1", None);
+        c1.milestones[0].completed = true;
+        fs::write(journal_dir.join("2026-06-01.md"), "low talk mentioned\n").unwrap();
+
+        let mut c2 = Commitment::new("high talk");
+        let repeats = "high talk mentioned\n".repeat(20);
+        fs::write(journal_dir.join("2026-06-02.md"), &repeats).unwrap();
+
+        let indicators = compute_all_anti_talk(&[c1, c2], &journal_dir);
+        assert_eq!(indicators.len(), 2);
+        assert!(indicators[0].ratio >= indicators[1].ratio);
+    }
+
+    #[test]
+    fn test_anti_talk_display_summary() {
+        let warning = AntiTalkIndicator {
+            commitment_slug: "ship-feature".into(),
+            mention_count: 10,
+            milestone_count: 1,
+            ratio: 10.0,
+            is_warning: true,
+        };
+        assert!(warning.display_summary().contains("空谈警报"));
+
+        let ok = AntiTalkIndicator {
+            commitment_slug: "other".into(),
+            mention_count: 2,
+            milestone_count: 3,
+            ratio: 0.67,
+            is_warning: false,
+        };
+        assert!(!ok.display_summary().contains("空谈警报"));
     }
 }

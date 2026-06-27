@@ -9,7 +9,7 @@ use rig_core::completion::CompletionModel;
 use rig_core::streaming::StreamedAssistantContent;
 use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
-use tracing::instrument;
+use tracing::{instrument, warn};
 use zen_core::paths::ZenPaths;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
@@ -23,6 +23,441 @@ pub struct IdentityContext {
     pub soul_content: String,
     pub agents_content: String,
     pub memory_content: String,
+}
+
+/// Self-learning signals loaded from memory stores, injected into agent prompts.
+///
+/// Each field is a pre-formatted string suitable for `PromptAssembly` injection.
+/// Empty string means "no data available" — the section will be skipped.
+#[derive(Debug, Clone, Default)]
+pub struct SelfLearningSignals {
+    /// Loss-aversion guard: recent corrections to avoid repeating mistakes.
+    pub corrections: String,
+    /// Quality-filtered feedback archive.
+    pub feedback: String,
+    /// Top-5 low-confidence beliefs needing evidence.
+    pub beliefs: String,
+    /// Weekly virtue tracking (三省吾身).
+    pub virtue_logs: String,
+    /// Daily prompt-injected reflections from wiki.
+    pub reflections: String,
+    /// Relevant mental models from wiki.
+    pub mental_models: String,
+    /// Decisions under review.
+    pub decisions: String,
+    /// Priority scoring from beliefs × commitments.
+    pub priority_items: String,
+}
+
+impl SelfLearningSignals {
+    /// Load all self-learning signals from ZenPaths vault/memory directories.
+    ///
+    /// Degrades gracefully — missing files or parse errors yield empty strings.
+    /// Never panics; uses `tracing::warn` for errors.
+    ///
+    /// Also wires `ReinforcementTracker` to record retrieval hit-counts for
+    /// each loaded entity (§8.3.3 reinforcement mechanism).
+    pub fn load(zen_paths: &ZenPaths) -> Self {
+        use std::path::PathBuf;
+        use zen_memory::priority::ReinforcementTracker;
+
+        let memories_dir = zen_paths.vault().join("memories");
+        let wiki_dir = zen_paths.wiki();
+        let reinforcement_path: PathBuf =
+            zen_paths.global_root().join("memories/.reinforcement.json");
+        let mut tracker = ReinforcementTracker::new(reinforcement_path);
+
+        let corrections = load_corrections(&memories_dir.join("corrections"), &mut tracker);
+        let feedback = load_feedback(&memories_dir.join("feedback"), &mut tracker);
+        let beliefs = load_beliefs(&memories_dir.join("beliefs"), &mut tracker);
+        let virtue_logs = load_virtue_logs(&memories_dir.join("virtue_logs"));
+        let reflections = load_reflections(&wiki_dir.join("wisdom").join("reflections"));
+        let mental_models = load_mental_models(&wiki_dir.join("wisdom").join("models"));
+        let decisions = load_decisions(&memories_dir.join("decisions"), &mut tracker);
+        let priority_items = load_priority_items(
+            &memories_dir.join("beliefs"),
+            &memories_dir.join("commitments"),
+        );
+
+        let _ = tracker.save();
+
+        Self {
+            corrections,
+            feedback,
+            beliefs,
+            virtue_logs,
+            reflections,
+            mental_models,
+            decisions,
+            priority_items,
+        }
+    }
+
+    /// Returns true if all signal fields are empty.
+    pub fn is_empty(&self) -> bool {
+        self.corrections.is_empty()
+            && self.feedback.is_empty()
+            && self.beliefs.is_empty()
+            && self.virtue_logs.is_empty()
+            && self.reflections.is_empty()
+            && self.mental_models.is_empty()
+            && self.decisions.is_empty()
+            && self.priority_items.is_empty()
+    }
+}
+
+fn load_corrections(
+    dir: &std::path::Path,
+    tracker: &mut zen_memory::priority::ReinforcementTracker,
+) -> String {
+    let corrections = match zen_memory::Correction::load_all(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to load corrections");
+            return String::new();
+        }
+    };
+
+    if corrections.is_empty() {
+        return String::new();
+    }
+
+    for c in &corrections {
+        let _ = tracker.record_retrieval(&c.id);
+    }
+
+    let mut sorted = corrections;
+    sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let top: Vec<_> = sorted.into_iter().take(3).collect();
+
+    let mut out = String::from("⚠️ Past errors to avoid:\n");
+    for c in &top {
+        let cost_info = if c.cost.economic > 0.0 || c.cost.time_hours > 0.0 {
+            format!(
+                ", cost: ${:.0}/{}h",
+                c.cost.economic, c.cost.time_hours
+            )
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "- \"{}\" → fix: {}{}\n",
+            c.error_ref, c.fix, cost_info
+        ));
+    }
+    out
+}
+
+fn load_feedback(
+    dir: &std::path::Path,
+    tracker: &mut zen_memory::priority::ReinforcementTracker,
+) -> String {
+    let feedbacks = match zen_memory::Feedback::load_all(dir) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to load feedback");
+            return String::new();
+        }
+    };
+
+    if feedbacks.is_empty() {
+        return String::new();
+    }
+
+    for f in &feedbacks {
+        let _ = tracker.record_retrieval(&f.id);
+    }
+
+    let mut sorted = feedbacks;
+    sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let top: Vec<_> = sorted.into_iter().take(3).collect();
+
+    let mut out = String::from("📋 Recent feedback:\n");
+    for f in &top {
+        out.push_str(&format!(
+            "- [{}] {}: \"{}\"\n",
+            f.disposition, f.source, f.content
+        ));
+    }
+    out
+}
+
+fn load_beliefs(
+    dir: &std::path::Path,
+    tracker: &mut zen_memory::priority::ReinforcementTracker,
+) -> String {
+    let beliefs = match zen_memory::Belief::load_all(dir) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to load beliefs");
+            return String::new();
+        }
+    };
+
+    if beliefs.is_empty() {
+        return String::new();
+    }
+
+    for b in &beliefs {
+        let _ = tracker.record_retrieval(&b.id);
+    }
+
+    let mut sorted = beliefs;
+    sorted.sort_by(|a, b| {
+        a.posterior
+            .partial_cmp(&b.posterior)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top: Vec<_> = sorted.into_iter().take(5).collect();
+
+    let mut out = String::from("🔍 Low-confidence beliefs (need evidence):\n");
+    for b in &top {
+        out.push_str(&format!(
+            "- \"{}\" (confidence: {:.0}%)\n",
+            b.proposition,
+            b.posterior * 100.0
+        ));
+    }
+    out
+}
+
+fn load_virtue_logs(dir: &std::path::Path) -> String {
+    let logs = match zen_memory::VirtueLog::load_all(dir) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to load virtue logs");
+            return String::new();
+        }
+    };
+
+    if logs.is_empty() {
+        return String::new();
+    }
+
+    use std::collections::HashMap;
+    let mut latest: HashMap<zen_memory::VirtueDomain, &zen_memory::VirtueLog> = HashMap::new();
+    for log in &logs {
+        let entry = latest.entry(log.virtue).or_insert(log);
+        if log.date > entry.date {
+            *entry = log;
+        }
+    }
+
+    let mut out = String::from("🧘 Virtue tracking:\n");
+    for (domain, log) in &latest {
+        out.push_str(&format!(
+            "- {}: {} (streak: {} days)\n",
+            domain, log.status, log.streak
+        ));
+    }
+    out
+}
+
+fn load_reflections(dir: &std::path::Path) -> String {
+    if !dir.is_dir() {
+        return String::new();
+    }
+
+    let mut files: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "md")
+            })
+            .collect(),
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to read reflections dir");
+            return String::new();
+        }
+    };
+
+    files.sort_by(|a, b| {
+        let ta = a
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let tb = b
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        tb.cmp(&ta)
+    });
+
+    let top: Vec<_> = files.into_iter().take(3).collect();
+    if top.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("📝 Recent reflections:\n");
+    for entry in &top {
+        let path = entry.path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let first_para = extract_first_paragraph(&content);
+            if !first_para.is_empty() {
+                let title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("reflection");
+                out.push_str(&format!("- **{}**: {}\n", title, first_para));
+            }
+        }
+    }
+    out
+}
+
+fn load_mental_models(dir: &std::path::Path) -> String {
+    if !dir.is_dir() {
+        return String::new();
+    }
+
+    let files: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|ext| ext == "md")
+            })
+            .collect(),
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to read mental models dir");
+            return String::new();
+        }
+    };
+
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("🧠 Mental models:\n");
+    for entry in &files {
+        let path = entry.path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let first_para = extract_first_paragraph(&content);
+            if !first_para.is_empty() {
+                let title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model");
+                out.push_str(&format!("- **{}**: {}\n", title, first_para));
+            }
+        }
+    }
+    out
+}
+
+fn load_decisions(
+    dir: &std::path::Path,
+    tracker: &mut zen_memory::priority::ReinforcementTracker,
+) -> String {
+    let decisions = match zen_memory::Decision::load_all(dir) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "failed to load decisions");
+            return String::new();
+        }
+    };
+
+    if decisions.is_empty() {
+        return String::new();
+    }
+
+    for d in &decisions {
+        let _ = tracker.record_retrieval(&d.id);
+    }
+
+    let mut open: Vec<_> = decisions
+        .into_iter()
+        .filter(|d| d.closed_at.is_none())
+        .collect();
+    open.sort_by(|a, b| b.decided_at.cmp(&a.decided_at));
+    let top: Vec<_> = open.into_iter().take(3).collect();
+
+    if top.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("⚡ Decisions under review:\n");
+    for d in &top {
+        out.push_str(&format!(
+            "- \"{}\" (decided: {}, domain: {})\n",
+            d.title,
+            d.decided_at.format("%Y-%m-%d"),
+            d.domain
+        ));
+    }
+    out
+}
+
+fn load_priority_items(beliefs_dir: &std::path::Path, commitments_dir: &std::path::Path) -> String {
+    let beliefs = match zen_memory::Belief::load_all(beliefs_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(dir = %beliefs_dir.display(), error = %e, "failed to load beliefs for priority");
+            return String::new();
+        }
+    };
+    let commitments = match zen_memory::Commitment::load_all(commitments_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                dir = %commitments_dir.display(),
+                error = %e,
+                "failed to load commitments for priority"
+            );
+            return String::new();
+        }
+    };
+
+    let scores = zen_memory::priority::top_n_by_priority(&beliefs, &commitments, 5);
+    zen_memory::priority::format_priority_for_prompt(&scores)
+}
+
+fn extract_first_paragraph(content: &str) -> String {
+    let mut lines = content.lines();
+    let mut paragraph = String::new();
+    let mut found_first = false;
+    let mut in_frontmatter = false;
+
+    for line in lines.by_ref() {
+        let trimmed = line.trim();
+
+        if !found_first && trimmed == "---" {
+            if in_frontmatter {
+                in_frontmatter = false;
+                continue;
+            }
+            in_frontmatter = true;
+            continue;
+        }
+
+        if in_frontmatter {
+            continue;
+        }
+
+        if !found_first && trimmed.is_empty() {
+            continue;
+        }
+
+        if !found_first && trimmed.starts_with('#') {
+            continue;
+        }
+
+        found_first = true;
+
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if !paragraph.is_empty() {
+            paragraph.push(' ');
+        }
+        paragraph.push_str(trimmed);
+    }
+
+    paragraph.chars().take(200).collect()
 }
 
 /// Load identity files from the Zen home directory (~/.zen/).
@@ -85,6 +520,7 @@ pub struct ZenAgent {
     pub generic: GenericAgent,
     pub completion_model: ZenCompletionModel,
     identity: Option<IdentityContext>,
+    signals: Option<SelfLearningSignals>,
     memvid_store: Option<rig_memvid::MemvidStore>,
 }
 
@@ -97,6 +533,11 @@ impl ZenAgent {
     /// Access the agent's identity context (SOUL.md/MEMORY.md/AGENTS.md).
     pub fn identity(&self) -> &Option<IdentityContext> {
         &self.identity
+    }
+
+    /// Access loaded self-learning signals (if any).
+    pub fn signals(&self) -> &Option<SelfLearningSignals> {
+        &self.signals
     }
 
     /// Retrieve memories from the memvid store for this session.
@@ -493,11 +934,13 @@ impl ZenAgentBuilder {
             .build(&wiring.skills, &wiring.tools)?;
 
         let identity = self.zen_paths.as_ref().map(load_identity_files);
+        let signals = self.zen_paths.as_ref().map(SelfLearningSignals::load);
 
         Ok(ZenAgent {
             generic,
             completion_model,
             identity,
+            signals,
             memvid_store: self.memvid_store,
         })
     }

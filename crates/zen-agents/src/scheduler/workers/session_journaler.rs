@@ -1,14 +1,18 @@
 use std::fs;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
 use zen_core::types::Sensitivity;
+use zen_memory::belief::Belief;
 use zen_memory::conversation::ConversationStore;
+use zen_memory::correction::Correction;
+use zen_memory::decision::{CostBreakdown, Decision};
 use zen_memory::dream::{ExtractedSignals, extract_durable_facts_from_entry};
+use zen_memory::feedback_signal::Feedback;
 use zen_memory::quality_gate::{DECISION_PRINCIPLES, EXTRACTION_GUARDRAILS};
 use zen_provider::{DefaultRouter, LlmRouterExt};
 
@@ -53,15 +57,24 @@ struct CommitmentSummary {
 
 pub struct SessionJournaler {
     scheduled: Option<&'static str>,
+    fresh_eyes_mode: bool,
 }
 
 impl SessionJournaler {
     pub fn new() -> Self {
-        Self { scheduled: None }
+        Self {
+            scheduled: None,
+            fresh_eyes_mode: false,
+        }
     }
 
     pub fn with_schedule(mut self, expr: &str) -> Self {
         self.scheduled = Some(Box::leak(expr.to_string().into_boxed_str()));
+        self
+    }
+
+    pub fn with_fresh_eyes(mut self, enabled: bool) -> Self {
+        self.fresh_eyes_mode = enabled;
         self
     }
 }
@@ -105,6 +118,11 @@ impl ZenWorker for SessionJournaler {
             });
         }
 
+        let fresh_eyes = self.fresh_eyes_mode || Utc::now().day() == 1;
+        if fresh_eyes {
+            info!("fresh eyes mode active — skipping prior context injection");
+        }
+
         let router = match load_config() {
             Ok(c) => Some(DefaultRouter::from_agentic(c)),
             Err(e) => {
@@ -122,7 +140,7 @@ impl ZenWorker for SessionJournaler {
             }
 
             let session_id = extract_session_id(jsonl_path);
-            match process_session(&paths, jsonl_path, &session_id, router.clone()).await {
+            match process_session(&paths, jsonl_path, &session_id, router.clone(), fresh_eyes).await {
                 Ok(facts) => {
                     total_facts += facts;
                     processed += 1;
@@ -164,6 +182,7 @@ async fn process_session(
     jsonl_path: &std::path::Path,
     session_id: &str,
     router: Option<DefaultRouter>,
+    fresh_eyes: bool,
 ) -> Result<usize> {
     let store = ConversationStore::with_file(jsonl_path.to_path_buf(), session_id)?;
     let turns = store.load()?;
@@ -175,20 +194,32 @@ async fn process_session(
 
     let conversation_text = build_conversation_text(&turns);
 
-    let anti_patterns_dir = paths.vault().join("wiki/wisdom/anti-patterns");
-    let matched_anti_patterns = check_anti_pattern_match(&conversation_text, &anti_patterns_dir);
-    if !matched_anti_patterns.is_empty() {
-        info!(
-            session_id = %session_id,
-            anti_patterns = ?matched_anti_patterns,
-            "anti-patterns detected, forcing reflection extraction"
-        );
-    }
+    let matched_anti_patterns = if fresh_eyes {
+        Vec::new()
+    } else {
+        let anti_patterns_dir = paths.vault().join("wiki/wisdom/anti-patterns");
+        let matched = check_anti_pattern_match(&conversation_text, &anti_patterns_dir);
+        if !matched.is_empty() {
+            info!(
+                session_id = %session_id,
+                anti_patterns = ?matched,
+                "anti-patterns detected, forcing reflection extraction"
+            );
+        }
+        matched
+    };
 
-    let prompt_context = load_prompt_context(paths).await;
+    let prompt_context = if fresh_eyes {
+        PromptContext {
+            commitments_section: String::new(),
+            beliefs_section: String::new(),
+        }
+    } else {
+        load_prompt_context(paths).await
+    };
 
     let (signals, source) = if let Some(router) = router {
-        match extract_signals_via_llm(&conversation_text, &prompt_context, router, &matched_anti_patterns).await {
+        match extract_signals_via_llm(&conversation_text, &prompt_context, router, &matched_anti_patterns, fresh_eyes).await {
             Ok(llm_signals) if !llm_signals.is_empty() => {
                 info!(session_id = %session_id, total = llm_signals.total(), "LLM signal extraction succeeded");
                 (llm_signals, "llm")
@@ -209,9 +240,78 @@ async fn process_session(
     let journal_content = build_journal_entry(session_id, turns.len(), &signals, source);
     write_journal_entry(paths, session_id, &journal_content)?;
 
+    save_typed_signals(paths, &signals);
+
     append_journaled_marker(jsonl_path, source)?;
 
     Ok(signals.total())
+}
+
+fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
+    let vault = paths.vault();
+
+    for raw in &signals.decisions {
+        let parts: Vec<&str> = raw.splitn(3, "|||").collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let text = parts[0].trim();
+        let context = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let _expected_value = parts.get(2).map(|s| s.trim()).unwrap_or("");
+
+        let id = Decision::slugify_title(text);
+        let mut decision = Decision::new(id, text.to_string(), "session".to_string());
+        decision.goal = context.to_string();
+        if let Err(e) = decision.save(&vault.join("memories/decisions")) {
+            warn!(error = %e, text = %text, "failed to save decision");
+        }
+    }
+
+    for raw in &signals.corrections {
+        let parts: Vec<&str> = raw.splitn(3, "|||").collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let error_ref = parts[0].trim();
+        let fix = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let _cost_str = parts.get(2).map(|s| s.trim()).unwrap_or("");
+
+        let correction = Correction::new(error_ref, fix, CostBreakdown::default());
+        if let Err(e) = correction.save(&vault.join("memories/corrections")) {
+            warn!(error = %e, error_ref = %error_ref, "failed to save correction");
+        }
+    }
+
+    for raw in &signals.feedback {
+        let parts: Vec<&str> = raw.splitn(3, "|||").collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let target = parts[0].trim();
+        let content = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let _sentiment = parts.get(2).map(|s| s.trim()).unwrap_or("");
+
+        let feedback = Feedback::new(target, content);
+        if let Err(e) = feedback.save(&vault.join("memories/feedback")) {
+            warn!(error = %e, target = %target, "failed to save feedback");
+        }
+    }
+
+    for raw in &signals.beliefs {
+        let parts: Vec<&str> = raw.splitn(2, "|||").collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let statement = parts[0].trim();
+        let confidence = parts.get(1).and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.5);
+
+        let id = zen_memory::belief::slugify_proposition(statement);
+        let mut belief = Belief::new(id, statement.to_string(), "session".to_string());
+        belief.posterior = confidence.clamp(0.01, 0.99);
+        if let Err(e) = belief.save(&vault.join("memories/beliefs")) {
+            warn!(error = %e, statement = %statement, "failed to save belief candidate");
+        }
+    }
 }
 
 async fn extract_signals_via_llm(
@@ -219,6 +319,7 @@ async fn extract_signals_via_llm(
     prompt_context: &PromptContext,
     router: DefaultRouter,
     matched_anti_patterns: &[String],
+    fresh_eyes: bool,
 ) -> Result<ExtractedSignals> {
     let truncated = if conversation_text.len() > 12000 {
         let end = conversation_text
@@ -242,6 +343,12 @@ async fn extract_signals_via_llm(
         )
     };
 
+    let fresh_eyes_note = if fresh_eyes {
+        "\n[FRESH EYES MODE] No prior context injected. Extract signals from conversation only.\n"
+    } else {
+        ""
+    };
+
     let prompt = format!(
         r#"Extract typed signals from this development session conversation.
 
@@ -249,6 +356,7 @@ Conversation:
 {truncated}
 {context_section}
 {anti_pattern_warning}
+{fresh_eyes_note}
 {EXTRACTION_GUARDRAILS}
 {DECISION_PRINCIPLES}
 Respond with ONLY a JSON object:
@@ -264,6 +372,18 @@ Respond with ONLY a JSON object:
   "commitments": [
     "Simplify login to 2 steps by 2026-07-01",
     "Write integration tests for the auth module this week"
+  ],
+  "decisions": [
+    {{"text": "Use SQLite over PostgreSQL for local-first storage", "context": "Need offline capability with minimal setup", "expected_value": "Lower ops cost, good enough for single-user"}}
+  ],
+  "corrections": [
+    {{"error": "Assumed all env vars were set in production", "correct_answer": "Validate env vars at startup and fail fast", "cost": "2h debugging deploy failure"}}
+  ],
+  "feedback": [
+    {{"target": "login-flow", "content": "Users abandon at step 3 of registration", "sentiment": "negative"}}
+  ],
+  "beliefs": [
+    {{"statement": "SQLite is sufficient for local-first apps under 1GB data", "confidence": 0.7}}
   ]
 }}
 
@@ -271,6 +391,10 @@ Rules:
 - **Facts**: past-tense, specific, durable — useful after 6 months. Technical decisions, bug fixes, learnings.
 - **Reflections**: what went wrong, what could be better, what surprised you. Self-critical, honest.
 - **Commitments**: what you (the user) plan to do next. Include a rough timeframe if mentioned.
+- **Decisions**: explicit choices between alternatives. Include context and expected value rationale.
+- **Corrections**: errors caught and fixed. Include what went wrong, the correct answer, and the cost.
+- **Feedback**: observations about code/process quality. Include target, content, and sentiment.
+- **Beliefs**: assumptions or opinions held by the user. Include a confidence score (0.0-1.0).
 - Do NOT include transient mechanics ("user asked about X", "assistant replied")
 - If a category is empty, return an empty array for it
 - If nothing of value happened in any category, return all empty arrays"#
@@ -337,6 +461,65 @@ Rules:
         }
     }
 
+    if let Some(arr) = parsed["decisions"].as_array() {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                    let text = text.trim().to_string();
+                    if !text.is_empty() {
+                        let context = obj.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let ev = obj.get("expected_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        signals.decisions.push(format!("{text}|||{context}|||{ev}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(arr) = parsed["corrections"].as_array() {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                if let Some(error) = obj.get("error").and_then(|v| v.as_str()) {
+                    let error = error.trim().to_string();
+                    if !error.is_empty() {
+                        let correct = obj.get("correct_answer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let cost = obj.get("cost").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        signals.corrections.push(format!("{error}|||{correct}|||{cost}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(arr) = parsed["feedback"].as_array() {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+                    let content = content.trim().to_string();
+                    if !content.is_empty() {
+                        let target = obj.get("target").and_then(|v| v.as_str()).unwrap_or("session").to_string();
+                        let sentiment = obj.get("sentiment").and_then(|v| v.as_str()).unwrap_or("neutral").to_string();
+                        signals.feedback.push(format!("{target}|||{content}|||{sentiment}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(arr) = parsed["beliefs"].as_array() {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                if let Some(statement) = obj.get("statement").and_then(|v| v.as_str()) {
+                    let statement = statement.trim().to_string();
+                    if !statement.is_empty() {
+                        let confidence = obj.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                        signals.beliefs.push(format!("{statement}|||{confidence}"));
+                    }
+                }
+            }
+        }
+    }
+
     Ok(signals)
 }
 
@@ -346,6 +529,10 @@ fn extract_signals_via_keyword(conversation_text: &str) -> ExtractedSignals {
         facts,
         reflections: Vec::new(),
         commitments: Vec::new(),
+        decisions: Vec::new(),
+        corrections: Vec::new(),
+        feedback: Vec::new(),
+        beliefs: Vec::new(),
     }
 }
 
@@ -670,6 +857,10 @@ mod tests {
             ],
             reflections: vec![],
             commitments: vec![],
+            decisions: vec![],
+            corrections: vec![],
+            feedback: vec![],
+            beliefs: vec![],
         };
 
         let entry = build_journal_entry(session_id, turn_count, &signals, "keyword");
@@ -703,6 +894,10 @@ mod tests {
             facts: vec!["implemented auth".to_string()],
             reflections: vec!["login flow too complex".to_string()],
             commitments: vec!["simplify login by July".to_string()],
+            decisions: vec![],
+            corrections: vec![],
+            feedback: vec![],
+            beliefs: vec![],
         };
         let entry = build_journal_entry(session_id, 10, &signals, "llm");
 
@@ -878,5 +1073,17 @@ mod tests {
         let session = "I was selectively gathering evidence supporting my beliefs and also generating face-saving excuses instead honest assessment";
         let matched = check_anti_pattern_match(session, dir.path());
         assert!(matched.len() >= 2);
+    }
+
+    #[test]
+    fn test_fresh_eyes_mode_skips_context() {
+        let journaler = SessionJournaler::new().with_fresh_eyes(true);
+        assert!(journaler.fresh_eyes_mode);
+    }
+
+    #[test]
+    fn test_fresh_eyes_mode_default_false() {
+        let journaler = SessionJournaler::new();
+        assert!(!journaler.fresh_eyes_mode);
     }
 }

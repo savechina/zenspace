@@ -250,6 +250,34 @@ impl AgentExecutor {
         // Section 13: Env info (dynamic)
         builder = builder.env_info(PromptAssembly::build_env_info(&context.session));
 
+        // Self-Learning Signal Sections (corrections, feedback, beliefs, etc.)
+        if let Some(signals) = agent.signals() {
+            if !signals.corrections.is_empty() {
+                builder = builder.corrections(&signals.corrections);
+            }
+            if !signals.feedback.is_empty() {
+                builder = builder.feedback(&signals.feedback);
+            }
+            if !signals.beliefs.is_empty() {
+                builder = builder.beliefs(&signals.beliefs);
+            }
+            if !signals.virtue_logs.is_empty() {
+                builder = builder.virtue_logs(&signals.virtue_logs);
+            }
+            if !signals.reflections.is_empty() {
+                builder = builder.reflections(&signals.reflections);
+            }
+            if !signals.mental_models.is_empty() {
+                builder = builder.mental_models(&signals.mental_models);
+            }
+            if !signals.decisions.is_empty() {
+                builder = builder.decisions(&signals.decisions);
+            }
+            if !signals.priority_items.is_empty() {
+                builder = builder.priority_items(&signals.priority_items);
+            }
+        }
+
         // Build and assemble with cache boundary
         builder.build().assemble()
     }

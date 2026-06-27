@@ -160,6 +160,32 @@ pub struct PromptAssembly {
     /// Section 17: Memory Section (Conversation history + knowledge)
     pub memory: Option<String>,
 
+    // -- Self-Learning Signal Sections (dynamic, after cache boundary) --
+
+    /// Self-Learning: Loss-Aversion Guard — recent corrections to avoid repeating mistakes
+    pub corrections_section: Option<String>,
+
+    /// Self-Learning: Feedback Archive — quality-filtered feedback history
+    pub feedback_section: Option<String>,
+
+    /// Self-Learning: Active Beliefs — top-5 low-confidence beliefs
+    pub beliefs_section: Option<String>,
+
+    /// Self-Learning: Virtue Tracking — weekly three-reflections (三省吾身)
+    pub virtue_logs_section: Option<String>,
+
+    /// Self-Learning: Recent Reflections — daily prompt-injected reflections
+    pub reflections_section: Option<String>,
+
+    /// Self-Learning: Relevant Mental Models — relevance-queried mental models
+    pub mental_models_section: Option<String>,
+
+    /// Self-Learning: Decision Review — past decisions for review
+    pub decisions_section: Option<String>,
+
+    /// Self-Learning: Priority Attention — priority-scored belief×commitment pairs
+    pub priority_items_section: Option<String>,
+
     /// Section 18: CLAUDE.md Content (AGENTS.md + custom_instructions)
     pub claude_md: Option<String>,
 
@@ -215,6 +241,14 @@ impl Default for PromptAssembly {
             function_result_clearing: None,
             mcp_instructions: None,
             memory: None,
+            corrections_section: None,
+            feedback_section: None,
+            beliefs_section: None,
+            virtue_logs_section: None,
+            reflections_section: None,
+            mental_models_section: None,
+            decisions_section: None,
+            priority_items_section: None,
             claude_md: None,
             soul_content: String::new(),
             agents_content: String::new(),
@@ -321,6 +355,11 @@ impl PromptAssembly {
             dynamic_parts.push(memory_parts);
         }
 
+        let signal_parts = self.render_signal_sections();
+        if !signal_parts.is_empty() {
+            dynamic_parts.push(signal_parts);
+        }
+
         let mut result = static_parts.join("\n\n");
         result.push_str("\n\n");
         result.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
@@ -375,6 +414,11 @@ impl PromptAssembly {
             dynamic_parts.push(memory_parts);
         }
 
+        let signal_parts = self.render_signal_sections();
+        if !signal_parts.is_empty() {
+            dynamic_parts.push(signal_parts);
+        }
+
         // Section 18: CLAUDE.md (AGENTS.md + custom_instructions)
         if !self.agents_content.is_empty() || !def.custom_instructions.is_empty() {
             let claude_parts = self.build_claude_md_section(def);
@@ -423,6 +467,11 @@ impl PromptAssembly {
         let memory_parts = self.build_memory_section();
         if !memory_parts.is_empty() {
             dynamic_parts.push(memory_parts);
+        }
+
+        let signal_parts = self.render_signal_sections();
+        if !signal_parts.is_empty() {
+            dynamic_parts.push(signal_parts);
         }
 
         let mut result = static_parts.join("\n\n");
@@ -512,6 +561,12 @@ impl PromptAssembly {
             dynamic_parts.push(memory_parts);
         }
 
+        // Self-Learning Signal Sections (between memory and claude_md)
+        let signal_parts = self.render_signal_sections();
+        if !signal_parts.is_empty() {
+            dynamic_parts.push(signal_parts);
+        }
+
         // Section 18: CLAUDE.md
         if let Some(ref claude_md) = self.claude_md
             && !claude_md.is_empty()
@@ -536,6 +591,60 @@ impl PromptAssembly {
         );
 
         result
+    }
+
+    // -----------------------------------------------------------------------
+    // Signal Section Rendering
+    // -----------------------------------------------------------------------
+
+    /// Render all self-learning signal sections into a single string block.
+    ///
+    /// Used by all 4 prompt assembly paths (default, coordinator, agent,
+    /// custom) to ensure the 8 signal types are injected consistently.
+    fn render_signal_sections(&self) -> String {
+        let mut parts = Vec::new();
+        for (header, content) in [
+            (
+                "## Self-Learning: Loss-Aversion Guard / 止损线提醒",
+                &self.corrections_section,
+            ),
+            (
+                "## Self-Learning: Feedback Archive / 反馈档案",
+                &self.feedback_section,
+            ),
+            (
+                "## Self-Learning: Active Beliefs / 当前信念",
+                &self.beliefs_section,
+            ),
+            (
+                "## Self-Learning: Virtue Tracking / 三省吾身",
+                &self.virtue_logs_section,
+            ),
+            (
+                "## Self-Learning: Recent Reflections / 近期反思",
+                &self.reflections_section,
+            ),
+            (
+                "## Self-Learning: Relevant Mental Models / 思维模型",
+                &self.mental_models_section,
+            ),
+            (
+                "## Self-Learning: Decision Review / 决策复盘",
+                &self.decisions_section,
+            ),
+            (
+                "## Self-Learning: Priority Attention / 优先关注",
+                &self.priority_items_section,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(header, content)| content.as_deref().map(|c| (header, c)))
+        {
+            if !content.is_empty() {
+                parts.push(format!("{}\n{}", header, content));
+            }
+        }
+        parts.join("\n\n")
     }
 
     // -----------------------------------------------------------------------
@@ -913,6 +1022,54 @@ impl PromptAssemblyBuilder {
         self
     }
 
+    /// Self-Learning: Set corrections section (loss-aversion guard).
+    pub fn corrections(mut self, content: impl Into<String>) -> Self {
+        self.assembly.corrections_section = Some(content.into());
+        self
+    }
+
+    /// Self-Learning: Set feedback section (quality-filtered archive).
+    pub fn feedback(mut self, content: impl Into<String>) -> Self {
+        self.assembly.feedback_section = Some(content.into());
+        self
+    }
+
+    /// Self-Learning: Set beliefs section (top-5 low-confidence inject).
+    pub fn beliefs(mut self, content: impl Into<String>) -> Self {
+        self.assembly.beliefs_section = Some(content.into());
+        self
+    }
+
+    /// Self-Learning: Set virtue logs section (weekly review).
+    pub fn virtue_logs(mut self, content: impl Into<String>) -> Self {
+        self.assembly.virtue_logs_section = Some(content.into());
+        self
+    }
+
+    /// Self-Learning: Set reflections section (daily prompt inject).
+    pub fn reflections(mut self, content: impl Into<String>) -> Self {
+        self.assembly.reflections_section = Some(content.into());
+        self
+    }
+
+    /// Self-Learning: Set mental models section (relevance query inject).
+    pub fn mental_models(mut self, content: impl Into<String>) -> Self {
+        self.assembly.mental_models_section = Some(content.into());
+        self
+    }
+
+    /// Self-Learning: Set decisions section (decision review).
+    pub fn decisions(mut self, content: impl Into<String>) -> Self {
+        self.assembly.decisions_section = Some(content.into());
+        self
+    }
+
+    /// Self-Learning: Set priority items section (belief×commitment priority scores).
+    pub fn priority_items(mut self, content: impl Into<String>) -> Self {
+        self.assembly.priority_items_section = Some(content.into());
+        self
+    }
+
     /// Build final PromptAssembly.
     pub fn build(self) -> PromptAssembly {
         self.assembly
@@ -1140,5 +1297,142 @@ mod tests {
     fn read_file_or_empty_returns_empty_for_missing() {
         let result = read_file_or_empty(Path::new("/nonexistent/file.md"));
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn signal_corrections_section() {
+        let assembly = PromptAssembly::builder()
+            .corrections("Don't use unwrap in production code")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Loss-Aversion Guard / 止损线提醒"));
+        assert!(result.contains("Don't use unwrap in production code"));
+    }
+
+    #[test]
+    fn signal_feedback_section() {
+        let assembly = PromptAssembly::builder()
+            .feedback("User prefers concise answers")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Feedback Archive / 反馈档案"));
+        assert!(result.contains("User prefers concise answers"));
+    }
+
+    #[test]
+    fn signal_beliefs_section() {
+        let assembly = PromptAssembly::builder()
+            .beliefs("Rust is the best language for CLI tools")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Active Beliefs / 当前信念"));
+        assert!(result.contains("Rust is the best language for CLI tools"));
+    }
+
+    #[test]
+    fn signal_virtue_logs_section() {
+        let assembly = PromptAssembly::builder()
+            .virtue_logs("Reviewed 3 corrections this week")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Virtue Tracking / 三省吾身"));
+        assert!(result.contains("Reviewed 3 corrections this week"));
+    }
+
+    #[test]
+    fn signal_reflections_section() {
+        let assembly = PromptAssembly::builder()
+            .reflections("Should explore more before coding")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Recent Reflections / 近期反思"));
+        assert!(result.contains("Should explore more before coding"));
+    }
+
+    #[test]
+    fn signal_mental_models_section() {
+        let assembly = PromptAssembly::builder()
+            .mental_models("First principles thinking: break down complex problems")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Relevant Mental Models / 思维模型"));
+        assert!(result.contains("First principles thinking"));
+    }
+
+    #[test]
+    fn signal_decisions_section() {
+        let assembly = PromptAssembly::builder()
+            .decisions("Chose sqlx over diesel for type-safe queries")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Decision Review / 决策复盘"));
+        assert!(result.contains("Chose sqlx over diesel"));
+    }
+
+    #[test]
+    fn signal_priority_items_section() {
+        let assembly = PromptAssembly::builder()
+            .priority_items("ship jwt (score: 0.72)")
+            .build();
+        let result = assembly.assemble();
+        assert!(result.contains("Priority Attention / 优先关注"));
+        assert!(result.contains("ship jwt (score: 0.72)"));
+    }
+
+    #[test]
+    fn signal_empty_sections_not_rendered() {
+        let assembly = PromptAssembly::builder()
+            .env_info("CWD: /test")
+            .build();
+        let result = assembly.assemble();
+        assert!(!result.contains("Self-Learning"));
+    }
+
+    #[test]
+    fn signal_all_sections_with_claude_md() {
+        let assembly = PromptAssembly::builder()
+            .env_info("CWD: /test")
+            .corrections("Correction 1")
+            .feedback("Feedback 1")
+            .beliefs("Belief 1")
+            .virtue_logs("Virtue 1")
+            .reflections("Reflection 1")
+            .mental_models("Model 1")
+            .decisions("Decision 1")
+            .priority_items("Priority 1")
+            .claude_md("AGENTS content")
+            .build();
+        let result = assembly.assemble();
+
+        // All signal headers present
+        assert!(result.contains("Loss-Aversion Guard / 止损线提醒"));
+        assert!(result.contains("Feedback Archive / 反馈档案"));
+        assert!(result.contains("Active Beliefs / 当前信念"));
+        assert!(result.contains("Virtue Tracking / 三省吾身"));
+        assert!(result.contains("Recent Reflections / 近期反思"));
+        assert!(result.contains("Relevant Mental Models / 思维模型"));
+        assert!(result.contains("Decision Review / 决策复盘"));
+        assert!(result.contains("Priority Attention / 优先关注"));
+
+        // All signal content present
+        assert!(result.contains("Correction 1"));
+        assert!(result.contains("Feedback 1"));
+        assert!(result.contains("Belief 1"));
+        assert!(result.contains("Virtue 1"));
+        assert!(result.contains("Reflection 1"));
+        assert!(result.contains("Model 1"));
+        assert!(result.contains("Decision 1"));
+        assert!(result.contains("Priority 1"));
+
+        // CLAUDE.md still present
+        assert!(result.contains("AGENTS content"));
+
+        // Verify ordering: signals before claude_md
+        let priority_pos = result.find("Priority Attention / 优先关注").unwrap();
+        let claude_pos = result.find("AGENTS content").unwrap();
+        assert!(priority_pos < claude_pos);
+
+        // Cache boundary present
+        assert!(result.contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"));
     }
 }
