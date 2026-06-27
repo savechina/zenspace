@@ -237,6 +237,40 @@ pub fn init_graph_schema(repo: &SqliteRepo) -> Result<()> {
             FOREIGN KEY (canonical_entity_id) REFERENCES entities(id)
         );
         CREATE INDEX IF NOT EXISTS idx_aliases_lookup ON entity_aliases(alias);
+
+        -- Self-model nodes with 6-layer introspective typing (Phase C3)
+        CREATE TABLE IF NOT EXISTS self_nodes (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            layer TEXT NOT NULL CHECK(layer IN (
+                'knowledge', 'skill', 'social_role', 'self_concept', 'trait', 'motivation'
+            )),
+            description TEXT NOT NULL DEFAULT '',
+            domain TEXT NOT NULL DEFAULT 'uncategorized',
+
+            -- Layer-specific fields (nullable, layer-dependent)
+            is_explicit INTEGER,                -- Knowledge only
+            sufficient_for TEXT,                 -- Skill only (JSON array of strings)
+            necessary_for TEXT,                  -- Skill only (JSON array of strings)
+            controllability REAL,                -- SocialRole only (0.0-1.0)
+            humility_score REAL,                 -- SelfConcept only (0.0-1.0, auto-computed)
+            optionality_count INTEGER,           -- Trait only
+            core_pursuit TEXT,                   -- Motivation only
+
+            -- Common metadata
+            source TEXT NOT NULL DEFAULT 'manual'
+                CHECK(source IN ('fact', 'reflection', 'antipattern', 'belief', 'manual')),
+            confidence REAL NOT NULL DEFAULT 0.5 CHECK(confidence >= 0.0 AND confidence <= 1.0),
+            evidence_refs TEXT,                  -- JSON array of entity/belief/decision IDs
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+
+            UNIQUE(name, layer)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_self_nodes_layer ON self_nodes(layer);
+        CREATE INDEX IF NOT EXISTS idx_self_nodes_humility ON self_nodes(humility_score);
+        CREATE INDEX IF NOT EXISTS idx_self_nodes_confidence ON self_nodes(confidence);
         "#,
     )
 }
