@@ -185,12 +185,8 @@ impl ZenWiring {
 
         // --- Register tools --------------------------------------------
 
-        tools.register(Arc::new(ZenToolToolAdapter::new(
-            zen_vault::Tier2Search,
-        )));
-        tools.register(Arc::new(ZenToolToolAdapter::new(
-            zen_vault::Tier4Search,
-        )));
+        tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier2Search)));
+        tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier4Search)));
         tools.register(Arc::new(ZenToolToolAdapter::new(
             zen_vault::ComputeEmbeddings,
         )));

@@ -161,7 +161,6 @@ pub struct PromptAssembly {
     pub memory: Option<String>,
 
     // -- Self-Learning Signal Sections (dynamic, after cache boundary) --
-
     /// Self-Learning: Loss-Aversion Guard — recent corrections to avoid repeating mistakes
     pub corrections_section: Option<String>,
 
@@ -1381,9 +1380,7 @@ mod tests {
 
     #[test]
     fn signal_empty_sections_not_rendered() {
-        let assembly = PromptAssembly::builder()
-            .env_info("CWD: /test")
-            .build();
+        let assembly = PromptAssembly::builder().env_info("CWD: /test").build();
         let result = assembly.assemble();
         assert!(!result.contains("Self-Learning"));
     }

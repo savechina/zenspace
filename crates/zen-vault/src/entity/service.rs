@@ -1,10 +1,13 @@
 use anyhow::Result;
 use std::collections::HashSet;
-use std::path::Path;
 
-use rusqlite::{params, OptionalExtension};
-
-use zen_repo::sqlite_repo::{SqliteRepo, init_graph_schema};
+use zen_repo::{
+    BeliefsRepo, EntitiesRepo, GoalsRepo, SelfModelRepo, SqliteClient,
+    types::{
+        InsertRelationshipRequest, UpsertBeliefNodeRequest, UpsertGoalNodeRequest,
+        UpsertPathNodeRequest,
+    },
+};
 
 use crate::maintenance::compute_embeddings_for_text;
 use crate::search::Tier3Search;
@@ -70,6 +73,112 @@ fn parse_aliases_column(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Convert a `RelationshipRow` string to a `RelationType` enum.
+fn relation_type_from_str(s: &str) -> RelationType {
+    match s {
+        "DependsOn" => RelationType::DependsOn,
+        "Implements" => RelationType::Implements,
+        "RelatedTo" => RelationType::RelatedTo,
+        "References" => RelationType::References,
+        "Contradicts" => RelationType::Contradicts,
+        "Extends" => RelationType::Extends,
+        "Uses" => RelationType::Uses,
+        "Contains" => RelationType::Contains,
+        "SelfBelieves" => RelationType::SelfBelieves,
+        "SelfAims" => RelationType::SelfAims,
+        "SelfCapableOf" => RelationType::SelfCapableOf,
+        "SelfPartOf" => RelationType::SelfPartOf,
+        "ServesGoal" => RelationType::ServesGoal,
+        "AlternativeTo" => RelationType::AlternativeTo,
+        "DecidedAbout" => RelationType::DecidedAbout,
+        "CorrectedBy" => RelationType::CorrectedBy,
+        "ExtractedFrom" => RelationType::ExtractedFrom,
+        "Supports" => RelationType::Supports,
+        _ => RelationType::RelatedTo,
+    }
+}
+
+/// Convert an `EntityRow` from the repo to the domain `Entity` type.
+fn entity_row_to_entity(row: zen_repo::types::EntityRow) -> Entity {
+    let entity_type = parse_entity_type(&row.entity_type);
+    let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    let last_updated = row
+        .last_updated
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or(created_at);
+    let aliases = parse_aliases_column(row.aliases.as_deref());
+
+    let mut entity = Entity::new(row.name, entity_type, "graph-db");
+    entity.id = row.id;
+    entity.created_at = created_at;
+    entity.last_updated = last_updated;
+    entity.domain = row.domain;
+    entity.aliases = aliases;
+    entity
+}
+
+/// Convert a `SelfNodeRow` from the repo to the domain `SelfNode` type.
+fn self_node_row_to_self_node(row: zen_repo::types::SelfNodeRow) -> super::self_node::SelfNode {
+    let layer = row
+        .layer
+        .parse()
+        .unwrap_or(super::self_node::SelfModelLayer::Knowledge);
+
+    let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    let updated_at = chrono::DateTime::parse_from_rfc3339(&row.updated_at)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    super::self_node::SelfNode {
+        id: row.id,
+        name: row.name,
+        layer,
+        description: row.description,
+        domain: row.domain,
+        is_explicit: row.is_explicit,
+        sufficient_for: row.sufficient_for,
+        necessary_for: row.necessary_for,
+        controllability: row.controllability,
+        humility_score: row.humility_score,
+        optionality_count: row.optionality_count.map(|v| v as u32),
+        core_pursuit: row.core_pursuit,
+        source: row.source,
+        confidence: row.confidence,
+        evidence_refs: row.evidence_refs,
+        created_at,
+        updated_at,
+    }
+}
+
+/// Convert a domain `SelfNode` to a `SelfNodeRow` for the repo.
+fn self_node_to_row(node: &super::self_node::SelfNode) -> zen_repo::types::SelfNodeRow {
+    zen_repo::types::SelfNodeRow {
+        id: node.id.clone(),
+        name: node.name.clone(),
+        layer: node.layer.to_string(),
+        description: node.description.clone(),
+        domain: node.domain.clone(),
+        is_explicit: node.is_explicit,
+        sufficient_for: node.sufficient_for.clone(),
+        necessary_for: node.necessary_for.clone(),
+        controllability: node.controllability,
+        humility_score: node.humility_score,
+        optionality_count: node.optionality_count.map(|v| v as i64),
+        core_pursuit: node.core_pursuit.clone(),
+        source: node.source.clone(),
+        confidence: node.confidence,
+        evidence_refs: node.evidence_refs.clone(),
+        created_at: node.created_at.to_rfc3339(),
+        updated_at: node.updated_at.to_rfc3339(),
+    }
+}
+
 /// Service for extracting entities and relationships from workspace content.
 pub struct EntityService;
 
@@ -101,250 +210,116 @@ impl EntityService {
     /// Load all known entity names from graph.db.
     /// Returns canonical names AND known aliases.
     /// Returns an empty set if the database does not exist yet.
-    pub fn load_known_entity_names(&self, db_path: &Path) -> Result<HashSet<String>> {
-        if !db_path.exists() {
-            return Ok(HashSet::new());
-        }
-        let repo = SqliteRepo::open(db_path)?;
-        let names = repo.query_map(
-            "SELECT DISTINCT name FROM entities
-             UNION
-             SELECT DISTINCT alias FROM entity_aliases",
-            &[],
-            |row| row.get::<_, String>(0),
-        )?;
+    pub async fn load_known_entity_names(&self, client: &SqliteClient) -> Result<HashSet<String>> {
+        let names = EntitiesRepo::new(client).load_known_entity_names().await?;
         Ok(names.into_iter().collect())
     }
 
     /// Upsert an entity into graph.db.
     /// Normalizes the name and checks aliases before insert.
     /// Ensures the schema exists before writing.
-    pub fn upsert_entity(&self, db_path: &Path, entity: &Entity) -> Result<()> {
-        let mut repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
+    pub async fn upsert_entity(&self, client: &SqliteClient, entity: &Entity) -> Result<()> {
+        let repo = EntitiesRepo::new(client);
 
         let canonical_name = normalize_entity_name(&entity.name);
         let type_str = format!("{:?}", entity.entity_type);
-        let first_seen = entity.created_at.to_rfc3339();
+        let created_at = entity.created_at.to_rfc3339();
         let last_updated = chrono::Utc::now().to_rfc3339();
 
         // Check if an alias already maps to a canonical entity
-        let existing_canonical: Option<String> = repo
-            .query_row(
-                "SELECT canonical_entity_id FROM entity_aliases WHERE alias = ?1",
-                params![canonical_name],
-                |row| row.get(0),
-            )
-            .ok();
+        let existing_canonical = repo.resolve_alias(&canonical_name).await?;
 
         if let Some(canonical_id) = existing_canonical {
             // Alias found — just update last_updated on the canonical entity
-            repo.execute(
-                "UPDATE entities SET last_updated = ?1 WHERE id = ?2",
-                params![last_updated, canonical_id],
-            )?;
+            repo.update_entity_timestamp(&canonical_id, &last_updated).await?;
             return Ok(());
         }
 
         // No alias match — insert the entity with normalized name
-        let tx = repo.transaction()?;
-        tx.execute(
-            "INSERT INTO entities (id, name, entity_type, first_seen, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(name, entity_type) DO UPDATE SET last_updated = ?5",
-            params![entity.id, canonical_name, type_str, first_seen, last_updated],
-        )?;
+        repo.upsert_entity(
+            &entity.id,
+            &canonical_name,
+            &type_str,
+            &created_at,
+            &last_updated,
+        )
+        .await?;
 
         // Register the alias (INSERT OR IGNORE in case of concurrent insert)
-        tx.execute(
-            "INSERT OR IGNORE INTO entity_aliases (alias, canonical_entity_id)
-             VALUES (?1, ?2)",
-            params![canonical_name, entity.id],
-        )?;
+        repo.insert_alias(&canonical_name, &entity.id).await?;
 
-        tx.commit()?;
         Ok(())
     }
 
     /// Insert a relationship into graph.db.
     /// Confidence defaults to 0.8 for auto-extracted edges.
-    pub fn insert_relationship(&self, db_path: &Path, rel: &Relationship) -> Result<()> {
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
+    pub async fn insert_relationship(&self, client: &SqliteClient, rel: &Relationship) -> Result<()> {
         let type_str = format!("{:?}", rel.relation_type);
         let created = rel.created_at.to_rfc3339();
-        repo.execute(
-            "INSERT INTO relationships
-                (id, source_entity_id, target_entity_id, relation_type, confidence, source_note_ids, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                rel.id,
-                rel.source_entity_id,
-                rel.target_entity_id,
-                type_str,
-                0.8f64,
-                rel.source_note_id,
-                created,
-            ],
-        )?;
+
+        EntitiesRepo::new(client)
+            .insert_relationship(&InsertRelationshipRequest {
+                id: &rel.id,
+                source_id: &rel.source_entity_id,
+                target_id: &rel.target_entity_id,
+                rel_type: &type_str,
+                confidence: 0.8,
+                source_note_ids: Some(&rel.source_note_id),
+                created_at: &created,
+            })
+            .await?;
         Ok(())
     }
 
-    /// Compute a 384-dim embedding for entity text and store in vec.db.
+    /// Compute a 384-dim embedding for entity text and store in state.db.
     /// Falls back to hash-based embedding when no LLM provider is available.
     /// Fails gracefully (returns Err) if the vec0 extension is not loaded.
-    pub fn store_entity_embedding(
+    pub async fn store_entity_embedding(
         &self,
-        vec_db_path: &Path,
+        client: &zen_repo::SqliteClient,
         entity_id: &str,
         text: &str,
     ) -> Result<()> {
         let embedding = compute_embeddings_for_text(text)?;
-        Tier3Search.insert_entity_embedding(vec_db_path, entity_id, &embedding)
+        Tier3Search
+            .insert_entity_embedding(client, entity_id, &embedding)
+            .await
     }
 
-    pub fn load_all_entities(&self, db_path: &Path) -> Result<Vec<Entity>> {
-        if !db_path.exists() {
-            return Ok(Vec::new());
-        }
-        let repo = SqliteRepo::open(db_path)?;
-        let rows = repo.query_map(
-            "SELECT id, name, entity_type, first_seen, domain, aliases, last_updated \
-             FROM entities ORDER BY name",
-            &[],
-            |row| {
-                let id: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let type_str: String = row.get(2)?;
-                let first_seen: String = row.get(3)?;
-                let domain: Option<String> = row.get(4)?;
-                let aliases_raw: Option<String> = row.get(5)?;
-                let last_updated: Option<String> = row.get(6)?;
-
-                let entity_type = parse_entity_type(&type_str);
-                let created_at = chrono::DateTime::parse_from_rfc3339(&first_seen)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now());
-                let updated_at = last_updated
-                    .as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or(created_at);
-
-                let aliases = parse_aliases_column(aliases_raw.as_deref());
-
-                let mut entity = Entity::new(name, entity_type, "graph-db");
-                entity.id = id;
-                entity.created_at = created_at;
-                entity.last_updated = updated_at;
-                entity.domain = domain;
-                entity.aliases = aliases;
-                Ok(entity)
-            },
-        )?;
-        Ok(rows)
+    pub async fn load_all_entities(&self, client: &SqliteClient) -> Result<Vec<Entity>> {
+        let rows = EntitiesRepo::new(client).load_all_entities().await?;
+        Ok(rows.into_iter().map(entity_row_to_entity).collect())
     }
 
     /// Load entities that have been updated since the given timestamp.
     /// Used by incremental wiki compilation.
-    pub fn load_entities_updated_since(
+    pub async fn load_entities_updated_since(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<Entity>> {
-        if !db_path.exists() {
-            return Ok(Vec::new());
-        }
-        let repo = SqliteRepo::open(db_path)?;
         let since_str = since.to_rfc3339();
-        let rows = repo.query_map(
-            "SELECT id, name, entity_type, first_seen, domain, aliases, last_updated \
-             FROM entities WHERE last_updated > ?1 ORDER BY name",
-            rusqlite::params![since_str],
-            |row| {
-                let id: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let type_str: String = row.get(2)?;
-                let first_seen: String = row.get(3)?;
-                let domain: Option<String> = row.get(4)?;
-                let aliases_raw: Option<String> = row.get(5)?;
-                let last_updated: Option<String> = row.get(6)?;
-
-                let entity_type = parse_entity_type(&type_str);
-                let created_at = chrono::DateTime::parse_from_rfc3339(&first_seen)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now());
-                let updated_at = last_updated
-                    .as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or(created_at);
-
-                let aliases = parse_aliases_column(aliases_raw.as_deref());
-
-                let mut entity = Entity::new(name, entity_type, "graph-db");
-                entity.id = id;
-                entity.created_at = created_at;
-                entity.last_updated = updated_at;
-                entity.domain = domain;
-                entity.aliases = aliases;
-                Ok(entity)
-            },
-        )?;
-        Ok(rows)
+        let rows = EntitiesRepo::new(client)
+            .load_entities_updated_since(&since_str)
+            .await?;
+        Ok(rows.into_iter().map(entity_row_to_entity).collect())
     }
 
-    pub fn load_relationships_for_entity(
+    pub async fn load_relationships_for_entity(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         entity_id: &str,
     ) -> Result<Vec<(String, RelationType)>> {
-        if !db_path.exists() {
-            return Ok(Vec::new());
-        }
-        let repo = SqliteRepo::open(db_path)?;
-        let rows: Vec<(String, RelationType)> = repo.query_map(
-            "SELECT target_entity_id, relation_type FROM relationships WHERE source_entity_id = ?1",
-            params![entity_id],
-            |row| {
-                let target_id: String = row.get(0)?;
-                let rel_str: String = row.get(1)?;
-                let rt = match rel_str.as_str() {
-                    "DependsOn" => RelationType::DependsOn,
-                    "Implements" => RelationType::Implements,
-                    "RelatedTo" => RelationType::RelatedTo,
-                    "References" => RelationType::References,
-                    "Contradicts" => RelationType::Contradicts,
-                    "Extends" => RelationType::Extends,
-                    "Uses" => RelationType::Uses,
-                    "Contains" => RelationType::Contains,
-                    "SelfBelieves" => RelationType::SelfBelieves,
-                    "SelfAims" => RelationType::SelfAims,
-                    "SelfCapableOf" => RelationType::SelfCapableOf,
-                    "SelfPartOf" => RelationType::SelfPartOf,
-                    "ServesGoal" => RelationType::ServesGoal,
-                    "AlternativeTo" => RelationType::AlternativeTo,
-                    "DecidedAbout" => RelationType::DecidedAbout,
-                    "CorrectedBy" => RelationType::CorrectedBy,
-                    "ExtractedFrom" => RelationType::ExtractedFrom,
-                    "Supports" => RelationType::Supports,
-                    _ => RelationType::RelatedTo,
-                };
-                Ok((target_id, rt))
-            },
-        )?;
+        let repo = EntitiesRepo::new(client);
+        let rows = repo.load_relationships(entity_id).await?;
 
         let mut result = Vec::new();
-        for (target_id, rt) in rows {
+        for row in rows {
+            let rt = relation_type_from_str(&row.relation_type);
             let target_name = repo
-                .query_map(
-                    "SELECT name FROM entities WHERE id = ?1",
-                    params![target_id],
-                    |row| row.get::<_, String>(0),
-                )?
-                .into_iter()
-                .next()
-                .unwrap_or(target_id);
+                .entity_name(&row.target_entity_id)
+                .await?
+                .unwrap_or(row.target_entity_id);
             result.push((target_name, rt));
         }
         Ok(result)
@@ -354,9 +329,9 @@ impl EntityService {
     /// This enables graph-based queries for self-knowledge.
     ///
     /// `layer` is one of: "Knowledge", "Skill", "SocialRole", "SelfConcept", "Trait", "Motivation"
-    pub fn upsert_self_model_entity(
+    pub async fn upsert_self_model_entity(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
         name: &str,
         layer: &str,
@@ -372,196 +347,45 @@ impl EntityService {
                 .metadata
                 .insert("domain".to_string(), d.to_string());
         }
-        self.upsert_entity(db_path, &entity)
+        self.upsert_entity(client, &entity).await
     }
 
     /// Upserts a SelfNode into the dedicated self_nodes table.
     /// This is the Phase C3 implementation with typed columns for 6-layer introspective typing.
-    pub fn upsert_self_node(
+    pub async fn upsert_self_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         node: &super::self_node::SelfNode,
     ) -> Result<()> {
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
-
-        let is_explicit = node.is_explicit.map(|b| b as i32);
-        let sufficient_for = serde_json::to_string(&node.sufficient_for).unwrap_or_default();
-        let necessary_for = serde_json::to_string(&node.necessary_for).unwrap_or_default();
-        let evidence_refs = serde_json::to_string(&node.evidence_refs).unwrap_or_default();
-
-        repo.conn().execute(
-            "INSERT OR REPLACE INTO self_nodes (
-                id, name, layer, description, domain,
-                is_explicit, sufficient_for, necessary_for, controllability,
-                humility_score, optionality_count, core_pursuit,
-                source, confidence, evidence_refs, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            params![
-                node.id,
-                node.name,
-                node.layer.to_string(),
-                node.description,
-                node.domain,
-                is_explicit,
-                sufficient_for,
-                necessary_for,
-                node.controllability,
-                node.humility_score,
-                node.optionality_count,
-                node.core_pursuit,
-                node.source,
-                node.confidence,
-                evidence_refs,
-                node.created_at.to_rfc3339(),
-                node.updated_at.to_rfc3339(),
-            ],
-        )?;
-
+        let row = self_node_to_row(node);
+        SelfModelRepo::new(client).upsert(&row).await?;
         Ok(())
     }
 
     /// Loads all SelfNodes from the self_nodes table.
-    pub fn load_self_nodes(&self, db_path: &Path) -> Result<Vec<super::self_node::SelfNode>> {
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
-
-        let mut stmt = repo.conn().prepare(
-            "SELECT id, name, layer, description, domain,
-                    is_explicit, sufficient_for, necessary_for, controllability,
-                    humility_score, optionality_count, core_pursuit,
-                    source, confidence, evidence_refs, created_at, updated_at
-             FROM self_nodes ORDER BY name"
-        )?;
-
-        let nodes = stmt.query_map([], |row| {
-            let layer_str: String = row.get(2)?;
-            let layer = layer_str.parse().unwrap_or(super::self_node::SelfModelLayer::Knowledge);
-
-            let is_explicit_i32: Option<i32> = row.get(5)?;
-            let is_explicit = is_explicit_i32.map(|b| b != 0);
-
-            let sufficient_for_str: String = row.get(6)?;
-            let sufficient_for: Vec<String> = serde_json::from_str(&sufficient_for_str).unwrap_or_default();
-
-            let necessary_for_str: String = row.get(7)?;
-            let necessary_for: Vec<String> = serde_json::from_str(&necessary_for_str).unwrap_or_default();
-
-            let evidence_refs_str: String = row.get(14)?;
-            let evidence_refs: Vec<String> = serde_json::from_str(&evidence_refs_str).unwrap_or_default();
-
-            let created_at_str: String = row.get(15)?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
-
-            let updated_at_str: String = row.get(16)?;
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
-
-            Ok(super::self_node::SelfNode {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                layer,
-                description: row.get(3)?,
-                domain: row.get(4)?,
-                is_explicit,
-                sufficient_for,
-                necessary_for,
-                controllability: row.get(8)?,
-                humility_score: row.get(9)?,
-                optionality_count: row.get(10)?,
-                core_pursuit: row.get(11)?,
-                source: row.get(12)?,
-                confidence: row.get(13)?,
-                evidence_refs,
-                created_at,
-                updated_at,
-            })
-        })?;
-
-        let mut result = Vec::new();
-        for node in nodes {
-            result.push(node?);
-        }
-        Ok(result)
+    pub async fn load_self_nodes(
+        &self,
+        client: &SqliteClient,
+    ) -> Result<Vec<super::self_node::SelfNode>> {
+        let rows = SelfModelRepo::new(client).load_all().await?;
+        Ok(rows.into_iter().map(self_node_row_to_self_node).collect())
     }
 
     /// Loads SelfNodes filtered by layer from the self_nodes table.
-    pub fn load_self_nodes_by_layer(
+    pub async fn load_self_nodes_by_layer(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         layer: &super::self_node::SelfModelLayer,
     ) -> Result<Vec<super::self_node::SelfNode>> {
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
-
-        let mut stmt = repo.conn().prepare(
-            "SELECT id, name, layer, description, domain,
-                    is_explicit, sufficient_for, necessary_for, controllability,
-                    humility_score, optionality_count, core_pursuit,
-                    source, confidence, evidence_refs, created_at, updated_at
-             FROM self_nodes WHERE layer = ?1 ORDER BY name"
-        )?;
-
-        let nodes = stmt.query_map([layer.to_string().as_str()], |row| {
-            let layer_str: String = row.get(2)?;
-            let layer = layer_str.parse().unwrap_or(super::self_node::SelfModelLayer::Knowledge);
-
-            let is_explicit_i32: Option<i32> = row.get(5)?;
-            let is_explicit = is_explicit_i32.map(|b| b != 0);
-
-            let sufficient_for_str: String = row.get(6)?;
-            let sufficient_for: Vec<String> = serde_json::from_str(&sufficient_for_str).unwrap_or_default();
-
-            let necessary_for_str: String = row.get(7)?;
-            let necessary_for: Vec<String> = serde_json::from_str(&necessary_for_str).unwrap_or_default();
-
-            let evidence_refs_str: String = row.get(14)?;
-            let evidence_refs: Vec<String> = serde_json::from_str(&evidence_refs_str).unwrap_or_default();
-
-            let created_at_str: String = row.get(15)?;
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
-
-            let updated_at_str: String = row.get(16)?;
-            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at_str)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
-
-            Ok(super::self_node::SelfNode {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                layer,
-                description: row.get(3)?,
-                domain: row.get(4)?,
-                is_explicit,
-                sufficient_for,
-                necessary_for,
-                controllability: row.get(8)?,
-                humility_score: row.get(9)?,
-                optionality_count: row.get(10)?,
-                core_pursuit: row.get(11)?,
-                source: row.get(12)?,
-                confidence: row.get(13)?,
-                evidence_refs,
-                created_at,
-                updated_at,
-            })
-        })?;
-
-        let mut result = Vec::new();
-        for node in nodes {
-            result.push(node?);
-        }
-        Ok(result)
+        let rows = SelfModelRepo::new(client)
+            .load_by_layer(&layer.to_string())
+            .await?;
+        Ok(rows.into_iter().map(self_node_row_to_self_node).collect())
     }
 
-    pub fn upsert_goal_node(
+    pub async fn upsert_goal_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
         name: &str,
         controllability: f64,
@@ -581,24 +405,27 @@ impl EntityService {
                 .metadata
                 .insert("deadline".to_string(), d.to_string());
         }
-        self.upsert_entity(db_path, &entity)?;
+        self.upsert_entity(client, &entity).await?;
 
         // Also write to dedicated goal_nodes table
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
         let now = chrono::Utc::now().to_rfc3339();
-        repo.conn().execute(
-            "INSERT OR REPLACE INTO goal_nodes (id, name, controllability, core_pursuit, deadline, created_at, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![id, name, controllability, core_pursuit, deadline, now],
-        )?;
+        GoalsRepo::new(client)
+            .upsert_goal(&UpsertGoalNodeRequest {
+                id,
+                name,
+                controllability,
+                core_pursuit,
+                deadline,
+                now: &now,
+            })
+            .await?;
 
         Ok(())
     }
 
-    pub fn upsert_decision_node(
+    pub async fn upsert_decision_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
         name: &str,
         goal: &str,
@@ -618,13 +445,13 @@ impl EntityService {
                 .metadata
                 .insert("outcome_status".to_string(), status.to_string());
         }
-        self.upsert_entity(db_path, &entity)
+        self.upsert_entity(client, &entity).await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn upsert_belief_node(
+    pub async fn upsert_belief_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
         name: &str,
         proposition: &str,
@@ -646,25 +473,29 @@ impl EntityService {
         entity
             .metadata
             .insert("evidence_count".to_string(), evidence_count.to_string());
-        self.upsert_entity(db_path, &entity)?;
+        self.upsert_entity(client, &entity).await?;
 
         // Also write to dedicated belief_nodes table
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
         let now = chrono::Utc::now().to_rfc3339();
-        repo.conn().execute(
-            "INSERT OR REPLACE INTO belief_nodes (id, name, proposition, prior, posterior, evidence_count, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, name, proposition, prior, posterior, evidence_count, now],
-        )?;
+        BeliefsRepo::new(client)
+            .upsert(&UpsertBeliefNodeRequest {
+                id,
+                name,
+                proposition,
+                prior,
+                posterior,
+                evidence_count,
+                now: &now,
+            })
+            .await?;
 
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn upsert_path_node(
+    pub async fn upsert_path_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
         name: &str,
         serves_goal: &str,
@@ -686,28 +517,32 @@ impl EntityService {
         entity
             .metadata
             .insert("alternatives".to_string(), alternatives.to_string());
-        self.upsert_entity(db_path, &entity)?;
+        self.upsert_entity(client, &entity).await?;
 
         // Also write to dedicated path_nodes table
-        let goal_entities = self.load_all_entities(db_path)?;
+        let goal_entities = self.load_all_entities(client).await?;
         let goal_id = goal_entities
             .iter()
             .find(|e| e.name == normalize_entity_name(serves_goal) && e.entity_type == EntityType::Goal)
             .map(|e| e.id.clone());
 
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
         let now = chrono::Utc::now().to_rfc3339();
-        repo.conn().execute(
-            "INSERT OR REPLACE INTO path_nodes (id, name, serves_goal_id, is_default, crowdedness, alternatives, created_at, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![id, name, goal_id, is_default as i32, crowdedness, alternatives, now],
-        )?;
+        GoalsRepo::new(client)
+            .upsert_path(&UpsertPathNodeRequest {
+                id,
+                name,
+                serves_goal_id: goal_id.as_deref(),
+                is_default,
+                crowdedness,
+                alternatives,
+                now: &now,
+            })
+            .await?;
 
         // Create ServesGoal relationship from this path to the goal
         if let Some(goal) = goal_entities.iter().find(|e| e.name == normalize_entity_name(serves_goal)) {
             let rel = Relationship::new(id, goal.id.clone(), RelationType::ServesGoal, "path-model");
-            self.insert_relationship(db_path, &rel)?;
+            self.insert_relationship(client, &rel).await?;
         }
 
         Ok(())
@@ -715,83 +550,35 @@ impl EntityService {
 
     /// Loads a goal node from the goal_nodes table.
     #[allow(clippy::type_complexity)]
-    pub fn load_goal_node(
+    pub async fn load_goal_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
     ) -> Result<Option<(String, f64, String, Option<String>)>> {
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
-
-        let mut stmt = repo.conn().prepare(
-            "SELECT name, controllability, core_pursuit, deadline FROM goal_nodes WHERE id = ?1"
-        )?;
-
-        let result = stmt.query_row(params![id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        }).optional()?;
-
-        Ok(result)
+        let row = GoalsRepo::new(client).load_goal(id).await?;
+        Ok(row.map(|r| (r.name, r.controllability, r.core_pursuit, r.deadline)))
     }
 
     /// Loads a path node from the path_nodes table.
     #[allow(clippy::type_complexity)]
-    pub fn load_path_node(
+    pub async fn load_path_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
     ) -> Result<Option<(String, String, bool, f64, String)>> {
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
-
-        let mut stmt = repo.conn().prepare(
-            "SELECT name, serves_goal_id, is_default, crowdedness, alternatives FROM path_nodes WHERE id = ?1"
-        )?;
-
-        let result = stmt.query_row(params![id], |row| {
-            let is_default_i32: i32 = row.get(2)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                is_default_i32 != 0,
-                row.get::<_, f64>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        }).optional()?;
-
-        Ok(result)
+        let row = GoalsRepo::new(client).load_path(id).await?;
+        Ok(row.map(|r| (r.name, r.serves_goal_id.unwrap_or_default(), r.is_default, r.crowdedness, r.alternatives)))
     }
 
     /// Loads a belief node from the belief_nodes table.
     #[allow(clippy::type_complexity)]
-    pub fn load_belief_node(
+    pub async fn load_belief_node(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
     ) -> Result<Option<(String, String, f64, f64, usize)>> {
-        let repo = SqliteRepo::open(db_path)?;
-        init_graph_schema(&repo)?;
-
-        let mut stmt = repo.conn().prepare(
-            "SELECT name, proposition, prior, posterior, evidence_count FROM belief_nodes WHERE id = ?1"
-        )?;
-
-        let result = stmt.query_row(params![id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, usize>(4)?,
-            ))
-        }).optional()?;
-
-        Ok(result)
+        let row = BeliefsRepo::new(client).load(id).await?;
+        Ok(row.map(|r| (r.name, r.proposition, r.prior, r.posterior, r.evidence_count as usize)))
     }
 }
 
@@ -820,46 +607,36 @@ mod tests {
         assert_eq!(normalize_entity_name(combining), normalize_entity_name(precomposed));
     }
 
-    #[test]
-    fn test_alias_resolution() {
+    #[tokio::test]
+    async fn test_alias_resolution() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
 
         let service = EntityService::new();
 
         // Create first entity with name "Rust"
         let mut entity1 = Entity::new("Rust", super::super::entity::EntityType::Technology, "note1");
         entity1.id = "entity-rust-1".to_string();
-        service.upsert_entity(&db_path, &entity1).unwrap();
+        service.upsert_entity(&client, &entity1).await.unwrap();
 
         // Create second entity with name "rust" — should resolve to the same entity
         let mut entity2 = Entity::new("rust", super::super::entity::EntityType::Technology, "note2");
         entity2.id = "entity-rust-2".to_string();
-        service.upsert_entity(&db_path, &entity2).unwrap();
+        service.upsert_entity(&client, &entity2).await.unwrap();
 
         // Verify: only one entity exists (the canonical one)
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let count: i32 = repo
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE name = 'rust'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
+        let entities_repo = EntitiesRepo::new(&client);
+        let entities = entities_repo.load_all_entities().await.unwrap();
+        let rust_count = entities.iter().filter(|e| e.name == "rust").count();
+        assert_eq!(rust_count, 1);
 
         // Verify alias exists
-        let alias_count: i32 = repo
-            .query_row(
-                "SELECT COUNT(*) FROM entity_aliases WHERE alias = 'rust'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(alias_count, 1);
+        let alias_resolved = entities_repo.resolve_alias("rust").await.unwrap();
+        assert!(alias_resolved.is_some());
 
         // Verify load_known_entity_names includes the canonical name
-        let names = service.load_known_entity_names(&db_path).unwrap();
+        let names = service.load_known_entity_names(&client).await.unwrap();
         assert!(names.contains("rust"));
     }
 
@@ -917,96 +694,95 @@ mod tests {
         assert_eq!(roundtripped, RelationType::SelfBelieves);
     }
 
-    #[test]
-    fn test_upsert_self_model_entity() {
+    #[tokio::test]
+    async fn test_upsert_self_model_entity() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
             .upsert_self_model_entity(
-                &db_path,
+                &client,
                 "sm-1",
                 "Rust Proficiency",
                 "Skill",
                 Some("programming"),
             )
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].id, "sm-1");
         assert_eq!(entities[0].name, "rust proficiency");
         assert_eq!(entities[0].entity_type, EntityType::SelfModel);
     }
 
-    #[test]
-    fn test_upsert_self_model_entity_without_domain() {
+    #[tokio::test]
+    async fn test_upsert_self_model_entity_without_domain() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
             .upsert_self_model_entity(
-                &db_path,
+                &client,
                 "sm-2",
                 "Curiosity",
                 "Trait",
                 None,
             )
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].entity_type, EntityType::SelfModel);
         assert_eq!(entities[0].name, "curiosity");
 
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let stored_type: String = repo
-            .query_row(
-                "SELECT entity_type FROM entities WHERE id = 'sm-2'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored_type, "SelfModel");
+        let entities_repo = EntitiesRepo::new(&client);
+        let all = entities_repo.load_all_entities().await.unwrap();
+        let stored = all.iter().find(|e| e.id == "sm-2").unwrap();
+        assert_eq!(stored.entity_type, "SelfModel");
     }
 
-    #[test]
-    fn test_upsert_self_model_entity_idempotent() {
+    #[tokio::test]
+    async fn test_upsert_self_model_entity_idempotent() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_self_model_entity(&db_path, "sm-3", "Writing", "Skill", None)
+            .upsert_self_model_entity(&client, "sm-3", "Writing", "Skill", None)
+            .await
             .unwrap();
         service
-            .upsert_self_model_entity(&db_path, "sm-3", "Writing", "Skill", None)
+            .upsert_self_model_entity(&client, "sm-3", "Writing", "Skill", None)
+            .await
             .unwrap();
 
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let count: i32 = repo
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE id = 'sm-3'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let entities_repo = EntitiesRepo::new(&client);
+        let all = entities_repo.load_all_entities().await.unwrap();
+        let count = all.iter().filter(|e| e.id == "sm-3").count();
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn test_self_model_entity_loads_correct_type() {
+    #[tokio::test]
+    async fn test_self_model_entity_loads_correct_type() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_self_model_entity(&db_path, "sm-4", "Empathy", "Trait", Some("social"))
+            .upsert_self_model_entity(&client, "sm-4", "Empathy", "Trait", Some("social"))
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         let entity = &entities[0];
         assert_eq!(entity.entity_type, EntityType::SelfModel);
 
@@ -1015,165 +791,171 @@ mod tests {
         assert_eq!(reparsed, EntityType::SelfModel);
     }
 
-    #[test]
-    fn test_upsert_goal_node() {
+    #[tokio::test]
+    async fn test_upsert_goal_node() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_goal_node(&db_path, "g-1", "Learn Rust", 0.8, "mastery", Some("2026-12-31"))
+            .upsert_goal_node(&client, "g-1", "Learn Rust", 0.8, "mastery", Some("2026-12-31"))
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].id, "g-1");
         assert_eq!(entities[0].name, "learn rust");
         assert_eq!(entities[0].entity_type, EntityType::Goal);
     }
 
-    #[test]
-    fn test_upsert_goal_node_without_deadline() {
+    #[tokio::test]
+    async fn test_upsert_goal_node_without_deadline() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_goal_node(&db_path, "g-2", "Ship Feature", 0.5, "delivery", None)
+            .upsert_goal_node(&client, "g-2", "Ship Feature", 0.5, "delivery", None)
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].entity_type, EntityType::Goal);
     }
 
-    #[test]
-    fn test_upsert_goal_node_metadata() {
+    #[tokio::test]
+    async fn test_upsert_goal_node_metadata() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_goal_node(&db_path, "g-3", "Run Marathon", 0.9, "fitness", Some("2027-06-01"))
+            .upsert_goal_node(&client, "g-3", "Run Marathon", 0.9, "fitness", Some("2027-06-01"))
+            .await
             .unwrap();
 
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let stored_type: String = repo
-            .query_row(
-                "SELECT entity_type FROM entities WHERE id = 'g-3'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored_type, "Goal");
+        let entities_repo = EntitiesRepo::new(&client);
+        let all = entities_repo.load_all_entities().await.unwrap();
+        let stored = all.iter().find(|e| e.id == "g-3").unwrap();
+        assert_eq!(stored.entity_type, "Goal");
     }
 
-    #[test]
-    fn test_upsert_goal_node_idempotent() {
+    #[tokio::test]
+    async fn test_upsert_goal_node_idempotent() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_goal_node(&db_path, "g-4", "Write Book", 0.6, "creative", None)
+            .upsert_goal_node(&client, "g-4", "Write Book", 0.6, "creative", None)
+            .await
             .unwrap();
         service
-            .upsert_goal_node(&db_path, "g-4", "Write Book", 0.6, "creative", None)
+            .upsert_goal_node(&client, "g-4", "Write Book", 0.6, "creative", None)
+            .await
             .unwrap();
 
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let count: i32 = repo
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE id = 'g-4'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let entities_repo = EntitiesRepo::new(&client);
+        let all = entities_repo.load_all_entities().await.unwrap();
+        let count = all.iter().filter(|e| e.id == "g-4").count();
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn test_upsert_path_node() {
+    #[tokio::test]
+    async fn test_upsert_path_node() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_goal_node(&db_path, "g-5", "Learn Rust", 0.8, "mastery", None)
+            .upsert_goal_node(&client, "g-5", "Learn Rust", 0.8, "mastery", None)
+            .await
             .unwrap();
 
         service
-            .upsert_path_node(&db_path, "p-1", "Online Courses", "Learn Rust", true, 0.3, "")
+            .upsert_path_node(&client, "p-1", "Online Courses", "Learn Rust", true, 0.3, "")
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 2);
         let path = entities.iter().find(|e| e.id == "p-1").unwrap();
         assert_eq!(path.entity_type, EntityType::Path);
         assert_eq!(path.name, "online courses");
     }
 
-    #[test]
-    fn test_upsert_path_node_creates_serves_goal_relationship() {
+    #[tokio::test]
+    async fn test_upsert_path_node_creates_serves_goal_relationship() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_goal_node(&db_path, "g-6", "Master Cooking", 0.7, "hobby", None)
+            .upsert_goal_node(&client, "g-6", "Master Cooking", 0.7, "hobby", None)
+            .await
             .unwrap();
         service
-            .upsert_path_node(&db_path, "p-2", "Cooking Classes", "Master Cooking", false, 0.8, "")
+            .upsert_path_node(&client, "p-2", "Cooking Classes", "Master Cooking", false, 0.8, "")
+            .await
             .unwrap();
 
-        let rels = service.load_relationships_for_entity(&db_path, "p-2").unwrap();
+        let rels = service.load_relationships_for_entity(&client, "p-2").await.unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].1, RelationType::ServesGoal);
         assert_eq!(rels[0].0, "master cooking");
     }
 
-    #[test]
-    fn test_upsert_path_node_without_existing_goal() {
+    #[tokio::test]
+    async fn test_upsert_path_node_without_existing_goal() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_path_node(&db_path, "p-3", "Mentorship", "Nonexistent Goal", true, 0.5, "")
+            .upsert_path_node(&client, "p-3", "Mentorship", "Nonexistent Goal", true, 0.5, "")
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].entity_type, EntityType::Path);
 
-        let rels = service.load_relationships_for_entity(&db_path, "p-3").unwrap();
+        let rels = service.load_relationships_for_entity(&client, "p-3").await.unwrap();
         assert!(rels.is_empty());
     }
 
-    #[test]
-    fn test_upsert_path_node_idempotent() {
+    #[tokio::test]
+    async fn test_upsert_path_node_idempotent() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_goal_node(&db_path, "g-7", "Get Fit", 0.9, "health", None)
+            .upsert_goal_node(&client, "g-7", "Get Fit", 0.9, "health", None)
+            .await
             .unwrap();
         service
-            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6, "")
+            .upsert_path_node(&client, "p-4", "Gym", "Get Fit", true, 0.6, "")
+            .await
             .unwrap();
         service
-            .upsert_path_node(&db_path, "p-4", "Gym", "Get Fit", true, 0.6, "")
+            .upsert_path_node(&client, "p-4", "Gym", "Get Fit", true, 0.6, "")
+            .await
             .unwrap();
 
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let count: i32 = repo
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE id = 'p-4'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let entities_repo = EntitiesRepo::new(&client);
+        let all = entities_repo.load_all_entities().await.unwrap();
+        let count = all.iter().filter(|e| e.id == "p-4").count();
         assert_eq!(count, 1);
     }
 
@@ -1212,85 +994,88 @@ mod tests {
         assert_eq!(parse_entity_type("bogus"), None);
     }
 
-    #[test]
-    fn test_upsert_decision_node() {
+    #[tokio::test]
+    async fn test_upsert_decision_node() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
             .upsert_decision_node(
-                &db_path,
+                &client,
                 "d-1",
                 "Choose Framework",
                 "Build web app",
                 "React",
                 Some("executed"),
             )
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].id, "d-1");
         assert_eq!(entities[0].name, "choose framework");
         assert_eq!(entities[0].entity_type, EntityType::Decision);
     }
 
-    #[test]
-    fn test_upsert_decision_node_without_outcome() {
+    #[tokio::test]
+    async fn test_upsert_decision_node_without_outcome() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
             .upsert_decision_node(
-                &db_path,
+                &client,
                 "d-2",
                 "Pick Language",
                 "Write CLI",
                 "Rust",
                 None,
             )
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].entity_type, EntityType::Decision);
     }
 
-    #[test]
-    fn test_upsert_decision_node_idempotent() {
+    #[tokio::test]
+    async fn test_upsert_decision_node_idempotent() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_decision_node(&db_path, "d-3", "Deploy", "Ship", "AWS", Some("done"))
+            .upsert_decision_node(&client, "d-3", "Deploy", "Ship", "AWS", Some("done"))
+            .await
             .unwrap();
         service
-            .upsert_decision_node(&db_path, "d-3", "Deploy", "Ship", "AWS", Some("done"))
+            .upsert_decision_node(&client, "d-3", "Deploy", "Ship", "AWS", Some("done"))
+            .await
             .unwrap();
 
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let count: i32 = repo
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE id = 'd-3'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let entities_repo = EntitiesRepo::new(&client);
+        let all = entities_repo.load_all_entities().await.unwrap();
+        let count = all.iter().filter(|e| e.id == "d-3").count();
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn test_upsert_belief_node() {
+    #[tokio::test]
+    async fn test_upsert_belief_node() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
             .upsert_belief_node(
-                &db_path,
+                &client,
                 "b-1",
                 "Rust is fast",
                 "Rust has zero-cost abstractions",
@@ -1298,36 +1083,35 @@ mod tests {
                 0.95,
                 12,
             )
+            .await
             .unwrap();
 
-        let entities = service.load_all_entities(&db_path).unwrap();
+        let entities = service.load_all_entities(&client).await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].id, "b-1");
         assert_eq!(entities[0].name, "rust is fast");
         assert_eq!(entities[0].entity_type, EntityType::Belief);
     }
 
-    #[test]
-    fn test_upsert_belief_node_idempotent() {
+    #[tokio::test]
+    async fn test_upsert_belief_node_idempotent() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         service
-            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
+            .upsert_belief_node(&client, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
+            .await
             .unwrap();
         service
-            .upsert_belief_node(&db_path, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
+            .upsert_belief_node(&client, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
+            .await
             .unwrap();
 
-        let repo = SqliteRepo::open(&db_path).unwrap();
-        let count: i32 = repo
-            .query_row(
-                "SELECT COUNT(*) FROM entities WHERE id = 'b-2'",
-                &[],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let entities_repo = EntitiesRepo::new(&client);
+        let all = entities_repo.load_all_entities().await.unwrap();
+        let count = all.iter().filter(|e| e.id == "b-2").count();
         assert_eq!(count, 1);
     }
 
@@ -1362,10 +1146,11 @@ mod tests {
         assert_eq!(parse_entity_type("decision"), Some(EntityType::Decision));
     }
 
-    #[test]
-    fn test_upsert_and_load_self_node() {
+    #[tokio::test]
+    async fn test_upsert_and_load_self_node() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         let mut node = crate::entity::self_node::SelfNode::new(
@@ -1378,9 +1163,9 @@ mod tests {
         node.confidence = 0.9;
         node.source = "fact".to_string();
 
-        service.upsert_self_node(&db_path, &node).unwrap();
+        service.upsert_self_node(&client, &node).await.unwrap();
 
-        let loaded = service.load_self_nodes(&db_path).unwrap();
+        let loaded = service.load_self_nodes(&client).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "sn-1");
         assert_eq!(loaded[0].name, "knows GTD");
@@ -1390,10 +1175,11 @@ mod tests {
         assert_eq!(loaded[0].source, "fact");
     }
 
-    #[test]
-    fn test_load_self_nodes_by_layer() {
+    #[tokio::test]
+    async fn test_load_self_nodes_by_layer() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         let k1 = crate::entity::self_node::SelfNode::new(
@@ -1415,26 +1201,29 @@ mod tests {
             "programming".to_string(),
         );
 
-        service.upsert_self_node(&db_path, &k1).unwrap();
-        service.upsert_self_node(&db_path, &k2).unwrap();
-        service.upsert_self_node(&db_path, &s1).unwrap();
+        service.upsert_self_node(&client, &k1).await.unwrap();
+        service.upsert_self_node(&client, &k2).await.unwrap();
+        service.upsert_self_node(&client, &s1).await.unwrap();
 
         let knowledge = service
-            .load_self_nodes_by_layer(&db_path, &crate::entity::self_node::SelfModelLayer::Knowledge)
+            .load_self_nodes_by_layer(&client, &crate::entity::self_node::SelfModelLayer::Knowledge)
+            .await
             .unwrap();
         assert_eq!(knowledge.len(), 2);
 
         let skills = service
-            .load_self_nodes_by_layer(&db_path, &crate::entity::self_node::SelfModelLayer::Skill)
+            .load_self_nodes_by_layer(&client, &crate::entity::self_node::SelfModelLayer::Skill)
+            .await
             .unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "writes async code");
     }
 
-    #[test]
-    fn test_self_node_with_skill_fields() {
+    #[tokio::test]
+    async fn test_self_node_with_skill_fields() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("graph.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
         let service = EntityService::new();
 
         let mut node = crate::entity::self_node::SelfNode::new(
@@ -1446,9 +1235,9 @@ mod tests {
         node.sufficient_for = vec!["architect".to_string(), "engineer".to_string()];
         node.necessary_for = vec!["systems-engineer".to_string()];
 
-        service.upsert_self_node(&db_path, &node).unwrap();
+        service.upsert_self_node(&client, &node).await.unwrap();
 
-        let loaded = service.load_self_nodes(&db_path).unwrap();
+        let loaded = service.load_self_nodes(&client).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].sufficient_for, vec!["architect", "engineer"]);
         assert_eq!(loaded[0].necessary_for, vec!["systems-engineer"]);

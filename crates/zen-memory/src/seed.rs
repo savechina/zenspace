@@ -4,7 +4,7 @@
 //! 11 decision anti-patterns, 13 virtue domains, 2 index files.
 //! Embedded at compile time via `include_dir!`.
 
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use std::path::Path;
 
 static SEED_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/seeds");
@@ -105,10 +105,9 @@ mod tests {
     fn test_extracted_file_has_content() {
         let tmp = tempfile::TempDir::new().unwrap();
         copy_seeds_to(tmp.path()).unwrap();
-        let sample = std::fs::read_to_string(
-            tmp.path().join("wiki/wisdom/models/first-principles.md"),
-        )
-        .unwrap();
+        let sample =
+            std::fs::read_to_string(tmp.path().join("wiki/wisdom/models/first-principles.md"))
+                .unwrap();
         assert!(sample.contains("type: mental-model"));
         assert!(sample.contains("# First Principles Thinking"));
     }

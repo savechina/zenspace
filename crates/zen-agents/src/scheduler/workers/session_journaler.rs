@@ -147,7 +147,8 @@ impl ZenWorker for SessionJournaler {
             }
 
             let session_id = extract_session_id(jsonl_path);
-            match process_session(&paths, jsonl_path, &session_id, router.clone(), fresh_eyes).await {
+            match process_session(&paths, jsonl_path, &session_id, router.clone(), fresh_eyes).await
+            {
                 Ok(facts) => {
                     total_facts += facts;
                     processed += 1;
@@ -226,7 +227,15 @@ async fn process_session(
     };
 
     let (signals, source) = if let Some(router) = router {
-        match extract_signals_via_llm(&conversation_text, &prompt_context, router, &matched_anti_patterns, fresh_eyes).await {
+        match extract_signals_via_llm(
+            &conversation_text,
+            &prompt_context,
+            router,
+            &matched_anti_patterns,
+            fresh_eyes,
+        )
+        .await
+        {
             Ok(llm_signals) if !llm_signals.is_empty() => {
                 info!(session_id = %session_id, total = llm_signals.total(), "LLM signal extraction succeeded");
                 (llm_signals, "llm")
@@ -310,7 +319,10 @@ fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
             continue;
         }
         let statement = parts[0].trim();
-        let confidence = parts.get(1).and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.5);
+        let confidence = parts
+            .get(1)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(0.5);
 
         let id = zen_memory::belief::slugify_proposition(statement);
         let mut belief = Belief::new(id, statement.to_string(), "session".to_string());
@@ -478,8 +490,16 @@ Rules:
             {
                 let text = text.trim().to_string();
                 if !text.is_empty() {
-                    let context = obj.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let ev = obj.get("expected_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let context = obj
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let ev = obj
+                        .get("expected_value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     signals.decisions.push(format!("{text}|||{context}|||{ev}"));
                 }
             }
@@ -493,9 +513,19 @@ Rules:
             {
                 let error = error.trim().to_string();
                 if !error.is_empty() {
-                    let correct = obj.get("correct_answer").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let cost = obj.get("cost").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    signals.corrections.push(format!("{error}|||{correct}|||{cost}"));
+                    let correct = obj
+                        .get("correct_answer")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let cost = obj
+                        .get("cost")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    signals
+                        .corrections
+                        .push(format!("{error}|||{correct}|||{cost}"));
                 }
             }
         }
@@ -508,9 +538,19 @@ Rules:
             {
                 let content = content.trim().to_string();
                 if !content.is_empty() {
-                    let target = obj.get("target").and_then(|v| v.as_str()).unwrap_or("session").to_string();
-                    let sentiment = obj.get("sentiment").and_then(|v| v.as_str()).unwrap_or("neutral").to_string();
-                    signals.feedback.push(format!("{target}|||{content}|||{sentiment}"));
+                    let target = obj
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("session")
+                        .to_string();
+                    let sentiment = obj
+                        .get("sentiment")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("neutral")
+                        .to_string();
+                    signals
+                        .feedback
+                        .push(format!("{target}|||{content}|||{sentiment}"));
                 }
             }
         }
@@ -523,7 +563,10 @@ Rules:
             {
                 let statement = statement.trim().to_string();
                 if !statement.is_empty() {
-                    let confidence = obj.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5);
+                    let confidence = obj
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.5);
                     signals.beliefs.push(format!("{statement}|||{confidence}"));
                 }
             }
@@ -668,7 +711,10 @@ fn extract_session_id(jsonl_path: &std::path::Path) -> String {
         .to_string()
 }
 
-fn check_anti_pattern_match(session_text: &str, anti_patterns_dir: &std::path::Path) -> Vec<String> {
+fn check_anti_pattern_match(
+    session_text: &str,
+    anti_patterns_dir: &std::path::Path,
+) -> Vec<String> {
     let mut matched = Vec::new();
     if !anti_patterns_dir.is_dir() {
         return matched;
@@ -707,7 +753,10 @@ fn check_anti_pattern_match(session_text: &str, anti_patterns_dir: &std::path::P
             .filter(|w| w.len() > 3)
             .collect();
 
-        let match_count = keywords.iter().filter(|kw| session_lower.contains(*kw)).count();
+        let match_count = keywords
+            .iter()
+            .filter(|kw| session_lower.contains(*kw))
+            .count();
         let threshold = (keywords.len() / 2).max(1);
 
         if match_count >= threshold {
@@ -810,7 +859,6 @@ fn parse_frontmatter_field(content: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     #[test]
     fn test_has_journaled_marker_via_sidecar() {
@@ -956,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_load_top_commitments_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let _dir = tempfile::tempdir().unwrap();
         let paths = ZenPaths::detect().unwrap_or_else(|_| {
             panic!("ZenPaths::detect failed");
         });
@@ -966,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_load_top_beliefs_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let _dir = tempfile::tempdir().unwrap();
         let paths = ZenPaths::detect().unwrap_or_else(|_| {
             panic!("ZenPaths::detect failed");
         });
@@ -1056,7 +1104,8 @@ mod tests {
         let ap_content = "---\nid: confirmation-bias\ntype: anti-pattern\ntrigger: \"Selectively gathering evidence that supports existing beliefs\"\nseverity: high\n---\n\n# Confirmation Bias\n\nBody\n";
         fs::write(dir.path().join("confirmation-bias.md"), ap_content).unwrap();
 
-        let session = "I only looked for evidence that supports my existing beliefs about the architecture";
+        let session =
+            "I only looked for evidence that supports my existing beliefs about the architecture";
         let matched = check_anti_pattern_match(session, dir.path());
         assert!(matched.contains(&"confirmation-bias".to_string()));
     }
@@ -1067,7 +1116,8 @@ mod tests {
         let ap_content = "---\nid: anchoring-effect\ntype: anti-pattern\ntrigger: \"First number or estimate disproportionately influencing judgment\"\nseverity: med\n---\n\n# Anchoring\n\nBody\n";
         fs::write(dir.path().join("anchoring-effect.md"), ap_content).unwrap();
 
-        let session = "We discussed the project timeline and decided on a different approach entirely";
+        let session =
+            "We discussed the project timeline and decided on a different approach entirely";
         let matched = check_anti_pattern_match(session, dir.path());
         assert!(matched.is_empty());
     }

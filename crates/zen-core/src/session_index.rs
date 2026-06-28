@@ -21,7 +21,7 @@ pub struct IndexedSession {
 impl SessionIndex {
     pub fn open(db_dir: &PathBuf) -> Result<Self> {
         std::fs::create_dir_all(db_dir)?;
-        let db_path = db_dir.join("sessions.db");
+        let db_path = db_dir.join("state.db");
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;

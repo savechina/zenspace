@@ -35,7 +35,12 @@ impl ReflectionSignal {
         let mut md = String::new();
         md.push_str("---\n");
         md.push_str(&format!("severity: {:?}\n", self.severity));
-        md.push_str(&format!("domain: {}\n", serde_json::to_string(&self.domain).unwrap_or_default().trim_matches('"')));
+        md.push_str(&format!(
+            "domain: {}\n",
+            serde_json::to_string(&self.domain)
+                .unwrap_or_default()
+                .trim_matches('"')
+        ));
         md.push_str("---\n\n");
         md.push_str("## What went wrong\n\n");
         md.push_str(&format!("{}\n\n", self.what_wrong));
@@ -69,9 +74,8 @@ impl ReflectionSignal {
     /// Load a signal from a markdown file.
     pub fn load(path: &Path) -> Result<Self, ReflectionSignalError> {
         let content = fs::read_to_string(path)?;
-        Self::from_markdown(&content).ok_or_else(|| {
-            ReflectionSignalError::Parse("failed to parse reflection signal".into())
-        })
+        Self::from_markdown(&content)
+            .ok_or_else(|| ReflectionSignalError::Parse("failed to parse reflection signal".into()))
     }
 
     /// Load all signals from a directory of `.md` files.

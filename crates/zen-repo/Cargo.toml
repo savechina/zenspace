@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }
+tokio-rusqlite = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

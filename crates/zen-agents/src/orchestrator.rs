@@ -330,7 +330,11 @@ impl AgentOrchestrator {
 
         session.add_turn("user", user_query);
         session.add_turn("assistant", &final_execution.response);
-        zen_agent.persist_turn(&session.session_id.to_string(), user_query, &final_execution.response);
+        zen_agent.persist_turn(
+            &session.session_id.to_string(),
+            user_query,
+            &final_execution.response,
+        );
 
         Ok(final_execution)
     }

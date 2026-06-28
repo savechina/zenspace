@@ -1,11 +1,9 @@
-use std::path::Path;
-
 use anyhow::Result;
 use rig_core::Embed;
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStoreTable};
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use zen_repo::{EmbeddingsRepo, InsertEntityEmbeddingRequest, InsertNoteEmbeddingRequest, SqliteClient};
 
 use super::SearchResult;
 
@@ -51,65 +49,26 @@ impl SqliteVectorStoreTable for KnowledgeDocument {
 pub struct Tier3Search;
 
 impl Tier3Search {
-    pub fn search(
+    pub async fn search(
         &self,
+        client: &SqliteClient,
         query_embedding: &[f32],
-        db_path: &Path,
         top_k: usize,
     ) -> Result<Vec<SearchResult>> {
         if query_embedding.is_empty() {
             return Ok(Vec::new());
         }
 
-        if !db_path.exists() {
-            return Ok(Vec::new());
-        }
+        let results = EmbeddingsRepo::new(client).search(query_embedding, top_k).await?;
 
-        let conn = Connection::open(db_path)?;
-
-        let top_k = top_k.max(1);
-        let blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
+        let docs: Vec<SearchResult> = results
+            .into_iter()
+            .map(|r| SearchResult {
+                file: std::path::PathBuf::from(r.file),
+                line: r.line,
+                content: r.content,
+            })
             .collect();
-
-        let rowids = {
-            let mut stmt = conn
-                .prepare("SELECT rowid FROM note_embeddings WHERE embedding MATCH ? AND k = ?")?;
-            stmt.query_map(rusqlite::params![blob, top_k as u32], |row| {
-                row.get::<_, u64>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-
-        if rowids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let placeholders: Vec<String> = (1..=rowids.len()).map(|i| format!("?{i}")).collect();
-        let query = format!(
-            "SELECT nm.file_path, nf.content \
-             FROM notes_meta nm \
-             JOIN notes_fts nf ON nf.rowid = nm.rowid \
-             WHERE nm.id IN ({}) \
-             ORDER BY nm.rowid",
-            placeholders.join(","),
-        );
-
-        let docs = {
-            let mut stmt = conn.prepare(&query)?;
-            stmt.query_map(
-                rusqlite::params_from_iter(rowids.iter().map(|r| *r as i64)),
-                |row| {
-                    Ok(SearchResult {
-                        file: std::path::PathBuf::from(row.get::<_, String>(0)?),
-                        line: 0,
-                        content: row.get::<_, String>(1)?,
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
 
         debug!(
             "Tier3Search: found {} results for {DIM}-dim query (top_k={top_k})",
@@ -119,26 +78,19 @@ impl Tier3Search {
         Ok(docs)
     }
 
-    pub fn insert_embedding(&self, db_path: &Path, note_id: &str, embedding: &[f32]) -> Result<()> {
+    pub async fn insert_embedding(
+        &self,
+        client: &SqliteClient,
+        note_id: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
         if embedding.is_empty() {
             anyhow::bail!("Cannot insert empty embedding for note {note_id}");
         }
 
-        if !db_path.exists() {
-            anyhow::bail!(
-                "Vector database not found at {}. \
-                 Initialize the database with init_vec_schema() first.",
-                db_path.display()
-            );
-        }
-
-        let conn = Connection::open(db_path)?;
-        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-
-        conn.execute(
-            "INSERT OR REPLACE INTO note_embeddings (note_id, embedding) VALUES (?1, ?2)",
-            rusqlite::params![note_id, blob],
-        )?;
+        EmbeddingsRepo::new(client)
+            .insert_note_embedding(InsertNoteEmbeddingRequest { note_id, embedding })
+            .await?;
 
         debug!(
             "Tier3Search: stored embedding for {note_id} ({}-dim)",
@@ -148,9 +100,9 @@ impl Tier3Search {
         Ok(())
     }
 
-    pub fn insert_entity_embedding(
+    pub async fn insert_entity_embedding(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         entity_id: &str,
         embedding: &[f32],
     ) -> Result<()> {
@@ -158,21 +110,9 @@ impl Tier3Search {
             anyhow::bail!("Cannot insert empty embedding for entity {entity_id}");
         }
 
-        if !db_path.exists() {
-            anyhow::bail!(
-                "Vector database not found at {}. \
-                 Initialize the database with init_vec_schema() first.",
-                db_path.display()
-            );
-        }
-
-        let conn = Connection::open(db_path)?;
-        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-
-        conn.execute(
-            "INSERT OR REPLACE INTO entity_embeddings (entity_id, embedding) VALUES (?1, ?2)",
-            rusqlite::params![entity_id, blob],
-        )?;
+        EmbeddingsRepo::new(client)
+            .insert_entity_embedding(InsertEntityEmbeddingRequest { entity_id, embedding })
+            .await?;
 
         debug!(
             "Tier3Search: stored entity embedding for {entity_id} ({}-dim)",
@@ -196,49 +136,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_tier3_search_empty_embedding_returns_empty() {
+    async fn setup_test_db() -> (tempfile::TempDir, SqliteClient) {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("vec.db");
+        let db_path = dir.path().join("state.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
+        (dir, client)
+    }
+
+    #[tokio::test]
+    async fn test_tier3_search_empty_embedding_returns_empty() {
+        let (_dir, client) = setup_test_db().await;
         let tier3 = Tier3Search;
 
-        let results = tier3.search(&[], &db_path, 5).unwrap();
+        let results = tier3.search(&client, &[], 5).await.unwrap();
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_tier3_search_missing_db_returns_empty() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("nonexistent.db");
+    #[tokio::test]
+    async fn test_tier3_insert_empty_embedding_fails() {
+        let (_dir, client) = setup_test_db().await;
         let tier3 = Tier3Search;
 
-        let results = tier3.search(&[1.0; DIM], &db_path, 5).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_tier3_insert_empty_embedding_fails() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("vec.db");
-        let tier3 = Tier3Search;
-
-        let result = tier3.insert_embedding(&db_path, "note-x", &[]);
+        let result = tier3.insert_embedding(&client, "note-x", &[]).await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_tier3_insert_missing_db_fails_clearly() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("nonexistent.db");
-        let tier3 = Tier3Search;
-
-        let result = tier3.insert_embedding(&db_path, "note-x", &[1.0; DIM]);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("not found") || err.contains("not available"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]

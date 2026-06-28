@@ -143,8 +143,7 @@ impl Fact {
     /// Parse fact from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Self, FactError> {
         let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id")
-            .ok_or_else(|| FactError::MissingField("id".into()))?;
+        let id = parse_yaml_field(&fm, "id").ok_or_else(|| FactError::MissingField("id".into()))?;
         let what = parse_yaml_field(&fm, "what")
             .map(|s| s.trim_matches('"').to_string())
             .ok_or_else(|| FactError::MissingField("what".into()))?;
@@ -174,9 +173,7 @@ fn extract_frontmatter(content: &str) -> Result<String, FactError> {
     let mut lines = content.lines();
     let first = lines.next().unwrap_or("").trim();
     if first != "---" {
-        return Err(FactError::Parse(
-            "missing frontmatter opening ---".into(),
-        ));
+        return Err(FactError::Parse("missing frontmatter opening ---".into()));
     }
     let mut fm = String::new();
     for line in lines {
@@ -186,9 +183,7 @@ fn extract_frontmatter(content: &str) -> Result<String, FactError> {
         fm.push_str(line);
         fm.push('\n');
     }
-    Err(FactError::Parse(
-        "missing frontmatter closing ---".into(),
-    ))
+    Err(FactError::Parse("missing frontmatter closing ---".into()))
 }
 
 fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
@@ -255,17 +250,13 @@ mod tests {
         let md = f.to_markdown();
         assert!(md.starts_with("---\n"));
         assert!(md.contains(&format!("id: {}", f.id)));
-        assert!(md.contains(
-            "what: \"The Rust compiler uses LLVM as its backend\""
-        ));
+        assert!(md.contains("what: \"The Rust compiler uses LLVM as its backend\""));
         assert!(md.contains("source: \"consolidation\""));
         assert!(md.contains("  - rust"));
         assert!(md.contains("  - llvm"));
         assert!(md.contains("  - compiler"));
         assert!(md.contains("# Fact"));
-        assert!(md.contains(
-            "**What**: The Rust compiler uses LLVM as its backend"
-        ));
+        assert!(md.contains("**What**: The Rust compiler uses LLVM as its backend"));
         assert!(md.contains("**Source**: consolidation"));
         assert!(md.contains("**Entities**: rust, llvm, compiler"));
     }

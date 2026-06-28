@@ -88,11 +88,8 @@ impl ZenWorker for ReflectionWorker {
                 Ok(reflections) if !reflections.is_empty() => {
                     let (date_str, session_id) = read_frontmatter_meta(&path);
                     // DESIGN.md §3.1: reflections use weekly format {YYYY-Www}.md
-                    let date = chrono::NaiveDate::parse_from_str(
-                        &date_str,
-                        "%Y-%m-%d"
-                    )
-                    .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+                    let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
                     let filename = format!("{}.md", date.format("%G-W%V"));
                     let file_path = reflections_dir.join(&filename);
 
@@ -174,7 +171,10 @@ impl ZenWorker for ReflectionWorker {
 
             match synthesize_anti_patterns(&reflections_dir).await {
                 Ok(count) if count > 0 => {
-                    info!(anti_patterns = count, "anti-pattern candidates synthesized from reflections");
+                    info!(
+                        anti_patterns = count,
+                        "anti-pattern candidates synthesized from reflections"
+                    );
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -210,9 +210,7 @@ fn extract_reflections_from_journal(path: &Path) -> Result<Vec<String>> {
             continue;
         }
 
-        if in_reflections
-            && let Some(item) = trimmed.strip_prefix("- ")
-        {
+        if in_reflections && let Some(item) = trimmed.strip_prefix("- ") {
             let text = item.trim().to_string();
             if !text.is_empty() && !text.starts_with("_(no ") {
                 reflections.push(text);
@@ -349,9 +347,7 @@ fn update_stop_doing_ledger(anti_patterns: &[Value]) -> Result<()> {
     for ap in anti_patterns.iter().take(10) {
         let pattern = ap["pattern"].as_str().unwrap_or("unknown");
         let trigger = ap["trigger"].as_str().unwrap_or("");
-        entries.push(format!(
-            "- **{pattern}** — detected {today}: {trigger}"
-        ));
+        entries.push(format!("- **{pattern}** — detected {today}: {trigger}"));
     }
 
     let updated = if content.contains(section_marker) {

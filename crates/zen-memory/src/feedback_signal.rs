@@ -30,10 +30,16 @@ pub struct FeedbackProperties {
 
 impl FeedbackProperties {
     pub fn count_true(&self) -> u32 {
-        [self.timely, self.reasonable, self.actionable, self.constructive, self.interactive]
-            .iter()
-            .filter(|&&b| b)
-            .count() as u32
+        [
+            self.timely,
+            self.reasonable,
+            self.actionable,
+            self.constructive,
+            self.interactive,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count() as u32
     }
 }
 
@@ -116,8 +122,14 @@ impl Feedback {
         let mut md = String::new();
         md.push_str("---\n");
         md.push_str(&format!("id: {}\n", self.id));
-        md.push_str(&format!("source: \"{}\"\n", self.source.replace('"', "\\\"")));
-        md.push_str(&format!("content: \"{}\"\n", self.content.replace('"', "\\\"")));
+        md.push_str(&format!(
+            "source: \"{}\"\n",
+            self.source.replace('"', "\\\"")
+        ));
+        md.push_str(&format!(
+            "content: \"{}\"\n",
+            self.content.replace('"', "\\\"")
+        ));
         md.push_str(&format!("disposition: {}\n", self.disposition));
         md.push_str(&format!("timely: {}\n", self.properties.timely));
         md.push_str(&format!("reasonable: {}\n", self.properties.reasonable));
@@ -129,7 +141,10 @@ impl Feedback {
         md.push_str(&format!("# Feedback from {}\n\n", self.source));
         md.push_str(&format!("{}\n\n", self.content));
         md.push_str(&format!("**Disposition**: {}\n", self.disposition));
-        md.push_str(&format!("**Quality**: {:.0}%\n", self.quality_score() * 100.0));
+        md.push_str(&format!(
+            "**Quality**: {:.0}%\n",
+            self.quality_score() * 100.0
+        ));
         md
     }
 
@@ -172,8 +187,8 @@ impl Feedback {
 
     pub fn from_markdown(content: &str) -> Result<Self, FeedbackError> {
         let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id")
-            .ok_or_else(|| FeedbackError::MissingField("id".into()))?;
+        let id =
+            parse_yaml_field(&fm, "id").ok_or_else(|| FeedbackError::MissingField("id".into()))?;
         let source = parse_yaml_field(&fm, "source")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
@@ -189,11 +204,21 @@ impl Feedback {
             })
             .unwrap_or(FeedbackDisposition::Pending);
         let properties = FeedbackProperties {
-            timely: parse_yaml_field(&fm, "timely").map(|s| s == "true").unwrap_or(false),
-            reasonable: parse_yaml_field(&fm, "reasonable").map(|s| s == "true").unwrap_or(false),
-            actionable: parse_yaml_field(&fm, "actionable").map(|s| s == "true").unwrap_or(false),
-            constructive: parse_yaml_field(&fm, "constructive").map(|s| s == "true").unwrap_or(false),
-            interactive: parse_yaml_field(&fm, "interactive").map(|s| s == "true").unwrap_or(false),
+            timely: parse_yaml_field(&fm, "timely")
+                .map(|s| s == "true")
+                .unwrap_or(false),
+            reasonable: parse_yaml_field(&fm, "reasonable")
+                .map(|s| s == "true")
+                .unwrap_or(false),
+            actionable: parse_yaml_field(&fm, "actionable")
+                .map(|s| s == "true")
+                .unwrap_or(false),
+            constructive: parse_yaml_field(&fm, "constructive")
+                .map(|s| s == "true")
+                .unwrap_or(false),
+            interactive: parse_yaml_field(&fm, "interactive")
+                .map(|s| s == "true")
+                .unwrap_or(false),
         };
         let created_at = parse_yaml_field(&fm, "created_at")
             .as_deref()

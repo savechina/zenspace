@@ -163,18 +163,30 @@ fn test_tool_permission_variant_coverage() {
 #[test]
 fn test_sanitize_strips_script_tags() {
     let sanitizer = InputSanitizer::new();
-    let result = sanitizer.sanitize("hello <script>alert('xss')</script> world").unwrap();
+    let result = sanitizer
+        .sanitize("hello <script>alert('xss')</script> world")
+        .unwrap();
     assert!(!result.sanitized.contains("<script>"));
     assert!(!result.sanitized.contains("</script>"));
-    assert!(result.stripped_patterns.contains(&"html_injection".to_string()));
+    assert!(
+        result
+            .stripped_patterns
+            .contains(&"html_injection".to_string())
+    );
 }
 
 #[test]
 fn test_sanitize_strips_iframe_tags() {
     let sanitizer = InputSanitizer::new();
-    let result = sanitizer.sanitize("<iframe src='evil.com'></iframe> text").unwrap();
+    let result = sanitizer
+        .sanitize("<iframe src='evil.com'></iframe> text")
+        .unwrap();
     assert!(!result.sanitized.contains("<iframe"));
-    assert!(result.stripped_patterns.contains(&"html_injection".to_string()));
+    assert!(
+        result
+            .stripped_patterns
+            .contains(&"html_injection".to_string())
+    );
 }
 
 #[test]
@@ -182,15 +194,25 @@ fn test_sanitize_strips_event_handlers() {
     let sanitizer = InputSanitizer::new();
     let result = sanitizer.sanitize("<img onerror=alert(1) src=x>").unwrap();
     assert!(!result.sanitized.to_lowercase().contains("onerror="));
-    assert!(result.stripped_patterns.contains(&"html_injection".to_string()));
+    assert!(
+        result
+            .stripped_patterns
+            .contains(&"html_injection".to_string())
+    );
 }
 
 #[test]
 fn test_sanitize_strips_javascript_urls() {
     let sanitizer = InputSanitizer::new();
-    let result = sanitizer.sanitize("<a href='javascript:alert(1)'>click</a>").unwrap();
+    let result = sanitizer
+        .sanitize("<a href='javascript:alert(1)'>click</a>")
+        .unwrap();
     assert!(!result.sanitized.to_lowercase().contains("javascript:"));
-    assert!(result.stripped_patterns.contains(&"html_injection".to_string()));
+    assert!(
+        result
+            .stripped_patterns
+            .contains(&"html_injection".to_string())
+    );
 }
 
 #[test]
@@ -200,7 +222,11 @@ fn test_sanitize_strips_zero_width_chars() {
     let result = sanitizer.sanitize(input).unwrap();
     assert!(!result.sanitized.contains('\u{200B}'));
     assert!(!result.sanitized.contains('\u{FEFF}'));
-    assert!(result.stripped_patterns.contains(&"zero_width_chars".to_string()));
+    assert!(
+        result
+            .stripped_patterns
+            .contains(&"zero_width_chars".to_string())
+    );
 }
 
 #[test]

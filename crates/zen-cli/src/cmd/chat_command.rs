@@ -55,8 +55,17 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
         let tier = TierSelector::select_tier(message);
         let mut seen = std::collections::HashSet::new();
 
+        let db_path = paths.db().join("state.db");
+        let client = match zen_repo::SqliteClient::open(&db_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to create database client for chat search");
+                return Err(ZenError::Message(format!("Database error: {}", e)));
+            }
+        };
+
         for dir in [paths.inbox(), paths.wiki()] {
-            if let Ok(results) = service.search(message, &dir, Some(tier)) {
+            if let Ok(results) = service.search(message, &dir, &client, Some(tier)).await {
                 for r in results {
                     if seen.insert(r.file.clone()) {
                         session.knowledge.push(zen_core::types::RetrievedNote {
@@ -71,7 +80,10 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
         }
 
         if !session.knowledge.is_empty() {
-            tracing::info!(count = session.knowledge.len(), "Knowledge context injected for CLI chat");
+            tracing::info!(
+                count = session.knowledge.len(),
+                "Knowledge context injected for CLI chat"
+            );
         }
     }
 

@@ -375,8 +375,7 @@ impl Belief {
     /// Parse belief from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Belief> {
         let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id")
-            .ok_or_else(|| anyhow::anyhow!("missing id field"))?;
+        let id = parse_yaml_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
         let proposition = parse_yaml_field(&fm, "proposition")
             .map(|s| s.trim_matches('"').to_string())
             .ok_or_else(|| anyhow::anyhow!("missing proposition field"))?;
@@ -390,8 +389,7 @@ impl Belief {
         let weight: f64 = parse_yaml_field(&fm, "weight")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
-        let domain =
-            parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
+        let domain = parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
         let created_at = parse_yaml_field(&fm, "created_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -590,7 +588,11 @@ mod tests {
         for _ in 0..200 {
             b.reinforce();
         }
-        assert!((b.weight - 2.0).abs() < 0.001, "expected 2.0, got {}", b.weight);
+        assert!(
+            (b.weight - 2.0).abs() < 0.001,
+            "expected 2.0, got {}",
+            b.weight
+        );
     }
 
     #[test]
@@ -601,7 +603,12 @@ mod tests {
         let now = b.last_retrieved.unwrap() + Duration::days(91);
         let decayed = b.apply_decay(now);
         assert!(decayed, "expected decay to apply");
-        assert!(b.weight < initial_weight, "expected weight < {}, got {}", initial_weight, b.weight);
+        assert!(
+            b.weight < initial_weight,
+            "expected weight < {}, got {}",
+            initial_weight,
+            b.weight
+        );
     }
 
     #[test]
@@ -622,7 +629,12 @@ mod tests {
         for _ in 0..6 {
             b.update(true, SourceType::SelfObservation, None);
         }
-        assert!(b.should_promote(), "expected promote, posterior={}, count={}", b.posterior, b.evidence_count);
+        assert!(
+            b.should_promote(),
+            "expected promote, posterior={}, count={}",
+            b.posterior,
+            b.evidence_count
+        );
     }
 
     #[test]
@@ -632,7 +644,11 @@ mod tests {
         for _ in 0..10 {
             b.update(false, SourceType::SelfObservation, None);
         }
-        assert!(b.should_demote(), "expected demote, posterior={}", b.posterior);
+        assert!(
+            b.should_demote(),
+            "expected demote, posterior={}",
+            b.posterior
+        );
     }
 
     #[test]
@@ -640,8 +656,16 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().join("beliefs");
 
-        let mut b = Belief::new("rt-test".into(), "round trip prop".into(), "test-domain".into());
-        b.update(true, SourceType::TrustedPeer, Some("supporting note".into()));
+        let mut b = Belief::new(
+            "rt-test".into(),
+            "round trip prop".into(),
+            "test-domain".into(),
+        );
+        b.update(
+            true,
+            SourceType::TrustedPeer,
+            Some("supporting note".into()),
+        );
         b.update(false, SourceType::AnonymousInternet, None);
 
         b.save(&dir).unwrap();
@@ -672,9 +696,8 @@ mod tests {
             "jwt-with-refresh-rotation"
         );
         assert_eq!(slugify_proposition("  spaces  "), "spaces");
-        let long = slugify_proposition(
-            "A very long proposition that exceeds the sixty character limit",
-        );
+        let long =
+            slugify_proposition("A very long proposition that exceeds the sixty character limit");
         assert_eq!(long.len(), 60);
         assert_eq!(
             long,
@@ -684,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_top_by_priority_returns_highest_first() {
-        let mut b1 = Belief::new("low".into(), "low".into(), "d".into());
+        let b1 = Belief::new("low".into(), "low".into(), "d".into());
         let mut b2 = Belief::new("high".into(), "high".into(), "d".into());
         b2.update(true, SourceType::SelfObservation, None);
         let beliefs = vec![b1.clone(), b2.clone()];
@@ -723,12 +746,18 @@ mod tests {
         }
         // posterior should be very low, evidence_count = 3 > 2
         assert!(b.posterior < 0.3);
-        assert!(b.should_correct(), "expected correction with 3 contradictions");
+        assert!(
+            b.should_correct(),
+            "expected correction with 3 contradictions"
+        );
 
         // Only 1 contradiction: evidence_count = 1, should NOT correct
         let mut b2 = Belief::new("test2".into(), "prop2".into(), "domain".into());
         b2.update(false, SourceType::SelfObservation, None);
-        assert!(!b2.should_correct(), "should not correct with evidence_count=1");
+        assert!(
+            !b2.should_correct(),
+            "should not correct with evidence_count=1"
+        );
     }
 
     #[test]
@@ -775,7 +804,10 @@ mod tests {
             Some("direct observation".into()),
         );
         assert_eq!(b.evidence.len(), 1);
-        assert_eq!(b.evidence[0].research_method, Some(ResearchMethod::Observation));
+        assert_eq!(
+            b.evidence[0].research_method,
+            Some(ResearchMethod::Observation)
+        );
         assert_eq!(b.evidence[0].note.as_deref(), Some("direct observation"));
     }
 
@@ -797,6 +829,9 @@ mod tests {
             None,
         );
         let md = b.to_markdown();
-        assert!(md.contains("[qa_search]"), "expected research method in markdown");
+        assert!(
+            md.contains("[qa_search]"),
+            "expected research method in markdown"
+        );
     }
 }

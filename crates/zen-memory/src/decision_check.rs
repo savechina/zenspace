@@ -6,43 +6,103 @@
 use crate::decision::{AntiPatternReport, AntiPatternViolation, Decision, Severity};
 
 const LEGAL_KEYWORDS: &[&str] = &[
-    "版权", "税务", "隐私", "合同", "lawsuit", "patent", "compliance", "legal", "法律",
+    "版权",
+    "税务",
+    "隐私",
+    "合同",
+    "lawsuit",
+    "patent",
+    "compliance",
+    "legal",
+    "法律",
     "风险评估",
 ];
-const MARKET_KEYWORDS: &[&str] = &[
-    "获客", "流量", "市场", "policy", "政策", "growth", "增长",
-];
+const MARKET_KEYWORDS: &[&str] = &["获客", "流量", "市场", "policy", "政策", "growth", "增长"];
 const PROCEED_KEYWORDS: &[&str] = &["proceed", "继续", "推进", "go ahead", "all in", "坚持"];
 
 /// Urgency keywords indicating time pressure (bilingual EN/ZH)
 const URGENCY_KEYWORDS: &[&str] = &[
-    "now", "immediately", "right now", "asap", "urgent",
-    "act now", "final notice", "last chance", "don't wait",
-    "limited time", "must decide", "no time to waste",
-    "立即", "马上", "赶紧", "赶快", "紧急", "最后机会", "限时",
+    "now",
+    "immediately",
+    "right now",
+    "asap",
+    "urgent",
+    "act now",
+    "final notice",
+    "last chance",
+    "don't wait",
+    "limited time",
+    "must decide",
+    "no time to waste",
+    "立即",
+    "马上",
+    "赶紧",
+    "赶快",
+    "紧急",
+    "最后机会",
+    "限时",
 ];
 
 /// Emotional intensity markers — absolutist/extreme language
 const EMOTION_INTENSITY: &[&str] = &[
-    "absolutely", "never", "always", "everyone", "nobody",
-    "completely", "totally", "insane", "crazy", "amazing",
-    "terrible", "worst", "best", "love", "hate",
-    "绝对", "从不", "总是", "完全", "彻底", "疯狂", "太棒了", "太糟了",
+    "absolutely",
+    "never",
+    "always",
+    "everyone",
+    "nobody",
+    "completely",
+    "totally",
+    "insane",
+    "crazy",
+    "amazing",
+    "terrible",
+    "worst",
+    "best",
+    "love",
+    "hate",
+    "绝对",
+    "从不",
+    "总是",
+    "完全",
+    "彻底",
+    "疯狂",
+    "太棒了",
+    "太糟了",
 ];
 
 /// Cooling-off language — presence indicates deliberation (reduces impulse score)
 const COOLING_LANGUAGE: &[&str] = &[
-    "sleep on", "think about", "tomorrow", "next week",
-    "revisit", "consider", "maybe later", "wait",
-    "明天再说", "考虑一下", "再想想", "不急", "等等",
+    "sleep on",
+    "think about",
+    "tomorrow",
+    "next week",
+    "revisit",
+    "consider",
+    "maybe later",
+    "wait",
+    "明天再说",
+    "考虑一下",
+    "再想想",
+    "不急",
+    "等等",
 ];
 
 /// Alternative-consideration language — presence indicates deliberation
 const ALTERNATIVE_MARKERS: &[&str] = &[
-    "alternatives", "options", "instead", "could also",
-    "pros and cons", "trade-offs", "on the other hand",
-    "alternative", "comparison",
-    "备选", "选项", "权衡", "利弊", "另一方面",
+    "alternatives",
+    "options",
+    "instead",
+    "could also",
+    "pros and cons",
+    "trade-offs",
+    "on the other hand",
+    "alternative",
+    "comparison",
+    "备选",
+    "选项",
+    "权衡",
+    "利弊",
+    "另一方面",
 ];
 
 /// Run all 10 anti-pattern checks and return aggregated report.
@@ -93,13 +153,7 @@ fn check_misplaced_priority(d: &Decision) -> Option<AntiPatternViolation> {
         return None;
     }
 
-    let decision_text = format!(
-        "{} {} {}",
-        d.goal,
-        d.choice,
-        d.facts.join(" ")
-    )
-    .to_lowercase();
+    let decision_text = format!("{} {} {}", d.goal, d.choice, d.facts.join(" ")).to_lowercase();
 
     let has_overlap = core_keywords.iter().any(|kw| {
         let kw_lower = kw.to_lowercase();
@@ -121,12 +175,7 @@ fn check_misplaced_priority(d: &Decision) -> Option<AntiPatternViolation> {
 
 /// Check if legal/compliance risk is present without risk assessment.
 fn check_legal_risk_blind(d: &Decision) -> Option<AntiPatternViolation> {
-    let text = format!(
-        "{} {} {}",
-        d.goal,
-        d.choice,
-        d.facts.join(" ")
-    );
+    let text = format!("{} {} {}", d.goal, d.choice, d.facts.join(" "));
     let text_lower = text.to_lowercase();
 
     let has_legal = LEGAL_KEYWORDS.iter().any(|kw| {
@@ -140,9 +189,8 @@ fn check_legal_risk_blind(d: &Decision) -> Option<AntiPatternViolation> {
 
     let plan = d.execution_plan.as_deref().unwrap_or("");
     let plan_lower = plan.to_lowercase();
-    let has_risk_assessment = plan_lower.contains("risk")
-        || plan.contains("风险评估")
-        || plan_lower.contains("legal");
+    let has_risk_assessment =
+        plan_lower.contains("risk") || plan.contains("风险评估") || plan_lower.contains("legal");
 
     if has_risk_assessment {
         None
@@ -170,8 +218,16 @@ fn check_inertia_thinking(d: &Decision) -> Option<AntiPatternViolation> {
     }
 
     let inertia_markers = [
-        "past success", "previously worked", "last time", "always worked",
-        "used to", "before it was", "上次", "之前成功", "以前都", "历来",
+        "past success",
+        "previously worked",
+        "last time",
+        "always worked",
+        "used to",
+        "before it was",
+        "上次",
+        "之前成功",
+        "以前都",
+        "历来",
     ];
 
     let facts_text = d.facts.join(" ").to_lowercase();
@@ -181,7 +237,9 @@ fn check_inertia_thinking(d: &Decision) -> Option<AntiPatternViolation> {
         Some(AntiPatternViolation {
             pattern_id: "inertia_thinking".into(),
             severity: Severity::High,
-            message: "Decision based solely on past experience without current environment analysis".into(),
+            message:
+                "Decision based solely on past experience without current environment analysis"
+                    .into(),
         })
     } else {
         None
@@ -288,12 +346,7 @@ fn check_emotional_impulse(d: &Decision) -> Option<AntiPatternViolation> {
 
 /// Check for proceeding despite known legal/compliance risk.
 fn check_fluke_mindset(d: &Decision) -> Option<AntiPatternViolation> {
-    let text = format!(
-        "{} {} {}",
-        d.goal,
-        d.choice,
-        d.facts.join(" ")
-    );
+    let text = format!("{} {} {}", d.goal, d.choice, d.facts.join(" "));
     let text_lower = text.to_lowercase();
 
     let has_legal = LEGAL_KEYWORDS.iter().any(|kw| {
@@ -354,18 +407,14 @@ fn check_all_in_no_reserve(d: &Decision) -> Option<AntiPatternViolation> {
 
 /// Check for overconfidence with insufficient evidence.
 fn check_self_cognition_block(d: &Decision) -> Option<AntiPatternViolation> {
-    let is_overconfident = d
-        .confidence
-        .as_ref()
-        .is_some_and(|c| *c > 0.9);
+    let is_overconfident = d.confidence.as_ref().is_some_and(|c| *c > 0.9);
     let insufficient_facts = d.facts.len() < 3;
 
     if is_overconfident && insufficient_facts {
         Some(AntiPatternViolation {
             pattern_id: "self_cognition_block".into(),
             severity: Severity::High,
-            message: "High confidence with insufficient evidence (potential Dunning-Kruger)"
-                .into(),
+            message: "High confidence with insufficient evidence (potential Dunning-Kruger)".into(),
         })
     } else {
         None
@@ -414,7 +463,9 @@ mod tests {
         let report = check_all(&d);
         let violations = &report.violations;
         assert!(
-            violations.iter().any(|v| v.pattern_id == "legal_risk_blind"),
+            violations
+                .iter()
+                .any(|v| v.pattern_id == "legal_risk_blind"),
             "expected legal_risk_blind violation"
         );
     }
@@ -427,7 +478,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            !report.violations.iter().any(|v| v.pattern_id == "legal_risk_blind"),
+            !report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "legal_risk_blind"),
             "should not trigger with risk assessment"
         );
     }
@@ -437,7 +491,10 @@ mod tests {
         let d = make_decision();
         let report = check_all(&d);
         assert!(
-            !report.violations.iter().any(|v| v.pattern_id == "legal_risk_blind"),
+            !report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "legal_risk_blind"),
             "should not trigger without legal keywords"
         );
     }
@@ -460,7 +517,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            report.violations.iter().any(|v| v.pattern_id == "loss_aversion"),
+            report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "loss_aversion"),
             "expected loss_aversion violation"
         );
     }
@@ -483,7 +543,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            !report.violations.iter().any(|v| v.pattern_id == "loss_aversion"),
+            !report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "loss_aversion"),
             "should not trigger when recoverable"
         );
     }
@@ -497,7 +560,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            report.violations.iter().any(|v| v.pattern_id == "fluke_mindset"),
+            report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "fluke_mindset"),
             "expected fluke_mindset violation"
         );
     }
@@ -509,7 +575,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            report.violations.iter().any(|v| v.pattern_id == "authority_blindness"),
+            report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "authority_blindness"),
             "expected authority_blindness violation"
         );
     }
@@ -521,7 +590,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            !report.violations.iter().any(|v| v.pattern_id == "authority_blindness"),
+            !report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "authority_blindness"),
             "should not trigger with multiple sources"
         );
     }
@@ -540,7 +612,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            report.violations.iter().any(|v| v.pattern_id == "all_in_no_reserve"),
+            report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "all_in_no_reserve"),
             "expected all_in_no_reserve violation"
         );
     }
@@ -553,7 +628,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            report.violations.iter().any(|v| v.pattern_id == "self_cognition_block"),
+            report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "self_cognition_block"),
             "expected self_cognition_block violation"
         );
     }
@@ -567,7 +645,10 @@ mod tests {
 
         let report = check_all(&d);
         assert!(
-            report.violations.iter().any(|v| v.pattern_id == "market_cognition_block"),
+            report
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "market_cognition_block"),
             "expected market_cognition_block violation"
         );
     }
@@ -613,7 +694,8 @@ mod tests {
 
     #[test]
     fn test_emotional_impulse_score_calm_text() {
-        let text = "I should sleep on this. Let me consider the alternatives and trade-offs tomorrow.";
+        let text =
+            "I should sleep on this. Let me consider the alternatives and trade-offs tomorrow.";
         let score = emotional_impulse_score(text);
         assert!(score < 0.3, "calm text should have low score, got {score}");
     }
@@ -622,14 +704,20 @@ mod tests {
     fn test_emotional_impulse_score_urgent_text() {
         let text = "We must decide NOW!!! This is URGENT!!! Act immediately, no time to waste!!!";
         let score = emotional_impulse_score(text);
-        assert!(score > 0.6, "urgent text should have high score, got {score}");
+        assert!(
+            score > 0.6,
+            "urgent text should have high score, got {score}"
+        );
     }
 
     #[test]
     fn test_emotional_impulse_score_chinese_urgent() {
         let text = "立即决定！马上行动！紧急情况！赶紧！最后机会！";
         let score = emotional_impulse_score(text);
-        assert!(score > 0.4, "Chinese urgent text should score high, got {score}");
+        assert!(
+            score > 0.4,
+            "Chinese urgent text should score high, got {score}"
+        );
     }
 
     #[test]
@@ -657,7 +745,8 @@ mod tests {
 
     #[test]
     fn test_emotional_impulse_score_caps_at_1() {
-        let text = "NOW!!! URGENT!!! ACT NOW!!! absolutely never always completely totally insane!!!";
+        let text =
+            "NOW!!! URGENT!!! ACT NOW!!! absolutely never always completely totally insane!!!";
         let score = emotional_impulse_score(text);
         assert!(score <= 1.0, "score should not exceed 1.0, got {score}");
     }

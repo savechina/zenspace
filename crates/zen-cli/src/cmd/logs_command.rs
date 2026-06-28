@@ -109,7 +109,12 @@ pub fn execute_command(operation: &LogCommands) -> Result<(), ZenError> {
     }
 }
 
-pub fn execute_show(lines: usize, level: Option<&str>, follow: bool, json: bool) -> Result<(), ZenError> {
+pub fn execute_show(
+    lines: usize,
+    level: Option<&str>,
+    follow: bool,
+    json: bool,
+) -> Result<(), ZenError> {
     if follow {
         tail_logs(lines, level)?;
         return Ok(());
@@ -152,8 +157,8 @@ pub fn execute_show(lines: usize, level: Option<&str>, follow: bool, json: bool)
 
 /// Read all log entries from agent-session.jsonl and safety-audit.jsonl.
 fn read_all_log_entries() -> Result<Vec<serde_json::Value>, ZenError> {
-    let paths =
-        ZenPaths::detect().map_err(|e| ZenError::Message(format!("failed to resolve paths: {e}")))?;
+    let paths = ZenPaths::detect()
+        .map_err(|e| ZenError::Message(format!("failed to resolve paths: {e}")))?;
     let log_dir = paths.logs();
 
     let agent_log = log_dir.join("agent-session.jsonl");
@@ -197,10 +202,7 @@ fn print_log_entry(entry: &serde_json::Value) {
         .get("sensitivity")
         .and_then(|s| s.as_str())
         .unwrap_or("unknown");
-    let query_len = entry
-        .get("query_len")
-        .and_then(|q| q.as_u64())
-        .unwrap_or(0);
+    let query_len = entry.get("query_len").and_then(|q| q.as_u64()).unwrap_or(0);
     let response_len = entry
         .get("response_len")
         .and_then(|r| r.as_u64())
@@ -229,8 +231,7 @@ fn tail_logs(lines: usize, level_filter: Option<&str>) -> Result<(), ZenError> {
         return Ok(());
     }
 
-    let existing = jsonl::read_jsonl_lines(&log_file)
-        .unwrap_or_default();
+    let existing = jsonl::read_jsonl_lines(&log_file).unwrap_or_default();
     for entry in existing.iter().rev().take(lines).rev() {
         if should_show_entry(entry, level_filter) {
             print_log_entry(entry);
@@ -242,7 +243,11 @@ fn tail_logs(lines: usize, level_filter: Option<&str>) -> Result<(), ZenError> {
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::End(0)).ok();
 
-    println!("{} Following {} (Ctrl-C to stop)", "⏳".yellow(), log_file.display().to_string().dimmed());
+    println!(
+        "{} Following {} (Ctrl-C to stop)",
+        "⏳".yellow(),
+        log_file.display().to_string().dimmed()
+    );
 
     loop {
         let mut line = String::new();
@@ -415,7 +420,10 @@ fn list_log_files() -> Result<(), ZenError> {
     files.sort_by_key(|e| e.file_name());
 
     if files.is_empty() {
-        println!("No log files found in {}", log_dir.display().to_string().dimmed());
+        println!(
+            "No log files found in {}",
+            log_dir.display().to_string().dimmed()
+        );
         return Ok(());
     }
 

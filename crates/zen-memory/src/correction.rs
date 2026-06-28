@@ -108,17 +108,11 @@ impl Correction {
         md.push_str(&format!("id: {}\n", self.id));
         md.push_str(&format!("error_ref: {}\n", self.error_ref));
         md.push_str(&format!("fix: \"{}\"\n", self.fix.replace('"', "\\\"")));
-        md.push_str(&format!(
-            "cost_economic: {}\n",
-            self.cost.economic
-        ));
+        md.push_str(&format!("cost_economic: {}\n", self.cost.economic));
         md.push_str(&format!("cost_time: {}\n", self.cost.time_hours));
         md.push_str(&format!("cost_credit: {}\n", self.cost.credit));
         md.push_str(&format!("cost_sunk: {}\n", self.cost.sunk));
-        md.push_str(&format!(
-            "is_recoverable: {}\n",
-            self.cost.is_recoverable
-        ));
+        md.push_str(&format!("is_recoverable: {}\n", self.cost.is_recoverable));
         md.push_str(&format!("created_at: {}\n", self.created_at.to_rfc3339()));
         if let Some(va) = self.verified_at {
             md.push_str(&format!("verified_at: {}\n", va.to_rfc3339()));
@@ -127,7 +121,10 @@ impl Correction {
         md.push_str(&format!("# Correction: {}\n\n", self.error_ref));
         md.push_str(&format!("**Fix**: {}\n\n", self.fix));
         if let Some(va) = self.verified_at {
-            md.push_str(&format!("**Verified**: {}\n", va.format("%Y-%m-%d %H:%M UTC")));
+            md.push_str(&format!(
+                "**Verified**: {}\n",
+                va.format("%Y-%m-%d %H:%M UTC")
+            ));
         } else {
             md.push_str("**Verified**: pending\n");
         }
@@ -313,7 +310,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().join("corrections");
 
-        let mut c = Correction::new("auth-reset", "Changed token rotation interval", sample_cost());
+        let mut c = Correction::new(
+            "auth-reset",
+            "Changed token rotation interval",
+            sample_cost(),
+        );
         c.verify();
         let path = c.save(&dir).unwrap();
 

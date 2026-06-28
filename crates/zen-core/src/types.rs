@@ -125,7 +125,10 @@ impl SessionEvent {
             .with_context(|| format!("failed to parse session event: {}", path.display()))?
         {
             SessionEvent::Meta(entity) => Ok(entity),
-            _ => anyhow::bail!("expected session/meta event as first line in {}", path.display()),
+            _ => anyhow::bail!(
+                "expected session/meta event as first line in {}",
+                path.display()
+            ),
         }
     }
 
@@ -258,8 +261,12 @@ impl SessionEntity {
     pub fn save(&self) -> Result<PathBuf> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
         let date_dir = paths.session_dir_for_date(self.created_at);
-        std::fs::create_dir_all(&date_dir)
-            .with_context(|| format!("failed to create sessions directory: {}", date_dir.display()))?;
+        std::fs::create_dir_all(&date_dir).with_context(|| {
+            format!(
+                "failed to create sessions directory: {}",
+                date_dir.display()
+            )
+        })?;
 
         let file_path = date_dir.join(format!("{}.jsonl", self.id));
         SessionEvent::write_meta(&file_path, self)?;
@@ -305,21 +312,31 @@ impl SessionEntity {
 
         // Fallback: brute-force date-dir scan for .jsonl
         let sessions_root = paths.sessions();
-        let date_dirs_result: Result<Vec<PathBuf>> = Self::scan_date_dirs(&sessions_root, id, "jsonl");
-        if let Ok(Some(session)) = date_dirs_result?.into_iter().next().map(|p| {
-            SessionEvent::read_meta(&p)
-        }).transpose() {
+        let date_dirs_result: Result<Vec<PathBuf>> =
+            Self::scan_date_dirs(&sessions_root, id, "jsonl");
+        if let Ok(Some(session)) = date_dirs_result?
+            .into_iter()
+            .next()
+            .map(|p| SessionEvent::read_meta(&p))
+            .transpose()
+        {
             return Ok(session);
         }
 
         // Legacy fallback: .json metadata file (pre-JSONL format)
-        let date_dirs_result: Result<Vec<PathBuf>> = Self::scan_date_dirs(&sessions_root, id, "json");
-        if let Ok(Some(session)) = date_dirs_result?.into_iter().next().map(|p| {
-            let json = std::fs::read_to_string(&p)
-                .with_context(|| format!("failed to read session file: {}", p.display()))?;
-            serde_json::from_str::<SessionEntity>(&json)
-                .with_context(|| format!("failed to parse session file: {}", p.display()))
-        }).transpose() {
+        let date_dirs_result: Result<Vec<PathBuf>> =
+            Self::scan_date_dirs(&sessions_root, id, "json");
+        if let Ok(Some(session)) = date_dirs_result?
+            .into_iter()
+            .next()
+            .map(|p| {
+                let json = std::fs::read_to_string(&p)
+                    .with_context(|| format!("failed to read session file: {}", p.display()))?;
+                serde_json::from_str::<SessionEntity>(&json)
+                    .with_context(|| format!("failed to parse session file: {}", p.display()))
+            })
+            .transpose()
+        {
             return Ok(session);
         }
 
@@ -332,8 +349,9 @@ impl SessionEntity {
         if flat_path.exists() {
             let json = std::fs::read_to_string(&flat_path)
                 .with_context(|| format!("failed to read session file: {}", flat_path.display()))?;
-            let session: SessionEntity = serde_json::from_str(&json)
-                .with_context(|| format!("failed to parse session file: {}", flat_path.display()))?;
+            let session: SessionEntity = serde_json::from_str(&json).with_context(|| {
+                format!("failed to parse session file: {}", flat_path.display())
+            })?;
             return Ok(session);
         }
 
@@ -347,9 +365,12 @@ impl SessionEntity {
             return Ok(results);
         }
 
-        for year_entry in std::fs::read_dir(sessions_root)
-            .with_context(|| format!("failed to read sessions directory: {}", sessions_root.display()))?
-        {
+        for year_entry in std::fs::read_dir(sessions_root).with_context(|| {
+            format!(
+                "failed to read sessions directory: {}",
+                sessions_root.display()
+            )
+        })? {
             let year_entry = year_entry?;
             let year_path = year_entry.path();
             if !year_path.is_dir() {
@@ -399,9 +420,9 @@ impl SessionEntity {
                     };
                     seen_ids.insert(session.id.clone());
                     sessions.push(session);
-                } else if let Some(repaired) = Self::repair_indexed_session(
-                    &sessions_root, &row.id, &paths.db(),
-                ) {
+                } else if let Some(repaired) =
+                    Self::repair_indexed_session(&sessions_root, &row.id, &paths.db())
+                {
                     seen_ids.insert(repaired.id.clone());
                     sessions.push(repaired);
                 }
@@ -420,10 +441,12 @@ impl SessionEntity {
         id: &str,
         db_dir: &PathBuf,
     ) -> Option<SessionEntity> {
-        let result = Self::scan_date_dirs(sessions_root, id, "jsonl").ok()
+        let result = Self::scan_date_dirs(sessions_root, id, "jsonl")
+            .ok()
             .and_then(|paths| paths.into_iter().next());
         let found_path = result.or_else(|| {
-            Self::scan_date_dirs(sessions_root, id, "json").ok()
+            Self::scan_date_dirs(sessions_root, id, "json")
+                .ok()
                 .and_then(|paths| paths.into_iter().next())
         })?;
         let json = std::fs::read_to_string(&found_path).ok()?;
@@ -457,7 +480,12 @@ impl SessionEntity {
         sessions: &mut Vec<SessionEntity>,
         seen_ids: &mut std::collections::HashSet<String>,
     ) -> Result<()> {
-        for entry in std::fs::read_dir(dir).ok().into_iter().flatten().filter_map(Result::ok) {
+        for entry in std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+        {
             let path = entry.path();
             if path.is_dir() {
                 Self::walk_sessions_dir(&path, sessions, seen_ids)?;
@@ -877,7 +905,6 @@ mod tests {
     /// Returns the global temp dir used by ALL session store tests.
     /// SAFETY: Sets ZEN_HOME once per test process via atomic flag.
     fn session_test_dir() -> &'static std::path::Path {
-
         use std::sync::OnceLock;
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
         let tmp = DIR.get_or_init(|| {
@@ -902,7 +929,12 @@ mod tests {
         let year = session.created_at.format("%Y").to_string();
         let month = session.created_at.format("%m").to_string();
         let day = session.created_at.format("%d").to_string();
-        let expected = root.join("sessions").join(&year).join(&month).join(&day).join(format!("{}.jsonl", session.id));
+        let expected = root
+            .join("sessions")
+            .join(&year)
+            .join(&month)
+            .join(&day)
+            .join(format!("{}.jsonl", session.id));
 
         assert_eq!(path, expected);
         assert!(expected.exists());
@@ -928,7 +960,11 @@ mod tests {
         // Legacy flat .json file
         let flat_session = SessionEntity::new("flat-agent", "/flat-ws");
         let flat_path = sessions_root.join(format!("{}.json", flat_session.id));
-        std::fs::write(&flat_path, serde_json::to_string_pretty(&flat_session).unwrap()).unwrap();
+        std::fs::write(
+            &flat_path,
+            serde_json::to_string_pretty(&flat_session).unwrap(),
+        )
+        .unwrap();
 
         // New .jsonl file via save()
         let date_session = SessionEntity::new("date-agent", "/date-ws");
@@ -936,8 +972,14 @@ mod tests {
 
         let all = SessionEntity::list().unwrap();
         let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&flat_session.id.as_str()), "flat .json session should be in list");
-        assert!(ids.contains(&date_session.id.as_str()), ".jsonl session should be in list");
+        assert!(
+            ids.contains(&flat_session.id.as_str()),
+            "flat .json session should be in list"
+        );
+        assert!(
+            ids.contains(&date_session.id.as_str()),
+            ".jsonl session should be in list"
+        );
     }
 
     #[test]
@@ -948,15 +990,17 @@ mod tests {
 
         let prefix = format!("sqlite-{}", Uuid::now_v7());
         for i in 0..3 {
-            index.upsert(
-                &format!("{}-{}", prefix, i),
-                &format!("2025/06/{:02}/{}-{}.jsonl", 15 + i, prefix, i),
-                &format!("agent-{}", i),
-                "Active",
-                &format!("2025-06-1{}T10:00:00Z", 5 + i),
-                &format!("2025-06-1{}T12:00:00Z", 5 + i),
-                "/ws",
-            ).unwrap();
+            index
+                .upsert(
+                    &format!("{}-{}", prefix, i),
+                    &format!("2025/06/{:02}/{}-{}.jsonl", 15 + i, prefix, i),
+                    &format!("agent-{}", i),
+                    "Active",
+                    &format!("2025-06-1{}T10:00:00Z", 5 + i),
+                    &format!("2025-06-1{}T12:00:00Z", 5 + i),
+                    "/ws",
+                )
+                .unwrap();
         }
 
         let found = index.find(&format!("{}-1", prefix)).unwrap();
@@ -995,6 +1039,9 @@ mod tests {
         index.reconcile(&session.id, "wrong/path.jsonl").unwrap();
 
         let all = SessionEntity::list().unwrap();
-        assert!(all.iter().any(|s| s.id == session.id), "repaired session should be in list");
+        assert!(
+            all.iter().any(|s| s.id == session.id),
+            "repaired session should be in list"
+        );
     }
 }

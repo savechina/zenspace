@@ -99,9 +99,21 @@ impl ZenWorker for EntityExtractorWorker {
         }
 
         let graph_db = paths.db().join("graph.db");
+        let client = match zen_vault::SqliteClient::open(&graph_db).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "failed to open graph.db, skipping entity extraction");
+                return Ok(WorkerReport {
+                    worker_id: self.id().to_string(),
+                    success: true,
+                    fact_count: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
         let svc = EntityService::new();
 
-        let mut known = svc.load_known_entity_names(&graph_db).unwrap_or_default();
+        let mut known = svc.load_known_entity_names(&client).await.unwrap_or_default();
         for kw in TECH_KEYWORDS {
             known.insert((*kw).to_string());
         }
@@ -122,7 +134,7 @@ impl ZenWorker for EntityExtractorWorker {
                 continue;
             }
 
-            match process_entry(entry_path, &svc, &graph_db, &known, router.clone()).await {
+            match process_entry(entry_path, &svc, &client, &known, router.clone()).await {
                 Ok(count) => {
                     total_entities += count;
                     processed += 1;
@@ -156,7 +168,7 @@ impl ZenWorker for EntityExtractorWorker {
 async fn process_entry(
     entry_path: &std::path::Path,
     svc: &EntityService,
-    graph_db: &std::path::Path,
+    client: &zen_vault::SqliteClient,
     known: &HashSet<String>,
     router: Option<DefaultRouter>,
 ) -> Result<usize> {
@@ -186,7 +198,7 @@ async fn process_entry(
         match llm_result {
             Ok(llm_entities) if !llm_entities.is_empty() => {
                 info!(path = %entry_path.display(), count = llm_entities.len(), "LLM entity extraction succeeded");
-                let count = upsert_entities(llm_entities, svc, graph_db)?;
+                let count = upsert_entities(llm_entities, svc, client).await?;
                 append_extracted_marker(entry_path, "llm")?;
                 return Ok(count);
             }
@@ -211,7 +223,7 @@ async fn process_entry(
     for (entity_name, fact_list) in &matched {
         let canonical = entity_name.to_lowercase();
         let entity = Entity::new(canonical, EntityType::Technology, "entity-extractor");
-        if let Err(e) = svc.upsert_entity(graph_db, &entity) {
+        if let Err(e) = svc.upsert_entity(client, &entity).await {
             warn!(entity = %entity_name, error = %e, "failed to upsert entity");
             continue;
         }
@@ -307,15 +319,15 @@ Only include entities explicitly mentioned in the facts. If nothing meaningful, 
     Ok(entities)
 }
 
-fn upsert_entities(
+async fn upsert_entities(
     entities: Vec<(String, EntityType)>,
     svc: &EntityService,
-    graph_db: &std::path::Path,
+    client: &zen_vault::SqliteClient,
 ) -> Result<usize> {
     let mut upserted = 0usize;
     for (name, entity_type) in &entities {
         let entity = Entity::new(name.clone(), entity_type.clone(), "entity-extractor");
-        if let Err(e) = svc.upsert_entity(graph_db, &entity) {
+        if let Err(e) = svc.upsert_entity(client, &entity).await {
             warn!(entity = %name, error = %e, "failed to upsert entity");
             continue;
         }
@@ -359,7 +371,8 @@ fn extract_facts_from_journal(content: &str) -> Vec<String> {
                 break;
             }
             if let Some(fact) = trimmed.strip_prefix("- ")
-                && !fact.is_empty() && fact != "_(no durable facts extracted)_"
+                && !fact.is_empty()
+                && fact != "_(no durable facts extracted)_"
             {
                 facts.push(fact.to_string());
             }
@@ -499,10 +512,11 @@ mod tests {
         assert!(!has_extracted_marker(&path));
     }
 
-    #[test]
-    fn test_upsert_entities() {
+    #[tokio::test]
+    async fn test_upsert_entities() {
         let dir = tempfile::tempdir().unwrap();
         let graph_db = dir.path().join("graph.db");
+        let client = zen_vault::SqliteClient::open(&graph_db).await.unwrap();
         let svc = EntityService::new();
 
         let entities = vec![
@@ -510,10 +524,10 @@ mod tests {
             ("auth".to_string(), EntityType::Concept),
         ];
 
-        let count = upsert_entities(entities, &svc, &graph_db).unwrap();
+        let count = upsert_entities(entities, &svc, &client).await.unwrap();
         assert_eq!(count, 2);
 
-        let known = svc.load_known_entity_names(&graph_db).unwrap();
+        let known = svc.load_known_entity_names(&client).await.unwrap();
         assert!(known.contains("rust"));
         assert!(known.contains("auth"));
     }

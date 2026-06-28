@@ -1,8 +1,8 @@
 <!--
 Sync Impact Report:
-- Version: 1.3.0 → 1.4.0 (MINOR - Design-First & Reuse Priority principle added)
+- Version: 1.4.0 → 1.5.0 (MINOR - Unified Data Layer Architecture principle added)
 - Modified principles: None
-- Added principles: XI. Design-First & Reuse Priority
+- Added principles: XII. Unified Data Layer Architecture
 - Removed sections: None
 - Templates requiring updates: None
 - Deferred items: None
@@ -94,17 +94,50 @@ Rationale: CLI tools must feel responsive; users expect low latency.
 
 Rationale: Industry best practices reduce maintenance burden, improve reliability, and accelerate development. Proven frameworks handle edge cases we haven't discovered yet.
 
+### XII. Unified Data Layer Architecture
+
+**All persistence operations MUST follow the unified data layer design**:
+
+1. **Single Database File**: All application state MUST be stored in a single `state.db` SQLite file. No separate database files for different domains (no kb.db, vec.db, graph.db, sessions.db).
+2. **Unified Client**: All database access MUST go through `SqliteClient` which holds both `tokio_rusqlite::Connection` (for writes) and `sqlx::SqlitePool` (for reads). No direct `SqlitePool` or `Connection` usage.
+3. **Domain-Driven Repositories**: Data access MUST be organized by business domain, not by technology. Each domain repository holds a `&SqliteClient` reference and exposes domain-specific async methods.
+4. **Repository Taxonomy**:
+   - `NotesRepo` — FTS5 full-text search operations
+   - `EmbeddingsRepo` — Vector similarity search (sqlite-vec)
+   - `EntitiesRepo` — Entity graph operations (entities, relationships, aliases)
+   - `SelfModelRepo` — Self-knowledge nodes
+   - `GoalsRepo` — Goals and paths
+   - `BeliefsRepo` — Belief tracking
+   - `DispatchRepo` — Task dispatch and scheduling
+   - `SessionsRepo` — Session index
+
+**Prohibited patterns**:
+- Creating separate database files for different concerns
+- Using raw `SqlitePool` or `Connection` directly in business logic
+- Technology-named repositories (FtsRepo, VectorRepo, GraphRepo)
+- Sync database access methods in async contexts
+
+**Enforcement requirements**:
+- All new data access code MUST use domain repositories
+- Repository methods MUST be async and take `&SqliteClient`
+- Schema migrations MUST be coordinated through `SqliteClient::ensure_schema()`
+- Cross-domain queries MUST go through `SqliteClient` to maintain consistency
+
+Rationale: Unified database eliminates schema sync issues, enables cross-domain queries, and reduces operational complexity. Domain-driven naming improves code readability and maintainability.
+
 ## Technology Stack
 
 - **Language**: Rust (edition 2024)
 - **CLI Framework**: clap for argument parsing
 - **Logging**: tracing with env-filter
-- **Database**: SQLx with MySQL + SQLite support (agentic module uses SQLite)
+- **Database**: Single SQLite file (state.db) via SqliteClient with dual-architecture (tokio-rusqlite for writes, sqlx for reads)
+- **Vector Search**: sqlite-vec extension with 384-dim embeddings
+- **Full-Text Search**: SQLite FTS5 with porter tokenizer
 - **Error Handling**: thiserror + anyhow
 - **Template Engine**: tera with include_dir for embedding
 - **Configuration**: dotenvy
 
-Rationale: Selected for CLI tool suitability, runtime performance, and developer productivity.
+Rationale: Selected for CLI tool suitability, runtime performance, and developer productivity. Unified database architecture eliminates schema sync issues and enables cross-domain queries.
 
 ## Development Workflow
 
@@ -124,4 +157,4 @@ This constitution supersedes all other practices. Amendments require:
 
 All PRs MUST verify compliance with these principles. The AGENTS.md file serves as runtime development guidance.
 
-**Version**: 1.4.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-06-01
+**Version**: 1.5.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-06-28

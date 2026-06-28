@@ -2,9 +2,9 @@ use std::fs::read_to_string;
 
 use anyhow::Result;
 use futures::stream::StreamExt;
+use rig_compose::ContextPackConfig;
 use rig_compose::agent::{Agent, GenericAgent};
 use rig_compose::context::{Evidence, InvestigationContext, Signal};
-use rig_compose::ContextPackConfig;
 use rig_core::completion::CompletionModel;
 use rig_core::streaming::StreamedAssistantContent;
 use rig_memvid::{CardSelection, MemoryCardContext};
@@ -133,10 +133,7 @@ fn load_corrections(
     let mut out = String::from("⚠️ Past errors to avoid:\n");
     for c in &top {
         let cost_info = if c.cost.economic > 0.0 || c.cost.time_hours > 0.0 {
-            format!(
-                ", cost: ${:.0}/{}h",
-                c.cost.economic, c.cost.time_hours
-            )
+            format!(", cost: ${:.0}/{}h", c.cost.economic, c.cost.time_hours)
         } else {
             String::new()
         };
@@ -268,11 +265,7 @@ fn load_reflections(dir: &std::path::Path) -> String {
     let mut files: Vec<_> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "md")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .collect(),
         Err(e) => {
             warn!(dir = %dir.display(), error = %e, "failed to read reflections dir");
@@ -322,11 +315,7 @@ fn load_mental_models(dir: &std::path::Path) -> String {
     let files: Vec<_> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "md")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .collect(),
         Err(e) => {
             warn!(dir = %dir.display(), error = %e, "failed to read mental models dir");
@@ -344,10 +333,7 @@ fn load_mental_models(dir: &std::path::Path) -> String {
         if let Ok(content) = std::fs::read_to_string(&path) {
             let first_para = extract_first_paragraph(&content);
             if !first_para.is_empty() {
-                let title = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("model");
+                let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
                 out.push_str(&format!("- **{}**: {}\n", title, first_para));
             }
         }
@@ -569,12 +555,20 @@ impl ZenAgent {
                 return None;
             }
 
-            tracing::info!(session_id, count = all_cards.len(), "Memories retrieved (session + user)");
-            Some(all_cards.into_iter()
-                .filter(|c| c.confidence.unwrap_or(1.0) >= zen_memory::memvid::TRIPLET_MIN_CONFIDENCE)
-                .map(|c| {
-                    format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value)
-                }).collect())
+            tracing::info!(
+                session_id,
+                count = all_cards.len(),
+                "Memories retrieved (session + user)"
+            );
+            Some(
+                all_cards
+                    .into_iter()
+                    .filter(|c| {
+                        c.confidence.unwrap_or(1.0) >= zen_memory::memvid::TRIPLET_MIN_CONFIDENCE
+                    })
+                    .map(|c| format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value))
+                    .collect(),
+            )
         })
     }
 
@@ -588,12 +582,21 @@ impl ZenAgent {
 
             match ctx.select(query) {
                 Ok(cards) if !cards.is_empty() => {
-                    tracing::info!(session_id, count = cards.len(), "Structured memory cards retrieved");
-                    Some(cards.into_iter()
-                        .filter(|c| c.confidence.unwrap_or(1.0) >= zen_memory::memvid::TRIPLET_MIN_CONFIDENCE)
-                        .map(|c| {
-                            format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value)
-                        }).collect())
+                    tracing::info!(
+                        session_id,
+                        count = cards.len(),
+                        "Structured memory cards retrieved"
+                    );
+                    Some(
+                        cards
+                            .into_iter()
+                            .filter(|c| {
+                                c.confidence.unwrap_or(1.0)
+                                    >= zen_memory::memvid::TRIPLET_MIN_CONFIDENCE
+                            })
+                            .map(|c| format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value))
+                            .collect(),
+                    )
                 }
                 Ok(_) => {
                     tracing::debug!(session_id, "No structured cards found");
@@ -707,7 +710,10 @@ impl ZenAgent {
         Self::tier_score(skill, label)
     }
 
-    fn build_chat_history(prompt: &str, session: &SessionContext) -> rig_core::OneOrMany<rig_core::message::Message> {
+    fn build_chat_history(
+        prompt: &str,
+        session: &SessionContext,
+    ) -> rig_core::OneOrMany<rig_core::message::Message> {
         use rig_core::message::Message;
 
         if session.conversation.is_empty() {
@@ -725,7 +731,8 @@ impl ZenAgent {
             .collect();
 
         messages.push(Message::user(prompt));
-        rig_core::OneOrMany::many(messages).unwrap_or_else(|_| rig_core::OneOrMany::one(Message::user(prompt)))
+        rig_core::OneOrMany::many(messages)
+            .unwrap_or_else(|_| rig_core::OneOrMany::one(Message::user(prompt)))
     }
 
     fn build_prompt(&self, query: &str, ctx: &InvestigationContext) -> String {
@@ -802,7 +809,11 @@ impl ZenAgent {
                 }
             }
             Err(e) => {
-                crate::observability::emit_prompt_failed(model_name, &conversation_id, &e.to_string());
+                crate::observability::emit_prompt_failed(
+                    model_name,
+                    &conversation_id,
+                    &e.to_string(),
+                );
                 Err(e.into())
             }
         }
@@ -979,7 +990,7 @@ impl ZenAgentBuilder {
 #[cfg(test)]
 mod chain_tests {
     use super::*;
-    use zen_core::types::{ConversationTurn, RetrievedNote, Sensitivity, SessionContext};
+    use zen_core::types::SessionContext;
 
     fn dummy_session_with_history() -> SessionContext {
         let mut session = SessionContext::new("test-agent".to_string(), String::new());

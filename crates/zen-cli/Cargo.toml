@@ -17,6 +17,7 @@ zen-agents = { path = "../zen-agents" }
 zen-memory = { path = "../zen-memory" }
 zen-provider = { path = "../zen-provider" }
 zen-plugin = { path = "../zen-plugin" }
+zen-repo = { path = "../zen-repo" }
 clap = { workspace = true }
 clap-verbosity-flag = { workspace = true }
 colored = { workspace = true }
@@ -45,6 +46,7 @@ time = { workspace = true }
 arboard = { workspace = true }
 base64 = { workspace = true }
 unicode-width = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

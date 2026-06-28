@@ -30,7 +30,10 @@ fn crash_recovery_committed_frames_intact() {
         .expect("reopen after crash");
 
     let count = reopened.frame_count().expect("frame count");
-    assert!(count >= 5, "expected >=5 frames after recovery, got {count}");
+    assert!(
+        count >= 5,
+        "expected >=5 frames after recovery, got {count}"
+    );
 }
 
 #[test]
@@ -45,7 +48,10 @@ fn crash_recovery_writes_after_reopen() {
         .expect("store creation");
 
     store
-        .put_text("First write before crash", rig_memvid::memvid_core::PutOptions::default())
+        .put_text(
+            "First write before crash",
+            rig_memvid::memvid_core::PutOptions::default(),
+        )
         .expect("put_text before crash");
 
     drop(store);
@@ -57,9 +63,15 @@ fn crash_recovery_writes_after_reopen() {
         .expect("reopen");
 
     reopened
-        .put_text("Second write after recovery", rig_memvid::memvid_core::PutOptions::default())
+        .put_text(
+            "Second write after recovery",
+            rig_memvid::memvid_core::PutOptions::default(),
+        )
         .expect("put_text after recovery");
 
     let count = reopened.frame_count().expect("frame count");
-    assert!(count >= 2, "expected >=2 frames after recovery + new write, got {count}");
+    assert!(
+        count >= 2,
+        "expected >=2 frames after recovery + new write, got {count}"
+    );
 }

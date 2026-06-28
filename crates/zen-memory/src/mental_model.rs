@@ -41,7 +41,10 @@ impl MentalModelSignal {
         md.push_str("---\n");
         md.push_str(&format!("model: \"{}\"\n", self.model.replace('"', "\\\"")));
         md.push_str(&format!("domain: {}\n", self.domain));
-        md.push_str(&format!("source: \"{}\"\n", self.source.replace('"', "\\\"")));
+        md.push_str(&format!(
+            "source: \"{}\"\n",
+            self.source.replace('"', "\\\"")
+        ));
         md.push_str("---\n\n");
         md.push_str(&format!("# {}\n\n", self.model));
         md.push_str(&format!("**Application**: {}\n", self.application));

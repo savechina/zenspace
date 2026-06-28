@@ -115,7 +115,7 @@ pub fn compute_commitment_completion_rate(
 mod tests {
     use super::*;
     use crate::commitment::{Milestone, StopLossLine};
-    use chrono::{NaiveDate, Utc};
+    use chrono::Utc;
 
     fn make_commitment(what: &str, days_ago: i64) -> Commitment {
         let created = Utc::now() - Duration::days(days_ago);
@@ -198,10 +198,8 @@ mod tests {
         let mut old = make_commitment("old task", 200);
         old.state = CommitmentState::Completed;
 
-        let kpi = compute_commitment_completion_rate(
-            &[completed, abandoned, overdue, active, old],
-            90,
-        );
+        let kpi =
+            compute_commitment_completion_rate(&[completed, abandoned, overdue, active, old], 90);
         assert_eq!(kpi.total_commitments, 4);
         assert_eq!(kpi.completed, 1);
         assert_eq!(kpi.abandoned, 1);

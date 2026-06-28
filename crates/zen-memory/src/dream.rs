@@ -76,7 +76,11 @@ impl ZenDream {
     ///
     /// Refactored: fact extraction is the single shared bridge for both
     /// MEMORY.md and knowledge-graph recompute_entities().
-    pub fn run_cycle(&self, zen_paths: &ZenPaths, date: NaiveDate) -> Result<DreamReport, DreamError> {
+    pub async fn run_cycle(
+        &self,
+        zen_paths: &ZenPaths,
+        date: NaiveDate,
+    ) -> Result<DreamReport, DreamError> {
         info!("dream cycle started for {date}");
 
         let facts = extract_facts_from_journal_entries(zen_paths, date)?;
@@ -86,7 +90,11 @@ impl ZenDream {
             return Ok(DreamReport::empty(date));
         }
 
-        info!(fact_count = facts.len(), "extracted {} durable fact(s) for {date}", facts.len());
+        info!(
+            fact_count = facts.len(),
+            "extracted {} durable fact(s) for {date}",
+            facts.len()
+        );
 
         // Phase B: entity promotion + wiki compilation moved to WikiCompilerWorker.
         // DreamWorker now only handles MEMORY.md update + maintenance.
@@ -102,9 +110,9 @@ impl ZenDream {
             facts_extracted: facts.len(),
             memory_updated,
             logs_compressed: compress_old_logs(zen_paths)?,
-            entities_recomputed: recompute_entities(zen_paths)?,
-            knowledge_updated: false,  // Phase B: moved to WikiCompilerWorker
-            wiki_pages_created: 0,     // Phase B: moved to WikiCompilerWorker
+            entities_recomputed: recompute_entities(zen_paths).await?,
+            knowledge_updated: false, // Phase B: moved to WikiCompilerWorker
+            wiki_pages_created: 0,    // Phase B: moved to WikiCompilerWorker
         };
 
         info!(
@@ -122,7 +130,7 @@ impl ZenDream {
     ///
     /// Phase 3 Task 7: First-run historical scanning. Each day is processed
     /// via `run_cycle`; failures are logged and skipped, not fatal.
-    pub fn backfill(
+    pub async fn backfill(
         &self,
         zen_paths: &ZenPaths,
         from: NaiveDate,
@@ -132,7 +140,7 @@ impl ZenDream {
         let mut date = from;
 
         while date <= to {
-            match self.run_cycle(zen_paths, date) {
+            match self.run_cycle(zen_paths, date).await {
                 Ok(report) => {
                     info!(date = %date, facts = report.facts_extracted, "backfill cycle ok");
                     reports.push(report);
@@ -219,11 +227,17 @@ pub enum DreamError {
 /// Extract durable facts from journal entries for a given date.
 /// Reads `memories/journal/{date}-*.md` files written by SessionJournaler.
 /// Parses the `## Facts` section from each entry.
-fn extract_facts_from_journal_entries(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<String>, DreamError> {
+fn extract_facts_from_journal_entries(
+    zen_paths: &ZenPaths,
+    date: NaiveDate,
+) -> Result<Vec<String>, DreamError> {
     let journal_dir = zen_paths.journal_entries();
 
     if !journal_dir.exists() {
-        debug!("journal entries dir does not exist: {}", journal_dir.display());
+        debug!(
+            "journal entries dir does not exist: {}",
+            journal_dir.display()
+        );
         return Ok(Vec::new());
     }
 
@@ -302,7 +316,7 @@ fn extract_durable_facts(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<St
     }
 
     let mut facts = Vec::new();
-    
+
     for entry in &entries {
         let entry_facts = extract_durable_facts_from_entry(&entry.content);
         if !entry_facts.is_empty() {
@@ -323,9 +337,22 @@ fn extract_durable_facts(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<St
 /// Heuristic: lines that look like completed actions (past tense verbs).
 pub fn extract_durable_facts_from_entry(content: &str) -> Vec<String> {
     const ACTION_KEYWORDS: &[&str] = &[
-        "completed", "fixed", "added", "removed", "resolved",
-        "implemented", "created", "shipped", "deployed", "updated",
-        "design", "build", "migrate", "refactor", "optimize", "test",
+        "completed",
+        "fixed",
+        "added",
+        "removed",
+        "resolved",
+        "implemented",
+        "created",
+        "shipped",
+        "deployed",
+        "updated",
+        "design",
+        "build",
+        "migrate",
+        "refactor",
+        "optimize",
+        "test",
     ];
 
     let mut facts = Vec::new();
@@ -353,7 +380,11 @@ pub fn extract_durable_facts_from_entry(content: &str) -> Vec<String> {
 /// Now accepts pre-extracted facts as a bridge — ensures ALL durable facts
 /// are stored in MEMORY.md, while **entity-aware facts also go to knowledge graph**.
 /// Personal-only facts (no known entity names) go ONLY to MEMORY.md (not graph).
-pub fn update_memory_from_facts(zen_paths: &ZenPaths, facts: &[String], source: &str) -> Result<bool, DreamError> {
+pub fn update_memory_from_facts(
+    zen_paths: &ZenPaths,
+    facts: &[String],
+    source: &str,
+) -> Result<bool, DreamError> {
     if facts.is_empty() {
         debug!("no facts provided for MEMORY.md update");
         return Ok(false);
@@ -368,7 +399,7 @@ pub fn update_memory_from_facts(zen_paths: &ZenPaths, facts: &[String], source: 
 
     // Deduplicate facts before writing
     let unique_facts: Vec<String> = dedupe_facts(facts);
-    
+
     if unique_facts.is_empty() {
         debug!("all facts were duplicates, skipping MEMORY.md write");
         return Ok(false);
@@ -433,14 +464,18 @@ pub fn update_memory_from_facts(zen_paths: &ZenPaths, facts: &[String], source: 
     fs::write(&tmp_path, &new_content)?;
     fs::rename(&tmp_path, &memory_path)?;
 
-    info!("MEMORY.md updated with {} new fact(s)", filtered_entries.len());
+    info!(
+        "MEMORY.md updated with {} new fact(s)",
+        filtered_entries.len()
+    );
     Ok(true)
 }
 
 /// Deduplicate fact strings while preserving order.
 fn dedupe_facts(facts: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
-    facts.iter()
+    facts
+        .iter()
         .filter(|f| seen.insert(f.to_lowercase()))
         .cloned()
         .collect()
@@ -513,8 +548,8 @@ fn compress_old_logs(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
 /// Recompute entity relationships by scanning the wiki/entities/ directory.
 ///
 /// Reads each `.md` file in `wiki/entities/`, parses frontmatter for name,
-/// entity_type, and aliases, then upserts each entity into graph.db.
-fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
+/// entity_type, and aliases, then upserts each entity into state.db.
+async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
     let entities_dir = zen_paths.vault().join("wiki/entities");
 
     if !entities_dir.exists() {
@@ -522,13 +557,17 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
         return Ok(0);
     }
 
-    let graph_db = zen_paths.db().join("graph.db");
+    let state_db = zen_paths.db().join("state.db");
 
-    if !graph_db.exists() {
+    if !state_db.exists() {
         return Err(DreamError::KnowledgeGraphPersist(
-            "graph.db does not exist; cannot recompute entities".into(),
+            "state.db does not exist; cannot recompute entities".into(),
         ));
     }
+
+    let client = zen_repo::SqliteClient::open(&state_db)
+        .await
+        .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
 
     let svc = EntityService::new();
     let mut upserted = 0usize;
@@ -557,7 +596,7 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
                 let mut entity = Entity::new(name, entity_type, "wiki-recompute");
                 entity.id = format!("wiki-{}", md5_hex(&md5_input));
 
-                if let Err(e) = svc.upsert_entity(&graph_db, &entity) {
+                if let Err(e) = svc.upsert_entity(&client, &entity).await {
                     warn!(
                         file = %path.display(),
                         error = %e,
@@ -566,15 +605,8 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
                     continue;
                 }
 
-                if let Ok(repo) = zen_repo::sqlite_repo::SqliteRepo::open(&graph_db) {
-                    for alias in &aliases {
-                        let sql = format!(
-                            "INSERT OR IGNORE INTO entity_aliases (alias, canonical_entity_id) VALUES ('{}', '{}')",
-                            alias.replace('\'', "''"),
-                            entity.id.replace('\'', "''")
-                        );
-                        let _ = repo.execute_batch(&sql);
-                    }
+                for alias in &aliases {
+                    let _ = zen_repo::EntitiesRepo::new(&client).insert_alias(alias, &entity.id).await;
                 }
 
                 upserted += 1;
@@ -590,9 +622,10 @@ fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
     Ok(upserted)
 }
 
-fn parse_entity_file(path: &std::path::Path) -> Result<(String, EntityType, Vec<String>), DreamError> {
-    let content = fs::read_to_string(path)
-        .map_err(DreamError::Io)?;
+fn parse_entity_file(
+    path: &std::path::Path,
+) -> Result<(String, EntityType, Vec<String>), DreamError> {
+    let content = fs::read_to_string(path).map_err(DreamError::Io)?;
 
     let mut in_frontmatter = false;
     let mut name: Option<String> = None;
@@ -621,7 +654,10 @@ fn parse_entity_file(path: &std::path::Path) -> Result<(String, EntityType, Vec<
         DreamError::WikiCompile(format!("missing 'name' in frontmatter: {}", path.display()))
     })?;
     let type_str = entity_type_str.ok_or_else(|| {
-        DreamError::WikiCompile(format!("missing 'entity_type' in frontmatter: {}", path.display()))
+        DreamError::WikiCompile(format!(
+            "missing 'entity_type' in frontmatter: {}",
+            path.display()
+        ))
     })?;
 
     let entity_type = match type_str.as_str() {
@@ -792,25 +828,23 @@ mod tests {
         assert!(facts2.is_empty(), "no facts section means no facts");
     }
 
-    #[test]
-    fn test_recompute_entities_empty_dir() {
+    #[tokio::test]
+    async fn test_recompute_entities_empty_dir() {
         let (_dir, paths) = setup_test_paths();
         let entities_dir = paths.vault().join("wiki/entities");
         fs::create_dir_all(&entities_dir).unwrap();
 
         let db_dir = paths.db();
         fs::create_dir_all(&db_dir).unwrap();
-        let graph_db = db_dir.join("graph.db");
-        zen_repo::sqlite_repo::SqliteRepo::open(&graph_db)
-            .and_then(|repo| zen_repo::sqlite_repo::init_graph_schema(&repo))
-            .unwrap();
+        let state_db = db_dir.join("state.db");
+        zen_repo::SqliteClient::open(&state_db).await.unwrap();
 
-        let count = recompute_entities(&paths).unwrap();
+        let count = recompute_entities(&paths).await.unwrap();
         assert_eq!(count, 0, "empty entities dir should return 0");
     }
 
-    #[test]
-    fn test_recompute_entities_valid_entity() {
+    #[tokio::test]
+    async fn test_recompute_entities_valid_entity() {
         let (_dir, paths) = setup_test_paths();
         let entities_dir = paths.vault().join("wiki/entities");
         fs::create_dir_all(&entities_dir).unwrap();
@@ -820,31 +854,31 @@ mod tests {
 
         let db_dir = paths.db();
         fs::create_dir_all(&db_dir).unwrap();
-        let graph_db = db_dir.join("graph.db");
-        zen_repo::sqlite_repo::SqliteRepo::open(&graph_db)
-            .and_then(|repo| zen_repo::sqlite_repo::init_graph_schema(&repo))
-            .unwrap();
+        let state_db = db_dir.join("state.db");
+        zen_repo::SqliteClient::open(&state_db).await.unwrap();
 
-        let count = recompute_entities(&paths).unwrap();
+        let count = recompute_entities(&paths).await.unwrap();
         assert_eq!(count, 1, "should upsert 1 entity");
     }
 
-    #[test]
-    fn test_recompute_entities_malformed_file_skipped() {
+    #[tokio::test]
+    async fn test_recompute_entities_malformed_file_skipped() {
         let (_dir, paths) = setup_test_paths();
         let entities_dir = paths.vault().join("wiki/entities");
         fs::create_dir_all(&entities_dir).unwrap();
 
-        fs::write(entities_dir.join("bad.md"), "---\ntitle: no entity_type\n---\n\nBody\n").unwrap();
+        fs::write(
+            entities_dir.join("bad.md"),
+            "---\ntitle: no entity_type\n---\n\nBody\n",
+        )
+        .unwrap();
 
         let db_dir = paths.db();
         fs::create_dir_all(&db_dir).unwrap();
-        let graph_db = db_dir.join("graph.db");
-        zen_repo::sqlite_repo::SqliteRepo::open(&graph_db)
-            .and_then(|repo| zen_repo::sqlite_repo::init_graph_schema(&repo))
-            .unwrap();
+        let state_db = db_dir.join("state.db");
+        zen_repo::SqliteClient::open(&state_db).await.unwrap();
 
-        let count = recompute_entities(&paths).unwrap();
+        let count = recompute_entities(&paths).await.unwrap();
         assert_eq!(count, 0, "malformed file should be skipped, returning 0");
     }
 }

@@ -39,9 +39,18 @@ impl AntiPatternSignal {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str("---\n");
-        md.push_str(&format!("pattern: \"{}\"\n", self.pattern.replace('"', "\\\"")));
-        md.push_str(&format!("trigger: \"{}\"\n", self.trigger.replace('"', "\\\"")));
-        md.push_str(&format!("avoidance: \"{}\"\n", self.avoidance.replace('"', "\\\"")));
+        md.push_str(&format!(
+            "pattern: \"{}\"\n",
+            self.pattern.replace('"', "\\\"")
+        ));
+        md.push_str(&format!(
+            "trigger: \"{}\"\n",
+            self.trigger.replace('"', "\\\"")
+        ));
+        md.push_str(&format!(
+            "avoidance: \"{}\"\n",
+            self.avoidance.replace('"', "\\\"")
+        ));
         if !self.detected_in.is_empty() {
             md.push_str("detected_in:\n");
             for r in &self.detected_in {

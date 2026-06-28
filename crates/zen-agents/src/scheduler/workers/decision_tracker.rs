@@ -214,9 +214,7 @@ fn check_body_outcome(body_lines: &[&str]) -> bool {
         if in_feedback && trimmed.starts_with("## ") {
             break;
         }
-        if in_feedback
-            && let Some(val) = trimmed.strip_prefix("outcome:")
-        {
+        if in_feedback && let Some(val) = trimmed.strip_prefix("outcome:") {
             let v = val.trim();
             if !v.is_empty() && v != "(pending)" && v != "null" {
                 return true;

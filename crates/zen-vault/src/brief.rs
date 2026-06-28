@@ -188,10 +188,7 @@ fn read_habits_and_goals(
 
 fn count_contradictions(zen_paths: &ZenPaths) -> Result<usize, anyhow::Error> {
     // Read contradiction records from knowledge/contradictions/ if present.
-    let contra_dir = zen_paths
-        .vault()
-        .join("consolidate")
-        .join("contradictions");
+    let contra_dir = zen_paths.vault().join("consolidate").join("contradictions");
     if !contra_dir.is_dir() {
         return Ok(0);
     }

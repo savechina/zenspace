@@ -167,10 +167,7 @@ impl SelfModelItem {
         md.push_str("---\n");
         md.push_str(&format!("id: {}\n", self.id));
         md.push_str(&format!("layer: \"{}\"\n", self.layer));
-        md.push_str(&format!(
-            "name: \"{}\"\n",
-            self.name.replace('"', "\\\"")
-        ));
+        md.push_str(&format!("name: \"{}\"\n", self.name.replace('"', "\\\"")));
         md.push_str(&format!("domain: {}\n", self.domain));
         md.push_str(&format!("source: {}\n", self.source));
         md.push_str(&format!("confidence: {}\n", self.confidence));
@@ -278,18 +275,15 @@ impl SelfModelItem {
     /// Parse self-model item from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<SelfModelItem> {
         let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id")
-            .ok_or_else(|| anyhow::anyhow!("missing id field"))?;
-        let layer_str = parse_yaml_field(&fm, "layer")
-            .ok_or_else(|| anyhow::anyhow!("missing layer field"))?;
+        let id = parse_yaml_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
+        let layer_str =
+            parse_yaml_field(&fm, "layer").ok_or_else(|| anyhow::anyhow!("missing layer field"))?;
         let layer = SelfModelLayer::from_str(layer_str.trim_matches('"'))?;
         let name = parse_yaml_field(&fm, "name")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let domain =
-            parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
-        let source = parse_yaml_field(&fm, "source")
-            .unwrap_or_else(|| "manual".to_string());
+        let domain = parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
+        let source = parse_yaml_field(&fm, "source").unwrap_or_else(|| "manual".to_string());
         let confidence: f64 = parse_yaml_field(&fm, "confidence")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.5);
@@ -306,14 +300,12 @@ impl SelfModelItem {
 
         // Layer-specific optional fields
         let is_explicit = parse_yaml_field(&fm, "is_explicit").map(|s| s == "true");
-        let controllability = parse_yaml_field(&fm, "controllability")
-            .and_then(|s| s.parse().ok());
-        let humility_score = parse_yaml_field(&fm, "humility_score")
-            .and_then(|s| s.parse().ok());
-        let optionality_count = parse_yaml_field(&fm, "optionality_count")
-            .and_then(|s| s.parse().ok());
-        let core_pursuit = parse_yaml_field(&fm, "core_pursuit")
-            .map(|s| s.trim_matches('"').to_string());
+        let controllability = parse_yaml_field(&fm, "controllability").and_then(|s| s.parse().ok());
+        let humility_score = parse_yaml_field(&fm, "humility_score").and_then(|s| s.parse().ok());
+        let optionality_count =
+            parse_yaml_field(&fm, "optionality_count").and_then(|s| s.parse().ok());
+        let core_pursuit =
+            parse_yaml_field(&fm, "core_pursuit").map(|s| s.trim_matches('"').to_string());
         let sufficient_for = parse_yaml_array(&fm, "sufficient_for");
         let necessary_for = parse_yaml_array(&fm, "necessary_for");
         let evidence_refs = parse_yaml_array(&fm, "evidence_refs");
@@ -441,10 +433,7 @@ pub fn compute_humility_score(decisions_dir: &Path, min_decisions: usize) -> Opt
         Err(_) => return None,
     };
 
-    let with_outcome: Vec<_> = decisions
-        .iter()
-        .filter(|d| d.outcome.is_some())
-        .collect();
+    let with_outcome: Vec<_> = decisions.iter().filter(|d| d.outcome.is_some()).collect();
 
     if with_outcome.len() < min_decisions {
         return None;
@@ -467,10 +456,7 @@ pub fn compute_humility_score(decisions_dir: &Path, min_decisions: usize) -> Opt
 // ─── Aggregation helpers ───────────────────────────────────────────────
 
 /// Filter self-model items by layer.
-pub fn items_by_layer(
-    items: &[SelfModelItem],
-    layer: SelfModelLayer,
-) -> Vec<&SelfModelItem> {
+pub fn items_by_layer(items: &[SelfModelItem], layer: SelfModelLayer) -> Vec<&SelfModelItem> {
     items.iter().filter(|i| i.layer == layer).collect()
 }
 
@@ -831,12 +817,7 @@ updated_at: 2026-06-26T00:00:00Z
                 "K1".into(),
                 "d".into(),
             ),
-            SelfModelItem::new(
-                "s1".into(),
-                SelfModelLayer::Skill,
-                "S1".into(),
-                "d".into(),
-            ),
+            SelfModelItem::new("s1".into(), SelfModelLayer::Skill, "S1".into(), "d".into()),
             SelfModelItem::new(
                 "k2".into(),
                 SelfModelLayer::Knowledge,
@@ -846,7 +827,11 @@ updated_at: 2026-06-26T00:00:00Z
         ];
         let knowledge = items_by_layer(&items, SelfModelLayer::Knowledge);
         assert_eq!(knowledge.len(), 2);
-        assert!(knowledge.iter().all(|i| i.layer == SelfModelLayer::Knowledge));
+        assert!(
+            knowledge
+                .iter()
+                .all(|i| i.layer == SelfModelLayer::Knowledge)
+        );
 
         let skills = items_by_layer(&items, SelfModelLayer::Skill);
         assert_eq!(skills.len(), 1);
@@ -885,11 +870,13 @@ updated_at: 2026-06-26T00:00:00Z
 
     #[test]
     fn test_slugify_name() {
-        assert_eq!(slugify_name("JWT with refresh rotation"), "jwt-with-refresh-rotation");
-        assert_eq!(slugify_name("  spaces  "), "spaces");
-        let long = slugify_name(
-            "A very long name that exceeds the sixty character limit for slugs",
+        assert_eq!(
+            slugify_name("JWT with refresh rotation"),
+            "jwt-with-refresh-rotation"
         );
+        assert_eq!(slugify_name("  spaces  "), "spaces");
+        let long =
+            slugify_name("A very long name that exceeds the sixty character limit for slugs");
         assert_eq!(long.len(), 60);
     }
 

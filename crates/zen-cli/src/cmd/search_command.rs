@@ -55,7 +55,7 @@ impl From<&SearchResult> for SearchResultJson {
     }
 }
 
-pub fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
+pub async fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
     match cmd {
         SearchCommands::Run {
             query,
@@ -76,8 +76,14 @@ pub fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
             let router = DefaultRouter::from_agentic(config);
             let service = SearchService::new(router);
 
+            let db_path = paths.db().join("state.db");
+            let client = zen_repo::SqliteClient::open(&db_path)
+                .await
+                .map_err(|e| ZenError::Message(format!("Database error: {}", e)))?;
+
             let results = service
-                .search(query, &base_dir, *tier)
+                .search(query, &base_dir, &client, *tier)
+                .await
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 
             if results.is_empty() {

@@ -122,7 +122,13 @@ impl CompletionModel for ZenCompletionModel {
 
         tracing::info!(provider = %self.model_name, "completion_model: LLM stream initialized");
 
-        let state = (stream_resp.token_rx, stream_resp.done_rx, String::new(), 0usize, self.model_name.clone());
+        let state = (
+            stream_resp.token_rx,
+            stream_resp.done_rx,
+            String::new(),
+            0usize,
+            self.model_name.clone(),
+        );
 
         #[allow(clippy::type_complexity)]
         let boxed: std::pin::Pin<

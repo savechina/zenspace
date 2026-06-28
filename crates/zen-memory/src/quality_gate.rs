@@ -334,10 +334,12 @@ mod tests {
         let report = check_decision_promotion(true, true, false, false, true);
         assert!(!report.can_promote);
         assert!(!report.anti_patterns_passed);
-        assert!(report
-            .fail_reasons
-            .iter()
-            .any(|r| r.contains("anti-pattern")));
+        assert!(
+            report
+                .fail_reasons
+                .iter()
+                .any(|r| r.contains("anti-pattern"))
+        );
     }
 
     #[test]
@@ -352,10 +354,12 @@ mod tests {
         let report = check_decision_promotion(true, true, true, false, false);
         assert!(!report.can_promote);
         assert!(!report.goal_path_resolved);
-        assert!(report
-            .fail_reasons
-            .iter()
-            .any(|r| r.contains("path decision")));
+        assert!(
+            report
+                .fail_reasons
+                .iter()
+                .any(|r| r.contains("path decision"))
+        );
     }
 
     #[test]

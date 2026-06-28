@@ -390,9 +390,7 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
         .wisdom_synthesis_schedule
         .clone()
         .unwrap_or_else(|| default_wisdom_synthesis_schedule().to_string());
-    if let Err(e) =
-        scheduler.register(WisdomSynthesizer::new().with_schedule(&wisdom_schedule))
-    {
+    if let Err(e) = scheduler.register(WisdomSynthesizer::new().with_schedule(&wisdom_schedule)) {
         warn!("scheduler: failed to register wisdom-synth worker: {e}");
     }
 

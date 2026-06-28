@@ -16,8 +16,8 @@ use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
 use super::cell::{BannerCell, ErrorCell, MarkdownCell, OutputCell, PlainCell};
-use super::render::normalize_compact_markdown;
 use super::model_picker::ModelPickerState;
+use super::render::normalize_compact_markdown;
 use super::session_picker::SessionPickerState;
 use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::MarkdownStreamCollector;
@@ -33,7 +33,10 @@ pub struct PendingLlmCall {
 pub struct PendingLlmCallStream {
     pub query: String,
     pub tokens_rx: mpsc::Receiver<String>,
-    pub done_rx: mpsc::Receiver<(Result<String, String>, Option<zen_core::types::SessionContext>)>,
+    pub done_rx: mpsc::Receiver<(
+        Result<String, String>,
+        Option<zen_core::types::SessionContext>,
+    )>,
 }
 
 pub enum PendingCallKind {
@@ -325,6 +328,7 @@ pub struct App {
     pub current_toast: Option<(String, Instant)>,
     conversation_store: Option<ConversationStore>,
     history_store: HistoryStore,
+    db_client: Option<zen_repo::SqliteClient>,
 }
 
 impl App {
@@ -392,6 +396,7 @@ impl App {
                         Some(1_048_576),
                     )
                 }),
+            db_client: None,
         };
         app.load_command_history();
         app
@@ -793,7 +798,10 @@ Use /thinking to show/hide thinking process."#;
 
         let context = self.auto_search_knowledge(query);
         if !context.is_empty() {
-            tracing::info!(count = context.len(), "TUI chat: knowledge context injected");
+            tracing::info!(
+                count = context.len(),
+                "TUI chat: knowledge context injected"
+            );
             self.push_output(
                 format!("[Knowledge] Found {} relevant notes", context.len()),
                 false,
@@ -812,7 +820,7 @@ Use /thinking to show/hide thinking process."#;
         self.start_llm_call_via_orchestrator(query, &context);
     }
 
-    fn auto_search_knowledge(&self, query: &str) -> Vec<String> {
+    fn auto_search_knowledge(&mut self, query: &str) -> Vec<String> {
         use zen_core::paths::ZenPaths;
         use zen_vault::search::{SearchService, TierSelector};
 
@@ -823,9 +831,24 @@ Use /thinking to show/hide thinking process."#;
         let service = SearchService::new(self.router.clone());
         let tier = TierSelector::select_tier(query);
 
+        if self.db_client.is_none() {
+            let db_path = paths.db().join("state.db");
+            self.db_client = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
+            })
+            .ok();
+        }
+        let client = match self.db_client.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+
         let mut results = Vec::new();
         for dir in [paths.inbox(), paths.wiki()] {
-            if let Ok(r) = service.search(query, &dir, Some(tier)) {
+            if let Ok(r) = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(service.search(query, &dir, client, Some(tier)))
+            }) {
                 results.extend(r);
             }
         }
@@ -918,7 +941,10 @@ Use /thinking to show/hide thinking process."#;
 
     pub fn poll_llm_response(&mut self) {
         struct StreamResult {
-            done_result: Option<(Result<String, String>, Option<zen_core::types::SessionContext>)>,
+            done_result: Option<(
+                Result<String, String>,
+                Option<zen_core::types::SessionContext>,
+            )>,
             tokens: Vec<String>,
         }
 
@@ -1019,10 +1045,14 @@ Use /thinking to show/hide thinking process."#;
 
                 let partial = self.stream_collector.buffer().to_string();
                 if !partial.is_empty() {
-                    self.output.retain(|c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")));
-                    self.output.push(OutputCell::Plain(super::cell::PlainCell::new(
-                        format!("[streaming] {}", partial),
-                    )));
+                    self.output.retain(
+                        |c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")),
+                    );
+                    self.output
+                        .push(OutputCell::Plain(super::cell::PlainCell::new(format!(
+                            "[streaming] {}",
+                            partial
+                        ))));
                 }
 
                 if let Some(done_result) = result.done_result {
@@ -1098,14 +1128,10 @@ Use /thinking to show/hide thinking process."#;
                         if pc.models.is_empty() {
                             let d = pc.default_model.as_deref().unwrap_or("-");
                             self.push_output(format!("  (no catalog; default: {d})"), false);
-                            self.push_output(
-                                format!("  Use: /model {provider} {d}"),
-                                false,
-                            );
+                            self.push_output(format!("  Use: /model {provider} {d}"), false);
                         } else {
                             for (mid, e) in &pc.models {
-                                let tag = if Some(mid.as_str()) == pc.default_model.as_deref()
-                                {
+                                let tag = if Some(mid.as_str()) == pc.default_model.as_deref() {
                                     " (default)"
                                 } else {
                                     ""
@@ -1116,10 +1142,7 @@ Use /thinking to show/hide thinking process."#;
                                 } else {
                                     String::new()
                                 };
-                                self.push_output(
-                                    format!("  {mid}{tag}{vi}"),
-                                    false,
-                                );
+                                self.push_output(format!("  {mid}{tag}{vi}"), false);
                             }
                             self.push_output(
                                 format!("Usage: /model {provider} <model> [variant]"),
@@ -1215,7 +1238,11 @@ Use /thinking to show/hide thinking process."#;
                     Ok(o) => o,
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to re-wire memory store after model switch");
-                        AgentOrchestrator::new(DefaultRouter::from_config_override(self.config, provider, model))
+                        AgentOrchestrator::new(DefaultRouter::from_config_override(
+                            self.config,
+                            provider,
+                            model,
+                        ))
                     }
                 }
             }
@@ -1330,7 +1357,25 @@ Use /thinking to show/hide thinking process."#;
         };
         let base_dir = paths.inbox();
 
-        match SearchService::new(self.router.clone()).search(query, &base_dir, Some(tier)) {
+        if self.db_client.is_none() {
+            let db_path = paths.db().join("state.db");
+            self.db_client = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
+            })
+            .ok();
+        }
+        let client = match self.db_client.as_ref() {
+            Some(c) => c,
+            None => {
+                self.push_output("Database error: failed to open database".into(), true);
+                return;
+            }
+        };
+
+        match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(SearchService::new(self.router.clone()).search(query, &base_dir, client, Some(tier)))
+        }) {
             Ok(results) => {
                 if results.is_empty() {
                     self.push_output(format!("[tier {}] No results for '{}'", tier, query), false);
@@ -1419,10 +1464,16 @@ Use /thinking to show/hide thinking process."#;
             }
             let turn_count = self.chat_history.len();
 
-            let mut summary = if entity.title.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+            let mut summary = if entity
+                .title
+                .as_ref()
+                .map(|t| !t.is_empty())
+                .unwrap_or(false)
+            {
                 format!(
                     "Agent session: {} agent ({} turns) — \"{}\"\n",
-                    entity.agent_name, turn_count,
+                    entity.agent_name,
+                    turn_count,
                     entity.title.as_ref().unwrap()
                 )
             } else {
@@ -1434,10 +1485,7 @@ Use /thinking to show/hide thinking process."#;
 
             let start = turn_count.saturating_sub(10);
             for (role, content) in &self.chat_history[start..] {
-                let preview: String = content
-                    .chars()
-                    .take(200)
-                    .collect();
+                let preview: String = content.chars().take(200).collect();
                 let ellipsis = if content.len() > 200 { "…" } else { "" };
                 summary.push_str(&format!("  {role}: {preview}{ellipsis}\n"));
             }

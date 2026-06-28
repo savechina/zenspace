@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use anyhow::Result;
 use serde_json::{Value, json};
 use tracing::debug;
@@ -8,79 +6,19 @@ use crate::tools::{
     ZenTool, ZenToolError, ZenToolResult, args_schema_string_limit, result_schema_array,
 };
 
-/// Tier 2 search: SQLite FTS5 with BM25 ranking.
+pub use zen_repo::{FtsResult, IndexNoteRequest, NotesRepo, SqliteClient};
+
 #[derive(Debug)]
 pub struct Tier2Search;
 
 impl Tier2Search {
-    /// Ensure the database has the required schema (notes_fts + notes_meta).
-    fn ensure_db(db_path: &Path) -> Result<rusqlite::Connection> {
-        if !db_path.exists() {
-            anyhow::bail!(
-                "Database not found at {}. Initialize with init_kb_schema() first.",
-                db_path.display()
-            );
-        }
-        let conn = rusqlite::Connection::open(db_path)?;
-        conn.execute_batch(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-                id UNINDEXED,
-                title,
-                content,
-                tags,
-                tokenize='porter'
-            );
-
-            CREATE TABLE IF NOT EXISTS notes_meta (
-                id TEXT PRIMARY KEY,
-                file_path TEXT NOT NULL,
-                source TEXT NOT NULL,
-                domain TEXT,
-                project TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                content_hash TEXT
-            );
-
-            CREATE TRIGGER IF NOT EXISTS notes_fts_after_insert
-            AFTER INSERT ON notes_meta
-            BEGIN
-                INSERT INTO notes_fts(rowid, id, title, content, tags)
-                VALUES (new.rowid, new.id, '', '', '');
-            END;
-            "#,
-        )?;
-        Ok(conn)
-    }
-
-    pub fn search(&self, query: &str, db_path: &Path, limit: usize) -> Result<Vec<FTSResult>> {
-        if query.trim().is_empty() || !db_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let conn = Self::ensure_db(db_path)?;
-        let limit = limit.max(1);
-
-        // Join with notes_meta to get file_path (not stored in notes_fts)
-        let mut stmt = conn.prepare(
-            "SELECT nf.title, nf.content, bm25(notes_fts) as score, nm.file_path \
-             FROM notes_fts nf \
-             JOIN notes_meta nm ON nf.rowid = nm.rowid \
-             WHERE notes_fts MATCH ?1 \
-             ORDER BY score LIMIT ?2",
-        )?;
-
-        let results: Vec<FTSResult> = stmt
-            .query_map(rusqlite::params![query, limit as i32], |row| {
-                Ok(FTSResult {
-                    path: row.get::<_, String>(3)?,
-                    score: row.get::<_, f64>(2)?,
-                    snippet: make_snippet(&row.get::<_, String>(1)?),
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+    pub async fn search(
+        &self,
+        client: &SqliteClient,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<FtsResult>> {
+        let results = NotesRepo::new(client).search(query, limit).await?;
 
         debug!(
             "Tier2Search: found {} results for query='{}' (limit={})",
@@ -92,9 +30,9 @@ impl Tier2Search {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn index_note(
+    pub async fn index_note(
         &self,
-        db_path: &Path,
+        client: &SqliteClient,
         id: &str,
         title: &str,
         content: &str,
@@ -102,45 +40,19 @@ impl Tier2Search {
         file_path: &str,
         source: &str,
     ) -> Result<()> {
-        if !db_path.exists() {
-            anyhow::bail!(
-                "Database not found at {}. Initialize with init_kb_schema() first.",
-                db_path.display()
-            );
-        }
-
-        let conn = Self::ensure_db(db_path)?;
-
-        // Insert metadata row (trigger creates empty notes_fts entry)
-        conn.execute(
-            "INSERT OR REPLACE INTO notes_meta (id, file_path, source, domain, project, created_at, updated_at, content_hash) \
-             VALUES (?1, ?2, ?3, '', '', datetime('now'), datetime('now'), '')",
-            rusqlite::params![id, file_path, source],
-        )?;
-
-        // Overwrite the auto-inserted FTS entry with actual content
-        conn.execute(
-            "INSERT OR REPLACE INTO notes_fts (rowid, id, title, content, tags) \
-             VALUES (last_insert_rowid(), ?1, ?2, ?3, ?4)",
-            rusqlite::params![id, title, content, tags],
-        )?;
+        NotesRepo::new(client)
+            .index_note(IndexNoteRequest {
+                id,
+                title,
+                content,
+                tags,
+                file_path,
+                source,
+            })
+            .await?;
 
         debug!("Tier2Search: indexed note '{id}' (title='{title}', tags='{tags}')");
         Ok(())
-    }
-}
-
-pub struct FTSResult {
-    pub path: String,
-    pub score: f64,
-    pub snippet: String,
-}
-
-fn make_snippet(content: &str) -> String {
-    if content.len() <= 200 {
-        content.to_string()
-    } else {
-        format!("{}...", &content[..200])
     }
 }
 
@@ -162,11 +74,16 @@ impl ZenTool for Tier2Search {
         let db_path = args
             .get("db_path")
             .and_then(Value::as_str)
-            .unwrap_or("kb.db");
+            .unwrap_or("state.db");
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
 
+        let client = zen_repo::SqliteClient::open(std::path::Path::new(db_path))
+            .await
+            .map_err(|e| ZenToolError::ExecutionFailed(format!("failed to open state db: {e}")))?;
+
         let results = self
-            .search(query, Path::new(db_path), limit)
+            .search(&client, query, limit)
+            .await
             .map_err(|e| ZenToolError::ExecutionFailed(e.to_string()))?;
 
         let formatted: Vec<Value> = results
@@ -189,25 +106,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_tier2_search_empty_query_returns_empty() {
+    async fn setup_test_db() -> (tempfile::TempDir, SqliteClient) {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("kb.db");
+        let db_path = dir.path().join("state.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
+        (dir, client)
+    }
+
+    #[tokio::test]
+    async fn test_tier2_search_empty_query_returns_empty() {
+        let (_dir, client) = setup_test_db().await;
         let tier2 = Tier2Search;
-        let results = tier2.search("test", &db_path, 10).unwrap();
+        let results = tier2.search(&client, "test", 10).await.unwrap();
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_tier2_index_and_search() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("kb.db");
-        let _conn = rusqlite::Connection::open(&db_path).unwrap();
+    #[tokio::test]
+    async fn test_tier2_index_and_search() {
+        let (_dir, client) = setup_test_db().await;
         let tier2 = Tier2Search;
 
         tier2
             .index_note(
-                &db_path,
+                &client,
                 "note-1",
                 "Hello World",
                 "This is a test note about rust programming.",
@@ -215,23 +136,22 @@ mod tests {
                 "notes/hello.md",
                 "manual",
             )
+            .await
             .unwrap();
 
-        let results = tier2.search("rust", &db_path, 10).unwrap();
+        let results = tier2.search(&client, "rust", 10).await.unwrap();
         assert!(!results.is_empty());
         assert!(results[0].path.contains("hello.md"));
     }
 
-    #[test]
-    fn test_tier2_bm25_ranking() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("kb.db");
-        let _conn = rusqlite::Connection::open(&db_path).unwrap();
+    #[tokio::test]
+    async fn test_tier2_bm25_ranking() {
+        let (_dir, client) = setup_test_db().await;
         let tier2 = Tier2Search;
 
         tier2
             .index_note(
-                &db_path,
+                &client,
                 "note-a",
                 "rust",
                 "rust rust rust rust rust",
@@ -239,10 +159,11 @@ mod tests {
                 "a.md",
                 "test",
             )
+            .await
             .unwrap();
         tier2
             .index_note(
-                &db_path,
+                &client,
                 "note-b",
                 "rust",
                 "rust and other things",
@@ -250,20 +171,11 @@ mod tests {
                 "b.md",
                 "test",
             )
+            .await
             .unwrap();
 
-        let results = tier2.search("rust", &db_path, 10).unwrap();
+        let results = tier2.search(&client, "rust", 10).await.unwrap();
         assert!(results.len() >= 2);
-    }
-
-    #[test]
-    fn test_tier2_missing_db_fails() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("nonexistent.db");
-        let tier2 = Tier2Search;
-
-        let result = tier2.index_note(&db_path, "x", "t", "c", "", "f", "s");
-        assert!(result.is_err());
     }
 
     #[test]

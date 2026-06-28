@@ -15,6 +15,7 @@ pub use consolidate::{
     SourceIngester, TransactionScope, WikiCompiler,
 };
 pub use entity::{Entity, EntityData, EntityService, EntityType, RelationType, Relationship};
+pub use zen_repo::SqliteClient;
 pub use ingest::{
     FeedEntry, IngestResult, RssFetcher, extract_readable_content, fetch_feed, ingest_local_file,
     ingest_url,

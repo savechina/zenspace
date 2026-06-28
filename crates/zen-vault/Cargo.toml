@@ -32,6 +32,9 @@ schemars = { workspace = true }
 toml = { workspace = true }
 fastembed = { workspace = true }
 unicode-normalization = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite"] }
+tokio-rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

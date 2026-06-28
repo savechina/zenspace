@@ -348,9 +348,8 @@ fn slugify(s: &str) -> String {
 
 fn promote_mental_models(vault: &Path, candidates: &[Value]) -> Result<usize> {
     let models_dir = vault.join("wiki/wisdom/models");
-    fs::create_dir_all(&models_dir).with_context(|| {
-        format!("failed to create models dir: {}", models_dir.display())
-    })?;
+    fs::create_dir_all(&models_dir)
+        .with_context(|| format!("failed to create models dir: {}", models_dir.display()))?;
 
     let mut count = 0usize;
     let date_str = Utc::now().format("%Y-%m-%d").to_string();
@@ -394,9 +393,8 @@ fn promote_mental_models(vault: &Path, candidates: &[Value]) -> Result<usize> {
 
 fn promote_anti_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
     let ap_dir = vault.join("wiki/wisdom/anti-patterns");
-    fs::create_dir_all(&ap_dir).with_context(|| {
-        format!("failed to create anti-patterns dir: {}", ap_dir.display())
-    })?;
+    fs::create_dir_all(&ap_dir)
+        .with_context(|| format!("failed to create anti-patterns dir: {}", ap_dir.display()))?;
 
     let mut count = 0usize;
     let date_str = Utc::now().format("%Y-%m-%d").to_string();

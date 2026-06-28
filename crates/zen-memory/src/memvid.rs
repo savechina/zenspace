@@ -37,20 +37,29 @@ impl ZenMemvidStore {
 
     pub fn retrieve(&self, session_id: &str) -> Result<Vec<String>> {
         let cards = self.store.entity_memories(session_id)?;
-        Ok(cards.into_iter()
+        Ok(cards
+            .into_iter()
             .filter(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE)
-            .map(|c| {
-                format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value)
-            }).collect())
+            .map(|c| format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value))
+            .collect())
     }
 
     pub fn retrieve_high_confidence(&self, session_id: &str) -> Result<Vec<String>> {
         let cards = self.store.entity_memories(session_id)?;
-        Ok(cards.into_iter()
+        Ok(cards
+            .into_iter()
             .filter(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE)
             .map(|c| {
-                format!("[{}] {}={}: {} (confidence: {:.2})", c.kind, c.entity, c.slot, c.value, c.confidence.unwrap_or(1.0))
-            }).collect())
+                format!(
+                    "[{}] {}={}: {} (confidence: {:.2})",
+                    c.kind,
+                    c.entity,
+                    c.slot,
+                    c.value,
+                    c.confidence.unwrap_or(1.0)
+                )
+            })
+            .collect())
     }
 
     /// Persist a conversation turn with both full-text and structured card storage.
@@ -198,11 +207,11 @@ impl ContextProjector {
 
     pub fn project_relevant(&self, session_id: &str) -> Result<Vec<String>> {
         let cards = self.store.entity_memories(session_id)?;
-        Ok(cards.into_iter()
+        Ok(cards
+            .into_iter()
             .filter(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE)
-            .map(|c| {
-                format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value)
-            }).collect())
+            .map(|c| format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value))
+            .collect())
     }
 }
 
@@ -286,8 +295,6 @@ mod tests {
             uri: Some("sess-456".to_string()),
             scope: None,
             cursor: None,
-            #[cfg(feature = "temporal")]
-            temporal: None,
             as_of_frame: None,
             as_of_ts: None,
             no_sketch: false,

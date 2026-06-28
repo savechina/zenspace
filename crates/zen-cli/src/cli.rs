@@ -269,19 +269,23 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Provider { ref operation } => provider_command::execute_command(operation),
         Commands::Audit { ref operation } => audit_command::execute_command(operation),
         Commands::Note { ref operation } => note_command::execute_command(operation),
-        Commands::Search { ref operation } => search_command::execute_command(operation),
+        Commands::Search { ref operation } => search_command::execute_command(operation).await,
         Commands::Similar { ref operation } => similar_command::execute_command(operation),
         Commands::Graph { ref operation } => graph_command::execute_command(operation),
         Commands::Reindex { ref operation } => reindex_command::execute_command(operation),
-        Commands::Research { ref operation } => research_command::execute_command(operation),
+        Commands::Research { ref operation } => research_command::execute_command(operation).await,
         Commands::Consolidate { ref operation } => consolidate_command::execute_command(operation),
         Commands::Lint { ref operation } => lint_command::execute_command(operation),
-        Commands::Logs { lines, level, follow, json, ref operation } => {
-            match operation {
-                Some(cmd) => logs_command::execute_command(cmd),
-                None => logs_command::execute_show(lines, level.as_deref(), follow, json),
-            }
-        }
+        Commands::Logs {
+            lines,
+            level,
+            follow,
+            json,
+            ref operation,
+        } => match operation {
+            Some(cmd) => logs_command::execute_command(cmd),
+            None => logs_command::execute_show(lines, level.as_deref(), follow, json),
+        },
         Commands::Ingest { ref operation } => ingest_command::execute_command(operation),
         Commands::Task { ref operation } => task_command::execute_command(operation),
         Commands::Wiki { ref operation } => wiki_command::execute_command(operation),

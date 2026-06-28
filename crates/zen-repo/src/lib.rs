@@ -1,43 +1,21 @@
-use std::fmt;
+pub mod client;
+pub mod types;
+pub mod notes_repo;
+pub mod embeddings_repo;
+pub mod entities_repo;
+pub mod self_model_repo;
+pub mod goals_repo;
+pub mod beliefs_repo;
+pub mod dispatch_repo;
+pub mod sessions_repo;
 
-pub mod models;
-pub mod pool;
-pub mod repo_impl;
-pub mod repositories;
-pub mod schema;
-pub mod sqlite_repo;
-
-pub use models::{AgentProfile, AuditLog, Note};
-pub use pool::create_pool;
-pub use repo_impl::{SqliteAgentProfileRepository, SqliteAuditLogRepository, SqliteNoteRepository};
-pub use repositories::{AgentProfileRepository, AuditLogRepository, NoteRepository};
-pub use sqlite_repo::{SqliteRepo, init_graph_schema, init_kb_schema, init_vec_schema};
-
-#[derive(Debug)]
-pub enum DataError {
-    Database(sqlx::Error),
-    NotFound(String),
-}
-
-impl fmt::Display for DataError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DataError::Database(e) => write!(f, "database error: {e}"),
-            DataError::NotFound(msg) => write!(f, "not found: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for DataError {}
-
-impl From<sqlx::Error> for DataError {
-    fn from(e: sqlx::Error) -> Self {
-        DataError::Database(e)
-    }
-}
-
-impl From<DataError> for zen_core::errors::ZenError {
-    fn from(e: DataError) -> Self {
-        zen_core::errors::ZenError::Service(e.to_string())
-    }
-}
+pub use client::{SqliteClient, SqliteError};
+pub use types::*;
+pub use notes_repo::NotesRepo;
+pub use embeddings_repo::EmbeddingsRepo;
+pub use entities_repo::EntitiesRepo;
+pub use self_model_repo::SelfModelRepo;
+pub use goals_repo::GoalsRepo;
+pub use beliefs_repo::BeliefsRepo;
+pub use dispatch_repo::{DispatchRepo, DispatchTaskRow};
+pub use sessions_repo::{SessionsRepo, IndexedSession};

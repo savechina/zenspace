@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use crate::constants::{
-    CACHE_DIR, CONFIG_FILE, DB_DIR, FINANCE_DIR, IDENTITY_DIR, INBOX_DIR, VAULT_DIR, LOGS_DIR,
-    MEMORY_DIR, OUTPUT_DIR, PLUGINS_DIR, RAW_DIR, SESSIONS_DIR, SKILLS_DIR, WIKI_DIR, ZEN_HOME_ENV,
+    CACHE_DIR, CONFIG_FILE, DB_DIR, FINANCE_DIR, IDENTITY_DIR, INBOX_DIR, LOGS_DIR, MEMORY_DIR,
+    OUTPUT_DIR, PLUGINS_DIR, RAW_DIR, SESSIONS_DIR, SKILLS_DIR, VAULT_DIR, WIKI_DIR, ZEN_HOME_ENV,
 };
 use crate::errors::PathError;
 
@@ -51,7 +51,10 @@ impl ZenPaths {
     }
 
     pub fn for_testing(global_root: PathBuf) -> Self {
-        Self { global_root, workspace_root: None }
+        Self {
+            global_root,
+            workspace_root: None,
+        }
     }
 
     pub fn config_file(&self) -> PathBuf {

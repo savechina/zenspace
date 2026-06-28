@@ -47,7 +47,7 @@ impl ZenWorker for DreamWorker {
         let paths = ZenPaths::detect()?;
         let today = Utc::now().date_naive();
 
-        let report = ZenDream::new().run_cycle(&paths, today)?;
+        let report = ZenDream::new().run_cycle(&paths, today).await?;
 
         info!(
             "dream cycle: facts={}, memory={}, logs={}, entities={}",

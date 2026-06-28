@@ -68,6 +68,7 @@ security-framework = "3.0"
 
 toml = "1.1.2"
 rusqlite = { version = "0.32", features = ["bundled", "functions", "uuid"] }
+tokio-rusqlite = "0.6"
 libc = "0.2"
 
 # Jento DI framework (spec.md Gap 5 — plugin lifecycle pattern)

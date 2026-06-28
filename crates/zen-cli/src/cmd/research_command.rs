@@ -39,7 +39,7 @@ struct ResearchOutput {
     existing_results: usize,
 }
 
-pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
+pub async fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
     match cmd {
         ResearchCommands::Run {
             topic,
@@ -54,7 +54,12 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
             let config = load_config()?;
             let router = DefaultRouter::from_agentic(config);
 
-            let existing_results = search_existing_content(topic, &wiki_dir, router.clone());
+            let db_path = paths.db().join("state.db");
+            let client = zen_repo::SqliteClient::open(&db_path)
+                .await
+                .map_err(|e| ZenError::Message(format!("Database error: {}", e)))?;
+
+            let existing_results = search_existing_content(topic, &wiki_dir, router.clone(), &client).await;
 
             let prompt = build_research_prompt(topic, &existing_results);
 
@@ -115,17 +120,18 @@ pub fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
     }
 }
 
-fn search_existing_content(
+async fn search_existing_content(
     topic: &str,
     wiki_dir: &std::path::Path,
     router: DefaultRouter,
+    client: &zen_repo::SqliteClient,
 ) -> Vec<SearchResult> {
     if !wiki_dir.exists() {
         return Vec::new();
     }
 
     let service = SearchService::new(router);
-    let results = service.search(topic, wiki_dir, None);
+    let results = service.search(topic, wiki_dir, client, None).await;
 
     match results {
         Ok(results) => {

@@ -230,7 +230,8 @@ impl Commitment {
                 if self.execution_checklist.low_cost_validation.is_none() {
                     return Err(TransitionError::MissingValidation);
                 }
-                if !self.stop_loss.triggered && self.stop_loss.economic.is_none()
+                if !self.stop_loss.triggered
+                    && self.stop_loss.economic.is_none()
                     && self.stop_loss.time_hours.is_none()
                 {
                     return Err(TransitionError::MissingStopLoss);
@@ -390,10 +391,7 @@ impl Commitment {
         let mut md = String::new();
         md.push_str("---\n");
         md.push_str(&format!("id: {}\n", self.id));
-        md.push_str(&format!(
-            "what: \"{}\"\n",
-            self.what.replace('"', "\\\"")
-        ));
+        md.push_str(&format!("what: \"{}\"\n", self.what.replace('"', "\\\"")));
         md.push_str(&format!("state: {}\n", self.state));
         if let Some(d) = self.by_when {
             md.push_str(&format!("by_when: {}\n", d));
@@ -407,14 +405,8 @@ impl Commitment {
         ));
         md.push_str(&format!("two_minute_rule: {}\n", self.two_minute_rule));
         md.push_str(&format!("discipline_streak: {}\n", self.discipline_streak));
-        md.push_str(&format!(
-            "created_at: {}\n",
-            self.created_at.to_rfc3339()
-        ));
-        md.push_str(&format!(
-            "updated_at: {}\n",
-            self.updated_at.to_rfc3339()
-        ));
+        md.push_str(&format!("created_at: {}\n", self.created_at.to_rfc3339()));
+        md.push_str(&format!("updated_at: {}\n", self.updated_at.to_rfc3339()));
         if let Some(closed) = self.closed_at {
             md.push_str(&format!("closed_at: {}\n", closed.to_rfc3339()));
         }
@@ -465,8 +457,7 @@ impl Commitment {
     }
 
     pub fn from_markdown(content: &str) -> Result<Self, CommitmentError> {
-        let fm = extract_frontmatter(content)
-            .map_err(|e| CommitmentError::Parse(e.to_string()))?;
+        let fm = extract_frontmatter(content).map_err(|e| CommitmentError::Parse(e.to_string()))?;
 
         let id = parse_yaml_field(&fm, "id")
             .ok_or_else(|| CommitmentError::Parse("missing id field".into()))?;
@@ -505,8 +496,7 @@ impl Commitment {
             .map(|dt| dt.with_timezone(&Utc));
         let source_journal = parse_yaml_field(&fm, "source_journal");
 
-        let body = extract_body(content)
-            .map_err(|e| CommitmentError::Parse(e.to_string()))?;
+        let body = extract_body(content).map_err(|e| CommitmentError::Parse(e.to_string()))?;
         let milestones = parse_milestones(&body);
         let stop_loss = parse_stop_loss(&body);
         let sustained_value_plan = parse_body_section(&body, "## Sustained Value Plan");
@@ -776,7 +766,10 @@ mod tests {
     #[test]
     fn test_add_milestone() {
         let mut c = Commitment::new("test");
-        c.add_milestone("first step", Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()));
+        c.add_milestone(
+            "first step",
+            Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
+        );
         assert_eq!(c.milestone_count(), 1);
         assert_eq!(c.milestones[0].description, "first step");
         assert!(!c.milestones[0].completed);
@@ -953,7 +946,7 @@ mod tests {
             c.add_milestone(&format!("m{i}"), None);
         }
         c.transition(CommitmentState::Executing).unwrap();
-        
+
         // Complete all milestones before transitioning to Reviewing
         for i in 0..3 {
             c.complete_milestone(i).unwrap();

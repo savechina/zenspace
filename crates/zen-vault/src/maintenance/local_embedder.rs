@@ -13,16 +13,16 @@ pub fn try_local_embed(text: &str) -> Option<Vec<f32>> {
         if guard.is_none() {
             match TextEmbedding::try_new(TextInitOptions::default()) {
                 Ok(embed) => {
-                     *guard = Some(embed);
-                      info!("LocalModel initialized");
-                  }
-                  Err(e) => {
+                    *guard = Some(embed);
+                    info!("LocalModel initialized");
+                }
+                Err(e) => {
                     warn!("LocalModel init failed: {}", e);
-                      return None;
-                  }
-             }
-         }
-     }
+                    return None;
+                }
+            }
+        }
+    }
 
     let input = vec![text.to_string()];
     let mut guard = model.lock().unwrap();
@@ -30,11 +30,11 @@ pub fn try_local_embed(text: &str) -> Option<Vec<f32>> {
 
     let vecs = match embed_inner.embed(input, None) {
         Ok(v) => v,
-          Err(e) => {
+        Err(e) => {
             warn!("LocalModel embed error: {}", e);
-             return None;
-         }
-      };
+            return None;
+        }
+    };
 
-     Some(vecs.into_iter().flatten().collect())
+    Some(vecs.into_iter().flatten().collect())
 }

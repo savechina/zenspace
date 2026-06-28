@@ -1036,40 +1036,41 @@ pub fn consolidation_time(config: &ZenConfig) -> &str {
 /// Uses `subconscious_interval_minutes` to produce `"0 */N * * * *"`, falling
 /// back to `"0 */5 * * * *"` when the field is unset or invalid.
 impl CronConfig {
-     /// Generate a cron expression for the daily-log worker.
+    /// Generate a cron expression for the daily-log worker.
     pub fn daily_log_schedule(&self) -> Option<String> {
-        self.subconscious_interval_minutes.map(|mins| format!("0 */{mins} * * * *"))
-     }
+        self.subconscious_interval_minutes
+            .map(|mins| format!("0 */{mins} * * * *"))
+    }
 
-     /// Generate a cron expression for the dream (nightly consolidation) worker.
-     /// Produces `"0 0 {start}-{end} * * *"` from start and end hours, or `None` if invalid.
+    /// Generate a cron expression for the dream (nightly consolidation) worker.
+    /// Produces `"0 0 {start}-{end} * * *"` from start and end hours, or `None` if invalid.
     pub fn night_dream_schedule(&self) -> Option<String> {
         let start = self.dream_start_hour?;
         if !(1..24).contains(&start) {
             return None;
-         }
+        }
         let end = self.dream_end_hour?;
         if end <= start || end > 24 {
             return None;
-         }
+        }
         Some(format!("0 0 {start}-{end} * * *"))
-     }
+    }
 }
 
 /// Generate the default daily-log schedule expression.
 ///
 /// This is the fallback used when no config-driven value is available.
 pub fn default_daily_log_schedule() -> &'static str {
-     "0 */5 * * * *"
+    "0 */5 * * * *"
 }
 
 /// Generate the default night-dream schedule expression.
 pub fn default_night_dream_schedule() -> &'static str {
-     "0 0 2-4 * * *"
+    "0 0 2-4 * * *"
 }
 
 pub fn default_wisdom_synthesis_schedule() -> &'static str {
-     "0 0 2 * * 7"
+    "0 0 2 * * 7"
 }
 
 // ---------------------------------------------------------------------------

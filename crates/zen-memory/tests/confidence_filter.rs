@@ -1,4 +1,3 @@
-use rig_memvid::MemvidStore;
 use tempfile::TempDir;
 use zen_memory::memvid::{TRIPLET_MIN_CONFIDENCE, ZenMemvidStore};
 
@@ -48,6 +47,6 @@ fn confidence_threshold_filters_low_confidence_cards() {
 #[test]
 fn triplet_min_confidence_is_0_8() {
     assert_eq!(TRIPLET_MIN_CONFIDENCE, 0.8);
-    assert!(TRIPLET_MIN_CONFIDENCE > 0.0);
-    assert!(TRIPLET_MIN_CONFIDENCE <= 1.0);
+    const { assert!(TRIPLET_MIN_CONFIDENCE > 0.0) };
+    const { assert!(TRIPLET_MIN_CONFIDENCE <= 1.0) };
 }

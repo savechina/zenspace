@@ -65,8 +65,9 @@ impl ConversationStore {
     /// Create a conversation store from a specific file path.
     pub fn with_file(file_path: PathBuf, session_id: &str) -> Result<Self> {
         if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create parent directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create parent directory: {}", parent.display())
+            })?;
         }
 
         Ok(Self {
@@ -94,7 +95,12 @@ impl ConversationStore {
             .open(&self.file_path)
             .with_context(|| format!("failed to open session file: {}", self.file_path.display()))?
             .write_all(format!("{}\n", line).as_bytes())
-            .with_context(|| format!("failed to write chat/turn event: {}", self.file_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to write chat/turn event: {}",
+                    self.file_path.display()
+                )
+            })?;
 
         debug!(
             session_id = %self.session_id,
@@ -115,8 +121,9 @@ impl ConversationStore {
             return Ok(Vec::new());
         }
 
-        let content = std::fs::read_to_string(&self.file_path)
-            .with_context(|| format!("failed to read session file: {}", self.file_path.display()))?;
+        let content = std::fs::read_to_string(&self.file_path).with_context(|| {
+            format!("failed to read session file: {}", self.file_path.display())
+        })?;
 
         let mut entries = Vec::new();
         for line in content.lines() {

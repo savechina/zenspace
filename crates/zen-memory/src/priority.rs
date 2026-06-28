@@ -104,17 +104,19 @@ pub fn compute_priority_scores_with_ev(
 ) -> Vec<PriorityScore> {
     let active: Vec<&Commitment> = commitments
         .iter()
-        .filter(|c| matches!(c.state, CommitmentState::Validated | CommitmentState::Executing))
+        .filter(|c| {
+            matches!(
+                c.state,
+                CommitmentState::Validated | CommitmentState::Executing
+            )
+        })
         .collect();
 
     let mut scores: Vec<PriorityScore> = Vec::new();
 
     for belief in beliefs {
         for commitment in &active {
-            let ev = ev_map
-                .get(&commitment.id)
-                .copied()
-                .unwrap_or(1.0);
+            let ev = ev_map.get(&commitment.id).copied().unwrap_or(1.0);
 
             // Skip zero/negative EV — no point allocating attention.
             if ev <= 0.0 {
@@ -243,8 +245,7 @@ impl ReinforcementTracker {
         let today = Utc::now().date_naive();
         let count = self.counts.entry(entity_id.to_string()).or_insert(0);
         *count += 1;
-        self.last_accessed
-            .insert(entity_id.to_string(), today);
+        self.last_accessed.insert(entity_id.to_string(), today);
         self.save()
     }
 

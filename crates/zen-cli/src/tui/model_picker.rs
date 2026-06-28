@@ -106,10 +106,7 @@ impl ModelPickerState {
                     self.model_names.sort();
                     if self.model_names.is_empty() {
                         // No model catalog — jump directly to done with default model
-                        let model = p
-                            .default_model
-                            .clone()
-                            .unwrap_or_else(|| "default".into());
+                        let model = p.default_model.clone().unwrap_or_else(|| "default".into());
                         self.dismiss();
                         return Some((name, model, None));
                     }
@@ -129,10 +126,11 @@ impl ModelPickerState {
                 self.variant_names.clear();
                 if let Some(provider) = &self.chosen_provider
                     && let Some(p) = config.providers.get(provider)
-                        && let Some(entry) = p.models.get(&name) {
-                            self.variant_names = entry.variants.keys().cloned().collect();
-                            self.variant_names.sort();
-                        }
+                    && let Some(entry) = p.models.get(&name)
+                {
+                    self.variant_names = entry.variants.keys().cloned().collect();
+                    self.variant_names.sort();
+                }
                 if self.variant_names.is_empty() {
                     // No variants — done
                     let provider = self.chosen_provider.take()?;
@@ -187,9 +185,7 @@ pub fn render_model_picker(
     }
 
     let items = state.current_items();
-    if items.is_empty()
-        && state.stage == PickerStage::Provider
-    {
+    if items.is_empty() && state.stage == PickerStage::Provider {
         return;
     }
 
@@ -240,10 +236,7 @@ pub fn render_model_picker(
             } else {
                 Style::default()
             };
-            ListItem::new(Line::from(Span::styled(
-                format!("  {item}"),
-                style,
-            )))
+            ListItem::new(Line::from(Span::styled(format!("  {item}"), style)))
         })
         .collect();
 
@@ -259,28 +252,24 @@ pub fn render_model_picker(
     frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
     let help = match state.stage {
-        PickerStage::Provider => {
-            Line::from(vec![
-                Span::styled("↑↓", muted),
-                Span::styled(" nav ", accent),
-                Span::styled("↵", muted),
-                Span::styled(" pick ", accent),
-                Span::styled("esc", muted),
-                Span::styled(" cancel", accent),
-            ])
-        }
-        PickerStage::Model | PickerStage::Variant => {
-            Line::from(vec![
-                Span::styled("↑↓", muted),
-                Span::styled(" nav ", accent),
-                Span::styled("↵", muted),
-                Span::styled(" pick ", accent),
-                Span::styled("←", muted),
-                Span::styled(" back ", accent),
-                Span::styled("esc", muted),
-                Span::styled(" cancel", accent),
-            ])
-        }
+        PickerStage::Provider => Line::from(vec![
+            Span::styled("↑↓", muted),
+            Span::styled(" nav ", accent),
+            Span::styled("↵", muted),
+            Span::styled(" pick ", accent),
+            Span::styled("esc", muted),
+            Span::styled(" cancel", accent),
+        ]),
+        PickerStage::Model | PickerStage::Variant => Line::from(vec![
+            Span::styled("↑↓", muted),
+            Span::styled(" nav ", accent),
+            Span::styled("↵", muted),
+            Span::styled(" pick ", accent),
+            Span::styled("←", muted),
+            Span::styled(" back ", accent),
+            Span::styled("esc", muted),
+            Span::styled(" cancel", accent),
+        ]),
     };
     frame.render_widget(ratatui::widgets::Paragraph::new(help), chunks[1]);
 }

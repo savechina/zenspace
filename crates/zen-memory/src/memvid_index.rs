@@ -96,10 +96,7 @@ impl MemvidIndexer {
     ///
     /// Each file is chunked by `## ` headers (Facts, Reflections, Commitments, etc.)
     /// and each chunk is written to the store with a `"journal-{date}"` session id.
-    pub fn index_m2_episodic(
-        &self,
-        store: &mut ZenMemvidStore,
-    ) -> Result<(usize, usize)> {
+    pub fn index_m2_episodic(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
         let journal_dir = self.workspace_root.join("memories").join("journal");
 
         let files = list_md_files(&journal_dir)?;
@@ -165,14 +162,8 @@ impl MemvidIndexer {
     /// Index wiki entity files under `wiki/entities/*.md`.
     ///
     /// Each file is stored in full with a `"knowledge-base"` session id.
-    pub fn index_m3_semantic(
-        &self,
-        store: &mut ZenMemvidStore,
-    ) -> Result<(usize, usize)> {
-        let entities_dir = self
-            .workspace_root
-            .join("wiki")
-            .join("entities");
+    pub fn index_m3_semantic(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
+        let entities_dir = self.workspace_root.join("wiki").join("entities");
 
         let files = list_md_files(&entities_dir)?;
         if files.is_empty() {
@@ -226,10 +217,7 @@ impl MemvidIndexer {
     /// - `wiki/wisdom/models/*.md`
     ///
     /// Each file is stored in full with a `"knowledge-base"` session id.
-    pub fn index_m4_wisdom(
-        &self,
-        store: &mut ZenMemvidStore,
-    ) -> Result<(usize, usize)> {
+    pub fn index_m4_wisdom(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
         let wisdom_root = self.workspace_root.join("wiki").join("wisdom");
 
         let subdirs = ["reflections", "anti-patterns", "models"];
@@ -373,10 +361,7 @@ fn list_md_files(dir: &Path) -> Result<Vec<PathBuf>> {
 fn extract_date_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     // Validate format loosely: must contain hyphens in expected positions
-    if stem.len() == 10
-        && stem.as_bytes()[4] == b'-'
-        && stem.as_bytes()[7] == b'-'
-    {
+    if stem.len() == 10 && stem.as_bytes()[4] == b'-' && stem.as_bytes()[7] == b'-' {
         Some(stem.to_string())
     } else {
         None
@@ -568,11 +553,7 @@ mod tests {
         for subdir in &["reflections", "anti-patterns", "models"] {
             let dir = tmp.path().join("wiki").join("wisdom").join(subdir);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("item.md"),
-                format!("# {subdir}\n\nSome wisdom.\n"),
-            )
-            .unwrap();
+            std::fs::write(dir.join("item.md"), format!("# {subdir}\n\nSome wisdom.\n")).unwrap();
         }
 
         let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
@@ -621,20 +602,12 @@ mod tests {
         // M3: one entity file
         let entities_dir = tmp.path().join("wiki").join("entities");
         std::fs::create_dir_all(&entities_dir).unwrap();
-        std::fs::write(
-            entities_dir.join("topic.md"),
-            "# Topic\n\nContent.\n",
-        )
-        .unwrap();
+        std::fs::write(entities_dir.join("topic.md"), "# Topic\n\nContent.\n").unwrap();
 
         // M4: one wisdom file
         let wisdom_dir = tmp.path().join("wiki").join("wisdom").join("reflections");
         std::fs::create_dir_all(&wisdom_dir).unwrap();
-        std::fs::write(
-            wisdom_dir.join("lesson.md"),
-            "# Lesson\n\nWisdom.\n",
-        )
-        .unwrap();
+        std::fs::write(wisdom_dir.join("lesson.md"), "# Lesson\n\nWisdom.\n").unwrap();
 
         let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
         let db_path = tmp.path().join("test.mv2");

@@ -269,7 +269,9 @@ fn strip_html_dangerous(content: &str) -> (String, bool) {
     let lower_result = result.to_lowercase();
     if lower_result.contains("javascript:") || lower_result.contains("javascript :") {
         stripped = true;
-        result = result.replace("javascript:", "").replace("javascript :", "");
+        result = result
+            .replace("javascript:", "")
+            .replace("javascript :", "");
     }
 
     (result, stripped)

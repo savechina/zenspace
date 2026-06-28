@@ -87,11 +87,7 @@ mod tests {
     #[test]
     fn test_read_jsonl_normal() {
         let path = tmp_path("read-normal");
-        std::fs::write(
-            &path,
-            "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
 
         let entries = read_jsonl_lines(&path).unwrap();
         assert_eq!(entries.len(), 3);
@@ -124,11 +120,7 @@ mod tests {
     #[test]
     fn test_read_jsonl_corrupted_line() {
         let path = tmp_path("read-corrupted");
-        std::fs::write(
-            &path,
-            "{\"a\":1}\nnot-json\n{\"c\":3}\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "{\"a\":1}\nnot-json\n{\"c\":3}\n").unwrap();
 
         let entries = read_jsonl_lines(&path).unwrap();
         assert_eq!(entries.len(), 2);
@@ -197,7 +189,13 @@ mod tests {
             msg: String,
         }
 
-        append_jsonl_line(&path, &Entry { msg: "hello".to_string() }).unwrap();
+        append_jsonl_line(
+            &path,
+            &Entry {
+                msg: "hello".to_string(),
+            },
+        )
+        .unwrap();
 
         let entries = read_jsonl_lines(&path).unwrap();
         assert_eq!(entries.len(), 1);

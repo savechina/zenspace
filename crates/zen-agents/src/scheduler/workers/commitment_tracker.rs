@@ -127,9 +127,8 @@ impl ZenWorker for CommitmentTracker {
                         }
 
                         let mut commitment = Commitment::from_raw(&item.text);
-                        commitment.review_at = Some(
-                            (item.created_at + chrono::Duration::days(7)).date_naive(),
-                        );
+                        commitment.review_at =
+                            Some((item.created_at + chrono::Duration::days(7)).date_naive());
                         commitment.source_journal = Some(item.session_id.clone());
                         if let Err(e) = commitment.save(&commitments_dir) {
                             warn!(
@@ -269,9 +268,7 @@ fn extract_commitments_from_journal(path: &Path) -> Result<Vec<CommitmentItem>> 
             continue;
         }
 
-        if in_commitments
-            && let Some(item) = trimmed.strip_prefix("- ")
-        {
+        if in_commitments && let Some(item) = trimmed.strip_prefix("- ") {
             let text = item.trim().to_string();
             if !text.is_empty() && !text.starts_with("_(no ") {
                 let created_at = date_str
@@ -391,11 +388,7 @@ fn compute_anti_talk_indicator(
         }
     }
 
-    let milestone_count = commitment
-        .milestones
-        .iter()
-        .filter(|m| m.completed)
-        .count();
+    let milestone_count = commitment.milestones.iter().filter(|m| m.completed).count();
 
     let denominator = std::cmp::max(milestone_count, 1) as f64;
     let ratio = mention_count as f64 / denominator;
@@ -410,10 +403,7 @@ fn compute_anti_talk_indicator(
     })
 }
 
-fn compute_all_anti_talk(
-    commitments: &[Commitment],
-    journal_dir: &Path,
-) -> Vec<AntiTalkIndicator> {
+fn compute_all_anti_talk(commitments: &[Commitment], journal_dir: &Path) -> Vec<AntiTalkIndicator> {
     let mut indicators: Vec<AntiTalkIndicator> = commitments
         .iter()
         .filter_map(|c| match compute_anti_talk_indicator(c, journal_dir) {
@@ -425,7 +415,11 @@ fn compute_all_anti_talk(
         })
         .collect();
 
-    indicators.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
+    indicators.sort_by(|a, b| {
+        b.ratio
+            .partial_cmp(&a.ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     indicators
 }
 
@@ -610,7 +604,7 @@ mod tests {
         c1.milestones[0].completed = true;
         fs::write(journal_dir.join("2026-06-01.md"), "low talk mentioned\n").unwrap();
 
-        let mut c2 = Commitment::new("high talk");
+        let c2 = Commitment::new("high talk");
         let repeats = "high talk mentioned\n".repeat(20);
         fs::write(journal_dir.join("2026-06-02.md"), &repeats).unwrap();
 

@@ -36,10 +36,7 @@ pub async fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
                 return Ok(());
             }
 
-            println!(
-                "{:<15} {:<22} DESCRIPTION",
-                "WORKER", "SCHEDULE"
-            );
+            println!("{:<15} {:<22} DESCRIPTION", "WORKER", "SCHEDULE");
             println!("{}", "-".repeat(70));
             for w in &workers {
                 println!("{:<15} {:<22} {}", w.id, w.schedule, w.description);

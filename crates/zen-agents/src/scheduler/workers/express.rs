@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -104,9 +104,7 @@ impl ZenWorker for ExpressWorker {
 
         let beliefs_formatted = format_beliefs_for_prompt(&beliefs);
 
-        let combined_text = format!(
-            "{reflections_text}\n{commitments_text}\n{suggestions_text}"
-        );
+        let combined_text = format!("{reflections_text}\n{commitments_text}\n{suggestions_text}");
         let truncated = if combined_text.len() > 8000 {
             let end = combined_text
                 .char_indices()
@@ -196,10 +194,7 @@ Respond with ONLY a JSON object:
             .as_array()
             .cloned()
             .unwrap_or_default();
-        let themes = parsed["themes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let themes = parsed["themes"].as_array().cloned().unwrap_or_default();
 
         let week_str = iso_week_string(Utc::now());
         let today_str = Utc::now().format("%Y-%m-%d").to_string();

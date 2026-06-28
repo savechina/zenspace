@@ -22,12 +22,8 @@ pub fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
     let wiki_dir = paths.wiki().join("entities");
 
     match operation {
-        WikiCommands::List => {
-            list_wiki_pages(&wiki_dir)
-        }
-        WikiCommands::Show { name } => {
-            show_wiki_page(&wiki_dir, name)
-        }
+        WikiCommands::List => list_wiki_pages(&wiki_dir),
+        WikiCommands::Show { name } => show_wiki_page(&wiki_dir, name),
     }
 }
 
@@ -38,12 +34,11 @@ fn list_wiki_pages(wiki_dir: &std::path::Path) -> Result<(), ZenError> {
     }
 
     let mut pages: Vec<String> = Vec::new();
-    for entry in fs::read_dir(wiki_dir).map_err(|e| {
-        ZenError::Message(format!("failed to read wiki directory: {e}"))
-    })? {
-        let entry = entry.map_err(|e| {
-            ZenError::Message(format!("failed to read wiki entry: {e}"))
-        })?;
+    for entry in fs::read_dir(wiki_dir)
+        .map_err(|e| ZenError::Message(format!("failed to read wiki directory: {e}")))?
+    {
+        let entry =
+            entry.map_err(|e| ZenError::Message(format!("failed to read wiki entry: {e}")))?;
         let path = entry.path();
         if path.is_file()
             && path.extension().is_some_and(|ext| ext == "md")
@@ -95,9 +90,8 @@ fn show_wiki_page(wiki_dir: &std::path::Path, name: &str) -> Result<(), ZenError
 }
 
 fn print_page(path: &std::path::Path, name: &str) -> Result<(), ZenError> {
-    let content = fs::read_to_string(path).map_err(|e| {
-        ZenError::Message(format!("failed to read wiki page: {e}"))
-    })?;
+    let content = fs::read_to_string(path)
+        .map_err(|e| ZenError::Message(format!("failed to read wiki page: {e}")))?;
 
     println!("# {name}\n");
     println!("{content}");

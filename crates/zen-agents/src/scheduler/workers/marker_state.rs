@@ -71,9 +71,9 @@ impl JournalEntryState {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;
-        lock_file
-            .lock_exclusive()
-            .with_context(|| format!("failed to acquire exclusive lock: {}", lock_path.display()))?;
+        lock_file.lock_exclusive().with_context(|| {
+            format!("failed to acquire exclusive lock: {}", lock_path.display())
+        })?;
 
         let mut existing: Self = match fs::read_to_string(&path) {
             Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
@@ -261,9 +261,9 @@ impl SessionState {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock file: {}", lock_path.display()))?;
-        lock_file
-            .lock_exclusive()
-            .with_context(|| format!("failed to acquire exclusive lock: {}", lock_path.display()))?;
+        lock_file.lock_exclusive().with_context(|| {
+            format!("failed to acquire exclusive lock: {}", lock_path.display())
+        })?;
 
         let mut existing: Self = match fs::read_to_string(&path) {
             Ok(json) => serde_json::from_str(&json).unwrap_or_default(),

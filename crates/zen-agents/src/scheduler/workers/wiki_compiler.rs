@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
 use zen_vault::{EntityData, EntityService, WikiCompiler};
@@ -71,13 +71,14 @@ impl WikiCompilerWorker {
         global_root.join("db").join(STATE_FILE)
     }
 
-    fn build_entity_data(
+    async fn build_entity_data(
         svc: &EntityService,
-        graph_db: &std::path::Path,
+        client: &zen_vault::SqliteClient,
         entity: &zen_vault::Entity,
     ) -> EntityData {
         let relationships = svc
-            .load_relationships_for_entity(graph_db, &entity.id)
+            .load_relationships_for_entity(client, &entity.id)
+            .await
             .unwrap_or_default();
 
         let fact = format!(
@@ -123,9 +124,21 @@ impl ZenWorker for WikiCompilerWorker {
         let graph_db = paths.db().join("graph.db");
         let wiki_dir = paths.vault().join("wiki");
 
+        let client = match zen_vault::SqliteClient::open(&graph_db).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "failed to open graph.db, skipping wiki compilation");
+                return Ok(WorkerReport {
+                    worker_id: self.id().to_string(),
+                    success: true,
+                    fact_count: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
         let svc = EntityService::new();
 
-        let entities = svc.load_entities_updated_since(&graph_db, state.last_compile_time)?;
+        let entities = svc.load_entities_updated_since(&client, state.last_compile_time).await?;
         if entities.is_empty() {
             debug!("no entities updated since last compile, skipping");
             return Ok(WorkerReport {
@@ -144,7 +157,7 @@ impl ZenWorker for WikiCompilerWorker {
 
         let mut entity_data_list: Vec<EntityData> = Vec::with_capacity(entities.len());
         for entity in &entities {
-            entity_data_list.push(Self::build_entity_data(&svc, &graph_db, entity));
+            entity_data_list.push(Self::build_entity_data(&svc, &client, entity).await);
         }
 
         let pages_written =
@@ -237,8 +250,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_entity_data_creates_synthetic_fact() {
+    #[tokio::test]
+    async fn test_build_entity_data_creates_synthetic_fact() {
         let entity = zen_vault::Entity {
             id: "test-1".to_string(),
             name: "Rust".to_string(),
@@ -255,8 +268,9 @@ mod tests {
         let svc = EntityService::new();
         let dir = setup_state_dir();
         let db_path = dir.path().join("graph.db");
+        let client = zen_vault::SqliteClient::open(&db_path).await.unwrap();
 
-        let data = WikiCompilerWorker::build_entity_data(&svc, &db_path, &entity);
+        let data = WikiCompilerWorker::build_entity_data(&svc, &client, &entity).await;
 
         assert!(!data.facts.is_empty(), "should have at least one fact");
         let fact = &data.facts[0];
@@ -265,18 +279,15 @@ mod tests {
             fact.contains("technology"),
             "fact should contain entity type"
         );
-        assert!(
-            fact.contains("programming"),
-            "fact should contain domain"
-        );
+        assert!(fact.contains("programming"), "fact should contain domain");
         assert!(
             fact.contains("1970-01-01"),
             "fact should contain first_seen date"
         );
     }
 
-    #[test]
-    fn test_build_entity_data_without_domain() {
+    #[tokio::test]
+    async fn test_build_entity_data_without_domain() {
         let entity = zen_vault::Entity {
             id: "test-2".to_string(),
             name: "Python".to_string(),
@@ -293,8 +304,9 @@ mod tests {
         let svc = EntityService::new();
         let dir = setup_state_dir();
         let db_path = dir.path().join("graph.db");
+        let client = zen_vault::SqliteClient::open(&db_path).await.unwrap();
 
-        let data = WikiCompilerWorker::build_entity_data(&svc, &db_path, &entity);
+        let data = WikiCompilerWorker::build_entity_data(&svc, &client, &entity).await;
 
         assert!(!data.facts.is_empty(), "should have at least one fact");
         let fact = &data.facts[0];

@@ -170,10 +170,7 @@ impl VirtueLog {
 
     /// Compute current streak from sorted logs for a given virtue.
     pub fn compute_streak(logs: &[VirtueLog], virtue: VirtueDomain) -> u32 {
-        let mut sorted: Vec<&VirtueLog> = logs
-            .iter()
-            .filter(|l| l.virtue == virtue)
-            .collect();
+        let mut sorted: Vec<&VirtueLog> = logs.iter().filter(|l| l.virtue == virtue).collect();
         sorted.sort_by_key(|b| std::cmp::Reverse(b.date));
 
         let mut streak = 0u32;
@@ -237,7 +234,10 @@ impl VirtueLog {
         Ok(logs)
     }
 
-    pub fn load_for_virtue(dir: &Path, virtue: VirtueDomain) -> Result<Vec<VirtueLog>, VirtueLogError> {
+    pub fn load_for_virtue(
+        dir: &Path,
+        virtue: VirtueDomain,
+    ) -> Result<Vec<VirtueLog>, VirtueLogError> {
         let virtue_dir = dir.join(virtue.slug());
         if !virtue_dir.is_dir() {
             return Ok(Vec::new());
@@ -265,8 +265,8 @@ impl VirtueLog {
 
     pub fn from_markdown(content: &str) -> Result<Self, VirtueLogError> {
         let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id")
-            .ok_or_else(|| VirtueLogError::MissingField("id".into()))?;
+        let id =
+            parse_yaml_field(&fm, "id").ok_or_else(|| VirtueLogError::MissingField("id".into()))?;
         let virtue_slug = parse_yaml_field(&fm, "virtue")
             .ok_or_else(|| VirtueLogError::MissingField("virtue".into()))?;
         let virtue = VirtueDomain::from_slug(&virtue_slug)
@@ -277,7 +277,11 @@ impl VirtueLog {
             "kept" => VirtueStatus::Kept,
             "broken" => VirtueStatus::Broken,
             "partial" => VirtueStatus::Partial,
-            _ => return Err(VirtueLogError::Parse(format!("invalid status: {status_str}"))),
+            _ => {
+                return Err(VirtueLogError::Parse(format!(
+                    "invalid status: {status_str}"
+                )));
+            }
         };
         let streak: u32 = parse_yaml_field(&fm, "streak")
             .and_then(|s| s.parse().ok())
@@ -400,13 +404,31 @@ mod tests {
 
     #[test]
     fn test_domain_from_slug() {
-        assert_eq!(VirtueDomain::from_slug("health"), Some(VirtueDomain::Health));
-        assert_eq!(VirtueDomain::from_slug("speech"), Some(VirtueDomain::Speech));
+        assert_eq!(
+            VirtueDomain::from_slug("health"),
+            Some(VirtueDomain::Health)
+        );
+        assert_eq!(
+            VirtueDomain::from_slug("speech"),
+            Some(VirtueDomain::Speech)
+        );
         assert_eq!(VirtueDomain::from_slug("order"), Some(VirtueDomain::Order));
-        assert_eq!(VirtueDomain::from_slug("resolution"), Some(VirtueDomain::Resolution));
-        assert_eq!(VirtueDomain::from_slug("diligence"), Some(VirtueDomain::Diligence));
-        assert_eq!(VirtueDomain::from_slug("balance"), Some(VirtueDomain::Balance));
-        assert_eq!(VirtueDomain::from_slug("tranquility"), Some(VirtueDomain::Tranquility));
+        assert_eq!(
+            VirtueDomain::from_slug("resolution"),
+            Some(VirtueDomain::Resolution)
+        );
+        assert_eq!(
+            VirtueDomain::from_slug("diligence"),
+            Some(VirtueDomain::Diligence)
+        );
+        assert_eq!(
+            VirtueDomain::from_slug("balance"),
+            Some(VirtueDomain::Balance)
+        );
+        assert_eq!(
+            VirtueDomain::from_slug("tranquility"),
+            Some(VirtueDomain::Tranquility)
+        );
         assert_eq!(VirtueDomain::from_slug("invalid"), None);
     }
 
@@ -559,7 +581,8 @@ mod tests {
         let log3 = VirtueLog::check_in(VirtueDomain::Health, VirtueStatus::Broken, d2, log2.streak);
         assert_eq!(log3.streak, 0);
 
-        let log4 = VirtueLog::check_in(VirtueDomain::Health, VirtueStatus::Partial, d2, log3.streak);
+        let log4 =
+            VirtueLog::check_in(VirtueDomain::Health, VirtueStatus::Partial, d2, log3.streak);
         assert_eq!(log4.streak, 0);
     }
 

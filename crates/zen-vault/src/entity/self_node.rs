@@ -53,13 +53,13 @@ pub struct SelfNode {
     pub description: String,
     pub domain: String,
 
-    pub is_explicit: Option<bool>,          // Knowledge
-    pub sufficient_for: Vec<String>,        // Skill
-    pub necessary_for: Vec<String>,         // Skill
-    pub controllability: Option<f64>,       // SocialRole
-    pub humility_score: Option<f64>,        // SelfConcept
-    pub optionality_count: Option<u32>,     // Trait
-    pub core_pursuit: Option<String>,       // Motivation
+    pub is_explicit: Option<bool>,      // Knowledge
+    pub sufficient_for: Vec<String>,    // Skill
+    pub necessary_for: Vec<String>,     // Skill
+    pub controllability: Option<f64>,   // SocialRole
+    pub humility_score: Option<f64>,    // SelfConcept
+    pub optionality_count: Option<u32>, // Trait
+    pub core_pursuit: Option<String>,   // Motivation
 
     pub source: String,
     pub confidence: f64,

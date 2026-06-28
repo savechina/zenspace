@@ -60,17 +60,10 @@ impl ZenWorker for EvidenceGatherer {
             }
         };
 
-        let beliefs = Belief::load_all(&beliefs_dir).with_context(|| {
-            format!(
-                "failed to load beliefs from: {}",
-                beliefs_dir.display()
-            )
-        })?;
+        let beliefs = Belief::load_all(&beliefs_dir)
+            .with_context(|| format!("failed to load beliefs from: {}", beliefs_dir.display()))?;
 
-        let weak_beliefs: Vec<&Belief> = beliefs
-            .iter()
-            .filter(|b| b.evidence_count < 3)
-            .collect();
+        let weak_beliefs: Vec<&Belief> = beliefs.iter().filter(|b| b.evidence_count < 3).collect();
 
         if weak_beliefs.is_empty() {
             debug!("no beliefs with low evidence count found");
@@ -128,8 +121,14 @@ fn format_research_suggestions(beliefs: &[&Belief], now: chrono::DateTime<chrono
 
     for belief in beliefs {
         content.push_str(&format!("## {}\n\n", belief.proposition));
-        content.push_str(&format!("- **Current evidence count**: {}\n", belief.evidence_count));
-        content.push_str(&format!("- **Posterior**: {:.1}%\n", belief.posterior * 100.0));
+        content.push_str(&format!(
+            "- **Current evidence count**: {}\n",
+            belief.evidence_count
+        ));
+        content.push_str(&format!(
+            "- **Posterior**: {:.1}%\n",
+            belief.posterior * 100.0
+        ));
         content.push_str(&format!("- **Domain**: {}\n\n", belief.domain));
         content.push_str("### Suggested Research Methods\n\n");
         content.push_str(&suggest_methods(belief));
@@ -166,7 +165,10 @@ mod tests {
     fn write_belief_file(dir: &Path, id: &str, proposition: &str, evidence_count: u32) {
         let content = format!(
             "---\nid: {}\nproposition: \"{}\"\nposterior: 0.5000\nevidence_count: {}\nweight: 1.0000\ndomain: test\ncreated_at: 2026-06-01T00:00:00Z\nlast_updated: 2026-06-01T00:00:00Z\n---\n\n# Belief: {}\n\n**Posterior**: 50.0% confident\n\n## Evidence Log\n\n_(no evidence recorded yet)_\n",
-            id, proposition.replace('"', "\\\""), evidence_count, proposition
+            id,
+            proposition.replace('"', "\\\""),
+            evidence_count,
+            proposition
         );
         fs::write(dir.join(format!("{id}.md")), content).unwrap();
     }

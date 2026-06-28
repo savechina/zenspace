@@ -243,15 +243,9 @@ impl Decision {
         let mut md = String::new();
         md.push_str("---\n");
         md.push_str(&format!("id: {}\n", self.id));
-        md.push_str(&format!(
-            "title: \"{}\"\n",
-            self.title.replace('"', "\\\"")
-        ));
+        md.push_str(&format!("title: \"{}\"\n", self.title.replace('"', "\\\"")));
         md.push_str(&format!("domain: {}\n", self.domain));
-        md.push_str(&format!(
-            "decided_at: {}\n",
-            self.decided_at.to_rfc3339()
-        ));
+        md.push_str(&format!("decided_at: {}\n", self.decided_at.to_rfc3339()));
         md.push_str(&format!(
             "closed_at: {}\n",
             self.closed_at
@@ -261,10 +255,7 @@ impl Decision {
         if let Some(conf) = self.confidence {
             md.push_str(&format!("confidence: {conf}\n"));
         }
-        md.push_str(&format!(
-            "is_path_not_goal: {}\n",
-            self.is_path_not_goal
-        ));
+        md.push_str(&format!("is_path_not_goal: {}\n", self.is_path_not_goal));
         md.push_str("---\n\n");
 
         md.push_str(&format!("# Decision: {}\n\n", self.title));
@@ -327,14 +318,8 @@ impl Decision {
         if let Some(ref val) = self.low_cost_validation {
             md.push_str(&format!("low_cost_validation: {val}\n"));
         }
-        md.push_str(&format!(
-            "cost_economic: {}\n",
-            self.cost_analysis.economic
-        ));
-        md.push_str(&format!(
-            "cost_time: {}\n",
-            self.cost_analysis.time_hours
-        ));
+        md.push_str(&format!("cost_economic: {}\n", self.cost_analysis.economic));
+        md.push_str(&format!("cost_time: {}\n", self.cost_analysis.time_hours));
         md.push_str(&format!("cost_credit: {}\n", self.cost_analysis.credit));
         md.push_str(&format!("cost_sunk: {}\n", self.cost_analysis.sunk));
         md.push_str(&format!(
@@ -417,13 +402,11 @@ impl Decision {
     /// Parse decision from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Decision> {
         let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id")
-            .ok_or_else(|| anyhow::anyhow!("missing id field"))?;
+        let id = parse_yaml_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
         let title = parse_yaml_field(&fm, "title")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let domain =
-            parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
+        let domain = parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
         let decided_at = parse_yaml_field(&fm, "decided_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -439,8 +422,7 @@ impl Decision {
                 }
             })
             .map(|dt| dt.with_timezone(&Utc));
-        let confidence = parse_yaml_field(&fm, "confidence")
-            .and_then(|s| s.parse().ok());
+        let confidence = parse_yaml_field(&fm, "confidence").and_then(|s| s.parse().ok());
         let is_path_not_goal = parse_yaml_field(&fm, "is_path_not_goal")
             .map(|s| s == "true")
             .unwrap_or(false);
@@ -453,8 +435,7 @@ impl Decision {
         let information_sources = parse_body_list(&body, "## Sources");
         let choice = parse_body_key(&body, "choice").unwrap_or_default();
         let alternatives = parse_body_list_in_section(&body, "## Logic", "alternatives");
-        let controllability = parse_body_key(&body, "controllability")
-            .and_then(|s| s.parse().ok());
+        let controllability = parse_body_key(&body, "controllability").and_then(|s| s.parse().ok());
         let execution_plan = parse_body_key(&body, "plan");
         let low_cost_validation = parse_body_key(&body, "low_cost_validation");
 
@@ -628,12 +609,9 @@ fn parse_body_list_in_section(body: &str, section_header: &str, list_key: &str) 
 
 /// Parse expected value fields from body.
 fn parse_expected_value(body: &str) -> Option<ExpectedValue> {
-    let sp = parse_body_key(body, "success_probability")
-        .and_then(|s| s.parse().ok())?;
-    let payoff = parse_body_key(body, "payoff")
-        .and_then(|s| s.parse().ok())?;
-    let loss = parse_body_key(body, "loss")
-        .and_then(|s| s.parse().ok())?;
+    let sp = parse_body_key(body, "success_probability").and_then(|s| s.parse().ok())?;
+    let payoff = parse_body_key(body, "payoff").and_then(|s| s.parse().ok())?;
+    let loss = parse_body_key(body, "loss").and_then(|s| s.parse().ok())?;
 
     let ev = sp * payoff - (1.0 - sp) * loss;
     Some(ExpectedValue {

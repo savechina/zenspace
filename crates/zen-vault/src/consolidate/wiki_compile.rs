@@ -156,11 +156,7 @@ impl WikiCompiler {
 
     /// Compile entity data into wiki pages under `wiki/entities/`.
     /// Relationships rendered as `[[wikilinks]]` for cross-linking.
-    pub fn compile_from_entities(
-        &self,
-        entities: &[EntityData],
-        wiki_dir: &Path,
-    ) -> Result<usize> {
+    pub fn compile_from_entities(&self, entities: &[EntityData], wiki_dir: &Path) -> Result<usize> {
         let structure = WikiStructure::new(wiki_dir);
         structure.ensure_directories()?;
 
@@ -220,7 +216,10 @@ impl WikiCompiler {
                 .map(|f| truncate_for_description(f))
                 .unwrap_or_else(|| format!("{:?} entity", data.entity.entity_type));
             // OKF §6: "* [Title](relative-url) - description"
-            md.push_str(&format!("* [{}]({}.md) - {}\n", data.entity.name, slug, desc));
+            md.push_str(&format!(
+                "* [{}]({}.md) - {}\n",
+                data.entity.name, slug, desc
+            ));
         }
 
         std::fs::write(&index_path, &md)
@@ -564,7 +563,12 @@ fn truncate_for_description(s: &str) -> String {
     if s.len() <= MAX {
         s.replace('"', "'").replace('\n', " ")
     } else {
-        let truncated = s[..s.char_indices().take(MAX).last().map(|(i, _)| i).unwrap_or(MAX)]
+        let truncated = s[..s
+            .char_indices()
+            .take(MAX)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(MAX)]
             .replace('"', "'")
             .replace('\n', " ");
         format!("{truncated}…")

@@ -72,7 +72,12 @@ impl HistoryStore {
             .open(&self.file_path)
             .with_context(|| format!("failed to open history: {}", self.file_path.display()))?
             .write_all(format!("{}\n", line).as_bytes())
-            .with_context(|| format!("failed to write history entry: {}", self.file_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to write history entry: {}",
+                    self.file_path.display()
+                )
+            })?;
 
         debug!(path = %self.file_path.display(), "history entry appended");
 
@@ -186,8 +191,12 @@ impl HistoryStore {
             })?;
             writeln!(tmp, "{}", line)?;
         }
-        tmp.persist(&self.file_path)
-            .with_context(|| format!("failed to rewrite trimmed history: {}", self.file_path.display()))?;
+        tmp.persist(&self.file_path).with_context(|| {
+            format!(
+                "failed to rewrite trimmed history: {}",
+                self.file_path.display()
+            )
+        })?;
 
         debug!(
             path = %self.file_path.display(),
@@ -271,7 +280,12 @@ mod tests {
 
         // Write entries that add up
         for i in 0..20 {
-            store.append(&format!("long command number {} with extra padding", i), None).unwrap();
+            store
+                .append(
+                    &format!("long command number {} with extra padding", i),
+                    None,
+                )
+                .unwrap();
         }
 
         // File should be <= 100 bytes after trim

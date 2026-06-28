@@ -68,14 +68,13 @@ impl ZenWorker for MemvidIndexerWorker {
             )
         })?;
 
-        let mut store = ZenMemvidStore::new(store_path).with_context(|| {
-            "failed to open memvid store"
-        })?;
+        let mut store =
+            ZenMemvidStore::new(store_path).with_context(|| "failed to open memvid store")?;
 
         let indexer = MemvidIndexer::new(workspace_root);
-        let report = indexer.index_all(&mut store).with_context(|| {
-            "memvid indexing failed"
-        })?;
+        let report = indexer
+            .index_all(&mut store)
+            .with_context(|| "memvid indexing failed")?;
 
         info!(
             files = report.files_scanned,

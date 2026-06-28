@@ -22,7 +22,9 @@ fn bench_retrieval(n: usize, label: &str) {
     }
 
     let start = Instant::now();
-    let cards = store.entity_memories(&format!("bench-session-{label}")).expect("entity_memories");
+    let cards = store
+        .entity_memories(&format!("bench-session-{label}"))
+        .expect("entity_memories");
     let elapsed = start.elapsed();
 
     println!(
@@ -52,10 +54,16 @@ fn bench_retrieval_100_frames() {
     }
 
     let start = Instant::now();
-    let cards = store.entity_memories("bench-session-100").expect("entity_memories");
+    let cards = store
+        .entity_memories("bench-session-100")
+        .expect("entity_memories");
     let elapsed = start.elapsed();
 
-    println!("[100] 100 frames: {} cards, retrieval in {}ms", cards.len(), elapsed.as_millis());
+    println!(
+        "[100] 100 frames: {} cards, retrieval in {}ms",
+        cards.len(),
+        elapsed.as_millis()
+    );
 
     assert!(
         elapsed.as_millis() < 100,

@@ -28,7 +28,10 @@ fn resolve_api_key(p: &ProviderConfig, provider_name: &str) -> Option<String> {
     let kc_name = format!("zen-{provider_name}-api-key");
     let default_env = SecretRef::legacy_env_var(provider_name);
     if let Ok(key) = zen_auth::SecretResolver::new(&kc_name, &default_env).resolve() {
-        info!(provider = provider_name, "resolved API key via Keychain resolver");
+        info!(
+            provider = provider_name,
+            "resolved API key via Keychain resolver"
+        );
         return Some(key);
     }
 

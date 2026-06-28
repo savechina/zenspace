@@ -38,10 +38,7 @@ impl Tier5Search {
         context: &[SearchResult],
     ) -> Result<String, anyhow::Error> {
         // Phase 1: Cost guard — skip LLM when local tiers suffice
-        let high_confidence_count = context
-            .iter()
-            .filter(|r| !r.content.is_empty())
-            .count();
+        let high_confidence_count = context.iter().filter(|r| !r.content.is_empty()).count();
 
         if high_confidence_count >= 3 {
             tracing::info!(
