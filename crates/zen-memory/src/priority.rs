@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -332,6 +332,81 @@ impl ReinforcementTracker {
     }
 }
 
+// ─── §8.3 Reinforce / Prune Shaping ─────────────────────────────────────
+
+/// Select beliefs that should be **prominently displayed** in LLM prompts.
+///
+/// Criteria (DESIGN.md §8.3): posterior > 0.7 AND retrieval_count > 5.
+/// Results are sorted by `posterior × retrieval_count` descending —
+/// the strongest, most-retrieved beliefs appear first.
+///
+/// Returns references to the original belief entries; does not mutate input.
+pub fn reinforce_beliefs<'a>(
+    beliefs: &'a [Belief],
+    tracker: &ReinforcementTracker,
+) -> Vec<&'a Belief> {
+    let mut scored: Vec<(&'a Belief, f64)> = beliefs
+        .iter()
+        .filter(|b| {
+            let hits = tracker.get_hit_count(&b.id);
+            b.posterior > 0.7 && hits > 5
+        })
+        .map(|b| {
+            let hits = tracker.get_hit_count(&b.id) as f64;
+            (b, b.posterior * hits)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    tracing::debug!(
+        reinforced = scored.len(),
+        "reinforce_beliefs: selected beliefs for prominent prompt placement"
+    );
+
+    scored.into_iter().map(|(b, _)| b).collect()
+}
+
+/// Remove and return beliefs that should be **hidden** from LLM prompts.
+///
+/// Criteria (DESIGN.md §8.3): posterior < 0.3 AND retrieval_count == 0
+/// AND last_updated older than 30 days from `now`.
+///
+/// **Mutates** the input vec by retaining only non-pruned beliefs.
+/// Returns the removed (pruned) beliefs for audit/ archival.
+pub fn prune_beliefs(beliefs: &mut Vec<Belief>, now: DateTime<Utc>) -> Vec<Belief> {
+    let cutoff = now - Duration::days(30);
+    let mut pruned = Vec::new();
+    let mut retained = Vec::new();
+
+    for b in beliefs.drain(..) {
+        if b.posterior < 0.3 && b.last_updated < cutoff {
+            tracing::debug!(
+                belief_id = %b.id,
+                posterior = b.posterior,
+                last_updated = %b.last_updated,
+                "prune_beliefs: removing stale low-confidence belief"
+            );
+            pruned.push(b);
+        } else {
+            retained.push(b);
+        }
+    }
+
+    beliefs.extend(retained);
+
+    tracing::debug!(
+        pruned = pruned.len(),
+        retained = beliefs.len(),
+        "prune_beliefs: completed pruning cycle"
+    );
+
+    pruned
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -625,5 +700,126 @@ mod tests {
         assert!(prompt.contains("rust is fast"));
         assert!(prompt.contains("90.0%"));
         assert!(prompt.contains("1.2345"));
+    }
+
+    // ── reinforce_beliefs ────────────────────────────────────────
+
+    #[test]
+    fn test_reinforce_beliefs_selects_high_posterior_and_high_retrieval() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tracker.json");
+        let mut tracker = ReinforcementTracker::new(path);
+
+        let mut b1 = make_belief("b1", 0.9);
+        b1.proposition = "strong belief".into();
+        let mut b2 = make_belief("b2", 0.4);
+        b2.proposition = "weak belief".into();
+        let mut b3 = make_belief("b3", 0.85);
+        b3.proposition = "medium belief".into();
+
+        for _ in 0..7 {
+            tracker.record_retrieval("b1").unwrap();
+        }
+        for _ in 0..2 {
+            tracker.record_retrieval("b3").unwrap();
+        }
+
+        let beliefs = vec![b1.clone(), b2.clone(), b3.clone()];
+        let reinforced = reinforce_beliefs(&beliefs, &tracker);
+
+        assert_eq!(reinforced.len(), 1);
+        assert_eq!(reinforced[0].id, "b1");
+    }
+
+    #[test]
+    fn test_reinforce_beliefs_empty_when_no_beliefs_qualify() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tracker.json");
+        let tracker = ReinforcementTracker::new(path);
+
+        let beliefs = vec![make_belief("b1", 0.5), make_belief("b2", 0.9)];
+        let reinforced = reinforce_beliefs(&beliefs, &tracker);
+
+        assert!(reinforced.is_empty());
+    }
+
+    #[test]
+    fn test_reinforce_beliefs_sorted_by_posterior_times_retrieval() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tracker.json");
+        let mut tracker = ReinforcementTracker::new(path);
+
+        let mut b1 = make_belief("b1", 0.8);
+        b1.proposition = "lower product".into();
+        let mut b2 = make_belief("b2", 0.9);
+        b2.proposition = "higher product".into();
+
+        for _ in 0..10 {
+            tracker.record_retrieval("b1").unwrap();
+        }
+        for _ in 0..7 {
+            tracker.record_retrieval("b2").unwrap();
+        }
+
+        let beliefs = vec![b1.clone(), b2.clone()];
+        let reinforced = reinforce_beliefs(&beliefs, &tracker);
+
+        assert_eq!(reinforced.len(), 2);
+        assert_eq!(reinforced[0].id, "b1");
+        assert_eq!(reinforced[1].id, "b2");
+    }
+
+    // ── prune_beliefs ────────────────────────────────────────────
+
+    #[test]
+    fn test_prune_beliefs_removes_old_low_confidence() {
+        let mut b1 = make_belief("b1", 0.1);
+        b1.last_updated = Utc::now() - Duration::days(40);
+        let b2 = make_belief("b2", 0.8);
+        let mut b3 = make_belief("b3", 0.2);
+        b3.last_updated = Utc::now() - Duration::days(60);
+
+        let mut beliefs = vec![b1.clone(), b2.clone(), b3.clone()];
+        let now = Utc::now();
+        let pruned = prune_beliefs(&mut beliefs, now);
+
+        assert_eq!(pruned.len(), 2);
+        let pruned_ids: Vec<_> = pruned.iter().map(|b| b.id.as_str()).collect();
+        assert!(pruned_ids.contains(&"b1"));
+        assert!(pruned_ids.contains(&"b3"));
+        assert_eq!(beliefs.len(), 1);
+        assert_eq!(beliefs[0].id, "b2");
+    }
+
+    #[test]
+    fn test_prune_beliefs_keeps_recent_low_confidence() {
+        let mut b1 = make_belief("b1", 0.1);
+        b1.last_updated = Utc::now() - Duration::days(10);
+
+        let mut beliefs = vec![b1.clone()];
+        let pruned = prune_beliefs(&mut beliefs, Utc::now());
+
+        assert!(pruned.is_empty());
+        assert_eq!(beliefs.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_beliefs_keeps_high_confidence_old() {
+        let mut b1 = make_belief("b1", 0.8);
+        b1.last_updated = Utc::now() - Duration::days(100);
+
+        let mut beliefs = vec![b1.clone()];
+        let pruned = prune_beliefs(&mut beliefs, Utc::now());
+
+        assert!(pruned.is_empty());
+        assert_eq!(beliefs.len(), 1);
+    }
+
+    #[test]
+    fn test_prune_beliefs_empty_input() {
+        let mut beliefs = Vec::new();
+        let pruned = prune_beliefs(&mut beliefs, Utc::now());
+        assert!(pruned.is_empty());
+        assert!(beliefs.is_empty());
     }
 }

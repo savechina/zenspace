@@ -105,7 +105,7 @@ impl ZenWorker for WikiCompilerWorker {
     }
 
     fn description(&self) -> &'static str {
-        "Compile wiki pages from graph.db entities (incremental)"
+        "Compile wiki pages from state.db entities (incremental)"
     }
 
     fn schedule(&self) -> &'static str {
@@ -121,13 +121,13 @@ impl ZenWorker for WikiCompilerWorker {
         let state = CompilerState::load(&state_path);
         debug!(last_compile_time = %state.last_compile_time, "loaded compiler state");
 
-        let graph_db = paths.db().join("graph.db");
+        let state_db = paths.db().join("state.db");
         let wiki_dir = paths.vault().join("wiki");
 
-        let client = match zen_vault::SqliteClient::open(&graph_db).await {
+        let client = match zen_vault::SqliteClient::open(&state_db).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to open graph.db, skipping wiki compilation");
+                warn!(error = %e, "failed to open state.db, skipping wiki compilation");
                 return Ok(WorkerReport {
                     worker_id: self.id().to_string(),
                     success: true,
@@ -140,7 +140,10 @@ impl ZenWorker for WikiCompilerWorker {
 
         let entities = svc.load_entities_updated_since(&client, state.last_compile_time).await?;
         if entities.is_empty() {
-            debug!("no entities updated since last compile, skipping");
+            debug!(
+                since = %state.last_compile_time,
+                "wiki-compiler: no entities updated since last compile, nothing to do"
+            );
             return Ok(WorkerReport {
                 worker_id: self.id().to_string(),
                 success: true,
@@ -163,7 +166,7 @@ impl ZenWorker for WikiCompilerWorker {
         let pages_written =
             match WikiCompiler::new().compile_from_entities(&entity_data_list, &wiki_dir) {
                 Ok(n) => {
-                    info!(pages = n, "wiki pages compiled from graph.db entities");
+                    info!(pages = n, "wiki pages compiled from state.db entities");
                     n
                 }
                 Err(e) => {
@@ -267,7 +270,7 @@ mod tests {
 
         let svc = EntityService::new();
         let dir = setup_state_dir();
-        let db_path = dir.path().join("graph.db");
+        let db_path = dir.path().join("state.db");
         let client = zen_vault::SqliteClient::open(&db_path).await.unwrap();
 
         let data = WikiCompilerWorker::build_entity_data(&svc, &client, &entity).await;
@@ -303,7 +306,7 @@ mod tests {
 
         let svc = EntityService::new();
         let dir = setup_state_dir();
-        let db_path = dir.path().join("graph.db");
+        let db_path = dir.path().join("state.db");
         let client = zen_vault::SqliteClient::open(&db_path).await.unwrap();
 
         let data = WikiCompilerWorker::build_entity_data(&svc, &client, &entity).await;

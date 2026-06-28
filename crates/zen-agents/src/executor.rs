@@ -172,16 +172,17 @@ impl AgentExecutor {
 
         // Build prompt with agent identity (SOUL.md/MEMORY.md/AGENTS.md)
         let prompt = self.build_prompt_with_identity(context, agent);
-        let response = self.execute_with_retry(&provider, &prompt, &agent_name)?;
+        let (response, tokens) = self.execute_with_retry(&provider, &prompt, &agent_name)?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
+        let cost = tokens as f64 * 0.002 / 1000.0; // ~$0.002/1K tokens estimate
 
         Ok(AgentExecution {
             agent_name,
             response,
             metadata: ExecutionMetadata {
-                tokens_used: 0,
-                cost_estimate: 0.0,
+                tokens_used: tokens,
+                cost_estimate: (cost * 1000.0).round() / 1000.0,
                 model_used: provider.to_string(),
                 duration_ms,
                 sensitivity,
@@ -227,11 +228,11 @@ impl AgentExecutor {
         // Section 2: Intro (SOUL.md)
         // Section 18: CLAUDE.md (AGENTS.md)
         if let Some(identity) = agent.identity() {
-            if !identity.soul_content.is_empty() {
-                builder = builder.intro(identity.soul_content.clone());
+            if !identity.soul_content().is_empty() {
+                builder = builder.intro(identity.soul_content().to_string());
             }
-            if !identity.agents_content.is_empty() {
-                builder = builder.claude_md(identity.agents_content.clone());
+            if !identity.agents_content().is_empty() {
+                builder = builder.claude_md(identity.agents_content().to_string());
             }
         }
 
@@ -291,7 +292,7 @@ impl AgentExecutor {
         provider: &Provider,
         prompt: &str,
         agent_name: &str,
-    ) -> Result<String> {
+    ) -> Result<(String, u32)> {
         let mut last_error = None;
 
         for attempt in 0..=self.retry_policy.max_retries {
@@ -308,10 +309,11 @@ impl AgentExecutor {
 
             match self.router.call(provider.clone(), prompt) {
                 Ok(response) => {
+                    let estimated_tokens = (prompt.len() + response.len()) as u32 / 4;
                     if attempt > 0 {
                         info!(attempt, agent = agent_name, "Retry succeeded");
                     }
-                    return Ok(response);
+                    return Ok((response, estimated_tokens));
                 }
                 Err(e) => {
                     let category = ErrorCategory::from_error_message(&e.to_string());
@@ -344,33 +346,35 @@ impl AgentExecutor {
             "All retries exhausted, falling back to mock"
         );
 
-        self.router.call(Provider::Mock, prompt).with_context(|| {
+        let response = self.router.call(Provider::Mock, prompt).with_context(|| {
             format!(
                 "Mock fallback also failed after {} retries. Last error: {:?}",
                 self.retry_policy.max_retries, last_error
             )
-        })
+        })?;
+        let estimated_tokens = (prompt.len() + response.len()) as u32 / 4;
+        Ok((response, estimated_tokens))
     }
 
     /// Execute a single agent request with streaming.
     ///
     /// Calls `on_token` for each token chunk received from the streaming
     /// response and returns the complete accumulated response.
-    #[instrument(skip(self, _context, on_token))]
+    ///
+    /// **T296 Note**: Full streaming implementation requires rig-core
+    /// `CompletionModel::stream()` + BudgetGuard (T295). Until those are
+    /// available, this method falls back gracefully to the non-streaming
+    /// execution path — the complete response is delivered as a single
+    /// token via `on_token`.
+    #[instrument(skip(self, context, agent, on_token))]
     pub fn execute_with_retry_stream(
         &self,
-        _context: &AgentContext,
-        on_token: impl FnMut(&str),
-    ) -> Result<()> {
-        // T296: Placeholder stub for streaming execution
-        // Full implementation requires:
-        // 1. Streaming LLM call via rig-core CompletionModel::stream()
-        // 2. BudgetGuard pre-reservation (T295)
-        // 3. Token-by-token delivery to on_token callback
-        let _ = on_token;
-        anyhow::bail!(
-            "execute_with_retry_stream: streaming not yet implemented in AgentExecutor. \
-             Use zen_agent::ZenAgent::execute_stream for streaming support."
-        );
+        context: &AgentContext,
+        agent: &crate::ZenAgent,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<AgentExecution> {
+        let result = self.execute(context, agent)?;
+        on_token(&result.response);
+        Ok(result)
     }
 }

@@ -12,8 +12,6 @@ pub mod feedback_signal;
 pub mod history;
 pub mod identity;
 pub mod journal;
-pub mod memory;
-pub mod memory_flush;
 pub mod memory_service;
 pub mod memvid;
 pub mod memvid_index;
@@ -34,8 +32,7 @@ pub use belief::{Belief, EvidenceEntry, ResearchMethod, SourceType};
 pub use commitment::{Commitment, CommitmentState, ExecutionChecklist, Milestone, StopLossLine};
 #[deprecated(
     since = "0.0.1",
-    note = "Will be refactored into CompactionStrategyTrait for multi-strategy extensibility. \
-            Use rig_compose::ContextPack + rig_memvid::MemoryContextPack for built-in path."
+    note = "Use rig_compose::ContextPack for budget allocation."
 )]
 #[allow(deprecated)]
 pub use context_budget::ContextBudget;
@@ -49,14 +46,11 @@ pub use dream::ZenDream;
 pub use fact::Fact;
 pub use feedback_signal::{Feedback, FeedbackDisposition, FeedbackProperties};
 pub use history::HistoryStore;
-#[allow(deprecated)]
-pub use memory::{MemoryEntry, MemoryStats, MemoryStore};
-pub use memory_flush::MemoryFlush;
 pub use memory_service::IdentityContext;
 pub use memvid::TRIPLET_MIN_CONFIDENCE;
 #[allow(deprecated)]
 pub use memvid::{
-    CompactionResult, CompactionStrategy, ContextProjector, ZenMemvidStore, create_persist_hook,
+    ContextProjector, ZenMemvidStore, create_persist_hook,
     default_memory_config,
 };
 pub use memvid_index::{MemvidIndexReport, MemvidIndexer};

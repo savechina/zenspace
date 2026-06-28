@@ -3,9 +3,10 @@ use colored::Colorize;
 use tracing::debug;
 
 use zen_core::errors::ZenError;
+use zen_core::paths::ZenPaths;
 use zen_core::types::SessionStatus;
 
-use crate::session::SessionOrchestrator;
+use crate::session::{SessionContext, SessionOrchestrator};
 
 // ---------------------------------------------------------------------------
 // Session subcommands (FR-076, FR-078)
@@ -59,6 +60,40 @@ pub fn execute_command(operation: &SessionCommands) -> Result<(), ZenError> {
                 format!("{:?}", session.sensitivity_policy).dimmed()
             );
             println!("  Workspace: {}", session.workspace.dimmed());
+
+            match ZenPaths::detect() {
+                Ok(paths) => match SessionContext::assemble(agent, &paths) {
+                    Ok(ctx) => {
+                        let files = ctx.memory_context.file_count();
+                        if files > 0 {
+                            println!(
+                                "  Identity: {} file(s) loaded — {}",
+                                files.to_string().green().bold(),
+                                ctx.memory_context.has_content(),
+                            );
+                        } else {
+                            println!(
+                                "  Identity: {}",
+                                "no SOUL.md/MEMORY.md/AGENTS.md found".yellow()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!(
+                            "  Identity: {} ({})",
+                            "load failed".yellow(),
+                            e.to_string().dimmed()
+                        );
+                    }
+                },
+                Err(e) => {
+                    println!(
+                        "  Identity: {} ({})",
+                        "ZenPaths detection failed".yellow(),
+                        e.to_string().dimmed()
+                    );
+                }
+            }
 
             Ok(())
         }

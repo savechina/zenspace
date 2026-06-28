@@ -52,30 +52,84 @@ impl WasmSandbox {
         Ok(Self { engine, limits })
     }
 
-    pub async fn execute(&self, wasm_bytes: &[u8], _args: &[String]) -> Result<ExecutionOutput> {
+    pub async fn execute(&self, wasm_bytes: &[u8], args: &[String]) -> Result<ExecutionOutput> {
+        use std::io::{Cursor, Write};
+        use std::sync::{Arc, Mutex};
         use std::time::Instant;
         let start = Instant::now();
 
         let module = wasmtime::Module::new(&self.engine, wasm_bytes)?;
-        let mut store = wasmtime::Store::new(&self.engine, ());
+
+        let stdout_buf = Arc::new(Mutex::new(Cursor::new(Vec::<u8>::new())));
+        let stderr_buf = Arc::new(Mutex::new(Cursor::new(Vec::<u8>::new())));
+        let stdout_clone = stdout_buf.clone();
+        let stderr_clone = stderr_buf.clone();
+
+        struct CursorWriter(Arc<Mutex<Cursor<Vec<u8>>>>);
+        impl Write for CursorWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut wasi_builder = wasi_common::sync::WasiCtxBuilder::new();
+        let _ = wasi_builder.args(args);
+        wasi_builder.stdout(Box::new(wasi_common::pipe::WritePipe::new(CursorWriter(
+            stdout_clone,
+        ))));
+        wasi_builder.stderr(Box::new(wasi_common::pipe::WritePipe::new(CursorWriter(
+            stderr_clone,
+        ))));
+        let wasi_ctx = wasi_builder.build();
+
+        let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
         store.set_fuel(self.limits.max_execution_time_ms / 100)?;
 
-        let linker = wasmtime::Linker::new(&self.engine);
+        let mut linker = wasmtime::Linker::new(&self.engine);
+        wasi_common::sync::add_to_linker(&mut linker, |s: &mut wasi_common::WasiCtx| s)?;
+
         let instance = linker.instantiate_async(&mut store, &module).await?;
 
         if let Some(run_func) = instance.get_func(&mut store, "_start") {
-            run_func.call_async(&mut store, &[], &mut []).await?;
+            let result = run_func.call_async(&mut store, &[], &mut []).await;
+            let elapsed = start.elapsed().as_millis() as u64;
+
+            let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap().get_ref()).into_owned();
+            let mut stderr =
+                String::from_utf8_lossy(&stderr_buf.lock().unwrap().get_ref()).into_owned();
+
+            let exit_code = match &result {
+                Ok(_) => 0,
+                Err(e) => {
+                    use std::fmt::Write as _;
+                    let _ = write!(stderr, "{e}");
+                    1
+                }
+            };
+
+            let used_fuel = self.limits.max_execution_time_ms / 100
+                - store.get_fuel().unwrap_or(self.limits.max_execution_time_ms / 100);
+
+            Ok(ExecutionOutput {
+                stdout,
+                stderr,
+                exit_code,
+                execution_time_ms: elapsed,
+                memory_used_bytes: used_fuel * 64 * 1024,
+            })
+        } else {
+            let elapsed = start.elapsed().as_millis() as u64;
+            Ok(ExecutionOutput {
+                stdout: String::new(),
+                stderr: "[no _start function found]".to_string(),
+                exit_code: 0,
+                execution_time_ms: elapsed,
+                memory_used_bytes: 0,
+            })
         }
-
-        let elapsed = start.elapsed().as_millis() as u64;
-
-        Ok(ExecutionOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: 0,
-            execution_time_ms: elapsed,
-            memory_used_bytes: 0,
-        })
     }
 
     pub fn validate_module(&self, wasm_bytes: &[u8]) -> Result<()> {

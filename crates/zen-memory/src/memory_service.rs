@@ -42,6 +42,27 @@ impl IdentityContext {
             self.agents = other.agents;
         }
     }
+
+    /// SOUL.md content as `&str` (empty string when absent).
+    ///
+    /// Convenience for prompt-assembly consumers that previously held
+    /// `soul_content: String` fields. Avoids `.unwrap_or("")` boilerplate.
+    #[must_use]
+    pub fn soul_content(&self) -> &str {
+        self.soul.as_deref().unwrap_or("")
+    }
+
+    /// MEMORY.md content as `&str` (empty string when absent).
+    #[must_use]
+    pub fn memory_content(&self) -> &str {
+        self.memory.as_deref().unwrap_or("")
+    }
+
+    /// AGENTS.md content as `&str` (empty string when absent).
+    #[must_use]
+    pub fn agents_content(&self) -> &str {
+        self.agents.as_deref().unwrap_or("")
+    }
 }
 
 /// Loads identity files from a single directory that may contain
@@ -111,18 +132,33 @@ pub fn load_all(zen_paths: &ZenPaths) -> Result<IdentityContext> {
     let mut ctx = IdentityContext::default();
 
     // Tier 2: global ~/.zen/ level (AGENTS.md at root)
-    let global_identity = load_identity_from_dir(zen_paths.global_root())?;
+    let global_root = zen_paths.global_root();
+    let global_identity = load_identity_from_dir(global_root)?;
+    let global_count = global_identity.file_count();
     ctx.merge(global_identity);
 
     // Tier 1: user identity directory ~/.zen/identity/
     let identity_dir = zen_paths.identity();
     let user_identity = load_identity_from_dir(&identity_dir)?;
+    let user_count = user_identity.file_count();
     ctx.merge(user_identity);
 
-    debug!(
-        "loaded identity context: {} files present",
-        ctx.file_count()
-    );
+    if ctx.file_count() > 0 {
+        debug!(
+            global = %global_root.display(),
+            identity = %identity_dir.display(),
+            global_files = global_count,
+            user_files = user_count,
+            total = ctx.file_count(),
+            "loaded identity context",
+        );
+    } else {
+        debug!(
+            global = %global_root.display(),
+            identity = %identity_dir.display(),
+            "identity context empty — no identity files found in either directory",
+        );
+    }
 
     Ok(ctx)
 }

@@ -564,7 +564,7 @@ impl App {
                 if let Err(e) = std::fs::create_dir_all(&memvid_dir) {
                     tracing::warn!(path = ?memvid_dir, error = %e, "Failed to create memory directory");
                 }
-                let memvid_path = memvid_dir.join("mem1.mv2");
+                let memvid_path = memvid_dir.join(MEMVID_STORE_FILE);
                 match orch.with_memory(memvid_path) {
                     Ok(o) => {
                         tracing::info!("Memvid store wired successfully");
@@ -1325,7 +1325,7 @@ Use /thinking to show/hide thinking process."#;
             Ok(paths) => {
                 let memvid_dir = paths.memory();
                 std::fs::create_dir_all(&memvid_dir).ok();
-                let memvid_path = memvid_dir.join("mem1.mv2");
+                let memvid_path = memvid_dir.join(MEMVID_STORE_FILE);
                 match AgentOrchestrator::new(router).with_memory(memvid_path) {
                     Ok(o) => o,
                     Err(e) => {

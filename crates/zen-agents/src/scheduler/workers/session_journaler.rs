@@ -51,7 +51,6 @@ impl PromptContext {
 
 struct CommitmentSummary {
     text: String,
-    #[allow(dead_code)]
     status: String,
     review_at: String,
 }
@@ -140,15 +139,25 @@ impl ZenWorker for SessionJournaler {
 
         let mut processed = 0usize;
         let mut total_facts = 0usize;
+        let mut skipped_short = 0usize;
+        let mut total_files = 0usize;
 
         for jsonl_path in &jsonl_files {
             if has_journaled_marker(jsonl_path) {
                 continue;
             }
 
+            total_files += 1;
             let session_id = extract_session_id(jsonl_path);
             match process_session(&paths, jsonl_path, &session_id, router.clone(), fresh_eyes).await
             {
+                Ok(0) => {
+                    skipped_short += 1;
+                    debug!(
+                        session_id = %session_id,
+                        "session skipped (short conversation)"
+                    );
+                }
                 Ok(facts) => {
                     total_facts += facts;
                     processed += 1;
@@ -168,10 +177,27 @@ impl ZenWorker for SessionJournaler {
             }
         }
 
+        if skipped_short > 0 && processed == 0 {
+            warn!(
+                skipped = skipped_short,
+                min_turns = MIN_TURNS,
+                "all {} unprocessed sessions too short for journaling — knowledge pipeline may be starved",
+                total_files
+            );
+        } else if skipped_short > 0 {
+            debug!(
+                skipped = skipped_short,
+                min_turns = MIN_TURNS,
+                "skipped {} short sessions",
+                skipped_short
+            );
+        }
+
         if processed > 0 {
             info!(
                 processed = processed,
                 facts = total_facts,
+                skipped = skipped_short,
                 "session-journaler tick complete"
             );
         }
@@ -785,7 +811,7 @@ fn load_top_commitments(paths: &ZenPaths, n: usize) -> String {
     let top: Vec<&CommitmentSummary> = items.iter().take(n).collect();
     let mut s = String::from("User's active commitments (prioritize signals relevant to these):\n");
     for item in top {
-        s.push_str(&format!("- {}\n", item.text));
+        s.push_str(&format!("- {} [{}, review: {}]\n", item.text, item.status, item.review_at));
     }
     s
 }

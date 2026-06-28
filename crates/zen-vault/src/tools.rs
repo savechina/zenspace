@@ -86,7 +86,9 @@ pub(crate) fn args_schema_entity() -> Value {
     json_schema_object(props, vec!["entity_name"])
 }
 
-#[allow(dead_code)]
+// Schema helpers for future tool implementations. Kept as public crate
+// API so tool authors don't need to rewrite JSON schema definitions.
+#[expect(dead_code, reason = "infrastructure for future tool args_schema")]
 pub(crate) fn args_schema_file_path() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -99,7 +101,7 @@ pub(crate) fn args_schema_file_path() -> Value {
     json_schema_object(props, vec!["file_path"])
 }
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "infrastructure for future search-insert tool")]
 pub(crate) fn args_schema_search_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -129,7 +131,7 @@ pub(crate) fn args_schema_search_insert() -> Value {
     json_schema_object(props, vec!["id", "title", "content", "file_path", "source"])
 }
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "infrastructure for future graph-insert tool")]
 pub(crate) fn args_schema_graph_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -147,7 +149,7 @@ pub(crate) fn args_schema_graph_insert() -> Value {
     json_schema_object(props, vec!["id", "name", "entity_type"])
 }
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "infrastructure for future relationship-insert tool")]
 pub(crate) fn args_schema_relationship_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -198,4 +200,60 @@ fn json_schema_map(fields: &[(&str, &str)]) -> Value {
         .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
         .collect();
     Value::Object(props)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_args_schema_file_path() {
+        let schema = args_schema_file_path();
+        assert!(schema.is_object());
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("file_path"));
+    }
+
+    #[test]
+    fn test_args_schema_search_insert() {
+        let schema = args_schema_search_insert();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("id"));
+        assert!(props.contains_key("title"));
+        assert!(props.contains_key("content"));
+    }
+
+    #[test]
+    fn test_args_schema_graph_insert() {
+        let schema = args_schema_graph_insert();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("id"));
+        assert!(props.contains_key("name"));
+        assert!(props.contains_key("entity_type"));
+    }
+
+    #[test]
+    fn test_args_schema_relationship_insert() {
+        let schema = args_schema_relationship_insert();
+        let props = schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("source_id"));
+        assert!(props.contains_key("target_id"));
+        assert!(props.contains_key("relation_type"));
+    }
+
+    #[test]
+    fn test_all_schema_functions_return_valid_json() {
+        for (name, schema) in [
+            ("file_path", args_schema_file_path()),
+            ("search_insert", args_schema_search_insert()),
+            ("graph_insert", args_schema_graph_insert()),
+            ("relationship_insert", args_schema_relationship_insert()),
+        ] {
+            assert!(
+                schema.is_object(),
+                "{} should return a JSON object",
+                name
+            );
+        }
+    }
 }

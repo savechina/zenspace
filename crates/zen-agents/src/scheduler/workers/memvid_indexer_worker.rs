@@ -3,6 +3,7 @@ use std::fs;
 use anyhow::{Context, Result};
 use tracing::{debug, info};
 
+use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::paths::ZenPaths;
 use zen_memory::{MemvidIndexer, ZenMemvidStore};
 
@@ -60,7 +61,7 @@ impl ZenWorker for MemvidIndexerWorker {
             }
         };
 
-        let store_path = paths.memory().join("memvid.db");
+        let store_path = paths.memory().join(MEMVID_STORE_FILE);
         fs::create_dir_all(store_path.parent().unwrap_or(&store_path)).with_context(|| {
             format!(
                 "failed to create memvid store dir: {}",

@@ -278,8 +278,8 @@ pub struct WorkerSummary {
 /// - `subconscious`: runs every 5 minutes, evaluates workspace state
 /// - `dream`: runs 2-4AM, executes the nightly consolidation cycle
 /// - `session-journaler`: runs every 5 minutes, extracts journal entries from session conversations
-/// - `entity-extractor`: runs every 10 minutes, extracts entities from journal entries into graph.db
-/// - `wiki-compiler`: runs every 30 minutes, compiles wiki pages from graph.db entities
+/// - `entity-extractor`: runs every 10 minutes, extracts entities from journal entries into state.db
+/// - `wiki-compiler`: runs every 30 minutes, compiles wiki pages from state.db entities
 /// - `commitment-tracker` (CommitmentTracker): runs daily 8AM, tracks commitments from journal entries
 /// - `reflection-worker` (ReflectionWorker): runs daily 6AM, aggregates reflections into wiki/wisdom/
 /// - `wisdom-synth` (WisdomSynthesizer): runs weekly Sun 2AM (cron: `0 0 2 * * 7`), synthesizes reflections + beliefs into wisdom candidates

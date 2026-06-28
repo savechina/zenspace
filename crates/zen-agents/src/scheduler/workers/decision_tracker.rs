@@ -85,6 +85,34 @@ impl ZenWorker for DecisionTracker {
                     overdue.push(meta);
                 }
                 tracked_count += 1;
+
+                if let Ok(decision) = zen_memory::decision::Decision::from_file(&path) {
+                    let report = zen_memory::decision_check::check_all(&decision);
+                    let wiki_dir = paths.vault().join("wiki");
+                    for violation in &report.violations {
+                        match zen_memory::decision_check::persist_anti_pattern_wiki_page(
+                            &wiki_dir,
+                            violation,
+                            &decision.id,
+                        ) {
+                            Ok(true) => {
+                                info!(
+                                    pattern = %violation.pattern_id,
+                                    decision = %decision.id,
+                                    "new anti-pattern wiki page created"
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(
+                                    pattern = %violation.pattern_id,
+                                    error = %e,
+                                    "failed to persist anti-pattern wiki page"
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             let state = JournalEntryState {

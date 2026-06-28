@@ -414,27 +414,27 @@ impl PromptBuilder {
 
         // Tier 0: Identity (STATIC)
         if let Some(ref identity) = self.identity {
-            if !identity.soul_content.is_empty() {
+            if !identity.soul_content().is_empty() {
                 template = template.section(PromptSection {
                     name: "soul",
                     tier: PromptTier::Identity,
-                    content: Some(identity.soul_content.clone()),
+                    content: Some(identity.soul_content().to_string()),
                     cache_scope: CacheScope::Static,
                 });
             }
-            if !identity.agents_content.is_empty() {
+            if !identity.agents_content().is_empty() {
                 template = template.section(PromptSection {
                     name: "agents",
                     tier: PromptTier::Identity,
-                    content: Some(identity.agents_content.clone()),
+                    content: Some(identity.agents_content().to_string()),
                     cache_scope: CacheScope::Static,
                 });
             }
-            if !identity.memory_content.is_empty() {
+            if !identity.memory_content().is_empty() {
                 template = template.section(PromptSection {
                     name: "memory_file",
                     tier: PromptTier::Identity,
-                    content: Some(identity.memory_content.clone()),
+                    content: Some(identity.memory_content().to_string()),
                     cache_scope: CacheScope::Static,
                 });
             }
@@ -512,16 +512,16 @@ impl PromptBuilder {
     fn build_coordinator_prompt(&self) -> String {
         let identity_block = self.identity.as_ref().map_or_else(String::new, |id| {
             let mut block = String::new();
-            if !id.soul_content.is_empty() {
-                block.push_str(&id.soul_content);
+            if !id.soul_content().is_empty() {
+                block.push_str(&id.soul_content());
                 block.push('\n');
             }
-            if !id.agents_content.is_empty() {
-                block.push_str(&id.agents_content);
+            if !id.agents_content().is_empty() {
+                block.push_str(id.agents_content());
                 block.push('\n');
             }
-            if !id.memory_content.is_empty() {
-                block.push_str(&id.memory_content);
+            if !id.memory_content().is_empty() {
+                block.push_str(&id.memory_content());
             }
             block
         });
@@ -825,8 +825,8 @@ mod tests {
     #[test]
     fn builder_default_assembly() {
         let identity = IdentityContext {
-            soul_content: "SOUL_CONTENT".into(),
-            agents_content: "AGENTS_CONTENT".into(),
+            soul: Some("SOUL_CONTENT".into()),
+            agents: Some("AGENTS_CONTENT".into()),
             ..Default::default()
         };
 

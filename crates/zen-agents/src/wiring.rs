@@ -3,6 +3,11 @@
 //! Provides a single [`ZenWiring`] struct that creates and populates
 //! `SkillRegistry`, `ToolRegistry`, and `DelegateRegistry` with all
 //! existing implementations from `zen_vault`.
+//!
+//! When `ZenPaths::detect()` succeeds, `ZenWiring::new()` also auto-opens
+//! a [`MemvidStore`] at `<memory>/mem1.mv2` for downstream consumers
+//! (orchestrator, executor). Failure is non-fatal: wiring still constructs
+//! with `memvid_store: None`.
 
 use std::sync::Arc;
 
@@ -13,7 +18,10 @@ use rig_compose::registry::{KernelError, SkillRegistry, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
 use rig_compose::tool::Tool;
 use serde_json::Value;
-
+use tracing::debug;
+use zen_core::constants::MEMVID_STORE_FILE;
+use zen_core::paths::ZenPaths;
+use zen_memory::ZenMemvidStore;
 use zen_vault::tools::{ZenTool, ZenToolError};
 
 // Re-exports for consumers
@@ -153,10 +161,17 @@ pub struct ZenWiring {
     pub skills: SkillRegistry,
     pub tools: ToolRegistry,
     pub delegates: DelegateRegistry,
+    pub memvid_store: Option<rig_memvid::MemvidStore>,
 }
 
 impl ZenWiring {
     /// Create a new `ZenWiring` with all skills and tools registered.
+    ///
+    /// When `ZenPaths::detect()` succeeds and `<memory>/memvid.db` can be
+    /// opened, the resulting [`rig_memvid::MemvidStore`] is exposed via
+    /// [`Self::memvid_store`] for downstream consumers (orchestrator,
+    /// executor). Otherwise `memvid_store` is `None` and the registries
+    /// are still usable.
     ///
     /// # Skills registered
     /// - `zen-wiki-compilation` → `WikiCompiler`
@@ -175,15 +190,11 @@ impl ZenWiring {
         let tools = ToolRegistry::new();
         let delegates = DelegateRegistry::new();
 
-        // --- Register skills -------------------------------------------
-
         skills.register(Arc::new(zen_vault::WikiCompiler::new()));
         skills.register(Arc::new(zen_vault::LearningLoop::new()));
         skills.register(Arc::new(zen_vault::EntityExtractor::new()));
         skills.register(Arc::new(zen_vault::ContradictionDetector::new()));
         skills.register(Arc::new(ConsolidationPipelineSkillAdapter));
-
-        // --- Register tools --------------------------------------------
 
         tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier2Search)));
         tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier4Search)));
@@ -191,12 +202,36 @@ impl ZenWiring {
             zen_vault::ComputeEmbeddings,
         )));
 
-        // --- DelegateRegistry (empty — Phase 4 populates) ---------------
+        let memvid_store = Self::try_open_memvid_store();
 
         Self {
             skills,
             tools,
             delegates,
+            memvid_store,
+        }
+    }
+
+    fn try_open_memvid_store() -> Option<rig_memvid::MemvidStore> {
+        let paths = ZenPaths::detect().ok()?;
+        let store_path = paths.memory().join(MEMVID_STORE_FILE);
+
+        if let Some(parent) = store_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                debug!(path = %parent.display(), error = %e, "ZenWiring: failed to create memvid parent dir");
+                return None;
+            }
+        }
+
+        match ZenMemvidStore::new(store_path.clone()) {
+            Ok(store) => {
+                debug!(path = %store_path.display(), "ZenWiring: memvid store opened");
+                Some(store.into_inner())
+            }
+            Err(e) => {
+                debug!(path = %store_path.display(), error = %e, "ZenWiring: memvid store unavailable, running without persistent memory");
+                None
+            }
         }
     }
 }

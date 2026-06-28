@@ -66,7 +66,7 @@ impl ZenWorker for EntityExtractorWorker {
     }
 
     fn description(&self) -> &'static str {
-        "Scan journal entries, extract entities via LLM with keyword fallback, upsert to graph.db"
+        "Scan journal entries, extract entities via LLM with keyword fallback, upsert to state.db"
     }
 
     fn schedule(&self) -> &'static str {
@@ -90,6 +90,7 @@ impl ZenWorker for EntityExtractorWorker {
 
         let entries = scan_journal_entries(&journal_dir)?;
         if entries.is_empty() {
+            debug!("no journal entries found in {}, nothing to extract", journal_dir.display());
             return Ok(WorkerReport {
                 worker_id: self.id().to_string(),
                 success: true,
@@ -98,11 +99,11 @@ impl ZenWorker for EntityExtractorWorker {
             });
         }
 
-        let graph_db = paths.db().join("graph.db");
-        let client = match zen_vault::SqliteClient::open(&graph_db).await {
+        let state_db = paths.db().join("state.db");
+        let client = match zen_vault::SqliteClient::open(&state_db).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to open graph.db, skipping entity extraction");
+                warn!(error = %e, "failed to open state.db, skipping entity extraction");
                 return Ok(WorkerReport {
                     worker_id: self.id().to_string(),
                     success: true,
@@ -154,6 +155,8 @@ impl ZenWorker for EntityExtractorWorker {
                 entities = total_entities,
                 "entity-extractor tick complete"
             );
+        } else {
+            debug!("entity-extractor tick: {} entries scanned, none needed processing (all previously extracted or empty)", entries.len());
         }
 
         Ok(WorkerReport {
@@ -515,8 +518,8 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_entities() {
         let dir = tempfile::tempdir().unwrap();
-        let graph_db = dir.path().join("graph.db");
-        let client = zen_vault::SqliteClient::open(&graph_db).await.unwrap();
+        let state_db = dir.path().join("state.db");
+        let client = zen_vault::SqliteClient::open(&state_db).await.unwrap();
         let svc = EntityService::new();
 
         let entities = vec![

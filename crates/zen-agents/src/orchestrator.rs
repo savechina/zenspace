@@ -4,10 +4,11 @@ use std::time::Instant;
 
 use anyhow::Result;
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
-use tracing::{info, instrument};
+use rig_memvid::MemvidPersistHook;
+use tracing::{debug, info, instrument};
 
 use zen_core::types::SessionContext;
-use zen_memory::ZenMemvidStore;
+use zen_memory::{ZenMemvidStore, create_persist_hook, default_memory_config};
 use zen_provider::DefaultRouter;
 
 use crate::delegate_tools;
@@ -32,6 +33,7 @@ pub struct AgentOrchestrator {
     executor: crate::executor::AgentExecutor,
     token_budget: Arc<AtomicTokenBudget>,
     memvid_store: Option<rig_memvid::MemvidStore>,
+    persist_hook: Option<MemvidPersistHook<rig_core::completion::CompletionRequest>>,
     quality_pipeline: QualityPipeline,
 }
 
@@ -39,6 +41,14 @@ impl AgentOrchestrator {
     pub fn new(router: DefaultRouter) -> Self {
         let registry = crate::registry::DefaultAgentRegistry::new();
         let wiring = ZenWiring::new();
+        let memvid_store = wiring.memvid_store.clone();
+        let persist_hook = memvid_store.as_ref().map(|store| {
+            let config = zen_memory::default_memory_config();
+            zen_memory::create_persist_hook(store.clone(), config)
+        });
+        if memvid_store.is_some() {
+            debug!("AgentOrchestrator: auto-wired memvid store from ZenWiring");
+        }
         let delegates = ZenDelegateTools::new(&wiring, &router);
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(100_000));
@@ -48,7 +58,8 @@ impl AgentOrchestrator {
             delegates,
             executor,
             token_budget,
-            memvid_store: None,
+            memvid_store,
+            persist_hook,
             quality_pipeline: QualityPipeline::new(),
         }
     }
@@ -56,6 +67,11 @@ impl AgentOrchestrator {
     pub fn with_token_budget(router: DefaultRouter, capacity: u64) -> Self {
         let registry = crate::registry::DefaultAgentRegistry::new();
         let wiring = ZenWiring::new();
+        let memvid_store = wiring.memvid_store.clone();
+        let persist_hook = memvid_store.as_ref().map(|store| {
+            let config = zen_memory::default_memory_config();
+            zen_memory::create_persist_hook(store.clone(), config)
+        });
         let delegates = ZenDelegateTools::new(&wiring, &router);
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(capacity));
@@ -65,14 +81,20 @@ impl AgentOrchestrator {
             delegates,
             executor,
             token_budget,
-            memvid_store: None,
+            memvid_store,
+            persist_hook,
             quality_pipeline: QualityPipeline::new(),
         }
     }
 
     pub fn with_memory(mut self, memory_path: PathBuf) -> Result<Self> {
         let store = ZenMemvidStore::new(memory_path)?;
-        self.memvid_store = Some(store.into_inner());
+        let inner = store.into_inner();
+        let config = default_memory_config();
+        let hook = create_persist_hook(inner.clone(), config);
+        self.memvid_store = Some(inner);
+        self.persist_hook = Some(hook);
+        debug!("AgentOrchestrator: PersistHook wired for auto-capture (FR-MEM-002 / D2)");
         Ok(self)
     }
 
@@ -102,6 +124,7 @@ impl AgentOrchestrator {
     async fn build_agent(&self, agent_name: &str) -> Result<ZenAgent> {
         let skills = delegate_tools::resolve_skill_ids_for_agent(agent_name);
         let tools = delegate_tools::resolve_tool_ids_for_agent(agent_name);
+        debug!("building agent: {}", delegate_tools::describe_agent(agent_name, &self.registry));
 
         let mut builder = ZenAgent::builder(agent_name);
         for skill_id in &skills {

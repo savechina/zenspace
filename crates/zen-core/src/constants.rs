@@ -19,6 +19,7 @@ pub const FINANCE_DIR: &str = "finance/";
 
 pub const CACHE_DIR: &str = "cache/";
 pub const MEMORY_DIR: &str = "memories/";
+pub const MEMVID_STORE_FILE: &str = "mem1.mv2";
 pub const IDENTITY_DIR: &str = "memories/";
 pub const PROMPTS_DIR: &str = "prompts/";
 

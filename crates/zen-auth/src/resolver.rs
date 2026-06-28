@@ -1,7 +1,25 @@
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 use crate::keychain::{AuthError, Keychain};
 
 // Re-export SecretRef from zen-core for convenience
 pub use zen_core::secrets::SecretRef;
+
+// ── Keychain availability cache ───────────────────────────────────────
+// When keychain fails for a given service name, subsequent calls skip the
+// keychain attempt entirely, avoiding repeated "keychain unavailable" log
+// spam (Bug 4 from 2026-06-28 log analysis).
+static KEYCHAIN_UNAVAILABLE: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn keychain_known_unavailable(service: &str) -> bool {
+    KEYCHAIN_UNAVAILABLE.lock().unwrap().contains(service)
+}
+
+fn mark_keychain_unavailable(service: &str) {
+    KEYCHAIN_UNAVAILABLE.lock().unwrap().insert(service.to_string());
+}
 
 pub fn resolve_secret_ref(ref_: &SecretRef) -> Result<String, AuthError> {
     match ref_ {
@@ -40,18 +58,21 @@ impl SecretResolver {
 
     /// Try Keychain first, then fall back to env var, then fail.
     pub fn resolve(&self) -> Result<String, AuthError> {
-        // 1) Keychain
-        match Keychain::retrieve(&self.keychain_service, "zen") {
-            Ok(val) => return Ok(val),
-            Err(AuthError::KeychainAccessDenied { .. })
-            | Err(AuthError::CredentialNotFound { .. })
-            | Err(AuthError::KeychainUnavailable { .. }) => {
-                tracing::debug!(
-                    "keychain unavailable for '{}', falling back to env var",
-                    self.keychain_service
-                );
+        // 1) Keychain — skip if known unavailable for this service (Bug 4 cache)
+        if !keychain_known_unavailable(&self.keychain_service) {
+            match Keychain::retrieve(&self.keychain_service, "zen") {
+                Ok(val) => return Ok(val),
+                Err(AuthError::KeychainAccessDenied { .. })
+                | Err(AuthError::CredentialNotFound { .. })
+                | Err(AuthError::KeychainUnavailable { .. }) => {
+                    mark_keychain_unavailable(&self.keychain_service);
+                    tracing::debug!(
+                        "keychain unavailable for '{}', falling back to env var",
+                        self.keychain_service
+                    );
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
 
         // 2) Environment variable

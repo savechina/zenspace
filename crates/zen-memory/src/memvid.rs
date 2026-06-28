@@ -138,60 +138,6 @@ pub fn default_memory_config() -> MemoryConfig {
         .build()
 }
 
-#[deprecated(
-    since = "0.0.1",
-    note = "Will be refactored into CompactionStrategyTrait for multi-strategy extensibility. \
-            Use rig_memvid::projection::MemoryContextPack for built-in memvid path. \
-            Future external strategies: openviking, cortex-mem, supermemory (see D10)."
-)]
-#[derive(Debug, Clone)]
-pub struct CompactionResult {
-    pub summary: String,
-    pub tokens_remaining: usize,
-}
-
-#[deprecated(
-    since = "0.0.1",
-    note = "Will be refactored into CompactionStrategyTrait for multi-strategy extensibility. \
-            Use rig_compose::ContextPack + MemvidDemotionHook for built-in memvid path. \
-            Future external strategies: openviking, cortex-mem, supermemory (see D10)."
-)]
-pub struct CompactionStrategy {
-    pub max_tokens: usize,
-}
-
-#[allow(deprecated)]
-impl CompactionStrategy {
-    pub fn new(max_tokens: usize) -> Self {
-        Self { max_tokens }
-    }
-
-    pub fn compact(&self, conversation_turns: &[String]) -> CompactionResult {
-        let mut total_tokens: usize = conversation_turns.iter().map(|t| t.len() / 4).sum();
-        let mut turns = conversation_turns.to_vec();
-
-        while total_tokens > self.max_tokens && turns.len() > 1 {
-            let removed = turns.remove(0);
-            total_tokens -= removed.len() / 4;
-        }
-
-        let summary = if turns.len() < conversation_turns.len() {
-            format!(
-                "active context: {} of {} turns (full history in archive)",
-                turns.len(),
-                conversation_turns.len()
-            )
-        } else {
-            String::new()
-        };
-
-        CompactionResult {
-            summary,
-            tokens_remaining: total_tokens,
-        }
-    }
-}
-
 pub struct ContextProjector {
     store: MemvidStore,
 }
@@ -216,45 +162,14 @@ impl ContextProjector {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     #[test]
-    fn compaction_strategy_creation() {
-        let strategy = CompactionStrategy::new(4096);
-        assert_eq!(strategy.max_tokens, 4096);
-    }
-
-    #[test]
     fn default_memory_config_creation() {
         let config = default_memory_config();
         let _ = config;
-    }
-
-    #[test]
-    fn compaction_reduces_tokens() {
-        let strategy = CompactionStrategy::new(100);
-        let turns = vec![
-            "turn one content here".repeat(20),
-            "turn two content here".repeat(20),
-            "turn three content".repeat(20),
-        ];
-        let result = strategy.compact(&turns);
-        assert!(result.tokens_remaining <= 100 || result.summary.contains("active context"));
-    }
-
-    #[test]
-    fn compaction_preserves_last_turn() {
-        let strategy = CompactionStrategy::new(10);
-        let turns = vec![
-            "short1".to_string(),
-            "short2".to_string(),
-            "keep_this".to_string(),
-        ];
-        let result = strategy.compact(&turns);
-        assert!(result.tokens_remaining > 0);
     }
 
     #[test]

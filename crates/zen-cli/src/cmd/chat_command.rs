@@ -5,6 +5,7 @@ use tracing::debug;
 
 use zen_agents::AgentOrchestrator;
 use zen_core::config::load_config;
+use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::errors::ZenError;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
@@ -29,7 +30,7 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
         Ok(paths) => {
             let mem_dir = paths.memory();
             std::fs::create_dir_all(&mem_dir).ok();
-            let store_path = mem_dir.join("mem1.mv2");
+            let store_path = mem_dir.join(MEMVID_STORE_FILE);
             match AgentOrchestrator::new(router.clone()).with_memory(store_path) {
                 Ok(o) => o,
                 Err(e) => {

@@ -184,8 +184,9 @@ fn resolve_tool_ids(agent_name: &str) -> Vec<&str> {
         .to_vec()
 }
 
-#[allow(dead_code)]
-fn describe_agent(agent_name: &str, registry: &DefaultAgentRegistry) -> String {
+/// Format a human-readable description of an agent by looking it up in the
+/// DefaultAgentRegistry. Used in diagnostics and logging output.
+pub(crate) fn describe_agent(agent_name: &str, registry: &DefaultAgentRegistry) -> String {
     if let Ok(profile) = registry.find_by_name(agent_name) {
         let caps: Vec<String> = profile.capabilities.iter().map(|c| c.to_string()).collect();
         format!(

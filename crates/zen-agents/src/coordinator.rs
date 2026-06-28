@@ -728,6 +728,7 @@ mod tests {
             skills,
             tools: ToolRegistry::new(),
             delegates: rig_compose::delegate::DelegateRegistry::new(),
+            memvid_store: None,
         }
     }
 

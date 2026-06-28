@@ -18,12 +18,11 @@ use crate::completion_model::ZenCompletionModel;
 pub use crate::wiring::ZenWiring;
 
 /// Context loaded from identity files: SOUL.md, AGENTS.md, MEMORY.md.
-#[derive(Debug, Clone, Default)]
-pub struct IdentityContext {
-    pub soul_content: String,
-    pub agents_content: String,
-    pub memory_content: String,
-}
+///
+/// Re-exported from `zen_memory::IdentityContext` (canonical type).
+/// Field access via `.soul_content()`, `.agents_content()`, `.memory_content()`
+/// which return `&str` (empty when the corresponding file is absent).
+pub use zen_memory::IdentityContext;
 
 /// Self-learning signals loaded from memory stores, injected into agent prompts.
 ///
@@ -195,6 +194,17 @@ fn load_beliefs(
         return String::new();
     }
 
+    let now = chrono::Utc::now();
+    let pruned = zen_memory::priority::prune_beliefs(&mut beliefs, now);
+    if !pruned.is_empty() {
+        tracing::debug!(count = pruned.len(), "pruned stale low-confidence beliefs");
+    }
+
+    let reinforced_ids: std::collections::HashSet<String> = {
+        let reinforced = zen_memory::priority::reinforce_beliefs(&beliefs, tracker);
+        reinforced.into_iter().map(|b| b.id.clone()).collect()
+    };
+
     for b in &mut beliefs {
         let _ = tracker.record_retrieval(&b.id);
         b.reinforce();
@@ -216,9 +226,15 @@ fn load_beliefs(
 
     let mut out = String::from("🔍 Low-confidence beliefs (need evidence):\n");
     for b in &top {
+        let marker = if reinforced_ids.contains(b.id.as_str()) {
+            " [REINFORCED]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "- \"{}\" (confidence: {:.0}%)\n",
+            "- \"{}\"{} (confidence: {:.0}%)\n",
             b.proposition,
+            marker,
             b.posterior * 100.0
         ));
     }
@@ -455,55 +471,49 @@ fn extract_first_paragraph(content: &str) -> String {
 
 /// Load identity files from the Zen home directory (~/.zen/).
 ///
-/// Each file is optional — missing or unreadable files yield empty strings
-/// with a warning logged.
+/// Each file is optional — missing or unreadable files yield `None`
+/// with a warning logged. Falls back to `<workspace>/AGENTS.md` if
+/// the identity-dir copy is absent.
 pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
     let identity_dir = zen_paths.identity();
 
     let soul_path = identity_dir.join("SOUL.md");
-    let soul_content = match read_to_string(&soul_path) {
-        Ok(content) => content,
-        Err(e) => {
+    let soul = read_to_string(&soul_path)
+        .map_err(|e| {
             tracing::warn!(path = ?soul_path, error = %e, "SOUL.md not found or unreadable");
-            String::new()
-        }
-    };
+            e
+        })
+        .ok();
 
-    let agents_content = {
-        let agents_path = identity_dir.join("AGENTS.md");
-        match read_to_string(&agents_path) {
-            Ok(content) => content,
-            Err(_) => {
-                if let Some(ws) = zen_paths.workspace_root() {
-                    let ws_agents = ws.join("AGENTS.md");
-                    match read_to_string(&ws_agents) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            tracing::warn!(path = ?ws_agents, error = %e, "AGENTS.md not found in workspace root either");
-                            String::new()
-                        }
-                    }
-                } else {
-                    tracing::warn!(path = ?agents_path, "AGENTS.md not found (no workspace root detected)");
-                    String::new()
+    let agents_path = identity_dir.join("AGENTS.md");
+    let agents = read_to_string(&agents_path).ok().or_else(|| {
+        if let Some(ws) = zen_paths.workspace_root() {
+            let ws_agents = ws.join("AGENTS.md");
+            match read_to_string(&ws_agents) {
+                Ok(content) => Some(content),
+                Err(e) => {
+                    tracing::warn!(path = ?ws_agents, error = %e, "AGENTS.md not found in workspace root either");
+                    None
                 }
             }
+        } else {
+            tracing::warn!(path = ?agents_path, "AGENTS.md not found (no workspace root detected)");
+            None
         }
-    };
+    });
 
     let memory_path = identity_dir.join("MEMORY.md");
-    let memory_content = match read_to_string(&memory_path) {
-        Ok(content) => content,
-        Err(e) => {
+    let memory = read_to_string(&memory_path)
+        .map_err(|e| {
             tracing::warn!(path = ?memory_path, error = %e, "MEMORY.md not found or unreadable");
-            String::new()
-        }
-    };
+            e
+        })
+        .ok();
 
     IdentityContext {
-        soul_content,
-        agents_content,
-        memory_content,
+        soul,
+        memory,
+        agents,
     }
 }
 
@@ -729,15 +739,15 @@ impl ZenAgent {
         if let Some(ref identity) = self.identity {
             ctx.evidence.push(
                 Evidence::new("identity", "soul")
-                    .with_detail(json!({ "summary": identity.soul_content })),
+                    .with_detail(json!({ "summary": identity.soul_content() })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "agents")
-                    .with_detail(json!({ "summary": identity.agents_content })),
+                    .with_detail(json!({ "summary": identity.agents_content() })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "memory")
-                    .with_detail(json!({ "summary": identity.memory_content })),
+                    .with_detail(json!({ "summary": identity.memory_content() })),
             );
         }
 
@@ -818,42 +828,6 @@ impl ZenAgent {
         Self::tier_score(skill, label)
     }
 
-    fn build_chat_history(
-        prompt: &str,
-        session: &SessionContext,
-    ) -> rig_core::OneOrMany<rig_core::message::Message> {
-        use rig_core::message::Message;
-
-        tracing::info!(
-            conversation_turns = session.conversation.len(),
-            "build_chat_history: building chat history"
-        );
-
-        if session.conversation.is_empty() {
-            tracing::info!("build_chat_history: conversation is empty, returning single message");
-            return rig_core::OneOrMany::one(Message::user(prompt));
-        }
-
-        let mut messages: Vec<Message> = session
-            .conversation
-            .iter()
-            .filter_map(|turn| match turn.role.as_str() {
-                "user" => Some(Message::user(&turn.content)),
-                "assistant" => Some(Message::assistant(&turn.content)),
-                _ => None,
-            })
-            .collect();
-
-        tracing::info!(
-            history_messages = messages.len(),
-            "build_chat_history: added history messages"
-        );
-
-        messages.push(Message::user(prompt));
-        rig_core::OneOrMany::many(messages)
-            .unwrap_or_else(|_| rig_core::OneOrMany::one(Message::user(prompt)))
-    }
-
     fn build_system_prompt_with_assembly(
         &self,
         session: &SessionContext,
@@ -864,11 +838,11 @@ impl ZenAgent {
         let mut builder = PromptAssembly::builder().sensitivity(session.sensitivity_policy);
 
         if let Some(ref identity) = self.identity {
-            if !identity.soul_content.is_empty() {
-                builder = builder.intro(&identity.soul_content);
+            if !identity.soul_content().is_empty() {
+                builder = builder.intro(identity.soul_content());
             }
-            if !identity.agents_content.is_empty() {
-                builder = builder.claude_md(&identity.agents_content);
+            if !identity.agents_content().is_empty() {
+                builder = builder.claude_md(identity.agents_content());
             }
         }
 
@@ -976,65 +950,6 @@ impl ZenAgent {
             .join("\n\n")
     }
 
-    #[instrument(skip(self, ctx, session), fields(session_id = %session.session_id, query_len = query.len()))]
-    async fn call_llm(
-        &self,
-        query: &str,
-        ctx: &InvestigationContext,
-        session: &SessionContext,
-    ) -> Result<String> {
-        use rig_core::completion::CompletionRequest;
-        use std::time::Instant;
-
-        let prompt = self.build_prompt(query, ctx);
-        let messages_in = session.conversation.len() + 1;
-        let model_name = self.completion_model.provider_name();
-        let conversation_id = session.session_id.to_string();
-        let start = Instant::now();
-
-        crate::observability::emit_prompt_started(model_name, &conversation_id, messages_in);
-
-        let request = CompletionRequest {
-            model: None,
-            preamble: Some("You are a helpful Zen assistant. Answer concisely. Use proper markdown formatting with blank lines between headings, paragraphs, code blocks, and lists.".to_string()),
-            chat_history: Self::build_chat_history(&prompt, session),
-            documents: Vec::new(),
-            tools: Vec::new(),
-            temperature: None,
-            max_tokens: Some(2048),
-            tool_choice: None,
-            additional_params: None,
-            output_schema: None,
-        };
-
-        let result = self.completion_model.completion(request).await;
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        match result {
-            Ok(response) => {
-                crate::observability::emit_prompt_completed(
-                    model_name,
-                    &conversation_id,
-                    Some(response.usage.input_tokens),
-                    Some(response.usage.output_tokens),
-                    Some(duration_ms),
-                );
-                match response.choice.first() {
-                    rig_core::completion::AssistantContent::Text(t) => Ok(t.text.clone()),
-                    other => Ok(format!("{other:?}")),
-                }
-            }
-            Err(e) => {
-                crate::observability::emit_prompt_failed(
-                    model_name,
-                    &conversation_id,
-                    &e.to_string(),
-                );
-                Err(e.into())
-            }
-        }
-    }
-
     #[instrument(skip(self, system_prompt, user_message, session), fields(session_id = %session.session_id, query_len = query.len()))]
     async fn call_llm_with_assembly(
         &self,
@@ -1134,15 +1049,15 @@ impl ZenAgent {
         if let Some(ref identity) = self.identity {
             ctx.evidence.push(
                 Evidence::new("identity", "soul")
-                    .with_detail(json!({ "summary": identity.soul_content })),
+                    .with_detail(json!({ "summary": identity.soul_content() })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "agents")
-                    .with_detail(json!({ "summary": identity.agents_content })),
+                    .with_detail(json!({ "summary": identity.agents_content() })),
             );
             ctx.evidence.push(
                 Evidence::new("identity", "memory")
-                    .with_detail(json!({ "summary": identity.memory_content })),
+                    .with_detail(json!({ "summary": identity.memory_content() })),
             );
         }
 
@@ -1351,29 +1266,6 @@ impl ZenAgentBuilder {
 mod chain_tests {
     use super::*;
     use zen_core::types::SessionContext;
-
-    fn dummy_session_with_history() -> SessionContext {
-        let mut session = SessionContext::new("test-agent".to_string(), String::new());
-        session.add_turn("user", "I prefer Rust");
-        session.add_turn("assistant", "Got it, Rust is great");
-        session
-    }
-
-    #[test]
-    fn build_chat_history_includes_prior_turns() {
-        let session = dummy_session_with_history();
-        let history = ZenAgent::build_chat_history("what did I say?", &session);
-        let msgs: Vec<_> = history.iter().collect();
-        assert_eq!(msgs.len(), 3, "Should have 2 prior turns + 1 current");
-    }
-
-    #[test]
-    fn build_chat_history_empty_session_single_message() {
-        let session = SessionContext::new("test".to_string(), String::new());
-        let history = ZenAgent::build_chat_history("hello", &session);
-        let msgs: Vec<_> = history.iter().collect();
-        assert_eq!(msgs.len(), 1, "Empty session should produce single message");
-    }
 
     #[test]
     fn tier_score_includes_knowledge() {

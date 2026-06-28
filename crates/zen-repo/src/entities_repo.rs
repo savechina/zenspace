@@ -3,6 +3,23 @@ use sqlx::Row;
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{EntityRow, GraphSearchResult, InsertRelationshipRequest, RelationshipRow};
 
+/// Normalize an entity alias per DESIGN.md §6.3 rules:
+/// lowercase, trim whitespace, strip common suffixes (`.js`, `.rs`, `.py`, `-lang`, ` language`).
+/// NFC normalization is implicitly handled by Rust's Unicode-aware `to_lowercase()`.
+pub fn normalize_alias(raw: &str) -> String {
+    let mut s = raw.trim().to_lowercase();
+
+    // Strip programming language / framework suffixes
+    for suffix in &[".js", ".rs", ".py", "-lang", " language", ".ts", ".go", ".java", ".rb"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.to_string();
+            break;
+        }
+    }
+
+    s.trim().to_string()
+}
+
 pub struct EntitiesRepo<'a> {
     client: &'a SqliteClient,
 }
@@ -88,7 +105,10 @@ impl<'a> EntitiesRepo<'a> {
     }
 
     pub async fn insert_alias(&self, alias: &str, canonical_entity_id: &str) -> Result<()> {
-        let alias = alias.to_string();
+        let alias = normalize_alias(alias);
+        if alias.is_empty() {
+            return Ok(());
+        }
         let canonical_entity_id = canonical_entity_id.to_string();
 
         self.client
@@ -161,6 +181,7 @@ impl<'a> EntitiesRepo<'a> {
     }
 
     pub async fn resolve_alias(&self, alias: &str) -> Result<Option<String>> {
+        let alias = normalize_alias(alias);
         let result = sqlx::query("SELECT canonical_entity_id FROM entity_aliases WHERE alias = ?1")
             .bind(alias)
             .fetch_optional(self.client.pool())

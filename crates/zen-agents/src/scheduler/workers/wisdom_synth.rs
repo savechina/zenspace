@@ -248,6 +248,15 @@ Respond with ONLY a JSON object:
             "wisdom synthesis complete"
         );
 
+        let suggestions_dir = paths.vault().join("wiki/wisdom/suggestions");
+        fs::create_dir_all(&suggestions_dir)?;
+        let suggestion_path = suggestions_dir.join(format!("{date_str}.md", date_str = Utc::now().format("%Y-%m-%d")));
+        if let Err(e) = write_suggestions(&suggestion_path, &models, &anti_patterns, &belief_updates) {
+            warn!(path = %suggestion_path.display(), error = %e, "failed to write synthesis suggestions");
+        } else {
+            info!(path = %suggestion_path.display(), "wisdom synthesis suggestions written");
+        }
+
         Ok(WorkerReport {
             worker_id: self.id().to_string(),
             success: true,
@@ -428,7 +437,6 @@ fn promote_anti_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
     Ok(count)
 }
 
-#[allow(dead_code)]
 fn write_suggestions(
     path: &Path,
     models: &[Value],

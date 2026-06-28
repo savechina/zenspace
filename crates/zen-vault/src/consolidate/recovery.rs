@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
-use tracing::info;
+use anyhow::{Context, Result};
+use tracing::{debug, info};
 
 use super::checkpoint::Checkpoint;
 
@@ -34,10 +34,29 @@ impl RecoveryManager {
 
     /// Recover from an incomplete consolidation.
     ///
-    /// Currently a stub — real rollback logic deferred.
-    pub fn recover(&self) -> Result<()> {
-        info!("Recovery stub: would rollback incomplete consolidation");
-        Ok(())
+    /// Reads the checkpoint to determine what was in progress, then
+    /// clears it so the next pipeline run can restart from scratch.
+    /// Returns the checkpoint that was recovered (if any).
+    pub fn recover(&self) -> Result<Option<Checkpoint>> {
+        let incomplete = self.check_incomplete()?;
+        match incomplete {
+            Some(cp) => {
+                info!(
+                    status = %cp.status,
+                    notes_count = cp.notes_count,
+                    "recovering from incomplete consolidation"
+                );
+                let mgr = super::checkpoint::CheckpointManager::new(&self.logs_dir);
+                mgr.clear_checkpoint().with_context(|| {
+                    format!("clear checkpoint in logs dir: {}", self.logs_dir.display())
+                })?;
+                Ok(Some(cp))
+            }
+            None => {
+                debug!("no incomplete consolidation to recover");
+                Ok(None)
+            }
+        }
     }
 }
 

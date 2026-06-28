@@ -1,4 +1,3 @@
-use crate::journal::Journal;
 use std::collections::HashSet;
 use std::fs;
 
@@ -57,11 +56,10 @@ impl ExtractedSignals {
 /// ZenDream — Nightly consolidation state.
 ///
 /// Runs during a configurable window (default 2AM–4AM) to:
-/// 1. Consolidate daily logs → extract durable facts
+/// 1. Extract durable facts from journal entries (written by SessionJournaler)
 /// 2. Update MEMORY.md with all new durable facts (personal record)
-/// 3. **Promote entity-aware facts to knowledge graph** — detect tech/concept entities, write to graph.db + vec.db
-/// 4. Compress old subconscious logs
-/// 5. Recompute entity relationships from wiki
+/// 3. Compress old subconscious logs
+/// 4. Recompute entity relationships from wiki
 ///
 /// All operations are offline-first — no network/LLM calls required.
 pub struct ZenDream;
@@ -126,7 +124,7 @@ impl ZenDream {
         Ok(report)
     }
 
-    /// Backfill the knowledge graph by replaying daily logs from `from` to `to`.
+    /// Backfill the knowledge graph by replaying journal entries from `from` to `to`.
     ///
     /// Phase 3 Task 7: First-run historical scanning. Each day is processed
     /// via `run_cycle`; failures are logged and skipped, not fatal.
@@ -205,9 +203,6 @@ impl DreamReport {
 pub enum DreamError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("failed to read daily log: {0}")]
-    DailyLogRead(String),
 
     #[error("failed to update MEMORY.md: {0}")]
     MemoryUpdate(String),
@@ -301,40 +296,10 @@ pub(crate) fn parse_facts_section(content: &str) -> Vec<String> {
     facts
 }
 
-/// Step 1 (refactored): Consolidate daily log → durable facts.
+/// Extract durable facts from a conversation string via keyword matching.
 ///
-/// Reads the daily log for `date`, extracts structured facts from entries,
-/// returns the full Vec<String> as a **shared bridge** — consumed by both
-/// MEMORY.md and knowledge-graph recompute_entities().
-#[allow(dead_code)]
-fn extract_durable_facts(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<String>, DreamError> {
-    let entries = Journal::read_entries(zen_paths, date)
-        .map_err(|e| DreamError::DailyLogRead(e.to_string()))?;
-
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut facts = Vec::new();
-
-    for entry in &entries {
-        let entry_facts = extract_durable_facts_from_entry(&entry.content);
-        if !entry_facts.is_empty() {
-            debug!(
-                "extracted {} durable fact(s) from entry at {}",
-                entry_facts.len(),
-                entry.timestamp
-            );
-            facts.extend(entry_facts);
-        }
-    }
-
-    Ok(facts)
-}
-
-/// Extract durable facts from a single journal entry content string.
-///
-/// Heuristic: lines that look like completed actions (past tense verbs).
+/// Heuristic: lines containing past-tense action verbs (completed, fixed, added, etc.).
+/// Used as a LLM-free fallback by SessionJournaler when no LLM provider is available.
 pub fn extract_durable_facts_from_entry(content: &str) -> Vec<String> {
     const ACTION_KEYWORDS: &[&str] = &[
         "completed",
@@ -374,6 +339,32 @@ pub fn extract_durable_facts_from_entry(content: &str) -> Vec<String> {
 
 // ─── Step 2: All Facts → MEMORY.md — Tasks 2 & 3 ────────────────────────
 
+/// Per DESIGN.md §3.1, MEMORY.md must contain these sections.
+/// If any are missing, they are initialized as empty headers.
+const MEMORY_SECTION_HEADERS: &[&str] = &[
+    "## Identity",
+    "## Active Commitments",
+    "## Stop-Doing Ledger",
+    "## Active Mental Models",
+    "## Recent Wisdom",
+];
+
+/// Ensure all DESIGN.md §3.1 required section headers exist in MEMORY.md.
+/// Inserts missing headers before `## Recent Wisdom` so facts land in the right place.
+fn ensure_memory_sections(content: &str) -> String {
+    let mut result = content.to_string();
+    for header in MEMORY_SECTION_HEADERS {
+        if !result.contains(header) {
+            if let Some(pos) = result.find("## Recent Wisdom") {
+                result.insert_str(pos, &format!("{header}\n\n"));
+            } else {
+                result.push_str(&format!("\n{header}\n\n"));
+            }
+        }
+    }
+    result
+}
+
 /// NEW Step 2 (refactored): Update MEMORY.md from the shared facts Vec.
 ///
 /// Replaces the old update_memory() which read entries again internally.
@@ -393,19 +384,22 @@ pub fn update_memory_from_facts(
     let memory_path = zen_paths.identity().join("MEMORY.md");
 
     if !memory_path.exists() {
-        debug!("MEMORY.md not found, skipping update");
-        return Ok(false);
+        let default_content = MEMORY_SECTION_HEADERS.join("\n\n");
+        if let Some(parent) = memory_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&memory_path, &default_content)?;
+        debug!("initialized MEMORY.md with all DESIGN.md §3.1 section headers");
     }
+
+    let content = ensure_memory_sections(&fs::read_to_string(&memory_path)?);
 
     // Deduplicate facts before writing
     let unique_facts: Vec<String> = dedupe_facts(facts);
-
     if unique_facts.is_empty() {
         debug!("all facts were duplicates, skipping MEMORY.md write");
         return Ok(false);
     }
-
-    let content = fs::read_to_string(&memory_path)?;
 
     let section_header = "## Recent Wisdom";
     let now = chrono::Utc::now().format("%Y-%m-%d").to_string();

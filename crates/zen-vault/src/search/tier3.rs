@@ -12,7 +12,6 @@ use super::SearchResult;
 // ---------------------------------------------------------------------------
 
 #[derive(Embed, Clone, Debug, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct KnowledgeDocument {
     pub id: String,
     #[embed]
@@ -49,6 +48,14 @@ impl SqliteVectorStoreTable for KnowledgeDocument {
 pub struct Tier3Search;
 
 impl Tier3Search {
+    pub fn knowledge_doc_schema_name() -> &'static str {
+        KnowledgeDocument::name()
+    }
+
+    pub fn knowledge_doc_schema_columns() -> usize {
+        KnowledgeDocument::schema().len()
+    }
+
     pub async fn search(
         &self,
         client: &SqliteClient,

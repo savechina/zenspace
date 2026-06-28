@@ -134,6 +134,59 @@ pub fn check_all(d: &Decision) -> AntiPatternReport {
     }
 }
 
+fn slugify_pattern_id(pattern_id: &str) -> String {
+    pattern_id.replace('_', "-")
+}
+
+pub fn persist_anti_pattern_wiki_page(
+    wiki_dir: &std::path::Path,
+    violation: &AntiPatternViolation,
+    decision_id: &str,
+) -> Result<bool, std::io::Error> {
+    let slug = slugify_pattern_id(&violation.pattern_id);
+    let target_dir = wiki_dir.join("wisdom").join("anti-patterns").join("decisions");
+    let target_path = target_dir.join(format!("{slug}.md"));
+
+    if target_path.exists() {
+        return Ok(false);
+    }
+
+    std::fs::create_dir_all(&target_dir)?;
+
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let severity_str = match violation.severity {
+        Severity::Crit => "crit",
+        Severity::High => "high",
+        Severity::Med => "medium",
+    };
+
+    let content = format!(
+        "---\n\
+         id: {slug}\n\
+         type: anti-pattern\n\
+         subtype: decision\n\
+         category: decision\n\
+         severity: {severity_str}\n\
+         source_decision: {decision_id}\n\
+         detected_at: {now}\n\
+         ---\n\n\
+         # {slug}\n\n\
+         Detected in decision `{decision_id}`.\n\n\
+         ## Trigger\n\n\
+         {message}\n\n\
+         ## Avoidance\n\n\
+         _(To be expanded — review the decision context and document the avoidance strategy.)_\n",
+        slug = slug,
+        severity_str = severity_str,
+        decision_id = decision_id,
+        now = now,
+        message = violation.message,
+    );
+
+    std::fs::write(&target_path, content)?;
+    Ok(true)
+}
+
 /// Check if decision focus diverges from stated core pursuit.
 ///
 /// Rule-based heuristic: tokenize core_pursuit into keywords, check if any
@@ -749,5 +802,77 @@ mod tests {
             "NOW!!! URGENT!!! ACT NOW!!! absolutely never always completely totally insane!!!";
         let score = emotional_impulse_score(text);
         assert!(score <= 1.0, "score should not exceed 1.0, got {score}");
+    }
+
+    #[test]
+    fn test_persist_anti_pattern_creates_file_for_new_pattern() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki_dir: PathBuf = tmp.path().to_path_buf();
+        let violation = AntiPatternViolation {
+            pattern_id: "sunk_cost_fallacy".into(),
+            severity: Severity::High,
+            message: "Justifying continuation with past investment".into(),
+        };
+
+        let created = persist_anti_pattern_wiki_page(&wiki_dir, &violation, "dec-123").unwrap();
+        assert!(created, "file should have been created");
+
+        let target = wiki_dir
+            .join("wisdom/anti-patterns/decisions/sunk-cost-fallacy.md");
+        assert!(target.exists(), "target file should exist");
+        let body = std::fs::read_to_string(&target).unwrap();
+        assert!(body.contains("id: sunk-cost-fallacy"));
+        assert!(body.contains("source_decision: dec-123"));
+        assert!(body.contains("severity: high"));
+        assert!(body.contains("Justifying continuation with past investment"));
+    }
+
+    #[test]
+    fn test_persist_anti_pattern_skips_existing_file() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki_dir: PathBuf = tmp.path().to_path_buf();
+        let violation = AntiPatternViolation {
+            pattern_id: "inertia_thinking".into(),
+            severity: Severity::Med,
+            message: "Preferring status quo".into(),
+        };
+
+        let first = persist_anti_pattern_wiki_page(&wiki_dir, &violation, "dec-1").unwrap();
+        assert!(first);
+        let second = persist_anti_pattern_wiki_page(&wiki_dir, &violation, "dec-2").unwrap();
+        assert!(
+            !second,
+            "second call must be a no-op when file already exists"
+        );
+
+        let body = std::fs::read_to_string(
+            wiki_dir.join("wisdom/anti-patterns/decisions/inertia-thinking.md"),
+        )
+        .unwrap();
+        assert!(
+            body.contains("source_decision: dec-1"),
+            "existing file must not be overwritten by second call"
+        );
+    }
+
+    #[test]
+    fn test_persist_anti_pattern_creates_parent_dirs() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki_dir: PathBuf = tmp.path().to_path_buf().join("nested").join("wiki");
+        assert!(!wiki_dir.exists());
+
+        let violation = AntiPatternViolation {
+            pattern_id: "authority_blindness".into(),
+            severity: Severity::Med,
+            message: "Trusting authority without verification".into(),
+        };
+
+        let created =
+            persist_anti_pattern_wiki_page(&wiki_dir, &violation, "dec-9").unwrap();
+        assert!(created);
+        assert!(wiki_dir.join("wisdom/anti-patterns/decisions/authority-blindness.md").exists());
     }
 }

@@ -13,7 +13,7 @@ pub use client::{SqliteClient, SqliteError};
 pub use types::*;
 pub use notes_repo::NotesRepo;
 pub use embeddings_repo::EmbeddingsRepo;
-pub use entities_repo::EntitiesRepo;
+pub use entities_repo::{EntitiesRepo, normalize_alias};
 pub use self_model_repo::SelfModelRepo;
 pub use goals_repo::GoalsRepo;
 pub use beliefs_repo::BeliefsRepo;

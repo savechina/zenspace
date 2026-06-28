@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono;
 use serde_json::Value;
 use tracing::debug;
 
@@ -54,7 +53,6 @@ impl Tier4Search {
         Ok(graph_results)
     }
 
-    // TODO: route through EntityService::upsert_entity for alias normalization
     pub async fn insert_entity(
         &self,
         client: &SqliteClient,
@@ -63,7 +61,16 @@ impl Tier4Search {
         entity_type: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        EntitiesRepo::new(client).insert_entity(id, name, entity_type, &now).await?;
+        let repo = EntitiesRepo::new(client);
+
+        repo.insert_entity(id, name, entity_type, &now).await?;
+
+        // Register normalized alias for entity deduplication.
+        use unicode_normalization::UnicodeNormalization;
+        let normalized: String = name.nfc().collect();
+        let normalized = normalized.trim().to_lowercase();
+        repo.insert_alias(&normalized, id).await?;
+
         Ok(())
     }
 

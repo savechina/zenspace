@@ -10,13 +10,24 @@ use std::sync::Arc;
 use zen_provider::LlmRouter;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MockResponse {
-    _text: String,
+pub struct ZenCompletionResponse {
+    text: String,
 }
 
-impl GetTokenUsage for MockResponse {
+impl GetTokenUsage for ZenCompletionResponse {
     fn token_usage(&self) -> Option<Usage> {
-        None
+        let n = self.text.len() as u64 / 4; // conservative ~4 chars/token
+        if n == 0 {
+            return None;
+        }
+        Some(Usage {
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            output_tokens: n,
+            reasoning_tokens: 0,
+            total_tokens: n,
+        })
     }
 }
 
@@ -43,8 +54,8 @@ impl ZenCompletionModel {
 }
 
 impl CompletionModel for ZenCompletionModel {
-    type Response = MockResponse;
-    type StreamingResponse = MockResponse;
+    type Response = ZenCompletionResponse;
+    type StreamingResponse = ZenCompletionResponse;
     type Client = ();
 
     fn make(_: &(), model: impl Into<String>) -> Self {
@@ -91,8 +102,8 @@ impl CompletionModel for ZenCompletionModel {
         Ok(CompletionResponse {
             choice: OneOrMany::one(AssistantContent::text(response_text.clone())),
             usage: Usage::new(),
-            raw_response: MockResponse {
-                _text: response_text,
+            raw_response: ZenCompletionResponse {
+                text: response_text,
             },
             message_id: None,
         })
@@ -161,8 +172,8 @@ impl CompletionModel for ZenCompletionModel {
                                     "completion_model: LLM stream completed"
                                 );
                                 Some((
-                                    Ok(RawStreamingChoice::FinalResponse(MockResponse {
-                                        _text: text,
+                                    Ok(RawStreamingChoice::FinalResponse(ZenCompletionResponse {
+                                        text,
                                     })),
                                     (token_rx, done_rx, collected, token_count, provider_name),
                                 ))
