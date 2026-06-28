@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
+use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_memory::belief::Belief;
 use zen_memory::conversation::ConversationStore;
@@ -354,6 +355,9 @@ async fn extract_signals_via_llm(
     } else {
         ""
     };
+
+    let sanitizer = InputSanitizer::new();
+    let truncated = sanitizer.strip_dangerous_patterns(&truncated);
 
     let prompt = format!(
         r#"Extract typed signals from this development session conversation.

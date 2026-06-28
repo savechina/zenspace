@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
+use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_provider::{DefaultRouter, LlmRouterExt};
 
@@ -281,6 +282,9 @@ async fn synthesize_anti_patterns(reflections_dir: &Path) -> Result<usize> {
     } else {
         reflections_text
     };
+
+    let sanitizer = InputSanitizer::new();
+    let truncated = sanitizer.strip_dangerous_patterns(&truncated);
 
     let prompt = format!(
         r#"Analyze these session reflections and identify recurring anti-patterns — repeated mistakes, blind spots, or behavioral traps.

@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
+use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_memory::belief::Belief;
 use zen_provider::{DefaultRouter, LlmRouterExt};
@@ -116,6 +117,12 @@ impl ZenWorker for ExpressWorker {
         } else {
             combined_text
         };
+
+        let sanitizer = InputSanitizer::new();
+        let truncated = sanitizer.strip_dangerous_patterns(&truncated);
+        let beliefs_formatted = sanitizer.strip_dangerous_patterns(&beliefs_formatted);
+        let commitments_text = sanitizer.strip_dangerous_patterns(&commitments_text);
+        let suggestions_text = sanitizer.strip_dangerous_patterns(&suggestions_text);
 
         let prompt = format!(
             r#"You are a knowledge expression engine. Synthesize the following source material into a polished weekly review and a blog-ready draft.

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
 use super::SearchResult;
+use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_provider::{DefaultRouter, LlmRouterExt};
 
@@ -54,16 +55,19 @@ impl Tier5Search {
         }
 
         // Phase 2: Build prompt with numbered source references
+        let sanitizer = InputSanitizer::new();
+        let sanitized_query = sanitizer.strip_dangerous_patterns(query);
         let context_text = context
             .iter()
             .enumerate()
             .map(|(i, r)| {
+                let sanitized_content = sanitizer.strip_dangerous_patterns(&r.content);
                 format!(
                     "[{}] {}:{}\n{}",
                     i + 1,
                     r.file.display(),
                     r.line,
-                    r.content
+                    sanitized_content
                 )
             })
             .collect::<Vec<_>>()
@@ -72,14 +76,14 @@ impl Tier5Search {
         let prompt = format!(
             "You are a knowledge synthesis assistant. Given a user query and search results \
              from a local knowledge base, synthesize a concise, accurate answer.\n\n\
-             Query: {query}\n\n\
-             Search Results:\n{context_text}\n\n\
+             Query: [USER_CONTENT_START]{query}[USER_CONTENT_END]\n\n\
+             Search Results:\n[USER_CONTENT_START]{context_text}[USER_CONTENT_END]\n\n\
              Instructions:\n\
              - Answer based ONLY on the provided search results\n\
              - If the results don't contain enough information, say so\n\
              - Cite sources by filename where possible\n\
              - Be concise (2-3 paragraphs max unless the query demands more)",
-            query = query,
+            query = sanitized_query,
             context_text = context_text
         );
 

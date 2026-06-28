@@ -761,8 +761,15 @@ impl ZenAgent {
         session: &SessionContext,
     ) -> Result<String> {
         use rig_core::completion::CompletionRequest;
+        use std::time::Instant;
 
         let prompt = self.build_prompt(query, ctx);
+        let messages_in = session.conversation.len() + 1;
+        let model_name = self.completion_model.provider_name();
+        let conversation_id = session.session_id.to_string();
+        let start = Instant::now();
+
+        crate::observability::emit_prompt_started(model_name, &conversation_id, messages_in);
 
         let request = CompletionRequest {
             model: None,
@@ -777,11 +784,27 @@ impl ZenAgent {
             output_schema: None,
         };
 
-        let response = self.completion_model.completion(request).await?;
+        let result = self.completion_model.completion(request).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
 
-        match response.choice.first() {
-            rig_core::completion::AssistantContent::Text(t) => Ok(t.text.clone()),
-            other => Ok(format!("{other:?}")),
+        match result {
+            Ok(response) => {
+                crate::observability::emit_prompt_completed(
+                    model_name,
+                    &conversation_id,
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    Some(duration_ms),
+                );
+                match response.choice.first() {
+                    rig_core::completion::AssistantContent::Text(t) => Ok(t.text.clone()),
+                    other => Ok(format!("{other:?}")),
+                }
+            }
+            Err(e) => {
+                crate::observability::emit_prompt_failed(model_name, &conversation_id, &e.to_string());
+                Err(e.into())
+            }
         }
     }
 

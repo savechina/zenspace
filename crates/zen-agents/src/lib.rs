@@ -36,7 +36,7 @@ pub use context::AgentContext;
 pub use coordinator::{EntropyConfig, ZenCoordinator};
 pub use execution::{AgentExecution, ExecutionMetadata, ToolCall};
 pub use executor::{AgentExecutor, ErrorCategory, RetryPolicy};
-pub use observability::create_telemetry_hook;
+pub use observability::{emit_prompt_completed, emit_prompt_failed, emit_prompt_started};
 pub use orchestrator::AgentOrchestrator;
 pub use registry::{AgentRegistry, DefaultAgentRegistry, RegistryError};
 pub use review::{HermesValidator, MetisReviewer, MomusReviewer, QualityPipeline, ZeusEscalation};

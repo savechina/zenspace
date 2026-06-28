@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
+use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_memory::belief::{Belief, SourceType};
 use zen_provider::{DefaultRouter, LlmRouterExt};
@@ -133,6 +134,10 @@ impl ZenWorker for WisdomSynthesizer {
         } else {
             reflections_text
         };
+
+        let sanitizer = InputSanitizer::new();
+        let truncated_reflections = sanitizer.strip_dangerous_patterns(&truncated_reflections);
+        let beliefs_formatted = sanitizer.strip_dangerous_patterns(&beliefs_formatted);
 
         let prompt = format!(
             r#"You are a wisdom synthesis engine. Analyze the following reflections and beliefs, then identify:

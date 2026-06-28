@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
+use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_provider::{DefaultRouter, LlmRouterExt};
 use zen_vault::entity::{Entity, EntityService, EntityType};
@@ -233,6 +234,9 @@ fn extract_entities_via_llm(
         .map(|f| format!("- {f}"))
         .collect::<Vec<_>>()
         .join("\n");
+
+    let sanitizer = InputSanitizer::new();
+    let facts_text = sanitizer.strip_dangerous_patterns(&facts_text);
 
     let prompt = format!(
         r#"Extract entities from these development session facts. Identify technologies, concepts, tools, and patterns mentioned.

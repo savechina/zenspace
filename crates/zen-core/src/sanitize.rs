@@ -173,6 +173,108 @@ fn strip_privilege_escalation(content: &str) -> (String, bool) {
     (result, stripped)
 }
 
+fn strip_zero_width_chars(content: &str) -> (String, bool) {
+    let mut stripped = false;
+    let result: String = content
+        .chars()
+        .filter(|c| {
+            matches!(
+                *c,
+                '\u{200B}'  // zero-width space
+                | '\u{200C}' // zero-width non-joiner
+                | '\u{200D}' // zero-width joiner
+                | '\u{FEFF}' // BOM / zero-width no-break space
+                | '\u{2060}' // word joiner
+                | '\u{00AD}' // soft hyphen
+            )
+            .then(|| {
+                stripped = true;
+            })
+            .is_none()
+        })
+        .collect();
+    (result, stripped)
+}
+
+fn strip_html_dangerous(content: &str) -> (String, bool) {
+    let lower = content.to_lowercase();
+    let mut stripped = false;
+    let mut result = content.to_string();
+
+    let dangerous_tags = [
+        "<script",
+        "</script>",
+        "<iframe",
+        "</iframe>",
+        "<embed",
+        "</embed>",
+        "<object",
+        "</object>",
+        "<style",
+        "</style>",
+        "<link",
+        "<meta",
+    ];
+
+    for tag in &dangerous_tags {
+        if lower.contains(tag) {
+            stripped = true;
+            let mut buf = result.clone();
+            loop {
+                let buf_lower = buf.to_lowercase();
+                if let Some(start) = buf_lower.find(tag) {
+                    let end = buf[start..].find('>').map(|i| start + i + 1);
+                    if let Some(end) = end {
+                        buf = format!("{}{}", &buf[..start], &buf[end..]);
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            result = buf;
+        }
+    }
+
+    let event_handlers = ["onerror=", "onload=", "onclick=", "onmouseover="];
+    for handler in &event_handlers {
+        if result.to_lowercase().contains(handler) {
+            stripped = true;
+            let mut buf = result.clone();
+            loop {
+                let buf_lower = buf.to_lowercase();
+                if let Some(pos) = buf_lower.find(handler) {
+                    let after = &buf[pos + handler.len()..];
+                    let trimmed = after.trim_start();
+                    let skip = if let Some(rest) = trimmed.strip_prefix('"') {
+                        rest.find('"').map(|i| i + 1).unwrap_or(0) + 1
+                    } else if let Some(rest) = trimmed.strip_prefix('\'') {
+                        rest.find('\'').map(|i| i + 1).unwrap_or(0) + 1
+                    } else {
+                        trimmed
+                            .find(|c: char| c.is_whitespace() || c == '>')
+                            .unwrap_or(trimmed.len())
+                    };
+                    let ws_len = after.len() - trimmed.len();
+                    buf = format!("{}{}", &buf[..pos], &after[skip + ws_len..]);
+                } else {
+                    break;
+                }
+            }
+            result = buf;
+        }
+    }
+
+    let lower_result = result.to_lowercase();
+    if lower_result.contains("javascript:") || lower_result.contains("javascript :") {
+        stripped = true;
+        result = result.replace("javascript:", "").replace("javascript :", "");
+    }
+
+    (result, stripped)
+}
+
 fn strip_code_execution(content: &str) -> (String, bool) {
     let lower = content.to_lowercase();
     let mut stripped = false;
@@ -224,6 +326,18 @@ impl InputSanitizer {
 
         let mut stripped_patterns = Vec::new();
         let mut text = content.to_string();
+
+        let (t, s) = strip_zero_width_chars(&text);
+        text = t;
+        if s {
+            stripped_patterns.push("zero_width_chars".into());
+        }
+
+        let (t, s) = strip_html_dangerous(&text);
+        text = t;
+        if s {
+            stripped_patterns.push("html_injection".into());
+        }
 
         let (t, s) = strip_system_tags(&text);
         text = t;
@@ -290,10 +404,57 @@ impl InputSanitizer {
         })
     }
 
+    pub fn strip_dangerous_patterns(&self, content: &str) -> String {
+        let mut text = content.to_string();
+
+        let (t, _) = strip_zero_width_chars(&text);
+        text = t;
+
+        let (t, _) = strip_html_dangerous(&text);
+        text = t;
+
+        let (t, _) = strip_system_tags(&text);
+        text = t;
+
+        let (t, _) = strip_role_overrides(&text);
+        text = t;
+
+        let (t, _) = strip_shell_injection(&text);
+        text = t;
+
+        let (t, _) = strip_privilege_escalation(&text);
+        text = t;
+
+        let (t, _) = strip_code_execution(&text);
+        text = t;
+
+        text
+    }
+
     pub fn contains_dangerous_pattern(&self, content: &str) -> Vec<String> {
         let mut detected = Vec::new();
 
         let lower = content.to_lowercase();
+
+        if content.contains('\u{200B}')
+            || content.contains('\u{200C}')
+            || content.contains('\u{200D}')
+            || content.contains('\u{FEFF}')
+            || content.contains('\u{2060}')
+            || content.contains('\u{00AD}')
+        {
+            detected.push("zero_width_chars".into());
+        }
+        if lower.contains("<script")
+            || lower.contains("<iframe")
+            || lower.contains("<embed")
+            || lower.contains("<object")
+            || lower.contains("onerror=")
+            || lower.contains("onload=")
+            || lower.contains("javascript:")
+        {
+            detected.push("html_injection".into());
+        }
         if lower.contains("<system>") || lower.contains("</system>") || lower.contains("<system ") {
             detected.push("system_tag".into());
         }

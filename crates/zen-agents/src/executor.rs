@@ -19,6 +19,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tracing::{info, instrument, warn};
 
+use zen_core::sanitize::InputSanitizer;
 use zen_provider::{DefaultRouter, LlmRouter, Provider, TaskRequirements};
 
 use crate::AgentContext;
@@ -197,9 +198,11 @@ impl AgentExecutor {
         agent: &crate::ZenAgent,
     ) -> String {
         let system_prompt = self.assemble_system_prompt_with_identity(context, agent);
+        let sanitizer = InputSanitizer::new();
+        let sanitized_query = sanitizer.strip_dangerous_patterns(&context.user_query);
         format!(
-            "{}\n\nUser: {}\n\nAssistant:",
-            system_prompt, context.user_query
+            "{}\n\nUser: [USER_CONTENT_START]{}[USER_CONTENT_END]\n\nAssistant:",
+            system_prompt, sanitized_query
         )
     }
 
