@@ -272,7 +272,7 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Search { ref operation } => search_command::execute_command(operation).await,
         Commands::Similar { ref operation } => similar_command::execute_command(operation),
         Commands::Graph { ref operation } => graph_command::execute_command(operation),
-        Commands::Reindex { ref operation } => reindex_command::execute_command(operation),
+        Commands::Reindex { ref operation } => reindex_command::execute_command(operation).await,
         Commands::Research { ref operation } => research_command::execute_command(operation).await,
         Commands::Consolidate { ref operation } => consolidate_command::execute_command(operation),
         Commands::Lint { ref operation } => lint_command::execute_command(operation),

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::path::Path;
 use tracing::debug;
 
 use crate::tools::{
@@ -27,6 +28,30 @@ impl Tier2Search {
             limit
         );
         Ok(results)
+    }
+
+    pub async fn search_in_dir(
+        &self,
+        client: &SqliteClient,
+        query: &str,
+        base_dir: &Path,
+        limit: usize,
+    ) -> Result<Vec<FtsResult>> {
+        let all_results = NotesRepo::new(client).search(query, limit * 2).await?;
+        let base_str = base_dir.to_string_lossy().to_string();
+        let filtered: Vec<FtsResult> = all_results
+            .into_iter()
+            .filter(|r| r.path.starts_with(&base_str))
+            .take(limit)
+            .collect();
+
+        debug!(
+            "Tier2Search::search_in_dir: found {} results in {} for query='{}'",
+            filtered.len(),
+            base_str,
+            query
+        );
+        Ok(filtered)
     }
 
     #[allow(clippy::too_many_arguments)]

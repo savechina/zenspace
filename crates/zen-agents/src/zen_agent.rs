@@ -533,6 +533,95 @@ impl ZenAgent {
         &self.signals
     }
 
+    fn push_self_learning_evidence(&self, ctx: &mut InvestigationContext) {
+        let Some(ref signals) = self.signals else {
+            return;
+        };
+        if signals.is_empty() {
+            return;
+        }
+
+        let mut pushed = 0;
+        if !signals.corrections.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "corrections")
+                    .with_detail(json!({ "summary": signals.corrections })),
+            );
+            pushed += 1;
+        }
+        if !signals.feedback.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "feedback")
+                    .with_detail(json!({ "summary": signals.feedback })),
+            );
+            pushed += 1;
+        }
+        if !signals.beliefs.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "beliefs")
+                    .with_detail(json!({ "summary": signals.beliefs })),
+            );
+            pushed += 1;
+        }
+        if !signals.virtue_logs.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "virtue-logs")
+                    .with_detail(json!({ "summary": signals.virtue_logs })),
+            );
+            pushed += 1;
+        }
+        if !signals.reflections.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "reflections")
+                    .with_detail(json!({ "summary": signals.reflections })),
+            );
+            pushed += 1;
+        }
+        if !signals.mental_models.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "mental-models")
+                    .with_detail(json!({ "summary": signals.mental_models })),
+            );
+            pushed += 1;
+        }
+        if !signals.decisions.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "decisions")
+                    .with_detail(json!({ "summary": signals.decisions })),
+            );
+            pushed += 1;
+        }
+        if !signals.priority_items.is_empty() {
+            ctx.evidence.push(
+                Evidence::new("self-learning", "priority-items")
+                    .with_detail(json!({ "summary": signals.priority_items })),
+            );
+            pushed += 1;
+        }
+
+        if pushed > 0 {
+            tracing::info!(
+                signal_types = pushed,
+                "Self-learning signals injected as evidence"
+            );
+        }
+    }
+
+    fn push_conversation_evidence(&self, ctx: &mut InvestigationContext, session: &SessionContext) {
+        if session.conversation.is_empty() {
+            return;
+        }
+        let history: String = session
+            .conversation
+            .iter()
+            .map(|turn| format!("[{}] {}", turn.role, turn.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        ctx.evidence.push(
+            Evidence::new("conversation", "session").with_detail(json!({ "summary": history })),
+        );
+    }
+
     /// Retrieve memories from the memvid store for this session.
     ///
     /// Uses per-session scoping (D7): the session_id from SessionContext
@@ -659,17 +748,21 @@ impl ZenAgent {
             );
         }
 
+        self.push_conversation_evidence(&mut ctx, session);
+
         let memories = self
             .retrieve_memories_structured(&session_id, query)
             .or_else(|| self.retrieve_memories(&session_id));
 
-        if let Some(memories) = memories {
+        if let Some(ref memories) = memories {
             let memory_text = memories.join("\n");
             ctx.evidence.push(
                 Evidence::new("retrieved-memory", "memvid")
                     .with_detail(json!({ "summary": memory_text })),
             );
         }
+
+        self.push_self_learning_evidence(&mut ctx);
 
         ctx.signals.push(Signal::new("knowledge-query"));
 
@@ -682,7 +775,20 @@ impl ZenAgent {
             "ZenAgent::execute: skills completed"
         );
 
-        let response = self.call_llm(query, &ctx, session).await?;
+        let system_prompt = self.build_system_prompt_with_assembly(session, memories.as_deref());
+        let dynamic_context = self.build_prompt(query, &ctx);
+        let user_message = if dynamic_context.is_empty() || dynamic_context == query {
+            query.to_string()
+        } else {
+            format!(
+                "## Retrieved Context\n\n{}\n\n## Current Query\n{}",
+                dynamic_context, query
+            )
+        };
+
+        let response = self
+            .call_llm_with_assembly(query, &system_prompt, &user_message, session)
+            .await?;
 
         tracing::info!(
             response_len = response.len(),
@@ -697,10 +803,12 @@ impl ZenAgent {
 
     fn tier_score(source_skill: &str, label: &str) -> f64 {
         match (source_skill, label) {
+            ("user-input", _) => 1.00,
+            ("conversation", _) => 0.98,
             ("identity", _) => 0.95,
+            ("self-learning", _) => 0.85,
             ("retrieved-memory", _) => 0.80,
             ("knowledge", _) => 0.70,
-            ("user-input", _) => 1.00,
             _ => 0.50,
         }
     }
@@ -716,7 +824,13 @@ impl ZenAgent {
     ) -> rig_core::OneOrMany<rig_core::message::Message> {
         use rig_core::message::Message;
 
+        tracing::info!(
+            conversation_turns = session.conversation.len(),
+            "build_chat_history: building chat history"
+        );
+
         if session.conversation.is_empty() {
+            tracing::info!("build_chat_history: conversation is empty, returning single message");
             return rig_core::OneOrMany::one(Message::user(prompt));
         }
 
@@ -730,9 +844,93 @@ impl ZenAgent {
             })
             .collect();
 
+        tracing::info!(
+            history_messages = messages.len(),
+            "build_chat_history: added history messages"
+        );
+
         messages.push(Message::user(prompt));
         rig_core::OneOrMany::many(messages)
             .unwrap_or_else(|_| rig_core::OneOrMany::one(Message::user(prompt)))
+    }
+
+    fn build_system_prompt_with_assembly(
+        &self,
+        session: &SessionContext,
+        memories: Option<&[String]>,
+    ) -> String {
+        use zen_memory::PromptAssembly;
+
+        let mut builder = PromptAssembly::builder().sensitivity(session.sensitivity_policy);
+
+        if let Some(ref identity) = self.identity {
+            if !identity.soul_content.is_empty() {
+                builder = builder.intro(&identity.soul_content);
+            }
+            if !identity.agents_content.is_empty() {
+                builder = builder.claude_md(&identity.agents_content);
+            }
+        }
+
+        let mut knowledge: Vec<String> = session
+            .knowledge
+            .iter()
+            .map(|n| n.content.clone())
+            .collect();
+
+        if let Some(memories) = memories {
+            let memory_text = memories.join("\n");
+            if !memory_text.is_empty() {
+                knowledge.push(format!("## Retrieved Memories (Memvid)\n{}", memory_text));
+            }
+        }
+
+        let history: Vec<(String, String)> = session
+            .conversation
+            .iter()
+            .map(|turn| (turn.role.clone(), turn.content.clone()))
+            .collect();
+
+        builder = builder.memory_section(knowledge, history);
+        builder = builder.env_info(PromptAssembly::build_env_info(session));
+        builder = builder.blast_radius(session.sensitivity_policy);
+
+        if let Some(ref signals) = self.signals {
+            if !signals.corrections.is_empty() {
+                builder = builder.corrections(&signals.corrections);
+            }
+            if !signals.feedback.is_empty() {
+                builder = builder.feedback(&signals.feedback);
+            }
+            if !signals.beliefs.is_empty() {
+                builder = builder.beliefs(&signals.beliefs);
+            }
+            if !signals.virtue_logs.is_empty() {
+                builder = builder.virtue_logs(&signals.virtue_logs);
+            }
+            if !signals.reflections.is_empty() {
+                builder = builder.reflections(&signals.reflections);
+            }
+            if !signals.mental_models.is_empty() {
+                builder = builder.mental_models(&signals.mental_models);
+            }
+            if !signals.decisions.is_empty() {
+                builder = builder.decisions(&signals.decisions);
+            }
+            if !signals.priority_items.is_empty() {
+                builder = builder.priority_items(&signals.priority_items);
+            }
+        }
+
+        let prompt = builder.build().assemble();
+
+        tracing::info!(
+            prompt_len = prompt.len(),
+            has_cache_boundary = prompt.contains(zen_memory::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "build_system_prompt_with_assembly: assembled PromptAssembly"
+        );
+
+        prompt
     }
 
     fn build_prompt(&self, query: &str, ctx: &InvestigationContext) -> String {
@@ -747,11 +945,29 @@ impl ZenAgent {
             item.rank = rank;
         }
 
-        let config = ContextPackConfig::new(4096)
-            .with_max_items(20)
+        let config = ContextPackConfig::new(12288)
+            .with_max_items(30)
             .with_reserve_chars(query.chars().count());
 
         let pack = rig_resources::projection::pack_resource_context(items, config);
+
+        tracing::info!(
+            selected = pack.selected.len(),
+            omitted = pack.omitted.len(),
+            "Context pack: selected {} items, omitted {}",
+            pack.selected.len(),
+            pack.omitted.len()
+        );
+
+        if !pack.omitted.is_empty() {
+            for omitted in &pack.omitted {
+                tracing::debug!(
+                    source_id = %omitted.item.source_id,
+                    reason = ?omitted.reason,
+                    "Context item omitted from prompt"
+                );
+            }
+        }
 
         pack.selected
             .iter()
@@ -819,6 +1035,82 @@ impl ZenAgent {
         }
     }
 
+    #[instrument(skip(self, system_prompt, user_message, session), fields(session_id = %session.session_id, query_len = query.len()))]
+    async fn call_llm_with_assembly(
+        &self,
+        query: &str,
+        system_prompt: &str,
+        user_message: &str,
+        session: &SessionContext,
+    ) -> Result<String> {
+        use rig_core::completion::CompletionRequest;
+        use rig_core::message::Message;
+        use rig_core::OneOrMany;
+        use std::time::Instant;
+
+        let messages_in = session.conversation.len() + 1;
+        let model_name = self.completion_model.provider_name();
+        let conversation_id = session.session_id.to_string();
+        let start = Instant::now();
+
+        crate::observability::emit_prompt_started(model_name, &conversation_id, messages_in);
+
+        let mut history_messages: Vec<Message> = session
+            .conversation
+            .iter()
+            .filter_map(|turn| match turn.role.as_str() {
+                "user" => Some(Message::user(&turn.content)),
+                "assistant" => Some(Message::assistant(&turn.content)),
+                _ => None,
+            })
+            .collect();
+
+        history_messages.push(Message::user(user_message));
+
+        let chat_history = OneOrMany::many(history_messages)
+            .unwrap_or_else(|_| OneOrMany::one(Message::user(user_message)));
+
+        let request = CompletionRequest {
+            model: None,
+            preamble: Some(system_prompt.to_string()),
+            chat_history,
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(2048),
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+
+        let result = self.completion_model.completion(request).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        match result {
+            Ok(response) => {
+                crate::observability::emit_prompt_completed(
+                    model_name,
+                    &conversation_id,
+                    Some(response.usage.input_tokens),
+                    Some(response.usage.output_tokens),
+                    Some(duration_ms),
+                );
+                match response.choice.first() {
+                    rig_core::completion::AssistantContent::Text(t) => Ok(t.text.clone()),
+                    other => Ok(format!("{other:?}")),
+                }
+            }
+            Err(e) => {
+                crate::observability::emit_prompt_failed(
+                    model_name,
+                    &conversation_id,
+                    &e.to_string(),
+                );
+                Err(e.into())
+            }
+        }
+    }
+
     #[instrument(skip(self, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
     pub async fn execute_stream(
         &self,
@@ -827,6 +1119,13 @@ impl ZenAgent {
         on_token: impl FnMut(&str),
     ) -> Result<String> {
         let session_id = session.session_id.to_string();
+        let conv_len = session.conversation.len();
+        tracing::info!(
+            session_id = %session_id,
+            conversation_turns = conv_len,
+            "execute_stream: starting with PromptAssembly + rig projection merge"
+        );
+
         let mut ctx = InvestigationContext::new(&session_id, "query");
 
         ctx.evidence
@@ -847,6 +1146,8 @@ impl ZenAgent {
             );
         }
 
+        self.push_conversation_evidence(&mut ctx, session);
+
         for note in &session.knowledge {
             ctx.evidence.push(
                 Evidence::new("knowledge", "wiki")
@@ -858,7 +1159,7 @@ impl ZenAgent {
             .retrieve_memories_structured(&session_id, query)
             .or_else(|| self.retrieve_memories(&session_id));
 
-        if let Some(memories) = memories {
+        if let Some(ref memories) = memories {
             let memory_text = memories.join("\n");
             ctx.evidence.push(
                 Evidence::new("retrieved-memory", "memvid")
@@ -866,11 +1167,28 @@ impl ZenAgent {
             );
         }
 
+        self.push_self_learning_evidence(&mut ctx);
+
         ctx.signals.push(Signal::new("knowledge-query"));
 
         let _step_result = self.generic.step(&mut ctx).await?;
 
-        let response = self.call_llm_stream(query, &ctx, session, on_token).await?;
+        let system_prompt = self.build_system_prompt_with_assembly(session, memories.as_deref());
+
+        let dynamic_context = self.build_prompt(query, &ctx);
+
+        let user_message = if dynamic_context.is_empty() || dynamic_context == query {
+            query.to_string()
+        } else {
+            format!(
+                "## Retrieved Context\n\n{}\n\n## Current Query\n{}",
+                dynamic_context, query
+            )
+        };
+
+        let response = self
+            .call_llm_stream_with_assembly(query, &system_prompt, &user_message, session, on_token)
+            .await?;
 
         session.add_turn("user", query);
         session.add_turn("assistant", &response);
@@ -878,22 +1196,51 @@ impl ZenAgent {
         Ok(response)
     }
 
-    #[instrument(skip(self, ctx, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
-    async fn call_llm_stream(
+    #[instrument(skip(self, system_prompt, user_message, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
+    async fn call_llm_stream_with_assembly(
         &self,
         query: &str,
-        ctx: &InvestigationContext,
+        system_prompt: &str,
+        user_message: &str,
         session: &SessionContext,
         mut on_token: impl FnMut(&str),
     ) -> Result<String> {
         use rig_core::completion::{CompletionModel, CompletionRequest};
+        use rig_core::message::Message;
+        use rig_core::OneOrMany;
 
-        let prompt = self.build_prompt(query, ctx);
+        let model_name = self.completion_model.provider_name();
+        let conversation_id = session.session_id.to_string();
+        let messages_in = session.conversation.len() + 1;
+
+        crate::observability::emit_prompt_started(model_name, &conversation_id, messages_in);
+
+        let mut history_messages: Vec<Message> = session
+            .conversation
+            .iter()
+            .filter_map(|turn| match turn.role.as_str() {
+                "user" => Some(Message::user(&turn.content)),
+                "assistant" => Some(Message::assistant(&turn.content)),
+                _ => None,
+            })
+            .collect();
+
+        tracing::info!(
+            history_messages = history_messages.len(),
+            system_prompt_len = system_prompt.len(),
+            user_message_len = user_message.len(),
+            "call_llm_stream_with_assembly: sending request"
+        );
+
+        history_messages.push(Message::user(user_message));
+
+        let chat_history = OneOrMany::many(history_messages)
+            .unwrap_or_else(|_| OneOrMany::one(Message::user(user_message)));
 
         let request = CompletionRequest {
             model: None,
-            preamble: Some("You are a helpful Zen assistant. Answer concisely. Use proper markdown formatting with blank lines between headings, paragraphs, code blocks, and lists.".to_string()),
-            chat_history: Self::build_chat_history(&prompt, session),
+            preamble: Some(system_prompt.to_string()),
+            chat_history,
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -920,6 +1267,19 @@ impl ZenAgent {
                 }
             }
         }
+
+        crate::observability::emit_prompt_completed(
+            model_name,
+            &conversation_id,
+            None,
+            None,
+            None,
+        );
+
+        tracing::info!(
+            response_len = full_response.len(),
+            "call_llm_stream_with_assembly: response complete"
+        );
 
         Ok(full_response)
     }

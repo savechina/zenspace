@@ -734,10 +734,22 @@ impl SessionContext {
 
     /// Add a conversation turn.
     pub fn add_turn(&mut self, role: &str, content: &str) {
+        tracing::info!(
+            session_id = %self.session_id,
+            role = role,
+            content_len = content.len(),
+            conversation_turns_before = self.conversation.len(),
+            "SessionContext::add_turn: adding conversation turn"
+        );
         self.conversation.push(ConversationTurn {
             role: role.to_string(),
             content: content.to_string(),
         });
+        tracing::info!(
+            session_id = %self.session_id,
+            conversation_turns_after = self.conversation.len(),
+            "SessionContext::add_turn: turn added"
+        );
     }
 
     /// Build the full prompt for LLM submission.

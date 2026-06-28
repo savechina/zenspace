@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Once;
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio_rusqlite::Connection;
@@ -21,6 +22,18 @@ pub enum SqliteError {
 
 pub type Result<T> = std::result::Result<T, SqliteError>;
 
+static REGISTER_VEC_EXTENSION: Once = Once::new();
+
+fn register_sqlite_vec() {
+    REGISTER_VEC_EXTENSION.call_once(|| {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(
+                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
+            ));
+        }
+    });
+}
+
 async fn setup_writer(db_path: &Path) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -29,6 +42,8 @@ async fn setup_writer(db_path: &Path) -> Result<Connection> {
             ))))
         })?;
     }
+
+    register_sqlite_vec();
 
     let writer = Connection::open(db_path).await?;
     writer
@@ -75,6 +90,7 @@ pub struct SqliteClient {
 
 impl SqliteClient {
     pub async fn open(db_path: &Path) -> Result<Self> {
+        register_sqlite_vec();
         let writer = setup_writer(db_path).await?;
 
         let url = format!("sqlite://{}", db_path.display());
@@ -89,6 +105,7 @@ impl SqliteClient {
     }
 
     pub async fn open_lazy(db_path: &Path) -> Result<Self> {
+        register_sqlite_vec();
         let writer = setup_writer(db_path).await?;
 
         let url = format!("sqlite://{}", db_path.display());

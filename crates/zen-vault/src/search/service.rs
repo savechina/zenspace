@@ -52,7 +52,7 @@ impl SearchService {
             1 => Tier1Search::search(query, base_dir),
             2 => self
                 .tier2
-                .search(client, query, 20)
+                .search_in_dir(client, query, base_dir, 20)
                 .await
                 .map(|r| {
                     r.into_iter()
@@ -63,17 +63,20 @@ impl SearchService {
                         })
                         .collect()
                 }),
-            3 => self.tier3.search(client, &[], 10).await,
+            3 => {
+                let query_embedding = crate::maintenance::compute_embeddings_for_text(query)
+                    .unwrap_or_else(|_| vec![0.0; 384]);
+                self.tier3.search(client, &query_embedding, 10).await
+            }
             4 => self
                 .tier4
                 .search(client, query, 3)
                 .await
                 .map(|graphs| graphs.into_iter().map(graph_to_search).collect()),
             5 => {
-                // Get tier 2 results as context for LLM synthesis
                 let context = self
                     .tier2
-                    .search(client, query, 20)
+                    .search_in_dir(client, query, base_dir, 20)
                     .await
                     .map(|r| {
                         r.into_iter()

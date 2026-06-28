@@ -31,6 +31,20 @@ async fn test_client_open_creates_db_file() {
 }
 
 #[tokio::test]
+async fn test_sqlite_vec_extension_loaded_via_sqlx_pool() {
+    let (client, _dir) = make_client().await;
+    let pool = client.pool();
+    
+    let result: Result<(String,), _> = sqlx::query_as("SELECT vec_version()")
+        .fetch_one(pool)
+        .await;
+    
+    assert!(result.is_ok(), "sqlite-vec extension should be loaded via sqlx pool");
+    let (version,) = result.unwrap();
+    assert!(version.starts_with('v'), "vec_version should start with 'v', got: {}", version);
+}
+
+#[tokio::test]
 async fn test_client_open_lazy_creates_db_file() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("lazy.db");

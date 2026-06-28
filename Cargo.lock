@@ -10516,6 +10516,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sqlite-vec",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

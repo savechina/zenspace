@@ -828,6 +828,11 @@ Use /thinking to show/hide thinking process."#;
             Ok(p) => p,
             Err(_) => return Vec::new(),
         };
+
+        let mut results: Vec<zen_vault::search::SearchResult> = Vec::new();
+
+        results.extend(self.direct_file_lookup(&paths, query));
+
         let service = SearchService::new(self.router.clone());
         let tier = TierSelector::select_tier(query);
 
@@ -841,26 +846,32 @@ Use /thinking to show/hide thinking process."#;
         }
         let client = match self.db_client.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => {
+                let formatted: Vec<String> = results
+                    .into_iter()
+                    .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
+                    .collect();
+                return formatted;
+            }
         };
 
-        let mut results = Vec::new();
         for dir in [paths.inbox(), paths.wiki()] {
             if let Ok(r) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(service.search(query, &dir, client, Some(tier)))
+                tokio::runtime::Handle::current()
+                    .block_on(service.search(query, &dir, client, Some(tier)))
             }) {
                 results.extend(r);
             }
         }
         let mut seen = std::collections::HashSet::new();
         results.retain(|r| seen.insert(r.file.clone()));
-        results.truncate(3);
+        results.truncate(5);
         let formatted: Vec<String> = results
             .into_iter()
             .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
             .collect();
 
-        tracing::debug!(
+        tracing::info!(
             query_len = query.len(),
             tier,
             results_count = formatted.len(),
@@ -868,6 +879,75 @@ Use /thinking to show/hide thinking process."#;
         );
 
         formatted
+    }
+
+    fn direct_file_lookup(
+        &self,
+        paths: &zen_core::paths::ZenPaths,
+        query: &str,
+    ) -> Vec<zen_vault::search::SearchResult> {
+        use std::fs;
+        use zen_vault::search::SearchResult;
+
+        let query_lower = query.to_lowercase();
+        let keywords: Vec<&str> = query_lower
+            .split_whitespace()
+            .filter(|s| s.len() >= 3 && !["the", "and", "for", "with", "about", "summary", "summarize", "show", "tell", "me", "this", "that", "above"].contains(s))
+            .collect();
+
+        if keywords.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+
+        for dir in [paths.inbox(), paths.wiki()] {
+            let walker = match std::fs::read_dir(&dir) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+
+            for entry in walker.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let file_name = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(n) => n.to_lowercase(),
+                    None => continue,
+                };
+
+                let match_score = keywords
+                    .iter()
+                    .filter(|kw| file_name.contains(*kw))
+                    .count();
+
+                if match_score == 0 {
+                    continue;
+                }
+
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let body = if content.starts_with("---") {
+                        content
+                            .splitn(3, "---")
+                            .nth(2)
+                            .unwrap_or(&content)
+                            .trim_start()
+                    } else {
+                        &content
+                    };
+                    let snippet: String = body.chars().take(2000).collect();
+                    matches.push((match_score, SearchResult {
+                        file: path,
+                        line: 0,
+                        content: snippet,
+                    }));
+                }
+            }
+        }
+
+        matches.sort_by(|a, b| b.0.cmp(&a.0));
+        matches.into_iter().map(|(_, r)| r).take(2).collect()
     }
 
     fn start_llm_call_via_orchestrator(&mut self, query: &str, context: &[String]) {
@@ -895,7 +975,14 @@ Use /thinking to show/hide thinking process."#;
         };
 
         let mut session = match &self.session {
-            Some(s) => s.clone(),
+            Some(s) => {
+                tracing::info!(
+                    session_id = %s.session_id,
+                    conversation_turns = s.conversation.len(),
+                    "start_llm_call_via_orchestrator: cloning session"
+                );
+                s.clone()
+            }
             None => {
                 tracing::warn!("TUI chat: session not initialized");
                 let _ = done_tx.send((Err("Session not initialized".to_string()), None));
@@ -1065,6 +1152,11 @@ Use /thinking to show/hide thinking process."#;
                     match done_result {
                         (Ok(response), returned_session) => {
                             if let Some(s) = returned_session {
+                                tracing::info!(
+                                    session_id = %s.session_id,
+                                    conversation_turns = s.conversation.len(),
+                                    "poll_llm_response: updating session from returned session"
+                                );
                                 self.session = Some(s);
                             }
                             completed_indices.push(idx);
@@ -1439,6 +1531,9 @@ Use /thinking to show/hide thinking process."#;
                     self.conversation_store =
                         ConversationStore::with_dir(date_dir, &session.id).ok();
                 }
+                if let Some(ref mut ctx) = self.session {
+                    ctx.session_id = session.id.parse().unwrap_or_else(|_| ctx.session_id);
+                }
                 tracing::info!(
                     session_id = %session.id,
                     "auto-created session on first message"
@@ -1507,6 +1602,7 @@ Use /thinking to show/hide thinking process."#;
                     self.conversation_store =
                         ConversationStore::with_dir(date_dir, &session.id).ok();
                 }
+                self.session = Some(SessionContext::new(session.agent_name, String::new()));
                 self.output.clear();
                 self.chat_history.clear();
                 self.push_output(format!("New session started: {}", session.id), false);
@@ -1544,6 +1640,7 @@ Use /thinking to show/hide thinking process."#;
                             ConversationStore::with_dir(date_dir, &forked.id).ok();
                     }
                 }
+                self.session = Some(SessionContext::new(forked.agent_name, String::new()));
                 self.output.clear();
                 self.chat_history.clear();
                 self.push_output(
@@ -1618,6 +1715,8 @@ Use /thinking to show/hide thinking process."#;
                 }
                 self.output.clear();
                 self.chat_history.clear();
+                let mut session_ctx = SessionContext::new(session.agent_name.clone(), String::new());
+                
                 if let Some(store) = &self.conversation_store
                     && let Ok(entries) = store.load()
                 {
@@ -1626,13 +1725,17 @@ Use /thinking to show/hide thinking process."#;
                         if entries[i].0 == "user" {
                             let user_content = entries[i].1.clone();
                             self.push_output(format!("You: {}", user_content), false);
+                            session_ctx.add_turn("user", &user_content);
+                            
                             if i + 1 < entries.len() && entries[i + 1].0 == "assistant" {
                                 let raw_assistant = entries[i + 1].1.clone();
                                 let normalized = normalize_compact_markdown(&raw_assistant);
                                 self.output.push(OutputCell::Markdown(MarkdownCell::new(
                                     normalized.clone(),
                                 )));
-                                self.chat_history.push((user_content, normalized));
+                                self.chat_history.push((user_content.clone(), normalized.clone()));
+                                session_ctx.add_turn("assistant", &normalized);
+                                
                                 i += 2;
                             } else {
                                 i += 1;
@@ -1642,6 +1745,9 @@ Use /thinking to show/hide thinking process."#;
                         }
                     }
                 }
+                
+                self.session = Some(session_ctx);
+                
                 let title = session.title.as_deref().unwrap_or("(untitled)");
                 self.push_output(
                     format!("Resumed session: {} ({})", session.id, title),

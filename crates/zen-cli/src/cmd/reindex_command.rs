@@ -5,6 +5,7 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
+use zen_repo::SqliteClient;
 use zen_vault::maintenance::Reindexer;
 
 #[derive(Subcommand)]
@@ -20,15 +21,13 @@ pub enum ReindexCommands {
     },
 }
 
-pub fn execute_command(cmd: &ReindexCommands) -> Result<(), ZenError> {
+pub async fn execute_command(cmd: &ReindexCommands) -> Result<(), ZenError> {
     match cmd {
         ReindexCommands::Run { path, dry_run } => {
+            let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
             let knowledge_dir = match path {
                 Some(p) => p.clone(),
-                None => {
-                    let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-                    paths.vault()
-                }
+                None => paths.vault(),
             };
 
             if *dry_run {
@@ -41,11 +40,17 @@ pub fn execute_command(cmd: &ReindexCommands) -> Result<(), ZenError> {
 
             debug!("reindex: path={}", knowledge_dir.display());
 
-            let reindexer = Reindexer::new();
+            let db_path = paths.db().join("state.db");
+            let db_client = SqliteClient::open_lazy(&db_path)
+                .await
+                .map_err(|e| ZenError::Message(format!("Failed to open database: {e}")))?;
+
+            let reindexer = Reindexer::with_client(db_client);
             println!("Scanning {}...", knowledge_dir.display());
 
             let report = reindexer
                 .reindex(&knowledge_dir)
+                .await
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 
             println!(

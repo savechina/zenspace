@@ -62,7 +62,7 @@ pub use memvid::{
 pub use memvid_index::{MemvidIndexReport, MemvidIndexer};
 pub use mental_model::MentalModelSignal;
 pub use okr::{CommitmentOkr, compute_commitment_completion_rate};
-pub use prompt::PromptAssembly;
+pub use prompt::{PromptAssembly, SYSTEM_PROMPT_DYNAMIC_BOUNDARY};
 pub use quality_gate::{
     Bias, DECISION_PRINCIPLES, DecisionPrincipleReport, DecisionPromotionReport,
     EXTRACTION_GUARDRAILS, InformationQualityGate, check_decision_principles,

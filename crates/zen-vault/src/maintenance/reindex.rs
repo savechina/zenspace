@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use tracing::{info, warn};
 use walkdir::WalkDir;
+use zen_repo::{IndexNoteRequest, NotesRepo, SqliteClient};
 
 use super::checksum;
 use crate::note;
@@ -30,19 +31,32 @@ pub struct ReindexReport {
 ///
 /// The reindexer walks `knowledge_dir` for all `.md` files, computes
 /// SHA-256 checksums, and decides whether each note needs to be
-/// re-indexed.  FTS5 and SQLite index updates are stubbed with
-/// `tracing::info` as per the spec.
-#[derive(Default)]
+/// re-indexed. Files are indexed into the FTS5 `notes_fts` table via
+/// `NotesRepo::index_note()`.
 pub struct Reindexer {
-    /// Map of file path → stored checksum (populated by callers that
-    /// maintain a `notes_metadata` table).
     known_checksums: HashMap<String, String>,
+    db_client: Option<SqliteClient>,
+}
+
+impl Default for Reindexer {
+    fn default() -> Self {
+        Reindexer {
+            known_checksums: HashMap::new(),
+            db_client: None,
+        }
+    }
 }
 
 impl Reindexer {
     pub fn new() -> Self {
+        Reindexer::default()
+    }
+
+    /// Create a reindexer with a database client for actual FTS5 indexing.
+    pub fn with_client(db_client: SqliteClient) -> Self {
         Reindexer {
             known_checksums: HashMap::new(),
+            db_client: Some(db_client),
         }
     }
 
@@ -56,7 +70,7 @@ impl Reindexer {
 
     /// Walk `knowledge_dir` for `.md` files, decide which need reindexing,
     /// and return a [`ReindexReport`].
-    pub fn reindex(&self, knowledge_dir: &Path) -> Result<ReindexReport> {
+    pub async fn reindex(&self, knowledge_dir: &Path) -> Result<ReindexReport> {
         let mut report = ReindexReport::default();
 
         if !knowledge_dir.is_dir() {
@@ -112,7 +126,7 @@ impl Reindexer {
             }
 
             // Process: parse frontmatter, update index (stub), update checksum.
-            match self.process_file(file_path, &current_checksum) {
+            match self.process_file(file_path, &current_checksum).await {
                 Ok(()) => {
                     info!("Reindexed: {}", file_display);
                     report.files_updated += 1;
@@ -139,43 +153,63 @@ impl Reindexer {
         Ok(report)
     }
 
-    /// Process a single file: parse frontmatter, update index stub, log.
-    fn process_file(&self, file_path: &Path, checksum: &str) -> Result<()> {
-        // Read content (the "transaction" boundary is this function).
+    /// Process a single file: parse frontmatter, index into FTS5, update checksum.
+    async fn process_file(&self, file_path: &Path, checksum: &str) -> Result<()> {
         let content = fs::read_to_string(file_path)?;
+        let file_display = file_path.display().to_string();
+        let file_name = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled")
+            .to_string();
 
-        // Parse frontmatter stub (may fail for files without YAML headers).
-        match note::parse_frontmatter(&content) {
+        let (note_id, body_content, tags) = match note::parse_frontmatter(&content) {
             Ok(parsed_note) => {
-                info!(
-                    "Parsed note: id={} tags={} domain={:?}",
-                    parsed_note.id,
-                    parsed_note.tags.len(),
-                    parsed_note.domain
-                );
+                let tags_str = parsed_note.tags.join(",");
+                (parsed_note.id, parsed_note.content, tags_str)
             }
             Err(e) => {
                 warn!(
                     "Frontmatter parse failed for {}: {} — indexing as raw",
-                    file_path.display(),
-                    e
+                    file_display, e
                 );
+                let id = format!("auto-{}", file_name);
+                (id, content.clone(), String::new())
             }
+        };
+
+        let title = file_name.clone();
+        let source = if file_display.contains("/wiki/") {
+            "wiki"
+        } else if file_display.contains("/inbox/") {
+            "inbox"
+        } else {
+            "vault"
+        };
+
+        if let Some(client) = &self.db_client {
+            NotesRepo::new(client)
+                .index_note(IndexNoteRequest {
+                    id: &note_id,
+                    title: &title,
+                    content: &body_content,
+                    tags: &tags,
+                    file_path: &file_display,
+                    source,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("FTS5 index failed for {}: {}", file_display, e))?;
+
+            info!(
+                "FTS5 indexed: file={} id={} title={} source={}",
+                file_display, note_id, title, source
+            );
+        } else {
+            info!(
+                "FTS5 index skipped (no db client): file={} checksum={:.8}…",
+                file_display, checksum
+            );
         }
-
-        // FTS5 index update stub.
-        info!(
-            "FTS5 update stub: indexing file={} checksum={:.8}…",
-            file_path.display(),
-            checksum
-        );
-
-        // notes_metadata checksum update stub.
-        info!(
-            "Metadata update stub: storing checksum={:.8}… for file={}",
-            checksum,
-            file_path.display()
-        );
 
         Ok(())
     }
@@ -188,7 +222,7 @@ impl Reindexer {
 ///
 /// This is a convenience wrapper around [`Reindexer`] that assumes no
 /// prior checksums are known (first run or full reindex).
-pub fn reindex_all(knowledge_dir: &Path) -> Result<ReindexReport> {
+pub async fn reindex_all(knowledge_dir: &Path) -> Result<ReindexReport> {
     let reindexer = Reindexer::new();
-    reindexer.reindex(knowledge_dir)
+    reindexer.reindex(knowledge_dir).await
 }
