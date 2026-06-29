@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tui_textarea::TextArea;
 use zen_agents::AgentOrchestrator;
+use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::paths::ZenPaths;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
