@@ -40,14 +40,30 @@ pub struct EntityRow {
     pub entity_type: String,
     pub created_at: String,
     pub domain: Option<String>,
-    pub aliases: Option<String>,
     pub last_updated: Option<String>,
+    pub description: String,
+    pub properties: String,
+    pub access_count: i64,
+    pub last_accessed_at: Option<String>,
+    pub confidence: f64,
+    pub source: String,
+    pub promoted_at: Option<String>,
 }
 
 #[derive(FromRow)]
 pub struct RelationshipRow {
+    pub id: String,
+    pub source_entity_id: String,
     pub target_entity_id: String,
     pub relation_type: String,
+    pub confidence: f64,
+    pub source_note_ids: Option<String>,
+    pub created_at: String,
+    pub description: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub recorded_at: Option<String>,
+    pub weight: f64,
 }
 
 #[derive(FromRow)]
@@ -56,6 +72,8 @@ pub struct GraphSearchResult {
     pub depth: u32,
     pub relation: String,
     pub target: String,
+    pub source_entity: String,
+    pub direction: String,
 }
 
 #[derive(FromRow, Clone)]
@@ -116,6 +134,10 @@ pub struct InsertRelationshipRequest<'a> {
     pub confidence: f64,
     pub source_note_ids: Option<&'a str>,
     pub created_at: &'a str,
+    pub description: Option<&'a str>,
+    pub valid_from: Option<&'a str>,
+    pub valid_until: Option<&'a str>,
+    pub weight: Option<f64>,
 }
 
 pub struct UpsertGoalNodeRequest<'a> {

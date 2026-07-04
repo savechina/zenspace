@@ -446,15 +446,7 @@ async fn test_entities_insert_relationship_and_load() {
         .await
         .unwrap();
 
-    repo.insert_relationship(&InsertRelationshipRequest {
-        id: "r1",
-        source_id: "e1",
-        target_id: "e2",
-        rel_type: "depends_on",
-        confidence: 0.95,
-        source_note_ids: Some("note-1"),
-        created_at: "2024-01-01T00:00:00Z",
-    })
+    repo.insert_relationship(&InsertRelationshipRequest { id: "r1", source_id: "e1", target_id: "e2", rel_type: "depends_on", confidence: 0.95, source_note_ids: Some("note-1"), created_at: "2024-01-01T00:00:00Z", description: None, valid_from: None, valid_until: None, weight: None })
     .await
     .unwrap();
 
@@ -476,15 +468,7 @@ async fn test_entities_insert_relationship_without_source_notes() {
         .await
         .unwrap();
 
-    repo.insert_relationship(&InsertRelationshipRequest {
-        id: "r1",
-        source_id: "e1",
-        target_id: "e2",
-        rel_type: "links",
-        confidence: 1.0,
-        source_note_ids: None,
-        created_at: "2024-01-01T00:00:00Z",
-    })
+    repo.insert_relationship(&InsertRelationshipRequest { id: "r1", source_id: "e1", target_id: "e2", rel_type: "links", confidence: 1.0, source_note_ids: None, created_at: "2024-01-01T00:00:00Z", description: None, valid_from: None, valid_until: None, weight: None })
     .await
     .unwrap();
 
@@ -645,15 +629,7 @@ async fn test_entities_bfs_search_chain_a_b_c_d() {
     }
     let now = "2024-01-01T00:00:00Z";
     for (rid, src, tgt) in &[("r1", "a", "b"), ("r2", "b", "c"), ("r3", "c", "d")] {
-        repo.insert_relationship(&InsertRelationshipRequest {
-            id: rid,
-            source_id: src,
-            target_id: tgt,
-            rel_type: "next",
-            confidence: 1.0,
-            source_note_ids: None,
-            created_at: now,
-        })
+        repo.insert_relationship(&InsertRelationshipRequest { id: rid, source_id: src, target_id: tgt, rel_type: "next", confidence: 1.0, source_note_ids: None, created_at: now, description: None, valid_from: None, valid_until: None, weight: None })
         .await
         .unwrap();
     }
@@ -702,15 +678,7 @@ async fn test_entities_bfs_search_diamond_graph() {
         ("r3", "b", "d", "converge"),
         ("r4", "c", "d", "converge"),
     ] {
-        repo.insert_relationship(&InsertRelationshipRequest {
-            id: rid,
-            source_id: src,
-            target_id: tgt,
-            rel_type: rt,
-            confidence: 1.0,
-            source_note_ids: None,
-            created_at: now,
-        })
+        repo.insert_relationship(&InsertRelationshipRequest { id: rid, source_id: src, target_id: tgt, rel_type: rt, confidence: 1.0, source_note_ids: None, created_at: now, description: None, valid_from: None, valid_until: None, weight: None })
         .await
         .unwrap();
     }

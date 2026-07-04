@@ -52,27 +52,6 @@ fn parse_entity_type(s: &str) -> EntityType {
     }
 }
 
-/// Parse the `aliases` TEXT column from graph.db into a `Vec<String>`.
-/// Accepts JSON array format `["a","b"]` or comma-separated `"a, b"`.
-/// Returns an empty vec for NULL or empty input.
-fn parse_aliases_column(raw: Option<&str>) -> Vec<String> {
-    let raw = match raw {
-        Some(s) if !s.is_empty() => s,
-        _ => return Vec::new(),
-    };
-
-    // Try JSON array first
-    if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
-        return arr;
-    }
-
-    // Fall back to comma-separated
-    raw.split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 /// Convert a `RelationshipRow` string to a `RelationType` enum.
 fn relation_type_from_str(s: &str) -> RelationType {
     match s {
@@ -110,14 +89,13 @@ fn entity_row_to_entity(row: zen_repo::types::EntityRow) -> Entity {
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or(created_at);
-    let aliases = parse_aliases_column(row.aliases.as_deref());
 
     let mut entity = Entity::new(row.name, entity_type, "graph-db");
     entity.id = row.id;
     entity.created_at = created_at;
     entity.last_updated = last_updated;
     entity.domain = row.domain;
-    entity.aliases = aliases;
+    entity.description = row.description;
     entity
 }
 
@@ -318,12 +296,15 @@ impl EntityService {
         }
 
         // No alias match — insert the entity with normalized name
-        repo.upsert_entity(
+        repo.upsert_entity_with(
             &entity.id,
             &canonical_name,
             &type_str,
             &created_at,
             &last_updated,
+            &entity.description,
+            &entity.source_note_id,
+            0.5,
         )
         .await?;
 
@@ -348,6 +329,10 @@ impl EntityService {
                 confidence: 0.8,
                 source_note_ids: Some(&rel.source_note_id),
                 created_at: &created,
+                description: Some(&rel.description),
+                valid_from: None,
+                valid_until: None,
+                weight: None,
             })
             .await?;
         Ok(())

@@ -12,6 +12,8 @@ pub struct GraphResult {
     pub depth: u32,
     pub relation: String,
     pub target: String,
+    pub source_entity: String,
+    pub direction: String,
 }
 
 impl From<GraphSearchResult> for GraphResult {
@@ -21,6 +23,8 @@ impl From<GraphSearchResult> for GraphResult {
             depth: r.depth,
             relation: r.relation,
             target: r.target,
+            source_entity: r.source_entity,
+            direction: r.direction,
         }
     }
 }
@@ -94,6 +98,10 @@ impl Tier4Search {
             confidence,
             source_note_ids,
             created_at,
+            description: None,
+            valid_from: None,
+            valid_until: None,
+            weight: None,
         };
         EntitiesRepo::new(client).insert_relationship(&req).await?;
         Ok(())
@@ -142,6 +150,8 @@ impl ZenTool for Tier4Search {
                     "depth": r.depth,
                     "relation": r.relation,
                     "target": r.target,
+                    "source_entity": r.source_entity,
+                    "direction": r.direction,
                 })
             })
             .collect();
