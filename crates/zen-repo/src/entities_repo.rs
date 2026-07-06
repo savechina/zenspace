@@ -1,7 +1,12 @@
+use std::collections::{HashMap, HashSet};
+
 use sqlx::Row;
 
 use crate::client::{Result, SqliteClient, SqliteError};
-use crate::types::{EntityRow, GraphSearchResult, InsertRelationshipRequest, RelationshipRow};
+use crate::types::{
+    ComponentResult, EntityRow, GraphSearchResult, InsertRelationshipRequest, PageRankResult,
+    RelationshipRow, ShortestPathResult,
+};
 
 pub fn normalize_alias(raw: &str) -> String {
     let mut s = raw.trim().to_lowercase();
@@ -436,5 +441,309 @@ impl<'a> EntitiesRepo<'a> {
             .collect();
 
         Ok(results)
+    }
+
+    pub async fn shortest_paths_all(
+        &self,
+        entity_name: &str,
+        max_depth: u32,
+    ) -> Result<Vec<ShortestPathResult>> {
+        if entity_name.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            "WITH RECURSIVE \
+             edge_set(from_id, to_id, weight) AS ( \
+                 SELECT source_entity_id, target_entity_id, weight \
+                 FROM relationships WHERE (valid_until IS NULL OR valid_until = '') \
+                 UNION ALL \
+                 SELECT target_entity_id, source_entity_id, weight \
+                 FROM relationships WHERE (valid_until IS NULL OR valid_until = '') \
+             ), \
+             walker(id, name, total_weight, depth, path_names, path_ids) AS ( \
+                 SELECT id, name, 0.0, 0, name, ',' || id || ',' \
+                 FROM entities WHERE name = ?1 \
+                 UNION ALL \
+                 SELECT e.id, e.name, w.total_weight + edge.weight, w.depth + 1, \
+                        w.path_names || ' -> ' || e.name, w.path_ids || e.id || ',' \
+                 FROM walker w \
+                 JOIN edge_set edge ON edge.from_id = w.id \
+                 JOIN entities e ON e.id = edge.to_id \
+                 WHERE w.depth < ?2 \
+                   AND instr(w.path_ids, ',' || e.id || ',') = 0 \
+             ) \
+             SELECT pe.name as entity, \
+                    pe.total_weight as distance, \
+                    pe.depth as depth, \
+                    pe.path_names as path \
+             FROM walker pe \
+             WHERE pe.depth > 0 AND pe.total_weight = ( \
+                 SELECT MIN(pe2.total_weight) FROM walker pe2 WHERE pe2.name = pe.name \
+             ) \
+             ORDER BY pe.total_weight, pe.name",
+        )
+        .bind(entity_name)
+        .bind(max_depth)
+        .fetch_all(self.client.pool())
+        .await?;
+
+        let results = rows
+            .into_iter()
+            .map(|row| ShortestPathResult {
+                entity: row.get::<String, _>("entity"),
+                distance: row.get::<f64, _>("distance"),
+                depth: row.get::<i64, _>("depth") as u32,
+                path: row.get::<String, _>("path"),
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    pub async fn shortest_path(
+        &self,
+        src_name: &str,
+        dst_name: &str,
+        max_depth: u32,
+    ) -> Result<Option<ShortestPathResult>> {
+        let all = self.shortest_paths_all(src_name, max_depth).await?;
+        Ok(all.into_iter().find(|r| r.entity == dst_name))
+    }
+
+    pub async fn pagerank(
+        &self,
+        iterations: usize,
+        damping: f64,
+    ) -> Result<Vec<PageRankResult>> {
+        let entity_rows = sqlx::query("SELECT id, name FROM entities ORDER BY name")
+            .fetch_all(self.client.pool())
+            .await?;
+
+        let entities: Vec<(String, String)> = entity_rows
+            .iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .collect();
+
+        let n = entities.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let edge_rows = sqlx::query(
+            "SELECT source_entity_id, target_entity_id FROM relationships \
+             WHERE valid_until IS NULL OR valid_until = ''",
+        )
+        .fetch_all(self.client.pool())
+        .await?;
+
+        let edges: Vec<(String, String)> = edge_rows
+            .iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .collect();
+
+        let id_to_idx: HashMap<String, usize> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.clone(), i))
+            .collect();
+
+        let name_by_idx: Vec<String> = entities.iter().map(|(_, name)| name.clone()).collect();
+
+        let mut out_degree = vec![0usize; n];
+        let mut inbound: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        for (src, tgt) in &edges {
+            if let (Some(&src_idx), Some(&tgt_idx)) =
+                (id_to_idx.get(src), id_to_idx.get(tgt))
+            {
+                out_degree[src_idx] += 1;
+                inbound[tgt_idx].push(src_idx);
+            }
+        }
+
+        let n_f64 = n as f64;
+        let mut pr = vec![1.0 / n_f64; n];
+
+        for _ in 0..iterations {
+            let dangling_sum: f64 = pr
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| out_degree[*i] == 0)
+                .map(|(_, &score)| score)
+                .sum();
+            let dangling_share = damping * dangling_sum / n_f64;
+
+            let mut new_pr = vec![(1.0 - damping) / n_f64 + dangling_share; n];
+
+            for i in 0..n {
+                for &src_idx in &inbound[i] {
+                    if out_degree[src_idx] > 0 {
+                        new_pr[i] += damping * pr[src_idx] / out_degree[src_idx] as f64;
+                    }
+                }
+            }
+
+            pr = new_pr;
+        }
+
+        let mut results: Vec<PageRankResult> = pr
+            .iter()
+            .enumerate()
+            .map(|(i, &score)| PageRankResult {
+                entity: name_by_idx[i].clone(),
+                score,
+            })
+            .collect();
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(results)
+    }
+
+    pub async fn connected_components(&self) -> Result<Vec<ComponentResult>> {
+        let entity_rows = sqlx::query("SELECT id, name FROM entities ORDER BY name")
+            .fetch_all(self.client.pool())
+            .await?;
+
+        let entities: Vec<(String, String)> = entity_rows
+            .iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .collect();
+
+        let n = entities.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let edge_rows = sqlx::query(
+            "SELECT source_entity_id, target_entity_id FROM relationships \
+             WHERE valid_until IS NULL OR valid_until = ''",
+        )
+        .fetch_all(self.client.pool())
+        .await?;
+
+        let id_to_idx: HashMap<String, usize> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.clone(), i))
+            .collect();
+
+        let mut adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for row in &edge_rows {
+            let src = row.get::<String, _>(0);
+            let tgt = row.get::<String, _>(1);
+            if let (Some(&s), Some(&t)) = (id_to_idx.get(&src), id_to_idx.get(&tgt)) {
+                adj[s].insert(t);
+                adj[t].insert(s);
+            }
+        }
+
+        let mut component_id = vec![-1i64; n];
+        let mut component_sizes: HashMap<i64, i64> = HashMap::new();
+        let mut current_component = 0i64;
+
+        for start in 0..n {
+            if component_id[start] != -1 {
+                continue;
+            }
+
+            let mut queue = vec![start];
+            let mut visited = HashSet::new();
+            visited.insert(start);
+            component_id[start] = current_component;
+
+            while let Some(node) = queue.pop() {
+                for &neighbor in &adj[node] {
+                    if !visited.contains(&neighbor) {
+                        visited.insert(neighbor);
+                        component_id[neighbor] = current_component;
+                        queue.push(neighbor);
+                    }
+                }
+            }
+
+            let size = visited.len() as i64;
+            component_sizes.insert(current_component, size);
+
+            current_component += 1;
+        }
+
+        let results = entities
+            .iter()
+            .enumerate()
+            .map(|(i, (_, name))| ComponentResult {
+                entity: name.clone(),
+                component_id: component_id[i],
+                component_size: component_sizes[&component_id[i]],
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    pub async fn apply_confidence_decay(&self, half_life_days: f64) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT id, confidence, COALESCE(last_accessed_at, created_at) as ref_date \
+             FROM entities WHERE confidence > 0.0",
+        )
+        .fetch_all(self.client.pool())
+        .await?;
+
+        let now = chrono::Utc::now();
+        let mut count = 0usize;
+
+        for row in &rows {
+            let id: String = row.get(0);
+            let confidence: f64 = row.get(1);
+            let ref_date_str: String = row.get(2);
+
+            let days = chrono::DateTime::parse_from_rfc3339(&ref_date_str)
+                .map(|dt| {
+                    let dt_utc = dt.with_timezone(&chrono::Utc);
+                    ((now - dt_utc).num_milliseconds() as f64 / 86_400_000.0).max(0.0)
+                })
+                .unwrap_or(0.0);
+
+            let decay_factor = 0.5_f64.powf(days / half_life_days);
+            let new_confidence = (confidence * decay_factor).max(0.01);
+
+            if (new_confidence - confidence).abs() > 0.001 {
+                self.update_entity_confidence(&id, new_confidence).await?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    pub async fn auto_promote_entities(&self, access_threshold: i64) -> Result<usize> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let threshold = access_threshold;
+
+        self.client
+            .writer()
+            .call(move |conn| {
+                let rows = conn.execute(
+                    "UPDATE entities \
+                     SET promoted_at = ?1, confidence = MAX(confidence, 0.8) \
+                     WHERE access_count >= ?2 AND promoted_at IS NULL",
+                    rusqlite::params![now, threshold],
+                )?;
+                Ok(rows)
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)
+    }
+
+    pub async fn compute_importance(
+        &self,
+        iterations: usize,
+        damping: f64,
+    ) -> Result<Vec<PageRankResult>> {
+        self.pagerank(iterations, damping).await
     }
 }

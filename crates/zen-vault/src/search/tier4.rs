@@ -4,7 +4,8 @@ use tracing::debug;
 
 use crate::tools::{ZenTool, ZenToolError, ZenToolResult, args_schema_entity, result_schema_array};
 use zen_repo::{
-    EntitiesRepo, GraphSearchResult, InsertRelationshipRequest, SqliteClient,
+    ComponentResult, EntitiesRepo, GraphSearchResult, InsertRelationshipRequest,
+    PageRankResult, ShortestPathResult, SqliteClient,
 };
 
 pub struct GraphResult {
@@ -105,6 +106,41 @@ impl Tier4Search {
         };
         EntitiesRepo::new(client).insert_relationship(&req).await?;
         Ok(())
+    }
+
+    pub async fn shortest_path(
+        &self,
+        client: &SqliteClient,
+        src_name: &str,
+        dst_name: &str,
+        max_depth: u32,
+    ) -> Result<Option<ShortestPathResult>> {
+        EntitiesRepo::new(client)
+            .shortest_path(src_name, dst_name, max_depth)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn pagerank(
+        &self,
+        client: &SqliteClient,
+        iterations: usize,
+        damping: f64,
+    ) -> Result<Vec<PageRankResult>> {
+        EntitiesRepo::new(client)
+            .pagerank(iterations, damping)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn connected_components(
+        &self,
+        client: &SqliteClient,
+    ) -> Result<Vec<ComponentResult>> {
+        EntitiesRepo::new(client)
+            .connected_components()
+            .await
+            .map_err(Into::into)
     }
 }
 

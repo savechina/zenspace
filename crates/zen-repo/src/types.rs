@@ -76,6 +76,27 @@ pub struct GraphSearchResult {
     pub direction: String,
 }
 
+#[derive(FromRow, Debug, Clone)]
+pub struct ShortestPathResult {
+    pub entity: String,
+    pub distance: f64,
+    pub depth: u32,
+    pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PageRankResult {
+    pub entity: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComponentResult {
+    pub entity: String,
+    pub component_id: i64,
+    pub component_size: i64,
+}
+
 #[derive(FromRow, Clone)]
 pub struct SelfNodeRow {
     pub id: String,

@@ -163,6 +163,18 @@ impl ZenWorker for WikiCompilerWorker {
             entity_data_list.push(Self::build_entity_data(&svc, &client, entity).await);
         }
 
+        let scores = zen_repo::EntitiesRepo::new(&client)
+            .compute_importance(40, 0.85)
+            .await
+            .unwrap_or_default();
+        let score_map: std::collections::HashMap<String, f64> =
+            scores.iter().map(|s| (s.entity.clone(), s.score)).collect();
+        entity_data_list.sort_by(|a, b| {
+            let sa = score_map.get(&a.entity.name).copied().unwrap_or(0.0);
+            let sb = score_map.get(&b.entity.name).copied().unwrap_or(0.0);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         let pages_written =
             match WikiCompiler::new().compile_from_entities(&entity_data_list, &wiki_dir) {
                 Ok(n) => {

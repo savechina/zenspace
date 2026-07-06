@@ -103,22 +103,35 @@ impl ZenDream {
             info!("MEMORY.md updated with {} new fact(s)", facts.len());
         }
 
+        let logs_compressed = compress_old_logs(zen_paths)?;
+        let entities_recomputed = recompute_entities(zen_paths).await?;
+
+        let (entities_decayed, entities_promoted, top_entities) =
+            run_graph_maintenance(zen_paths).await;
+
         let report = DreamReport {
             date,
             facts_extracted: facts.len(),
             memory_updated,
-            logs_compressed: compress_old_logs(zen_paths)?,
-            entities_recomputed: recompute_entities(zen_paths).await?,
-            knowledge_updated: false, // Phase B: moved to WikiCompilerWorker
-            wiki_pages_created: 0,    // Phase B: moved to WikiCompilerWorker
+            knowledge_updated: false,
+            wiki_pages_created: 0,
+            logs_compressed,
+            entities_recomputed,
+            entities_decayed,
+            entities_promoted,
+            top_entities,
         };
 
         info!(
-            "dream cycle complete: facts={}, memory_updated={}, logs_compressed={}, entities_recomputed={}",
+            "dream cycle complete: facts={}, memory_updated={}, logs_compressed={}, entities_recomputed={}, decayed={}, promoted={}, top={} {:?}",
             report.facts_extracted,
             report.memory_updated,
             report.logs_compressed,
-            report.entities_recomputed
+            report.entities_recomputed,
+            report.entities_decayed,
+            report.entities_promoted,
+            report.top_entities.len(),
+            report.top_entities,
         );
 
         Ok(report)
@@ -181,6 +194,9 @@ pub struct DreamReport {
     pub wiki_pages_created: usize,
     pub logs_compressed: bool,
     pub entities_recomputed: usize,
+    pub entities_decayed: usize,
+    pub entities_promoted: usize,
+    pub top_entities: Vec<String>,
 }
 
 impl DreamReport {
@@ -193,6 +209,9 @@ impl DreamReport {
             wiki_pages_created: 0,
             logs_compressed: false,
             entities_recomputed: 0,
+            entities_decayed: 0,
+            entities_promoted: 0,
+            top_entities: Vec::new(),
         }
     }
 }
@@ -614,6 +633,53 @@ async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
 
     info!(upserted, "recompute_entities: complete");
     Ok(upserted)
+}
+
+async fn run_graph_maintenance(zen_paths: &ZenPaths) -> (usize, usize, Vec<String>) {
+    let state_db = zen_paths.db().join("state.db");
+    if !state_db.exists() {
+        return (0, 0, Vec::new());
+    }
+
+    let client = match zen_repo::SqliteClient::open(&state_db).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "run_graph_maintenance: failed to open state.db");
+            return (0, 0, Vec::new());
+        }
+    };
+
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    let decayed = repo.apply_confidence_decay(30.0).await.unwrap_or_else(|e| {
+        warn!(error = %e, "run_graph_maintenance: confidence decay failed");
+        0
+    });
+    debug!(decayed, "run_graph_maintenance: applied confidence decay (30-day half-life)");
+
+    let promoted = repo.auto_promote_entities(3).await.unwrap_or_else(|e| {
+        warn!(error = %e, "run_graph_maintenance: auto-promote failed");
+        0
+    });
+    debug!(promoted, "run_graph_maintenance: auto-promoted entities (access_count >= 3)");
+
+    let top_entities = repo
+        .compute_importance(40, 0.85)
+        .await
+        .map(|scores| {
+            scores
+                .iter()
+                .take(5)
+                .map(|s| s.entity.clone())
+                .collect()
+        })
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "run_graph_maintenance: PageRank computation failed");
+            Vec::new()
+        });
+    debug!(top = top_entities.len(), "run_graph_maintenance: computed PageRank importance");
+
+    (decayed, promoted, top_entities)
 }
 
 fn parse_entity_file(

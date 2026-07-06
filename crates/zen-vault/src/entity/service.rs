@@ -358,6 +358,18 @@ impl EntityService {
         Ok(rows.into_iter().map(entity_row_to_entity).collect())
     }
 
+    pub async fn run_graph_maintenance(
+        &self,
+        client: &SqliteClient,
+    ) -> Result<(usize, usize, Vec<String>)> {
+        let repo = EntitiesRepo::new(client);
+        let decayed = repo.apply_confidence_decay(30.0).await?;
+        let promoted = repo.auto_promote_entities(3).await?;
+        let scores = repo.compute_importance(40, 0.85).await?;
+        let top = scores.iter().take(5).map(|s| s.entity.clone()).collect();
+        Ok((decayed, promoted, top))
+    }
+
     /// Load entities that have been updated since the given timestamp.
     /// Used by incremental wiki compilation.
     pub async fn load_entities_updated_since(
