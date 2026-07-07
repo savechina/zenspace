@@ -612,7 +612,9 @@ impl App {
             self.command_history.remove(0);
         }
         self.history_position = None;
-        let _ = self.history_store.append(cmd, self.session_id.as_deref());
+        if let Err(e) = self.history_store.append(cmd, self.session_id.as_deref()) {
+            tracing::warn!(error = %e, "failed to append command to history store");
+        }
     }
 
     pub fn history_up(&mut self) {
@@ -1173,8 +1175,12 @@ Use /thinking to show/hide thinking process."#;
                             }
                             self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {
-                                let _ = store.append("user", &_query);
-                                let _ = store.append("assistant", &response);
+                                if let Err(e) = store.append("user", &_query) {
+                                    tracing::warn!(error = %e, "failed to persist user turn to conversation store");
+                                }
+                                if let Err(e) = store.append("assistant", &response) {
+                                    tracing::warn!(error = %e, "failed to persist assistant turn to conversation store");
+                                }
                             }
                         }
                         (Err(e), _) => {
@@ -1524,7 +1530,9 @@ Use /thinking to show/hide thinking process."#;
                     first_message.to_string()
                 };
                 session.title = Some(title);
-                let _ = session.save();
+                if let Err(e) = session.save() {
+                    tracing::warn!(error = %e, session_id = %session.id, "failed to save session metadata");
+                }
 
                 self.session_id = Some(session.id.clone());
                 if let Ok(paths) = ZenPaths::detect() {
@@ -1552,7 +1560,9 @@ Use /thinking to show/hide thinking process."#;
         {
             entity.updated_at = chrono::Utc::now();
             entity.status = zen_core::types::SessionStatus::Completed;
-            let _ = entity.save();
+            if let Err(e) = entity.save() {
+                tracing::warn!(error = %e, session_id = %id, "failed to save session entity status");
+            }
 
             // Write daily log entry with conversation content
             if self.chat_history.is_empty() {
@@ -1588,7 +1598,9 @@ Use /thinking to show/hide thinking process."#;
 
             tracing::debug!(session_id = %id, turns = turn_count, "writing daily log entry for session end");
             if let Ok(paths) = ZenPaths::detect() {
-                let _ = zen_memory::journal::Journal::create_entry(&paths, &summary);
+                if let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary) {
+                    tracing::warn!(error = %e, session_id = %id, "failed to write daily journal entry for session end");
+                }
             }
         }
     }

@@ -107,7 +107,12 @@ impl ZenDream {
         let entities_recomputed = recompute_entities(zen_paths).await?;
 
         let (entities_decayed, entities_promoted, top_entities) =
-            run_graph_maintenance(zen_paths).await;
+            run_graph_maintenance(zen_paths)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "run_graph_maintenance failed, dream cycle continues without graph maintenance");
+                    (0, 0, Vec::new())
+                });
 
         let report = DreamReport {
             date,
@@ -619,7 +624,9 @@ async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
                 }
 
                 for alias in &aliases {
-                    let _ = zen_repo::EntitiesRepo::new(&client).insert_alias(alias, &entity.id).await;
+                    if let Err(e) = zen_repo::EntitiesRepo::new(&client).insert_alias(alias, &entity.id).await {
+                        warn!(alias = %alias, error = %e, "recompute_entities: failed to insert alias");
+                    }
                 }
 
                 upserted += 1;
@@ -635,51 +642,43 @@ async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
     Ok(upserted)
 }
 
-async fn run_graph_maintenance(zen_paths: &ZenPaths) -> (usize, usize, Vec<String>) {
+async fn run_graph_maintenance(
+    zen_paths: &ZenPaths,
+) -> std::result::Result<(usize, usize, Vec<String>), DreamError> {
     let state_db = zen_paths.db().join("state.db");
     if !state_db.exists() {
-        return (0, 0, Vec::new());
+        return Ok((0, 0, Vec::new()));
     }
 
-    let client = match zen_repo::SqliteClient::open(&state_db).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "run_graph_maintenance: failed to open state.db");
-            return (0, 0, Vec::new());
-        }
-    };
+    let client = zen_repo::SqliteClient::open(&state_db)
+        .await
+        .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
 
     let repo = zen_repo::EntitiesRepo::new(&client);
 
-    let decayed = repo.apply_confidence_decay(30.0).await.unwrap_or_else(|e| {
-        warn!(error = %e, "run_graph_maintenance: confidence decay failed");
-        0
-    });
+    let decayed = repo
+        .apply_confidence_decay(30.0)
+        .await
+        .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
     debug!(decayed, "run_graph_maintenance: applied confidence decay (30-day half-life)");
 
-    let promoted = repo.auto_promote_entities(3).await.unwrap_or_else(|e| {
-        warn!(error = %e, "run_graph_maintenance: auto-promote failed");
-        0
-    });
+    let promoted = repo
+        .auto_promote_entities(3)
+        .await
+        .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
     debug!(promoted, "run_graph_maintenance: auto-promoted entities (access_count >= 3)");
 
     let top_entities = repo
         .compute_importance(40, 0.85)
         .await
-        .map(|scores| {
-            scores
-                .iter()
-                .take(5)
-                .map(|s| s.entity.clone())
-                .collect()
-        })
+        .map(|scores| scores.iter().take(5).map(|s| s.entity.clone()).collect())
         .unwrap_or_else(|e| {
-            warn!(error = %e, "run_graph_maintenance: PageRank computation failed");
+            warn!(error = %e, "run_graph_maintenance: PageRank computation failed, returning empty");
             Vec::new()
         });
     debug!(top = top_entities.len(), "run_graph_maintenance: computed PageRank importance");
 
-    (decayed, promoted, top_entities)
+    Ok((decayed, promoted, top_entities))
 }
 
 fn parse_entity_file(

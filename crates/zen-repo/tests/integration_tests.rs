@@ -1510,3 +1510,394 @@ async fn test_sessions_list_all_fields() {
     assert_eq!(s.updated_at, "2024-06-15T12:00:00Z");
     assert_eq!(s.workspace, "/my/workspace");
 }
+
+// ===========================================================================
+// Graph Algorithm Tests — PageRank, Shortest Path, Connected Components
+// ===========================================================================
+
+fn make_test_request<'a>(
+    id: &'a str,
+    src: &'a str,
+    tgt: &'a str,
+    rt: &'a str,
+    weight: Option<f64>,
+) -> InsertRelationshipRequest<'a> {
+    InsertRelationshipRequest {
+        id,
+        source_id: src,
+        target_id: tgt,
+        rel_type: rt,
+        confidence: 1.0,
+        source_note_ids: None,
+        created_at: "2024-01-01T00:00:00Z",
+        description: None,
+        valid_from: None,
+        valid_until: None,
+        weight,
+    }
+}
+
+#[tokio::test]
+async fn test_pagerank_simple_chain() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C")] {
+        repo.insert_entity(id, name, "node", "2024-01-01T00:00:00Z")
+            .await
+            .unwrap();
+    }
+    repo.insert_relationship(&make_test_request("r1", "a", "b", "next", None))
+        .await
+        .unwrap();
+    repo.insert_relationship(&make_test_request("r2", "b", "c", "next", None))
+        .await
+        .unwrap();
+
+    let scores = repo.pagerank(40, 0.85).await.unwrap();
+    assert_eq!(scores.len(), 3);
+
+    let total: f64 = scores.iter().map(|s| s.score).sum();
+    assert!(
+        (total - 1.0).abs() < 0.01,
+        "PageRank scores should sum to ~1.0, got {total}"
+    );
+
+    let a_score = scores.iter().find(|s| s.entity == "A").unwrap().score;
+    let b_score = scores.iter().find(|s| s.entity == "B").unwrap().score;
+    assert!(
+        b_score > a_score,
+        "B (has inbound from A) should outrank A (no inbound)"
+    );
+}
+
+#[tokio::test]
+async fn test_pagerank_empty_graph() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    let scores = repo.pagerank(10, 0.85).await.unwrap();
+    assert!(scores.is_empty());
+}
+
+#[tokio::test]
+async fn test_pagerank_hub_node_dominates() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    for (id, name) in &[("hub", "Hub"), ("s1", "Spoke1"), ("s2", "Spoke2"), ("s3", "Spoke3")] {
+        repo.insert_entity(id, name, "node", "2024-01-01T00:00:00Z")
+            .await
+            .unwrap();
+    }
+    for (rid, tgt) in &[("r1", "s1"), ("r2", "s2"), ("r3", "s3")] {
+        repo.insert_relationship(&make_test_request(rid, "hub", tgt, "connects", None))
+            .await
+            .unwrap();
+    }
+
+    let scores = repo.pagerank(40, 0.85).await.unwrap();
+    let total: f64 = scores.iter().map(|s| s.score).sum();
+    assert!(
+        (total - 1.0).abs() < 0.01,
+        "PageRank scores should sum to ~1.0, got {total}"
+    );
+
+    let spoke_score = scores.iter().find(|s| s.entity == "Spoke1").unwrap().score;
+    let hub_score = scores.iter().find(|s| s.entity == "Hub").unwrap().score;
+    assert!(
+        spoke_score > hub_score,
+        "Spoke (receives inbound from Hub) should outrank Hub (no inbound)"
+    );
+}
+
+#[tokio::test]
+async fn test_shortest_path_direct_connection() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C")] {
+        repo.insert_entity(id, name, "node", "2024-01-01T00:00:00Z")
+            .await
+            .unwrap();
+    }
+    repo.insert_relationship(&make_test_request("r1", "a", "b", "link", Some(1.0)))
+        .await
+        .unwrap();
+    repo.insert_relationship(&make_test_request("r2", "b", "c", "link", Some(1.0)))
+        .await
+        .unwrap();
+    repo.insert_relationship(&make_test_request("r3", "a", "c", "link", Some(5.0)))
+        .await
+        .unwrap();
+
+    let path = repo.shortest_path("A", "C", 5).await.unwrap();
+    assert!(path.is_some());
+    let p = path.unwrap();
+    assert_eq!(p.entity, "C");
+    assert!(p.distance <= 2.0, "shortest path should go A->B->C (weight 2.0), not A->C (weight 5.0)");
+    assert!(p.path.contains("A"));
+    assert!(p.path.contains("C"));
+}
+
+#[tokio::test]
+async fn test_shortest_path_no_connection() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    repo.insert_entity("a", "A", "node", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    repo.insert_entity("b", "B", "node", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    let path = repo.shortest_path("A", "B", 3).await.unwrap();
+    assert!(path.is_none());
+}
+
+#[tokio::test]
+async fn test_shortest_paths_all_returns_nearest() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C")] {
+        repo.insert_entity(id, name, "n", "2024-01-01T00:00:00Z")
+            .await
+            .unwrap();
+    }
+    repo.insert_relationship(&make_test_request("r1", "a", "b", "link", Some(2.0)))
+        .await
+        .unwrap();
+    repo.insert_relationship(&make_test_request("r2", "a", "c", "link", Some(1.0)))
+        .await
+        .unwrap();
+
+    let paths = repo.shortest_paths_all("A", 3).await.unwrap();
+    assert_eq!(paths.len(), 2);
+    let c_dist = paths.iter().find(|p| p.entity == "C").unwrap().distance;
+    let b_dist = paths.iter().find(|p| p.entity == "B").unwrap().distance;
+    assert!(c_dist < b_dist, "C (weight 1.0) should be closer than B (weight 2.0)");
+}
+
+#[tokio::test]
+async fn test_connected_components_separate_groups() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("e", "E")] {
+        repo.insert_entity(id, name, "n", "2024-01-01T00:00:00Z")
+            .await
+            .unwrap();
+    }
+    repo.insert_relationship(&make_test_request("r1", "a", "b", "link", None))
+        .await
+        .unwrap();
+    repo.insert_relationship(&make_test_request("r2", "c", "d", "link", None))
+        .await
+        .unwrap();
+
+    let components = repo.connected_components().await.unwrap();
+    assert_eq!(components.len(), 5);
+
+    let comp_a = components.iter().find(|c| c.entity == "A").unwrap();
+    let comp_b = components.iter().find(|c| c.entity == "B").unwrap();
+    let comp_c = components.iter().find(|c| c.entity == "C").unwrap();
+    let comp_d = components.iter().find(|c| c.entity == "D").unwrap();
+    let comp_e = components.iter().find(|c| c.entity == "E").unwrap();
+
+    assert_eq!(comp_a.component_id, comp_b.component_id, "A and B should be in same component");
+    assert_eq!(comp_c.component_id, comp_d.component_id, "C and D should be in same component");
+    assert_ne!(comp_a.component_id, comp_c.component_id, "AB group != CD group");
+    assert_eq!(comp_e.component_size, 1, "E should be isolated (component size 1)");
+}
+
+#[tokio::test]
+async fn test_connected_components_empty_graph() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    let components = repo.connected_components().await.unwrap();
+    assert!(components.is_empty());
+}
+
+#[tokio::test]
+async fn test_confidence_decay_reduces_old_entities() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    let old_date = "2020-01-01T00:00:00Z";
+    repo.insert_entity_with("e1", "OldEntity", "tech", old_date, "ancient", "manual", 1.0)
+        .await
+        .unwrap();
+
+    let decayed = repo.apply_confidence_decay(30.0).await.unwrap();
+    assert_eq!(decayed, 1);
+
+    let entities = repo.load_all_entities().await.unwrap();
+    let entity = &entities[0];
+    assert!(
+        entity.confidence < 1.0,
+        "Old entity confidence should have decayed from 1.0, got {}",
+        entity.confidence
+    );
+    assert!(
+        entity.confidence >= 0.01,
+        "Confidence should not drop below 0.01 floor"
+    );
+}
+
+#[tokio::test]
+async fn test_auto_promote_entities() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    repo.insert_entity_with("e1", "FrequentEntity", "tech", "2024-01-01T00:00:00Z", "", "test", 0.5)
+        .await
+        .unwrap();
+
+    repo.update_entity_access("e1").await.unwrap();
+    repo.update_entity_access("e1").await.unwrap();
+    repo.update_entity_access("e1").await.unwrap();
+
+    let promoted = repo.auto_promote_entities(3).await.unwrap();
+    assert_eq!(promoted, 1);
+
+    let entities = repo.load_all_entities().await.unwrap();
+    let entity = &entities[0];
+    assert!(entity.promoted_at.is_some(), "Entity should have promoted_at set");
+    assert!(
+        entity.confidence >= 0.8,
+        "Promoted entity confidence should be >= 0.8, got {}",
+        entity.confidence
+    );
+}
+
+#[tokio::test]
+async fn test_auto_promote_does_not_repromote() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    repo.insert_entity_with("e1", "AlreadyPromoted", "tech", "2024-01-01T00:00:00Z", "", "test", 0.9)
+        .await
+        .unwrap();
+    repo.promote_entity("e1").await.unwrap();
+
+    let promoted = repo.auto_promote_entities(0).await.unwrap();
+    assert_eq!(promoted, 0, "Should not re-promote already-promoted entity");
+}
+
+#[tokio::test]
+async fn test_compute_importance_returns_sorted() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    for (id, name) in &[("hub", "Hub"), ("s1", "Spoke1"), ("s2", "Spoke2")] {
+        repo.insert_entity(id, name, "n", "2024-01-01T00:00:00Z")
+            .await
+            .unwrap();
+    }
+    repo.insert_relationship(&make_test_request("r1", "hub", "s1", "connects", None))
+        .await
+        .unwrap();
+    repo.insert_relationship(&make_test_request("r2", "hub", "s2", "connects", None))
+        .await
+        .unwrap();
+
+    let scores = repo.compute_importance(20, 0.85).await.unwrap();
+    assert_eq!(scores.len(), 3);
+    for i in 0..scores.len() - 1 {
+        assert!(
+            scores[i].score >= scores[i + 1].score,
+            "Scores should be sorted descending"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_find_entity_by_name_case_insensitive() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    repo.insert_entity("e1", "Rust", "language", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    let found = repo.find_entity_by_name("Rust").await.unwrap();
+    assert!(found.is_some());
+    assert_eq!(found.unwrap().id, "e1");
+
+    let found_lower = repo.find_entity_by_name("rust").await.unwrap();
+    assert!(found_lower.is_some());
+    assert_eq!(found_lower.unwrap().id, "e1");
+
+    let found_upper = repo.find_entity_by_name("RUST").await.unwrap();
+    assert!(found_upper.is_some());
+    assert_eq!(found_upper.unwrap().id, "e1");
+}
+
+#[tokio::test]
+async fn test_find_entity_by_name_nonexistent() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    let found = repo.find_entity_by_name("Nonexistent").await.unwrap();
+    assert!(found.is_none());
+}
+
+#[tokio::test]
+async fn test_wikilink_edge_insertion() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EntitiesRepo::new(&client);
+
+    repo.insert_entity("e-rust", "Rust", "language", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    repo.insert_entity("e-tokio", "Tokio", "framework", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    let now = "2024-06-01T00:00:00Z";
+
+    repo.insert_relationship(&InsertRelationshipRequest {
+        id: "wikilink-e-rust-e-tokio",
+        source_id: "e-rust",
+        target_id: "e-tokio",
+        rel_type: "Wikilinks",
+        confidence: 0.7,
+        source_note_ids: None,
+        created_at: now,
+        description: Some("Wiki cross-reference"),
+        valid_from: None,
+        valid_until: None,
+        weight: None,
+    })
+    .await
+    .unwrap();
+
+    repo.insert_relationship(&InsertRelationshipRequest {
+        id: "wikilink-e-tokio-e-rust",
+        source_id: "e-tokio",
+        target_id: "e-rust",
+        rel_type: "Wikilinks",
+        confidence: 0.7,
+        source_note_ids: None,
+        created_at: now,
+        description: Some("Wiki cross-reference"),
+        valid_from: None,
+        valid_until: None,
+        weight: None,
+    })
+    .await
+    .unwrap();
+
+    let rust_rels = repo.load_relationships("e-rust").await.unwrap();
+    assert_eq!(rust_rels.len(), 1);
+    assert_eq!(rust_rels[0].target_entity_id, "e-tokio");
+    assert_eq!(rust_rels[0].relation_type, "Wikilinks");
+
+    let tokio_rels = repo.load_relationships("e-tokio").await.unwrap();
+    assert_eq!(tokio_rels.len(), 1);
+    assert_eq!(tokio_rels[0].target_entity_id, "e-rust");
+    assert_eq!(tokio_rels[0].relation_type, "Wikilinks");
+}

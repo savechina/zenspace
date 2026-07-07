@@ -1,4 +1,5 @@
 use std::fs::read_to_string;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use futures::stream::StreamExt;
@@ -78,7 +79,9 @@ impl SelfLearningSignals {
             &memories_dir.join("commitments"),
         );
 
-        let _ = tracker.save();
+        if let Err(e) = tracker.save() {
+            tracing::warn!(error = %e, "SelfLearningSignals: failed to save reinforcement tracker");
+        }
 
         Self {
             corrections,
@@ -525,6 +528,7 @@ pub struct ZenAgent {
     identity: Option<IdentityContext>,
     signals: Option<SelfLearningSignals>,
     memvid_store: Option<rig_memvid::MemvidStore>,
+    state_db_path: Option<PathBuf>,
 }
 
 impl ZenAgent {
@@ -709,6 +713,39 @@ impl ZenAgent {
         })
     }
 
+    async fn retrieve_memories_enriched(&self, session_id: &str) -> Option<Vec<String>> {
+        let store = self.memvid_store.as_ref()?;
+        let zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
+
+        let state_db = self.state_db_path.as_ref()?;
+
+        match zen_store
+            .retrieve_with_entity_context(session_id, state_db)
+            .await
+        {
+            Ok(enriched) if !enriched.is_empty() => {
+                tracing::info!(
+                    session_id,
+                    count = enriched.len(),
+                    "Enriched memories retrieved (KB entity context)"
+                );
+                Some(enriched.iter().map(|e| e.format_enriched()).collect())
+            }
+            Ok(_) => {
+                tracing::debug!(session_id, "No enriched memories, falling back");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "Enriched retrieval failed, falling back to plain"
+                );
+                None
+            }
+        }
+    }
+
     /// Persist a conversation turn to the memvid store with per-session scoping.
     ///
     /// Replaces the former inline `put_text()` calls. The orchestrator calls
@@ -761,8 +798,12 @@ impl ZenAgent {
         self.push_conversation_evidence(&mut ctx, session);
 
         let memories = self
-            .retrieve_memories_structured(&session_id, query)
-            .or_else(|| self.retrieve_memories(&session_id));
+            .retrieve_memories_enriched(&session_id)
+            .await
+            .or_else(|| {
+                self.retrieve_memories_structured(&session_id, query)
+                    .or_else(|| self.retrieve_memories(&session_id))
+            });
 
         if let Some(ref memories) = memories {
             let memory_text = memories.join("\n");
@@ -1071,8 +1112,12 @@ impl ZenAgent {
         }
 
         let memories = self
-            .retrieve_memories_structured(&session_id, query)
-            .or_else(|| self.retrieve_memories(&session_id));
+            .retrieve_memories_enriched(&session_id)
+            .await
+            .or_else(|| {
+                self.retrieve_memories_structured(&session_id, query)
+                    .or_else(|| self.retrieve_memories(&session_id))
+            });
 
         if let Some(ref memories) = memories {
             let memory_text = memories.join("\n");
@@ -1251,6 +1296,7 @@ impl ZenAgentBuilder {
 
         let identity = self.zen_paths.as_ref().map(load_identity_files);
         let signals = self.zen_paths.as_ref().map(SelfLearningSignals::load);
+        let state_db_path = self.zen_paths.as_ref().map(|p| p.db());
 
         Ok(ZenAgent {
             generic,
@@ -1258,6 +1304,7 @@ impl ZenAgentBuilder {
             identity,
             signals,
             memvid_store: self.memvid_store,
+            state_db_path,
         })
     }
 }

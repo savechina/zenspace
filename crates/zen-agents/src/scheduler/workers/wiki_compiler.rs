@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
-use zen_vault::{EntityData, EntityService, WikiCompiler};
+use zen_vault::{EntityData, EntityService, WikiCompiler, WikiPage};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
@@ -95,6 +95,108 @@ impl WikiCompilerWorker {
             facts: vec![fact],
             relationships,
         }
+    }
+
+    /// Insert wikilink relationship edges by reading compiled wiki pages,
+    /// extracting `[[wikilinks]]`, resolving them to entity IDs, and
+    /// inserting relationship edges into the entity graph.
+    async fn insert_wikilink_edges(
+        &self,
+        client: &zen_vault::SqliteClient,
+        entity_data_list: &[EntityData],
+        wiki_dir: &Path,
+    ) -> Result<usize> {
+        let repo = zen_repo::EntitiesRepo::new(client);
+        let mut edge_count = 0usize;
+
+        for entity_data in entity_data_list {
+            let slug = slugify(&entity_data.entity.name);
+            let page_path = wiki_dir.join("entities").join(format!("{slug}.md"));
+
+            let content = match std::fs::read_to_string(&page_path) {
+                Ok(c) => c,
+                Err(_) => {
+                    debug!(
+                        entity = %entity_data.entity.name,
+                        path = %page_path.display(),
+                        "wiki page not found, skipping wikilink extraction"
+                    );
+                    continue;
+                }
+            };
+
+            // Strip frontmatter: everything up to and including the second `---`
+            let body = strip_frontmatter(&content);
+            let wikilinks = WikiPage::extract_wikilinks(&body);
+
+            for target_name in &wikilinks {
+                // Skip self-references
+                if target_name.eq_ignore_ascii_case(&entity_data.entity.name) {
+                    continue;
+                }
+
+                // Resolve target entity: exact name match first, then FTS fallback
+                let target_entity = match repo.find_entity_by_name(target_name).await {
+                    Ok(Some(e)) => Some(e),
+                    Ok(None) => {
+                        // Fallback: FTS search for top-1 result
+                        repo.search_entities_fts(target_name)
+                            .await
+                            .ok()
+                            .and_then(|results| results.into_iter().next())
+                    }
+                    Err(e) => {
+                        debug!(
+                            target = %target_name,
+                            error = %e,
+                            "failed to look up entity for wikilink target"
+                        );
+                        continue;
+                    }
+                };
+
+                let target_entity = match target_entity {
+                    Some(e) => e,
+                    None => {
+                        debug!(
+                            target = %target_name,
+                            "wikilink target has no matching entity, skipping"
+                        );
+                        continue;
+                    }
+                };
+
+                let source_id = &entity_data.entity.id;
+                let target_id = &target_entity.id;
+
+                // Skip self-loops (DB has a CHECK constraint)
+                if source_id == target_id {
+                    continue;
+                }
+
+                let edge_id = format!("wikilink-{source_id}-{target_id}");
+                let now = chrono::Utc::now().to_rfc3339();
+
+                repo.insert_relationship(&zen_repo::InsertRelationshipRequest {
+                    id: &edge_id,
+                    source_id,
+                    target_id,
+                    rel_type: "Wikilinks",
+                    confidence: 0.7,
+                    source_note_ids: None,
+                    created_at: &now,
+                    description: Some("Wiki cross-reference"),
+                    valid_from: None,
+                    valid_until: None,
+                    weight: None,
+                })
+                .await?;
+
+                edge_count += 1;
+            }
+        }
+
+        Ok(edge_count)
     }
 }
 
@@ -187,6 +289,17 @@ impl ZenWorker for WikiCompilerWorker {
                 }
             };
 
+        let edge_count = self
+            .insert_wikilink_edges(&client, &entity_data_list, &wiki_dir)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "wikilink edge insertion failed, continuing");
+                0
+            });
+        if edge_count > 0 {
+            info!(edge_count, "inserted wikilink relationship edges");
+        }
+
         let new_state = CompilerState {
             last_compile_time: Utc::now(),
         };
@@ -200,6 +313,38 @@ impl ZenWorker for WikiCompilerWorker {
             fact_count: pages_written,
             duration_ms: start.elapsed().as_millis() as u64,
         })
+    }
+}
+
+fn slugify(title: &str) -> String {
+    let mut slug = String::with_capacity(title.len());
+    let mut prev_dash = false;
+
+    for c in title.to_lowercase().chars() {
+        if c.is_alphanumeric() {
+            slug.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+
+    slug.trim_matches('-').to_string()
+}
+
+fn strip_frontmatter(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return content.to_string();
+    }
+
+    let rest = &trimmed[3..];
+    if let Some(end_pos) = rest.find("---") {
+        let body = &rest[end_pos + 3..];
+        body.trim_start().to_string()
+    } else {
+        content.to_string()
     }
 }
 

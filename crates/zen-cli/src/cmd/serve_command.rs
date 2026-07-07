@@ -268,7 +268,9 @@ fn run_foreground(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<
 
     block_until_signal();
 
-    let _ = gw.stop();
+    if let Err(e) = gw.stop() {
+        tracing::warn!(error = %e, "failed to stop gateway cleanly");
+    }
     remove_pid(path).ok();
     println!("\nGateway stopped");
     Ok(())

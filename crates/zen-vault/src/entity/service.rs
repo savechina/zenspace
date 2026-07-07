@@ -171,74 +171,6 @@ impl EntityService {
         Self
     }
 
-    /// Extract typed entities from note content using keyword heuristics.
-    ///
-    /// Scans for known technology names, heading patterns, and capitalized
-    /// multi-word terms. Returns unique entities deduplicated by name.
-    /// Provides a baseline extraction when LLM extraction is unavailable.
-    pub fn extract_entities(&self, note_content: &str) -> Result<Vec<Entity>> {
-        let mut entities: Vec<Entity> = Vec::new();
-        let content_lower = note_content.to_lowercase();
-        let note_id = "note-content";
-
-        // Known technology keywords (common in development)
-        const KNOWN_TECHS: &[&str] = &[
-            "rust", "python", "javascript", "typescript", "go", "java", "c++",
-            "react", "vue", "angular", "svelte", "next.js", "node.js",
-            "postgresql", "mysql", "sqlite", "mongodb", "redis",
-            "docker", "kubernetes", "terraform", "aws", "gcp", "azure",
-            "graphql", "rest", "grpc", "websocket",
-            "linux", "macos", "windows",
-            "git", "github", "gitlab",
-            "wasm", "llm", "ai", "ml",
-            "openai", "anthropic", "ollama", "deepseek",
-            "sqlx", "rusqlite", "wasmtime", "rig-core", "rig-compose",
-        ];
-
-        for tech in KNOWN_TECHS {
-            if content_lower.contains(tech) {
-                let name = capitalize(tech);
-                if !entities.iter().any(|e| e.name == name) {
-                    entities.push(Entity::new(&name, EntityType::Technology, note_id));
-                }
-            }
-        }
-
-        // Extract ## heading concepts
-        for line in note_content.lines() {
-            let trimmed = line.trim();
-            if let Some(heading) = trimmed.strip_prefix("## ").or_else(|| trimmed.strip_prefix("# ")) {
-                let heading = heading.trim();
-                if heading.len() >= 3 && !entities.iter().any(|e| e.name == heading) {
-                    let typ = classify_heading(heading);
-                    entities.push(Entity::new(heading, typ, note_id));
-                }
-            }
-        }
-
-        // Extract capitalized multi-word terms (likely proper nouns)
-        let mut word = String::new();
-        let chars: Vec<char> = note_content.chars().collect();
-        for (i, &ch) in chars.iter().enumerate() {
-            if ch.is_uppercase() && i > 0 && !chars[i - 1].is_alphabetic() {
-                word.clear();
-                word.push(ch);
-            } else if ch.is_alphabetic() && !word.is_empty() {
-                word.push(ch);
-            } else if !ch.is_alphabetic() && !word.is_empty() {
-                if word.len() >= 4 {
-                    let name = word.clone();
-                    if !entities.iter().any(|e| e.name == name) {
-                        entities.push(Entity::new(&name, EntityType::Concept, note_id));
-                    }
-                }
-                word.clear();
-            }
-        }
-
-        Ok(entities)
-    }
-
     /// Extract relationships between co-occurring entities.
     ///
     /// Creates RELATED_TO relationships for every pair of entities.
@@ -1323,26 +1255,4 @@ mod tests {
     }
 }
 
-fn capitalize(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    let mut chars = s.chars();
-    let first = chars.next().unwrap().to_uppercase().collect::<String>();
-    first + &chars.as_str().to_string()
-}
 
-fn classify_heading(heading: &str) -> EntityType {
-    let lower = heading.to_lowercase();
-    if lower.contains("api") || lower.contains("database") || lower.contains("service")
-        || lower.contains("cli") || lower.contains("library") || lower.contains("tool")
-    {
-        EntityType::Technology
-    } else if lower.contains("company") || lower.contains("team") || lower.contains("org") {
-        EntityType::Organization
-    } else if lower.contains("person") || lower.contains("author") {
-        EntityType::Person
-    } else {
-        EntityType::Concept
-    }
-}

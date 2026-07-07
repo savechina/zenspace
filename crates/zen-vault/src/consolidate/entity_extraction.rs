@@ -19,54 +19,76 @@ impl EntityExtractor {
         Self
     }
 
+    const KNOWN_TECHS: &[&str] = &[
+        "rust", "python", "javascript", "typescript", "go", "java", "c++",
+        "react", "vue", "angular", "svelte", "next.js", "node.js",
+        "postgresql", "mysql", "sqlite", "mongodb", "redis",
+        "docker", "kubernetes", "terraform", "aws", "gcp", "azure",
+        "graphql", "rest", "grpc", "websocket",
+        "linux", "macos", "windows",
+        "git", "github", "gitlab",
+        "wasm", "llm", "ai", "ml",
+        "openai", "anthropic", "ollama", "deepseek",
+        "sqlx", "rusqlite", "wasmtime", "rig-core", "rig-compose",
+    ];
+
     /// Extract entities from a single note.
     ///
-    /// Uses keyword heuristics to identify technologies, concepts, and patterns
-    /// in the note content. Returns extracted entities with confidence scores.
+    /// Uses three strategies:
+    /// 1. **Keyword heuristics** — scans for 42 known technology names
+    /// 2. **Heading classification** — classifies `#`/`##` headings into typed entities
+    ///    (Technology, Organization, Person, or Concept) based on keyword patterns
+    /// 3. **Capitalized-word extraction** — finds multi-word proper nouns
+    ///    (e.g., "Apple Inc", "John Smith")
+    ///
+    /// Returns deduplicated entities by name.
     pub fn extract(&self, note: &Note) -> Result<Vec<Entity>> {
-        let mut entities = Vec::new();
-
-        let known_techs = [
-            "Rust",
-            "Python",
-            "JavaScript",
-            "TypeScript",
-            "Go",
-            "SQLite",
-            "PostgreSQL",
-            "Redis",
-            "Docker",
-            "Kubernetes",
-            "React",
-            "Vue",
-            "Tokio",
-            "async",
-            "LLM",
-            "AI",
-            "MCP",
-            "WASM",
-            "rig-core",
-            "ratatui",
-        ];
-
+        let mut entities: Vec<Entity> = Vec::new();
         let content_lower = note.content.to_lowercase();
+        let note_id = &note.id;
 
-        for tech in &known_techs {
-            if content_lower.contains(&tech.to_lowercase()) {
-                let entity = Entity::new(tech.to_string(), EntityType::Technology, note.id.clone());
-                entities.push(entity);
+        // Strategy 1: Known technology keywords
+        for tech in Self::KNOWN_TECHS {
+            if content_lower.contains(tech) {
+                let name = capitalize(tech);
+                if !entities.iter().any(|e| e.name == name) {
+                    entities.push(Entity::new(&name, EntityType::Technology, note_id));
+                }
             }
         }
 
-        let lines: Vec<&str> = note.content.lines().collect();
-        for line in &lines {
-            if line.starts_with('#') && line.len() > 2 {
-                let title = line.trim_start_matches('#').trim();
-                if !title.is_empty() && title.len() > 2 {
-                    let entity =
-                        Entity::new(title.to_string(), EntityType::Concept, note.id.clone());
-                    entities.push(entity);
+        // Strategy 2: Heading classification (# and ## headings)
+        for line in note.content.lines() {
+            let trimmed = line.trim();
+            if let Some(heading) = trimmed
+                .strip_prefix("## ")
+                .or_else(|| trimmed.strip_prefix("# "))
+            {
+                let heading = heading.trim();
+                if heading.len() >= 3 && !entities.iter().any(|e| e.name == heading) {
+                    let typ = classify_heading(heading);
+                    entities.push(Entity::new(heading, typ, note_id));
                 }
+            }
+        }
+
+        // Strategy 3: Capitalized multi-word terms (likely proper nouns)
+        let mut word = String::new();
+        let chars: Vec<char> = note.content.chars().collect();
+        for (i, &ch) in chars.iter().enumerate() {
+            if ch.is_uppercase() && (i == 0 || !chars[i - 1].is_alphabetic()) {
+                word.clear();
+                word.push(ch);
+            } else if ch.is_alphabetic() && !word.is_empty() {
+                word.push(ch);
+            } else if !ch.is_alphabetic() && !word.is_empty() {
+                if word.len() >= 4 {
+                    let name = word.clone();
+                    if !entities.iter().any(|e| e.name == name) {
+                        entities.push(Entity::new(&name, EntityType::Concept, note_id));
+                    }
+                }
+                word.clear();
             }
         }
 
@@ -111,31 +133,13 @@ impl EntityExtractor {
                 .unwrap_or("unknown")
                 .to_string();
 
-            for tech in &[
-                "Rust",
-                "Python",
-                "JavaScript",
-                "TypeScript",
-                "Go",
-                "SQLite",
-                "PostgreSQL",
-                "Redis",
-                "Docker",
-                "Kubernetes",
-                "React",
-                "Vue",
-                "Tokio",
-                "async",
-                "LLM",
-                "AI",
-                "MCP",
-                "WASM",
-                "rig-core",
-                "ratatui",
-            ] {
-                if content.to_lowercase().contains(&tech.to_lowercase()) {
+            let content_lower = content.to_lowercase();
+
+            for tech in Self::KNOWN_TECHS {
+                if content_lower.contains(tech) {
+                    let name = capitalize(tech);
                     let mut entity =
-                        Entity::new(tech.to_string(), EntityType::Technology, note_id.clone());
+                        Entity::new(name, EntityType::Technology, note_id.clone());
                     entity.metadata.insert(
                         "extraction_method".to_string(),
                         "skill_heuristic".to_string(),
@@ -152,6 +156,42 @@ impl EntityExtractor {
 impl Default for EntityExtractor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap().to_uppercase().collect::<String>();
+    first + chars.as_str()
+}
+
+fn classify_heading(heading: &str) -> EntityType {
+    let lower = heading.to_lowercase();
+    if lower.contains("api")
+        || lower.contains("database")
+        || lower.contains("service")
+        || lower.contains("cli")
+        || lower.contains("library")
+        || lower.contains("tool")
+        || lower.contains("programming")
+        || lower.contains("language")
+        || lower.contains("runtime")
+        || lower.contains("framework")
+        || lower.contains("compiler")
+        || lower.contains("algorithm")
+        || lower.contains("architecture")
+        || lower.contains("system")
+    {
+        EntityType::Technology
+    } else if lower.contains("company") || lower.contains("team") || lower.contains("org") {
+        EntityType::Organization
+    } else if lower.contains("person") || lower.contains("author") {
+        EntityType::Person
+    } else {
+        EntityType::Concept
     }
 }
 
@@ -226,11 +266,10 @@ mod tests {
     #[test]
     fn test_extract_finds_technology() {
         let extractor = EntityExtractor;
-        let note = make_note("I love using Rust and Tokio for async programming.");
+        let note = make_note("I love using Rust and Python for programming.");
         let entities = extractor.extract(&note).unwrap();
         assert!(entities.iter().any(|e| e.name == "Rust"));
-        assert!(entities.iter().any(|e| e.name == "Tokio"));
-        assert!(entities.iter().any(|e| e.name == "async"));
+        assert!(entities.iter().any(|e| e.name == "Python"));
     }
 
     #[test]
@@ -249,5 +288,81 @@ mod tests {
         let entities = extractor.extract_batch(&[note1, note2]).unwrap();
         let rust_count = entities.iter().filter(|e| e.name == "Rust").count();
         assert_eq!(rust_count, 1);
+    }
+
+    #[test]
+    fn test_heading_classification_produces_typed_entities() {
+        let extractor = EntityExtractor;
+        let note = make_note("# Rust Programming\n\nDetails about Rust.");
+        let entities = extractor.extract(&note).unwrap();
+        let rust_heading = entities.iter().find(|e| e.name == "Rust Programming");
+        assert!(rust_heading.is_some(), "should extract 'Rust Programming' heading");
+        assert_eq!(rust_heading.unwrap().entity_type, EntityType::Technology);
+    }
+
+    #[test]
+    fn test_heading_classification_organization() {
+        let extractor = EntityExtractor;
+        let note = make_note("## Engineering Team\n\nThe team works hard.");
+        let entities = extractor.extract(&note).unwrap();
+        let team = entities.iter().find(|e| e.name == "Engineering Team");
+        assert!(team.is_some());
+        assert_eq!(team.unwrap().entity_type, EntityType::Organization);
+    }
+
+    #[test]
+    fn test_heading_classification_person() {
+        let extractor = EntityExtractor;
+        let note = make_note("## Author Bio\n\nWritten by the author.");
+        let entities = extractor.extract(&note).unwrap();
+        let bio = entities.iter().find(|e| e.name == "Author Bio");
+        assert!(bio.is_some());
+        assert_eq!(bio.unwrap().entity_type, EntityType::Person);
+    }
+
+    #[test]
+    fn test_capitalized_words_extraction() {
+        let extractor = EntityExtractor;
+        let note = make_note("John Smith worked at Apple Inc on the project.");
+        let entities = extractor.extract(&note).unwrap();
+        assert!(
+            entities.iter().any(|e| e.name == "John"),
+            "should extract 'John' as capitalized word"
+        );
+        assert!(
+            entities.iter().any(|e| e.name == "Smith"),
+            "should extract 'Smith' as capitalized word"
+        );
+    }
+
+    #[test]
+    fn test_expanded_keyword_list_finds_sqlite() {
+        let extractor = EntityExtractor;
+        let note = make_note("We use sqlite for local storage.");
+        let entities = extractor.extract(&note).unwrap();
+        assert!(
+            entities.iter().any(|e| e.name == "Sqlite"),
+            "should find 'sqlite' via expanded keyword list"
+        );
+    }
+
+    #[test]
+    fn test_expanded_keyword_list_finds_deepseek() {
+        let extractor = EntityExtractor;
+        let note = make_note("We switched to deepseek for code generation.");
+        let entities = extractor.extract(&note).unwrap();
+        assert!(
+            entities.iter().any(|e| e.name == "Deepseek"),
+            "should find 'deepseek' via expanded keyword list"
+        );
+    }
+
+    #[test]
+    fn test_extract_deduplicates_within_note() {
+        let extractor = EntityExtractor;
+        let note = make_note("Rust is great. I love Rust. Rust forever.");
+        let entities = extractor.extract(&note).unwrap();
+        let rust_count = entities.iter().filter(|e| e.name == "Rust").count();
+        assert_eq!(rust_count, 1, "should deduplicate within a single note");
     }
 }

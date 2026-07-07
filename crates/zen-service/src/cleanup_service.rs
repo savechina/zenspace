@@ -102,15 +102,27 @@ pub fn clean_cache() -> Result<(), ServiceError> {
         }
     };
 
-    let _ = run_cleanup_cmd("gem", &["cleanup"]);
-    let _ = run_cleanup_cmd("brew", &["cleanup"]);
-    let _ = run_cleanup_cmd(
+    if let Err(e) = run_cleanup_cmd("gem", &["cleanup"]) {
+        tracing::debug!(error = %e, "gem cleanup skipped");
+    }
+    if let Err(e) = run_cleanup_cmd("brew", &["cleanup"]) {
+        tracing::debug!(error = %e, "brew cleanup skipped");
+    }
+    if let Err(e) = run_cleanup_cmd(
         "go",
         &["clean", "-cache", "-modcache", "-testcache", "-fuzzcache"],
-    );
-    let _ = run_cleanup_cmd("poetry", &["cache", "clear", "--all", "pypi"]);
-    let _ = run_cleanup_cmd("uv", &["cache", "prune"]);
-    let _ = run_cleanup_cmd("pip", &["cache", "purge"]);
+    ) {
+        tracing::debug!(error = %e, "go cleanup skipped");
+    }
+    if let Err(e) = run_cleanup_cmd("poetry", &["cache", "clear", "--all", "pypi"]) {
+        tracing::debug!(error = %e, "poetry cache clear skipped");
+    }
+    if let Err(e) = run_cleanup_cmd("uv", &["cache", "prune"]) {
+        tracing::debug!(error = %e, "uv cache prune skipped");
+    }
+    if let Err(e) = run_cleanup_cmd("pip", &["cache", "purge"]) {
+        tracing::debug!(error = %e, "pip cache purge skipped");
+    }
 
     let cargo_cache_path = home.join(".cargo/registry");
     if cargo_cache_path.exists() {

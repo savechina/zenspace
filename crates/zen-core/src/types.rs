@@ -461,7 +461,9 @@ impl SessionEntity {
             .to_string_lossy()
             .to_string();
         if let Ok(idx) = SessionIndex::open(db_dir) {
-            let _ = idx.reconcile(&session.id, &relative);
+            if let Err(e) = idx.reconcile(&session.id, &relative) {
+                tracing::warn!(error = %e, session_id = %session.id, "failed to reconcile session index entry");
+            }
         }
         Some(session)
     }

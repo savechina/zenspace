@@ -118,7 +118,9 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
                     response.len() / 4
                 );
                 tracing::debug!(agent = %session.agent_name, "writing daily log entry for CLI chat");
-                let _ = zen_memory::journal::Journal::create_entry(&paths, &summary);
+                if let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary) {
+                    tracing::warn!(error = %e, "failed to write daily journal entry for CLI chat");
+                }
             }
 
             Ok(())

@@ -103,10 +103,10 @@ impl ZenWorker for EntityExtractorWorker {
         let client = match zen_vault::SqliteClient::open(&state_db).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to open state.db, skipping entity extraction");
+                warn!(error = %e, "failed to open state.db, entity extraction aborted");
                 return Ok(WorkerReport {
                     worker_id: self.id().to_string(),
-                    success: true,
+                    success: false,
                     fact_count: 0,
                     duration_ms: start.elapsed().as_millis() as u64,
                 });

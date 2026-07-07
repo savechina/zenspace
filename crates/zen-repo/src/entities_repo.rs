@@ -341,6 +341,18 @@ impl<'a> EntitiesRepo<'a> {
         Ok(result.map(|row| row.get::<String, _>(0)))
     }
 
+    pub async fn find_entity_by_name(&self, name: &str) -> Result<Option<EntityRow>> {
+        Ok(sqlx::query_as::<_, EntityRow>(
+            "SELECT id, name, entity_type, created_at, domain, last_updated, \
+             description, properties, access_count, last_accessed_at, \
+             confidence, source, promoted_at \
+             FROM entities WHERE name = ?1 COLLATE NOCASE LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(self.client.pool())
+        .await?)
+    }
+
     pub async fn search_entities_fts(&self, query: &str) -> Result<Vec<EntityRow>> {
         let query = query.trim();
         if query.is_empty() {
