@@ -3,7 +3,9 @@ use memvid_core::MemoryCardBuilder;
 use rig_memvid::memvid_core;
 use rig_memvid::{MemoryConfig, MemvidPersistHook, MemvidStore, WritePolicy};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use zen_core::entity_graph::EntityGraphProvider;
 
 /// Minimum confidence threshold for auto-extracted triplets (D9).
 /// Cards from `extract_triplets` below this threshold are filtered out on retrieval.
@@ -12,16 +14,25 @@ pub const TRIPLET_MIN_CONFIDENCE: f32 = 0.8;
 
 pub struct ZenMemvidStore {
     store: MemvidStore,
+    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
 }
 
 impl ZenMemvidStore {
-    pub fn new(memory_path: PathBuf) -> Result<Self> {
+    pub fn new(memory_path: std::path::PathBuf) -> Result<Self> {
         let store = MemvidStore::builder()
             .path(memory_path)
             .enable_lex()
             .open_or_create()?;
 
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            entity_graph: None,
+        })
+    }
+
+    pub fn with_entity_graph(mut self, provider: Arc<dyn EntityGraphProvider>) -> Self {
+        self.entity_graph = Some(provider);
+        self
     }
 
     pub fn into_inner(self) -> MemvidStore {
@@ -33,7 +44,10 @@ impl ZenMemvidStore {
     }
 
     pub fn from_store(store: MemvidStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            entity_graph: None,
+        }
     }
 
     pub fn retrieve(&self, session_id: &str) -> Result<Vec<String>> {
@@ -159,22 +173,9 @@ impl EnrichedMemory {
 
 impl ZenMemvidStore {
     /// Retrieve memory cards enriched with KB entity context.
-    ///
-    /// For each card, attempts to resolve its entity name against the KB
-    /// entity graph (via `EntitiesRepo::find_entity_by_name()`). On match,
-    /// loads description, aliases, and PageRank importance score.
-    ///
-    /// **Graceful degradation**: if `state_db_path` doesn't exist or can't be
-    /// opened, returns cards with `entity_context: None` — the bridge is a
-    /// bonus, not a hard requirement.
-    ///
-    /// # Arguments
-    /// * `session_id` - Session scope for memory retrieval
-    /// * `state_db_path` - Path to state.db (KB entity graph)
     pub async fn retrieve_with_entity_context(
         &self,
         session_id: &str,
-        state_db_path: &Path,
     ) -> Result<Vec<EnrichedMemory>> {
         let cards = self.store.entity_memories(session_id)?;
 
@@ -183,7 +184,7 @@ impl ZenMemvidStore {
             .filter(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE)
             .collect();
 
-        if !state_db_path.exists() {
+        let Some(ref graph) = self.entity_graph else {
             return Ok(filtered
                 .into_iter()
                 .map(|c| EnrichedMemory {
@@ -195,34 +196,13 @@ impl ZenMemvidStore {
                     entity_context: None,
                 })
                 .collect());
-        }
-
-        let client = match zen_repo::SqliteClient::open(state_db_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    path = %state_db_path.display(),
-                    error = %e,
-                    "Failed to open state.db for entity enrichment, falling back to plain retrieval"
-                );
-                return Ok(filtered
-                    .into_iter()
-                    .map(|c| EnrichedMemory {
-                        kind: c.kind.to_string(),
-                        entity: c.entity,
-                        slot: c.slot,
-                        value: c.value,
-                        confidence: f64::from(c.confidence.unwrap_or(1.0)),
-                        entity_context: None,
-                    })
-                    .collect());
-            }
         };
 
-        let repo = zen_repo::EntitiesRepo::new(&client);
-
-        let importance_map: HashMap<String, f64> = match repo.compute_importance(100, 0.85).await {
-            Ok(results) => results.into_iter().map(|r| (r.entity, r.score)).collect(),
+        let importance_map: HashMap<String, f64> = match graph.compute_importance(100, 0.85).await {
+            Ok(results) => results
+                .into_iter()
+                .map(|r| (r.entity_id.clone(), r.score))
+                .collect(),
             Err(e) => {
                 tracing::warn!(error = %e, "PageRank computation failed, using empty importance map");
                 HashMap::new()
@@ -235,17 +215,17 @@ impl ZenMemvidStore {
 
             let mut entity_ctx = None;
             for name in &candidates {
-                if let Ok(Some(entity)) = repo.find_entity_by_name(name).await {
-                    let aliases = repo
-                        .load_aliases_for_entity(&entity.id)
+                if let Ok(Some(summary)) = graph.find_entity_by_name(name).await {
+                    let aliases = graph
+                        .load_aliases(&summary.id)
                         .await
                         .unwrap_or_default();
-                    let importance = importance_map.get(&entity.name).copied().unwrap_or(0.0);
+                    let importance = importance_map.get(&summary.name).copied().unwrap_or(0.0);
                     entity_ctx = Some(EntityContext {
-                        entity_id: entity.id,
-                        name: entity.name,
-                        entity_type: entity.entity_type,
-                        description: entity.description,
+                        entity_id: summary.id,
+                        name: summary.name,
+                        entity_type: summary.entity_type,
+                        description: summary.description,
                         importance_score: importance,
                         aliases,
                     });
@@ -339,6 +319,66 @@ impl ContextProjector {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use zen_core::entity_graph::{EntityGraphProvider, EntitySummary, ImportanceScore, SimpleEntity};
+
+    struct MockEntityGraph {
+        entities: std::collections::HashMap<String, EntitySummary>,
+        importance: std::collections::HashMap<String, f64>,
+    }
+
+    impl MockEntityGraph {
+        fn new() -> Self {
+            Self {
+                entities: std::collections::HashMap::new(),
+                importance: std::collections::HashMap::new(),
+            }
+        }
+
+        fn with_entity(mut self, name: &str, summary: EntitySummary, score: f64) -> Self {
+            self.importance.insert(name.to_string(), score);
+            self.entities.insert(name.to_string(), summary);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EntityGraphProvider for MockEntityGraph {
+        async fn upsert_entity(&self, _entity: &SimpleEntity) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn insert_alias(&self, _alias: &str, _canonical_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn find_entity_by_name(&self, name: &str) -> anyhow::Result<Option<EntitySummary>> {
+            Ok(self.entities.get(name).cloned())
+        }
+        async fn apply_confidence_decay(&self, _half_life_days: f64) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn auto_promote_entities(&self, _threshold: i64) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn compute_importance(
+            &self,
+            _iterations: usize,
+            _damping: f64,
+        ) -> anyhow::Result<Vec<ImportanceScore>> {
+            Ok(self
+                .importance
+                .iter()
+                .map(|(k, &v)| ImportanceScore {
+                    entity_id: k.clone(),
+                    score: v,
+                })
+                .collect())
+        }
+        async fn load_aliases(&self, _entity_id: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn default_memory_config_creation() {
@@ -405,24 +445,21 @@ mod tests {
             .persist_structured_turn("session-1", "user", "I love Rust programming")
             .unwrap();
 
-        let db_path = dir.path().join("state.db");
-        let client = zen_repo::SqliteClient::open(&db_path).await.unwrap();
-        let repo = zen_repo::EntitiesRepo::new(&client);
-        let now = chrono::Utc::now().to_rfc3339();
-        repo.insert_entity_with(
-            "ent-rust",
+        let mock = MockEntityGraph::new().with_entity(
             "Rust",
-            "technology",
-            &now,
-            "A systems programming language",
-            "test",
-            0.9,
-        )
-        .await
-        .unwrap();
+            EntitySummary {
+                id: "ent-rust".to_string(),
+                name: "Rust".to_string(),
+                entity_type: "technology".to_string(),
+                description: "A systems programming language".to_string(),
+                confidence: 0.9,
+            },
+            0.85,
+        );
 
+        let store = store.with_entity_graph(std::sync::Arc::new(mock));
         let enriched = store
-            .retrieve_with_entity_context("session-1", &db_path)
+            .retrieve_with_entity_context("session-1")
             .await
             .unwrap();
 
@@ -453,16 +490,15 @@ mod tests {
             .persist_structured_turn("session-2", "user", "Hello world")
             .unwrap();
 
-        let fake_path = dir.path().join("nonexistent.db");
         let enriched = store
-            .retrieve_with_entity_context("session-2", &fake_path)
+            .retrieve_with_entity_context("session-2")
             .await
             .unwrap();
 
         assert!(!enriched.is_empty());
         assert!(
             enriched.iter().all(|e| e.entity_context.is_none()),
-            "all memories should have None context when DB is missing"
+            "all memories should have None context when no provider is set"
         );
     }
 }

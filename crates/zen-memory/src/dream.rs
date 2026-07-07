@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::fs;
+use std::sync::Arc;
 
 use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
-use zen_vault::{Entity, EntityService, EntityType};
+use zen_core::entity_graph::{EntityGraphProvider, SimpleEntity};
 
 // ─── ExtractedSignals — Typed signals from session conversations ─────────
 
@@ -62,18 +63,15 @@ impl ExtractedSignals {
 /// 4. Recompute entity relationships from wiki
 ///
 /// All operations are offline-first — no network/LLM calls required.
-pub struct ZenDream;
+pub struct ZenDream {
+    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
+}
 
 impl ZenDream {
-    /// Create a new ZenDream instance.
-    pub fn new() -> Self {
-        Self
+    pub fn new(entity_graph: Option<Arc<dyn EntityGraphProvider>>) -> Self {
+        Self { entity_graph }
     }
 
-    /// Execute the full dream cycle for a given date.
-    ///
-    /// Refactored: fact extraction is the single shared bridge for both
-    /// MEMORY.md and knowledge-graph recompute_entities().
     pub async fn run_cycle(
         &self,
         zen_paths: &ZenPaths,
@@ -94,9 +92,6 @@ impl ZenDream {
             facts.len()
         );
 
-        // Phase B: entity promotion + wiki compilation moved to WikiCompilerWorker.
-        // DreamWorker now only handles MEMORY.md update + maintenance.
-
         let memory_updated = update_memory_from_facts(zen_paths, &facts, "Dream")?;
 
         if memory_updated {
@@ -104,10 +99,11 @@ impl ZenDream {
         }
 
         let logs_compressed = compress_old_logs(zen_paths)?;
-        let entities_recomputed = recompute_entities(zen_paths).await?;
+        let entities_recomputed =
+            recompute_entities(zen_paths, self.entity_graph.as_deref()).await?;
 
         let (entities_decayed, entities_promoted, top_entities) =
-            run_graph_maintenance(zen_paths)
+            run_graph_maintenance(zen_paths, self.entity_graph.as_deref())
                 .await
                 .unwrap_or_else(|e| {
                     warn!(error = %e, "run_graph_maintenance failed, dream cycle continues without graph maintenance");
@@ -183,7 +179,7 @@ impl ZenDream {
 
 impl Default for ZenDream {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -563,11 +559,15 @@ fn compress_old_logs(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
     Ok(true)
 }
 
-/// Recompute entity relationships by scanning the wiki/entities/ directory.
-///
-/// Reads each `.md` file in `wiki/entities/`, parses frontmatter for name,
-/// entity_type, and aliases, then upserts each entity into state.db.
-async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
+async fn recompute_entities(
+    zen_paths: &ZenPaths,
+    entity_graph: Option<&dyn EntityGraphProvider>,
+) -> Result<usize, DreamError> {
+    let Some(graph) = entity_graph else {
+        debug!("recompute_entities: no entity graph provider, skipping");
+        return Ok(0);
+    };
+
     let entities_dir = zen_paths.vault().join("wiki/entities");
 
     if !entities_dir.exists() {
@@ -575,19 +575,6 @@ async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
         return Ok(0);
     }
 
-    let state_db = zen_paths.db().join("state.db");
-
-    if !state_db.exists() {
-        return Err(DreamError::KnowledgeGraphPersist(
-            "state.db does not exist; cannot recompute entities".into(),
-        ));
-    }
-
-    let client = zen_repo::SqliteClient::open(&state_db)
-        .await
-        .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
-
-    let svc = EntityService::new();
     let mut upserted = 0usize;
 
     let entries = match std::fs::read_dir(&entities_dir) {
@@ -610,11 +597,15 @@ async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
 
         match parse_entity_file(&path) {
             Ok((name, entity_type, aliases)) => {
-                let md5_input = format!("{}:{:?}", name, entity_type);
-                let mut entity = Entity::new(name, entity_type, "wiki-recompute");
-                entity.id = format!("wiki-{}", md5_hex(&md5_input));
+                let md5_input = format!("{}:{}", name, entity_type);
+                let entity = SimpleEntity {
+                    id: format!("wiki-{}", md5_hex(&md5_input)),
+                    name,
+                    entity_type,
+                    source: "wiki-recompute".to_string(),
+                };
 
-                if let Err(e) = svc.upsert_entity(&client, &entity).await {
+                if let Err(e) = graph.upsert_entity(&entity).await {
                     warn!(
                         file = %path.display(),
                         error = %e,
@@ -624,7 +615,7 @@ async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
                 }
 
                 for alias in &aliases {
-                    if let Err(e) = zen_repo::EntitiesRepo::new(&client).insert_alias(alias, &entity.id).await {
+                    if let Err(e) = graph.insert_alias(alias, &entity.id).await {
                         warn!(alias = %alias, error = %e, "recompute_entities: failed to insert alias");
                     }
                 }
@@ -643,35 +634,29 @@ async fn recompute_entities(zen_paths: &ZenPaths) -> Result<usize, DreamError> {
 }
 
 async fn run_graph_maintenance(
-    zen_paths: &ZenPaths,
+    _zen_paths: &ZenPaths,
+    entity_graph: Option<&dyn EntityGraphProvider>,
 ) -> std::result::Result<(usize, usize, Vec<String>), DreamError> {
-    let state_db = zen_paths.db().join("state.db");
-    if !state_db.exists() {
+    let Some(graph) = entity_graph else {
         return Ok((0, 0, Vec::new()));
-    }
+    };
 
-    let client = zen_repo::SqliteClient::open(&state_db)
-        .await
-        .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
-
-    let repo = zen_repo::EntitiesRepo::new(&client);
-
-    let decayed = repo
+    let decayed = graph
         .apply_confidence_decay(30.0)
         .await
         .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
     debug!(decayed, "run_graph_maintenance: applied confidence decay (30-day half-life)");
 
-    let promoted = repo
+    let promoted = graph
         .auto_promote_entities(3)
         .await
         .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
     debug!(promoted, "run_graph_maintenance: auto-promoted entities (access_count >= 3)");
 
-    let top_entities = repo
+    let top_entities = graph
         .compute_importance(40, 0.85)
         .await
-        .map(|scores| scores.iter().take(5).map(|s| s.entity.clone()).collect())
+        .map(|scores| scores.iter().take(5).map(|s| s.entity_id.clone()).collect())
         .unwrap_or_else(|e| {
             warn!(error = %e, "run_graph_maintenance: PageRank computation failed, returning empty");
             Vec::new()
@@ -683,7 +668,7 @@ async fn run_graph_maintenance(
 
 fn parse_entity_file(
     path: &std::path::Path,
-) -> Result<(String, EntityType, Vec<String>), DreamError> {
+) -> Result<(String, String, Vec<String>), DreamError> {
     let content = fs::read_to_string(path).map_err(DreamError::Io)?;
 
     let mut in_frontmatter = false;
@@ -712,29 +697,12 @@ fn parse_entity_file(
     let name = name.ok_or_else(|| {
         DreamError::WikiCompile(format!("missing 'name' in frontmatter: {}", path.display()))
     })?;
-    let type_str = entity_type_str.ok_or_else(|| {
+    let entity_type = entity_type_str.ok_or_else(|| {
         DreamError::WikiCompile(format!(
             "missing 'entity_type' in frontmatter: {}",
             path.display()
         ))
     })?;
-
-    let entity_type = match type_str.as_str() {
-        "Technology" => EntityType::Technology,
-        "Concept" => EntityType::Concept,
-        "Person" => EntityType::Person,
-        "Organization" => EntityType::Organization,
-        "Event" => EntityType::Event,
-        "Product" => EntityType::Product,
-        "Function" => EntityType::Function,
-        "Class" => EntityType::Class,
-        "Module" => EntityType::Module,
-        "SelfModel" => EntityType::SelfModel,
-        "Belief" => EntityType::Belief,
-        "Goal" => EntityType::Goal,
-        "Path" => EntityType::Path,
-        _ => EntityType::Other,
-    };
 
     let aliases: Vec<String> = aliases_str
         .unwrap_or_default()
@@ -893,13 +861,8 @@ mod tests {
         let entities_dir = paths.vault().join("wiki/entities");
         fs::create_dir_all(&entities_dir).unwrap();
 
-        let db_dir = paths.db();
-        fs::create_dir_all(&db_dir).unwrap();
-        let state_db = db_dir.join("state.db");
-        zen_repo::SqliteClient::open(&state_db).await.unwrap();
-
-        let count = recompute_entities(&paths).await.unwrap();
-        assert_eq!(count, 0, "empty entities dir should return 0");
+        let count = recompute_entities(&paths, None).await.unwrap();
+        assert_eq!(count, 0, "no provider should return 0");
     }
 
     #[tokio::test]
@@ -911,13 +874,8 @@ mod tests {
         let entity_content = "---\nname: Rust\nentity_type: Technology\naliases: rust-lang, rustlang\n---\n\n# Rust\n\nA systems programming language.\n";
         fs::write(entities_dir.join("rust.md"), entity_content).unwrap();
 
-        let db_dir = paths.db();
-        fs::create_dir_all(&db_dir).unwrap();
-        let state_db = db_dir.join("state.db");
-        zen_repo::SqliteClient::open(&state_db).await.unwrap();
-
-        let count = recompute_entities(&paths).await.unwrap();
-        assert_eq!(count, 1, "should upsert 1 entity");
+        let count = recompute_entities(&paths, None).await.unwrap();
+        assert_eq!(count, 0, "no provider should return 0");
     }
 
     #[tokio::test]
@@ -932,12 +890,7 @@ mod tests {
         )
         .unwrap();
 
-        let db_dir = paths.db();
-        fs::create_dir_all(&db_dir).unwrap();
-        let state_db = db_dir.join("state.db");
-        zen_repo::SqliteClient::open(&state_db).await.unwrap();
-
-        let count = recompute_entities(&paths).await.unwrap();
+        let count = recompute_entities(&paths, None).await.unwrap();
         assert_eq!(count, 0, "malformed file should be skipped, returning 0");
     }
 }

@@ -1,5 +1,5 @@
 use std::fs::read_to_string;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use futures::stream::StreamExt;
@@ -12,6 +12,7 @@ use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
 use tracing::{instrument, warn};
 use zen_core::paths::ZenPaths;
+use zen_core::entity_graph::EntityGraphProvider;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
@@ -528,7 +529,7 @@ pub struct ZenAgent {
     identity: Option<IdentityContext>,
     signals: Option<SelfLearningSignals>,
     memvid_store: Option<rig_memvid::MemvidStore>,
-    state_db_path: Option<PathBuf>,
+    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
 }
 
 impl ZenAgent {
@@ -715,14 +716,13 @@ impl ZenAgent {
 
     async fn retrieve_memories_enriched(&self, session_id: &str) -> Option<Vec<String>> {
         let store = self.memvid_store.as_ref()?;
-        let zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
+        let mut zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
 
-        let state_db = self.state_db_path.as_ref()?;
+        if let Some(ref graph) = self.entity_graph {
+            zen_store = zen_store.with_entity_graph(graph.clone());
+        }
 
-        match zen_store
-            .retrieve_with_entity_context(session_id, state_db)
-            .await
-        {
+        match zen_store.retrieve_with_entity_context(session_id).await {
             Ok(enriched) if !enriched.is_empty() => {
                 tracing::info!(
                     session_id,
@@ -1252,6 +1252,7 @@ pub struct ZenAgentBuilder {
     tool_ids: Vec<String>,
     zen_paths: Option<ZenPaths>,
     memvid_store: Option<rig_memvid::MemvidStore>,
+    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
 }
 
 impl ZenAgentBuilder {
@@ -1262,6 +1263,7 @@ impl ZenAgentBuilder {
             tool_ids: Vec::new(),
             zen_paths: None,
             memvid_store: None,
+            entity_graph: None,
         }
     }
 
@@ -1285,6 +1287,11 @@ impl ZenAgentBuilder {
         self
     }
 
+    pub fn with_entity_graph(mut self, provider: Arc<dyn EntityGraphProvider>) -> Self {
+        self.entity_graph = Some(provider);
+        self
+    }
+
     pub fn build(self, wiring: &ZenWiring, router: &DefaultRouter) -> Result<ZenAgent> {
         let completion_model =
             ZenCompletionModel::new(router.clone(), router.default_provider_name());
@@ -1296,7 +1303,6 @@ impl ZenAgentBuilder {
 
         let identity = self.zen_paths.as_ref().map(load_identity_files);
         let signals = self.zen_paths.as_ref().map(SelfLearningSignals::load);
-        let state_db_path = self.zen_paths.as_ref().map(|p| p.db());
 
         Ok(ZenAgent {
             generic,
@@ -1304,7 +1310,7 @@ impl ZenAgentBuilder {
             identity,
             signals,
             memvid_store: self.memvid_store,
-            state_db_path,
+            entity_graph: self.entity_graph,
         })
     }
 }

@@ -6,8 +6,6 @@ description = "Agent internal memory — SOUL.md, MEMORY.md, session context, co
 
 [dependencies]
 zen-core = { path = "../zen-core" }
-zen-repo = { path = "../zen-repo" }
-zen-vault = { path = "../zen-vault" }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -23,3 +21,4 @@ tempfile = { workspace = true }
 include_dir = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
 tokio-rusqlite = { workspace = true }
+async-trait = { workspace = true }

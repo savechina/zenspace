@@ -14,7 +14,7 @@ pub use consolidate::{
     ConsolidationReport, Contradiction, ContradictionDetector, EntityExtractor, RecoveryManager,
     SourceIngester, TransactionScope, WikiCompiler,
 };
-pub use entity::{Entity, EntityData, EntityService, EntityType, RelationType, Relationship};
+pub use entity::{Entity, EntityData, EntityGraphAdapter, EntityService, EntityType, RelationType, Relationship};
 pub use zen_repo::SqliteClient;
 pub use ingest::{
     FeedEntry, IngestResult, RssFetcher, extract_readable_content, fetch_feed, ingest_local_file,

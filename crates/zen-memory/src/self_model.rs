@@ -6,7 +6,6 @@
 //!
 //! Storage: `memories/self-model/{slug}.md`
 
-use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -16,55 +15,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+pub use zen_core::entity_graph::SelfModelLayer;
+
 // ─── Data types ────────────────────────────────────────────────────────
-
-/// The 6-layer introspective typing hierarchy for self-model items.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SelfModelLayer {
-    /// Declarative knowledge (e.g., "knows GTD 5 steps").
-    Knowledge,
-    /// Applied ability (e.g., "writes Rust async").
-    Skill,
-    /// Social/role identity (e.g., "architect", "father").
-    SocialRole,
-    /// Self-concept and identity beliefs (e.g., "long-termist").
-    SelfConcept,
-    /// Behavioral trait (e.g., "honest", "over-reserved").
-    Trait,
-    /// Core motivation (e.g., "achievement-driven").
-    Motivation,
-}
-
-impl fmt::Display for SelfModelLayer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            SelfModelLayer::Knowledge => "knowledge",
-            SelfModelLayer::Skill => "skill",
-            SelfModelLayer::SocialRole => "social_role",
-            SelfModelLayer::SelfConcept => "self_concept",
-            SelfModelLayer::Trait => "trait",
-            SelfModelLayer::Motivation => "motivation",
-        };
-        write!(f, "{s}")
-    }
-}
-
-impl FromStr for SelfModelLayer {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "knowledge" => Ok(SelfModelLayer::Knowledge),
-            "skill" => Ok(SelfModelLayer::Skill),
-            "social_role" => Ok(SelfModelLayer::SocialRole),
-            "self_concept" => Ok(SelfModelLayer::SelfConcept),
-            "trait" => Ok(SelfModelLayer::Trait),
-            "motivation" => Ok(SelfModelLayer::Motivation),
-            _ => Err(anyhow::anyhow!("invalid SelfModelLayer: {s}")),
-        }
-    }
-}
 
 /// A single self-model item across any of the 6 layers.
 ///
@@ -278,7 +231,8 @@ impl SelfModelItem {
         let id = parse_yaml_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
         let layer_str =
             parse_yaml_field(&fm, "layer").ok_or_else(|| anyhow::anyhow!("missing layer field"))?;
-        let layer = SelfModelLayer::from_str(layer_str.trim_matches('"'))?;
+        let layer = SelfModelLayer::from_str(layer_str.trim_matches('"'))
+            .map_err(|e| anyhow::anyhow!(e))?;
         let name = parse_yaml_field(&fm, "name")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();

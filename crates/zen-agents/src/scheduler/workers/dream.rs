@@ -47,7 +47,24 @@ impl ZenWorker for DreamWorker {
         let paths = ZenPaths::detect()?;
         let today = Utc::now().date_naive();
 
-        let report = ZenDream::new().run_cycle(&paths, today).await?;
+        let state_db = paths.db().join("state.db");
+        let entity_graph = if state_db.exists() {
+            match zen_repo::SqliteClient::open(&state_db).await {
+                Ok(client) => {
+                    let adapter = zen_vault::EntityGraphAdapter::from_client(client);
+                    Some(std::sync::Arc::new(adapter)
+                        as std::sync::Arc<dyn zen_core::entity_graph::EntityGraphProvider>)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open state.db for dream cycle");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let report = ZenDream::new(entity_graph).run_cycle(&paths, today).await?;
 
         info!(
             "dream cycle: facts={}, memory={}, logs={}, entities={}",
