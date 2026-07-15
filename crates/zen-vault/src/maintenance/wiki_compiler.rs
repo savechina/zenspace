@@ -106,13 +106,13 @@ impl WikiCompilerSkill {
         for tag in tags {
             let tag_lower = tag.to_lowercase();
             if TECH_KEYWORDS.iter().any(|k| k == &tag_lower.as_str()) {
-                return "entities";
+                return "notions";
             }
         }
 
         for word in TECH_KEYWORDS {
             if content_lower.contains(word) {
-                return "entities";
+                return "notions";
             }
         }
 
@@ -238,7 +238,7 @@ impl Skill for WikiCompilerSkill {
     }
 
     fn description(&self) -> &str {
-        "Compile wiki pages from extracted entities, generates markdown files with wikilinks"
+        "Compile wiki pages from extracted notions, generates markdown files with wikilinks"
     }
 
     fn applies(&self, ctx: &InvestigationContext) -> bool {
@@ -342,7 +342,7 @@ mod tests {
         let skill = WikiCompilerSkill::new(tmp.path().to_path_buf());
         let notes = vec![make_note("note-1", "# Rust", vec![])];
         let pages = skill.compile_pages(&notes).unwrap();
-        assert!(pages[0].path.to_string_lossy().starts_with("entities/"));
+        assert!(pages[0].path.to_string_lossy().starts_with("notions/technology/"));
     }
 
     #[test]

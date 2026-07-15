@@ -193,7 +193,7 @@ const SPLASH_LOGO_3D: &str = r#"
  ░░░░░░░  ░░░░░░░  ░░    ░░░░   ░░░░░░░  ░░    ░░  ░░         ░░░░░░  ░░░░░░░
 "#;
 
-// Front Entity: RGB(43, 160, 152) | Drop Shadow: RGB(6, 106, 143)
+// Front Notion: RGB(43, 160, 152) | Drop Shadow: RGB(6, 106, 143)
 const LOGO_ZENSPACE_HYBRID: &str = r#"
  ███████░ ███████░ ███░   ██░  ███████░ ███████░  ███████░  ███████░ ███████░
     ███░  ██░      ████░  ██░  ██░      ██░   ██░ ██░   ██░ ██░      ██░
@@ -1556,12 +1556,12 @@ Use /thinking to show/hide thinking process."#;
 
     fn save_session_state(&mut self) {
         if let Some(ref id) = self.session_id
-            && let Ok(mut entity) = zen_core::types::SessionEntity::load(id)
+            && let Ok(mut notion) = zen_core::types::SessionRecord::load(id)
         {
-            entity.updated_at = chrono::Utc::now();
-            entity.status = zen_core::types::SessionStatus::Completed;
-            if let Err(e) = entity.save() {
-                tracing::warn!(error = %e, session_id = %id, "failed to save session entity status");
+            notion.updated_at = chrono::Utc::now();
+            notion.status = zen_core::types::SessionStatus::Completed;
+            if let Err(e) = notion.save() {
+                tracing::warn!(error = %e, session_id = %id, "failed to save session notion status");
             }
 
             // Write daily log entry with conversation content
@@ -1570,7 +1570,7 @@ Use /thinking to show/hide thinking process."#;
             }
             let turn_count = self.chat_history.len();
 
-            let mut summary = if entity
+            let mut summary = if notion
                 .title
                 .as_ref()
                 .map(|t| !t.is_empty())
@@ -1578,14 +1578,14 @@ Use /thinking to show/hide thinking process."#;
             {
                 format!(
                     "Agent session: {} agent ({} turns) — \"{}\"\n",
-                    entity.agent_name,
+                    notion.agent_name,
                     turn_count,
-                    entity.title.as_ref().unwrap()
+                    notion.title.as_ref().unwrap()
                 )
             } else {
                 format!(
                     "Agent session: {} agent ({} turns)\n",
-                    entity.agent_name, turn_count
+                    notion.agent_name, turn_count
                 )
             };
 

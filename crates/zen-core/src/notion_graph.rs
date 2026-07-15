@@ -2,30 +2,28 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimpleEntity {
+pub struct SimpleNotion {
     pub id: String,
     pub name: String,
-    pub entity_type: String,
+    pub kind: String,
     pub source: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImportanceScore {
-    pub entity_id: String,
+    pub notion_id: String,
     pub score: f64,
 }
 
 #[derive(Debug, Clone)]
-pub struct EntitySummary {
+pub struct NotionSummary {
     pub id: String,
     pub name: String,
-    pub entity_type: String,
+    pub kind: String,
     pub description: String,
     pub confidence: f64,
 }
 
-/// The 6-layer introspective typing hierarchy for self-model items.
-/// Canonical definition in zen-core; re-exported by zen-memory and zen-vault.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelfModelLayer {
@@ -35,6 +33,8 @@ pub enum SelfModelLayer {
     SelfConcept,
     Trait,
     Motivation,
+    Value,
+    Limit,
 }
 
 impl std::fmt::Display for SelfModelLayer {
@@ -46,6 +46,8 @@ impl std::fmt::Display for SelfModelLayer {
             SelfModelLayer::SelfConcept => "self_concept",
             SelfModelLayer::Trait => "trait",
             SelfModelLayer::Motivation => "motivation",
+            SelfModelLayer::Value => "value",
+            SelfModelLayer::Limit => "limit",
         };
         write!(f, "{s}")
     }
@@ -62,23 +64,23 @@ impl std::str::FromStr for SelfModelLayer {
             "self_concept" => Ok(SelfModelLayer::SelfConcept),
             "trait" => Ok(SelfModelLayer::Trait),
             "motivation" => Ok(SelfModelLayer::Motivation),
+            "value" => Ok(SelfModelLayer::Value),
+            "limit" => Ok(SelfModelLayer::Limit),
             _ => Err(format!("invalid SelfModelLayer: {s}")),
         }
     }
 }
 
-/// Entity graph operations for zen-memory. zen-vault implements this trait;
-/// zen-agents injects the concrete adapter at the wiring layer.
 #[async_trait]
-pub trait EntityGraphProvider: Send + Sync {
-    async fn upsert_entity(&self, entity: &SimpleEntity) -> anyhow::Result<()>;
+pub trait NotionGraphProvider: Send + Sync {
+    async fn upsert_entity(&self, notion: &SimpleNotion) -> anyhow::Result<()>;
 
-    async fn insert_alias(&self, alias: &str, canonical_entity_id: &str) -> anyhow::Result<()>;
+    async fn insert_alias(&self, alias: &str, canonical_notion_id: &str) -> anyhow::Result<()>;
 
     async fn find_entity_by_name(
         &self,
         name: &str,
-    ) -> anyhow::Result<Option<EntitySummary>>;
+    ) -> anyhow::Result<Option<NotionSummary>>;
 
     async fn apply_confidence_decay(&self, half_life_days: f64) -> anyhow::Result<usize>;
 
@@ -90,7 +92,7 @@ pub trait EntityGraphProvider: Send + Sync {
         damping: f64,
     ) -> anyhow::Result<Vec<ImportanceScore>>;
 
-    async fn load_aliases(&self, entity_id: &str) -> anyhow::Result<Vec<String>>;
+    async fn load_aliases(&self, notion_id: &str) -> anyhow::Result<Vec<String>>;
 
     fn is_available(&self) -> bool;
 }

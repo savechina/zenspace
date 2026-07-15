@@ -18,7 +18,7 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
     (
         "Sisyphus",
         &[
-            "zen-entity-extraction",
+            "zen-notion-extraction",
             "zen-wiki-compilation",
             "zen-consolidation-pipeline",
         ],
@@ -27,20 +27,20 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
     ("Hermes", &["zen-consolidation-pipeline"]),
     (
         "Metis",
-        &["zen-entity-extraction", "zen-contradiction-detection"],
+        &["zen-notion-extraction", "zen-contradiction-detection"],
     ),
     ("Momus", &["zen-vault-learning-loop"]),
     (
         "Oracle",
         &[
-            "zen-entity-extraction",
+            "zen-notion-extraction",
             "zen-vault-learning-loop",
             "zen-contradiction-detection",
         ],
     ),
     (
         "Prometheus",
-        &["zen-wiki-compilation", "zen-entity-extraction"],
+        &["zen-wiki-compilation", "zen-notion-extraction"],
     ),
     ("Explore", &["zen-vault-learning-loop"]),
     (
@@ -51,7 +51,7 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
     (
         "Hephaestus",
         &[
-            "zen-entity-extraction",
+            "zen-notion-extraction",
             "zen-wiki-compilation",
             "zen-consolidation-pipeline",
             "zen-contradiction-detection",
@@ -60,7 +60,7 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
     ("Atlas", &["zen-wiki-compilation"]),
     (
         "Zeus",
-        &["zen-entity-extraction", "zen-contradiction-detection"],
+        &["zen-notion-extraction", "zen-contradiction-detection"],
     ),
 ];
 

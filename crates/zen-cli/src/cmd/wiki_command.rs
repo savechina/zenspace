@@ -8,18 +8,18 @@ use zen_core::paths::ZenPaths;
 
 #[derive(Subcommand)]
 pub enum WikiCommands {
-    /// List all wiki entity pages
+    /// List all wiki notion pages
     List,
-    /// Show a wiki page by entity name
+    /// Show a wiki page by notion name
     Show {
-        /// Entity name (slug or display name)
+        /// Notion name (slug or display name)
         name: String,
     },
 }
 
 pub fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
     let paths = ZenPaths::detect()?;
-    let wiki_dir = paths.wiki().join("entities");
+    let wiki_dir = paths.wiki().join("notions");
 
     match operation {
         WikiCommands::List => list_wiki_pages(&wiki_dir),

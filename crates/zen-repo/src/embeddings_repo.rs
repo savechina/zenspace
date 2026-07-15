@@ -1,5 +1,5 @@
 use crate::client::{Result, SqliteClient, SqliteError};
-use crate::types::{InsertEntityEmbeddingRequest, InsertNoteEmbeddingRequest, VecSearchResult};
+use crate::types::{InsertNotionEmbeddingRequest, InsertNoteEmbeddingRequest, VecSearchResult};
 
 pub struct EmbeddingsRepo<'a> {
     client: &'a SqliteClient,
@@ -57,8 +57,8 @@ impl<'a> EmbeddingsRepo<'a> {
         Ok(())
     }
 
-    pub async fn insert_entity_embedding(&self, req: InsertEntityEmbeddingRequest<'_>) -> Result<()> {
-        let entity_id = req.entity_id.to_string();
+    pub async fn insert_entity_embedding(&self, req: InsertNotionEmbeddingRequest<'_>) -> Result<()> {
+        let notion_id = req.notion_id.to_string();
         let blob: Vec<u8> = req
             .embedding
             .iter()
@@ -69,8 +69,8 @@ impl<'a> EmbeddingsRepo<'a> {
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "INSERT OR REPLACE INTO entity_embeddings (entity_id, embedding) VALUES (?1, ?2)",
-                    rusqlite::params![entity_id, blob],
+                    "INSERT OR REPLACE INTO notion_embeddings (notion_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![notion_id, blob],
                 )?;
                 Ok(())
             })

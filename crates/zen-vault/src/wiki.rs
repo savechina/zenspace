@@ -64,7 +64,8 @@ impl WikiStructure {
     /// Create all wiki subdirectories.
     pub fn ensure_directories(&self) -> Result<()> {
         let dirs = [
-            "sources", "entities", "concepts", "coding", "research", "reports",
+            "sources", "notions/technology", "notions/concepts", "coding", "research", "reports",
+            "topics",
         ];
         for dir in &dirs {
             std::fs::create_dir_all(self.base_dir.join(dir))
@@ -187,7 +188,7 @@ mod tests {
         let wiki = WikiStructure::new(tmp.path());
         wiki.ensure_directories().unwrap();
         assert!(tmp.path().join("sources").exists());
-        assert!(tmp.path().join("entities").exists());
-        assert!(tmp.path().join("concepts").exists());
+        assert!(tmp.path().join("notions/technology").exists());
+        assert!(tmp.path().join("notions/concepts").exists());
     }
 }

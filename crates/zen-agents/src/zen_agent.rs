@@ -12,7 +12,7 @@ use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
 use tracing::{instrument, warn};
 use zen_core::paths::ZenPaths;
-use zen_core::entity_graph::EntityGraphProvider;
+use zen_core::notion_graph::NotionGraphProvider;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
@@ -57,7 +57,7 @@ impl SelfLearningSignals {
     /// Never panics; uses `tracing::warn` for errors.
     ///
     /// Also wires `ReinforcementTracker` to record retrieval hit-counts for
-    /// each loaded entity (§8.3.3 reinforcement mechanism).
+    /// each loaded notion (§8.3.3 reinforcement mechanism).
     pub fn load(zen_paths: &ZenPaths) -> Self {
         use std::path::PathBuf;
         use zen_memory::priority::ReinforcementTracker;
@@ -529,7 +529,7 @@ pub struct ZenAgent {
     identity: Option<IdentityContext>,
     signals: Option<SelfLearningSignals>,
     memvid_store: Option<rig_memvid::MemvidStore>,
-    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
+    notion_graph: Option<Arc<dyn NotionGraphProvider>>,
 }
 
 impl ZenAgent {
@@ -718,8 +718,8 @@ impl ZenAgent {
         let store = self.memvid_store.as_ref()?;
         let mut zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
 
-        if let Some(ref graph) = self.entity_graph {
-            zen_store = zen_store.with_entity_graph(graph.clone());
+        if let Some(ref graph) = self.notion_graph {
+            zen_store = zen_store.with_notion_graph(graph.clone());
         }
 
         match zen_store.retrieve_with_entity_context(session_id).await {
@@ -727,7 +727,7 @@ impl ZenAgent {
                 tracing::info!(
                     session_id,
                     count = enriched.len(),
-                    "Enriched memories retrieved (KB entity context)"
+                    "Enriched memories retrieved (KB notion context)"
                 );
                 Some(enriched.iter().map(|e| e.format_enriched()).collect())
             }
@@ -1252,7 +1252,7 @@ pub struct ZenAgentBuilder {
     tool_ids: Vec<String>,
     zen_paths: Option<ZenPaths>,
     memvid_store: Option<rig_memvid::MemvidStore>,
-    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
+    notion_graph: Option<Arc<dyn NotionGraphProvider>>,
 }
 
 impl ZenAgentBuilder {
@@ -1263,7 +1263,7 @@ impl ZenAgentBuilder {
             tool_ids: Vec::new(),
             zen_paths: None,
             memvid_store: None,
-            entity_graph: None,
+            notion_graph: None,
         }
     }
 
@@ -1287,8 +1287,8 @@ impl ZenAgentBuilder {
         self
     }
 
-    pub fn with_entity_graph(mut self, provider: Arc<dyn EntityGraphProvider>) -> Self {
-        self.entity_graph = Some(provider);
+    pub fn with_notion_graph(mut self, provider: Arc<dyn NotionGraphProvider>) -> Self {
+        self.notion_graph = Some(provider);
         self
     }
 
@@ -1310,7 +1310,7 @@ impl ZenAgentBuilder {
             identity,
             signals,
             memvid_store: self.memvid_store,
-            entity_graph: self.entity_graph,
+            notion_graph: self.notion_graph,
         })
     }
 }

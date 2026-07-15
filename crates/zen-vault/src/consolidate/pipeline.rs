@@ -10,7 +10,7 @@ use rig_compose::workflow::Workflow;
 use tracing::info;
 
 use super::contradiction::ContradictionDetector;
-use super::entity_extraction::EntityExtractor;
+use super::notion_extraction::NotionExtractor;
 use super::wiki_compile::WikiCompiler;
 
 use crate::note::{Note, parse_frontmatter};
@@ -24,7 +24,7 @@ pub struct ConsolidationReport {
 }
 
 pub struct ConsolidationPipeline {
-    extractor: EntityExtractor,
+    extractor: NotionExtractor,
     compiler: WikiCompiler,
     detector: ContradictionDetector,
 }
@@ -32,7 +32,7 @@ pub struct ConsolidationPipeline {
 impl ConsolidationPipeline {
     pub fn new() -> Self {
         Self {
-            extractor: EntityExtractor::new(),
+            extractor: NotionExtractor::new(),
             compiler: WikiCompiler::new(),
             detector: ContradictionDetector::new(),
         }
@@ -46,9 +46,9 @@ impl ConsolidationPipeline {
             "Loaded notes from inbox, starting consolidation pipeline"
         );
 
-        let entities = self.extractor.extract_batch(&notes)?;
-        let entities_extracted = entities.len();
-        info!(entities_extracted, "Entity extraction complete");
+        let notions = self.extractor.extract_batch(&notes)?;
+        let entities_extracted = notions.len();
+        info!(entities_extracted, "Notion extraction complete");
 
         let pages = self.compiler.compile(&notes, wiki_dir)?;
         let wiki_pages_created = pages.len();
@@ -207,7 +207,7 @@ impl Workflow for ConsolidationPipeline {
 
         let outcome1 = self.extractor.execute(&mut ctx, &tools).await?;
         let entities_extracted = if outcome1.confidence_delta > 0.0 {
-            info!("Entity extraction skill completed successfully");
+            info!("Notion extraction skill completed successfully");
             notes_processed.max(1)
         } else {
             0
@@ -379,7 +379,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         assert_eq!(report.notes_processed, 1);
         assert!(
             report.entities_extracted > 0,
-            "Should extract Rust/Tokio entities"
+            "Should extract Rust/Tokio notions"
         );
         assert_eq!(report.wiki_pages_created, 1, "Should create one wiki page");
         assert_eq!(report.contradictions_found, 0);

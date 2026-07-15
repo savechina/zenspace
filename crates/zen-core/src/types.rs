@@ -90,14 +90,14 @@ impl fmt::Display for SessionStatus {
 /// A single event in a session's `.jsonl` file.
 ///
 /// Each session is a single `<uuid>.jsonl` file containing ordered events:
-///   - `session/meta` (first event) — replaces SessionEntity metadata JSON
+///   - `session/meta` (first event) — replaces SessionRecord metadata JSON
 ///   - `chat/turn` — conversation turns (replaces separate chat.jsonl)
 ///   - future: `tool/call`, `session/status`, etc.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum SessionEvent {
     #[serde(rename = "session/meta")]
-    Meta(SessionEntity),
+    Meta(SessionRecord),
     #[serde(rename = "chat/turn")]
     Turn(ChatTurnEvent),
 }
@@ -114,7 +114,7 @@ pub struct ChatTurnEvent {
 
 impl SessionEvent {
     /// Read the first (meta) event from a `.jsonl` file.
-    pub fn read_meta(path: &std::path::Path) -> Result<SessionEntity> {
+    pub fn read_meta(path: &std::path::Path) -> Result<SessionRecord> {
         let line = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read session file: {}", path.display()))?
             .lines()
@@ -124,7 +124,7 @@ impl SessionEvent {
         match serde_json::from_str::<SessionEvent>(&line)
             .with_context(|| format!("failed to parse session event: {}", path.display()))?
         {
-            SessionEvent::Meta(entity) => Ok(entity),
+            SessionEvent::Meta(notion) => Ok(notion),
             _ => anyhow::bail!(
                 "expected session/meta event as first line in {}",
                 path.display()
@@ -134,8 +134,8 @@ impl SessionEvent {
 
     /// Write a `session/meta` event as the first line of a `.jsonl` file.
     /// If the file already exists, the meta line is overwritten (line 1).
-    pub fn write_meta(path: &std::path::Path, entity: &SessionEntity) -> Result<()> {
-        let meta_line = serde_json::to_string(&SessionEvent::Meta(entity.clone()))
+    pub fn write_meta(path: &std::path::Path, notion: &SessionRecord) -> Result<()> {
+        let meta_line = serde_json::to_string(&SessionEvent::Meta(notion.clone()))
             .context("failed to serialize session/meta event")?;
 
         if path.exists() {
@@ -163,32 +163,32 @@ impl SessionEvent {
     }
 }
 
-/// Read a SessionEntity from a file, detecting format by extension.
+/// Read a SessionRecord from a file, detecting format by extension.
 ///
 /// - `.jsonl` → parse first line as `session/meta` event
-/// - `.json` → legacy format, parse whole file as `SessionEntity`
-pub fn load_session_from_file(path: &std::path::Path) -> Result<SessionEntity> {
+/// - `.json` → legacy format, parse whole file as `SessionRecord`
+pub fn load_session_from_file(path: &std::path::Path) -> Result<SessionRecord> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("jsonl") => SessionEvent::read_meta(path),
         _ => {
             let json = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read session file: {}", path.display()))?;
-            serde_json::from_str::<SessionEntity>(&json)
+            serde_json::from_str::<SessionRecord>(&json)
                 .with_context(|| format!("failed to parse session file: {}", path.display()))
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// SessionEntity (FR-078, FR-081) — canonical definition
+// SessionRecord (FR-078, FR-081) — canonical definition
 // ---------------------------------------------------------------------------
 
-/// Session entity persisted as the first `session/meta` event in `<id>.jsonl`.
+/// Session notion persisted as the first `session/meta` event in `<id>.jsonl`.
 ///
 /// Per data-model.md §3.9: JSONL file is primary storage (Tier 2 derived cache).
 /// SQLite table is derived from these files for fast queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionEntity {
+pub struct SessionRecord {
     /// Unique session identifier (UUID v7).
     pub id: String,
     /// Agent name from zen-agents registry.
@@ -211,8 +211,8 @@ pub struct SessionEntity {
     pub workspace: String,
 }
 
-impl SessionEntity {
-    /// Create a new session entity with the given agent name and workspace.
+impl SessionRecord {
+    /// Create a new session notion with the given agent name and workspace.
     pub fn new(agent_name: &str, workspace: &str) -> Self {
         let now = Utc::now();
         Self {
@@ -297,7 +297,7 @@ impl SessionEntity {
         Ok(file_path)
     }
 
-    pub fn load(id: &str) -> Result<SessionEntity> {
+    pub fn load(id: &str) -> Result<SessionRecord> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
 
         // Fast path: SessionIndex → .jsonl
@@ -332,7 +332,7 @@ impl SessionEntity {
             .map(|p| {
                 let json = std::fs::read_to_string(&p)
                     .with_context(|| format!("failed to read session file: {}", p.display()))?;
-                serde_json::from_str::<SessionEntity>(&json)
+                serde_json::from_str::<SessionRecord>(&json)
                     .with_context(|| format!("failed to parse session file: {}", p.display()))
             })
             .transpose()
@@ -349,7 +349,7 @@ impl SessionEntity {
         if flat_path.exists() {
             let json = std::fs::read_to_string(&flat_path)
                 .with_context(|| format!("failed to read session file: {}", flat_path.display()))?;
-            let session: SessionEntity = serde_json::from_str(&json).with_context(|| {
+            let session: SessionRecord = serde_json::from_str(&json).with_context(|| {
                 format!("failed to parse session file: {}", flat_path.display())
             })?;
             return Ok(session);
@@ -399,10 +399,10 @@ impl SessionEntity {
         Ok(results)
     }
 
-    pub fn list() -> Result<Vec<SessionEntity>> {
+    pub fn list() -> Result<Vec<SessionRecord>> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
         let sessions_root = paths.sessions();
-        let mut sessions: Vec<SessionEntity> = Vec::new();
+        let mut sessions: Vec<SessionRecord> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
         if let Ok(index) = SessionIndex::open(&paths.db())
@@ -440,7 +440,7 @@ impl SessionEntity {
         sessions_root: &PathBuf,
         id: &str,
         db_dir: &PathBuf,
-    ) -> Option<SessionEntity> {
+    ) -> Option<SessionRecord> {
         let result = Self::scan_date_dirs(sessions_root, id, "jsonl")
             .ok()
             .and_then(|paths| paths.into_iter().next());
@@ -453,7 +453,7 @@ impl SessionEntity {
         let session = if found_path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             SessionEvent::read_meta(&found_path).ok()?
         } else {
-            serde_json::from_str::<SessionEntity>(&json).ok()?
+            serde_json::from_str::<SessionRecord>(&json).ok()?
         };
         let relative = found_path
             .strip_prefix(sessions_root)
@@ -470,7 +470,7 @@ impl SessionEntity {
 
     fn scan_filesystem_sessions(
         sessions_root: &PathBuf,
-        sessions: &mut Vec<SessionEntity>,
+        sessions: &mut Vec<SessionRecord>,
         seen_ids: &mut std::collections::HashSet<String>,
     ) -> Result<()> {
         Self::walk_sessions_dir(sessions_root, sessions, seen_ids)?;
@@ -479,7 +479,7 @@ impl SessionEntity {
 
     fn walk_sessions_dir(
         dir: &PathBuf,
-        sessions: &mut Vec<SessionEntity>,
+        sessions: &mut Vec<SessionRecord>,
         seen_ids: &mut std::collections::HashSet<String>,
     ) -> Result<()> {
         for entry in std::fs::read_dir(dir)
@@ -511,7 +511,7 @@ impl SessionEntity {
     }
 
     /// List only active sessions.
-    pub fn list_active() -> Result<Vec<SessionEntity>> {
+    pub fn list_active() -> Result<Vec<SessionRecord>> {
         Ok(Self::list()?
             .into_iter()
             .filter(|s| s.status == SessionStatus::Active)
@@ -552,7 +552,7 @@ impl SessionEntity {
 /// Parse the creation datetime from a UUID v7 session ID string.
 ///
 /// UUID v7 embeds a Unix millisecond timestamp in its first 48 bits.
-/// This extracts it without needing the `SessionEntity.created_at` field.
+/// This extracts it without needing the `SessionRecord.created_at` field.
 ///
 /// Returns `None` if the string is not a valid UUID v7.
 pub fn session_created_at_from_id(session_id: &str) -> Option<DateTime<Utc>> {
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_session_entity_new_has_correct_defaults() {
-        let session = SessionEntity::new("test-agent", "/workspace");
+        let session = SessionRecord::new("test-agent", "/workspace");
         assert_eq!(session.agent_name, "test-agent");
         assert_eq!(session.workspace, "/workspace");
         assert_eq!(session.sensitivity_policy, Sensitivity::Private);
@@ -889,9 +889,9 @@ mod tests {
 
     #[test]
     fn test_session_entity_serialization_roundtrip() {
-        let session = SessionEntity::new("Sisyphus-Junior", "/tmp");
+        let session = SessionRecord::new("Sisyphus-Junior", "/tmp");
         let json = serde_json::to_string(&session).unwrap();
-        let loaded: SessionEntity = serde_json::from_str(&json).unwrap();
+        let loaded: SessionRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.agent_name, "Sisyphus-Junior");
         assert_eq!(loaded.workspace, "/tmp");
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_session_state_transitions() {
-        let mut session = SessionEntity::new("test", "/workspace");
+        let mut session = SessionRecord::new("test", "/workspace");
         assert_eq!(session.status, SessionStatus::Active);
 
         session.compact().unwrap();
@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn test_session_save_to_date_path() {
         let root = session_test_dir();
-        let session = SessionEntity::new("agent-x", "/ws");
+        let session = SessionRecord::new("agent-x", "/ws");
         let path = session.save().unwrap();
 
         let year = session.created_at.format("%Y").to_string();
@@ -957,10 +957,10 @@ mod tests {
     #[test]
     fn test_session_load_roundtrip() {
         session_test_dir();
-        let session = SessionEntity::new("agent-y", "/ws2");
+        let session = SessionRecord::new("agent-y", "/ws2");
         session.save().unwrap();
 
-        let loaded = SessionEntity::load(&session.id).unwrap();
+        let loaded = SessionRecord::load(&session.id).unwrap();
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.agent_name, "agent-y");
         assert_eq!(loaded.workspace, "/ws2");
@@ -972,7 +972,7 @@ mod tests {
         let sessions_root = root.join("sessions");
 
         // Legacy flat .json file
-        let flat_session = SessionEntity::new("flat-agent", "/flat-ws");
+        let flat_session = SessionRecord::new("flat-agent", "/flat-ws");
         let flat_path = sessions_root.join(format!("{}.json", flat_session.id));
         std::fs::write(
             &flat_path,
@@ -981,10 +981,10 @@ mod tests {
         .unwrap();
 
         // New .jsonl file via save()
-        let date_session = SessionEntity::new("date-agent", "/date-ws");
+        let date_session = SessionRecord::new("date-agent", "/date-ws");
         date_session.save().unwrap();
 
-        let all = SessionEntity::list().unwrap();
+        let all = SessionRecord::list().unwrap();
         let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
         assert!(
             ids.contains(&flat_session.id.as_str()),
@@ -1030,12 +1030,12 @@ mod tests {
         let root = session_test_dir();
         let sessions_root = root.join("sessions");
 
-        let mut session = SessionEntity::new("legacy-agent", "/legacy-ws");
+        let mut session = SessionRecord::new("legacy-agent", "/legacy-ws");
         session.title = Some("Legacy Session".to_string());
         let flat_path = sessions_root.join(format!("{}.json", session.id));
         std::fs::write(&flat_path, serde_json::to_string_pretty(&session).unwrap()).unwrap();
 
-        let loaded = SessionEntity::load(&session.id).unwrap();
+        let loaded = SessionRecord::load(&session.id).unwrap();
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.agent_name, "legacy-agent");
         assert_eq!(loaded.title.as_deref(), Some("Legacy Session"));
@@ -1046,13 +1046,13 @@ mod tests {
         let root = session_test_dir();
         let db_dir = root.join("data");
 
-        let session = SessionEntity::new("repair-agent", "/repair-ws");
+        let session = SessionRecord::new("repair-agent", "/repair-ws");
         session.save().unwrap();
 
         let index = crate::session_index::SessionIndex::open(&db_dir).unwrap();
         index.reconcile(&session.id, "wrong/path.jsonl").unwrap();
 
-        let all = SessionEntity::list().unwrap();
+        let all = SessionRecord::list().unwrap();
         assert!(
             all.iter().any(|s| s.id == session.id),
             "repaired session should be in list"

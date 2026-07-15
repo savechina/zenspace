@@ -10,7 +10,7 @@ use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_provider::{DefaultRouter, LlmRouterExt};
-use zen_vault::entity::{Entity, EntityService, EntityType};
+use zen_vault::notion::{Notion, NotionService, NotionKind};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
@@ -38,11 +38,11 @@ const TECH_KEYWORDS: &[&str] = &[
 
 const MIN_CONTENT_LEN: usize = 20;
 
-pub struct EntityExtractorWorker {
+pub struct NotionExtractorWorker {
     scheduled: Option<&'static str>,
 }
 
-impl EntityExtractorWorker {
+impl NotionExtractorWorker {
     pub fn new() -> Self {
         Self { scheduled: None }
     }
@@ -53,20 +53,20 @@ impl EntityExtractorWorker {
     }
 }
 
-impl Default for EntityExtractorWorker {
+impl Default for NotionExtractorWorker {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait::async_trait]
-impl ZenWorker for EntityExtractorWorker {
+impl ZenWorker for NotionExtractorWorker {
     fn id(&self) -> &'static str {
-        "entity-extractor"
+        "notion-extractor"
     }
 
     fn description(&self) -> &'static str {
-        "Scan journal entries, extract entities via LLM with keyword fallback, upsert to state.db"
+        "Scan journal entries, extract notions via LLM with keyword fallback, upsert to state.db"
     }
 
     fn schedule(&self) -> &'static str {
@@ -103,7 +103,7 @@ impl ZenWorker for EntityExtractorWorker {
         let client = match zen_vault::SqliteClient::open(&state_db).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to open state.db, entity extraction aborted");
+                warn!(error = %e, "failed to open state.db, notion extraction aborted");
                 return Ok(WorkerReport {
                     worker_id: self.id().to_string(),
                     success: false,
@@ -112,9 +112,9 @@ impl ZenWorker for EntityExtractorWorker {
                 });
             }
         };
-        let svc = EntityService::new();
+        let svc = NotionService::new();
 
-        let mut known = svc.load_known_entity_names(&client).await.unwrap_or_default();
+        let mut known = svc.load_known_notion_names(&client).await.unwrap_or_default();
         for kw in TECH_KEYWORDS {
             known.insert((*kw).to_string());
         }
@@ -122,7 +122,7 @@ impl ZenWorker for EntityExtractorWorker {
         let router: Option<DefaultRouter> = match load_config() {
             Ok(c) => Some(DefaultRouter::from_agentic(c)),
             Err(e) => {
-                warn!(error = %e, "failed to load config for LLM entity extraction, falling back to keyword-only");
+                warn!(error = %e, "failed to load config for LLM notion extraction, falling back to keyword-only");
                 None
             }
         };
@@ -140,11 +140,11 @@ impl ZenWorker for EntityExtractorWorker {
                     total_entities += count;
                     processed += 1;
                     if count > 0 {
-                        info!(path = %entry_path.display(), entities = count, "entities extracted from journal entry");
+                        info!(path = %entry_path.display(), notions = count, "notions extracted from journal entry");
                     }
                 }
                 Err(e) => {
-                    warn!(path = %entry_path.display(), error = %e, "failed to extract entities from journal entry");
+                    warn!(path = %entry_path.display(), error = %e, "failed to extract notions from journal entry");
                 }
             }
         }
@@ -152,11 +152,11 @@ impl ZenWorker for EntityExtractorWorker {
         if processed > 0 {
             info!(
                 processed,
-                entities = total_entities,
-                "entity-extractor tick complete"
+                notions = total_entities,
+                "notion-extractor tick complete"
             );
         } else {
-            debug!("entity-extractor tick: {} entries scanned, none needed processing (all previously extracted or empty)", entries.len());
+            debug!("notion-extractor tick: {} entries scanned, none needed processing (all previously extracted or empty)", entries.len());
         }
 
         Ok(WorkerReport {
@@ -170,7 +170,7 @@ impl ZenWorker for EntityExtractorWorker {
 
 async fn process_entry(
     entry_path: &std::path::Path,
-    svc: &EntityService,
+    svc: &NotionService,
     client: &zen_vault::SqliteClient,
     known: &HashSet<String>,
     router: Option<DefaultRouter>,
@@ -200,13 +200,13 @@ async fn process_entry(
 
         match llm_result {
             Ok(llm_entities) if !llm_entities.is_empty() => {
-                info!(path = %entry_path.display(), count = llm_entities.len(), "LLM entity extraction succeeded");
+                info!(path = %entry_path.display(), count = llm_entities.len(), "LLM notion extraction succeeded");
                 let count = upsert_entities(llm_entities, svc, client).await?;
                 append_extracted_marker(entry_path, "llm")?;
                 return Ok(count);
             }
             Ok(_) => {
-                debug!(path = %entry_path.display(), "LLM returned no entities, falling back to keyword");
+                debug!(path = %entry_path.display(), "LLM returned no notions, falling back to keyword");
             }
             Err(e) => {
                 warn!(path = %entry_path.display(), error = %e, "LLM extraction failed, falling back to keyword");
@@ -223,14 +223,14 @@ async fn process_entry(
     }
 
     let mut upserted = 0usize;
-    for (entity_name, fact_list) in &matched {
-        let canonical = entity_name.to_lowercase();
-        let entity = Entity::new(canonical, EntityType::Technology, "entity-extractor");
-        if let Err(e) = svc.upsert_entity(client, &entity).await {
-            warn!(entity = %entity_name, error = %e, "failed to upsert entity");
+    for (notion_name, fact_list) in &matched {
+        let canonical = notion_name.to_lowercase();
+        let notion = Notion::new(canonical, NotionKind::Technology, "notion-extractor");
+        if let Err(e) = svc.upsert_entity(client, &notion).await {
+            warn!(notion = %notion_name, error = %e, "failed to upsert notion");
             continue;
         }
-        debug!(entity = %entity_name, facts = fact_list.len(), "upserted entity");
+        debug!(notion = %notion_name, facts = fact_list.len(), "upserted notion");
         upserted += 1;
     }
 
@@ -243,7 +243,7 @@ fn extract_entities_via_llm(
     _journal_content: &str,
     facts: &[String],
     router: DefaultRouter,
-) -> Result<Vec<(String, EntityType)>> {
+) -> Result<Vec<(String, NotionKind)>> {
     let facts_text = facts
         .iter()
         .map(|f| format!("- {f}"))
@@ -254,24 +254,24 @@ fn extract_entities_via_llm(
     let facts_text = sanitizer.strip_dangerous_patterns(&facts_text);
 
     let prompt = format!(
-        r#"Extract entities from these development session facts. Identify technologies, concepts, tools, and patterns mentioned.
+        r#"Extract notions from these development session facts. Identify technologies, concepts, tools, and patterns mentioned.
 
 Facts:
 {facts_text}
 
 Respond with ONLY a JSON object:
 {{
-  "entities": [
+  "notions": [
     {{"name": "Rust", "type": "Technology"}},
     {{"name": "migration patterns", "type": "Concept"}}
   ]
 }}
 
 Types: Technology, Concept, Person, Organization, Function, Module, Product, Event, Other.
-Only include entities explicitly mentioned in the facts. If nothing meaningful, return empty array."#
+Only include notions explicitly mentioned in the facts. If nothing meaningful, return empty array."#
     );
 
-    let response = router.complete("entity_extraction", &prompt, Sensitivity::Private)?;
+    let response = router.complete("notion_extraction", &prompt, Sensitivity::Private)?;
 
     let json_str = if let Some(start) = response.find("```json") {
         let after = &response[start + 7..];
@@ -291,50 +291,50 @@ Only include entities explicitly mentioned in the facts. If nothing meaningful, 
     };
 
     let parsed: serde_json::Value = serde_json::from_str(json_str.trim())
-        .context("failed to parse LLM entity extraction response")?;
+        .context("failed to parse LLM notion extraction response")?;
 
-    let mut entities = Vec::new();
-    if let Some(arr) = parsed["entities"].as_array() {
+    let mut notions = Vec::new();
+    if let Some(arr) = parsed["notions"].as_array() {
         for item in arr {
             let name = item["name"].as_str().unwrap_or_default().trim().to_string();
             if name.is_empty() {
                 continue;
             }
-            let entity_type = match item["type"].as_str().unwrap_or("Technology") {
-                "Technology" => EntityType::Technology,
-                "Concept" => EntityType::Concept,
-                "Person" => EntityType::Person,
-                "Organization" => EntityType::Organization,
-                "Function" => EntityType::Function,
-                "Module" => EntityType::Module,
-                "Product" => EntityType::Product,
-                "Event" => EntityType::Event,
-                _ => EntityType::Other,
+            let kind = match item["type"].as_str().unwrap_or("Technology") {
+                "Technology" => NotionKind::Technology,
+                "Concept" => NotionKind::Concept,
+                "Person" => NotionKind::Person,
+                "Organization" => NotionKind::Organization,
+                "Function" => NotionKind::Function,
+                "Module" => NotionKind::Module,
+                "Product" => NotionKind::Product,
+                "Event" => NotionKind::Event,
+                _ => NotionKind::Other,
             };
-            entities.push((name.to_lowercase(), entity_type));
+            notions.push((name.to_lowercase(), kind));
         }
     }
 
-    if !entities.is_empty() {
-        append_llm_entities_to_journal(entry_path, &entities)?;
+    if !notions.is_empty() {
+        append_llm_entities_to_journal(entry_path, &notions)?;
     }
 
-    Ok(entities)
+    Ok(notions)
 }
 
 async fn upsert_entities(
-    entities: Vec<(String, EntityType)>,
-    svc: &EntityService,
+    notions: Vec<(String, NotionKind)>,
+    svc: &NotionService,
     client: &zen_vault::SqliteClient,
 ) -> Result<usize> {
     let mut upserted = 0usize;
-    for (name, entity_type) in &entities {
-        let entity = Entity::new(name.clone(), entity_type.clone(), "entity-extractor");
-        if let Err(e) = svc.upsert_entity(client, &entity).await {
-            warn!(entity = %name, error = %e, "failed to upsert entity");
+    for (name, kind) in &notions {
+        let notion = Notion::new(name.clone(), kind.clone(), "notion-extractor");
+        if let Err(e) = svc.upsert_entity(client, &notion).await {
+            warn!(notion = %name, error = %e, "failed to upsert notion");
             continue;
         }
-        debug!(entity = %name, ?entity_type, "upserted entity via LLM");
+        debug!(notion = %name, ?kind, "upserted notion via LLM");
         upserted += 1;
     }
     Ok(upserted)
@@ -344,10 +344,10 @@ fn match_entities(facts: &[String], known: &HashSet<String>) -> HashMap<String, 
     let mut matched: HashMap<String, Vec<String>> = HashMap::new();
 
     for fact in facts {
-        for entity_name in known {
-            if fact.to_lowercase().contains(&entity_name.to_lowercase()) {
+        for notion_name in known {
+            if fact.to_lowercase().contains(&notion_name.to_lowercase()) {
                 matched
-                    .entry(entity_name.clone())
+                    .entry(notion_name.clone())
                     .or_default()
                     .push(fact.clone());
             }
@@ -422,19 +422,19 @@ fn append_extracted_marker(entry_path: &std::path::Path, source: &str) -> Result
 
 fn append_llm_entities_to_journal(
     entry_path: &std::path::Path,
-    entities: &[(String, EntityType)],
+    notions: &[(String, NotionKind)],
 ) -> Result<()> {
     let content = fs::read_to_string(entry_path)
         .with_context(|| format!("failed to read journal entry: {}", entry_path.display()))?;
 
     let mut section = String::from("\n## LLM Entities\n\n");
-    for (name, entity_type) in entities {
-        section.push_str(&format!("- [{entity_type:?}] {name}\n"));
+    for (name, kind) in notions {
+        section.push_str(&format!("- [{kind:?}] {name}\n"));
     }
 
     let new_content = format!("{content}{section}");
     fs::write(entry_path, new_content)
-        .with_context(|| format!("failed to append LLM entities: {}", entry_path.display()))?;
+        .with_context(|| format!("failed to append LLM notions: {}", entry_path.display()))?;
 
     Ok(())
 }
@@ -520,17 +520,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_db = dir.path().join("state.db");
         let client = zen_vault::SqliteClient::open(&state_db).await.unwrap();
-        let svc = EntityService::new();
+        let svc = NotionService::new();
 
-        let entities = vec![
-            ("rust".to_string(), EntityType::Technology),
-            ("auth".to_string(), EntityType::Concept),
+        let notions = vec![
+            ("rust".to_string(), NotionKind::Technology),
+            ("auth".to_string(), NotionKind::Concept),
         ];
 
-        let count = upsert_entities(entities, &svc, &client).await.unwrap();
+        let count = upsert_entities(notions, &svc, &client).await.unwrap();
         assert_eq!(count, 2);
 
-        let known = svc.load_known_entity_names(&client).await.unwrap();
+        let known = svc.load_known_notion_names(&client).await.unwrap();
         assert!(known.contains("rust"));
         assert!(known.contains("auth"));
     }

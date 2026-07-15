@@ -88,7 +88,7 @@ impl Skill for ConsolidationPipelineSkillAdapter {
     }
 
     fn description(&self) -> &str {
-        "Run the full consolidation pipeline: extract entities, compile wiki pages, detect contradictions"
+        "Run the full consolidation pipeline: extract notions, compile wiki pages, detect contradictions"
     }
 
     fn applies(&self, ctx: &InvestigationContext) -> bool {
@@ -176,7 +176,7 @@ impl ZenWiring {
     /// # Skills registered
     /// - `zen-wiki-compilation` → `WikiCompiler`
     /// - `zen-learning-loop` → `LearningLoop`
-    /// - `zen-entity-extraction` → `EntityExtractor`
+    /// - `zen-notion-extraction` → `NotionExtractor`
     /// - `zen-contradiction-detection` → `ContradictionDetector`
     /// - `zen-consolidation-pipeline` → `ConsolidationPipeline` (via adapter)
     ///
@@ -192,7 +192,7 @@ impl ZenWiring {
 
         skills.register(Arc::new(zen_vault::WikiCompiler::new()));
         skills.register(Arc::new(zen_vault::LearningLoop::new()));
-        skills.register(Arc::new(zen_vault::EntityExtractor::new()));
+        skills.register(Arc::new(zen_vault::NotionExtractor::new()));
         skills.register(Arc::new(zen_vault::ContradictionDetector::new()));
         skills.register(Arc::new(ConsolidationPipelineSkillAdapter));
 
@@ -253,7 +253,7 @@ mod tests {
 
         assert!(wiring.skills.get("zen-wiki-compilation").is_ok());
         assert!(wiring.skills.get("zen-vault-learning-loop").is_ok());
-        assert!(wiring.skills.get("zen-entity-extraction").is_ok());
+        assert!(wiring.skills.get("zen-notion-extraction").is_ok());
         assert!(wiring.skills.get("zen-contradiction-detection").is_ok());
         assert!(wiring.skills.get("zen-consolidation-pipeline").is_ok());
     }
@@ -294,8 +294,8 @@ mod tests {
         let learning = wiring.skills.get("zen-vault-learning-loop").unwrap();
         assert_eq!(learning.id(), "zen-vault-learning-loop");
 
-        let entity = wiring.skills.get("zen-entity-extraction").unwrap();
-        assert_eq!(entity.id(), "zen-entity-extraction");
+        let notion = wiring.skills.get("zen-notion-extraction").unwrap();
+        assert_eq!(notion.id(), "zen-notion-extraction");
 
         let contradiction = wiring.skills.get("zen-contradiction-detection").unwrap();
         assert_eq!(contradiction.id(), "zen-contradiction-detection");

@@ -13,7 +13,7 @@ pub enum ToolPermission {
     Write,
     /// Execute shell commands, run builds
     Exec,
-    /// Search knowledge base, query entity graph
+    /// Search knowledge base, query notion graph
     Search,
     /// Delete files, drop tables (HIGH blast radius)
     Delete,

@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
-use zen_core::entity_graph::{EntityGraphProvider, SimpleEntity};
+use zen_core::notion_graph::{NotionGraphProvider, SimpleNotion};
 
 // ─── ExtractedSignals — Typed signals from session conversations ─────────
 
@@ -60,16 +60,16 @@ impl ExtractedSignals {
 /// 1. Extract durable facts from journal entries (written by SessionJournaler)
 /// 2. Update MEMORY.md with all new durable facts (personal record)
 /// 3. Compress old subconscious logs
-/// 4. Recompute entity relationships from wiki
+/// 4. Recompute notion relationships from wiki
 ///
 /// All operations are offline-first — no network/LLM calls required.
 pub struct ZenDream {
-    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
+    notion_graph: Option<Arc<dyn NotionGraphProvider>>,
 }
 
 impl ZenDream {
-    pub fn new(entity_graph: Option<Arc<dyn EntityGraphProvider>>) -> Self {
-        Self { entity_graph }
+    pub fn new(notion_graph: Option<Arc<dyn NotionGraphProvider>>) -> Self {
+        Self { notion_graph }
     }
 
     pub async fn run_cycle(
@@ -100,10 +100,10 @@ impl ZenDream {
 
         let logs_compressed = compress_old_logs(zen_paths)?;
         let entities_recomputed =
-            recompute_entities(zen_paths, self.entity_graph.as_deref()).await?;
+            recompute_entities(zen_paths, self.notion_graph.as_deref()).await?;
 
         let (entities_decayed, entities_promoted, top_entities) =
-            run_graph_maintenance(zen_paths, self.entity_graph.as_deref())
+            run_graph_maintenance(zen_paths, self.notion_graph.as_deref())
                 .await
                 .unwrap_or_else(|e| {
                     warn!(error = %e, "run_graph_maintenance failed, dream cycle continues without graph maintenance");
@@ -389,8 +389,8 @@ fn ensure_memory_sections(content: &str) -> String {
 ///
 /// Replaces the old update_memory() which read entries again internally.
 /// Now accepts pre-extracted facts as a bridge — ensures ALL durable facts
-/// are stored in MEMORY.md, while **entity-aware facts also go to knowledge graph**.
-/// Personal-only facts (no known entity names) go ONLY to MEMORY.md (not graph).
+/// are stored in MEMORY.md, while **notion-aware facts also go to knowledge graph**.
+/// Personal-only facts (no known notion names) go ONLY to MEMORY.md (not graph).
 pub fn update_memory_from_facts(
     zen_paths: &ZenPaths,
     facts: &[String],
@@ -561,17 +561,17 @@ fn compress_old_logs(zen_paths: &ZenPaths) -> Result<bool, DreamError> {
 
 async fn recompute_entities(
     zen_paths: &ZenPaths,
-    entity_graph: Option<&dyn EntityGraphProvider>,
+    notion_graph: Option<&dyn NotionGraphProvider>,
 ) -> Result<usize, DreamError> {
-    let Some(graph) = entity_graph else {
-        debug!("recompute_entities: no entity graph provider, skipping");
+    let Some(graph) = notion_graph else {
+        debug!("recompute_entities: no notion graph provider, skipping");
         return Ok(0);
     };
 
-    let entities_dir = zen_paths.vault().join("wiki/entities");
+    let entities_dir = zen_paths.vault().join("wiki/notions");
 
     if !entities_dir.exists() {
-        debug!("recompute_entities: wiki/entities/ does not exist, nothing to recompute");
+        debug!("recompute_entities: wiki/notions/technology/ does not exist, nothing to recompute");
         return Ok(0);
     }
 
@@ -583,7 +583,7 @@ async fn recompute_entities(
             warn!(
                 error = %e,
                 path = %entities_dir.display(),
-                "recompute_entities: failed to read entities directory"
+                "recompute_entities: failed to read notions directory"
             );
             return Ok(0);
         }
@@ -596,35 +596,35 @@ async fn recompute_entities(
         }
 
         match parse_entity_file(&path) {
-            Ok((name, entity_type, aliases)) => {
-                let md5_input = format!("{}:{}", name, entity_type);
-                let entity = SimpleEntity {
+            Ok((name, kind, aliases)) => {
+                let md5_input = format!("{}:{}", name, kind);
+                let notion = SimpleNotion {
                     id: format!("wiki-{}", md5_hex(&md5_input)),
                     name,
-                    entity_type,
+                    kind,
                     source: "wiki-recompute".to_string(),
                 };
 
-                if let Err(e) = graph.upsert_entity(&entity).await {
+                if let Err(e) = graph.upsert_entity(&notion).await {
                     warn!(
                         file = %path.display(),
                         error = %e,
-                        "recompute_entities: failed to upsert entity"
+                        "recompute_entities: failed to upsert notion"
                     );
                     continue;
                 }
 
                 for alias in &aliases {
-                    if let Err(e) = graph.insert_alias(alias, &entity.id).await {
+                    if let Err(e) = graph.insert_alias(alias, &notion.id).await {
                         warn!(alias = %alias, error = %e, "recompute_entities: failed to insert alias");
                     }
                 }
 
                 upserted += 1;
-                debug!(file = %path.display(), name = %entity.name, "recompute_entities: upserted");
+                debug!(file = %path.display(), name = %notion.name, "recompute_entities: upserted");
             }
             Err(e) => {
-                warn!(file = %path.display(), error = %e, "recompute_entities: skipping malformed entity file");
+                warn!(file = %path.display(), error = %e, "recompute_entities: skipping malformed notion file");
             }
         }
     }
@@ -635,9 +635,9 @@ async fn recompute_entities(
 
 async fn run_graph_maintenance(
     _zen_paths: &ZenPaths,
-    entity_graph: Option<&dyn EntityGraphProvider>,
+    notion_graph: Option<&dyn NotionGraphProvider>,
 ) -> std::result::Result<(usize, usize, Vec<String>), DreamError> {
-    let Some(graph) = entity_graph else {
+    let Some(graph) = notion_graph else {
         return Ok((0, 0, Vec::new()));
     };
 
@@ -651,12 +651,12 @@ async fn run_graph_maintenance(
         .auto_promote_entities(3)
         .await
         .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
-    debug!(promoted, "run_graph_maintenance: auto-promoted entities (access_count >= 3)");
+    debug!(promoted, "run_graph_maintenance: auto-promoted notions (access_count >= 3)");
 
     let top_entities = graph
         .compute_importance(40, 0.85)
         .await
-        .map(|scores| scores.iter().take(5).map(|s| s.entity_id.clone()).collect())
+        .map(|scores| scores.iter().take(5).map(|s| s.notion_id.clone()).collect())
         .unwrap_or_else(|e| {
             warn!(error = %e, "run_graph_maintenance: PageRank computation failed, returning empty");
             Vec::new()
@@ -673,7 +673,7 @@ fn parse_entity_file(
 
     let mut in_frontmatter = false;
     let mut name: Option<String> = None;
-    let mut entity_type_str: Option<String> = None;
+    let mut kind_str: Option<String> = None;
     let mut aliases_str: Option<String> = None;
 
     for line in content.lines().take(20) {
@@ -687,8 +687,8 @@ fn parse_entity_file(
         }
         if let Some(val) = trimmed.strip_prefix("name:") {
             name = Some(val.trim().trim_matches('"').to_string());
-        } else if let Some(val) = trimmed.strip_prefix("entity_type:") {
-            entity_type_str = Some(val.trim().trim_matches('"').to_string());
+        } else if let Some(val) = trimmed.strip_prefix("kind:") {
+            kind_str = Some(val.trim().trim_matches('"').to_string());
         } else if let Some(val) = trimmed.strip_prefix("aliases:") {
             aliases_str = Some(val.trim().trim_matches('"').to_string());
         }
@@ -697,9 +697,9 @@ fn parse_entity_file(
     let name = name.ok_or_else(|| {
         DreamError::WikiCompile(format!("missing 'name' in frontmatter: {}", path.display()))
     })?;
-    let entity_type = entity_type_str.ok_or_else(|| {
+    let kind = kind_str.ok_or_else(|| {
         DreamError::WikiCompile(format!(
-            "missing 'entity_type' in frontmatter: {}",
+            "missing 'kind' in frontmatter: {}",
             path.display()
         ))
     })?;
@@ -711,7 +711,7 @@ fn parse_entity_file(
         .filter(|a| !a.is_empty())
         .collect();
 
-    Ok((name, entity_type, aliases))
+    Ok((name, kind, aliases))
 }
 
 fn md5_hex(input: &str) -> String {
@@ -858,7 +858,7 @@ mod tests {
     #[tokio::test]
     async fn test_recompute_entities_empty_dir() {
         let (_dir, paths) = setup_test_paths();
-        let entities_dir = paths.vault().join("wiki/entities");
+        let entities_dir = paths.vault().join("wiki/notions");
         fs::create_dir_all(&entities_dir).unwrap();
 
         let count = recompute_entities(&paths, None).await.unwrap();
@@ -868,10 +868,10 @@ mod tests {
     #[tokio::test]
     async fn test_recompute_entities_valid_entity() {
         let (_dir, paths) = setup_test_paths();
-        let entities_dir = paths.vault().join("wiki/entities");
+        let entities_dir = paths.vault().join("wiki/notions");
         fs::create_dir_all(&entities_dir).unwrap();
 
-        let entity_content = "---\nname: Rust\nentity_type: Technology\naliases: rust-lang, rustlang\n---\n\n# Rust\n\nA systems programming language.\n";
+        let entity_content = "---\nname: Rust\nkind: Technology\naliases: rust-lang, rustlang\n---\n\n# Rust\n\nA systems programming language.\n";
         fs::write(entities_dir.join("rust.md"), entity_content).unwrap();
 
         let count = recompute_entities(&paths, None).await.unwrap();
@@ -881,12 +881,12 @@ mod tests {
     #[tokio::test]
     async fn test_recompute_entities_malformed_file_skipped() {
         let (_dir, paths) = setup_test_paths();
-        let entities_dir = paths.vault().join("wiki/entities");
+        let entities_dir = paths.vault().join("wiki/notions");
         fs::create_dir_all(&entities_dir).unwrap();
 
         fs::write(
             entities_dir.join("bad.md"),
-            "---\ntitle: no entity_type\n---\n\nBody\n",
+            "---\ntitle: no kind\n---\n\nBody\n",
         )
         .unwrap();
 

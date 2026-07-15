@@ -35,7 +35,7 @@ impl ZenWorker for DreamWorker {
     }
 
     fn description(&self) -> &'static str {
-        "Nightly consolidation: extract facts, update memory, compress logs, recompute entities"
+        "Nightly consolidation: extract facts, update memory, compress logs, recompute notions"
     }
 
     fn schedule(&self) -> &'static str {
@@ -48,12 +48,12 @@ impl ZenWorker for DreamWorker {
         let today = Utc::now().date_naive();
 
         let state_db = paths.db().join("state.db");
-        let entity_graph = if state_db.exists() {
+        let notion_graph = if state_db.exists() {
             match zen_repo::SqliteClient::open(&state_db).await {
                 Ok(client) => {
-                    let adapter = zen_vault::EntityGraphAdapter::from_client(client);
+                    let adapter = zen_vault::NotionGraphAdapter::from_client(client);
                     Some(std::sync::Arc::new(adapter)
-                        as std::sync::Arc<dyn zen_core::entity_graph::EntityGraphProvider>)
+                        as std::sync::Arc<dyn zen_core::notion_graph::NotionGraphProvider>)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to open state.db for dream cycle");
@@ -64,10 +64,10 @@ impl ZenWorker for DreamWorker {
             None
         };
 
-        let report = ZenDream::new(entity_graph).run_cycle(&paths, today).await?;
+        let report = ZenDream::new(notion_graph).run_cycle(&paths, today).await?;
 
         info!(
-            "dream cycle: facts={}, memory={}, logs={}, entities={}",
+            "dream cycle: facts={}, memory={}, logs={}, notions={}",
             report.facts_extracted,
             report.memory_updated,
             report.logs_compressed,

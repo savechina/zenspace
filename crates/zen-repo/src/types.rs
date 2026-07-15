@@ -28,16 +28,16 @@ pub struct InsertNoteEmbeddingRequest<'a> {
     pub embedding: &'a [f32],
 }
 
-pub struct InsertEntityEmbeddingRequest<'a> {
-    pub entity_id: &'a str,
+pub struct InsertNotionEmbeddingRequest<'a> {
+    pub notion_id: &'a str,
     pub embedding: &'a [f32],
 }
 
 #[derive(FromRow)]
-pub struct EntityRow {
+pub struct NotionRow {
     pub id: String,
     pub name: String,
-    pub entity_type: String,
+    pub kind: String,
     pub created_at: String,
     pub domain: Option<String>,
     pub last_updated: Option<String>,
@@ -53,8 +53,8 @@ pub struct EntityRow {
 #[derive(FromRow)]
 pub struct RelationshipRow {
     pub id: String,
-    pub source_entity_id: String,
-    pub target_entity_id: String,
+    pub source_notion_id: String,
+    pub target_notion_id: String,
     pub relation_type: String,
     pub confidence: f64,
     pub source_note_ids: Option<String>,
@@ -68,7 +68,7 @@ pub struct RelationshipRow {
 
 #[derive(FromRow)]
 pub struct GraphSearchResult {
-    pub entity: String,
+    pub notion: String,
     pub depth: u32,
     pub relation: String,
     pub target: String,
@@ -78,7 +78,7 @@ pub struct GraphSearchResult {
 
 #[derive(FromRow, Debug, Clone)]
 pub struct ShortestPathResult {
-    pub entity: String,
+    pub notion: String,
     pub distance: f64,
     pub depth: u32,
     pub path: String,
@@ -86,13 +86,13 @@ pub struct ShortestPathResult {
 
 #[derive(Debug, Clone)]
 pub struct PageRankResult {
-    pub entity: String,
+    pub notion: String,
     pub score: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ComponentResult {
-    pub entity: String,
+    pub notion: String,
     pub component_id: i64,
     pub component_size: i64,
 }

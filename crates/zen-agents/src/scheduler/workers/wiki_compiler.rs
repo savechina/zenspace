@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use zen_core::paths::ZenPaths;
-use zen_vault::{EntityData, EntityService, WikiCompiler, WikiPage};
+use zen_vault::{NotionData, NotionService, WikiCompiler, WikiPage};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
@@ -72,52 +72,52 @@ impl WikiCompilerWorker {
     }
 
     async fn build_entity_data(
-        svc: &EntityService,
+        svc: &NotionService,
         client: &zen_vault::SqliteClient,
-        entity: &zen_vault::Entity,
-    ) -> EntityData {
+        notion: &zen_vault::Notion,
+    ) -> NotionData {
         let relationships = svc
-            .load_relationships_for_entity(client, &entity.id)
+            .load_relationships_for_entity(client, &notion.id)
             .await
             .unwrap_or_default();
 
         let fact = format!(
-            "{} is a {} entity in the {} domain, first seen on {}, last updated on {}",
-            entity.name,
-            entity.entity_type,
-            entity.domain.as_deref().unwrap_or("unknown"),
-            entity.created_at.format("%Y-%m-%d"),
-            entity.last_updated.format("%Y-%m-%d"),
+            "{} is a {} notion in the {} domain, first seen on {}, last updated on {}",
+            notion.name,
+            notion.kind,
+            notion.domain.as_deref().unwrap_or("unknown"),
+            notion.created_at.format("%Y-%m-%d"),
+            notion.last_updated.format("%Y-%m-%d"),
         );
 
-        EntityData {
-            entity: entity.clone(),
+        NotionData {
+            notion: notion.clone(),
             facts: vec![fact],
             relationships,
         }
     }
 
     /// Insert wikilink relationship edges by reading compiled wiki pages,
-    /// extracting `[[wikilinks]]`, resolving them to entity IDs, and
-    /// inserting relationship edges into the entity graph.
+    /// extracting `[[wikilinks]]`, resolving them to notion IDs, and
+    /// inserting relationship edges into the notion graph.
     async fn insert_wikilink_edges(
         &self,
         client: &zen_vault::SqliteClient,
-        entity_data_list: &[EntityData],
+        entity_data_list: &[NotionData],
         wiki_dir: &Path,
     ) -> Result<usize> {
-        let repo = zen_repo::EntitiesRepo::new(client);
+        let repo = zen_repo::NotionsRepo::new(client);
         let mut edge_count = 0usize;
 
         for entity_data in entity_data_list {
-            let slug = slugify(&entity_data.entity.name);
-            let page_path = wiki_dir.join("entities").join(format!("{slug}.md"));
+            let slug = slugify(&entity_data.notion.name);
+            let page_path = wiki_dir.join("notions").join(format!("{slug}.md"));
 
             let content = match std::fs::read_to_string(&page_path) {
                 Ok(c) => c,
                 Err(_) => {
                     debug!(
-                        entity = %entity_data.entity.name,
+                        notion = %entity_data.notion.name,
                         path = %page_path.display(),
                         "wiki page not found, skipping wikilink extraction"
                     );
@@ -131,16 +131,16 @@ impl WikiCompilerWorker {
 
             for target_name in &wikilinks {
                 // Skip self-references
-                if target_name.eq_ignore_ascii_case(&entity_data.entity.name) {
+                if target_name.eq_ignore_ascii_case(&entity_data.notion.name) {
                     continue;
                 }
 
-                // Resolve target entity: exact name match first, then FTS fallback
+                // Resolve target notion: exact name match first, then FTS fallback
                 let target_entity = match repo.find_entity_by_name(target_name).await {
                     Ok(Some(e)) => Some(e),
                     Ok(None) => {
                         // Fallback: FTS search for top-1 result
-                        repo.search_entities_fts(target_name)
+                        repo.search_notions_fts(target_name)
                             .await
                             .ok()
                             .and_then(|results| results.into_iter().next())
@@ -149,7 +149,7 @@ impl WikiCompilerWorker {
                         debug!(
                             target = %target_name,
                             error = %e,
-                            "failed to look up entity for wikilink target"
+                            "failed to look up notion for wikilink target"
                         );
                         continue;
                     }
@@ -160,13 +160,13 @@ impl WikiCompilerWorker {
                     None => {
                         debug!(
                             target = %target_name,
-                            "wikilink target has no matching entity, skipping"
+                            "wikilink target has no matching notion, skipping"
                         );
                         continue;
                     }
                 };
 
-                let source_id = &entity_data.entity.id;
+                let source_id = &entity_data.notion.id;
                 let target_id = &target_entity.id;
 
                 // Skip self-loops (DB has a CHECK constraint)
@@ -207,7 +207,7 @@ impl ZenWorker for WikiCompilerWorker {
     }
 
     fn description(&self) -> &'static str {
-        "Compile wiki pages from state.db entities (incremental)"
+        "Compile wiki pages from state.db notions (incremental)"
     }
 
     fn schedule(&self) -> &'static str {
@@ -238,13 +238,13 @@ impl ZenWorker for WikiCompilerWorker {
                 });
             }
         };
-        let svc = EntityService::new();
+        let svc = NotionService::new();
 
-        let entities = svc.load_entities_updated_since(&client, state.last_compile_time).await?;
-        if entities.is_empty() {
+        let notions = svc.load_entities_updated_since(&client, state.last_compile_time).await?;
+        if notions.is_empty() {
             debug!(
                 since = %state.last_compile_time,
-                "wiki-compiler: no entities updated since last compile, nothing to do"
+                "wiki-compiler: no notions updated since last compile, nothing to do"
             );
             return Ok(WorkerReport {
                 worker_id: self.id().to_string(),
@@ -255,32 +255,32 @@ impl ZenWorker for WikiCompilerWorker {
         }
 
         info!(
-            count = entities.len(),
+            count = notions.len(),
             since = %state.last_compile_time,
             "incremental wiki compile"
         );
 
-        let mut entity_data_list: Vec<EntityData> = Vec::with_capacity(entities.len());
-        for entity in &entities {
-            entity_data_list.push(Self::build_entity_data(&svc, &client, entity).await);
+        let mut entity_data_list: Vec<NotionData> = Vec::with_capacity(notions.len());
+        for notion in &notions {
+            entity_data_list.push(Self::build_entity_data(&svc, &client, notion).await);
         }
 
-        let scores = zen_repo::EntitiesRepo::new(&client)
+        let scores = zen_repo::NotionsRepo::new(&client)
             .compute_importance(40, 0.85)
             .await
             .unwrap_or_default();
         let score_map: std::collections::HashMap<String, f64> =
-            scores.iter().map(|s| (s.entity.clone(), s.score)).collect();
+            scores.iter().map(|s| (s.notion.clone(), s.score)).collect();
         entity_data_list.sort_by(|a, b| {
-            let sa = score_map.get(&a.entity.name).copied().unwrap_or(0.0);
-            let sb = score_map.get(&b.entity.name).copied().unwrap_or(0.0);
+            let sa = score_map.get(&a.notion.name).copied().unwrap_or(0.0);
+            let sb = score_map.get(&b.notion.name).copied().unwrap_or(0.0);
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let pages_written =
             match WikiCompiler::new().compile_from_entities(&entity_data_list, &wiki_dir) {
                 Ok(n) => {
-                    info!(pages = n, "wiki pages compiled from state.db entities");
+                    info!(pages = n, "wiki pages compiled from state.db notions");
                     n
                 }
                 Err(e) => {
@@ -412,10 +412,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_entity_data_creates_synthetic_fact() {
-        let entity = zen_vault::Entity {
+        let notion = zen_vault::Notion {
             id: "test-1".to_string(),
             name: "Rust".to_string(),
-            entity_type: zen_vault::EntityType::Technology,
+            kind: zen_vault::NotionKind::Technology,
             description: String::new(),
             source_note_id: "note-1".to_string(),
             created_at: DateTime::UNIX_EPOCH,
@@ -425,19 +425,19 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
 
-        let svc = EntityService::new();
+        let svc = NotionService::new();
         let dir = setup_state_dir();
         let db_path = dir.path().join("state.db");
         let client = zen_vault::SqliteClient::open(&db_path).await.unwrap();
 
-        let data = WikiCompilerWorker::build_entity_data(&svc, &client, &entity).await;
+        let data = WikiCompilerWorker::build_entity_data(&svc, &client, &notion).await;
 
         assert!(!data.facts.is_empty(), "should have at least one fact");
         let fact = &data.facts[0];
-        assert!(fact.contains("Rust"), "fact should contain entity name");
+        assert!(fact.contains("Rust"), "fact should contain notion name");
         assert!(
             fact.contains("technology"),
-            "fact should contain entity type"
+            "fact should contain notion type"
         );
         assert!(fact.contains("programming"), "fact should contain domain");
         assert!(
@@ -448,10 +448,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_entity_data_without_domain() {
-        let entity = zen_vault::Entity {
+        let notion = zen_vault::Notion {
             id: "test-2".to_string(),
             name: "Python".to_string(),
-            entity_type: zen_vault::EntityType::Technology,
+            kind: zen_vault::NotionKind::Technology,
             description: String::new(),
             source_note_id: "note-2".to_string(),
             created_at: DateTime::UNIX_EPOCH,
@@ -461,16 +461,16 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
 
-        let svc = EntityService::new();
+        let svc = NotionService::new();
         let dir = setup_state_dir();
         let db_path = dir.path().join("state.db");
         let client = zen_vault::SqliteClient::open(&db_path).await.unwrap();
 
-        let data = WikiCompilerWorker::build_entity_data(&svc, &client, &entity).await;
+        let data = WikiCompilerWorker::build_entity_data(&svc, &client, &notion).await;
 
         assert!(!data.facts.is_empty(), "should have at least one fact");
         let fact = &data.facts[0];
-        assert!(fact.contains("Python"), "fact should contain entity name");
+        assert!(fact.contains("Python"), "fact should contain notion name");
         assert!(
             fact.contains("unknown"),
             "fact should say unknown domain when none exists"

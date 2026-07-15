@@ -7,11 +7,11 @@ use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
 use tracing::info;
 
-use crate::entity::EntityData;
+use crate::notion::NotionData;
 use crate::note::Note;
 use crate::wiki::{WikiIndex, WikiLog, WikiPage, WikiStructure};
 
-/// Known technology keywords for entity classification.
+/// Known technology keywords for notion classification.
 const TECH_KEYWORDS: &[&str] = &[
     "rust",
     "python",
@@ -52,10 +52,10 @@ const TECH_KEYWORDS: &[&str] = &[
     "rest",
 ];
 
-/// Categorization result for a note's entity type.
+/// Categorization result for a note's notion type.
 #[derive(Debug, Clone, PartialEq)]
 enum NoteCategory {
-    /// Technology entity → goes under `entities/`
+    /// Technology notion → goes under `notions/technology/`
     Technology,
     /// Concept/page → goes under `concepts/`
     Concept,
@@ -64,8 +64,8 @@ enum NoteCategory {
 impl NoteCategory {
     fn directory_name(&self) -> &str {
         match self {
-            NoteCategory::Technology => "entities",
-            NoteCategory::Concept => "concepts",
+            NoteCategory::Technology => "notions/technology",
+            NoteCategory::Concept => "notions/concepts",
         }
     }
 }
@@ -86,7 +86,7 @@ impl WikiCompiler {
     /// 1. Extract title (first `# Heading` or fallback to note id)
     /// 2. Extract content (strip frontmatter if present)
     /// 3. Extract wikilinks using `[[...]]` pattern
-    /// 4. Categorize (Technology → `entities/`, Concept → `concepts/`)
+    /// 4. Categorize (Technology → `notions/technology/`, Concept → `concepts/`)
     /// 5. Write to disk under `wiki_dir`
     ///
     /// After processing all notes:
@@ -154,23 +154,23 @@ impl WikiCompiler {
         Ok(pages)
     }
 
-    /// Compile entity data into wiki pages under `wiki/entities/`.
+    /// Compile notion data into wiki pages under `wiki/notions/technology/`.
     /// Relationships rendered as `[[wikilinks]]` for cross-linking.
-    pub fn compile_from_entities(&self, entities: &[EntityData], wiki_dir: &Path) -> Result<usize> {
+    pub fn compile_from_entities(&self, notions: &[NotionData], wiki_dir: &Path) -> Result<usize> {
         let structure = WikiStructure::new(wiki_dir);
         structure.ensure_directories()?;
 
         let log = WikiLog::new(wiki_dir);
         log.append(
             "entity_compile_start",
-            &format!("compiling {} entity pages", entities.len()),
+            &format!("compiling {} notion pages", notions.len()),
         )?;
 
         let mut written = 0usize;
 
-        for data in entities {
-            let slug = slugify(&data.entity.name);
-            let rel_path = format!("entities/{slug}.md");
+        for data in notions {
+            let slug = slugify(&data.notion.name);
+            let rel_path = format!("notions/technology/{slug}.md");
             let full_path = wiki_dir.join(&rel_path);
 
             if let Some(parent) = full_path.parent() {
@@ -180,54 +180,54 @@ impl WikiCompiler {
 
             let md = self.render_entity_page(data);
             std::fs::write(&full_path, &md)
-                .with_context(|| format!("write entity wiki: {}", full_path.display()))?;
+                .with_context(|| format!("write notion wiki: {}", full_path.display()))?;
 
-            info!(entity = %data.entity.name, path = %rel_path, "entity wiki page written");
+            info!(notion = %data.notion.name, path = %rel_path, "notion wiki page written");
             written += 1;
         }
 
         log.append(
             "entity_compile_complete",
-            &format!("{written} entity pages compiled"),
+            &format!("{written} notion pages compiled"),
         )?;
 
-        self.generate_entity_index(entities, wiki_dir)?;
+        self.generate_entity_index(notions, wiki_dir)?;
 
         Ok(written)
     }
 
     /// Generate OKF v0.1 §6 compliant `index.md` — no frontmatter,
     /// standard markdown links with descriptions for progressive disclosure.
-    fn generate_entity_index(&self, entities: &[EntityData], wiki_dir: &Path) -> Result<()> {
+    fn generate_entity_index(&self, notions: &[NotionData], wiki_dir: &Path) -> Result<()> {
         let index_path = wiki_dir.join("index.md");
         let mut md = String::new();
 
         // OKF §6: index files contain no frontmatter.
         md.push_str("# Knowledge Index\n\n## Entities\n\n");
 
-        let mut sorted: Vec<&EntityData> = entities.iter().collect();
-        sorted.sort_by_key(|data| data.entity.name.to_lowercase());
+        let mut sorted: Vec<&NotionData> = notions.iter().collect();
+        sorted.sort_by_key(|data| data.notion.name.to_lowercase());
 
         for data in &sorted {
-            let slug = slugify(&data.entity.name);
+            let slug = slugify(&data.notion.name);
             let desc = data
                 .facts
                 .first()
                 .map(|f| truncate_for_description(f))
-                .unwrap_or_else(|| format!("{:?} entity", data.entity.entity_type));
+                .unwrap_or_else(|| format!("{:?} notion", data.notion.kind));
             // OKF §6: "* [Title](relative-url) - description"
             md.push_str(&format!(
                 "* [{}]({}.md) - {}\n",
-                data.entity.name, slug, desc
+                data.notion.name, slug, desc
             ));
         }
 
         std::fs::write(&index_path, &md)
-            .with_context(|| format!("write entity index: {}", index_path.display()))?;
+            .with_context(|| format!("write notion index: {}", index_path.display()))?;
         Ok(())
     }
 
-    /// Render an entity page as OKF v0.1 compliant markdown.
+    /// Render an notion page as OKF v0.1 compliant markdown.
     ///
     /// Frontmatter follows §4.1: `type` is required; `title`, `description`,
     /// `tags`, `timestamp` are recommended. `created_at` is a zen extension
@@ -235,17 +235,17 @@ impl WikiCompiler {
     ///
     /// Cross-links use standard markdown `[text](/path.md)` per §5.1 (absolute,
     /// bundle-relative), not `[[wikilinks]]`.
-    fn render_entity_page(&self, data: &EntityData) -> String {
+    fn render_entity_page(&self, data: &NotionData) -> String {
         let mut md = String::new();
 
-        let type_str = format!("{:?}", data.entity.entity_type);
+        let type_str = format!("{:?}", data.notion.kind);
         let now = chrono::Utc::now();
 
         let description = data
             .facts
             .first()
             .map(|f| truncate_for_description(f))
-            .unwrap_or_else(|| format!("{} entity", data.entity.name));
+            .unwrap_or_else(|| format!("{} notion", data.notion.name));
 
         // OKF §4.1 frontmatter
         let mut fm = format!(
@@ -254,16 +254,16 @@ impl WikiCompiler {
              title: {name}\n\
              description: {description}\n\
              tags: [{tag}]\n",
-            name = data.entity.name,
+            name = data.notion.name,
             tag = type_str.to_lowercase(),
         );
 
-        if let Some(ref domain) = data.entity.domain {
+        if let Some(ref domain) = data.notion.domain {
             fm.push_str(&format!("domain: {domain}\n"));
         }
-        if !data.entity.aliases.is_empty() {
+        if !data.notion.aliases.is_empty() {
             let aliases_str = data
-                .entity
+                .notion
                 .aliases
                 .iter()
                 .map(|a| a.to_string())
@@ -276,11 +276,11 @@ impl WikiCompiler {
              created_at: {created}\n\
              ---\n\n",
             ts = now.to_rfc3339(),
-            created = data.entity.created_at.to_rfc3339(),
+            created = data.notion.created_at.to_rfc3339(),
         ));
         md.push_str(&fm);
 
-        md.push_str(&format!("# {}\n\n", data.entity.name));
+        md.push_str(&format!("# {}\n\n", data.notion.name));
 
         if !data.facts.is_empty() {
             md.push_str("## Facts\n\n");
@@ -297,7 +297,7 @@ impl WikiCompiler {
                 let target_slug = slugify(target);
                 // OKF §5.1: absolute bundle-relative links
                 md.push_str(&format!(
-                    "- [{target}](/entities/{target_slug}.md) — {rel_str}\n"
+                    "- [{target}](/notions/technology/{target_slug}.md) — {rel_str}\n"
                 ));
             }
         }
@@ -644,8 +644,8 @@ mod tests {
         let pages = compiler.compile(&notes, dir.path()).unwrap();
         assert_eq!(pages.len(), 1);
 
-        assert!(dir.path().join("entities").exists());
-        assert!(dir.path().join("concepts").exists());
+        assert!(dir.path().join("notions/technology").exists());
+        assert!(dir.path().join("notions/concepts").exists());
         assert!(dir.path().join("sources").exists());
     }
 
@@ -732,7 +732,7 @@ mod tests {
         )];
 
         let pages = compiler.compile(&notes, dir.path()).unwrap();
-        assert!(pages[0].path.to_string_lossy().starts_with("entities/"));
+        assert!(pages[0].path.to_string_lossy().starts_with("notions/technology/"));
     }
 
     #[test]
@@ -745,7 +745,7 @@ mod tests {
         )];
 
         let pages = compiler.compile(&notes, dir.path()).unwrap();
-        assert!(pages[0].path.to_string_lossy().starts_with("concepts/"));
+        assert!(pages[0].path.to_string_lossy().starts_with("notions/concepts/"));
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
         )];
 
         let pages = compiler.compile(&notes, dir.path()).unwrap();
-        assert!(pages[0].path.to_string_lossy().starts_with("entities/"));
+        assert!(pages[0].path.to_string_lossy().starts_with("notions/technology/"));
     }
 
     #[test]
@@ -792,7 +792,7 @@ mod tests {
         // Find the written file (path depends on classification)
         for entry in walkdir::WalkDir::new(dir.path())
             .min_depth(2)
-            .max_depth(2)
+            .max_depth(3)
             .into_iter()
             .filter_map(|e| e.ok())
         {
@@ -857,11 +857,11 @@ mod tests {
 
         let has_entity = pages
             .iter()
-            .any(|p| p.path.to_string_lossy().starts_with("entities/"));
+            .any(|p| p.path.to_string_lossy().starts_with("notions/technology/"));
         let has_concept = pages
             .iter()
-            .any(|p| p.path.to_string_lossy().starts_with("concepts/"));
-        assert!(has_entity, "should have an entity page");
+            .any(|p| p.path.to_string_lossy().starts_with("notions/concepts/"));
+        assert!(has_entity, "should have an notion page");
         assert!(has_concept, "should have a concept page");
     }
 

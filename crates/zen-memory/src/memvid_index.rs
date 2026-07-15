@@ -6,7 +6,7 @@
 //!
 //! Indexing tiers:
 //! - **M2 (Episodic)** — `memories/journal/*.md`, chunked by `## ` headers
-//! - **M3 (Semantic)** — `wiki/entities/*.md`, full content per file
+//! - **M3 (Semantic)** — `wiki/notions/technology/*.md`, full content per file
 //! - **M4 (Wisdom)** — `wiki/wisdom/{reflections,anti-patterns,models}/*.md`, full content per file
 
 use std::path::{Path, PathBuf};
@@ -159,15 +159,15 @@ impl MemvidIndexer {
 
     // ─── M3 (Semantic) ──────────────────────────────────────────────
 
-    /// Index wiki entity files under `wiki/entities/*.md`.
+    /// Index wiki notion files under `wiki/notions/technology/*.md`.
     ///
     /// Each file is stored in full with a `"knowledge-base"` session id.
     pub fn index_m3_semantic(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
-        let entities_dir = self.workspace_root.join("wiki").join("entities");
+        let entities_dir = self.workspace_root.join("wiki").join("notions");
 
         let files = list_md_files(&entities_dir)?;
         if files.is_empty() {
-            debug!("M3: no entity files in {}", entities_dir.display());
+            debug!("M3: no notion files in {}", entities_dir.display());
             return Ok((0, 0));
         }
 
@@ -183,14 +183,14 @@ impl MemvidIndexer {
                     warn!(
                         path = %path.display(),
                         error = %e,
-                        "M3: failed to read entity file, skipping"
+                        "M3: failed to read notion file, skipping"
                     );
                     continue;
                 }
             };
 
             if content.trim().is_empty() {
-                debug!(path = %path.display(), "M3: empty entity file, skipping");
+                debug!(path = %path.display(), "M3: empty notion file, skipping");
                 continue;
             }
 
@@ -200,7 +200,7 @@ impl MemvidIndexer {
                     warn!(
                         path = %path.display(),
                         error = %e,
-                        "M3: failed to index entity"
+                        "M3: failed to index notion"
                     );
                 }
             }
@@ -525,7 +525,7 @@ mod tests {
     fn m3_indexes_entity_files() {
         let tmp = TempDir::new().unwrap();
 
-        let entities_dir = tmp.path().join("wiki").join("entities");
+        let entities_dir = tmp.path().join("wiki").join("notions");
         std::fs::create_dir_all(&entities_dir).unwrap();
         std::fs::write(
             entities_dir.join("rust.md"),
@@ -599,8 +599,8 @@ mod tests {
         )
         .unwrap();
 
-        // M3: one entity file
-        let entities_dir = tmp.path().join("wiki").join("entities");
+        // M3: one notion file
+        let entities_dir = tmp.path().join("wiki").join("notions");
         std::fs::create_dir_all(&entities_dir).unwrap();
         std::fs::write(entities_dir.join("topic.md"), "# Topic\n\nContent.\n").unwrap();
 

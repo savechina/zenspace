@@ -127,7 +127,7 @@ impl std::fmt::Display for CostPerToken {
 
 /// Profile describing an agent's identity, capabilities, and constraints.
 ///
-/// This is the core entity managed by agent registry implementations.
+/// This is the core notion managed by agent registry implementations.
 /// Each profile captures:
 /// - **name**: unique identifier (e.g. "Junior", "Sisyphus", "Hermes")
 /// - **role**: the agent's functional role in the system

@@ -1,7 +1,7 @@
 use tempfile::tempdir;
 
 use zen_repo::{
-    IndexNoteRequest, InsertEntityEmbeddingRequest, InsertNoteEmbeddingRequest,
+    IndexNoteRequest, InsertNotionEmbeddingRequest, InsertNoteEmbeddingRequest,
     InsertRelationshipRequest, SelfNodeRow, SqliteClient, UpsertBeliefNodeRequest,
     UpsertGoalNodeRequest, UpsertPathNodeRequest,
 };
@@ -88,9 +88,9 @@ async fn test_client_schema_has_expected_tables() {
     for expected in &[
         "sessions",
         "notes_meta",
-        "entities",
+        "notions",
         "relationships",
-        "entity_aliases",
+        "notion_aliases",
         "dispatch_tasks",
         "self_nodes",
         "goal_nodes",
@@ -274,8 +274,8 @@ async fn test_embeddings_insert_entity_embedding_vec0_unavailable() {
 
     let embedding = vec![0.1_f32; 384];
     let result = repo
-        .insert_entity_embedding(InsertEntityEmbeddingRequest {
-            entity_id: "ent1",
+        .insert_entity_embedding(InsertNotionEmbeddingRequest {
+            notion_id: "ent1",
             embedding: &embedding,
         })
         .await;
@@ -313,26 +313,26 @@ async fn test_embeddings_search_nonempty_embedding_vec0_unavailable() {
 }
 
 // ===========================================================================
-// EntitiesRepo
+// NotionsRepo
 // ===========================================================================
 
 #[tokio::test]
 async fn test_entities_insert_entity_and_load_name() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "RustLang", "language", "2024-01-01T00:00:00Z")
         .await
         .unwrap();
 
-    let name = repo.entity_name("e1").await.unwrap();
+    let name = repo.notion_name("e1").await.unwrap();
     assert_eq!(name.as_deref(), Some("RustLang"));
 }
 
 #[tokio::test]
 async fn test_entities_insert_entity_duplicate_id_replaces() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Original", "lang", "2024-01-01T00:00:00Z")
         .await
@@ -341,32 +341,32 @@ async fn test_entities_insert_entity_duplicate_id_replaces() {
         .await
         .unwrap();
 
-    let name = repo.entity_name("e1").await.unwrap();
+    let name = repo.notion_name("e1").await.unwrap();
     assert_eq!(name.as_deref(), Some("Replaced"));
 }
 
 #[tokio::test]
 async fn test_entities_upsert_entity_new() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.upsert_entity("e1", "Rust", "language", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z")
         .await
         .unwrap();
 
-    let entities = repo.load_all_entities().await.unwrap();
-    assert_eq!(entities.len(), 1);
-    assert_eq!(entities[0].id, "e1");
-    assert_eq!(entities[0].name, "Rust");
-    assert_eq!(entities[0].entity_type, "language");
+    let notions = repo.load_all_entities().await.unwrap();
+    assert_eq!(notions.len(), 1);
+    assert_eq!(notions[0].id, "e1");
+    assert_eq!(notions[0].name, "Rust");
+    assert_eq!(notions[0].kind, "language");
 }
 
 #[tokio::test]
 async fn test_entities_upsert_entity_conflict_updates_timestamp() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
-    // Two entities with same (name, entity_type) but different ids
+    // Two notions with same (name, kind) but different ids
     repo.upsert_entity("e1", "Rust", "language", "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z")
         .await
         .unwrap();
@@ -375,15 +375,15 @@ async fn test_entities_upsert_entity_conflict_updates_timestamp() {
         .unwrap();
 
     // Both inserts go in (conflict on name+type updates last_updated)
-    let entities = repo.load_all_entities().await.unwrap();
+    let notions = repo.load_all_entities().await.unwrap();
     // The ON CONFLICT updates last_updated but the row with id=e2 is the latest insert
-    assert!(!entities.is_empty());
+    assert!(!notions.is_empty());
 }
 
 #[tokio::test]
 async fn test_entities_update_entity_timestamp() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Test", "t", "2024-01-01T00:00:00Z")
         .await
@@ -392,14 +392,14 @@ async fn test_entities_update_entity_timestamp() {
         .await
         .unwrap();
 
-    let entities = repo.load_all_entities().await.unwrap();
-    assert_eq!(entities[0].last_updated.as_deref(), Some("2025-12-31T23:59:59Z"));
+    let notions = repo.load_all_entities().await.unwrap();
+    assert_eq!(notions[0].last_updated.as_deref(), Some("2025-12-31T23:59:59Z"));
 }
 
 #[tokio::test]
 async fn test_entities_insert_alias_and_resolve() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Rust", "language", "2024-01-01T00:00:00Z")
         .await
@@ -413,7 +413,7 @@ async fn test_entities_insert_alias_and_resolve() {
 #[tokio::test]
 async fn test_entities_insert_alias_duplicate_is_ignored() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Rust", "language", "2024-01-01T00:00:00Z")
         .await
@@ -428,7 +428,7 @@ async fn test_entities_insert_alias_duplicate_is_ignored() {
 #[tokio::test]
 async fn test_entities_resolve_alias_nonexistent() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let resolved = repo.resolve_alias("nope").await.unwrap();
     assert!(resolved.is_none());
@@ -437,7 +437,7 @@ async fn test_entities_resolve_alias_nonexistent() {
 #[tokio::test]
 async fn test_entities_insert_relationship_and_load() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "A", "type", "2024-01-01T00:00:00Z")
         .await
@@ -452,14 +452,14 @@ async fn test_entities_insert_relationship_and_load() {
 
     let rels = repo.load_relationships("e1").await.unwrap();
     assert_eq!(rels.len(), 1);
-    assert_eq!(rels[0].target_entity_id, "e2");
+    assert_eq!(rels[0].target_notion_id, "e2");
     assert_eq!(rels[0].relation_type, "depends_on");
 }
 
 #[tokio::test]
 async fn test_entities_insert_relationship_without_source_notes() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "A", "t", "2024-01-01T00:00:00Z")
         .await
@@ -479,7 +479,7 @@ async fn test_entities_insert_relationship_without_source_notes() {
 #[tokio::test]
 async fn test_entities_load_relationships_empty() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let rels = repo.load_relationships("nonexistent").await.unwrap();
     assert!(rels.is_empty());
@@ -488,7 +488,7 @@ async fn test_entities_load_relationships_empty() {
 #[tokio::test]
 async fn test_entities_load_all_entities_empty() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let all = repo.load_all_entities().await.unwrap();
     assert!(all.is_empty());
@@ -497,7 +497,7 @@ async fn test_entities_load_all_entities_empty() {
 #[tokio::test]
 async fn test_entities_load_all_entities_ordered_by_name() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e3", "Charlie", "t", "2024-01-01T00:00:00Z")
         .await
@@ -519,7 +519,7 @@ async fn test_entities_load_all_entities_ordered_by_name() {
 #[tokio::test]
 async fn test_entities_load_entities_updated_since() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Old", "t", "2020-01-01T00:00:00Z")
         .await
@@ -539,7 +539,7 @@ async fn test_entities_load_entities_updated_since() {
 #[tokio::test]
 async fn test_entities_load_entities_updated_since_all_old() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Old", "t", "2020-01-01T00:00:00Z")
         .await
@@ -553,18 +553,18 @@ async fn test_entities_load_entities_updated_since_all_old() {
 }
 
 #[tokio::test]
-async fn test_entities_entity_name_nonexistent() {
+async fn test_entities_notion_name_nonexistent() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
-    let name = repo.entity_name("no-such-id").await.unwrap();
+    let name = repo.notion_name("no-such-id").await.unwrap();
     assert!(name.is_none());
 }
 
 #[tokio::test]
-async fn test_entities_load_known_entity_names_includes_aliases() {
+async fn test_entities_load_known_notion_names_includes_aliases() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Rust", "language", "2024-01-01T00:00:00Z")
         .await
@@ -574,25 +574,25 @@ async fn test_entities_load_known_entity_names_includes_aliases() {
         .unwrap();
     repo.insert_alias("rs", "e1").await.unwrap();
 
-    let names = repo.load_known_entity_names().await.unwrap();
+    let names = repo.load_known_notion_names().await.unwrap();
     assert!(names.contains(&"Rust".to_string()));
     assert!(names.contains(&"Python".to_string()));
     assert!(names.contains(&"rs".to_string()));
 }
 
 #[tokio::test]
-async fn test_entities_load_known_entity_names_empty() {
+async fn test_entities_load_known_notion_names_empty() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
-    let names = repo.load_known_entity_names().await.unwrap();
+    let names = repo.load_known_notion_names().await.unwrap();
     assert!(names.is_empty());
 }
 
 #[tokio::test]
 async fn test_entities_bfs_search_empty_name() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let r = repo.bfs_search("", 5).await.unwrap();
     assert!(r.is_empty());
@@ -601,7 +601,7 @@ async fn test_entities_bfs_search_empty_name() {
 #[tokio::test]
 async fn test_entities_bfs_search_whitespace_name() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let r = repo.bfs_search("   ", 5).await.unwrap();
     assert!(r.is_empty());
@@ -610,7 +610,7 @@ async fn test_entities_bfs_search_whitespace_name() {
 #[tokio::test]
 async fn test_entities_bfs_search_no_start_entity() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let r = repo.bfs_search("Nonexistent", 5).await.unwrap();
     assert!(r.is_empty());
@@ -619,7 +619,7 @@ async fn test_entities_bfs_search_no_start_entity() {
 #[tokio::test]
 async fn test_entities_bfs_search_chain_a_b_c_d() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     // Create chain: A -> B -> C -> D
     for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")] {
@@ -637,20 +637,20 @@ async fn test_entities_bfs_search_chain_a_b_c_d() {
     // Depth 1: should reach B
     let r1 = repo.bfs_search("A", 1).await.unwrap();
     assert_eq!(r1.len(), 1);
-    assert_eq!(r1[0].entity, "B");
+    assert_eq!(r1[0].notion, "B");
     assert_eq!(r1[0].depth, 1);
 
     // Depth 2: should reach B and C
     let r2 = repo.bfs_search("A", 2).await.unwrap();
     assert_eq!(r2.len(), 2);
-    let names2: Vec<&str> = r2.iter().map(|r| r.entity.as_str()).collect();
+    let names2: Vec<&str> = r2.iter().map(|r| r.notion.as_str()).collect();
     assert!(names2.contains(&"B"));
     assert!(names2.contains(&"C"));
 
     // Depth 3: should reach B, C, and D
     let r3 = repo.bfs_search("A", 3).await.unwrap();
     assert_eq!(r3.len(), 3);
-    let names3: Vec<&str> = r3.iter().map(|r| r.entity.as_str()).collect();
+    let names3: Vec<&str> = r3.iter().map(|r| r.notion.as_str()).collect();
     assert!(names3.contains(&"B"));
     assert!(names3.contains(&"C"));
     assert!(names3.contains(&"D"));
@@ -663,7 +663,7 @@ async fn test_entities_bfs_search_chain_a_b_c_d() {
 #[tokio::test]
 async fn test_entities_bfs_search_diamond_graph() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     // Diamond: A -> B, A -> C, B -> D, C -> D
     for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")] {
@@ -690,14 +690,14 @@ async fn test_entities_bfs_search_diamond_graph() {
     // Depth 2: B, C, D (D reached from both B and C, but deduplicated by name)
     let r2 = repo.bfs_search("A", 2).await.unwrap();
     assert_eq!(r2.len(), 3);
-    let entities: Vec<&str> = r2.iter().map(|r| r.entity.as_str()).collect();
-    assert!(entities.contains(&"D"));
+    let notions: Vec<&str> = r2.iter().map(|r| r.notion.as_str()).collect();
+    assert!(notions.contains(&"D"));
 }
 
 #[tokio::test]
 async fn test_entities_bfs_search_nonexistent_start() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("a", "A", "n", "2024-01-01T00:00:00Z")
         .await
@@ -1540,7 +1540,7 @@ fn make_test_request<'a>(
 #[tokio::test]
 async fn test_pagerank_simple_chain() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C")] {
         repo.insert_entity(id, name, "node", "2024-01-01T00:00:00Z")
@@ -1563,8 +1563,8 @@ async fn test_pagerank_simple_chain() {
         "PageRank scores should sum to ~1.0, got {total}"
     );
 
-    let a_score = scores.iter().find(|s| s.entity == "A").unwrap().score;
-    let b_score = scores.iter().find(|s| s.entity == "B").unwrap().score;
+    let a_score = scores.iter().find(|s| s.notion == "A").unwrap().score;
+    let b_score = scores.iter().find(|s| s.notion == "B").unwrap().score;
     assert!(
         b_score > a_score,
         "B (has inbound from A) should outrank A (no inbound)"
@@ -1574,7 +1574,7 @@ async fn test_pagerank_simple_chain() {
 #[tokio::test]
 async fn test_pagerank_empty_graph() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let scores = repo.pagerank(10, 0.85).await.unwrap();
     assert!(scores.is_empty());
@@ -1583,7 +1583,7 @@ async fn test_pagerank_empty_graph() {
 #[tokio::test]
 async fn test_pagerank_hub_node_dominates() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     for (id, name) in &[("hub", "Hub"), ("s1", "Spoke1"), ("s2", "Spoke2"), ("s3", "Spoke3")] {
         repo.insert_entity(id, name, "node", "2024-01-01T00:00:00Z")
@@ -1603,8 +1603,8 @@ async fn test_pagerank_hub_node_dominates() {
         "PageRank scores should sum to ~1.0, got {total}"
     );
 
-    let spoke_score = scores.iter().find(|s| s.entity == "Spoke1").unwrap().score;
-    let hub_score = scores.iter().find(|s| s.entity == "Hub").unwrap().score;
+    let spoke_score = scores.iter().find(|s| s.notion == "Spoke1").unwrap().score;
+    let hub_score = scores.iter().find(|s| s.notion == "Hub").unwrap().score;
     assert!(
         spoke_score > hub_score,
         "Spoke (receives inbound from Hub) should outrank Hub (no inbound)"
@@ -1614,7 +1614,7 @@ async fn test_pagerank_hub_node_dominates() {
 #[tokio::test]
 async fn test_shortest_path_direct_connection() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C")] {
         repo.insert_entity(id, name, "node", "2024-01-01T00:00:00Z")
@@ -1634,7 +1634,7 @@ async fn test_shortest_path_direct_connection() {
     let path = repo.shortest_path("A", "C", 5).await.unwrap();
     assert!(path.is_some());
     let p = path.unwrap();
-    assert_eq!(p.entity, "C");
+    assert_eq!(p.notion, "C");
     assert!(p.distance <= 2.0, "shortest path should go A->B->C (weight 2.0), not A->C (weight 5.0)");
     assert!(p.path.contains("A"));
     assert!(p.path.contains("C"));
@@ -1643,7 +1643,7 @@ async fn test_shortest_path_direct_connection() {
 #[tokio::test]
 async fn test_shortest_path_no_connection() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("a", "A", "node", "2024-01-01T00:00:00Z")
         .await
@@ -1659,7 +1659,7 @@ async fn test_shortest_path_no_connection() {
 #[tokio::test]
 async fn test_shortest_paths_all_returns_nearest() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C")] {
         repo.insert_entity(id, name, "n", "2024-01-01T00:00:00Z")
@@ -1675,15 +1675,15 @@ async fn test_shortest_paths_all_returns_nearest() {
 
     let paths = repo.shortest_paths_all("A", 3).await.unwrap();
     assert_eq!(paths.len(), 2);
-    let c_dist = paths.iter().find(|p| p.entity == "C").unwrap().distance;
-    let b_dist = paths.iter().find(|p| p.entity == "B").unwrap().distance;
+    let c_dist = paths.iter().find(|p| p.notion == "C").unwrap().distance;
+    let b_dist = paths.iter().find(|p| p.notion == "B").unwrap().distance;
     assert!(c_dist < b_dist, "C (weight 1.0) should be closer than B (weight 2.0)");
 }
 
 #[tokio::test]
 async fn test_connected_components_separate_groups() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     for (id, name) in &[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("e", "E")] {
         repo.insert_entity(id, name, "n", "2024-01-01T00:00:00Z")
@@ -1700,11 +1700,11 @@ async fn test_connected_components_separate_groups() {
     let components = repo.connected_components().await.unwrap();
     assert_eq!(components.len(), 5);
 
-    let comp_a = components.iter().find(|c| c.entity == "A").unwrap();
-    let comp_b = components.iter().find(|c| c.entity == "B").unwrap();
-    let comp_c = components.iter().find(|c| c.entity == "C").unwrap();
-    let comp_d = components.iter().find(|c| c.entity == "D").unwrap();
-    let comp_e = components.iter().find(|c| c.entity == "E").unwrap();
+    let comp_a = components.iter().find(|c| c.notion == "A").unwrap();
+    let comp_b = components.iter().find(|c| c.notion == "B").unwrap();
+    let comp_c = components.iter().find(|c| c.notion == "C").unwrap();
+    let comp_d = components.iter().find(|c| c.notion == "D").unwrap();
+    let comp_e = components.iter().find(|c| c.notion == "E").unwrap();
 
     assert_eq!(comp_a.component_id, comp_b.component_id, "A and B should be in same component");
     assert_eq!(comp_c.component_id, comp_d.component_id, "C and D should be in same component");
@@ -1715,7 +1715,7 @@ async fn test_connected_components_separate_groups() {
 #[tokio::test]
 async fn test_connected_components_empty_graph() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let components = repo.connected_components().await.unwrap();
     assert!(components.is_empty());
@@ -1724,7 +1724,7 @@ async fn test_connected_components_empty_graph() {
 #[tokio::test]
 async fn test_confidence_decay_reduces_old_entities() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let old_date = "2020-01-01T00:00:00Z";
     repo.insert_entity_with("e1", "OldEntity", "tech", old_date, "ancient", "manual", 1.0)
@@ -1734,15 +1734,15 @@ async fn test_confidence_decay_reduces_old_entities() {
     let decayed = repo.apply_confidence_decay(30.0).await.unwrap();
     assert_eq!(decayed, 1);
 
-    let entities = repo.load_all_entities().await.unwrap();
-    let entity = &entities[0];
+    let notions = repo.load_all_entities().await.unwrap();
+    let notion = &notions[0];
     assert!(
-        entity.confidence < 1.0,
-        "Old entity confidence should have decayed from 1.0, got {}",
-        entity.confidence
+        notion.confidence < 1.0,
+        "Old notion confidence should have decayed from 1.0, got {}",
+        notion.confidence
     );
     assert!(
-        entity.confidence >= 0.01,
+        notion.confidence >= 0.01,
         "Confidence should not drop below 0.01 floor"
     );
 }
@@ -1750,7 +1750,7 @@ async fn test_confidence_decay_reduces_old_entities() {
 #[tokio::test]
 async fn test_auto_promote_entities() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity_with("e1", "FrequentEntity", "tech", "2024-01-01T00:00:00Z", "", "test", 0.5)
         .await
@@ -1763,20 +1763,20 @@ async fn test_auto_promote_entities() {
     let promoted = repo.auto_promote_entities(3).await.unwrap();
     assert_eq!(promoted, 1);
 
-    let entities = repo.load_all_entities().await.unwrap();
-    let entity = &entities[0];
-    assert!(entity.promoted_at.is_some(), "Entity should have promoted_at set");
+    let notions = repo.load_all_entities().await.unwrap();
+    let notion = &notions[0];
+    assert!(notion.promoted_at.is_some(), "Notion should have promoted_at set");
     assert!(
-        entity.confidence >= 0.8,
-        "Promoted entity confidence should be >= 0.8, got {}",
-        entity.confidence
+        notion.confidence >= 0.8,
+        "Promoted notion confidence should be >= 0.8, got {}",
+        notion.confidence
     );
 }
 
 #[tokio::test]
 async fn test_auto_promote_does_not_repromote() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity_with("e1", "AlreadyPromoted", "tech", "2024-01-01T00:00:00Z", "", "test", 0.9)
         .await
@@ -1784,13 +1784,13 @@ async fn test_auto_promote_does_not_repromote() {
     repo.promote_entity("e1").await.unwrap();
 
     let promoted = repo.auto_promote_entities(0).await.unwrap();
-    assert_eq!(promoted, 0, "Should not re-promote already-promoted entity");
+    assert_eq!(promoted, 0, "Should not re-promote already-promoted notion");
 }
 
 #[tokio::test]
 async fn test_compute_importance_returns_sorted() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     for (id, name) in &[("hub", "Hub"), ("s1", "Spoke1"), ("s2", "Spoke2")] {
         repo.insert_entity(id, name, "n", "2024-01-01T00:00:00Z")
@@ -1817,7 +1817,7 @@ async fn test_compute_importance_returns_sorted() {
 #[tokio::test]
 async fn test_find_entity_by_name_case_insensitive() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e1", "Rust", "language", "2024-01-01T00:00:00Z")
         .await
@@ -1839,7 +1839,7 @@ async fn test_find_entity_by_name_case_insensitive() {
 #[tokio::test]
 async fn test_find_entity_by_name_nonexistent() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     let found = repo.find_entity_by_name("Nonexistent").await.unwrap();
     assert!(found.is_none());
@@ -1848,7 +1848,7 @@ async fn test_find_entity_by_name_nonexistent() {
 #[tokio::test]
 async fn test_wikilink_edge_insertion() {
     let (client, _dir) = make_client().await;
-    let repo = zen_repo::EntitiesRepo::new(&client);
+    let repo = zen_repo::NotionsRepo::new(&client);
 
     repo.insert_entity("e-rust", "Rust", "language", "2024-01-01T00:00:00Z")
         .await
@@ -1893,11 +1893,11 @@ async fn test_wikilink_edge_insertion() {
 
     let rust_rels = repo.load_relationships("e-rust").await.unwrap();
     assert_eq!(rust_rels.len(), 1);
-    assert_eq!(rust_rels[0].target_entity_id, "e-tokio");
+    assert_eq!(rust_rels[0].target_notion_id, "e-tokio");
     assert_eq!(rust_rels[0].relation_type, "Wikilinks");
 
     let tokio_rels = repo.load_relationships("e-tokio").await.unwrap();
     assert_eq!(tokio_rels.len(), 1);
-    assert_eq!(tokio_rels[0].target_entity_id, "e-rust");
+    assert_eq!(tokio_rels[0].target_notion_id, "e-rust");
     assert_eq!(tokio_rels[0].relation_type, "Wikilinks");
 }

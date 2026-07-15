@@ -68,4 +68,4 @@ pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity
 pub use session::SessionManager;
 pub use session::{ConversationTurn, RetrievedNote, SessionContext};
 pub use virtue_log::{VirtueDomain, VirtueLog, VirtueStatus};
-pub use zen_core::types::{SessionEntity, SessionStatus};
+pub use zen_core::types::{SessionRecord, SessionStatus};

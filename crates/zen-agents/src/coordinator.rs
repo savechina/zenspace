@@ -14,7 +14,7 @@
 //!
 //! | Signal              | Specialist     | Skills                         |
 //! |---------------------|----------------|--------------------------------|
-//! | knowledge-query     | researcher     | zen-entity-extraction         |
+//! | knowledge-query     | researcher     | zen-notion-extraction         |
 //! | wiki-compile        | coder          | zen-wiki-compilation           |
 //! | analysis            | analyst        | zen-contradiction-detection,   |
 //! |                     |                |   zen-vault-learning-loop  |
@@ -115,7 +115,7 @@ impl ZenCoordinator {
         // --- Build specialist agents -----------------------------------
 
         let researcher = GenericAgent::builder("researcher")
-            .with_skills(["zen-entity-extraction"])
+            .with_skills(["zen-notion-extraction"])
             .with_tools(["tier2_search", "tier4_search"])
             .build(&wiring.skills, &wiring.tools)
             .expect("researcher build");
@@ -716,7 +716,7 @@ mod tests {
     fn wiring_with_skills() -> ZenWiring {
         let skills = SkillRegistry::new();
         for id in [
-            "zen-entity-extraction",
+            "zen-notion-extraction",
             "zen-wiki-compilation",
             "zen-contradiction-detection",
             "zen-vault-learning-loop",

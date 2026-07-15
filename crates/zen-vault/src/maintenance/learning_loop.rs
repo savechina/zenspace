@@ -630,7 +630,7 @@ impl Skill for LearningLoop {
             ctx.signals.push(Signal::new("knowledge_gaps_found"));
             ctx.pending_actions
                 .push(rig_compose::context::NextAction::RunSkill(
-                    "zen-entity-extraction".to_string(),
+                    "zen-notion-extraction".to_string(),
                 ));
         }
 

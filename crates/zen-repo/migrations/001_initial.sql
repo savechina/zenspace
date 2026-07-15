@@ -38,45 +38,45 @@ BEGIN
 END;
 
 -- Entities
-CREATE TABLE IF NOT EXISTS entities (
+CREATE TABLE IF NOT EXISTS notions (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    entity_type TEXT NOT NULL,
+    kind TEXT NOT NULL,
     aliases TEXT,
     created_at TEXT NOT NULL,
     last_updated TEXT NOT NULL,
     domain TEXT,
-    UNIQUE(name, entity_type)
+    UNIQUE(name, kind)
 );
-CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
-CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_notions_name ON notions(name);
+CREATE INDEX IF NOT EXISTS idx_notions_type ON notions(kind);
 
 -- Relationships
 CREATE TABLE IF NOT EXISTS relationships (
     id TEXT PRIMARY KEY,
-    source_entity_id TEXT NOT NULL,
-    target_entity_id TEXT NOT NULL,
+    source_notion_id TEXT NOT NULL,
+    target_notion_id TEXT NOT NULL,
     relation_type TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
     source_note_ids TEXT,
     created_at TEXT NOT NULL,
-    FOREIGN KEY (source_entity_id) REFERENCES entities(id),
-    FOREIGN KEY (target_entity_id) REFERENCES entities(id),
-    CHECK(source_entity_id != target_entity_id)
+    FOREIGN KEY (source_notion_id) REFERENCES notions(id),
+    FOREIGN KEY (target_notion_id) REFERENCES notions(id),
+    CHECK(source_notion_id != target_notion_id)
 );
-CREATE INDEX IF NOT EXISTS idx_rel_source ON relationships(source_entity_id);
-CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_entity_id);
+CREATE INDEX IF NOT EXISTS idx_rel_source ON relationships(source_notion_id);
+CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_notion_id);
 CREATE INDEX IF NOT EXISTS idx_rel_type ON relationships(relation_type);
 
--- Entity aliases
-CREATE TABLE IF NOT EXISTS entity_aliases (
+-- Notion aliases
+CREATE TABLE IF NOT EXISTS notion_aliases (
     alias TEXT NOT NULL,
-    canonical_entity_id TEXT NOT NULL,
+    canonical_notion_id TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (alias, canonical_entity_id),
-    FOREIGN KEY (canonical_entity_id) REFERENCES entities(id)
+    PRIMARY KEY (alias, canonical_notion_id),
+    FOREIGN KEY (canonical_notion_id) REFERENCES notions(id)
 );
-CREATE INDEX IF NOT EXISTS idx_aliases_lookup ON entity_aliases(alias);
+CREATE INDEX IF NOT EXISTS idx_aliases_lookup ON notion_aliases(alias);
 
 -- Dispatch tasks
 CREATE TABLE IF NOT EXISTS dispatch_tasks (
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS dispatch_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_dispatch_status ON dispatch_tasks(status);
 
--- Self nodes (identity graph)
+-- Self nodes (idnotion graph)
 CREATE TABLE IF NOT EXISTS self_nodes (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

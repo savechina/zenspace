@@ -142,7 +142,7 @@ fn suggest_methods(belief: &Belief) -> String {
     let mut suggestions = String::new();
 
     suggestions.push_str("- Review recent journal entries for direct observations on this topic\n");
-    suggestions.push_str("- Search knowledge base for related entities or wiki pages\n");
+    suggestions.push_str("- Search knowledge base for related notions or wiki pages\n");
     suggestions.push_str("- Conduct a targeted web search for authoritative sources\n");
 
     if belief.evidence_count == 0 {

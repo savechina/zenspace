@@ -73,8 +73,8 @@ pub(crate) fn args_schema_string_limit() -> Value {
 pub(crate) fn args_schema_entity() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
-        "entity_name".to_string(),
-        json_schema_map(&[("type", "string"), ("description", "entity name to query")]),
+        "notion_name".to_string(),
+        json_schema_map(&[("type", "string"), ("description", "notion name to query")]),
     );
     props.insert(
         "max_depth".to_string(),
@@ -83,7 +83,7 @@ pub(crate) fn args_schema_entity() -> Value {
             ("description", "maximum traversal depth"),
         ]),
     );
-    json_schema_object(props, vec!["entity_name"])
+    json_schema_object(props, vec!["notion_name"])
 }
 
 // Schema helpers for future tool implementations. Kept as public crate
@@ -136,17 +136,17 @@ pub(crate) fn args_schema_graph_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
         "id".to_string(),
-        json_schema_map(&[("type", "string"), ("description", "entity identifier")]),
+        json_schema_map(&[("type", "string"), ("description", "notion identifier")]),
     );
     props.insert(
         "name".to_string(),
-        json_schema_map(&[("type", "string"), ("description", "entity display name")]),
+        json_schema_map(&[("type", "string"), ("description", "notion display name")]),
     );
     props.insert(
-        "entity_type".to_string(),
-        json_schema_map(&[("type", "string"), ("description", "type of entity")]),
+        "kind".to_string(),
+        json_schema_map(&[("type", "string"), ("description", "type of notion")]),
     );
-    json_schema_object(props, vec!["id", "name", "entity_type"])
+    json_schema_object(props, vec!["id", "name", "kind"])
 }
 
 #[expect(dead_code, reason = "infrastructure for future relationship-insert tool")]
@@ -161,11 +161,11 @@ pub(crate) fn args_schema_relationship_insert() -> Value {
     );
     props.insert(
         "source_id".to_string(),
-        json_schema_map(&[("type", "string"), ("description", "source entity id")]),
+        json_schema_map(&[("type", "string"), ("description", "source notion id")]),
     );
     props.insert(
         "target_id".to_string(),
-        json_schema_map(&[("type", "string"), ("description", "target entity id")]),
+        json_schema_map(&[("type", "string"), ("description", "target notion id")]),
     );
     props.insert(
         "relation_type".to_string(),
@@ -229,7 +229,7 @@ mod tests {
         let props = schema["properties"].as_object().unwrap();
         assert!(props.contains_key("id"));
         assert!(props.contains_key("name"));
-        assert!(props.contains_key("entity_type"));
+        assert!(props.contains_key("kind"));
     }
 
     #[test]

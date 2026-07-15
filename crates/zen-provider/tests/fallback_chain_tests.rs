@@ -13,7 +13,7 @@ fn test_build_fallback_chain_with_fallbacks() {
         agents: {
             let mut map = HashMap::new();
             map.insert(
-                "entity_extraction".into(),
+                "notion_extraction".into(),
                 AgentConfig {
                     provider: Some("ollama".into()),
                     model: Some("qwen3.6:35b-mlx".into()),
@@ -44,7 +44,7 @@ fn test_build_fallback_chain_with_fallbacks() {
     };
 
     let router = DefaultRouter::from_agentic(&config);
-    let chain = router.build_fallback_chain("entity_extraction");
+    let chain = router.build_fallback_chain("notion_extraction");
 
     assert_eq!(chain.len(), 4);
     assert_eq!(chain[0].0, Provider::Ollama);

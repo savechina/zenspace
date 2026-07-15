@@ -3,7 +3,7 @@ use rig_core::Embed;
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStoreTable};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use zen_repo::{EmbeddingsRepo, InsertEntityEmbeddingRequest, InsertNoteEmbeddingRequest, SqliteClient};
+use zen_repo::{EmbeddingsRepo, InsertNotionEmbeddingRequest, InsertNoteEmbeddingRequest, SqliteClient};
 
 use super::SearchResult;
 
@@ -110,19 +110,19 @@ impl Tier3Search {
     pub async fn insert_entity_embedding(
         &self,
         client: &SqliteClient,
-        entity_id: &str,
+        notion_id: &str,
         embedding: &[f32],
     ) -> Result<()> {
         if embedding.is_empty() {
-            anyhow::bail!("Cannot insert empty embedding for entity {entity_id}");
+            anyhow::bail!("Cannot insert empty embedding for notion {notion_id}");
         }
 
         EmbeddingsRepo::new(client)
-            .insert_entity_embedding(InsertEntityEmbeddingRequest { entity_id, embedding })
+            .insert_entity_embedding(InsertNotionEmbeddingRequest { notion_id, embedding })
             .await?;
 
         debug!(
-            "Tier3Search: stored entity embedding for {entity_id} ({}-dim)",
+            "Tier3Search: stored notion embedding for {notion_id} ({}-dim)",
             embedding.len()
         );
 

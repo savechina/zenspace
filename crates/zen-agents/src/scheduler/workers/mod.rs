@@ -1,7 +1,7 @@
 pub mod commitment_tracker;
 pub mod decision_tracker;
 pub mod dream;
-pub mod entity_extractor_worker;
+pub mod notion_extractor_worker;
 pub mod evidence_gatherer;
 pub mod express;
 pub mod marker_state;
@@ -16,7 +16,7 @@ pub mod wisdom_synth;
 pub use commitment_tracker::CommitmentTracker;
 pub use decision_tracker::DecisionTracker;
 pub use dream::DreamWorker;
-pub use entity_extractor_worker::EntityExtractorWorker;
+pub use notion_extractor_worker::NotionExtractorWorker;
 pub use evidence_gatherer::EvidenceGatherer;
 pub use express::ExpressWorker;
 pub use marker_state::{JournalEntryState, SessionState};

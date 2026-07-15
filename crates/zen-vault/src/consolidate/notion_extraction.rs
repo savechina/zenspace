@@ -5,16 +5,16 @@ use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
 use tracing::info;
 
-use crate::entity::{Entity, EntityType};
+use crate::notion::{Notion, NotionKind};
 use crate::note::Note;
 
-/// Entity extractor — extracts entities from notes.
+/// Notion extractor — extracts notions from notes.
 ///
 /// Phase 1: Uses keyword heuristics and pattern matching.
-/// Phase 3: LLM-based entity extraction via zen-provider.
-pub struct EntityExtractor;
+/// Phase 3: LLM-based notion extraction via zen-provider.
+pub struct NotionExtractor;
 
-impl EntityExtractor {
+impl NotionExtractor {
     pub fn new() -> Self {
         Self
     }
@@ -32,18 +32,18 @@ impl EntityExtractor {
         "sqlx", "rusqlite", "wasmtime", "rig-core", "rig-compose",
     ];
 
-    /// Extract entities from a single note.
+    /// Extract notions from a single note.
     ///
     /// Uses three strategies:
     /// 1. **Keyword heuristics** — scans for 42 known technology names
-    /// 2. **Heading classification** — classifies `#`/`##` headings into typed entities
+    /// 2. **Heading classification** — classifies `#`/`##` headings into typed notions
     ///    (Technology, Organization, Person, or Concept) based on keyword patterns
     /// 3. **Capitalized-word extraction** — finds multi-word proper nouns
     ///    (e.g., "Apple Inc", "John Smith")
     ///
-    /// Returns deduplicated entities by name.
-    pub fn extract(&self, note: &Note) -> Result<Vec<Entity>> {
-        let mut entities: Vec<Entity> = Vec::new();
+    /// Returns deduplicated notions by name.
+    pub fn extract(&self, note: &Note) -> Result<Vec<Notion>> {
+        let mut notions: Vec<Notion> = Vec::new();
         let content_lower = note.content.to_lowercase();
         let note_id = &note.id;
 
@@ -51,8 +51,8 @@ impl EntityExtractor {
         for tech in Self::KNOWN_TECHS {
             if content_lower.contains(tech) {
                 let name = capitalize(tech);
-                if !entities.iter().any(|e| e.name == name) {
-                    entities.push(Entity::new(&name, EntityType::Technology, note_id));
+                if !notions.iter().any(|e| e.name == name) {
+                    notions.push(Notion::new(&name, NotionKind::Technology, note_id));
                 }
             }
         }
@@ -65,9 +65,9 @@ impl EntityExtractor {
                 .or_else(|| trimmed.strip_prefix("# "))
             {
                 let heading = heading.trim();
-                if heading.len() >= 3 && !entities.iter().any(|e| e.name == heading) {
+                if heading.len() >= 3 && !notions.iter().any(|e| e.name == heading) {
                     let typ = classify_heading(heading);
-                    entities.push(Entity::new(heading, typ, note_id));
+                    notions.push(Notion::new(heading, typ, note_id));
                 }
             }
         }
@@ -84,8 +84,8 @@ impl EntityExtractor {
             } else if !ch.is_alphabetic() && !word.is_empty() {
                 if word.len() >= 4 {
                     let name = word.clone();
-                    if !entities.iter().any(|e| e.name == name) {
-                        entities.push(Entity::new(&name, EntityType::Concept, note_id));
+                    if !notions.iter().any(|e| e.name == name) {
+                        notions.push(Notion::new(&name, NotionKind::Concept, note_id));
                     }
                 }
                 word.clear();
@@ -94,27 +94,27 @@ impl EntityExtractor {
 
         info!(
             note_id = %note.id,
-            entity_count = entities.len(),
-            "Entity extraction complete"
+            entity_count = notions.len(),
+            "Notion extraction complete"
         );
-        Ok(entities)
+        Ok(notions)
     }
 
-    /// Extract entities from multiple notes, deduplicating by name.
-    pub fn extract_batch(&self, notes: &[Note]) -> Result<Vec<Entity>> {
+    /// Extract notions from multiple notes, deduplicating by name.
+    pub fn extract_batch(&self, notes: &[Note]) -> Result<Vec<Notion>> {
         let mut seen = std::collections::HashMap::new();
 
         for note in notes {
             let extracted = self.extract(note)?;
-            for entity in extracted {
-                seen.entry(entity.name.clone()).or_insert(entity);
+            for notion in extracted {
+                seen.entry(notion.name.clone()).or_insert(notion);
             }
         }
 
         Ok(seen.into_values().collect())
     }
 
-    fn extract_from_json(&self, notes_val: &serde_json::Value) -> Result<Vec<Entity>> {
+    fn extract_from_json(&self, notes_val: &serde_json::Value) -> Result<Vec<Notion>> {
         let notes_array = notes_val
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("expected notes array"))?;
@@ -138,13 +138,13 @@ impl EntityExtractor {
             for tech in Self::KNOWN_TECHS {
                 if content_lower.contains(tech) {
                     let name = capitalize(tech);
-                    let mut entity =
-                        Entity::new(name, EntityType::Technology, note_id.clone());
-                    entity.metadata.insert(
+                    let mut notion =
+                        Notion::new(name, NotionKind::Technology, note_id.clone());
+                    notion.metadata.insert(
                         "extraction_method".to_string(),
                         "skill_heuristic".to_string(),
                     );
-                    all_entities.push(entity);
+                    all_entities.push(notion);
                 }
             }
         }
@@ -153,7 +153,7 @@ impl EntityExtractor {
     }
 }
 
-impl Default for EntityExtractor {
+impl Default for NotionExtractor {
     fn default() -> Self {
         Self::new()
     }
@@ -168,7 +168,7 @@ fn capitalize(s: &str) -> String {
     first + chars.as_str()
 }
 
-fn classify_heading(heading: &str) -> EntityType {
+fn classify_heading(heading: &str) -> NotionKind {
     let lower = heading.to_lowercase();
     if lower.contains("api")
         || lower.contains("database")
@@ -185,24 +185,24 @@ fn classify_heading(heading: &str) -> EntityType {
         || lower.contains("architecture")
         || lower.contains("system")
     {
-        EntityType::Technology
+        NotionKind::Technology
     } else if lower.contains("company") || lower.contains("team") || lower.contains("org") {
-        EntityType::Organization
+        NotionKind::Organization
     } else if lower.contains("person") || lower.contains("author") {
-        EntityType::Person
+        NotionKind::Person
     } else {
-        EntityType::Concept
+        NotionKind::Concept
     }
 }
 
 #[async_trait]
-impl Skill for EntityExtractor {
+impl Skill for NotionExtractor {
     fn id(&self) -> &str {
-        "zen-entity-extraction"
+        "zen-notion-extraction"
     }
 
     fn description(&self) -> &str {
-        "Extract entities (technologies, concepts, people) from notes using keyword heuristics and LLM augmentation"
+        "Extract notions (technologies, concepts, people) from notes using keyword heuristics and LLM augmentation"
     }
 
     fn applies(&self, ctx: &InvestigationContext) -> bool {
@@ -220,19 +220,19 @@ impl Skill for EntityExtractor {
             .filter_map(|ev| ev.detail.get("notes").cloned())
             .next();
 
-        let entities = if let Some(notes) = notes_val {
+        let notions = if let Some(notes) = notes_val {
             self.extract_from_json(&notes)
                 .map_err(|e| KernelError::SkillFailed(e.to_string()))?
         } else {
-            info!("EntityExtractor: no notes in context, using heuristic-only extraction");
+            info!("NotionExtractor: no notes in context, using heuristic-only extraction");
             Vec::new()
         };
 
-        let entity_count = entities.len();
+        let entity_count = notions.len();
         info!(
             entity_count,
             confidence = ctx.confidence,
-            "Entity extraction skill complete"
+            "Notion extraction skill complete"
         );
 
         Ok(SkillOutcome::noop().with_delta(if entity_count > 0 { 0.1 } else { 0.0 }))
@@ -265,104 +265,104 @@ mod tests {
 
     #[test]
     fn test_extract_finds_technology() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("I love using Rust and Python for programming.");
-        let entities = extractor.extract(&note).unwrap();
-        assert!(entities.iter().any(|e| e.name == "Rust"));
-        assert!(entities.iter().any(|e| e.name == "Python"));
+        let notions = extractor.extract(&note).unwrap();
+        assert!(notions.iter().any(|e| e.name == "Rust"));
+        assert!(notions.iter().any(|e| e.name == "Python"));
     }
 
     #[test]
     fn test_extract_finds_heading_concept() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("# Async Runtime\n\nThis is about async runtimes.");
-        let entities = extractor.extract(&note).unwrap();
-        assert!(entities.iter().any(|e| e.name == "Async Runtime"));
+        let notions = extractor.extract(&note).unwrap();
+        assert!(notions.iter().any(|e| e.name == "Async Runtime"));
     }
 
     #[test]
     fn test_extract_batch_deduplicates() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note1 = make_note("I use Rust for systems programming.");
         let note2 = make_note("Rust is great for performance.");
-        let entities = extractor.extract_batch(&[note1, note2]).unwrap();
-        let rust_count = entities.iter().filter(|e| e.name == "Rust").count();
+        let notions = extractor.extract_batch(&[note1, note2]).unwrap();
+        let rust_count = notions.iter().filter(|e| e.name == "Rust").count();
         assert_eq!(rust_count, 1);
     }
 
     #[test]
     fn test_heading_classification_produces_typed_entities() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("# Rust Programming\n\nDetails about Rust.");
-        let entities = extractor.extract(&note).unwrap();
-        let rust_heading = entities.iter().find(|e| e.name == "Rust Programming");
+        let notions = extractor.extract(&note).unwrap();
+        let rust_heading = notions.iter().find(|e| e.name == "Rust Programming");
         assert!(rust_heading.is_some(), "should extract 'Rust Programming' heading");
-        assert_eq!(rust_heading.unwrap().entity_type, EntityType::Technology);
+        assert_eq!(rust_heading.unwrap().kind, NotionKind::Technology);
     }
 
     #[test]
     fn test_heading_classification_organization() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("## Engineering Team\n\nThe team works hard.");
-        let entities = extractor.extract(&note).unwrap();
-        let team = entities.iter().find(|e| e.name == "Engineering Team");
+        let notions = extractor.extract(&note).unwrap();
+        let team = notions.iter().find(|e| e.name == "Engineering Team");
         assert!(team.is_some());
-        assert_eq!(team.unwrap().entity_type, EntityType::Organization);
+        assert_eq!(team.unwrap().kind, NotionKind::Organization);
     }
 
     #[test]
     fn test_heading_classification_person() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("## Author Bio\n\nWritten by the author.");
-        let entities = extractor.extract(&note).unwrap();
-        let bio = entities.iter().find(|e| e.name == "Author Bio");
+        let notions = extractor.extract(&note).unwrap();
+        let bio = notions.iter().find(|e| e.name == "Author Bio");
         assert!(bio.is_some());
-        assert_eq!(bio.unwrap().entity_type, EntityType::Person);
+        assert_eq!(bio.unwrap().kind, NotionKind::Person);
     }
 
     #[test]
     fn test_capitalized_words_extraction() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("John Smith worked at Apple Inc on the project.");
-        let entities = extractor.extract(&note).unwrap();
+        let notions = extractor.extract(&note).unwrap();
         assert!(
-            entities.iter().any(|e| e.name == "John"),
+            notions.iter().any(|e| e.name == "John"),
             "should extract 'John' as capitalized word"
         );
         assert!(
-            entities.iter().any(|e| e.name == "Smith"),
+            notions.iter().any(|e| e.name == "Smith"),
             "should extract 'Smith' as capitalized word"
         );
     }
 
     #[test]
     fn test_expanded_keyword_list_finds_sqlite() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("We use sqlite for local storage.");
-        let entities = extractor.extract(&note).unwrap();
+        let notions = extractor.extract(&note).unwrap();
         assert!(
-            entities.iter().any(|e| e.name == "Sqlite"),
+            notions.iter().any(|e| e.name == "Sqlite"),
             "should find 'sqlite' via expanded keyword list"
         );
     }
 
     #[test]
     fn test_expanded_keyword_list_finds_deepseek() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("We switched to deepseek for code generation.");
-        let entities = extractor.extract(&note).unwrap();
+        let notions = extractor.extract(&note).unwrap();
         assert!(
-            entities.iter().any(|e| e.name == "Deepseek"),
+            notions.iter().any(|e| e.name == "Deepseek"),
             "should find 'deepseek' via expanded keyword list"
         );
     }
 
     #[test]
     fn test_extract_deduplicates_within_note() {
-        let extractor = EntityExtractor;
+        let extractor = NotionExtractor;
         let note = make_note("Rust is great. I love Rust. Rust forever.");
-        let entities = extractor.extract(&note).unwrap();
-        let rust_count = entities.iter().filter(|e| e.name == "Rust").count();
+        let notions = extractor.extract(&note).unwrap();
+        let rust_count = notions.iter().filter(|e| e.name == "Rust").count();
         assert_eq!(rust_count, 1, "should deduplicate within a single note");
     }
 }

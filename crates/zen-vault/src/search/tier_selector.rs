@@ -4,7 +4,7 @@
 /// - Tier 1: ripgrep exact match (single word)
 /// - Tier 2: FTS5 full-text search (multi-word)
 /// - Tier 3: vector similarity search
-/// - Tier 4: entity graph traversal
+/// - Tier 4: notion graph traversal
 /// - Tier 5: LLM synthesis
 pub struct TierSelector;
 
@@ -13,7 +13,7 @@ impl TierSelector {
     ///
     /// # Tier selection rules
     /// - `"similar:"` or `"like:"` prefix → Tier 3 (vector)
-    /// - `"graph:"` or `"related:"` prefix → Tier 4 (entity graph)
+    /// - `"graph:"` or `"related:"` prefix → Tier 4 (notion graph)
     /// - `"summarize:"` or `"explain:"` prefix → Tier 5 (LLM synthesis)
     /// - Single word (no whitespace) → Tier 1 (ripgrep)
     /// - Multiple words → Tier 2 (FTS5)
@@ -74,7 +74,7 @@ mod tests {
     fn test_prefix_selection() {
         assert_eq!(TierSelector::select_tier("similar: embeddings"), 3);
         assert_eq!(TierSelector::select_tier("like: vectors"), 3);
-        assert_eq!(TierSelector::select_tier("graph: entities"), 4);
+        assert_eq!(TierSelector::select_tier("graph: notions"), 4);
         assert_eq!(TierSelector::select_tier("related: concepts"), 4);
         assert_eq!(TierSelector::select_tier("summarize: this"), 5);
         assert_eq!(TierSelector::select_tier("explain: the code"), 5);
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn test_prefix_case_insensitive() {
         assert_eq!(TierSelector::select_tier("Similar: embeddings"), 3);
-        assert_eq!(TierSelector::select_tier("GRAPH: entities"), 4);
+        assert_eq!(TierSelector::select_tier("GRAPH: notions"), 4);
         assert_eq!(TierSelector::select_tier("Explain: the code"), 5);
     }
 

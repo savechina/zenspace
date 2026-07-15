@@ -5,7 +5,7 @@ use rig_memvid::{MemoryConfig, MemvidPersistHook, MemvidStore, WritePolicy};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use zen_core::entity_graph::EntityGraphProvider;
+use zen_core::notion_graph::NotionGraphProvider;
 
 /// Minimum confidence threshold for auto-extracted triplets (D9).
 /// Cards from `extract_triplets` below this threshold are filtered out on retrieval.
@@ -14,7 +14,7 @@ pub const TRIPLET_MIN_CONFIDENCE: f32 = 0.8;
 
 pub struct ZenMemvidStore {
     store: MemvidStore,
-    entity_graph: Option<Arc<dyn EntityGraphProvider>>,
+    notion_graph: Option<Arc<dyn NotionGraphProvider>>,
 }
 
 impl ZenMemvidStore {
@@ -26,12 +26,12 @@ impl ZenMemvidStore {
 
         Ok(Self {
             store,
-            entity_graph: None,
+            notion_graph: None,
         })
     }
 
-    pub fn with_entity_graph(mut self, provider: Arc<dyn EntityGraphProvider>) -> Self {
-        self.entity_graph = Some(provider);
+    pub fn with_notion_graph(mut self, provider: Arc<dyn NotionGraphProvider>) -> Self {
+        self.notion_graph = Some(provider);
         self
     }
 
@@ -46,7 +46,7 @@ impl ZenMemvidStore {
     pub fn from_store(store: MemvidStore) -> Self {
         Self {
             store,
-            entity_graph: None,
+            notion_graph: None,
         }
     }
 
@@ -81,7 +81,7 @@ impl ZenMemvidStore {
     ///
     /// Writes the turn text via `put_text()` with enriched `PutOptions` for full-text
     /// search, then writes a `MemoryCard` via `put_memory_card()` linked to the frame
-    /// from the text write. The card enables entity/slot/value graph queries.
+    /// from the text write. The card enables notion/slot/value graph queries.
     ///
     /// # Arguments
     /// * `session_id` - The session scope for this turn
@@ -140,10 +140,10 @@ impl ZenMemvidStore {
 }
 
 #[derive(Debug, Clone)]
-pub struct EntityContext {
-    pub entity_id: String,
+pub struct NotionContext {
+    pub notion_id: String,
     pub name: String,
-    pub entity_type: String,
+    pub kind: String,
     pub description: String,
     pub importance_score: f64,
     pub aliases: Vec<String>,
@@ -152,27 +152,27 @@ pub struct EntityContext {
 #[derive(Debug, Clone)]
 pub struct EnrichedMemory {
     pub kind: String,
-    pub entity: String,
+    pub notion: String,
     pub slot: String,
     pub value: String,
     pub confidence: f64,
-    pub entity_context: Option<EntityContext>,
+    pub entity_context: Option<NotionContext>,
 }
 
 impl EnrichedMemory {
     pub fn format_enriched(&self) -> String {
         match &self.entity_context {
             Some(ctx) => format!(
-                "[{}] {}={}: {} (entity: {}, importance: {:.2})",
-                self.kind, self.entity, self.slot, self.value, ctx.name, ctx.importance_score
+                "[{}] {}={}: {} (notion: {}, importance: {:.2})",
+                self.kind, self.notion, self.slot, self.value, ctx.name, ctx.importance_score
             ),
-            None => format!("[{}] {}={}: {}", self.kind, self.entity, self.slot, self.value),
+            None => format!("[{}] {}={}: {}", self.kind, self.notion, self.slot, self.value),
         }
     }
 }
 
 impl ZenMemvidStore {
-    /// Retrieve memory cards enriched with KB entity context.
+    /// Retrieve memory cards enriched with KB notion context.
     pub async fn retrieve_with_entity_context(
         &self,
         session_id: &str,
@@ -184,12 +184,12 @@ impl ZenMemvidStore {
             .filter(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE)
             .collect();
 
-        let Some(ref graph) = self.entity_graph else {
+        let Some(ref graph) = self.notion_graph else {
             return Ok(filtered
                 .into_iter()
                 .map(|c| EnrichedMemory {
                     kind: c.kind.to_string(),
-                    entity: c.entity,
+                    notion: c.entity,
                     slot: c.slot,
                     value: c.value,
                     confidence: f64::from(c.confidence.unwrap_or(1.0)),
@@ -201,7 +201,7 @@ impl ZenMemvidStore {
         let importance_map: HashMap<String, f64> = match graph.compute_importance(100, 0.85).await {
             Ok(results) => results
                 .into_iter()
-                .map(|r| (r.entity_id.clone(), r.score))
+                .map(|r| (r.notion_id.clone(), r.score))
                 .collect(),
             Err(e) => {
                 tracing::warn!(error = %e, "PageRank computation failed, using empty importance map");
@@ -221,10 +221,10 @@ impl ZenMemvidStore {
                         .await
                         .unwrap_or_default();
                     let importance = importance_map.get(&summary.name).copied().unwrap_or(0.0);
-                    entity_ctx = Some(EntityContext {
-                        entity_id: summary.id,
+                    entity_ctx = Some(NotionContext {
+                        notion_id: summary.id,
                         name: summary.name,
-                        entity_type: summary.entity_type,
+                        kind: summary.kind,
                         description: summary.description,
                         importance_score: importance,
                         aliases,
@@ -235,7 +235,7 @@ impl ZenMemvidStore {
 
             enriched.push(EnrichedMemory {
                 kind: card.kind.to_string(),
-                entity: card.entity,
+                notion: card.entity,
                 slot: card.slot,
                 value: card.value,
                 confidence: f64::from(card.confidence.unwrap_or(1.0)),
@@ -247,14 +247,14 @@ impl ZenMemvidStore {
     }
 }
 
-/// Heuristic: extracts candidate entity names from a memory card's fields.
+/// Heuristic: extracts candidate notion names from a memory card's fields.
 ///
-/// Sources: entity field (non-session), slot field, capitalized words in value.
-fn extract_candidate_names(entity: &str, slot: &str, value: &str) -> Vec<String> {
+/// Sources: notion field (non-session), slot field, capitalized words in value.
+fn extract_candidate_names(notion: &str, slot: &str, value: &str) -> Vec<String> {
     let mut candidates = Vec::new();
 
-    if !entity.contains('-') && !entity.starts_with("session") && !entity.starts_with("user") {
-        candidates.push(entity.to_string());
+    if !notion.contains('-') && !notion.starts_with("session") && !notion.starts_with("user") {
+        candidates.push(notion.to_string());
     }
 
     if !slot.is_empty() && slot != "conversation" {
@@ -319,38 +319,38 @@ impl ContextProjector {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use zen_core::entity_graph::{EntityGraphProvider, EntitySummary, ImportanceScore, SimpleEntity};
+    use zen_core::notion_graph::{NotionGraphProvider, NotionSummary, ImportanceScore, SimpleNotion};
 
     struct MockEntityGraph {
-        entities: std::collections::HashMap<String, EntitySummary>,
+        notions: std::collections::HashMap<String, NotionSummary>,
         importance: std::collections::HashMap<String, f64>,
     }
 
     impl MockEntityGraph {
         fn new() -> Self {
             Self {
-                entities: std::collections::HashMap::new(),
+                notions: std::collections::HashMap::new(),
                 importance: std::collections::HashMap::new(),
             }
         }
 
-        fn with_entity(mut self, name: &str, summary: EntitySummary, score: f64) -> Self {
+        fn with_entity(mut self, name: &str, summary: NotionSummary, score: f64) -> Self {
             self.importance.insert(name.to_string(), score);
-            self.entities.insert(name.to_string(), summary);
+            self.notions.insert(name.to_string(), summary);
             self
         }
     }
 
     #[async_trait::async_trait]
-    impl EntityGraphProvider for MockEntityGraph {
-        async fn upsert_entity(&self, _entity: &SimpleEntity) -> anyhow::Result<()> {
+    impl NotionGraphProvider for MockEntityGraph {
+        async fn upsert_entity(&self, _entity: &SimpleNotion) -> anyhow::Result<()> {
             Ok(())
         }
         async fn insert_alias(&self, _alias: &str, _canonical_id: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn find_entity_by_name(&self, name: &str) -> anyhow::Result<Option<EntitySummary>> {
-            Ok(self.entities.get(name).cloned())
+        async fn find_entity_by_name(&self, name: &str) -> anyhow::Result<Option<NotionSummary>> {
+            Ok(self.notions.get(name).cloned())
         }
         async fn apply_confidence_decay(&self, _half_life_days: f64) -> anyhow::Result<usize> {
             Ok(0)
@@ -367,12 +367,12 @@ mod tests {
                 .importance
                 .iter()
                 .map(|(k, &v)| ImportanceScore {
-                    entity_id: k.clone(),
+                    notion_id: k.clone(),
                     score: v,
                 })
                 .collect())
         }
-        async fn load_aliases(&self, _entity_id: &str) -> anyhow::Result<Vec<String>> {
+        async fn load_aliases(&self, _notion_id: &str) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
         fn is_available(&self) -> bool {
@@ -447,17 +447,17 @@ mod tests {
 
         let mock = MockEntityGraph::new().with_entity(
             "Rust",
-            EntitySummary {
+            NotionSummary {
                 id: "ent-rust".to_string(),
                 name: "Rust".to_string(),
-                entity_type: "technology".to_string(),
+                kind: "technology".to_string(),
                 description: "A systems programming language".to_string(),
                 confidence: 0.9,
             },
             0.85,
         );
 
-        let store = store.with_entity_graph(std::sync::Arc::new(mock));
+        let store = store.with_notion_graph(std::sync::Arc::new(mock));
         let enriched = store
             .retrieve_with_entity_context("session-1")
             .await
@@ -475,7 +475,7 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(ctx.name, "Rust");
-        assert_eq!(ctx.entity_type, "technology");
+        assert_eq!(ctx.kind, "technology");
         assert_eq!(ctx.description, "A systems programming language");
         assert!(ctx.importance_score > 0.0);
     }

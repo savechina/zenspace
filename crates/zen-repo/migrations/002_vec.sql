@@ -4,8 +4,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS note_embeddings USING vec0(
     embedding FLOAT[384]
 );
 
--- Vector embeddings for entities (requires sqlite-vec extension)
-CREATE VIRTUAL TABLE IF NOT EXISTS entity_embeddings USING vec0(
-    entity_id TEXT PRIMARY KEY,
+-- Vector embeddings for notions (requires sqlite-vec extension)
+CREATE VIRTUAL TABLE IF NOT EXISTS notion_embeddings USING vec0(
+    notion_id TEXT PRIMARY KEY,
     embedding FLOAT[384]
 );

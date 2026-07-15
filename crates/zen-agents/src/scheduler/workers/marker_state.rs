@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Each field is owned by a specific worker:
 /// - `journaled_at`: SessionJournaler
 /// - `memory_updated_at`: MemoryCurator
-/// - `extracted_at` / `extraction_source`: EntityExtractorWorker
+/// - `extracted_at` / `extraction_source`: NotionExtractorWorker
 /// - `commitment_tracked_at`: CommitmentTracker
 /// - `reflection_extracted_at`: ReflectionWorker
 /// - `wisdom_synthesized_at`: WisdomSynthesizer

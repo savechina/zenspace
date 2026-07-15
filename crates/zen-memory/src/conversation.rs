@@ -15,7 +15,7 @@ use zen_core::types::{ChatTurnEvent, SessionEvent, session_created_at_from_id};
 /// `~/.zen/sessions/YYYY/MM/DD/<uuid>.jsonl`.
 /// Chat turns are appended as `{"type":"chat/turn","payload":{...}}` lines.
 ///
-/// The first line is a `session/meta` event written by `SessionEntity::save()`.
+/// The first line is a `session/meta` event written by `SessionRecord::save()`.
 /// This store only appends `chat/turn` events to the same file.
 pub struct ConversationStore {
     session_id: String,
@@ -79,7 +79,7 @@ impl ConversationStore {
     /// Append a chat turn to the session's `.jsonl` file.
     ///
     /// Writes a `chat/turn` event line. The file is created on first write;
-    /// the `session/meta` event (written by `SessionEntity::save()`) must
+    /// the `session/meta` event (written by `SessionRecord::save()`) must
     /// already exist as the first line.
     pub fn append(&self, role: &str, content: &str) -> Result<()> {
         let event = SessionEvent::Turn(ChatTurnEvent {
@@ -212,15 +212,15 @@ impl ConversationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zen_core::types::SessionEntity;
+    use zen_core::types::SessionRecord;
 
     #[test]
     fn append_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
-        // First write the meta event (as SessionEntity::save() would)
-        let session = SessionEntity::new("test-agent", "/ws");
+        // First write the meta event (as SessionRecord::save() would)
+        let session = SessionRecord::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {
@@ -254,7 +254,7 @@ mod tests {
     fn load_empty_file_with_only_meta_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
-        let session = SessionEntity::new("test-agent", "/ws");
+        let session = SessionRecord::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {
@@ -272,7 +272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
-        let session = SessionEntity::new("test-agent", "/ws");
+        let session = SessionRecord::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {
@@ -295,7 +295,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
-        let session = SessionEntity::new("test-agent", "/ws");
+        let session = SessionRecord::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {

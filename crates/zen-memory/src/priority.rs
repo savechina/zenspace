@@ -18,8 +18,8 @@
 //!
 //! ## §8.3.3 Reinforcement / Decay
 //!
-//! `ReinforcementTracker` records retrieval hit-counts per entity.
-//! Frequently-retrieved M3 entities get wiki priority.
+//! `ReinforcementTracker` records retrieval hit-counts per notion.
+//! Frequently-retrieved M3 notions get wiki priority.
 //! Unretrieved M2 episodes become compression candidates after 90 days.
 
 use std::collections::HashMap;
@@ -200,7 +200,7 @@ pub fn format_priority_for_prompt(scores: &[PriorityScore]) -> String {
 /// Persisted hit-count entry for reinforcement tracking.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ReinforcementEntry {
-    /// How many times this entity has been retrieved.
+    /// How many times this notion has been retrieved.
     hit_count: u32,
     /// Date of the most recent retrieval (YYYY-MM-DD).
     last_accessed: NaiveDate,
@@ -209,14 +209,14 @@ struct ReinforcementEntry {
 /// On-disk schema for the reinforcement sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct ReinforcementFile {
-    entities: HashMap<String, ReinforcementEntry>,
+    notions: HashMap<String, ReinforcementEntry>,
 }
 
 /// Tracks retrieval hit-counts for reinforcement/decay decisions.
 ///
 /// Persists to a JSON sidecar file (`memories/.reinforcement.json`).
 ///
-/// - **Frequently-retrieved** M3 entities get wiki priority.
+/// - **Frequently-retrieved** M3 notions get wiki priority.
 /// - **Unretrieved** M2 episodes become compression candidates after 90 days.
 pub struct ReinforcementTracker {
     path: PathBuf,
@@ -237,24 +237,24 @@ impl ReinforcementTracker {
         })
     }
 
-    /// Record a retrieval event for the given entity.
+    /// Record a retrieval event for the given notion.
     ///
     /// Increments the hit-count and updates `last_accessed` to today.
     /// Automatically persists to disk.
-    pub fn record_retrieval(&mut self, entity_id: &str) -> Result<(), PriorityError> {
+    pub fn record_retrieval(&mut self, notion_id: &str) -> Result<(), PriorityError> {
         let today = Utc::now().date_naive();
-        let count = self.counts.entry(entity_id.to_string()).or_insert(0);
+        let count = self.counts.entry(notion_id.to_string()).or_insert(0);
         *count += 1;
-        self.last_accessed.insert(entity_id.to_string(), today);
+        self.last_accessed.insert(notion_id.to_string(), today);
         self.save()
     }
 
-    /// Get the current hit-count for an entity (0 if never retrieved).
-    pub fn get_hit_count(&self, entity_id: &str) -> u32 {
-        self.counts.get(entity_id).copied().unwrap_or(0)
+    /// Get the current hit-count for an notion (0 if never retrieved).
+    pub fn get_hit_count(&self, notion_id: &str) -> u32 {
+        self.counts.get(notion_id).copied().unwrap_or(0)
     }
 
-    /// Get entities not retrieved within the given number of days.
+    /// Get notions not retrieved within the given number of days.
     ///
     /// These are candidates for compression / archival (§8.3.3).
     pub fn get_stale_episodes(&self, days_threshold: u32) -> Vec<String> {
@@ -266,9 +266,9 @@ impl ReinforcementTracker {
             .collect()
     }
 
-    /// Get entities that have been retrieved at least `min_hits` times.
+    /// Get notions that have been retrieved at least `min_hits` times.
     ///
-    /// Frequently-retrieved entities are candidates for wiki promotion.
+    /// Frequently-retrieved notions are candidates for wiki promotion.
     pub fn get_frequent_entities(&self, min_hits: u32) -> Vec<String> {
         self.counts
             .iter()
@@ -280,7 +280,7 @@ impl ReinforcementTracker {
     /// Persist the current state to the JSON sidecar file.
     pub fn save(&self) -> Result<(), PriorityError> {
         let file = ReinforcementFile {
-            entities: self
+            notions: self
                 .counts
                 .iter()
                 .map(|(id, &count)| {
@@ -319,7 +319,7 @@ impl ReinforcementTracker {
         let mut counts = HashMap::new();
         let mut last_accessed = HashMap::new();
 
-        for (id, entry) in file.entities {
+        for (id, entry) in file.notions {
             counts.insert(id.clone(), entry.hit_count);
             last_accessed.insert(id, entry.last_accessed);
         }
@@ -593,14 +593,14 @@ mod tests {
         let path = dir.path().join("tracker.json");
         let mut tracker = ReinforcementTracker::new(path);
 
-        tracker.record_retrieval("entity-1").unwrap();
-        assert_eq!(tracker.get_hit_count("entity-1"), 1);
+        tracker.record_retrieval("notion-1").unwrap();
+        assert_eq!(tracker.get_hit_count("notion-1"), 1);
 
-        tracker.record_retrieval("entity-1").unwrap();
-        assert_eq!(tracker.get_hit_count("entity-1"), 2);
+        tracker.record_retrieval("notion-1").unwrap();
+        assert_eq!(tracker.get_hit_count("notion-1"), 2);
 
-        tracker.record_retrieval("entity-2").unwrap();
-        assert_eq!(tracker.get_hit_count("entity-2"), 1);
+        tracker.record_retrieval("notion-2").unwrap();
+        assert_eq!(tracker.get_hit_count("notion-2"), 1);
     }
 
     #[test]
@@ -645,8 +645,8 @@ mod tests {
         // Manually write a file with an old date.
         let old_date = Utc::now().date_naive() - Duration::days(100);
         let file = ReinforcementFile {
-            entities: HashMap::from([(
-                "stale-entity".to_string(),
+            notions: HashMap::from([(
+                "stale-notion".to_string(),
                 ReinforcementEntry {
                     hit_count: 3,
                     last_accessed: old_date,
@@ -658,7 +658,7 @@ mod tests {
 
         let tracker = ReinforcementTracker::new(path);
         let stale = tracker.get_stale_episodes(90);
-        assert!(stale.contains(&"stale-entity".to_string()));
+        assert!(stale.contains(&"stale-notion".to_string()));
     }
 
     #[test]

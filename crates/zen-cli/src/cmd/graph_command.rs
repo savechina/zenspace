@@ -5,10 +5,10 @@ use zen_core::errors::ZenError;
 
 #[derive(Subcommand)]
 pub enum GraphCommands {
-    /// Query the entity knowledge graph
+    /// Query the notion knowledge graph
     Query {
-        /// Entity name or ID
-        entity: String,
+        /// Notion name or ID
+        notion: String,
         /// Maximum traversal depth
         #[arg(short, long)]
         depth: Option<u32>,
@@ -21,19 +21,19 @@ pub enum GraphCommands {
 pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
     match cmd {
         GraphCommands::Query {
-            entity,
+            notion,
             depth,
             relation_type,
         } => {
             let d = depth.unwrap_or(3);
             debug!(
-                "graph: entity={} depth={:?} relation_type={:?}",
-                entity, d, relation_type
+                "graph: notion={} depth={:?} relation_type={:?}",
+                notion, d, relation_type
             );
 
-            warn!("Entity graph traversal not yet implemented (requires graph.db)");
-            eprintln!("⚠ Entity graph traversal not yet implemented (requires graph.db)");
-            eprintln!("Entity: {entity}, depth: {d}");
+            warn!("Notion graph traversal not yet implemented (requires graph.db)");
+            eprintln!("⚠ Notion graph traversal not yet implemented (requires graph.db)");
+            eprintln!("Notion: {notion}, depth: {d}");
             if let Some(rt) = relation_type {
                 eprintln!("Relation filter: {rt}");
             }

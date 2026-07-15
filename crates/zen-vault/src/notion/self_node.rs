@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use zen_core::entity_graph::SelfModelLayer;
+pub use zen_core::notion_graph::SelfModelLayer;
 
 /// A self-model node with 6-layer introspective typing.
 /// Stored in the dedicated self_nodes table, separate from EntityNode.

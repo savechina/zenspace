@@ -119,7 +119,7 @@ impl SearchService {
 
 fn graph_to_search(g: GraphResult) -> SearchResult {
     SearchResult {
-        file: PathBuf::from(format!("@{}", g.entity)),
+        file: PathBuf::from(format!("@{}", g.notion)),
         line: g.depth,
         content: format!("{} → {}", g.relation, g.target),
     }

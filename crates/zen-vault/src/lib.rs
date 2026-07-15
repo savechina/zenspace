@@ -1,6 +1,6 @@
 pub mod brief;
 pub mod consolidate;
-pub mod entity;
+pub mod notion;
 pub mod ingest;
 pub mod intent;
 pub mod maintenance;
@@ -11,10 +11,10 @@ pub mod wiki;
 
 pub use consolidate::{
     ChatImporter, Checkpoint, CheckpointManager, ConsolidationPipeline, ConsolidationPipelineInput,
-    ConsolidationReport, Contradiction, ContradictionDetector, EntityExtractor, RecoveryManager,
+    ConsolidationReport, Contradiction, ContradictionDetector, NotionExtractor, RecoveryManager,
     SourceIngester, TransactionScope, WikiCompiler,
 };
-pub use entity::{Entity, EntityData, EntityGraphAdapter, EntityService, EntityType, RelationType, Relationship};
+pub use notion::{Notion, NotionData, NotionGraphAdapter, NotionService, NotionKind, RelationKind, Relationship};
 pub use zen_repo::SqliteClient;
 pub use ingest::{
     FeedEntry, IngestResult, RssFetcher, extract_readable_content, fetch_feed, ingest_local_file,

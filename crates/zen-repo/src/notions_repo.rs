@@ -4,7 +4,7 @@ use sqlx::Row;
 
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{
-    ComponentResult, EntityRow, GraphSearchResult, InsertRelationshipRequest, PageRankResult,
+    ComponentResult, NotionRow, GraphSearchResult, InsertRelationshipRequest, PageRankResult,
     RelationshipRow, ShortestPathResult,
 };
 
@@ -21,11 +21,11 @@ pub fn normalize_alias(raw: &str) -> String {
     s.trim().to_string()
 }
 
-pub struct EntitiesRepo<'a> {
+pub struct NotionsRepo<'a> {
     client: &'a SqliteClient,
 }
 
-impl<'a> EntitiesRepo<'a> {
+impl<'a> NotionsRepo<'a> {
     pub fn new(client: &'a SqliteClient) -> Self {
         Self { client }
     }
@@ -34,10 +34,10 @@ impl<'a> EntitiesRepo<'a> {
         &self,
         id: &str,
         name: &str,
-        entity_type: &str,
+        kind: &str,
         now: &str,
     ) -> Result<()> {
-        self.insert_entity_with(id, name, entity_type, now, "", "manual", 0.5)
+        self.insert_entity_with(id, name, kind, now, "", "manual", 0.5)
             .await
     }
 
@@ -45,7 +45,7 @@ impl<'a> EntitiesRepo<'a> {
         &self,
         id: &str,
         name: &str,
-        entity_type: &str,
+        kind: &str,
         now: &str,
         description: &str,
         source: &str,
@@ -53,7 +53,7 @@ impl<'a> EntitiesRepo<'a> {
     ) -> Result<()> {
         let id = id.to_string();
         let name = name.to_string();
-        let entity_type = entity_type.to_string();
+        let kind = kind.to_string();
         let now = now.to_string();
         let description = description.to_string();
         let source = source.to_string();
@@ -62,10 +62,10 @@ impl<'a> EntitiesRepo<'a> {
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "INSERT OR REPLACE INTO entities \
-                     (id, name, entity_type, created_at, last_updated, description, source, confidence) \
+                    "INSERT OR REPLACE INTO notions \
+                     (id, name, kind, created_at, last_updated, description, source, confidence) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![id, name, entity_type, now, now, description, source, confidence],
+                    rusqlite::params![id, name, kind, now, now, description, source, confidence],
                 )?;
                 Ok(())
             })
@@ -78,11 +78,11 @@ impl<'a> EntitiesRepo<'a> {
         &self,
         id: &str,
         name: &str,
-        entity_type: &str,
+        kind: &str,
         created_at: &str,
         last_updated: &str,
     ) -> Result<()> {
-        self.upsert_entity_with(id, name, entity_type, created_at, last_updated, "", "manual", 0.5)
+        self.upsert_entity_with(id, name, kind, created_at, last_updated, "", "manual", 0.5)
             .await
     }
 
@@ -90,7 +90,7 @@ impl<'a> EntitiesRepo<'a> {
         &self,
         id: &str,
         name: &str,
-        entity_type: &str,
+        kind: &str,
         created_at: &str,
         last_updated: &str,
         description: &str,
@@ -99,7 +99,7 @@ impl<'a> EntitiesRepo<'a> {
     ) -> Result<()> {
         let id = id.to_string();
         let name = name.to_string();
-        let entity_type = entity_type.to_string();
+        let kind = kind.to_string();
         let created_at = created_at.to_string();
         let last_updated = last_updated.to_string();
         let description = description.to_string();
@@ -109,14 +109,14 @@ impl<'a> EntitiesRepo<'a> {
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "INSERT INTO entities \
-                     (id, name, entity_type, created_at, last_updated, description, source, confidence) \
+                    "INSERT INTO notions \
+                     (id, name, kind, created_at, last_updated, description, source, confidence) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                     ON CONFLICT(name, entity_type) DO UPDATE SET \
+                     ON CONFLICT(name, kind) DO UPDATE SET \
                      last_updated = ?5, \
-                     description = CASE WHEN excluded.description != '' THEN excluded.description ELSE entities.description END, \
-                     confidence = CASE WHEN excluded.confidence != 0.5 THEN excluded.confidence ELSE entities.confidence END",
-                    rusqlite::params![id, name, entity_type, created_at, last_updated, description, source, confidence],
+                     description = CASE WHEN excluded.description != '' THEN excluded.description ELSE notions.description END, \
+                     confidence = CASE WHEN excluded.confidence != 0.5 THEN excluded.confidence ELSE notions.confidence END",
+                    rusqlite::params![id, name, kind, created_at, last_updated, description, source, confidence],
                 )?;
                 Ok(())
             })
@@ -125,16 +125,16 @@ impl<'a> EntitiesRepo<'a> {
         Ok(())
     }
 
-    pub async fn update_entity_timestamp(&self, entity_id: &str, last_updated: &str) -> Result<()> {
-        let entity_id = entity_id.to_string();
+    pub async fn update_entity_timestamp(&self, notion_id: &str, last_updated: &str) -> Result<()> {
+        let notion_id = notion_id.to_string();
         let last_updated = last_updated.to_string();
 
         self.client
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "UPDATE entities SET last_updated = ?1 WHERE id = ?2",
-                    rusqlite::params![last_updated, entity_id],
+                    "UPDATE notions SET last_updated = ?1 WHERE id = ?2",
+                    rusqlite::params![last_updated, notion_id],
                 )?;
                 Ok(())
             })
@@ -143,18 +143,18 @@ impl<'a> EntitiesRepo<'a> {
         Ok(())
     }
 
-    pub async fn update_entity_access(&self, entity_id: &str) -> Result<()> {
-        let entity_id = entity_id.to_string();
+    pub async fn update_entity_access(&self, notion_id: &str) -> Result<()> {
+        let notion_id = notion_id.to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
         self.client
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "UPDATE entities \
+                    "UPDATE notions \
                      SET access_count = access_count + 1, last_accessed_at = ?1 \
                      WHERE id = ?2",
-                    rusqlite::params![now, entity_id],
+                    rusqlite::params![now, notion_id],
                 )?;
                 Ok(())
             })
@@ -165,17 +165,17 @@ impl<'a> EntitiesRepo<'a> {
 
     pub async fn update_entity_confidence(
         &self,
-        entity_id: &str,
+        notion_id: &str,
         confidence: f64,
     ) -> Result<()> {
-        let entity_id = entity_id.to_string();
+        let notion_id = notion_id.to_string();
 
         self.client
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "UPDATE entities SET confidence = ?1 WHERE id = ?2",
-                    rusqlite::params![confidence, entity_id],
+                    "UPDATE notions SET confidence = ?1 WHERE id = ?2",
+                    rusqlite::params![confidence, notion_id],
                 )?;
                 Ok(())
             })
@@ -184,16 +184,16 @@ impl<'a> EntitiesRepo<'a> {
         Ok(())
     }
 
-    pub async fn promote_entity(&self, entity_id: &str) -> Result<()> {
-        let entity_id = entity_id.to_string();
+    pub async fn promote_entity(&self, notion_id: &str) -> Result<()> {
+        let notion_id = notion_id.to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
         self.client
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "UPDATE entities SET promoted_at = ?1 WHERE id = ?2 AND promoted_at IS NULL",
-                    rusqlite::params![now, entity_id],
+                    "UPDATE notions SET promoted_at = ?1 WHERE id = ?2 AND promoted_at IS NULL",
+                    rusqlite::params![now, notion_id],
                 )?;
                 Ok(())
             })
@@ -202,19 +202,19 @@ impl<'a> EntitiesRepo<'a> {
         Ok(())
     }
 
-    pub async fn insert_alias(&self, alias: &str, canonical_entity_id: &str) -> Result<()> {
+    pub async fn insert_alias(&self, alias: &str, canonical_notion_id: &str) -> Result<()> {
         let alias = normalize_alias(alias);
         if alias.is_empty() {
             return Ok(());
         }
-        let canonical_entity_id = canonical_entity_id.to_string();
+        let canonical_notion_id = canonical_notion_id.to_string();
 
         self.client
             .writer()
             .call(move |conn| {
                 conn.execute(
-                    "INSERT OR IGNORE INTO entity_aliases (alias, canonical_entity_id) VALUES (?1, ?2)",
-                    rusqlite::params![alias, canonical_entity_id],
+                    "INSERT OR IGNORE INTO notion_aliases (alias, canonical_notion_id) VALUES (?1, ?2)",
+                    rusqlite::params![alias, canonical_notion_id],
                 )?;
                 Ok(())
             })
@@ -223,11 +223,11 @@ impl<'a> EntitiesRepo<'a> {
         Ok(())
     }
 
-    pub async fn load_aliases_for_entity(&self, entity_id: &str) -> Result<Vec<String>> {
+    pub async fn load_aliases_for_entity(&self, notion_id: &str) -> Result<Vec<String>> {
         let rows = sqlx::query(
-            "SELECT alias FROM entity_aliases WHERE canonical_entity_id = ?1 ORDER BY alias",
+            "SELECT alias FROM notion_aliases WHERE canonical_notion_id = ?1 ORDER BY alias",
         )
-        .bind(entity_id)
+        .bind(notion_id)
         .fetch_all(self.client.pool())
         .await?;
         Ok(rows.iter().map(|row| row.get::<String, _>(0)).collect())
@@ -251,7 +251,7 @@ impl<'a> EntitiesRepo<'a> {
             .call(move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO relationships \
-                     (id, source_entity_id, target_entity_id, relation_type, confidence, \
+                     (id, source_notion_id, target_notion_id, relation_type, confidence, \
                       source_note_ids, created_at, description, valid_from, valid_until, weight) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     rusqlite::params![
@@ -266,34 +266,34 @@ impl<'a> EntitiesRepo<'a> {
         Ok(())
     }
 
-    pub async fn load_known_entity_names(&self) -> Result<Vec<String>> {
+    pub async fn load_known_notion_names(&self) -> Result<Vec<String>> {
         let rows = sqlx::query(
-            "SELECT DISTINCT name FROM entities \
+            "SELECT DISTINCT name FROM notions \
              UNION \
-             SELECT DISTINCT alias FROM entity_aliases",
+             SELECT DISTINCT alias FROM notion_aliases",
         )
         .fetch_all(self.client.pool())
         .await?;
         Ok(rows.iter().map(|row| row.get::<String, _>(0)).collect())
     }
 
-    pub async fn load_all_entities(&self) -> Result<Vec<EntityRow>> {
-        Ok(sqlx::query_as::<_, EntityRow>(
-            "SELECT id, name, entity_type, created_at, domain, last_updated, \
+    pub async fn load_all_entities(&self) -> Result<Vec<NotionRow>> {
+        Ok(sqlx::query_as::<_, NotionRow>(
+            "SELECT id, name, kind, created_at, domain, last_updated, \
              description, properties, access_count, last_accessed_at, \
              confidence, source, promoted_at \
-             FROM entities ORDER BY name",
+             FROM notions ORDER BY name",
         )
         .fetch_all(self.client.pool())
         .await?)
     }
 
-    pub async fn load_entities_updated_since(&self, since: &str) -> Result<Vec<EntityRow>> {
-        Ok(sqlx::query_as::<_, EntityRow>(
-            "SELECT id, name, entity_type, created_at, domain, last_updated, \
+    pub async fn load_entities_updated_since(&self, since: &str) -> Result<Vec<NotionRow>> {
+        Ok(sqlx::query_as::<_, NotionRow>(
+            "SELECT id, name, kind, created_at, domain, last_updated, \
              description, properties, access_count, last_accessed_at, \
              confidence, source, promoted_at \
-             FROM entities WHERE last_updated > ?1 ORDER BY name",
+             FROM notions WHERE last_updated > ?1 ORDER BY name",
         )
         .bind(since)
         .fetch_all(self.client.pool())
@@ -302,58 +302,58 @@ impl<'a> EntitiesRepo<'a> {
 
     pub async fn resolve_alias(&self, alias: &str) -> Result<Option<String>> {
         let alias = normalize_alias(alias);
-        let result = sqlx::query("SELECT canonical_entity_id FROM entity_aliases WHERE alias = ?1")
+        let result = sqlx::query("SELECT canonical_notion_id FROM notion_aliases WHERE alias = ?1")
             .bind(alias)
             .fetch_optional(self.client.pool())
             .await?;
         Ok(result.map(|row| row.get::<String, _>(0)))
     }
 
-    pub async fn load_relationships(&self, entity_id: &str) -> Result<Vec<RelationshipRow>> {
+    pub async fn load_relationships(&self, notion_id: &str) -> Result<Vec<RelationshipRow>> {
         Ok(sqlx::query_as::<_, RelationshipRow>(
-            "SELECT id, source_entity_id, target_entity_id, relation_type, confidence, \
+            "SELECT id, source_notion_id, target_notion_id, relation_type, confidence, \
              source_note_ids, created_at, description, valid_from, valid_until, \
              recorded_at, weight \
-             FROM relationships WHERE source_entity_id = ?1",
+             FROM relationships WHERE source_notion_id = ?1",
         )
-        .bind(entity_id)
+        .bind(notion_id)
         .fetch_all(self.client.pool())
         .await?)
     }
 
-    pub async fn load_relationships_all(&self, entity_id: &str) -> Result<Vec<RelationshipRow>> {
+    pub async fn load_relationships_all(&self, notion_id: &str) -> Result<Vec<RelationshipRow>> {
         Ok(sqlx::query_as::<_, RelationshipRow>(
-            "SELECT id, source_entity_id, target_entity_id, relation_type, confidence, \
+            "SELECT id, source_notion_id, target_notion_id, relation_type, confidence, \
              source_note_ids, created_at, description, valid_from, valid_until, \
              recorded_at, weight \
-             FROM relationships WHERE source_entity_id = ?1 OR target_entity_id = ?1",
+             FROM relationships WHERE source_notion_id = ?1 OR target_notion_id = ?1",
         )
-        .bind(entity_id)
+        .bind(notion_id)
         .fetch_all(self.client.pool())
         .await?)
     }
 
-    pub async fn entity_name(&self, entity_id: &str) -> Result<Option<String>> {
-        let result = sqlx::query("SELECT name FROM entities WHERE id = ?1")
-            .bind(entity_id)
+    pub async fn notion_name(&self, notion_id: &str) -> Result<Option<String>> {
+        let result = sqlx::query("SELECT name FROM notions WHERE id = ?1")
+            .bind(notion_id)
             .fetch_optional(self.client.pool())
             .await?;
         Ok(result.map(|row| row.get::<String, _>(0)))
     }
 
-    pub async fn find_entity_by_name(&self, name: &str) -> Result<Option<EntityRow>> {
-        Ok(sqlx::query_as::<_, EntityRow>(
-            "SELECT id, name, entity_type, created_at, domain, last_updated, \
+    pub async fn find_entity_by_name(&self, name: &str) -> Result<Option<NotionRow>> {
+        Ok(sqlx::query_as::<_, NotionRow>(
+            "SELECT id, name, kind, created_at, domain, last_updated, \
              description, properties, access_count, last_accessed_at, \
              confidence, source, promoted_at \
-             FROM entities WHERE name = ?1 COLLATE NOCASE LIMIT 1",
+             FROM notions WHERE name = ?1 COLLATE NOCASE LIMIT 1",
         )
         .bind(name)
         .fetch_optional(self.client.pool())
         .await?)
     }
 
-    pub async fn search_entities_fts(&self, query: &str) -> Result<Vec<EntityRow>> {
+    pub async fn search_notions_fts(&self, query: &str) -> Result<Vec<NotionRow>> {
         let query = query.trim();
         if query.is_empty() {
             return self.load_all_entities().await;
@@ -361,13 +361,13 @@ impl<'a> EntitiesRepo<'a> {
 
         let fts_query = format!("{}*", query.replace('"', "''"));
 
-        Ok(sqlx::query_as::<_, EntityRow>(
-            "SELECT e.id, e.name, e.entity_type, e.created_at, e.domain, e.last_updated, \
+        Ok(sqlx::query_as::<_, NotionRow>(
+            "SELECT e.id, e.name, e.kind, e.created_at, e.domain, e.last_updated, \
              e.description, e.properties, e.access_count, e.last_accessed_at, \
              e.confidence, e.source, e.promoted_at \
-             FROM entities_fts f \
-             JOIN entities e ON e.id = f.entity_id \
-             WHERE entities_fts MATCH ?1 \
+             FROM notions_fts f \
+             JOIN notions e ON e.id = f.notion_id \
+             WHERE notions_fts MATCH ?1 \
              ORDER BY rank \
              LIMIT 50",
         )
@@ -378,19 +378,19 @@ impl<'a> EntitiesRepo<'a> {
 
     pub async fn bfs_search(
         &self,
-        entity_name: &str,
+        notion_name: &str,
         max_depth: u32,
     ) -> Result<Vec<GraphSearchResult>> {
-        self.bfs_search_filtered(entity_name, max_depth, "").await
+        self.bfs_search_filtered(notion_name, max_depth, "").await
     }
 
     pub async fn bfs_search_filtered(
         &self,
-        entity_name: &str,
+        notion_name: &str,
         max_depth: u32,
         relation_type_filter: &str,
     ) -> Result<Vec<GraphSearchResult>> {
-        if entity_name.trim().is_empty() {
+        if notion_name.trim().is_empty() {
             return Ok(Vec::new());
         }
 
@@ -399,12 +399,12 @@ impl<'a> EntitiesRepo<'a> {
         let rows = sqlx::query(
             "WITH RECURSIVE \
              edge_set(from_id, to_id, relation_type, direction) AS ( \
-                 SELECT source_entity_id, target_entity_id, relation_type, 'outbound' \
+                 SELECT source_notion_id, target_notion_id, relation_type, 'outbound' \
                  FROM relationships \
                  WHERE (valid_until IS NULL OR valid_until = '') \
                    AND (?3 = '' OR relation_type = ?3) \
                  UNION ALL \
-                 SELECT target_entity_id, source_entity_id, relation_type, 'inbound' \
+                 SELECT target_notion_id, source_notion_id, relation_type, 'inbound' \
                  FROM relationships \
                  WHERE (valid_until IS NULL OR valid_until = '') \
                    AND (?3 = '' OR relation_type = ?3) \
@@ -412,18 +412,18 @@ impl<'a> EntitiesRepo<'a> {
              bfs(id, name, depth, source_name, relation_type, direction, path) AS ( \
                  SELECT id, name, 0, CAST('' AS TEXT), CAST('' AS TEXT), CAST('' AS TEXT), \
                         ',' || id || ',' \
-                 FROM entities WHERE name = ?1 \
+                 FROM notions WHERE name = ?1 \
                  UNION ALL \
                  SELECT e.id, e.name, b.depth + 1, b.name, edge.relation_type, edge.direction, \
                         b.path || e.id || ',' \
                  FROM bfs b \
                  JOIN edge_set edge ON edge.from_id = b.id \
-                 JOIN entities e ON e.id = edge.to_id \
+                 JOIN notions e ON e.id = edge.to_id \
                  WHERE b.depth < ?2 \
                    AND instr(b.path, ',' || e.id || ',') = 0 \
              ) \
              SELECT \
-                 b.name as entity, \
+                 b.name as notion, \
                  b.depth as depth, \
                  MIN(b.relation_type) as relation, \
                  b.name as target, \
@@ -434,7 +434,7 @@ impl<'a> EntitiesRepo<'a> {
              GROUP BY b.name, b.depth \
              ORDER BY b.depth, b.name",
         )
-        .bind(entity_name)
+        .bind(notion_name)
         .bind(max_depth)
         .bind(rel_filter)
         .fetch_all(self.client.pool())
@@ -443,7 +443,7 @@ impl<'a> EntitiesRepo<'a> {
         let results = rows
             .into_iter()
             .map(|row| GraphSearchResult {
-                entity: row.get::<String, _>("entity"),
+                notion: row.get::<String, _>("notion"),
                 depth: row.get::<i64, _>("depth") as u32,
                 relation: row.get::<String, _>("relation"),
                 target: row.get::<String, _>("target"),
@@ -457,35 +457,35 @@ impl<'a> EntitiesRepo<'a> {
 
     pub async fn shortest_paths_all(
         &self,
-        entity_name: &str,
+        notion_name: &str,
         max_depth: u32,
     ) -> Result<Vec<ShortestPathResult>> {
-        if entity_name.trim().is_empty() {
+        if notion_name.trim().is_empty() {
             return Ok(Vec::new());
         }
 
         let rows = sqlx::query(
             "WITH RECURSIVE \
              edge_set(from_id, to_id, weight) AS ( \
-                 SELECT source_entity_id, target_entity_id, weight \
+                 SELECT source_notion_id, target_notion_id, weight \
                  FROM relationships WHERE (valid_until IS NULL OR valid_until = '') \
                  UNION ALL \
-                 SELECT target_entity_id, source_entity_id, weight \
+                 SELECT target_notion_id, source_notion_id, weight \
                  FROM relationships WHERE (valid_until IS NULL OR valid_until = '') \
              ), \
              walker(id, name, total_weight, depth, path_names, path_ids) AS ( \
                  SELECT id, name, 0.0, 0, name, ',' || id || ',' \
-                 FROM entities WHERE name = ?1 \
+                 FROM notions WHERE name = ?1 \
                  UNION ALL \
                  SELECT e.id, e.name, w.total_weight + edge.weight, w.depth + 1, \
                         w.path_names || ' -> ' || e.name, w.path_ids || e.id || ',' \
                  FROM walker w \
                  JOIN edge_set edge ON edge.from_id = w.id \
-                 JOIN entities e ON e.id = edge.to_id \
+                 JOIN notions e ON e.id = edge.to_id \
                  WHERE w.depth < ?2 \
                    AND instr(w.path_ids, ',' || e.id || ',') = 0 \
              ) \
-             SELECT pe.name as entity, \
+             SELECT pe.name as notion, \
                     pe.total_weight as distance, \
                     pe.depth as depth, \
                     pe.path_names as path \
@@ -495,7 +495,7 @@ impl<'a> EntitiesRepo<'a> {
              ) \
              ORDER BY pe.total_weight, pe.name",
         )
-        .bind(entity_name)
+        .bind(notion_name)
         .bind(max_depth)
         .fetch_all(self.client.pool())
         .await?;
@@ -503,7 +503,7 @@ impl<'a> EntitiesRepo<'a> {
         let results = rows
             .into_iter()
             .map(|row| ShortestPathResult {
-                entity: row.get::<String, _>("entity"),
+                notion: row.get::<String, _>("notion"),
                 distance: row.get::<f64, _>("distance"),
                 depth: row.get::<i64, _>("depth") as u32,
                 path: row.get::<String, _>("path"),
@@ -520,7 +520,7 @@ impl<'a> EntitiesRepo<'a> {
         max_depth: u32,
     ) -> Result<Option<ShortestPathResult>> {
         let all = self.shortest_paths_all(src_name, max_depth).await?;
-        Ok(all.into_iter().find(|r| r.entity == dst_name))
+        Ok(all.into_iter().find(|r| r.notion == dst_name))
     }
 
     pub async fn pagerank(
@@ -528,22 +528,22 @@ impl<'a> EntitiesRepo<'a> {
         iterations: usize,
         damping: f64,
     ) -> Result<Vec<PageRankResult>> {
-        let entity_rows = sqlx::query("SELECT id, name FROM entities ORDER BY name")
+        let notion_rows = sqlx::query("SELECT id, name FROM notions ORDER BY name")
             .fetch_all(self.client.pool())
             .await?;
 
-        let entities: Vec<(String, String)> = entity_rows
+        let notions: Vec<(String, String)> = notion_rows
             .iter()
             .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
             .collect();
 
-        let n = entities.len();
+        let n = notions.len();
         if n == 0 {
             return Ok(Vec::new());
         }
 
         let edge_rows = sqlx::query(
-            "SELECT source_entity_id, target_entity_id FROM relationships \
+            "SELECT source_notion_id, target_notion_id FROM relationships \
              WHERE valid_until IS NULL OR valid_until = ''",
         )
         .fetch_all(self.client.pool())
@@ -554,13 +554,13 @@ impl<'a> EntitiesRepo<'a> {
             .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
             .collect();
 
-        let id_to_idx: HashMap<String, usize> = entities
+        let id_to_idx: HashMap<String, usize> = notions
             .iter()
             .enumerate()
             .map(|(i, (id, _))| (id.clone(), i))
             .collect();
 
-        let name_by_idx: Vec<String> = entities.iter().map(|(_, name)| name.clone()).collect();
+        let name_by_idx: Vec<String> = notions.iter().map(|(_, name)| name.clone()).collect();
 
         let mut out_degree = vec![0usize; n];
         let mut inbound: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -603,7 +603,7 @@ impl<'a> EntitiesRepo<'a> {
             .iter()
             .enumerate()
             .map(|(i, &score)| PageRankResult {
-                entity: name_by_idx[i].clone(),
+                notion: name_by_idx[i].clone(),
                 score,
             })
             .collect();
@@ -617,28 +617,28 @@ impl<'a> EntitiesRepo<'a> {
     }
 
     pub async fn connected_components(&self) -> Result<Vec<ComponentResult>> {
-        let entity_rows = sqlx::query("SELECT id, name FROM entities ORDER BY name")
+        let notion_rows = sqlx::query("SELECT id, name FROM notions ORDER BY name")
             .fetch_all(self.client.pool())
             .await?;
 
-        let entities: Vec<(String, String)> = entity_rows
+        let notions: Vec<(String, String)> = notion_rows
             .iter()
             .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
             .collect();
 
-        let n = entities.len();
+        let n = notions.len();
         if n == 0 {
             return Ok(Vec::new());
         }
 
         let edge_rows = sqlx::query(
-            "SELECT source_entity_id, target_entity_id FROM relationships \
+            "SELECT source_notion_id, target_notion_id FROM relationships \
              WHERE valid_until IS NULL OR valid_until = ''",
         )
         .fetch_all(self.client.pool())
         .await?;
 
-        let id_to_idx: HashMap<String, usize> = entities
+        let id_to_idx: HashMap<String, usize> = notions
             .iter()
             .enumerate()
             .map(|(i, (id, _))| (id.clone(), i))
@@ -684,11 +684,11 @@ impl<'a> EntitiesRepo<'a> {
             current_component += 1;
         }
 
-        let results = entities
+        let results = notions
             .iter()
             .enumerate()
             .map(|(i, (_, name))| ComponentResult {
-                entity: name.clone(),
+                notion: name.clone(),
                 component_id: component_id[i],
                 component_size: component_sizes[&component_id[i]],
             })
@@ -700,7 +700,7 @@ impl<'a> EntitiesRepo<'a> {
     pub async fn apply_confidence_decay(&self, half_life_days: f64) -> Result<usize> {
         let rows = sqlx::query(
             "SELECT id, confidence, COALESCE(last_accessed_at, created_at) as ref_date \
-             FROM entities WHERE confidence > 0.0",
+             FROM notions WHERE confidence > 0.0",
         )
         .fetch_all(self.client.pool())
         .await?;
@@ -740,7 +740,7 @@ impl<'a> EntitiesRepo<'a> {
             .writer()
             .call(move |conn| {
                 let rows = conn.execute(
-                    "UPDATE entities \
+                    "UPDATE notions \
                      SET promoted_at = ?1, confidence = MAX(confidence, 0.8) \
                      WHERE access_count >= ?2 AND promoted_at IS NULL",
                     rusqlite::params![now, threshold],

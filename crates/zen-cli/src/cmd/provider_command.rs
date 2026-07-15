@@ -10,7 +10,7 @@ use zen_provider::{DefaultRouter, LlmRouter};
 pub enum ProviderCommands {
     /// Show provider routing for a task type
     Route {
-        /// Task type: entity_extraction, synthesis, consolidation, dispatch
+        /// Task type: notion_extraction, synthesis, consolidation, dispatch
         #[arg(short, long)]
         task: String,
     },

@@ -129,7 +129,7 @@ default_model = "command-r"
 # =============================================================================
 
 # Knowledge pipeline tasks (legacy)
-[agents.entity_extraction]
+[agents.notion_extraction]
 provider = "ollama"
 model = "qwen3.6:35b-mlx"
 fallbacks = [

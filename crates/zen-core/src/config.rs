@@ -217,7 +217,7 @@ impl Default for FeatureConfig {
 #[serde(default)]
 pub struct LlmConfig {
     pub default_provider: Option<String>,
-    pub entity_extraction: Option<LlmTaskConfig>,
+    pub notion_extraction: Option<LlmTaskConfig>,
     pub contradiction_detection: Option<LlmTaskConfig>,
     pub synthesis: Option<LlmTaskConfig>,
     pub dispatch: Option<LlmTaskConfig>,
@@ -432,7 +432,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             default_provider: Some("ollama".into()),
-            entity_extraction: Some(LlmTaskConfig::default()),
+            notion_extraction: Some(LlmTaskConfig::default()),
             contradiction_detection: Some(LlmTaskConfig::default()),
             synthesis: Some(LlmTaskConfig::default()),
             dispatch: Some(LlmTaskConfig::default()),
@@ -819,7 +819,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
 fn apply_agent_env(agents: &mut HashMap<String, AgentConfig>) {
     // Per-task env overrides: ZEN_AGENT_{TASK}_PROVIDER, ZEN_AGENT_{TASK}_MODEL
     for task in [
-        "entity_extraction",
+        "notion_extraction",
         "contradiction_detection",
         "synthesis",
         "dispatch",

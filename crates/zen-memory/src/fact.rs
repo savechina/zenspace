@@ -2,7 +2,7 @@
 //!
 //! Facts are the core knowledge type in the evolution engine,
 //! representing atomic pieces of extracted knowledge with
-//! associated entities and source tracking.
+//! associated notions and source tracking.
 //!
 //! Storage: `wiki/wisdom/facts/{id}.md`
 
@@ -31,7 +31,7 @@ pub enum FactError {
 
 // ─── Data types ────────────────────────────────────────────────────────
 
-/// An atomic piece of extracted knowledge with entity associations.
+/// An atomic piece of extracted knowledge with notion associations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Fact {
     /// Unique identifier (UUID v4).
@@ -41,7 +41,7 @@ pub struct Fact {
     /// When this fact was recorded.
     pub when: DateTime<Utc>,
     /// Entities associated with this fact.
-    pub entities: Vec<String>,
+    pub notions: Vec<String>,
     /// Source of the fact (e.g., "consolidation", "manual", file path).
     pub source: String,
 }
@@ -50,12 +50,12 @@ pub struct Fact {
 
 impl Fact {
     /// Create a new fact with auto-generated UUID.
-    pub fn new(what: &str, source: &str, entities: Vec<String>) -> Self {
+    pub fn new(what: &str, source: &str, notions: Vec<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             what: what.to_string(),
             when: Utc::now(),
-            entities,
+            notions,
             source: source.to_string(),
         }
     }
@@ -80,9 +80,9 @@ impl Fact {
             "source: \"{}\"\n",
             self.source.replace('"', "\\\"")
         ));
-        if !self.entities.is_empty() {
-            md.push_str("entities:\n");
-            for e in &self.entities {
+        if !self.notions.is_empty() {
+            md.push_str("notions:\n");
+            for e in &self.notions {
                 md.push_str(&format!("  - {e}\n"));
             }
         }
@@ -94,8 +94,8 @@ impl Fact {
             self.when.format("%Y-%m-%d %H:%M UTC")
         ));
         md.push_str(&format!("**Source**: {}\n", self.source));
-        if !self.entities.is_empty() {
-            md.push_str(&format!("**Entities**: {}\n", self.entities.join(", ")));
+        if !self.notions.is_empty() {
+            md.push_str(&format!("**Entities**: {}\n", self.notions.join(", ")));
         }
         md
     }
@@ -155,13 +155,13 @@ impl Fact {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let entities = parse_list_field(&fm, "entities");
+        let notions = parse_list_field(&fm, "notions");
 
         Ok(Fact {
             id,
             what,
             when,
-            entities,
+            notions,
             source,
         })
     }
@@ -240,8 +240,8 @@ mod tests {
         assert!(!f.id.is_empty());
         assert_eq!(f.what, "The Rust compiler uses LLVM as its backend");
         assert_eq!(f.source, "consolidation");
-        assert_eq!(f.entities.len(), 3);
-        assert!(f.entities.contains(&"rust".to_string()));
+        assert_eq!(f.notions.len(), 3);
+        assert!(f.notions.contains(&"rust".to_string()));
     }
 
     #[test]
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(parsed.id, f.id);
         assert_eq!(parsed.what, f.what);
         assert_eq!(parsed.source, f.source);
-        assert_eq!(parsed.entities, f.entities);
+        assert_eq!(parsed.notions, f.notions);
     }
 
     #[test]
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(loaded.id, f.id);
         assert_eq!(loaded.what, f.what);
         assert_eq!(loaded.source, f.source);
-        assert_eq!(loaded.entities, f.entities);
+        assert_eq!(loaded.notions, f.notions);
     }
 
     #[test]
@@ -294,7 +294,7 @@ mod tests {
         let dir = tmp.path().join("facts");
 
         let f1 = Fact::new("fact one", "test", vec![]);
-        let f2 = Fact::new("fact two", "test", vec!["entity".into()]);
+        let f2 = Fact::new("fact two", "test", vec!["notion".into()]);
         f1.save(&dir).unwrap();
         f2.save(&dir).unwrap();
 

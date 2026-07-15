@@ -4,12 +4,12 @@ use tracing::debug;
 
 use crate::tools::{ZenTool, ZenToolError, ZenToolResult, args_schema_entity, result_schema_array};
 use zen_repo::{
-    ComponentResult, EntitiesRepo, GraphSearchResult, InsertRelationshipRequest,
+    ComponentResult, NotionsRepo, GraphSearchResult, InsertRelationshipRequest,
     PageRankResult, ShortestPathResult, SqliteClient,
 };
 
 pub struct GraphResult {
-    pub entity: String,
+    pub notion: String,
     pub depth: u32,
     pub relation: String,
     pub target: String,
@@ -20,7 +20,7 @@ pub struct GraphResult {
 impl From<GraphSearchResult> for GraphResult {
     fn from(r: GraphSearchResult) -> Self {
         GraphResult {
-            entity: r.entity,
+            notion: r.notion,
             depth: r.depth,
             relation: r.relation,
             target: r.target,
@@ -30,7 +30,7 @@ impl From<GraphSearchResult> for GraphResult {
     }
 }
 
-/// Tier 4 search: entity graph traversal with BFS.
+/// Tier 4 search: notion graph traversal with BFS.
 #[derive(Debug)]
 pub struct Tier4Search;
 
@@ -38,21 +38,21 @@ impl Tier4Search {
     pub async fn search(
         &self,
         client: &SqliteClient,
-        entity_name: &str,
+        notion_name: &str,
         max_depth: u32,
     ) -> Result<Vec<GraphResult>> {
-        if entity_name.trim().is_empty() {
+        if notion_name.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        let results = EntitiesRepo::new(client).bfs_search(entity_name, max_depth).await?;
+        let results = NotionsRepo::new(client).bfs_search(notion_name, max_depth).await?;
 
         let graph_results: Vec<GraphResult> = results.into_iter().map(GraphResult::from).collect();
 
         debug!(
-            "Tier4Search: found {} entities for '{}' (depth={})",
+            "Tier4Search: found {} notions for '{}' (depth={})",
             graph_results.len(),
-            entity_name,
+            notion_name,
             max_depth
         );
         Ok(graph_results)
@@ -63,14 +63,14 @@ impl Tier4Search {
         client: &SqliteClient,
         id: &str,
         name: &str,
-        entity_type: &str,
+        kind: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let repo = EntitiesRepo::new(client);
+        let repo = NotionsRepo::new(client);
 
-        repo.insert_entity(id, name, entity_type, &now).await?;
+        repo.insert_entity(id, name, kind, &now).await?;
 
-        // Register normalized alias for entity deduplication.
+        // Register normalized alias for notion deduplication.
         use unicode_normalization::UnicodeNormalization;
         let normalized: String = name.nfc().collect();
         let normalized = normalized.trim().to_lowercase();
@@ -104,7 +104,7 @@ impl Tier4Search {
             valid_until: None,
             weight: None,
         };
-        EntitiesRepo::new(client).insert_relationship(&req).await?;
+        NotionsRepo::new(client).insert_relationship(&req).await?;
         Ok(())
     }
 
@@ -115,7 +115,7 @@ impl Tier4Search {
         dst_name: &str,
         max_depth: u32,
     ) -> Result<Option<ShortestPathResult>> {
-        EntitiesRepo::new(client)
+        NotionsRepo::new(client)
             .shortest_path(src_name, dst_name, max_depth)
             .await
             .map_err(Into::into)
@@ -127,7 +127,7 @@ impl Tier4Search {
         iterations: usize,
         damping: f64,
     ) -> Result<Vec<PageRankResult>> {
-        EntitiesRepo::new(client)
+        NotionsRepo::new(client)
             .pagerank(iterations, damping)
             .await
             .map_err(Into::into)
@@ -137,7 +137,7 @@ impl Tier4Search {
         &self,
         client: &SqliteClient,
     ) -> Result<Vec<ComponentResult>> {
-        EntitiesRepo::new(client)
+        NotionsRepo::new(client)
             .connected_components()
             .await
             .map_err(Into::into)
@@ -148,18 +148,18 @@ impl ZenTool for Tier4Search {
     fn schema(&self) -> crate::tools::ToolSchema {
         crate::tools::ToolSchema {
             name: "tier4_search".to_string(),
-            description: "Entity graph traversal using BFS from a starting entity.".to_string(),
+            description: "Notion graph traversal using BFS from a starting notion.".to_string(),
             args_schema: args_schema_entity(),
             result_schema: result_schema_array(),
         }
     }
 
     async fn invoke(&self, args: Value) -> ZenToolResult {
-        let entity_name = args
-            .get("entity_name")
+        let notion_name = args
+            .get("notion_name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                ZenToolError::InvalidArgs("missing required field: entity_name".to_string())
+                ZenToolError::InvalidArgs("missing required field: notion_name".to_string())
             })?;
         let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(3) as u32;
         let db_path = args
@@ -174,7 +174,7 @@ impl ZenTool for Tier4Search {
             })?;
 
         let results = self
-            .search(&client, entity_name, max_depth)
+            .search(&client, notion_name, max_depth)
             .await
             .map_err(|e| ZenToolError::ExecutionFailed(e.to_string()))?;
 
@@ -182,7 +182,7 @@ impl ZenTool for Tier4Search {
             .into_iter()
             .map(|r| {
                 serde_json::json!({
-                    "entity": r.entity,
+                    "notion": r.notion,
                     "depth": r.depth,
                     "relation": r.relation,
                     "target": r.target,
@@ -192,7 +192,7 @@ impl ZenTool for Tier4Search {
             })
             .collect();
 
-        Ok(serde_json::json!({ "entities": formatted }))
+        Ok(serde_json::json!({ "notions": formatted }))
     }
 }
 

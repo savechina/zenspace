@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-pub use zen_core::entity_graph::SelfModelLayer;
+pub use zen_core::notion_graph::SelfModelLayer;
 
 // ─── Data types ────────────────────────────────────────────────────────
 
@@ -440,6 +440,8 @@ mod tests {
         assert_eq!(SelfModelLayer::SelfConcept.to_string(), "self_concept");
         assert_eq!(SelfModelLayer::Trait.to_string(), "trait");
         assert_eq!(SelfModelLayer::Motivation.to_string(), "motivation");
+        assert_eq!(SelfModelLayer::Value.to_string(), "value");
+        assert_eq!(SelfModelLayer::Limit.to_string(), "limit");
     }
 
     #[test]
@@ -467,6 +469,14 @@ mod tests {
         assert_eq!(
             SelfModelLayer::from_str("motivation").unwrap(),
             SelfModelLayer::Motivation
+        );
+        assert_eq!(
+            SelfModelLayer::from_str("value").unwrap(),
+            SelfModelLayer::Value
+        );
+        assert_eq!(
+            SelfModelLayer::from_str("limit").unwrap(),
+            SelfModelLayer::Limit
         );
     }
 

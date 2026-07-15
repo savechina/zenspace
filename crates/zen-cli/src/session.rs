@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::debug;
 use uuid::Uuid;
-use zen_core::types::{Sensitivity, SessionEntity, SessionStatus};
+use zen_core::types::{Sensitivity, SessionRecord, SessionStatus};
 use zen_memory::memory_service::IdentityContext;
 
 pub struct SessionContext {
@@ -29,11 +29,11 @@ impl SessionOrchestrator {
         Self
     }
 
-    pub fn start_session_with_agent(&self, workspace: &str, agent: &str) -> Result<SessionEntity> {
+    pub fn start_session_with_agent(&self, workspace: &str, agent: &str) -> Result<SessionRecord> {
         let id = Uuid::now_v7().to_string();
         let now = Utc::now();
 
-        let session = SessionEntity {
+        let session = SessionRecord {
             id: id.clone(),
             agent_name: agent.to_string(),
             title: None,
@@ -53,8 +53,8 @@ impl SessionOrchestrator {
         Ok(session)
     }
 
-    pub fn list_sessions(&self) -> Result<Vec<SessionEntity>> {
-        SessionEntity::list()
+    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
+        SessionRecord::list()
     }
 }
 
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn test_session_entity_serialization_roundtrip() {
-        let session = SessionEntity {
+        let session = SessionRecord {
             id: "test-id".to_string(),
             agent_name: "Sisyphus-Junior".to_string(),
             title: None,
@@ -92,7 +92,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&session).unwrap();
-        let loaded: SessionEntity = serde_json::from_str(&json).unwrap();
+        let loaded: SessionRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.id, "test-id");
         assert_eq!(loaded.agent_name, "Sisyphus-Junior");
         assert_eq!(loaded.status, SessionStatus::Active);

@@ -309,7 +309,7 @@ impl<T: LlmRouter> LlmRouterExt for T {}
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 enum TaskContext {
-    EntityExtraction,
+    NotionExtraction,
     ContradictionDetection,
     Synthesis,
     Dispatch,
@@ -320,7 +320,7 @@ impl TaskContext {
     #[allow(dead_code)]
     fn from_label(label: &str) -> Self {
         match label {
-            "entity_extraction" | "extraction" => TaskContext::EntityExtraction,
+            "notion_extraction" | "extraction" => TaskContext::NotionExtraction,
             "contradiction_detection" | "contradiction" => TaskContext::ContradictionDetection,
             "synthesis" => TaskContext::Synthesis,
             "dispatch" => TaskContext::Dispatch,
@@ -330,7 +330,7 @@ impl TaskContext {
 
     fn config_key(&self) -> &'static str {
         match self {
-            TaskContext::EntityExtraction => "entity_extraction",
+            TaskContext::NotionExtraction => "notion_extraction",
             TaskContext::ContradictionDetection => "contradiction_detection",
             TaskContext::Synthesis => "synthesis",
             TaskContext::Dispatch => "dispatch",
@@ -341,7 +341,7 @@ impl TaskContext {
     #[allow(dead_code)]
     fn task_config<'a>(&self, cfg: &'a LlmConfig) -> Option<&'a zen_core::config::LlmTaskConfig> {
         match self {
-            TaskContext::EntityExtraction => cfg.entity_extraction.as_ref(),
+            TaskContext::NotionExtraction => cfg.notion_extraction.as_ref(),
             TaskContext::ContradictionDetection => cfg.contradiction_detection.as_ref(),
             TaskContext::Synthesis => cfg.synthesis.as_ref(),
             TaskContext::Dispatch => cfg.dispatch.as_ref(),
@@ -581,7 +581,7 @@ impl DefaultRouter {
     pub fn new(config: LlmConfig) -> Self {
         let mut providers = std::collections::HashMap::new();
 
-        if let Some(tc) = config.entity_extraction.as_ref()
+        if let Some(tc) = config.notion_extraction.as_ref()
             && tc.provider.as_deref() == Some("ollama")
         {
             let base_url = tc
@@ -599,7 +599,7 @@ impl DefaultRouter {
             && let Some(ref provider_name) = tc.provider
         {
             if provider_name == "ollama" {
-                // Ollama handled above in entity_extraction
+                // Ollama handled above in notion_extraction
             } else if provider_name != "mock" {
                 // Cloud provider: resolve API key and base_url from config
                 let default_env = format!("{}_API_KEY", provider_name.to_uppercase());
@@ -779,7 +779,7 @@ impl DefaultRouter {
                 // Attempt fallback to a local provider (ollama) if available + reachable.
                 if self.is_local_llm_available()
                     && let Some(local) =
-                        Self::resolve_provider(&self.config, TaskContext::EntityExtraction)
+                        Self::resolve_provider(&self.config, TaskContext::NotionExtraction)
                     && self.is_local(&local)
                 {
                     warn!(

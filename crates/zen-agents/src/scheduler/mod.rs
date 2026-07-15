@@ -278,8 +278,8 @@ pub struct WorkerSummary {
 /// - `subconscious`: runs every 5 minutes, evaluates workspace state
 /// - `dream`: runs 2-4AM, executes the nightly consolidation cycle
 /// - `session-journaler`: runs every 5 minutes, extracts journal entries from session conversations
-/// - `entity-extractor`: runs every 10 minutes, extracts entities from journal entries into state.db
-/// - `wiki-compiler`: runs every 30 minutes, compiles wiki pages from state.db entities
+/// - `notion-extractor`: runs every 10 minutes, extracts notions from journal entries into state.db
+/// - `wiki-compiler`: runs every 30 minutes, compiles wiki pages from state.db notions
 /// - `commitment-tracker` (CommitmentTracker): runs daily 8AM, tracks commitments from journal entries
 /// - `reflection-worker` (ReflectionWorker): runs daily 6AM, aggregates reflections into wiki/wisdom/
 /// - `wisdom-synth` (WisdomSynthesizer): runs weekly Sun 2AM (cron: `0 0 2 * * 7`), synthesizes reflections + beliefs into wisdom candidates
@@ -301,8 +301,8 @@ pub fn create_default_scheduler() -> ZenScheduler {
     if let Err(e) = scheduler.register(SessionJournaler::new()) {
         warn!("scheduler: failed to register session-journaler worker: {e}");
     }
-    if let Err(e) = scheduler.register(EntityExtractorWorker::new()) {
-        warn!("scheduler: failed to register entity-extractor worker: {e}");
+    if let Err(e) = scheduler.register(NotionExtractorWorker::new()) {
+        warn!("scheduler: failed to register notion-extractor worker: {e}");
     }
     if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
         warn!("scheduler: failed to register wiki-compiler worker: {e}");
@@ -370,8 +370,8 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
         warn!("scheduler: failed to register session-journaler worker: {e}");
     }
 
-    if let Err(e) = scheduler.register(EntityExtractorWorker::new()) {
-        warn!("scheduler: failed to register entity-extractor worker: {e}");
+    if let Err(e) = scheduler.register(NotionExtractorWorker::new()) {
+        warn!("scheduler: failed to register notion-extractor worker: {e}");
     }
 
     if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
@@ -502,7 +502,7 @@ mod tests {
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
         assert!(items.iter().any(|w| w.id == "session-journaler"));
-        assert!(items.iter().any(|w| w.id == "entity-extractor"));
+        assert!(items.iter().any(|w| w.id == "notion-extractor"));
         assert!(items.iter().any(|w| w.id == "wiki-compiler"));
         assert!(items.iter().any(|w| w.id == "commitment-tracker"));
         assert!(items.iter().any(|w| w.id == "reflection-worker"));
