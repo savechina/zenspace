@@ -293,10 +293,10 @@ fn test_zen_research_help_succeeds() {
 }
 
 #[test]
-fn test_zen_consolidate_help_succeeds() {
+fn test_zen_distill_help_succeeds() {
     let test = ZenTest::new();
-    let output = test.zen(&["consolidate", "--help"]);
-    assert!(output.success(), "consolidate --help should succeed");
+    let output = test.zen(&["distill", "--help"]);
+    assert!(output.success(), "distill --help should succeed");
 }
 
 #[test]

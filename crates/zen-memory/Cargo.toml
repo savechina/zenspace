@@ -19,6 +19,4 @@ rig-memvid = { workspace = true }
 rig-compose = { workspace = true }
 tempfile = { workspace = true }
 include_dir = { workspace = true }
-sqlx = { workspace = true, features = ["sqlite"] }
-tokio-rusqlite = { workspace = true }
 async-trait = { workspace = true }

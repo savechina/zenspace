@@ -7,7 +7,11 @@ use zen_core::errors::ZenError;
 #[derive(Subcommand)]
 pub enum RoutineCommands {
     /// List all registered scheduler workers
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Trigger a worker by name immediately (e.g. "dream", "journal-worker", "subconscious")
     Trigger {
         /// Worker name
@@ -27,21 +31,41 @@ pub enum RoutineCommands {
 
 pub async fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
     match cmd {
-        RoutineCommands::List => {
+        RoutineCommands::List { json } => {
             let scheduler = create_default_scheduler();
             let workers = scheduler.list();
 
             if workers.is_empty() {
-                println!("No workers registered.");
+                if *json {
+                    println!("[]");
+                } else {
+                    println!("No workers registered.");
+                }
                 return Ok(());
             }
 
-            println!("{:<15} {:<22} DESCRIPTION", "WORKER", "SCHEDULE");
-            println!("{}", "-".repeat(70));
-            for w in &workers {
-                println!("{:<15} {:<22} {}", w.id, w.schedule, w.description);
+            if *json {
+                let json_arr: Vec<serde_json::Value> = workers
+                    .iter()
+                    .map(|w| {
+                        serde_json::json!({
+                            "id": w.id,
+                            "schedule": w.schedule,
+                            "description": w.description,
+                            "enabled": w.enabled,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&json_arr).unwrap_or_default());
+            } else {
+                println!("{:<15} {:<22} {:<7} DESCRIPTION", "WORKER", "SCHEDULE", "ENABLED");
+                println!("{}", "-".repeat(80));
+                for w in &workers {
+                    let status = if w.enabled { "✓" } else { "✗" };
+                    println!("{:<15} {:<22} {:<7} {}", w.id, w.schedule, status, w.description);
+                }
+                println!("\n{} worker(s) registered.", workers.len());
             }
-            println!("\n{} worker(s) registered.", workers.len());
             Ok(())
         }
 
@@ -64,13 +88,33 @@ pub async fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
         }
 
         RoutineCommands::Enable { name } => {
-            println!("enable not yet implemented for worker '{name}'");
-            Ok(())
+            let mut scheduler = create_default_scheduler();
+            match scheduler.enable(name) {
+                Ok(()) => {
+                    println!("✓ Worker '{name}' enabled");
+                    Ok(())
+                }
+                Err(_) => {
+                    Err(ZenError::Message(format!(
+                        "worker '{name}' not registered — run `zen routine list` to see registered workers"
+                    )))
+                }
+            }
         }
 
         RoutineCommands::Disable { name } => {
-            println!("disable not yet implemented for worker '{name}'");
-            Ok(())
+            let mut scheduler = create_default_scheduler();
+            match scheduler.disable(name) {
+                Ok(()) => {
+                    println!("✓ Worker '{name}' disabled");
+                    Ok(())
+                }
+                Err(_) => {
+                    Err(ZenError::Message(format!(
+                        "worker '{name}' not registered — run `zen routine list` to see registered workers"
+                    )))
+                }
+            }
         }
     }
 }

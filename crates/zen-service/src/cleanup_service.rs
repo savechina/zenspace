@@ -5,6 +5,7 @@ use std::{
 };
 
 use home::home_dir;
+use tracing::warn;
 
 use zen_core::errors::ServiceError;
 
@@ -127,16 +128,20 @@ pub fn clean_cache() -> Result<(), ServiceError> {
     let cargo_cache_path = home.join(".cargo/registry");
     if cargo_cache_path.exists() {
         println!("Cleaning Cargo cache");
-        if let Ok(pattern) = cargo_cache_path.to_str().ok_or("Invalid Unicode in path") {
-            let _ = std::panic::catch_unwind(|| utils::delete_pattern(pattern));
+        if let Ok(pattern) = cargo_cache_path.to_str().ok_or("Invalid Unicode in path")
+            && let Err(e) = std::panic::catch_unwind(|| utils::delete_pattern(pattern))
+        {
+            warn!(pattern = %pattern, error = ?e, "panic during Cargo cache cleanup");
         }
     }
 
     let edge_cache_path = home.join("Library/Caches/Microsoft Edge/Default/Cache");
     if edge_cache_path.exists() {
         println!("Cleaning Microsoft Edge cache");
-        if let Ok(pattern) = edge_cache_path.to_str().ok_or("Invalid Unicode in path") {
-            let _ = std::panic::catch_unwind(|| utils::delete_pattern(pattern));
+        if let Ok(pattern) = edge_cache_path.to_str().ok_or("Invalid Unicode in path")
+            && let Err(e) = std::panic::catch_unwind(|| utils::delete_pattern(pattern))
+        {
+            warn!(pattern = %pattern, error = ?e, "panic during Edge cache cleanup");
         }
     }
 
@@ -146,16 +151,19 @@ pub fn clean_cache() -> Result<(), ServiceError> {
         if let Ok(pattern) = edge_code_cache_path
             .to_str()
             .ok_or("Invalid Unicode in path")
+            && let Err(e) = std::panic::catch_unwind(|| utils::delete_pattern(pattern))
         {
-            let _ = std::panic::catch_unwind(|| utils::delete_pattern(pattern));
+            warn!(pattern = %pattern, error = ?e, "panic during Edge code cache cleanup");
         }
     }
 
     let chrome_cache_path = home.join("Library/Caches/Google/Chrome/Default/Cache");
     if chrome_cache_path.exists() {
         println!("Cleaning Google Chrome cache");
-        if let Ok(pattern) = chrome_cache_path.to_str().ok_or("Invalid Unicode in path") {
-            let _ = std::panic::catch_unwind(|| utils::delete_pattern(pattern));
+        if let Ok(pattern) = chrome_cache_path.to_str().ok_or("Invalid Unicode in path")
+            && let Err(e) = std::panic::catch_unwind(|| utils::delete_pattern(pattern))
+        {
+            warn!(pattern = %pattern, error = ?e, "panic during Chrome cache cleanup");
         }
     }
 
@@ -165,8 +173,9 @@ pub fn clean_cache() -> Result<(), ServiceError> {
         if let Ok(pattern) = chrome_code_cache_path
             .to_str()
             .ok_or("Invalid Unicode in path")
+            && let Err(e) = std::panic::catch_unwind(|| utils::delete_pattern(pattern))
         {
-            let _ = std::panic::catch_unwind(|| utils::delete_pattern(pattern));
+            warn!(pattern = %pattern, error = ?e, "panic during Chrome code cache cleanup");
         }
     }
 
@@ -181,8 +190,10 @@ pub fn clean_logs() -> Result<(), ServiceError> {
     let delete_if_exists = |path: PathBuf, description: &str| {
         if path.exists() {
             println!("Deleting {}", description);
-            if let Ok(pattern) = path.to_str().ok_or("Invalid Unicode in path") {
-                let _ = std::panic::catch_unwind(|| utils::delete_pattern(pattern));
+            if let Ok(pattern) = path.to_str().ok_or("Invalid Unicode in path")
+                && let Err(e) = std::panic::catch_unwind(|| utils::delete_pattern(pattern))
+            {
+                warn!(pattern = %pattern, error = ?e, "panic during log cleanup");
             }
         }
     };
@@ -231,8 +242,10 @@ pub fn clean_ide() -> Result<(), ServiceError> {
     let delete_if_exists = |path: PathBuf, description: &str| {
         if path.exists() {
             println!("Deleting {}", description);
-            if let Ok(pattern) = path.to_str().ok_or("Invalid Unicode in path") {
-                let _ = std::panic::catch_unwind(|| utils::delete_pattern(pattern));
+            if let Ok(pattern) = path.to_str().ok_or("Invalid Unicode in path")
+                && let Err(e) = std::panic::catch_unwind(|| utils::delete_pattern(pattern))
+            {
+                warn!(pattern = %pattern, error = ?e, "panic during IDE cleanup");
             }
         }
     };

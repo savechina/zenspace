@@ -9,7 +9,7 @@ use zen_repo::{
     },
 };
 
-use crate::maintenance::compute_embeddings_for_text;
+use crate::tindy::compute_embeddings_for_text;
 use crate::search::Tier3Search;
 
 use super::notion::{Notion, NotionKind};
@@ -31,28 +31,7 @@ fn normalize_notion_name(name: &str) -> String {
     s
 }
 
-/// Parse an notion type string (as stored in graph.db) back into the enum variant.
-fn parse_kind(s: &str) -> NotionKind {
-    match s {
-        "Function" => NotionKind::Function,
-        "Class" => NotionKind::Class,
-        "Module" => NotionKind::Module,
-        "Concept" => NotionKind::Concept,
-        "Person" => NotionKind::Person,
-        "Organization" => NotionKind::Organization,
-        "Event" => NotionKind::Event,
-        "Product" => NotionKind::Product,
-        "Technology" => NotionKind::Technology,
-        "SelfModel" => NotionKind::SelfModel,
-        "Belief" => NotionKind::Belief,
-        "Goal" => NotionKind::Goal,
-        "Path" => NotionKind::Path,
-        "Decision" => NotionKind::Decision,
-        _ => NotionKind::Other,
-    }
-}
-
-/// Convert a `RelationshipRow` string to a `RelationKind` enum.
+/// Convert a `RelationRow` string to a `RelationKind` enum.
 fn relation_type_from_str(s: &str) -> RelationKind {
     match s {
         "DependsOn" => RelationKind::DependsOn,
@@ -79,7 +58,7 @@ fn relation_type_from_str(s: &str) -> RelationKind {
 
 /// Convert an `NotionRow` from the repo to the domain `Notion` type.
 fn entity_row_to_entity(row: zen_repo::types::NotionRow) -> Notion {
-    let kind = parse_kind(&row.kind);
+    let kind = super::notion::parse_kind(&row.kind).unwrap_or(NotionKind::Other);
     let created_at = chrono::DateTime::parse_from_rfc3339(&row.created_at)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
@@ -214,7 +193,7 @@ impl NotionService {
         let repo = NotionsRepo::new(client);
 
         let canonical_name = normalize_notion_name(&notion.name);
-        let type_str = format!("{:?}", notion.kind);
+        let type_str = notion.kind.to_string();
         let created_at = notion.created_at.to_rfc3339();
         let last_updated = chrono::Utc::now().to_rfc3339();
 
@@ -362,7 +341,7 @@ impl NotionService {
     }
 
     /// Upserts a SelfNode into the dedicated self_nodes table.
-    /// This is the Phase C3 implementation with typed columns for 6-layer introspective typing.
+    /// This is the Phase C3 implementation with typed columns for 8-layer introspective typing.
     pub async fn upsert_self_node(
         &self,
         client: &SqliteClient,
@@ -581,6 +560,24 @@ impl NotionService {
         Ok(row.map(|r| (r.name, r.serves_goal_id.unwrap_or_default(), r.is_default, r.crowdedness, r.alternatives)))
     }
 
+    /// Loads all goal nodes from the goal_nodes table.
+    pub async fn load_all_goal_nodes(
+        &self,
+        client: &SqliteClient,
+    ) -> Result<Vec<(String, String, f64, String, Option<String>)>> {
+        let rows = GoalsRepo::new(client).load_all_goals().await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.name, r.controllability, r.core_pursuit, r.deadline)).collect())
+    }
+
+    /// Loads all path nodes from the path_nodes table.
+    pub async fn load_all_path_nodes(
+        &self,
+        client: &SqliteClient,
+    ) -> Result<Vec<(String, String, Option<String>, bool, f64, String)>> {
+        let rows = GoalsRepo::new(client).load_all_paths().await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.name, r.serves_goal_id, r.is_default, r.crowdedness, r.alternatives)).collect())
+    }
+
     /// Loads a belief node from the belief_nodes table.
     #[allow(clippy::type_complexity)]
     pub async fn load_belief_node(
@@ -596,6 +593,7 @@ impl NotionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notion::notion::parse_kind;
     use tempfile::tempdir;
 
     #[test]
@@ -653,28 +651,28 @@ mod tests {
 
     #[test]
     fn test_parse_kind_self_model() {
-        let parsed = parse_kind("SelfModel");
+        let parsed = parse_kind("self_model").unwrap();
         assert_eq!(parsed, NotionKind::SelfModel);
 
-        let parsed_belief = parse_kind("Belief");
+        let parsed_belief = parse_kind("belief").unwrap();
         assert_eq!(parsed_belief, NotionKind::Belief);
 
-        let parsed_goal = parse_kind("Goal");
+        let parsed_goal = parse_kind("goal").unwrap();
         assert_eq!(parsed_goal, NotionKind::Goal);
     }
 
     #[test]
-    fn test_parse_kind_unknown_falls_back_to_other() {
+    fn test_parse_kind_unknown_returns_none() {
         let parsed = parse_kind("UnknownType");
-        assert_eq!(parsed, NotionKind::Other);
+        assert_eq!(parsed, None);
     }
 
     #[test]
-    fn test_kind_self_model_debug_roundtrip() {
+    fn test_kind_self_model_display_roundtrip() {
         let et = NotionKind::SelfModel;
-        let debug_str = format!("{:?}", et);
-        assert_eq!(debug_str, "SelfModel");
-        let reparsed = parse_kind(&debug_str);
+        let display_str = et.to_string();
+        assert_eq!(display_str, "self_model");
+        let reparsed = parse_kind(&display_str).unwrap();
         assert_eq!(reparsed, et);
     }
 
@@ -756,7 +754,7 @@ mod tests {
         let notions_repo = NotionsRepo::new(&client);
         let all = notions_repo.load_all_entities().await.unwrap();
         let stored = all.iter().find(|e| e.id == "sm-2").unwrap();
-        assert_eq!(stored.kind, "SelfModel");
+        assert_eq!(stored.kind, "self_model");
     }
 
     #[tokio::test]
@@ -797,8 +795,8 @@ mod tests {
         let notion = &notions[0];
         assert_eq!(notion.kind, NotionKind::SelfModel);
 
-        let type_str = format!("{:?}", notion.kind);
-        let reparsed = parse_kind(&type_str);
+        let type_str = notion.kind.to_string();
+        let reparsed = parse_kind(&type_str).unwrap();
         assert_eq!(reparsed, NotionKind::SelfModel);
     }
 
@@ -853,7 +851,7 @@ mod tests {
         let notions_repo = NotionsRepo::new(&client);
         let all = notions_repo.load_all_entities().await.unwrap();
         let stored = all.iter().find(|e| e.id == "g-3").unwrap();
-        assert_eq!(stored.kind, "Goal");
+        assert_eq!(stored.kind, "goal");
     }
 
     #[tokio::test]

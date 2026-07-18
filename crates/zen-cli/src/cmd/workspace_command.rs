@@ -75,6 +75,13 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
                 );
             }
 
+            let para_dirs = ["vault/projects", "vault/areas", "vault/resources", "vault/archive"];
+            for dir in &para_dirs {
+                let full = format!("{}/{}", zen_dir, dir);
+                fs::create_dir_all(&full)?;
+                println!("  {} {}", "✓".green().bold(), full.dimmed());
+            }
+
             Ok(())
         }
         WorkspaceCommands::Status => {

@@ -263,6 +263,7 @@ pub struct CronConfig {
     pub dream_start_hour: Option<u32>,
     pub dream_end_hour: Option<u32>,
     pub wisdom_synthesis_schedule: Option<String>,
+    pub fresh_eyes_mode: Option<bool>,
 }
 
 /// Plugin system config.
@@ -460,6 +461,7 @@ impl Default for CronConfig {
             dream_start_hour: Some(2),
             dream_end_hour: Some(4),
             wisdom_synthesis_schedule: Some("0 0 2 * * 7".into()),
+            fresh_eyes_mode: Some(false),
         }
     }
 }
@@ -744,6 +746,7 @@ fn merge_cron(base: CronConfig, ov: CronConfig) -> CronConfig {
             base.wisdom_synthesis_schedule,
             ov.wisdom_synthesis_schedule,
         ),
+        fresh_eyes_mode: ov.fresh_eyes_mode.or(base.fresh_eyes_mode),
     }
 }
 

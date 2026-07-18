@@ -12,6 +12,10 @@
 
 <!-- Top-10 anti-patterns the user is watching for — updated by ReflectionWorker -->
 
+## Continue-Doing Ledger
+
+<!-- Top-10 positive patterns the user should keep doing — updated by ReflectionWorker -->
+
 ## Active Mental Models
 
 <!-- Top-5 mental models currently in use — updated by WisdomSynthesizer -->

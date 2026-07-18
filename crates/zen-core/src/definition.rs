@@ -39,24 +39,25 @@ impl fmt::Display for ToolPermission {
 /// Defines an agent's prompt template, tool permissions, behavior constraints,
 /// output format, context injection paths, and optional category routing.
 ///
-/// **Current Status (2026-06-02)**:
-/// - ✅ `prompt_template`: Active — consumed by executor.rs:200
-/// - ⏳ `tool_permissions`: Reserved for FR-SEC-001 permission gating
-/// - ⏳ `context_injection`: Reserved for ADR-011 Tier 3 integration
-/// - ⏳ `category_routing`: Reserved for FR-ROUTING-002 intent classification
-/// - ⏳ `behavior_constraints`: Reserved for ADR-011 Tier 1 → PromptBuilder
-/// - ⏳ `output_format`: Reserved for ADR-011 Tier 2 → PromptBuilder
-/// - ⏳ `custom_instructions`: Reserved for ADR-011 Tier 6 → PromptBuilder
+/// **Field Status (2026-06-02)**:
+/// - `prompt_template`: Active — consumed by executor.rs:200
+/// - `tool_permissions`: Reserved for FR-SEC-001 permission gating (ZenSafetyHook)
+/// - `context_injection`: Reserved for ADR-011 Tier 3 integration (InvestigationContext)
+/// - `category_routing`: Reserved for FR-ROUTING-002 intent classification (ZenCoordinator)
+/// - `behavior_constraints`: Reserved for ADR-011 Tier 1 → PromptBuilder
+/// - `output_format`: Reserved for ADR-011 Tier 2 → PromptBuilder
+/// - `custom_instructions`: Reserved for ADR-011 Tier 6 → PromptBuilder
 ///
-/// **TODO**: Connect reserved fields to PromptBuilder via `from_definition()` method.
-/// See: docs/specs/001-agentic-foundation/spec.md ADR-011 lines 1115-1126
-///
-/// Tier mapping (ADR-011 system prompt assembly):
+/// **ADR-011 Tier Mapping** (system prompt assembly):
 /// - Tier 0 (Identity): prompt_template
 /// - Tier 1 (Behavior): behavior_constraints + tool_permissions
 /// - Tier 2 (Output Format): output_format
 /// - Tier 3 (Tools): injected from registry (not in definition)
 /// - Tier 6 (Business): custom_instructions
+///
+/// Reserved fields are intentionally placeholders — ADR-011 PromptBuilder
+/// integration is a Phase 2 architectural task tracked in
+/// `docs/specs/001-agentic-foundation/spec.md` lines 1115-1126.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDefinition {
     /// Agent name (e.g., "coordinator", "junior", "oracle")

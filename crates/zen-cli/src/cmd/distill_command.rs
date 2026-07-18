@@ -3,10 +3,10 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_vault::consolidate::ConsolidationPipeline;
+use zen_vault::distill::DistillationPipeline;
 
 #[derive(Subcommand)]
-pub enum ConsolidateCommands {
+pub enum DistillCommands {
     /// Run the consolidation pipeline
     Run {
         /// Target pathway (reserved, not yet used)
@@ -18,22 +18,22 @@ pub enum ConsolidateCommands {
     },
 }
 
-pub fn execute_command(cmd: &ConsolidateCommands) -> Result<(), ZenError> {
+pub fn execute_command(cmd: &DistillCommands) -> Result<(), ZenError> {
     match cmd {
-        ConsolidateCommands::Run { pathway, date } => {
-            debug!("consolidate: pathway={:?} date={:?}", pathway, date);
+        DistillCommands::Run { pathway, date } => {
+            debug!("distill: pathway={:?} date={:?}", pathway, date);
 
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
             let inbox_dir = paths.inbox();
             let wiki_dir = paths.wiki();
 
-            let pipeline = ConsolidationPipeline::new();
+            let pipeline = DistillationPipeline::new();
             let report = pipeline
                 .run(&inbox_dir, &wiki_dir)
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 
             println!(
-                "Consolidation report ({}, pathway: {:?}, date: {:?}):",
+                "Distillation report ({}, pathway: {:?}, date: {:?}):",
                 inbox_dir.display(),
                 pathway,
                 date

@@ -5,6 +5,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceLimits {
@@ -76,7 +77,9 @@ impl WasmSandbox {
         }
 
         let mut wasi_builder = wasi_common::sync::WasiCtxBuilder::new();
-        let _ = wasi_builder.args(args);
+        if let Err(e) = wasi_builder.args(args) {
+            warn!(error = ?e, "failed to set WASI arguments");
+        }
         wasi_builder.stdout(Box::new(wasi_common::pipe::WritePipe::new(CursorWriter(
             stdout_clone,
         ))));
@@ -97,9 +100,9 @@ impl WasmSandbox {
             let result = run_func.call_async(&mut store, &[], &mut []).await;
             let elapsed = start.elapsed().as_millis() as u64;
 
-            let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap().get_ref()).into_owned();
+            let stdout = String::from_utf8_lossy(stdout_buf.lock().unwrap().get_ref()).into_owned();
             let mut stderr =
-                String::from_utf8_lossy(&stderr_buf.lock().unwrap().get_ref()).into_owned();
+                String::from_utf8_lossy(stderr_buf.lock().unwrap().get_ref()).into_owned();
 
             let exit_code = match &result {
                 Ok(_) => 0,

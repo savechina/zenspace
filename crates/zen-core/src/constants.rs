@@ -14,12 +14,30 @@ pub const VAULT_DIR: &str = "vault/";
 pub const INBOX_DIR: &str = "inbox/";
 pub const RAW_DIR: &str = "raw/";
 pub const WIKI_DIR: &str = "wiki/";
+pub const WIKI_NOTIONS_DIR: &str = "wiki/notions/";
+pub const WIKI_TOPICS_DIR: &str = "wiki/topics/";
+pub const WIKI_SUBJECTS_DIR: &str = "wiki/subjects/";
+pub const WIKI_WISDOM_DIR: &str = "wiki/wisdom/";
+pub const WIKI_VIRTUES_DIR: &str = "wiki/virtues/";
 pub const SKILLS_DIR: &str = "skills/";
 pub const FINANCE_DIR: &str = "finance/";
+pub const PROJECTS_DIR: &str = "vault/projects/";
+pub const AREAS_DIR: &str = "vault/areas/";
+pub const RESOURCES_DIR: &str = "vault/resources/";
+pub const ARCHIVE_DIR: &str = "vault/archive/";
 
 pub const CACHE_DIR: &str = "cache/";
+/// Root directory for cumulative memory artifacts (journal entries, logs).
 pub const MEMORY_DIR: &str = "memories/";
 pub const MEMVID_STORE_FILE: &str = "mem1.mv2";
+/// Directory holding identity definition files (SOUL.md, MEMORY.md, AGENTS.md).
+///
+/// **Design Note**: Intentionally co-located with `MEMORY_DIR` ("memories/").
+/// Identity files ARE memory artifacts — SOUL.md defines personality,
+/// MEMORY.md is the cumulative record, AGENTS.md captures agent behavior.
+/// Both `ZenPaths::identity()` and `ZenPaths::memory()` resolve to the same
+/// physical directory; the distinct accessors preserve semantic intent at the
+/// API level without fragmenting the filesystem. See `memory-architecture/spec.md`.
 pub const IDENTITY_DIR: &str = "memories/";
 pub const PROMPTS_DIR: &str = "prompts/";
 

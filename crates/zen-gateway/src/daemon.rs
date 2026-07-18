@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process;
@@ -18,8 +19,12 @@ use tracing::{info, warn};
 
 use crate::gateway_error::GatewayError;
 use crate::gateway_trait::{Gateway, GatewayStatus};
+use crate::inference_gateway::InferenceGateway;
+use crate::mcp_server::{McpConfig, McpServer};
 use crate::routes::{AgentInfo, ChatRequest, ChatResponse, GatewayState, ws_handler};
-use zen_agents::{AgentRegistry, DefaultAgentRegistry};
+use zen_agents::{AgentOrchestrator, AgentRegistry, DefaultAgentRegistry};
+use zen_core::types::SessionContext;
+use zen_provider::DefaultRouter;
 
 /// HTTP configuration for the gateway daemon.
 #[derive(Clone)]
@@ -148,29 +153,39 @@ async fn chat_handler(
         );
     }
 
-    let agent_name = req
-        .agent
-        .clone()
-        .unwrap_or_else(|| "Sisyphus-Junior".to_string());
-    let agents = state.agents.lock().await;
-    let agent = agents.find_by_name(&agent_name);
-
-    match agent {
-        Ok(_) => {
-            drop(agents);
-            let reply = format!("[{}] Processing: {}", agent_name, req.message);
-            (
-                StatusCode::OK,
+    let orchestrator = match &state.orchestrator {
+        Some(o) => Arc::clone(o),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(ChatResponse {
-                    reply,
-                    agent: Some(agent_name),
+                    reply: "No LLM provider configured".to_string(),
+                    agent: None,
                 }),
-            )
+            );
         }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
+    };
+
+    let session_key = req
+        .session_id
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions
+        .entry(session_key)
+        .or_insert_with(|| SessionContext::new("gateway".to_string(), String::new()));
+
+    match orchestrator.execute(&mut *session, &req.message).await {
+        Ok(execution) => (
+            StatusCode::OK,
             Json(ChatResponse {
-                reply: format!("Agent '{}' not found", agent_name),
+                reply: execution.response,
+                agent: Some(execution.agent_name),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ChatResponse {
+                reply: format!("Execution error: {}", e),
                 agent: None,
             }),
         ),
@@ -187,9 +202,23 @@ impl Gateway for HttpGateway {
         let agents: Arc<Mutex<dyn AgentRegistry + Send>> =
             Arc::new(Mutex::new(DefaultAgentRegistry::new()));
 
+        let orchestrator = match zen_core::config::load_config() {
+            Ok(zen_config) => {
+                let router = DefaultRouter::from_agentic(zen_config);
+                Some(Arc::new(AgentOrchestrator::new(router)))
+            }
+            Err(e) => {
+                warn!("Failed to load config for orchestrator, chat will be unavailable: {}", e);
+                None
+            }
+        };
+
         let gateway_state = GatewayState {
             agents,
             config: config.clone(),
+            orchestrator: orchestrator.clone(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            inference_gateway: Arc::new(InferenceGateway::new(5, 100, orchestrator)),
         };
 
         let router = self.build_router(gateway_state);
@@ -213,7 +242,9 @@ impl Gateway for HttpGateway {
 
             let server = axum::serve(listener, router.into_make_service()).with_graceful_shutdown(
                 async move {
-                    let _ = shutdown_rx.await;
+                    if let Err(e) = shutdown_rx.await {
+                        warn!("shutdown signal receive error: {}", e);
+                    }
                 },
             );
 
@@ -223,12 +254,22 @@ impl Gateway for HttpGateway {
             }
         });
 
+        let mcp_server = McpServer::new(McpConfig::default());
+        tokio::spawn(async move {
+            if let Err(e) = mcp_server.start_stdio().await {
+                warn!("MCP stdio server stopped: {}", e);
+            }
+        });
+        info!("MCP server started (stdio transport)");
+
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), GatewayError> {
         if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+            if tx.send(()).is_err() {
+                warn!("gateway shutdown receiver already dropped");
+            }
             info!("Gateway shutdown signal sent");
         }
         Ok(())
@@ -262,7 +303,7 @@ pub fn read_pid<P: AsRef<Path>>(path: P) -> Result<u32, GatewayError> {
     content
         .trim()
         .parse::<u32>()
-        .map_err(|_| GatewayError::NotImplemented)
+        .map_err(|e| GatewayError::Parse(format!("PID file {:?}: {}", path.as_ref(), e)))
 }
 
 pub fn remove_pid<P: AsRef<Path>>(path: P) -> Result<(), GatewayError> {

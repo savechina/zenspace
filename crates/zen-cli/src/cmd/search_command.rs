@@ -22,7 +22,7 @@ pub enum SearchCommands {
         /// Max results (stub: not yet applied)
         #[arg(short, long)]
         limit: Option<usize>,
-        /// Domain filter (stub: not yet applied)
+        /// Domain filter
         #[arg(short, long)]
         domain: Option<String>,
         /// Output results as JSON
@@ -82,7 +82,7 @@ pub async fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
                 .map_err(|e| ZenError::Message(format!("Database error: {}", e)))?;
 
             let results = service
-                .search(query, &base_dir, &client, *tier)
+                .search(query, &base_dir, &client, *tier, domain.as_deref())
                 .await
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 

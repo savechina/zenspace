@@ -5,6 +5,8 @@ pub enum GatewayError {
     NotImplemented,
     Io(std::io::Error),
     Bind(String),
+    /// Failed to parse a value (e.g., PID file contained non-numeric text).
+    Parse(String),
 }
 
 impl fmt::Display for GatewayError {
@@ -13,6 +15,7 @@ impl fmt::Display for GatewayError {
             GatewayError::NotImplemented => write!(f, "Gateway method not yet implemented"),
             GatewayError::Io(e) => write!(f, "IO error: {e}"),
             GatewayError::Bind(e) => write!(f, "Bind error: {e}"),
+            GatewayError::Parse(ctx) => write!(f, "Parse error: {ctx}"),
         }
     }
 }

@@ -303,7 +303,9 @@ impl Commitment {
     pub fn trigger_stop_loss(&mut self) {
         self.stop_loss.triggered = true;
         self.stop_loss.triggered_at = Some(Utc::now());
-        let _ = self.transition(CommitmentState::Abandoned);
+        if let Err(e) = self.transition(CommitmentState::Abandoned) {
+            warn!(error = %e, "failed to transition to Abandoned on stop-loss");
+        }
     }
 
     pub fn add_milestone(&mut self, description: &str, target_date: Option<NaiveDate>) {

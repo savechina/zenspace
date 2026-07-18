@@ -102,7 +102,7 @@ pub enum SchedulerError {
 /// Default tick interval for the scheduler loop (30 seconds).
 pub const DEFAULT_TICK_INTERVAL_SECONDS: u64 = 30;
 
-type RegisteredWorker = (String, Schedule, Arc<dyn ZenWorker>);
+type RegisteredWorker = (String, Schedule, Arc<dyn ZenWorker>, bool);
 
 /// Cron-driven scheduler that manages and executes background workers.
 ///
@@ -164,7 +164,7 @@ impl ZenScheduler {
         );
 
         self.workers
-            .insert(id, (expr.to_string(), schedule, Arc::new(worker)));
+            .insert(id, (expr.to_string(), schedule, Arc::new(worker), true));
         Ok(())
     }
 
@@ -192,7 +192,10 @@ impl ZenScheduler {
         // Collect workers to fire first to avoid borrow issues with spawn.
         let mut to_fire: Vec<(String, Arc<dyn ZenWorker>, WorkerContext)> = Vec::new();
 
-        for (id, (_expr, schedule, worker)) in &self.workers {
+        for (id, (_expr, schedule, worker, enabled)) in &self.workers {
+            if !enabled {
+                continue;
+            }
             let should_fire = schedule.upcoming(Utc).next().is_some_and(|next| {
                 let diff = (next - now).num_seconds().unsigned_abs();
                 // Fire if the next scheduled time is within the tick window
@@ -227,7 +230,7 @@ impl ZenScheduler {
 
     /// Immediately trigger a named worker outside the scheduled loop.
     pub async fn trigger(&self, name: &str) -> Result<WorkerReport, SchedulerError> {
-        let (_, _, worker) = self
+        let (_, _, worker, _) = self
             .workers
             .get(name)
             .ok_or_else(|| SchedulerError::WorkerNotFound(name.to_string()))?;
@@ -244,12 +247,35 @@ impl ZenScheduler {
     pub fn list(&self) -> Vec<WorkerSummary> {
         self.workers
             .iter()
-            .map(|(id, (expr, _schedule, worker))| WorkerSummary {
+            .map(|(id, (expr, _schedule, worker, enabled))| WorkerSummary {
                 id: id.clone(),
                 schedule: expr.clone(),
                 description: worker.description().to_string(),
+                enabled: *enabled,
             })
             .collect()
+    }
+
+    /// Enable a worker by name. Returns `Err` if no worker with that ID is registered.
+    pub fn enable(&mut self, name: &str) -> Result<(), SchedulerError> {
+        let entry = self
+            .workers
+            .get_mut(name)
+            .ok_or_else(|| SchedulerError::WorkerNotFound(name.to_string()))?;
+        entry.3 = true;
+        info!(worker = %name, "scheduler: worker enabled");
+        Ok(())
+    }
+
+    /// Disable a worker by name. Returns `Err` if no worker with that ID is registered.
+    pub fn disable(&mut self, name: &str) -> Result<(), SchedulerError> {
+        let entry = self
+            .workers
+            .get_mut(name)
+            .ok_or_else(|| SchedulerError::WorkerNotFound(name.to_string()))?;
+        entry.3 = false;
+        info!(worker = %name, "scheduler: worker disabled");
+        Ok(())
     }
 }
 
@@ -265,6 +291,7 @@ pub struct WorkerSummary {
     pub id: String,
     pub schedule: String,
     pub description: String,
+    pub enabled: bool,
 }
 
 // ─── Convenience constructor ──────────────────────────────────────────

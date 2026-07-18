@@ -141,4 +141,38 @@ mod tests {
         assert_eq!(result.line, 10);
         assert_eq!(result.content, "key: value: extra");
     }
+
+    #[test]
+    fn test_domain_filter() {
+        use super::service::filter_by_domain;
+        let tmp = TempDir::new().unwrap();
+
+        let work_file = tmp.path().join("work_note.md");
+        fs::write(
+            &work_file,
+            "---\nid: \"w1\"\ntags: []\nsource: test\nsensitivity: private\ncreated_at: \"2026-01-01T00:00:00Z\"\nupdated_at: \"2026-01-01T00:00:00Z\"\ndomain: [work]\n---\nWork content",
+        ).unwrap();
+
+        let personal_file = tmp.path().join("personal_note.md");
+        fs::write(
+            &personal_file,
+            "---\nid: \"p1\"\ntags: []\nsource: test\nsensitivity: private\ncreated_at: \"2026-01-01T00:00:00Z\"\nupdated_at: \"2026-01-01T00:00:00Z\"\ndomain: [personal]\n---\nPersonal content",
+        ).unwrap();
+
+        let results = vec![
+            SearchResult { file: work_file.clone(), line: 1, content: "work".to_string() },
+            SearchResult { file: personal_file.clone(), line: 1, content: "personal".to_string() },
+        ];
+
+        let filtered = filter_by_domain(results, "work").unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].file, work_file);
+
+        let results2 = vec![
+            SearchResult { file: work_file, line: 1, content: "work".to_string() },
+            SearchResult { file: personal_file, line: 1, content: "personal".to_string() },
+        ];
+        let filtered2 = filter_by_domain(results2, "personal").unwrap();
+        assert_eq!(filtered2.len(), 1);
+    }
 }

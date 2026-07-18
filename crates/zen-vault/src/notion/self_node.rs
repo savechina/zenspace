@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub use zen_core::notion_graph::SelfModelLayer;
 
-/// A self-model node with 6-layer introspective typing.
+/// A self-model node with 8-layer introspective typing.
 /// Stored in the dedicated self_nodes table, separate from EntityNode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfNode {

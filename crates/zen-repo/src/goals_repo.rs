@@ -74,4 +74,20 @@ impl<'a> GoalsRepo<'a> {
         .fetch_optional(self.client.pool())
         .await?)
     }
+
+    pub async fn load_all_goals(&self) -> Result<Vec<GoalNodeRow>> {
+        Ok(sqlx::query_as::<_, GoalNodeRow>(
+            "SELECT id, name, controllability, core_pursuit, deadline FROM goal_nodes",
+        )
+        .fetch_all(self.client.pool())
+        .await?)
+    }
+
+    pub async fn load_all_paths(&self) -> Result<Vec<PathNodeRow>> {
+        Ok(sqlx::query_as::<_, PathNodeRow>(
+            "SELECT id, name, serves_goal_id, is_default, crowdedness, alternatives FROM path_nodes",
+        )
+        .fetch_all(self.client.pool())
+        .await?)
+    }
 }

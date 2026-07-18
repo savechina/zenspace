@@ -1,4 +1,4 @@
-use super::render::render_markdown_to_lines;
+use super::render::render_markdown_with_thoughts;
 use ratatui::text::Line;
 
 pub struct MarkdownStreamCollector {
@@ -28,7 +28,7 @@ impl MarkdownStreamCollector {
             return (Vec::new(), String::new());
         };
 
-        let lines = render_markdown_to_lines(&renderable);
+        let lines = render_markdown_with_thoughts(&renderable);
         let complete_count = lines.len();
 
         if self.committed_line_count >= complete_count {
@@ -48,7 +48,7 @@ impl MarkdownStreamCollector {
             source.push('\n');
         }
 
-        let lines = render_markdown_to_lines(&source);
+        let lines = render_markdown_with_thoughts(&source);
         let out = if self.committed_line_count >= lines.len() {
             Vec::new()
         } else {

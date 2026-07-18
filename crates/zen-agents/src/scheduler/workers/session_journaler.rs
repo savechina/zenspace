@@ -124,7 +124,11 @@ impl ZenWorker for SessionJournaler {
             });
         }
 
-        let fresh_eyes = self.fresh_eyes_mode || Utc::now().day() == 1;
+        let fresh_eyes_config = load_config()
+            .ok()
+            .and_then(|c| c.cron.fresh_eyes_mode)
+            .unwrap_or(false);
+        let fresh_eyes = self.fresh_eyes_mode || fresh_eyes_config || Utc::now().day() == 1;
         if fresh_eyes {
             info!("fresh eyes mode active — skipping prior context injection");
         }
@@ -432,6 +436,10 @@ Respond with ONLY a JSON object:
   ],
   "beliefs": [
     {{"statement": "SQLite is sufficient for local-first apps under 1GB data", "confidence": 0.7}}
+  ],
+  "continue_doing": [
+    "Writing tests before implementation caught 3 regressions early",
+    "Pair programming on the API design reduced rework by half"
   ]
 }}
 
@@ -443,6 +451,7 @@ Rules:
 - **Corrections**: errors caught and fixed. Include what went wrong, the correct answer, and the cost.
 - **Feedback**: observations about code/process quality. Include target, content, and sentiment.
 - **Beliefs**: assumptions or opinions held by the user. Include a confidence score (0.0-1.0).
+- **Continue-doing**: positive actions or practices that worked well and should be repeated. Capture what went RIGHT — techniques, habits, or decisions that produced good outcomes. These are the "continue-doing" counterpart to reflections (stop-doing).
 - Do NOT include transient mechanics ("user asked about X", "assistant replied")
 - If a category is empty, return an empty array for it
 - If nothing of value happened in any category, return all empty arrays"#
@@ -599,6 +608,17 @@ Rules:
         }
     }
 
+    if let Some(arr) = parsed["continue_doing"].as_array() {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let s = s.trim();
+                if !s.is_empty() {
+                    signals.continue_doing_candidates.push(s.to_string());
+                }
+            }
+        }
+    }
+
     Ok(signals)
 }
 
@@ -612,6 +632,7 @@ fn extract_signals_via_keyword(conversation_text: &str) -> ExtractedSignals {
         corrections: Vec::new(),
         feedback: Vec::new(),
         beliefs: Vec::new(),
+        continue_doing_candidates: Vec::new(),
     }
 }
 
@@ -945,6 +966,7 @@ mod tests {
             corrections: vec![],
             feedback: vec![],
             beliefs: vec![],
+            continue_doing_candidates: vec![],
         };
 
         let entry = build_journal_entry(session_id, turn_count, &signals, "keyword");
@@ -982,6 +1004,7 @@ mod tests {
             corrections: vec![],
             feedback: vec![],
             beliefs: vec![],
+            continue_doing_candidates: vec![],
         };
         let entry = build_journal_entry(session_id, 10, &signals, "llm");
 

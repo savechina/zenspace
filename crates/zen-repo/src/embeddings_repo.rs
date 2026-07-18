@@ -35,6 +35,29 @@ impl<'a> EmbeddingsRepo<'a> {
         Ok(results)
     }
 
+    /// Fetch the stored embedding for a given note ID, if present.
+    pub async fn get_note_embedding(&self, note_id: &str) -> Result<Option<Vec<f32>>> {
+        let note_id = note_id.to_string();
+        let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT embedding FROM note_embeddings WHERE note_id = ?1")
+            .bind(note_id)
+            .fetch_optional(self.client.pool())
+            .await?;
+
+        match row {
+            None => Ok(None),
+            Some((blob,)) => {
+                if blob.is_empty() {
+                    return Ok(Some(Vec::new()));
+                }
+                let floats: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                Ok(Some(floats))
+            }
+        }
+    }
+
     pub async fn insert_note_embedding(&self, req: InsertNoteEmbeddingRequest<'_>) -> Result<()> {
         let note_id = req.note_id.to_string();
         let blob: Vec<u8> = req

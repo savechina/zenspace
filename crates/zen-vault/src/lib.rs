@@ -1,17 +1,20 @@
 pub mod brief;
-pub mod consolidate;
+pub mod distill;
+pub mod dispatch;
+pub mod goal;
+pub mod habit;
 pub mod notion;
 pub mod ingest;
 pub mod intent;
-pub mod maintenance;
+pub mod tindy;
 pub mod note;
 pub mod search;
 pub mod tools;
 pub mod wiki;
 
-pub use consolidate::{
-    ChatImporter, Checkpoint, CheckpointManager, ConsolidationPipeline, ConsolidationPipelineInput,
-    ConsolidationReport, Contradiction, ContradictionDetector, NotionExtractor, RecoveryManager,
+pub use distill::{
+    ChatImporter, Checkpoint, CheckpointManager, DistillationPipeline, DistillationPipelineInput,
+    DistillationReport, Contradiction, ContradictionDetector, NotionExtractor, RecoveryManager,
     SourceIngester, TransactionScope, WikiCompiler,
 };
 pub use notion::{Notion, NotionData, NotionGraphAdapter, NotionService, NotionKind, RelationKind, Relationship};
@@ -20,7 +23,7 @@ pub use ingest::{
     FeedEntry, IngestResult, RssFetcher, extract_readable_content, fetch_feed, ingest_local_file,
     ingest_url,
 };
-pub use maintenance::{
+pub use tindy::{
     ChangeDetector, ComputeEmbeddings, EmbeddingResult, GapType, KnowledgeGap, LearningLoop,
     LearningReport, LintReportGenerator, LintResult, Linter, ReindexReport, Reindexer,
     ResearchTask, compute_embeddings, compute_embeddings_for_text, compute_file_checksum,

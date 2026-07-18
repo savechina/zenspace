@@ -3,12 +3,14 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 use zen_repo::{IndexNoteRequest, NotesRepo, SqliteClient};
 
 use super::checksum;
+use super::embeddings::compute_embeddings_for_text;
 use crate::note;
+use crate::search::Tier3Search;
 
 // ── Report ───────────────────────────────────────────────────────────
 
@@ -21,6 +23,10 @@ pub struct ReindexReport {
     pub files_updated: usize,
     /// Files whose checksum matched the stored value.
     pub files_unchanged: usize,
+    /// Files successfully embedded into `note_embeddings` (vec0).
+    pub files_embedded: usize,
+    /// Files where embedding generation was skipped (fallback exhausted or no client).
+    pub embeddings_skipped: usize,
     /// Non-fatal error messages encountered while processing files.
     pub errors: Vec<String>,
 }
@@ -29,35 +35,41 @@ pub struct ReindexReport {
 
 /// Orchestrates a full or incremental reindex of the knowledge directory.
 ///
-/// The reindexer walks `knowledge_dir` for all `.md` files, computes
-/// SHA-256 checksums, and decides whether each note needs to be
-/// re-indexed. Files are indexed into the FTS5 `notes_fts` table via
-/// `NotesRepo::index_note()`.
+/// Walks `knowledge_dir` for `.md` files, computes SHA-256 checksums, and
+/// indexes each changed file into both:
+///   - FTS5 `notes_fts` table (always, when `db_client` is set)
+///   - vec0 `note_embeddings` table (when `embed == true`, the default)
+///
+/// Embedding generation uses the 3-fallback chain in `tindy::embeddings`
+/// (provider → local ONNX → hash) and is guaranteed not to fail.
+#[derive(Default)]
 pub struct Reindexer {
     known_checksums: HashMap<String, String>,
     db_client: Option<SqliteClient>,
-}
-
-impl Default for Reindexer {
-    fn default() -> Self {
-        Reindexer {
-            known_checksums: HashMap::new(),
-            db_client: None,
-        }
-    }
+    embed: bool,
 }
 
 impl Reindexer {
     pub fn new() -> Self {
-        Reindexer::default()
+        Reindexer {
+            embed: true,
+            ..Default::default()
+        }
     }
 
-    /// Create a reindexer with a database client for actual FTS5 indexing.
+    /// Create a reindexer with a database client for FTS5 + vec0 indexing.
     pub fn with_client(db_client: SqliteClient) -> Self {
         Reindexer {
             known_checksums: HashMap::new(),
             db_client: Some(db_client),
+            embed: true,
         }
+    }
+
+    /// Disable vector embedding generation (FTS5-only mode).
+    pub fn without_embeddings(mut self) -> Self {
+        self.embed = false;
+        self
     }
 
     /// Register a known checksum for a file.
@@ -125,8 +137,8 @@ impl Reindexer {
                 continue;
             }
 
-            // Process: parse frontmatter, update index (stub), update checksum.
-            match self.process_file(file_path, &current_checksum).await {
+            // Process: parse frontmatter, FTS5 index, embedding index, update checksum.
+            match self.process_file(file_path, &current_checksum, &mut report).await {
                 Ok(()) => {
                     info!("Reindexed: {}", file_display);
                     report.files_updated += 1;
@@ -143,18 +155,26 @@ impl Reindexer {
         }
 
         info!(
-            "Reindex complete: scanned={} updated={} unchanged={} errors={}",
+            "Reindex complete: scanned={} updated={} unchanged={} embedded={} embed_skipped={} errors={}",
             report.files_scanned,
             report.files_updated,
             report.files_unchanged,
+            report.files_embedded,
+            report.embeddings_skipped,
             report.errors.len()
         );
 
         Ok(report)
     }
 
-    /// Process a single file: parse frontmatter, index into FTS5, update checksum.
-    async fn process_file(&self, file_path: &Path, checksum: &str) -> Result<()> {
+    /// Process a single file: parse frontmatter, index into FTS5, generate +
+    /// store vector embedding (when enabled), update checksum.
+    async fn process_file(
+        &self,
+        file_path: &Path,
+        checksum: &str,
+        report: &mut ReindexReport,
+    ) -> Result<()> {
         let content = fs::read_to_string(file_path)?;
         let file_display = file_path.display().to_string();
         let file_name = file_path
@@ -204,11 +224,49 @@ impl Reindexer {
                 "FTS5 indexed: file={} id={} title={} source={}",
                 file_display, note_id, title, source
             );
+
+            if self.embed {
+                match compute_embeddings_for_text(&body_content) {
+                    Ok(embedding) if !embedding.is_empty() => {
+                        match Tier3Search.insert_embedding(client, &note_id, &embedding).await {
+                            Ok(()) => {
+                                report.files_embedded += 1;
+                                debug!(
+                                    "Embedded: file={} id={} dim={}",
+                                    file_display,
+                                    note_id,
+                                    embedding.len()
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Embedding insert failed for {} (id={}): {} — FTS5 still indexed",
+                                    file_display, note_id, e
+                                );
+                                report.embeddings_skipped += 1;
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        report.embeddings_skipped += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Embedding generation failed for {}: {} — this should not happen (3-fallback chain)",
+                            file_display, e
+                        );
+                        report.embeddings_skipped += 1;
+                    }
+                }
+            }
         } else {
             info!(
                 "FTS5 index skipped (no db client): file={} checksum={:.8}…",
                 file_display, checksum
             );
+            if self.embed {
+                report.embeddings_skipped += 1;
+            }
         }
 
         Ok(())

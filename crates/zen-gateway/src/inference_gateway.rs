@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::warn;
 use uuid::Uuid;
+
+use zen_agents::AgentOrchestrator;
+use zen_core::types::SessionContext;
 
 // ---------------------------------------------------------------------------
 // T270: PromptTrie for KV-cache sharing
@@ -179,10 +183,15 @@ pub struct InferenceGateway {
     pub batcher: Arc<Mutex<ContinuousBatcher>>,
     pub stats: Arc<Mutex<GatewayStats>>,
     pub router: Arc<Mutex<HashMap<String, String>>>, // provider_name -> endpoint
+    pub orchestrator: Option<Arc<AgentOrchestrator>>,
 }
 
 impl InferenceGateway {
-    pub fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
+    pub fn new(
+        batch_size: usize,
+        batch_timeout_ms: u64,
+        orchestrator: Option<Arc<AgentOrchestrator>>,
+    ) -> Self {
         Self {
             prompt_trie: Arc::new(Mutex::new(PromptTrieNode::new())),
             batcher: Arc::new(Mutex::new(ContinuousBatcher::new(
@@ -191,6 +200,7 @@ impl InferenceGateway {
             ))),
             stats: Arc::new(Mutex::new(GatewayStats::new())),
             router: Arc::new(Mutex::new(HashMap::new())),
+            orchestrator,
         }
     }
 
@@ -257,11 +267,27 @@ impl InferenceGateway {
         stats.avg_batch_size = (stats.avg_batch_size * (stats.batches_processed - 1) as f64
             + batch.len() as f64)
             / stats.batches_processed as f64;
+        drop(stats);
 
         for req in batch {
-            let _ = req
-                .response_tx
-                .send(Ok(format!("[batched response for: {}]", req.id)));
+            let response = if let Some(ref orchestrator) = self.orchestrator {
+                let mut session = SessionContext::new(
+                    "inference-gateway".to_string(),
+                    String::new(),
+                );
+                match orchestrator.execute(&mut session, &req.prompt).await {
+                    Ok(execution) => Ok(execution.response),
+                    Err(e) => {
+                        warn!("LLM execution failed for request {}: {}", req.id, e);
+                        Err(format!("LLM execution error: {}", e))
+                    }
+                }
+            } else {
+                Ok(format!("[batched response for: {}]", req.id))
+            };
+            if req.response_tx.send(response).is_err() {
+                warn!("response channel closed for request {}", req.id);
+            }
         }
 
         Ok(())
@@ -350,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn inference_gateway_stats() {
-        let gateway = InferenceGateway::new(5, 100);
+        let gateway = InferenceGateway::new(5, 100, None);
         let stats = gateway.get_stats().await;
         assert_eq!(stats.total_requests, 0);
         assert_eq!(stats.batches_processed, 0);
@@ -358,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn inference_gateway_provider_registration() {
-        let gateway = InferenceGateway::new(5, 100);
+        let gateway = InferenceGateway::new(5, 100, None);
         gateway
             .register_provider("ollama", "http://localhost:11434")
             .await;
@@ -370,5 +396,25 @@ mod tests {
         assert_eq!(router.len(), 2);
         assert!(router.contains_key("ollama"));
         assert!(router.contains_key("openai"));
+    }
+
+    #[tokio::test]
+    async fn inference_gateway_mock_fallback_without_orchestrator() {
+        let gateway = InferenceGateway::new(5, 100, None);
+        let id = Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let batch = vec![BatchedRequest {
+            id,
+            prompt: "test prompt".to_string(),
+            max_tokens: 100,
+            response_tx: tx,
+        }];
+
+        gateway.process_batch(batch).await.unwrap();
+
+        let response = rx.await.unwrap();
+        assert!(response.is_ok());
+        assert_eq!(response.unwrap(), format!("[batched response for: {}]", id));
     }
 }

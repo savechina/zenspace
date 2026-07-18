@@ -10,7 +10,7 @@ use rig_core::completion::CompletionModel;
 use rig_core::streaming::StreamedAssistantContent;
 use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 use zen_core::paths::ZenPaths;
 use zen_core::notion_graph::NotionGraphProvider;
 use zen_core::types::SessionContext;
@@ -126,7 +126,9 @@ fn load_corrections(
     }
 
     for c in &corrections {
-        let _ = tracker.record_retrieval(&c.id);
+        if let Err(e) = tracker.record_retrieval(&c.id) {
+            warn!(correction_id = %c.id, error = %e, "failed to record retrieval for correction");
+        }
     }
 
     let mut sorted = corrections;
@@ -165,7 +167,9 @@ fn load_feedback(
     }
 
     for f in &feedbacks {
-        let _ = tracker.record_retrieval(&f.id);
+        if let Err(e) = tracker.record_retrieval(&f.id) {
+            warn!(feedback_id = %f.id, error = %e, "failed to record retrieval for feedback");
+        }
     }
 
     let mut sorted = feedbacks;
@@ -210,7 +214,9 @@ fn load_beliefs(
     };
 
     for b in &mut beliefs {
-        let _ = tracker.record_retrieval(&b.id);
+        if let Err(e) = tracker.record_retrieval(&b.id) {
+            warn!(belief_id = %b.id, error = %e, "failed to record retrieval for belief");
+        }
         b.reinforce();
     }
 
@@ -378,7 +384,9 @@ fn load_decisions(
     }
 
     for d in &decisions {
-        let _ = tracker.record_retrieval(&d.id);
+        if let Err(e) = tracker.record_retrieval(&d.id) {
+            warn!(decision_id = %d.id, error = %e, "failed to record retrieval for decision");
+        }
     }
 
     let mut open: Vec<_> = decisions
@@ -530,6 +538,7 @@ pub struct ZenAgent {
     signals: Option<SelfLearningSignals>,
     memvid_store: Option<rig_memvid::MemvidStore>,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
+    pub context_budget_chars: usize,
 }
 
 impl ZenAgent {
@@ -960,7 +969,15 @@ impl ZenAgent {
             item.rank = rank;
         }
 
-        let config = ContextPackConfig::new(12288)
+        // Tier 1: Reserve tokens for tool definitions (estimated ~200 tokens per tool).
+        let tool_token_reserve = 200 * 5;
+        // Tier 2: Trim conversation history to remaining budget.
+        // The conversation evidence items already carry the session history;
+        // ContextPack will naturally drop lower-tier items when the budget
+        // is tight, so we reduce the budget by the tool reserve.
+        let effective_budget = self.context_budget_chars.saturating_sub(tool_token_reserve);
+
+        let config = ContextPackConfig::new(effective_budget)
             .with_max_items(30)
             .with_reserve_chars(query.chars().count());
 
@@ -974,7 +991,20 @@ impl ZenAgent {
             pack.omitted.len()
         );
 
-        if !pack.omitted.is_empty() {
+        if let Some(store) = &self.memvid_store {
+            if !pack.omitted.is_empty() {
+                let zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
+                let hook = zen_memory::memvid::MemvidDemotionHook::new(zen_store);
+                match hook.persist_evicted(&ctx.entity_id, &pack.omitted) {
+                    Ok(count) => {
+                        debug!(persisted = count, "Demoted context items persisted to memvid");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to persist demoted context items");
+                    }
+                }
+            }
+        } else if !pack.omitted.is_empty() {
             for omitted in &pack.omitted {
                 tracing::debug!(
                     source_id = %omitted.item.source_id,
@@ -1004,19 +1034,63 @@ impl ZenAgent {
         use rig_core::OneOrMany;
         use std::time::Instant;
 
-        let messages_in = session.conversation.len() + 1;
         let model_name = self.completion_model.provider_name();
         let conversation_id = session.session_id.to_string();
         let start = Instant::now();
 
+        let window_size = 20;
+        let active_turns: Vec<(String, String)> = if let Some(store) = &self.memvid_store {
+            let zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
+            let mut compactor = zen_memory::memvid::MemvidStoringCompactor::new(
+                zen_store,
+                session.session_id.to_string(),
+                window_size,
+            );
+            for turn in &session.conversation {
+                compactor.append(&turn.role, &turn.content);
+            }
+            match compactor.compact() {
+                Ok((turns, persisted_count)) => {
+                    if persisted_count > 0 {
+                        debug!(persisted = persisted_count, "Evicted turns shadow-written to memvid");
+                    }
+                    turns
+                }
+                Err(e) => {
+                    warn!(error = %e, "MemvidStoringCompactor failed, falling back to no compaction");
+                    session
+                        .conversation
+                        .iter()
+                        .rev()
+                        .take(window_size)
+                        .map(|t| (t.role.clone(), t.content.clone()))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect()
+                }
+            }
+        } else {
+            session
+                .conversation
+                .iter()
+                .rev()
+                .take(window_size)
+                .map(|t| (t.role.clone(), t.content.clone()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        };
+
+        let messages_in = active_turns.len() + 1;
         crate::observability::emit_prompt_started(model_name, &conversation_id, messages_in);
 
-        let mut history_messages: Vec<Message> = session
-            .conversation
+        let mut history_messages: Vec<Message> = active_turns
             .iter()
-            .filter_map(|turn| match turn.role.as_str() {
-                "user" => Some(Message::user(&turn.content)),
-                "assistant" => Some(Message::assistant(&turn.content)),
+            .filter_map(|(role, content)| match role.as_str() {
+                "user" => Some(Message::user(content)),
+                "assistant" => Some(Message::assistant(content)),
                 _ => None,
             })
             .collect();
@@ -1171,16 +1245,60 @@ impl ZenAgent {
 
         let model_name = self.completion_model.provider_name();
         let conversation_id = session.session_id.to_string();
-        let messages_in = session.conversation.len() + 1;
 
+        let window_size = 20;
+        let active_turns: Vec<(String, String)> = if let Some(store) = &self.memvid_store {
+            let zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
+            let mut compactor = zen_memory::memvid::MemvidStoringCompactor::new(
+                zen_store,
+                session.session_id.to_string(),
+                window_size,
+            );
+            for turn in &session.conversation {
+                compactor.append(&turn.role, &turn.content);
+            }
+            match compactor.compact() {
+                Ok((turns, persisted_count)) => {
+                    if persisted_count > 0 {
+                        debug!(persisted = persisted_count, "Evicted turns shadow-written to memvid");
+                    }
+                    turns
+                }
+                Err(e) => {
+                    warn!(error = %e, "MemvidStoringCompactor failed, falling back to no compaction");
+                    session
+                        .conversation
+                        .iter()
+                        .rev()
+                        .take(window_size)
+                        .map(|t| (t.role.clone(), t.content.clone()))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect()
+                }
+            }
+        } else {
+            session
+                .conversation
+                .iter()
+                .rev()
+                .take(window_size)
+                .map(|t| (t.role.clone(), t.content.clone()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        };
+
+        let messages_in = active_turns.len() + 1;
         crate::observability::emit_prompt_started(model_name, &conversation_id, messages_in);
 
-        let mut history_messages: Vec<Message> = session
-            .conversation
+        let mut history_messages: Vec<Message> = active_turns
             .iter()
-            .filter_map(|turn| match turn.role.as_str() {
-                "user" => Some(Message::user(&turn.content)),
-                "assistant" => Some(Message::assistant(&turn.content)),
+            .filter_map(|(role, content)| match role.as_str() {
+                "user" => Some(Message::user(content)),
+                "assistant" => Some(Message::assistant(content)),
                 _ => None,
             })
             .collect();
@@ -1253,6 +1371,7 @@ pub struct ZenAgentBuilder {
     zen_paths: Option<ZenPaths>,
     memvid_store: Option<rig_memvid::MemvidStore>,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
+    context_budget_chars: usize,
 }
 
 impl ZenAgentBuilder {
@@ -1264,6 +1383,7 @@ impl ZenAgentBuilder {
             zen_paths: None,
             memvid_store: None,
             notion_graph: None,
+            context_budget_chars: 12288,
         }
     }
 
@@ -1292,6 +1412,11 @@ impl ZenAgentBuilder {
         self
     }
 
+    pub fn with_context_budget_chars(mut self, budget: usize) -> Self {
+        self.context_budget_chars = budget;
+        self
+    }
+
     pub fn build(self, wiring: &ZenWiring, router: &DefaultRouter) -> Result<ZenAgent> {
         let completion_model =
             ZenCompletionModel::new(router.clone(), router.default_provider_name());
@@ -1311,6 +1436,7 @@ impl ZenAgentBuilder {
             signals,
             memvid_store: self.memvid_store,
             notion_graph: self.notion_graph,
+            context_budget_chars: self.context_budget_chars,
         })
     }
 }
@@ -1318,7 +1444,6 @@ impl ZenAgentBuilder {
 #[cfg(test)]
 mod chain_tests {
     use super::*;
-    use zen_core::types::SessionContext;
 
     #[test]
     fn tier_score_includes_knowledge() {

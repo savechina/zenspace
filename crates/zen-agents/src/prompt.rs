@@ -513,7 +513,7 @@ impl PromptBuilder {
         let identity_block = self.identity.as_ref().map_or_else(String::new, |id| {
             let mut block = String::new();
             if !id.soul_content().is_empty() {
-                block.push_str(&id.soul_content());
+                block.push_str(id.soul_content());
                 block.push('\n');
             }
             if !id.agents_content().is_empty() {
@@ -521,7 +521,7 @@ impl PromptBuilder {
                 block.push('\n');
             }
             if !id.memory_content().is_empty() {
-                block.push_str(&id.memory_content());
+                block.push_str(id.memory_content());
             }
             block
         });

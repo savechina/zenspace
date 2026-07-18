@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+use tracing::warn;
 use zen_core::types::{ComplexityLevel, TaskType};
 
 type TaskReceiver = Option<mpsc::Receiver<BlackboardTask>>;
@@ -228,7 +229,9 @@ impl Blackboard {
     pub async fn push_task(&self, task: BlackboardTask) -> anyhow::Result<()> {
         let task_id = task.id;
         self.task_tx.send(task).await?;
-        let _ = self.event_tx.send(SystemEvent::TaskEnqueued { task_id });
+        if let Err(e) = self.event_tx.send(SystemEvent::TaskEnqueued { task_id }) {
+            warn!(error = %e, "failed to broadcast TaskEnqueued event");
+        }
         Ok(())
     }
 
@@ -278,7 +281,9 @@ impl Blackboard {
 
     /// Broadcast a system event
     pub fn broadcast_event(&self, event: SystemEvent) {
-        let _ = self.event_tx.send(event);
+        if let Err(e) = self.event_tx.send(event) {
+            warn!(error = %e, "failed to broadcast system event");
+        }
     }
 
     /// Take receivers (consumes the blackboard, returns receivers to caller)

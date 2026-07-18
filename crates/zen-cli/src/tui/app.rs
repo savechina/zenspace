@@ -64,6 +64,7 @@ pub struct InputCell {
     mode: InputMode,
     paste_timestamp: Option<Instant>,
     selected_cell_idx: usize,
+    just_exited_selection: bool,
 }
 
 impl InputCell {
@@ -75,6 +76,7 @@ impl InputCell {
             mode: InputMode::Default,
             paste_timestamp: None,
             selected_cell_idx: 0,
+            just_exited_selection: false,
         }
     }
 
@@ -118,6 +120,14 @@ impl InputCell {
         if self.mode == InputMode::Selection {
             self.mode = InputMode::Default;
         }
+    }
+
+    pub fn set_just_exited_selection(&mut self, val: bool) {
+        self.just_exited_selection = val;
+    }
+
+    pub fn take_just_exited_selection(&mut self) -> bool {
+        std::mem::take(&mut self.just_exited_selection)
     }
 
     pub fn exit_mode(&mut self) {
@@ -263,7 +273,7 @@ pub const SLASH_COMMANDS: &[&str] = &[
     "serve",
     "config",
     "model",
-    "consolidate",
+    "distill",
     "lint",
 ];
 
@@ -286,7 +296,7 @@ pub const CLI_COMMANDS: &[&str] = &[
     "graph",
     "reindex",
     "research",
-    "consolidate",
+    "distill",
     "lint",
     "ingest",
     "routine",
@@ -748,7 +758,7 @@ impl App {
             "config" => self.execute_config(),
             "model" => self.execute_model(parts.get(1).copied()),
             "variant" | "vc" | "variant_cycle" => self.execute_variant_cycle(),
-            "consolidate" => self.execute_consolidate(),
+            "distill" => self.execute_distill(),
             "lint" => self.execute_lint(),
             _ => self.push_output(
                 format!("Unknown command: /{}. Type /help for commands.", parts[0]),
@@ -775,7 +785,7 @@ impl App {
   /archive               Archive current session
   /serve                 Start gateway daemon
   /config                Show configuration
-  /consolidate           Run consolidation pipeline
+  /distill            Run distillation pipeline
   /lint                  Run knowledge lint
 
 Keyboard shortcuts:
@@ -861,7 +871,7 @@ Use /thinking to show/hide thinking process."#;
         for dir in [paths.inbox(), paths.wiki()] {
             if let Ok(r) = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(service.search(query, &dir, client, Some(tier)))
+                    .block_on(service.search(query, &dir, client, Some(tier), None))
             }) {
                 results.extend(r);
             }
@@ -949,7 +959,7 @@ Use /thinking to show/hide thinking process."#;
             }
         }
 
-        matches.sort_by(|a, b| b.0.cmp(&a.0));
+        matches.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
         matches.into_iter().map(|(_, r)| r).take(2).collect()
     }
 
@@ -972,7 +982,9 @@ Use /thinking to show/hide thinking process."#;
             Some(o) => o.clone(),
             None => {
                 tracing::warn!("TUI chat: orchestrator not initialized");
-                let _ = done_tx.send((Err("Orchestrator not initialized".to_string()), None));
+                if let Err(e) = done_tx.send((Err("Orchestrator not initialized".to_string()), None)) {
+                    tracing::warn!(error = %e, "failed to send orchestrator error to done channel");
+                }
                 return;
             }
         };
@@ -988,7 +1000,9 @@ Use /thinking to show/hide thinking process."#;
             }
             None => {
                 tracing::warn!("TUI chat: session not initialized");
-                let _ = done_tx.send((Err("Session not initialized".to_string()), None));
+                if let Err(e) = done_tx.send((Err("Session not initialized".to_string()), None)) {
+                    tracing::warn!(error = %e, "failed to send session error to done channel");
+                }
                 return;
             }
         };
@@ -1020,12 +1034,16 @@ Use /thinking to show/hide thinking process."#;
             let result = rt.block_on(async {
                 orchestrator
                     .execute_stream(&mut session, &query_owned, |token| {
-                        let _ = tokens_tx.send(token.to_string());
+                        if let Err(e) = tokens_tx.send(token.to_string()) {
+                            tracing::warn!(error = %e, "token channel closed during stream");
+                        }
                     })
                     .await
                     .map_err(|e| e.to_string())
             });
-            let _ = done_tx.send((result, Some(session)));
+            if let Err(e) = done_tx.send((result, Some(session))) {
+                tracing::warn!(error = %e, "done channel closed before result could be sent");
+            }
         });
     }
 
@@ -1473,7 +1491,7 @@ Use /thinking to show/hide thinking process."#;
         };
 
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(SearchService::new(self.router.clone()).search(query, &base_dir, client, Some(tier)))
+            tokio::runtime::Handle::current().block_on(SearchService::new(self.router.clone()).search(query, &base_dir, client, Some(tier), None))
         }) {
             Ok(results) => {
                 if results.is_empty() {
@@ -1541,7 +1559,7 @@ Use /thinking to show/hide thinking process."#;
                         ConversationStore::with_dir(date_dir, &session.id).ok();
                 }
                 if let Some(ref mut ctx) = self.session {
-                    ctx.session_id = session.id.parse().unwrap_or_else(|_| ctx.session_id);
+                    ctx.session_id = session.id.parse().unwrap_or(ctx.session_id);
                 }
                 tracing::info!(
                     session_id = %session.id,
@@ -1597,10 +1615,9 @@ Use /thinking to show/hide thinking process."#;
             }
 
             tracing::debug!(session_id = %id, turns = turn_count, "writing daily log entry for session end");
-            if let Ok(paths) = ZenPaths::detect() {
-                if let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary) {
-                    tracing::warn!(error = %e, session_id = %id, "failed to write daily journal entry for session end");
-                }
+            if let Ok(paths) = ZenPaths::detect()
+                && let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary) {
+                tracing::warn!(error = %e, session_id = %id, "failed to write daily journal entry for session end");
             }
         }
     }
@@ -1948,26 +1965,26 @@ Use /thinking to show/hide thinking process."#;
         );
     }
 
-    fn execute_consolidate(&mut self) {
+    fn execute_distill(&mut self) {
         use zen_core::paths::ZenPaths;
-        use zen_vault::consolidate::ConsolidationPipeline;
+        use zen_vault::distill::DistillationPipeline;
         if let Ok(paths) = ZenPaths::detect() {
-            match ConsolidationPipeline::new().run(&paths.inbox(), &paths.wiki()) {
+            match DistillationPipeline::new().run(&paths.inbox(), &paths.wiki()) {
                 Ok(report) => {
-                    self.push_output("Consolidation complete:".into(), false);
+                    self.push_output("Distillation complete:".into(), false);
                     self.push_output(
                         format!("  Notes processed: {}", report.notes_processed),
                         false,
                     );
                 }
-                Err(e) => self.push_output(format!("Consolidation error: {}", e), true),
+                Err(e) => self.push_output(format!("Distillation error: {}", e), true),
             }
         }
     }
 
     fn execute_lint(&mut self) {
         use zen_core::paths::ZenPaths;
-        use zen_vault::maintenance::Linter;
+        use zen_vault::tindy::Linter;
         if let Ok(paths) = ZenPaths::detect() {
             match Linter::new().run(&paths.wiki()) {
                 Ok(result) => {

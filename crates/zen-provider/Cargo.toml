@@ -16,6 +16,7 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
+async-trait = { workspace = true }
 rig = { workspace = true }
 rig-compose = { workspace = true }
 

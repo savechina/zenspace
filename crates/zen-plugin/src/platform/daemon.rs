@@ -3,6 +3,7 @@ use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
 use std::process::Command;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct DaemonTool;
@@ -89,7 +90,9 @@ impl DaemonTool {
                 Ok(json!({ "action": "stop", "name": name, "status": out, "running": false }))
             }
             "restart" => {
-                let _ = self.run_cmd(&["launchctl", "stop", &domain]);
+                if let Err(e) = self.run_cmd(&["launchctl", "stop", &domain]) {
+                    warn!(service = %name, error = %e, "failed to stop service before restart (macOS)");
+                }
                 let (_, out) = self
                     .run_cmd(&["launchctl", "start", &domain])
                     .map_err(KernelError::ToolFailed)?;
@@ -167,7 +170,9 @@ impl DaemonTool {
                 Ok(json!({ "action": "stop", "name": name, "status": out, "running": false }))
             }
             "restart" => {
-                let _ = self.run_cmd(&["net", "stop", name]);
+                if let Err(e) = self.run_cmd(&["net", "stop", name]) {
+                    warn!(service = %name, error = %e, "failed to stop service before restart (Windows)");
+                }
                 let (_, out) = self
                     .run_cmd(&["net", "start", name])
                     .map_err(KernelError::ToolFailed)?;

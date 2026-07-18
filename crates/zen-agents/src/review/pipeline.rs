@@ -1,6 +1,6 @@
 use zen_core::types::Task;
 
-use zen_core::review::{HermesValidator, MetisReviewer, ZeusEscalation};
+use zen_core::review::{HermesValidator, MetisReviewer, ReviewContext, ZeusEscalation};
 
 use super::momus::MomusReviewer;
 
@@ -98,13 +98,16 @@ impl QualityPipeline {
                     hermes_revisions += 1;
                     if hermes_revisions > self.max_hermes_revisions {
                         let is_high_risk = task.semantic_entropy > 0.8;
-                        let should_escalate = self
-                            .zeus
-                            .should_escalate(hermes_revisions, task.user_input.len() * 4);
+                        let ctx = ReviewContext::from_task_with_metadata(task, hermes_revisions);
+                        let should_escalate = self.zeus.should_escalate(
+                            ctx.sensitivity,
+                            ctx.hermes_rejections,
+                            ctx.token_budget,
+                        );
 
                         if should_escalate || is_high_risk {
                             review_notes.push_str("Hermes deadlock detected, escalating to Zeus\n");
-                            let zeus_review = self.zeus.final_review(task, &raw);
+                            let zeus_review = self.zeus.final_review(&ctx);
                             if let Some(shield) = zeus_review.athena_shield {
                                 return PipelineResult {
                                     plan_approved: true,
@@ -159,7 +162,8 @@ impl QualityPipeline {
                 ));
 
                 if attempt >= self.max_momus_retries {
-                    let zeus_review = self.zeus.final_review(task, "");
+                    let ctx = ReviewContext::from_task_with_metadata(task, 0);
+                    let zeus_review = self.zeus.final_review(&ctx);
                     return PipelineResult {
                         plan_approved: false,
                         review_notes,

@@ -12,10 +12,10 @@ pub use chat_import::ChatImporter;
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
 pub use notion_extraction::NotionExtractor;
-pub use pipeline::{ConsolidationPipeline, ConsolidationPipelineInput, ConsolidationReport};
+pub use pipeline::{DistillationPipeline, DistillationPipelineInput, DistillationReport};
 pub use recovery::RecoveryManager;
 pub use source_ingest::SourceIngester;
 pub use transaction::TransactionScope;
 pub use wiki_compile::WikiCompiler;
 
-pub struct Consolidate;
+pub struct Distill;

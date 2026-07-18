@@ -80,6 +80,10 @@ pub struct Notion {
     pub domain: Option<String>,
     pub aliases: Vec<String>,
     pub metadata: HashMap<String, String>,
+    /// OKF resource URI — objective referent (Layer 1: Ontological)
+    pub subject_uri: Option<String>,
+    /// OKF tags — thematic grouping (lightweight, not graph nodes)
+    pub topics: Vec<String>,
 }
 
 impl Notion {
@@ -100,6 +104,8 @@ impl Notion {
             domain: None,
             aliases: Vec::new(),
             metadata: HashMap::new(),
+            subject_uri: None,
+            topics: Vec::new(),
         }
     }
 }

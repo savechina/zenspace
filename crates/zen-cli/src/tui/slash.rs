@@ -141,9 +141,9 @@ pub fn create_default_registry() -> SlashCommandRegistry {
         "Show configuration".to_string(),
     );
     registry.register(
-        "consolidate".to_string(),
+        "distill".to_string(),
         vec![],
-        "Run consolidation pipeline".to_string(),
+        "Run distillation pipeline".to_string(),
     );
     registry.register("lint".to_string(), vec![], "Run knowledge lint".to_string());
 

@@ -12,7 +12,12 @@ pub enum KeyAction {
 pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
     if app.input.effective_mode() == InputMode::Selection {
         return match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::Char('v'), KeyModifiers::NONE) => {
+            (KeyCode::Char('v'), KeyModifiers::NONE) => {
+                app.input.set_just_exited_selection(true);
+                app.exit_selection();
+                KeyAction::Continue
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) => {
                 app.exit_selection();
                 KeyAction::Continue
             }
@@ -229,7 +234,16 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             return KeyAction::Continue;
         }
         (KeyCode::Char('v'), KeyModifiers::NONE) => {
-            if app.input.lines().join("\n").trim().is_empty() && !app.output.is_empty() {
+            if app.input.take_just_exited_selection() {
+                app.input.input(Input {
+                    key: Key::Char('v'),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
+                return KeyAction::Continue;
+            }
+            if app.input.lines().join("\n").is_empty() && !app.output.is_empty() {
                 app.enter_selection();
                 return KeyAction::Continue;
             }

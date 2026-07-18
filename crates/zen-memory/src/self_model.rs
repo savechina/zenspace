@@ -1,6 +1,6 @@
-//! 6-layer introspective Self-Model typing system.
+//! 8-layer introspective Self-Model typing system.
 //!
-//! Models the user's identity across 6 hierarchical layers
+//! Models the user's identity across 8 hierarchical layers
 //! (Knowledge, Skill, SocialRole, SelfConcept, Trait, Motivation),
 //! stored as canonical markdown files following the Belief/Decision pattern.
 //!

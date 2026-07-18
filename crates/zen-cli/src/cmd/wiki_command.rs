@@ -29,7 +29,7 @@ pub fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
 
 fn list_wiki_pages(wiki_dir: &std::path::Path) -> Result<(), ZenError> {
     if !wiki_dir.is_dir() {
-        println!("No wiki pages found. Run consolidation first (`zen consolidate run`).");
+        println!("No wiki pages found. Run distillation first (`zen distill run`).");
         return Ok(());
     }
 

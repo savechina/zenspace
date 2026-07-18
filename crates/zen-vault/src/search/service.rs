@@ -39,6 +39,7 @@ impl SearchService {
         base_dir: &Path,
         client: &SqliteClient,
         tier: Option<u8>,
+        domain_filter: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         let selected = tier.unwrap_or_else(|| TierSelector::select_tier(query));
 
@@ -64,7 +65,7 @@ impl SearchService {
                         .collect()
                 }),
             3 => {
-                let query_embedding = crate::maintenance::compute_embeddings_for_text(query)
+                let query_embedding = crate::tindy::compute_embeddings_for_text(query)
                     .unwrap_or_else(|_| vec![0.0; 384]);
                 self.tier3.search(client, &query_embedding, 10).await
             }
@@ -97,6 +98,12 @@ impl SearchService {
             _ => anyhow::bail!("unknown tier: {selected}"),
         }?;
 
+        let results = if let Some(domain) = domain_filter {
+            filter_by_domain(results, domain)?
+        } else {
+            results
+        };
+
         info!(
             query_len = query.len(),
             tier = selected,
@@ -115,6 +122,28 @@ impl SearchService {
     ) -> Result<String, anyhow::Error> {
         self.tier5.synthesize(query, results)
     }
+}
+
+pub(crate) fn filter_by_domain(results: Vec<SearchResult>, domain: &str) -> Result<Vec<SearchResult>> {
+    let domain_lower = domain.to_lowercase();
+    let mut filtered = Vec::new();
+    for r in results {
+        if !r.file.exists() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&r.file)
+            && let Ok(note) = crate::note::parse_frontmatter(&content)
+        {
+            let has_domain = note
+                .domain
+                .iter()
+                .any(|d| d.to_string() == domain_lower);
+            if has_domain {
+                filtered.push(r);
+            }
+        }
+    }
+    Ok(filtered)
 }
 
 fn graph_to_search(g: GraphResult) -> SearchResult {

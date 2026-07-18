@@ -285,7 +285,9 @@ async fn synthesize_anti_patterns(reflections_dir: &Path) -> Result<usize> {
     let truncated = sanitizer.strip_dangerous_patterns(&truncated);
 
     let prompt = format!(
-        r#"Analyze these session reflections and identify recurring anti-patterns — repeated mistakes, blind spots, or behavioral traps.
+        r#"Analyze these session reflections and identify:
+1. Recurring anti-patterns — repeated mistakes, blind spots, or behavioral traps
+2. Positive patterns — practices, techniques, or habits that produced good outcomes and should be continued
 
 ## Recent Reflections
 {truncated}
@@ -294,6 +296,9 @@ Respond with ONLY a JSON object:
 {{
   "anti_patterns": [
     {{"pattern": "...", "trigger": "...", "avoidance": "...", "evidence_refs": ["ref1", "ref2"]}}
+  ],
+  "positive_patterns": [
+    {{"pattern": "...", "trigger": "...", "reinforcement": "...", "evidence_refs": ["ref1", "ref2"]}}
   ]
 }}
 
@@ -301,6 +306,9 @@ Rules:
 - Each anti-pattern must have at least 2 evidence references from the reflections
 - "trigger" describes when this pattern typically occurs
 - "avoidance" describes what to do instead
+- Each positive_pattern must have at least 2 evidence references
+- "trigger" for positive patterns describes when this practice was applied
+- "reinforcement" describes why it worked and how to keep doing it
 - Return empty array if no recurring patterns found"#
     );
 
@@ -319,12 +327,25 @@ Rules:
         .cloned()
         .unwrap_or_default();
 
+    let positive_patterns = parsed["positive_patterns"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
     let count = write_anti_patterns(reflections_dir, &anti_patterns)?;
 
     if count > 0
         && let Err(e) = update_stop_doing_ledger(&anti_patterns)
     {
         warn!(error = %e, "failed to update MEMORY.md Stop-Doing Ledger (non-fatal)");
+    }
+
+    let positive_count = write_positive_patterns(reflections_dir, &positive_patterns)?;
+
+    if positive_count > 0
+        && let Err(e) = update_continue_doing_ledger(&positive_patterns)
+    {
+        warn!(error = %e, "failed to update MEMORY.md Continue-Doing Ledger (non-fatal)");
     }
 
     Ok(count)
@@ -508,6 +529,105 @@ fn write_anti_patterns(reflections_dir: &Path, candidates: &[Value]) -> Result<u
             .with_context(|| format!("failed to write anti-pattern: {}", file_path.display()))?;
         count += 1;
         debug!(pattern = pattern_name, path = %file_path.display(), "wrote anti-pattern candidate");
+    }
+
+    Ok(count)
+}
+
+fn update_continue_doing_ledger(positive_patterns: &[Value]) -> Result<()> {
+    if positive_patterns.is_empty() {
+        return Ok(());
+    }
+
+    let paths = ZenPaths::detect()?;
+    let memory_md = paths.memory().join("MEMORY.md");
+
+    let content = fs::read_to_string(&memory_md).unwrap_or_default();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let section_marker = "## Continue-Doing Ledger";
+
+    let mut entries: Vec<String> = Vec::new();
+    for pp in positive_patterns.iter().take(10) {
+        let pattern = pp["pattern"].as_str().unwrap_or("unknown");
+        let trigger = pp["trigger"].as_str().unwrap_or("");
+        entries.push(format!("- **{pattern}** — detected {today}: {trigger}"));
+    }
+
+    let updated = if content.contains(section_marker) {
+        let before = content.split(section_marker).next().unwrap_or("");
+        let rest = content.split(section_marker).nth(1).unwrap_or("");
+        let next_section = rest.find("\n## ").unwrap_or(rest.len());
+        let after = &rest[next_section..];
+        format!(
+            "{before}{section_marker}\n\n{}\n{after}",
+            entries.join("\n")
+        )
+    } else {
+        format!(
+            "{}\n\n{section_marker}\n\n{}\n",
+            content.trim_end(),
+            entries.join("\n")
+        )
+    };
+
+    let tmp = memory_md.with_extension("md.tmp");
+    fs::write(&tmp, &updated)
+        .with_context(|| format!("failed to write tmp MEMORY.md: {}", tmp.display()))?;
+    fs::rename(&tmp, &memory_md)
+        .with_context(|| format!("failed to rename tmp MEMORY.md: {}", memory_md.display()))?;
+
+    info!(
+        count = positive_patterns.len(),
+        "updated MEMORY.md Continue-Doing Ledger"
+    );
+    Ok(())
+}
+
+fn write_positive_patterns(reflections_dir: &Path, candidates: &[Value]) -> Result<usize> {
+    let pp_dir = reflections_dir
+        .parent()
+        .map(|p| p.join("positive-patterns"))
+        .unwrap_or_else(|| reflections_dir.join("../positive-patterns"));
+
+    fs::create_dir_all(&pp_dir)
+        .with_context(|| format!("failed to create positive-patterns dir: {}", pp_dir.display()))?;
+
+    let mut count = 0usize;
+    let date_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    for pp in candidates {
+        let pattern_name = pp["pattern"].as_str().unwrap_or("unknown-pattern");
+        let trigger = pp["trigger"].as_str().unwrap_or("unknown trigger");
+        let reinforcement = pp["reinforcement"].as_str().unwrap_or("unknown reinforcement");
+        let refs = pp["evidence_refs"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        let slug = slugify(pattern_name);
+        let file_path = pp_dir.join(format!("{slug}.md"));
+
+        let content = if file_path.exists() {
+            let existing = fs::read_to_string(&file_path).unwrap_or_default();
+            let entry = format!(
+                "\n\n## Observation — {date_str}\n\n- **Trigger**: {trigger}\n- **Reinforcement**: {reinforcement}\n- Evidence: {refs}\n"
+            );
+            format!("{existing}{entry}")
+        } else {
+            format!(
+                "---\npattern: {pattern_name}\ntrigger: {trigger}\nreinforcement: {reinforcement}\npromoted_at: {date_str}\nsource: reflection-synth\n---\n\n# {pattern_name}\n\n**Trigger**: {trigger}\n\n**Reinforcement**: {reinforcement}\n\n**Evidence**: {refs}\n"
+            )
+        };
+
+        fs::write(&file_path, &content)
+            .with_context(|| format!("failed to write positive-pattern: {}", file_path.display()))?;
+        count += 1;
+        debug!(pattern = pattern_name, path = %file_path.display(), "wrote positive-pattern candidate");
     }
 
     Ok(count)

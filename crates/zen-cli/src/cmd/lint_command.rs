@@ -5,7 +5,7 @@ use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_vault::maintenance::{LintReportGenerator, Linter};
+use zen_vault::tindy::{LintReportGenerator, Linter};
 
 #[derive(Subcommand)]
 pub enum LintCommands {

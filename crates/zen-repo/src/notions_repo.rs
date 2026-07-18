@@ -5,7 +5,7 @@ use sqlx::Row;
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{
     ComponentResult, NotionRow, GraphSearchResult, InsertRelationshipRequest, PageRankResult,
-    RelationshipRow, ShortestPathResult,
+    RelationRow, ShortestPathResult,
 };
 
 pub fn normalize_alias(raw: &str) -> String {
@@ -41,6 +41,7 @@ impl<'a> NotionsRepo<'a> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_entity_with(
         &self,
         id: &str,
@@ -86,6 +87,7 @@ impl<'a> NotionsRepo<'a> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_entity_with(
         &self,
         id: &str,
@@ -309,8 +311,8 @@ impl<'a> NotionsRepo<'a> {
         Ok(result.map(|row| row.get::<String, _>(0)))
     }
 
-    pub async fn load_relationships(&self, notion_id: &str) -> Result<Vec<RelationshipRow>> {
-        Ok(sqlx::query_as::<_, RelationshipRow>(
+    pub async fn load_relationships(&self, notion_id: &str) -> Result<Vec<RelationRow>> {
+        Ok(sqlx::query_as::<_, RelationRow>(
             "SELECT id, source_notion_id, target_notion_id, relation_type, confidence, \
              source_note_ids, created_at, description, valid_from, valid_until, \
              recorded_at, weight \
@@ -321,8 +323,8 @@ impl<'a> NotionsRepo<'a> {
         .await?)
     }
 
-    pub async fn load_relationships_all(&self, notion_id: &str) -> Result<Vec<RelationshipRow>> {
-        Ok(sqlx::query_as::<_, RelationshipRow>(
+    pub async fn load_relationships_all(&self, notion_id: &str) -> Result<Vec<RelationRow>> {
+        Ok(sqlx::query_as::<_, RelationRow>(
             "SELECT id, source_notion_id, target_notion_id, relation_type, confidence, \
              source_note_ids, created_at, description, valid_from, valid_until, \
              recorded_at, weight \

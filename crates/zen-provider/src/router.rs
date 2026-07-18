@@ -23,7 +23,7 @@ use zen_core::types::Sensitivity;
 /// 2. `api_key` (SecretRef) — explicit Keychain or env from config
 /// 3. `api_key_env` (legacy) — direct env var name
 /// 4. Default env var: `{PROVIDER}_API_KEY`
-fn resolve_api_key(p: &ProviderConfig, provider_name: &str) -> Option<String> {
+pub(crate) fn resolve_api_key(p: &ProviderConfig, provider_name: &str) -> Option<String> {
     // 1. Try Keychain-first with default naming (Keychain → env fallback)
     let kc_name = format!("zen-{provider_name}-api-key");
     let default_env = SecretRef::legacy_env_var(provider_name);
@@ -980,7 +980,9 @@ impl LlmRouter for DefaultRouter {
             let mock = self.mock.clone();
             tokio::spawn(async move {
                 let result = mock.complete_streaming("call", &prompt, token_tx).await;
-                let _ = done_tx.send(result.map_err(|e| e.to_string()));
+                if let Err(e) = done_tx.send(result.map_err(|e| e.to_string())) {
+                    warn!("mock provider done channel closed: {:?}", e);
+                }
             });
             return Ok(stream_resp);
         }
@@ -1001,10 +1003,14 @@ impl LlmRouter for DefaultRouter {
                 let result = instance
                     .complete_streaming(&prompt, token_tx, &options)
                     .await;
-                let _ = done_tx.send(result.map_err(|e| e.to_string()));
+                if let Err(e) = done_tx.send(result.map_err(|e| e.to_string())) {
+                    warn!("provider done channel closed: {:?}", e);
+                }
             });
         } else {
-            let _ = done_tx.send(Err(format!("Provider '{}' not configured", provider_name)));
+            if let Err(e) = done_tx.send(Err(format!("Provider '{}' not configured", provider_name))) {
+                warn!("provider error done channel closed: {:?}", e);
+            }
         }
 
         Ok(stream_resp)

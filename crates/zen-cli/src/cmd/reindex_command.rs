@@ -6,7 +6,7 @@ use tracing::debug;
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_repo::SqliteClient;
-use zen_vault::maintenance::Reindexer;
+use zen_vault::tindy::Reindexer;
 
 #[derive(Subcommand)]
 pub enum ReindexCommands {

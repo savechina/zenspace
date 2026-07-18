@@ -1,7 +1,12 @@
+use std::sync::OnceLock;
+
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[allow(unused_imports)]
 use tracing::{info, warn};
+use zen_provider::DefaultEmbeddingRouter;
+#[allow(unused_imports)]
+use zen_provider::EmbeddingRouter;
 
 use crate::tools::{
     ZenTool, ZenToolError, ZenToolResult, args_schema_string, result_schema_string,
@@ -14,108 +19,71 @@ pub struct EmbeddingResult {
 
 pub struct ComputeEmbeddings;
 
-#[derive(Debug, Serialize)]
-struct OllamaEmbedRequest {
-    model: String,
-    input: Vec<String>,
+// ---------------------------------------------------------------------------
+// Embedding router — single gateway for all provider calls
+// ---------------------------------------------------------------------------
+
+/// Lazily-initialized embedding router backed by zen-provider.
+///
+/// The router is created once from the project's `ZenConfig` and reused for
+/// all subsequent embedding calls. If config loading fails, an empty router
+/// is created so the hash fallback still works.
+static EMBEDDING_ROUTER: OnceLock<DefaultEmbeddingRouter> = OnceLock::new();
+
+#[cfg(test)]
+fn get_embedding_router() -> &'static DefaultEmbeddingRouter {
+    // In test mode, skip config loading (ZenPaths::detect() can hang)
+    // and return an empty router so hash fallback is used
+    EMBEDDING_ROUTER.get_or_init(|| {
+        info!("Embedding router: test mode, using empty router (hash fallback)");
+        DefaultEmbeddingRouter::with_providers(vec![])
+    })
 }
 
-#[derive(Debug, Deserialize)]
-struct OllamaEmbedResponse {
-    embeddings: Vec<Vec<f32>>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAIEmbedRequest {
-    model: String,
-    input: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIEmbedResponse {
-    data: Vec<OpenAIEmbedData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIEmbedData {
-    embedding: Vec<f32>,
-}
-
-fn call_ollama_embeddings(text: &str) -> Option<Vec<f32>> {
-    let base_url = std::env::var("OLLAMA_BASE_URL").unwrap_or("http://127.0.0.1:11434".to_string());
-    let model = std::env::var("OLLAMA_EMBED_MODEL").unwrap_or("nomic-embed-text".to_string());
-
-    let client = reqwest::blocking::Client::new();
-    let url = format!("{}/api/embed", base_url.trim_end_matches('/'));
-
-    let payload = OllamaEmbedRequest {
-        model,
-        input: vec![text.to_string()],
-    };
-
-    match client.post(&url).json(&payload).send() {
-        Ok(resp) if resp.status().is_success() => match resp.json::<OllamaEmbedResponse>() {
-            Ok(response) => {
-                if let Some(embedding) = response.embeddings.first() {
-                    info!("ComputeEmbeddings: Ollama returns {}-dim", embedding.len());
-                    l2_normalize(&mut embedding.clone());
-                    return Some(embedding.clone());
-                }
+#[cfg(not(test))]
+fn get_embedding_router() -> &'static DefaultEmbeddingRouter {
+    EMBEDDING_ROUTER.get_or_init(|| {
+        match zen_core::config::load_config() {
+            Ok(config) => {
+                let router = DefaultEmbeddingRouter::from_config(config);
+                info!(
+                    providers = router.list_providers().len(),
+                    "Embedding router initialized from config"
+                );
+                router
             }
-            Err(e) => warn!("ComputeEmbeddings: Ollama response parse error: {}", e),
-        },
-        Ok(resp) => {
-            warn!("ComputeEmbeddings: Ollama HTTP {}", resp.status());
-        }
-        Err(e) => {
-            warn!("ComputeEmbeddings: Ollama request error: {}", e);
-        }
-    }
-    None
-}
-
-fn call_openai_embeddings(text: &str) -> Option<Vec<f32>> {
-    let api_key = std::env::var("OPENAI_API_KEY").ok()?;
-    let model = std::env::var("OPENAI_EMBED_MODEL").unwrap_or("text-embedding-3-small".to_string());
-    let base_url = std::env::var("OPENAI_BASE_URL").unwrap_or("https://api.openai.com".to_string());
-
-    let client = reqwest::blocking::Client::new();
-    let url = format!("{}/v1/embeddings", base_url.trim_end_matches('/'));
-
-    let payload = OpenAIEmbedRequest {
-        model,
-        input: vec![text.to_string()],
-    };
-
-    match client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&payload)
-        .send()
-    {
-        Ok(resp) if resp.status().is_success() => match resp.json::<OpenAIEmbedResponse>() {
-            Ok(response) => {
-                if let Some(data) = response.data.first() {
-                    info!(
-                        "ComputeEmbeddings: OpenAI returns {}-dim",
-                        data.embedding.len()
-                    );
-                    let mut emb = data.embedding.clone();
-                    l2_normalize(&mut emb);
-                    return Some(emb);
-                }
+            Err(e) => {
+                warn!("Failed to load config for embedding router: {e}");
+                DefaultEmbeddingRouter::with_providers(vec![])
             }
-            Err(e) => warn!("ComputeEmbeddings: OpenAI response parse error: {}", e),
-        },
-        Ok(resp) => {
-            warn!("ComputeEmbeddings: OpenAI HTTP {}", resp.status());
         }
-        Err(e) => {
-            warn!("ComputeEmbeddings: OpenAI request error: {}", e);
-        }
-    }
-    None
+    })
 }
+
+/// Try to compute an embedding via zen-provider, falling back to local
+/// fastembed, then to hash-based embedding.
+fn compute_embedding_with_fallback(text: &str) -> Vec<f32> {
+    let router = get_embedding_router();
+
+    // 1. Try configured providers via zen-provider
+    if let Ok(embedding) = router.embed_sync(text) {
+        info!("ComputeEmbeddings: provider returns {}-dim", embedding.len());
+        return embedding;
+    }
+
+    // 2. Try local fastembed model
+    if let Some(embedding) = super::local_embedder::try_local_embed(text) {
+        return embedding;
+    }
+
+    // 3. Hash-based fallback (last resort)
+    info!("ComputeEmbeddings: falling back to hash-based embedding");
+    hash_embedding(text)
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 pub fn compute_embeddings(text: &str) -> Result<EmbeddingResult> {
     if text.trim().is_empty() {
@@ -125,13 +93,7 @@ pub fn compute_embeddings(text: &str) -> Result<EmbeddingResult> {
         });
     }
 
-    let embedding = call_ollama_embeddings(text)
-        .or_else(|| call_openai_embeddings(text))
-        .or_else(|| super::local_embedder::try_local_embed(text))
-        .unwrap_or_else(|| {
-            info!("ComputeEmbeddings: falling back to hash-based embedding");
-            hash_embedding(text)
-        });
+    let embedding = compute_embedding_with_fallback(text);
 
     Ok(EmbeddingResult {
         dimensions: embedding.len(),
@@ -168,10 +130,7 @@ fn aggregate_chunks(chunks: &[String]) -> Vec<f32> {
     let mut aggregated = vec![0.0f32; dim];
 
     for chunk in chunks {
-        let embedding = call_ollama_embeddings(chunk)
-            .or_else(|| call_openai_embeddings(chunk))
-            .or_else(|| super::local_embedder::try_local_embed(chunk))
-            .unwrap_or_else(|| hash_embedding(chunk));
+        let embedding = compute_embedding_with_fallback(chunk);
 
         let len = embedding.len().min(dim);
         for (i, v) in embedding.iter().enumerate().take(len) {
@@ -202,6 +161,10 @@ pub fn compute_embeddings_for_text(text: &str) -> Result<Vec<f32>> {
         Ok(aggregate_chunks(&chunks))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();

@@ -460,10 +460,10 @@ impl SessionRecord {
             .unwrap_or(&found_path)
             .to_string_lossy()
             .to_string();
-        if let Ok(idx) = SessionIndex::open(db_dir) {
-            if let Err(e) = idx.reconcile(&session.id, &relative) {
-                tracing::warn!(error = %e, session_id = %session.id, "failed to reconcile session index entry");
-            }
+        if let Ok(idx) = SessionIndex::open(db_dir)
+            && let Err(e) = idx.reconcile(&session.id, &relative)
+        {
+            tracing::warn!(error = %e, session_id = %session.id, "failed to reconcile session index entry");
         }
         Some(session)
     }

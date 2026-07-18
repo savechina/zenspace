@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast};
 use tokio_tungstenite::connect_async;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const QQ_WS_URL: &str = "wss://api.sgroup.qq.com/websocket";
 const DEFAULT_HEARTBEAT_SEC: u64 = 30;
@@ -113,7 +113,9 @@ impl QqBotClient {
                             {
                                 info!("QQ Bot ready, session={}", ready._session_id);
                             }
-                            let _ = event_tx.send(ws);
+                            if let Err(e) = event_tx.send(ws) {
+                                warn!("qqbot event channel closed: {}", e);
+                            }
                         }
                     }
                     Err(e) => {

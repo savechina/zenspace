@@ -73,16 +73,16 @@ impl<T: ZenTool + Send + Sync> Tool for ZenToolToolAdapter<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Adapter: ConsolidationPipeline → rig_compose::skill::Skill
+// Adapter: DistillationPipeline → rig_compose::skill::Skill
 // ---------------------------------------------------------------------------
 
-/// Wraps `zen_vault::ConsolidationPipeline` (which implements `Workflow`
+/// Wraps `zen_vault::DistillationPipeline` (which implements `Workflow`
 /// but not `Skill`) into a `rig_compose::skill::Skill` so it can be registered
 /// in the rig-compose `SkillRegistry`.
-pub struct ConsolidationPipelineSkillAdapter;
+pub struct DistillationPipelineSkillAdapter;
 
 #[async_trait]
-impl Skill for ConsolidationPipelineSkillAdapter {
+impl Skill for DistillationPipelineSkillAdapter {
     fn id(&self) -> &str {
         "zen-consolidation-pipeline"
     }
@@ -126,7 +126,7 @@ impl Skill for ConsolidationPipelineSkillAdapter {
                 KernelError::InvalidArgument("missing wiki_dir in context".to_string())
             })?;
 
-        let pipeline = zen_vault::ConsolidationPipeline::new();
+        let pipeline = zen_vault::DistillationPipeline::new();
         let report = pipeline
             .run(&inbox_dir, &wiki_dir)
             .map_err(|e| KernelError::SkillFailed(e.to_string()))?;
@@ -178,7 +178,7 @@ impl ZenWiring {
     /// - `zen-learning-loop` → `LearningLoop`
     /// - `zen-notion-extraction` → `NotionExtractor`
     /// - `zen-contradiction-detection` → `ContradictionDetector`
-    /// - `zen-consolidation-pipeline` → `ConsolidationPipeline` (via adapter)
+    /// - `zen-consolidation-pipeline` → `DistillationPipeline` (via adapter)
     ///
     /// # Tools registered
     /// - `tier2_search` → `Tier2Search` (via adapter)
@@ -194,7 +194,7 @@ impl ZenWiring {
         skills.register(Arc::new(zen_vault::LearningLoop::new()));
         skills.register(Arc::new(zen_vault::NotionExtractor::new()));
         skills.register(Arc::new(zen_vault::ContradictionDetector::new()));
-        skills.register(Arc::new(ConsolidationPipelineSkillAdapter));
+        skills.register(Arc::new(DistillationPipelineSkillAdapter));
 
         tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier2Search)));
         tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier4Search)));
@@ -216,11 +216,10 @@ impl ZenWiring {
         let paths = ZenPaths::detect().ok()?;
         let store_path = paths.memory().join(MEMVID_STORE_FILE);
 
-        if let Some(parent) = store_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                debug!(path = %parent.display(), error = %e, "ZenWiring: failed to create memvid parent dir");
-                return None;
-            }
+        if let Some(parent) = store_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
+            debug!(path = %parent.display(), error = %e, "ZenWiring: failed to create memvid parent dir");
+            return None;
         }
 
         match ZenMemvidStore::new(store_path.clone()) {

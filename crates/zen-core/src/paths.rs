@@ -116,6 +116,22 @@ impl ZenPaths {
         self.user_data(FINANCE_DIR)
     }
 
+    pub fn projects(&self) -> PathBuf {
+        self.vault().join("projects")
+    }
+
+    pub fn areas(&self) -> PathBuf {
+        self.vault().join("areas")
+    }
+
+    pub fn resources_dir(&self) -> PathBuf {
+        self.vault().join("resources")
+    }
+
+    pub fn archive(&self) -> PathBuf {
+        self.vault().join("archive")
+    }
+
     pub fn memory(&self) -> PathBuf {
         self.global_root.join(MEMORY_DIR)
     }
@@ -183,5 +199,21 @@ impl ZenPaths {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_para_path_accessors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+
+        assert_eq!(paths.projects(), tmp.path().join("vault/projects"));
+        assert_eq!(paths.areas(), tmp.path().join("vault/areas"));
+        assert_eq!(paths.resources_dir(), tmp.path().join("vault/resources"));
+        assert_eq!(paths.archive(), tmp.path().join("vault/archive"));
     }
 }

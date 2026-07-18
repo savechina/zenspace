@@ -14,22 +14,166 @@ use super::notion_extraction::NotionExtractor;
 use super::wiki_compile::WikiCompiler;
 
 use crate::note::{Note, parse_frontmatter};
+use crate::wiki::WikiPage;
+
 
 #[derive(Debug, Clone)]
-pub struct ConsolidationReport {
+pub struct DistillationReport {
     pub notes_processed: usize,
     pub entities_extracted: usize,
     pub wiki_pages_created: usize,
     pub contradictions_found: usize,
+    /// Notes migrated from inbox to wiki domain directories after distillation.
+    pub migrated_files: Vec<(PathBuf, PathBuf)>,
 }
 
-pub struct ConsolidationPipeline {
+/// Scan content for known entity names and wrap them in `[[wikilinks]]`
+/// if they appear as plain text and are not already linked.
+///
+/// Uses `WikiPage::extract_wikilinks()` to identify existing links and
+/// avoid double-linking.
+pub fn auto_link_wikilinks(content: &str, known_entities: &[String]) -> String {
+    let existing_links = WikiPage::extract_wikilinks(content);
+    let mut result = content.to_string();
+
+    // Sort entities by length (longest first) to avoid partial matches
+    let mut sorted_entities: Vec<&String> = known_entities.iter().collect();
+    sorted_entities.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+    for entity in sorted_entities {
+        // Skip if already linked
+        if existing_links.iter().any(|l| l == entity) {
+            continue;
+        }
+
+        // Only wrap if the entity appears as plain text (not inside [[...]] or `...`)
+        let entity_lower = entity.to_lowercase();
+        let mut new_result = String::with_capacity(result.len());
+        let mut i = 0;
+        let bytes = result.as_bytes();
+        let result_lower = result.to_lowercase();
+
+        while i < bytes.len() {
+            // Check if we're inside a wikilink or backtick
+            if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // Skip until ]]
+                new_result.push_str(&result[i..i + 2]);
+                i += 2;
+                while i < bytes.len() - 1 {
+                    if bytes[i] == b']' && bytes[i + 1] == b']' {
+                        new_result.push_str("]]");
+                        i += 2;
+                        break;
+                    }
+                    new_result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i] == b'`' {
+                // Skip until closing backtick
+                new_result.push(bytes[i] as char);
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'`' {
+                        new_result.push(bytes[i] as char);
+                        i += 1;
+                        break;
+                    }
+                    new_result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Check if entity starts at this position
+            let remaining_lower = &result_lower[i..];
+            if remaining_lower.starts_with(&entity_lower) {
+                // Ensure word boundary
+                let end = i + entity.len();
+                let before_ok = i == 0
+                    || !result.as_bytes()[i - 1].is_ascii_alphanumeric();
+                let after_ok = end >= result.len()
+                    || !result.as_bytes()[end].is_ascii_alphanumeric();
+
+                if before_ok && after_ok {
+                    new_result.push_str(&format!("[[{entity}]]"));
+                    i = end;
+                    continue;
+                }
+            }
+
+            new_result.push(bytes[i] as char);
+            i += 1;
+        }
+
+        result = new_result;
+    }
+
+    result
+}
+
+/// Returns (source, dest) pairs for successfully migrated files.
+fn migrate_inbox_to_wiki(notes: &[Note], wiki_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut migrated = Vec::new();
+
+    for note in notes {
+        let source = match &note.file_path {
+            Some(p) if p.exists() => p.clone(),
+            _ => continue,
+        };
+
+        let domain_dir = note.domain.first().map(|d| d.to_string()).unwrap_or_else(|| "general".to_string());
+        let dest_dir = wiki_dir.join(&domain_dir);
+
+        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+            tracing::warn!(
+                source = %source.display(),
+                error = %e,
+                "Failed to create wiki domain directory, skipping migration"
+            );
+            continue;
+        }
+
+        let filename = source.file_name().unwrap_or_default();
+        let mut dest = dest_dir.join(filename);
+
+        if dest.exists() {
+            let stem = source.file_stem().unwrap_or_default();
+            let ext = source.extension().unwrap_or_default();
+            let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+            dest = dest_dir.join(format!("{}_{}.{}", stem.to_string_lossy(), ts, ext.to_string_lossy()));
+        }
+
+        match std::fs::rename(&source, &dest) {
+            Ok(()) => {
+                info!(
+                    source = %source.display(),
+                    dest = %dest.display(),
+                    "Migrated inbox note to wiki domain"
+                );
+                migrated.push((source, dest));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    source = %source.display(),
+                    error = %e,
+                    "Failed to migrate inbox note, leaving in inbox"
+                );
+            }
+        }
+    }
+
+    migrated
+}
+
+pub struct DistillationPipeline {
     extractor: NotionExtractor,
     compiler: WikiCompiler,
     detector: ContradictionDetector,
 }
 
-impl ConsolidationPipeline {
+impl DistillationPipeline {
     pub fn new() -> Self {
         Self {
             extractor: NotionExtractor::new(),
@@ -38,7 +182,7 @@ impl ConsolidationPipeline {
         }
     }
 
-    pub fn run(&self, inbox_dir: &Path, wiki_dir: &Path) -> Result<ConsolidationReport> {
+    pub fn run(&self, inbox_dir: &Path, wiki_dir: &Path) -> Result<DistillationReport> {
         let notes = self.load_notes(inbox_dir)?;
         let notes_processed = notes.len();
         info!(
@@ -50,7 +194,17 @@ impl ConsolidationPipeline {
         let entities_extracted = notions.len();
         info!(entities_extracted, "Notion extraction complete");
 
-        let pages = self.compiler.compile(&notes, wiki_dir)?;
+        let entity_names: Vec<String> = notions.iter().map(|n| n.name.clone()).collect();
+        let linked_notes: Vec<Note> = notes
+            .clone()
+            .into_iter()
+            .map(|mut note| {
+                note.content = auto_link_wikilinks(&note.content, &entity_names);
+                note
+            })
+            .collect();
+
+        let pages = self.compiler.compile(&linked_notes, wiki_dir)?;
         let wiki_pages_created = pages.len();
         if wiki_pages_created > 0 {
             info!(wiki_pages_created, "Wiki pages compiled and written");
@@ -66,11 +220,14 @@ impl ConsolidationPipeline {
             info!("No contradictions found");
         }
 
-        Ok(ConsolidationReport {
+        let migrated = migrate_inbox_to_wiki(&notes, wiki_dir);
+
+        Ok(DistillationReport {
             notes_processed,
             entities_extracted,
             wiki_pages_created,
             contradictions_found,
+            migrated_files: migrated,
         })
     }
 
@@ -130,16 +287,16 @@ impl ConsolidationPipeline {
     }
 }
 
-impl Default for ConsolidationPipeline {
+impl Default for DistillationPipeline {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl Workflow for ConsolidationPipeline {
-    type Input = ConsolidationPipelineInput;
-    type Output = ConsolidationReport;
+impl Workflow for DistillationPipeline {
+    type Input = DistillationPipelineInput;
+    type Output = DistillationReport;
 
     fn name(&self) -> &str {
         "zen-consolidation-pipeline"
@@ -161,11 +318,12 @@ impl Workflow for ConsolidationPipeline {
 
         if notes.is_empty() {
             info!("No notes to process, returning empty report");
-            return Ok(ConsolidationReport {
+            return Ok(DistillationReport {
                 notes_processed: 0,
                 entities_extracted: 0,
                 wiki_pages_created: 0,
                 contradictions_found: 0,
+                migrated_files: Vec::new(),
             });
         }
 
@@ -275,23 +433,30 @@ impl Workflow for ConsolidationPipeline {
             0
         };
 
-        Ok(ConsolidationReport {
+        let migrated = if !dry_run {
+            migrate_inbox_to_wiki(&notes, wiki_dir)
+        } else {
+            Vec::new()
+        };
+
+        Ok(DistillationReport {
             notes_processed,
             entities_extracted,
             wiki_pages_created,
             contradictions_found,
+            migrated_files: migrated,
         })
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ConsolidationPipelineInput {
+pub struct DistillationPipelineInput {
     pub inbox_dir: PathBuf,
     pub wiki_dir: PathBuf,
     pub dry_run: bool,
 }
 
-impl ConsolidationPipelineInput {
+impl DistillationPipelineInput {
     pub fn new(inbox_dir: PathBuf, wiki_dir: PathBuf) -> Self {
         Self {
             inbox_dir,
@@ -336,7 +501,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::create_dir(&inbox_dir).unwrap();
         let wiki_dir = tmp.path().join("wiki");
 
-        let pipeline = ConsolidationPipeline::new();
+        let pipeline = DistillationPipeline::new();
         let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
 
         assert_eq!(report.notes_processed, 0);
@@ -351,7 +516,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let inbox_dir = tmp.path().join("inbox");
         let wiki_dir = tmp.path().join("wiki");
 
-        let pipeline = ConsolidationPipeline::new();
+        let pipeline = DistillationPipeline::new();
         let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
 
         assert_eq!(report.notes_processed, 0);
@@ -373,7 +538,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         );
         fs::write(inbox_dir.join("note1.md"), &note_content).unwrap();
 
-        let pipeline = ConsolidationPipeline::new();
+        let pipeline = DistillationPipeline::new();
         let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
 
         assert_eq!(report.notes_processed, 1);
@@ -397,7 +562,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("readme.txt"), "not a note").unwrap();
         fs::write(inbox_dir.join("data.json"), "{}").unwrap();
 
-        let pipeline = ConsolidationPipeline::new();
+        let pipeline = DistillationPipeline::new();
         let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
 
         assert_eq!(report.notes_processed, 1);
@@ -421,7 +586,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("01-rust.md"), &note1).unwrap();
         fs::write(inbox_dir.join("02-python.md"), &note2).unwrap();
 
-        let pipeline = ConsolidationPipeline::new();
+        let pipeline = DistillationPipeline::new();
         let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
 
         assert_eq!(report.notes_processed, 2);
@@ -447,7 +612,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         // Malformed frontmatter (missing closing ---)
         fs::write(inbox_dir.join("02-bad.md"), "---\nid: \"note-2\"\n\nbody").unwrap();
 
-        let pipeline = ConsolidationPipeline::new();
+        let pipeline = DistillationPipeline::new();
         let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
 
         assert_eq!(report.notes_processed, 1, "Should skip the malformed note");
@@ -464,7 +629,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let note = create_test_note("note-1", "# Hello");
         fs::write(inbox_dir.join("note.md"), &note).unwrap();
 
-        let pipeline = ConsolidationPipeline::new();
+        let pipeline = DistillationPipeline::new();
         // WikiStructure::ensure_directories creates wiki_dir hierarchy
         let result = pipeline.run(&inbox_dir, &wiki_dir);
         assert!(result.is_ok());
@@ -472,11 +637,12 @@ updated_at: "2026-05-23T15:00:00+00:00"
 
     #[test]
     fn test_report_debug_derive() {
-        let report = ConsolidationReport {
+        let report = DistillationReport {
             notes_processed: 5,
             entities_extracted: 3,
             wiki_pages_created: 2,
             contradictions_found: 1,
+            migrated_files: Vec::new(),
         };
         let debug_str = format!("{:?}", report);
         assert!(debug_str.contains("notes_processed"));
@@ -485,11 +651,12 @@ updated_at: "2026-05-23T15:00:00+00:00"
 
     #[test]
     fn test_report_clone() {
-        let report = ConsolidationReport {
+        let report = DistillationReport {
             notes_processed: 1,
             entities_extracted: 0,
             wiki_pages_created: 0,
             contradictions_found: 0,
+            migrated_files: Vec::new(),
         };
         let cloned = report.clone();
         assert_eq!(report.notes_processed, cloned.notes_processed);
@@ -497,12 +664,204 @@ updated_at: "2026-05-23T15:00:00+00:00"
 
     #[test]
     fn test_pipeline_default() {
-        let pipeline = ConsolidationPipeline::default();
+        let pipeline = DistillationPipeline::default();
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         let wiki_dir = tmp.path().join("wiki");
 
         let result = pipeline.run(&inbox_dir, &wiki_dir);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_wraps_entity() {
+        let content = "I love using Rust for systems programming.";
+        let entities = vec!["Rust".to_string()];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "I love using [[Rust]] for systems programming.");
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_skips_already_linked() {
+        let content = "I love using [[Rust]] for systems programming.";
+        let entities = vec!["Rust".to_string()];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "I love using [[Rust]] for systems programming.");
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_multiple_entities() {
+        let content = "Rust and Tokio are great for async programming.";
+        let entities = vec!["Rust".to_string(), "Tokio".to_string()];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "[[Rust]] and [[Tokio]] are great for async programming.");
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_longest_first() {
+        let content = "PostgreSQL and SQL are databases.";
+        let entities = vec!["SQL".to_string(), "PostgreSQL".to_string()];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "[[PostgreSQL]] and [[SQL]] are databases.");
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_word_boundary() {
+        let content = "Rustic is not Rust.";
+        let entities = vec!["Rust".to_string()];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "Rustic is not [[Rust]].");
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_no_entities() {
+        let content = "No entities here.";
+        let entities = vec![];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "No entities here.");
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_empty_content() {
+        let content = "";
+        let entities = vec!["Rust".to_string()];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_auto_link_wikilinks_preserves_backticks() {
+        let content = "Use `Rust` for programming.";
+        let entities = vec!["Rust".to_string()];
+        let result = auto_link_wikilinks(content, &entities);
+        assert_eq!(result, "Use `Rust` for programming.");
+    }
+
+    #[test]
+    fn test_migrate_inbox_to_wiki_moves_by_domain() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        let content = create_test_note("note-1", "# Work note");
+        let source = inbox_dir.join("work-note.md");
+        fs::write(&source, &content).unwrap();
+
+        let notes = vec![Note {
+            id: "note-1".to_string(),
+            domain: vec![crate::note::Domain::Work],
+            file_path: Some(source.clone()),
+            ..Note::default()
+        }];
+
+        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
+
+        assert_eq!(migrated.len(), 1);
+        let (src, dst) = &migrated[0];
+        assert_eq!(src, &source);
+        assert!(dst.starts_with(&wiki_dir.join("work")));
+        assert!(!source.exists(), "inbox file should be gone");
+        assert!(dst.exists(), "wiki file should exist");
+    }
+
+    #[test]
+    fn test_migrate_inbox_to_wiki_defaults_to_general() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        let content = create_test_note("note-2", "# Untagged note");
+        let source = inbox_dir.join("untagged.md");
+        fs::write(&source, &content).unwrap();
+
+        let notes = vec![Note {
+            id: "note-2".to_string(),
+            domain: Vec::new(),
+            file_path: Some(source.clone()),
+            ..Note::default()
+        }];
+
+        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
+
+        assert_eq!(migrated.len(), 1);
+        let (_, dst) = &migrated[0];
+        assert!(dst.starts_with(&wiki_dir.join("general")));
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn test_migrate_inbox_to_wiki_avoids_overwrite() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        let wiki_dir = tmp.path().join("wiki");
+        let work_dir = wiki_dir.join("work");
+        fs::create_dir_all(&inbox_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+
+        let content = create_test_note("note-3", "# Another work note");
+        let source = inbox_dir.join("duplicate.md");
+        fs::write(&source, &content).unwrap();
+
+        fs::write(work_dir.join("duplicate.md"), "existing").unwrap();
+
+        let notes = vec![Note {
+            id: "note-3".to_string(),
+            domain: vec![crate::note::Domain::Work],
+            file_path: Some(source.clone()),
+            ..Note::default()
+        }];
+
+        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
+
+        assert_eq!(migrated.len(), 1);
+        let (_, dst) = &migrated[0];
+        assert!(work_dir.join("duplicate.md").exists());
+        let dst_name = dst.file_name().unwrap().to_string_lossy();
+        assert!(dst_name.starts_with("duplicate_"), "expected timestamp suffix: {dst_name}");
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn test_migrate_inbox_to_wiki_inbox_empty_after() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir_all(&inbox_dir).unwrap();
+
+        let c1 = create_test_note("n1", "# Note one");
+        let c2 = create_test_note("n2", "# Note two");
+        let s1 = inbox_dir.join("note1.md");
+        let s2 = inbox_dir.join("note2.md");
+        fs::write(&s1, &c1).unwrap();
+        fs::write(&s2, &c2).unwrap();
+
+        let notes = vec![
+            Note {
+                id: "n1".to_string(),
+                domain: vec![crate::note::Domain::Personal],
+                file_path: Some(s1.clone()),
+                ..Note::default()
+            },
+            Note {
+                id: "n2".to_string(),
+                domain: vec![crate::note::Domain::Learning],
+                file_path: Some(s2.clone()),
+                ..Note::default()
+            },
+        ];
+
+        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
+
+        assert_eq!(migrated.len(), 2);
+        assert!(!s1.exists());
+        assert!(!s2.exists());
+
+        let inbox_entries: Vec<_> = fs::read_dir(&inbox_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(inbox_entries.is_empty(), "inbox should be empty after migration");
     }
 }

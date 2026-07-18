@@ -28,6 +28,8 @@ pub struct ExtractedSignals {
     pub feedback: Vec<String>,
     /// Candidate beliefs with confidence scores.
     pub beliefs: Vec<String>,
+    /// Positive actions that should be continued — inversion thinking counterpart to reflections.
+    pub continue_doing_candidates: Vec<String>,
 }
 
 impl ExtractedSignals {
@@ -39,6 +41,7 @@ impl ExtractedSignals {
             && self.corrections.is_empty()
             && self.feedback.is_empty()
             && self.beliefs.is_empty()
+            && self.continue_doing_candidates.is_empty()
     }
 
     pub fn total(&self) -> usize {
@@ -49,6 +52,7 @@ impl ExtractedSignals {
             + self.corrections.len()
             + self.feedback.len()
             + self.beliefs.len()
+            + self.continue_doing_candidates.len()
     }
 }
 
@@ -365,6 +369,7 @@ const MEMORY_SECTION_HEADERS: &[&str] = &[
     "## Identity",
     "## Active Commitments",
     "## Stop-Doing Ledger",
+    "## Continue-Doing Ledger",
     "## Active Mental Models",
     "## Recent Wisdom",
 ];

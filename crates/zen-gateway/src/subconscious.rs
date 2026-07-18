@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{Duration, NaiveDate};
 use tracing::{debug, info};
 
 use zen_core::config::ZenConfig;
@@ -97,6 +97,10 @@ fn evaluate_tick(
         )));
     }
 
+    if let Some(reminder) = evaluate_soul_goals(zen_paths, date) {
+        actions.push(reminder);
+    }
+
     actions.push(MicroAction::Log(format!(
         "Tick complete at {date}: {} log entries, {pending_notes} inbox notes",
         today_entries.len()
@@ -107,6 +111,82 @@ fn evaluate_tick(
 
 fn load_identity(zen_paths: &ZenPaths) -> Result<IdentityContext> {
     zen_memory::memory_service::load_all(zen_paths)
+}
+
+fn evaluate_soul_goals(zen_paths: &ZenPaths, date: NaiveDate) -> Option<MicroAction> {
+    let soul_path = zen_paths.identity().join("SOUL.md");
+    if !soul_path.exists() {
+        return None;
+    }
+
+    let soul_content = std::fs::read_to_string(&soul_path).ok()?;
+    let goals = parse_soul_goals(&soul_content);
+    if goals.is_empty() {
+        return None;
+    }
+
+    let recent_text = load_recent_journal_text(zen_paths, date, 7);
+    if recent_text.is_empty() {
+        return Some(MicroAction::Remind(format!(
+            "Goals defined in SOUL.md but no journal entries in the last 7 days: {}",
+            goals.join(", ")
+        )));
+    }
+
+    let recent_lower = recent_text.to_lowercase();
+    for goal in &goals {
+        let goal_lower = goal.to_lowercase();
+        let keywords: Vec<&str> = goal_lower
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|w| w.len() > 3)
+            .collect();
+
+        let match_count = keywords.iter().filter(|kw| recent_lower.contains(*kw)).count();
+        if match_count == 0 {
+            return Some(MicroAction::Remind(format!(
+                "Goal misalignment: '{}' has no matching journal entries in the last 7 days",
+                goal
+            )));
+        }
+    }
+
+    None
+}
+
+fn parse_soul_goals(content: &str) -> Vec<String> {
+    let mut goals = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(goal) = trimmed
+            .strip_prefix("- Goal:")
+            .or_else(|| trimmed.strip_prefix("- Intention:"))
+        {
+            let goal = goal.trim().to_string();
+            if !goal.is_empty() {
+                goals.push(goal);
+            }
+        } else if trimmed.starts_with("# ") && !trimmed.starts_with("## ") {
+            let heading = trimmed.trim_start_matches("# ").trim().to_string();
+            if !heading.is_empty() && heading.len() > 3 {
+                goals.push(heading);
+            }
+        }
+    }
+    goals
+}
+
+fn load_recent_journal_text(zen_paths: &ZenPaths, date: NaiveDate, days: u32) -> String {
+    let mut text = String::new();
+    for i in 0..days {
+        let check_date = date - Duration::days(i as i64);
+        if let Ok(entries) = Journal::read_entries(zen_paths, check_date) {
+            for entry in &entries {
+                text.push_str(&entry.content);
+                text.push('\n');
+            }
+        }
+    }
+    text
 }
 
 fn count_inbox_notes(zen_paths: &ZenPaths) -> usize {
@@ -177,5 +257,46 @@ mod tests {
             MicroAction::Remind(msg) => assert_eq!(msg, "test"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_parse_soul_goals_goal_prefix() {
+        let content = "# My Goals\n\n- Goal: Ship the feature by Friday\n- Intention: Learn Rust async";
+        let goals = parse_soul_goals(content);
+        assert_eq!(goals.len(), 3);
+        assert!(goals.contains(&"My Goals".to_string()));
+        assert!(goals.contains(&"Ship the feature by Friday".to_string()));
+        assert!(goals.contains(&"Learn Rust async".to_string()));
+    }
+
+    #[test]
+    fn test_parse_soul_goals_heading() {
+        let content = "# Health and Fitness\n\nSome content here.";
+        let goals = parse_soul_goals(content);
+        assert_eq!(goals.len(), 1);
+        assert!(goals.contains(&"Health and Fitness".to_string()));
+    }
+
+    #[test]
+    fn test_parse_soul_goals_mixed() {
+        let content = "# Overall Direction\n\n- Goal: Improve code quality\n- Intention: Write more tests";
+        let goals = parse_soul_goals(content);
+        assert_eq!(goals.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_soul_goals_empty() {
+        let content = "Just some plain text without goals.";
+        let goals = parse_soul_goals(content);
+        assert!(goals.is_empty());
+    }
+
+    #[test]
+    fn test_parse_soul_goals_skips_subheadings() {
+        let content = "# Main Goal\n\n## Sub Heading\n\n- Goal: Specific task";
+        let goals = parse_soul_goals(content);
+        assert_eq!(goals.len(), 2);
+        assert!(goals.contains(&"Main Goal".to_string()));
+        assert!(goals.contains(&"Specific task".to_string()));
     }
 }

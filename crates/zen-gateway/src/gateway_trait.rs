@@ -12,9 +12,6 @@ pub enum GatewayStatus {
 }
 
 /// Abstract gateway interface.
-///
-/// Phase 2: stub implementations returning `NotImplemented`.
-/// Phase 3: `HttpGateway` backed by `axum`, with auth and rate limiting.
 pub trait Gateway {
     /// Bind the gateway on the given port and begin accepting connections.
     fn start(&mut self, port: u16) -> Result<(), GatewayError>;

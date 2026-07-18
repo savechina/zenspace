@@ -14,33 +14,13 @@ impl NotionGraphAdapter {
     pub fn from_client(client: SqliteClient) -> Self {
         Self { client }
     }
-
-    fn parse_kind(s: &str) -> NotionKind {
-        match s {
-            "Technology" => NotionKind::Technology,
-            "Concept" => NotionKind::Concept,
-            "Person" => NotionKind::Person,
-            "Organization" => NotionKind::Organization,
-            "Event" => NotionKind::Event,
-            "Product" => NotionKind::Product,
-            "Function" => NotionKind::Function,
-            "Class" => NotionKind::Class,
-            "Module" => NotionKind::Module,
-            "SelfModel" => NotionKind::SelfModel,
-            "Belief" => NotionKind::Belief,
-            "Goal" => NotionKind::Goal,
-            "Path" => NotionKind::Path,
-            "Decision" => NotionKind::Decision,
-            _ => NotionKind::Other,
-        }
-    }
 }
 
 #[async_trait]
 impl NotionGraphProvider for NotionGraphAdapter {
     async fn upsert_entity(&self, notion: &SimpleNotion) -> Result<()> {
         let svc = NotionService::new();
-        let et = Self::parse_kind(&notion.kind);
+        let et = super::notion::parse_kind(&notion.kind).unwrap_or(NotionKind::Other);
         let mut e = crate::Notion::new(&notion.name, et, &notion.source);
         e.id = notion.id.clone();
         svc.upsert_entity(&self.client, &e)

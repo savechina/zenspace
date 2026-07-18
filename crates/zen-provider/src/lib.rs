@@ -1,10 +1,15 @@
 pub mod chat;
+pub mod embedding;
 pub mod model_meta;
 pub mod providers;
 mod router;
 pub mod stream;
 
 pub use chat::{ChatMessage, ChatSession, MessageRole};
+pub use embedding::{
+    DefaultEmbeddingRouter, EmbeddingError, EmbeddingProvider, EmbeddingRouter,
+    OpenAiEmbeddingProvider, OllamaEmbeddingProvider,
+};
 pub use model_meta::{
     ComplexityLevel, ModelMetadata, ModelRouter, ModelStats, PromptHookTelemetry, PromptTelemetry,
 };

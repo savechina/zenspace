@@ -1,7 +1,6 @@
 pub mod anti_pattern;
 pub mod belief;
 pub mod commitment;
-pub mod context_budget;
 pub mod conversation;
 pub mod correction;
 pub mod decision;
@@ -30,12 +29,6 @@ pub mod virtue_log;
 pub use anti_pattern::AntiPatternSignal;
 pub use belief::{Belief, EvidenceEntry, ResearchMethod, SourceType};
 pub use commitment::{Commitment, CommitmentState, ExecutionChecklist, Milestone, StopLossLine};
-#[deprecated(
-    since = "0.0.1",
-    note = "Use rig_compose::ContextPack for budget allocation."
-)]
-#[allow(deprecated)]
-pub use context_budget::ContextBudget;
 pub use conversation::ConversationStore;
 pub use correction::Correction;
 pub use decision::{
@@ -48,10 +41,9 @@ pub use feedback_signal::{Feedback, FeedbackDisposition, FeedbackProperties};
 pub use history::HistoryStore;
 pub use memory_service::IdentityContext;
 pub use memvid::TRIPLET_MIN_CONFIDENCE;
-#[allow(deprecated)]
 pub use memvid::{
-    ContextProjector, ZenMemvidStore, create_persist_hook,
-    default_memory_config,
+    ContextProjector, EntityType, MemvidDemotionHook, MemvidStoringCompactor, MemoryEntry,
+    ZenMemvidStore, create_persist_hook, default_memory_config,
 };
 pub use memvid_index::{MemvidIndexReport, MemvidIndexer};
 pub use mental_model::MentalModelSignal;

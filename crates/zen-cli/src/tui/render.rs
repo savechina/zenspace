@@ -1,3 +1,4 @@
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 pub fn render_markdown_to_lines(content: &str) -> Vec<Line<'static>> {
@@ -13,6 +14,61 @@ pub fn render_markdown_to_lines(content: &str) -> Vec<Line<'static>> {
             )
         })
         .collect()
+}
+
+pub fn render_markdown_with_thoughts(content: &str) -> Vec<Line<'static>> {
+    let thought_open = "<think>";
+    let thought_close = "</think>";
+
+    if !content.contains(thought_open) && !content.contains(thought_close) {
+        return render_markdown_to_lines(content);
+    }
+
+    let mut all_lines: Vec<Line<'static>> = Vec::new();
+    let mut remaining = content;
+
+    while !remaining.is_empty() {
+        if let Some(open_pos) = remaining.find(thought_open) {
+            if open_pos > 0 {
+                let before = &remaining[..open_pos];
+                all_lines.extend(render_markdown_to_lines(before));
+            }
+
+            let after_open = &remaining[open_pos + thought_open.len()..];
+            if let Some(close_pos) = after_open.find(thought_close) {
+                let thought_content = &after_open[..close_pos];
+                let dimmed_style = Style::default().fg(Color::DarkGray);
+                let thought_lines = render_markdown_to_lines(thought_content);
+                for line in thought_lines {
+                    let dimmed_spans: Vec<Span<'static>> = line
+                        .spans
+                        .into_iter()
+                        .map(|span| Span::styled(span.content.clone(), dimmed_style))
+                        .collect();
+                    all_lines.push(Line::from(dimmed_spans));
+                }
+
+                remaining = &after_open[close_pos + thought_close.len()..];
+            } else {
+                let dimmed_style = Style::default().fg(Color::DarkGray);
+                let rest_lines = render_markdown_to_lines(after_open);
+                for line in rest_lines {
+                    let dimmed_spans: Vec<Span<'static>> = line
+                        .spans
+                        .into_iter()
+                        .map(|span| Span::styled(span.content.clone(), dimmed_style))
+                        .collect();
+                    all_lines.push(Line::from(dimmed_spans));
+                }
+                break;
+            }
+        } else {
+            all_lines.extend(render_markdown_to_lines(remaining));
+            break;
+        }
+    }
+
+    all_lines
 }
 
 pub fn normalize_compact_markdown(content: &str) -> String {
@@ -94,5 +150,29 @@ mod tests {
         let bare = "singleword";
         let normalized = normalize_compact_markdown(bare);
         assert_eq!(normalized, bare, "no-space content should be unchanged");
+    }
+
+    #[test]
+    fn thought_tags_render_dimmed() {
+        let content = "Before <think>thinking content </think> After";
+        let lines = render_markdown_with_thoughts(content);
+        assert!(!lines.is_empty());
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(all_text.contains("Before"));
+        assert!(all_text.contains("thinking content"));
+        assert!(all_text.contains("After"));
+        assert!(!all_text.contains("<think>"));
+        assert!(!all_text.contains("</think>"));
+    }
+
+    #[test]
+    fn no_thought_tags_renders_normally() {
+        let content = "Normal **markdown** content";
+        let lines = render_markdown_with_thoughts(content);
+        let normal_lines = render_markdown_to_lines(content);
+        assert_eq!(lines.len(), normal_lines.len());
     }
 }

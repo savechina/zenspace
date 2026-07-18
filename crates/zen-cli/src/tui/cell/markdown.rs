@@ -1,4 +1,4 @@
-use crate::tui::render::render_markdown_to_lines;
+use crate::tui::render::render_markdown_with_thoughts;
 use ratatui::text::Line;
 use std::cell::OnceCell;
 
@@ -27,7 +27,7 @@ impl MarkdownCell {
 
     pub fn display_lines(&self) -> Vec<Line<'static>> {
         self.rendered
-            .get_or_init(|| render_markdown_to_lines(&self.content))
+            .get_or_init(|| render_markdown_with_thoughts(&self.content))
             .clone()
     }
 }

@@ -13,8 +13,11 @@ use crate::cmd::brief_command::{self, BriefCommands};
 use crate::cmd::chat_command::{self, ChatArgs};
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::config_command::{self, ConfigCommands};
-use crate::cmd::consolidate_command::{self, ConsolidateCommands};
+use crate::cmd::distill_command::{self, DistillCommands};
+use crate::cmd::dispatch_command::{self, DispatchCommands};
+use crate::cmd::goal_command::{self, GoalCommands};
 use crate::cmd::graph_command::{self, GraphCommands};
+use crate::cmd::habit_command::{self, HabitCommands};
 use crate::cmd::ingest_command::{self, IngestCommands};
 use crate::cmd::lint_command::{self, LintCommands};
 use crate::cmd::logs_command::{self, LogCommands};
@@ -29,6 +32,7 @@ use crate::cmd::search_command::{self, SearchCommands};
 use crate::cmd::serve_command::{self, ServeCommands};
 use crate::cmd::session_command::{self, SessionCommands};
 use crate::cmd::similar_command::{self, SimilarCommands};
+use crate::cmd::skill_command::{self, SkillCommands};
 use crate::cmd::starter_command::{self, StarterCommands};
 use crate::cmd::task_command::{self, TaskCommands};
 use crate::cmd::wiki_command::{self, WikiCommands};
@@ -108,7 +112,9 @@ enum Commands {
         #[command(subcommand)]
         operation: SimilarCommands,
     },
-    Graph {
+    /// Notion knowledge graph operations (alias: graph)
+    #[command(visible_alias = "graph")]
+    Notion {
         #[command(subcommand)]
         operation: GraphCommands,
     },
@@ -120,9 +126,9 @@ enum Commands {
         #[command(subcommand)]
         operation: ResearchCommands,
     },
-    Consolidate {
+    Distill {
         #[command(subcommand)]
-        operation: ConsolidateCommands,
+        operation: DistillCommands,
     },
     Lint {
         #[command(subcommand)]
@@ -176,6 +182,22 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         operation: AuthCommands,
+    },
+    Habit {
+        #[command(subcommand)]
+        operation: HabitCommands,
+    },
+    Goal {
+        #[command(subcommand)]
+        operation: GoalCommands,
+    },
+    Skill {
+        #[command(subcommand)]
+        operation: SkillCommands,
+    },
+    Dispatch {
+        #[command(subcommand)]
+        operation: DispatchCommands,
     },
 }
 
@@ -271,10 +293,10 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Note { ref operation } => note_command::execute_command(operation),
         Commands::Search { ref operation } => search_command::execute_command(operation).await,
         Commands::Similar { ref operation } => similar_command::execute_command(operation),
-        Commands::Graph { ref operation } => graph_command::execute_command(operation),
+        Commands::Notion { ref operation } => graph_command::execute_command(operation),
         Commands::Reindex { ref operation } => reindex_command::execute_command(operation).await,
         Commands::Research { ref operation } => research_command::execute_command(operation).await,
-        Commands::Consolidate { ref operation } => consolidate_command::execute_command(operation),
+        Commands::Distill { ref operation } => distill_command::execute_command(operation),
         Commands::Lint { ref operation } => lint_command::execute_command(operation),
         Commands::Logs {
             lines,
@@ -294,5 +316,11 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Model { ref operation } => model_command::execute_command(operation),
         Commands::Plugin { ref operation } => plugin_command::execute_command(operation),
         Commands::Auth { ref operation } => auth_command::execute_command(operation),
+        Commands::Habit { ref operation } => habit_command::execute_command(operation),
+        Commands::Goal { ref operation } => goal_command::execute_command(operation),
+        Commands::Skill { ref operation } => skill_command::execute_command(operation).await,
+        Commands::Dispatch { ref operation } => {
+            dispatch_command::execute_command(operation).await
+        }
     }
 }

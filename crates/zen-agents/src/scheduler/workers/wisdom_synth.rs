@@ -143,7 +143,8 @@ impl ZenWorker for WisdomSynthesizer {
             r#"You are a wisdom synthesis engine. Analyze the following reflections and beliefs, then identify:
 1. Recurring patterns that suggest mental models worth adopting
 2. Anti-patterns (repeated mistakes, blind spots)
-3. Beliefs that need more evidence (low confidence, high importance)
+3. Positive patterns (practices that worked well and should be continued)
+4. Beliefs that need more evidence (low confidence, high importance)
 
 ## Recent Reflections
 {truncated_reflections}
@@ -158,6 +159,9 @@ Respond with ONLY a JSON object:
   ],
   "anti_pattern_candidates": [
     {{"pattern": "...", "trigger": "...", "avoidance": "...", "evidence_refs": [...]}}
+  ],
+  "positive_pattern_candidates": [
+    {{"pattern": "...", "trigger": "...", "reinforcement": "...", "evidence_refs": [...]}}
   ],
   "belief_updates": [
     {{"proposition": "...", "supports": true, "source": "self_observation", "note": "..."}}
@@ -199,6 +203,10 @@ Respond with ONLY a JSON object:
             .as_array()
             .cloned()
             .unwrap_or_default();
+        let positive_patterns = parsed["positive_pattern_candidates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let belief_updates = parsed["belief_updates"]
             .as_array()
             .cloned()
@@ -207,6 +215,7 @@ Respond with ONLY a JSON object:
         let vault = paths.vault();
         let models_promoted = promote_mental_models(&vault, &models)?;
         let anti_patterns_promoted = promote_anti_patterns(&vault, &anti_patterns)?;
+        let positive_patterns_promoted = promote_positive_patterns(&vault, &positive_patterns)?;
 
         let mut total_updates_applied = 0usize;
 
@@ -244,6 +253,7 @@ Respond with ONLY a JSON object:
         info!(
             models = models_promoted,
             anti_patterns = anti_patterns_promoted,
+            positive_patterns = positive_patterns_promoted,
             belief_updates = total_updates_applied,
             "wisdom synthesis complete"
         );
@@ -251,7 +261,7 @@ Respond with ONLY a JSON object:
         let suggestions_dir = paths.vault().join("wiki/wisdom/suggestions");
         fs::create_dir_all(&suggestions_dir)?;
         let suggestion_path = suggestions_dir.join(format!("{date_str}.md", date_str = Utc::now().format("%Y-%m-%d")));
-        if let Err(e) = write_suggestions(&suggestion_path, &models, &anti_patterns, &belief_updates) {
+        if let Err(e) = write_suggestions(&suggestion_path, &models, &anti_patterns, &positive_patterns, &belief_updates) {
             warn!(path = %suggestion_path.display(), error = %e, "failed to write synthesis suggestions");
         } else {
             info!(path = %suggestion_path.display(), "wisdom synthesis suggestions written");
@@ -437,10 +447,48 @@ fn promote_anti_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
     Ok(count)
 }
 
+fn promote_positive_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
+    let pp_dir = vault.join("wiki/wisdom/positive-patterns");
+    fs::create_dir_all(&pp_dir)
+        .with_context(|| format!("failed to create positive-patterns dir: {}", pp_dir.display()))?;
+
+    let mut count = 0usize;
+    let date_str = Utc::now().format("%Y-%m-%d").to_string();
+
+    for pp in candidates {
+        let pattern_name = pp["pattern"].as_str().unwrap_or("unknown-pattern");
+        let trigger = pp["trigger"].as_str().unwrap_or("unknown trigger");
+        let reinforcement = pp["reinforcement"].as_str().unwrap_or("unknown reinforcement");
+
+        let slug = slugify(pattern_name);
+        let file_path = pp_dir.join(format!("{slug}.md"));
+
+        let content = if file_path.exists() {
+            let existing = fs::read_to_string(&file_path).unwrap_or_default();
+            let entry = format!(
+                "\n\n## Observation — {date_str}\n\n- **Trigger**: {trigger}\n- **Reinforcement**: {reinforcement}\n"
+            );
+            format!("{existing}{entry}")
+        } else {
+            format!(
+                "---\npattern: {pattern_name}\ntrigger: {trigger}\nreinforcement: {reinforcement}\npromoted_at: {date_str}\n---\n\n# {pattern_name}\n\n**Trigger**: {trigger}\n\n**Reinforcement**: {reinforcement}\n"
+            )
+        };
+
+        fs::write(&file_path, &content)
+            .with_context(|| format!("failed to write positive-pattern: {}", file_path.display()))?;
+        count += 1;
+        debug!(pattern = pattern_name, path = %file_path.display(), "promoted positive-pattern");
+    }
+
+    Ok(count)
+}
+
 fn write_suggestions(
     path: &Path,
     models: &[Value],
     anti_patterns: &[Value],
+    positive_patterns: &[Value],
     updates: &[Value],
 ) -> Result<()> {
     let date_str = Utc::now().format("%Y-%m-%d").to_string();
@@ -479,6 +527,21 @@ fn write_suggestions(
             let avoidance = ap["avoidance"].as_str().unwrap_or("?");
             content.push_str(&format!(
                 "- **{pattern}** (trigger: {trigger})\n  Avoidance: {avoidance}\n"
+            ));
+        }
+        content.push('\n');
+    }
+
+    content.push_str("## Positive Pattern Candidates\n\n");
+    if positive_patterns.is_empty() {
+        content.push_str("_(no positive patterns identified)_\n\n");
+    } else {
+        for pp in positive_patterns {
+            let pattern = pp["pattern"].as_str().unwrap_or("?");
+            let trigger = pp["trigger"].as_str().unwrap_or("?");
+            let reinforcement = pp["reinforcement"].as_str().unwrap_or("?");
+            content.push_str(&format!(
+                "- **{pattern}** (trigger: {trigger})\n  Reinforcement: {reinforcement}\n"
             ));
         }
         content.push('\n');

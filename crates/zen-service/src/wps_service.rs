@@ -156,10 +156,10 @@ pub fn dotfiles(restore: bool) -> Result<(), ServiceError> {
 
                 println!("from:{},to:{}", from_path.display(), to_path.display(),);
 
-                if to_path.exists() {
-                    if let Err(e) = fs_extra::remove_items(std::slice::from_ref(&to_path)) {
-                        tracing::warn!(error = %e, path = %to_path.display(), "failed to remove existing path before copy");
-                    }
+                if to_path.exists()
+                    && let Err(e) = fs_extra::remove_items(std::slice::from_ref(&to_path))
+                {
+                    tracing::warn!(error = %e, path = %to_path.display(), "failed to remove existing path before copy");
                 }
 
                 let options = CopyOptions::new().overwrite(true).copy_inside(true);

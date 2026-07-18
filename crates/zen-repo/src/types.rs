@@ -51,7 +51,7 @@ pub struct NotionRow {
 }
 
 #[derive(FromRow)]
-pub struct RelationshipRow {
+pub struct RelationRow {
     pub id: String,
     pub source_notion_id: String,
     pub target_notion_id: String,

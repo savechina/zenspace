@@ -10362,6 +10362,7 @@ dependencies = [
  "tempfile",
  "time 0.3.47",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "tui-markdown",
@@ -10449,11 +10450,9 @@ dependencies = [
  "rig-memvid",
  "serde",
  "serde_json",
- "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-rusqlite",
  "tracing",
  "uuid",
  "zen-core",
@@ -10481,7 +10480,9 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
+ "wasi-common",
  "wasmtime",
+ "wat",
  "zen-core",
 ]
 
@@ -10490,6 +10491,7 @@ name = "zen-provider"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono 0.4.45",
  "futures-util",
  "reqwest 0.13.4",

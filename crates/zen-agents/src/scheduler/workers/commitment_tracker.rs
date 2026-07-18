@@ -14,6 +14,7 @@ use super::marker_state::JournalEntryState;
 #[derive(Debug, Clone)]
 pub struct AntiTalkIndicator {
     pub commitment_slug: String,
+    pub commitment_title: String,
     pub mention_count: usize,
     pub milestone_count: usize,
     pub ratio: f64,
@@ -24,8 +25,8 @@ impl AntiTalkIndicator {
     pub fn display_summary(&self) -> String {
         if self.is_warning {
             format!(
-                "空谈警报: {} (mentions={}, milestones={}, ratio={:.1})",
-                self.commitment_slug, self.mention_count, self.milestone_count, self.ratio
+                "空谈警报: commitment '{}' mentioned {} times but only {} milestones completed (ratio={:.1})",
+                self.commitment_title, self.mention_count, self.milestone_count, self.ratio
             )
         } else {
             format!(
@@ -191,11 +192,8 @@ impl ZenWorker for CommitmentTracker {
         for at in &anti_talks {
             if at.is_warning {
                 warn!(
-                    slug = %at.commitment_slug,
-                    mentions = at.mention_count,
-                    milestones = at.milestone_count,
-                    ratio = at.ratio,
-                    "anti-talk warning: talk-to-achievement ratio exceeds threshold"
+                    "空谈警报: commitment '{}' mentioned {} times but only {} milestones completed",
+                    at.commitment_title, at.mention_count, at.milestone_count
                 );
                 anti_talk_warnings += 1;
             }
@@ -396,6 +394,7 @@ fn compute_anti_talk_indicator(
 
     Ok(AntiTalkIndicator {
         commitment_slug: slug,
+        commitment_title: commitment.what.clone(),
         mention_count,
         milestone_count,
         ratio,
@@ -617,6 +616,7 @@ mod tests {
     fn test_anti_talk_display_summary() {
         let warning = AntiTalkIndicator {
             commitment_slug: "ship-feature".into(),
+            commitment_title: "ship feature X".into(),
             mention_count: 10,
             milestone_count: 1,
             ratio: 10.0,
@@ -626,6 +626,7 @@ mod tests {
 
         let ok = AntiTalkIndicator {
             commitment_slug: "other".into(),
+            commitment_title: "other task".into(),
             mention_count: 2,
             milestone_count: 3,
             ratio: 0.67,

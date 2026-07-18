@@ -423,6 +423,8 @@ mod tests {
             domain: Some("programming".to_string()),
             aliases: vec!["rust-lang".to_string(), "rs".to_string()],
             metadata: std::collections::HashMap::new(),
+            subject_uri: None,
+            topics: Vec::new(),
         };
 
         let svc = NotionService::new();
@@ -459,6 +461,8 @@ mod tests {
             domain: None,
             aliases: Vec::new(),
             metadata: std::collections::HashMap::new(),
+            subject_uri: None,
+            topics: Vec::new(),
         };
 
         let svc = NotionService::new();
