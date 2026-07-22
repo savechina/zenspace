@@ -46,6 +46,7 @@ impl OpenAIProvider {
             reason: format!("Failed to create OpenAI client: {}", e),
         })?;
 
+        let client = client.completions_api();
         let model = client.completion_model(&self.model);
         let mut agent_builder = AgentBuilder::new(model);
         if let Some(t) = options.temperature {

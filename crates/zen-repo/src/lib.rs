@@ -1,4 +1,5 @@
 pub mod client;
+pub mod traits;
 pub mod types;
 pub mod notes_repo;
 pub mod embeddings_repo;
@@ -10,6 +11,7 @@ pub mod dispatch_repo;
 pub mod sessions_repo;
 
 pub use client::{SqliteClient, SqliteError};
+pub use traits::notions::NotionsRepository;
 pub use types::*;
 pub use notes_repo::NotesRepo;
 pub use embeddings_repo::EmbeddingsRepo;

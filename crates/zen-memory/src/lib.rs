@@ -8,6 +8,7 @@ pub mod decision_check;
 pub mod dream;
 pub mod fact;
 pub mod feedback_signal;
+pub mod frontmatter;
 pub mod history;
 pub mod identity;
 pub mod journal;
@@ -25,6 +26,8 @@ pub mod self_model;
 pub mod sensitivity;
 pub mod session;
 pub mod virtue_log;
+
+pub use frontmatter::{extract_frontmatter, parse_field, parse_yaml_array};
 
 pub use anti_pattern::AntiPatternSignal;
 pub use belief::{Belief, EvidenceEntry, ResearchMethod, SourceType};

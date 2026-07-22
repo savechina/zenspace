@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::frontmatter::{extract_frontmatter, parse_field, parse_yaml_array};
+
 // ─── Error type ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -111,7 +113,7 @@ impl AntiPatternSignal {
         let pattern = parse_field(&fm, "pattern")?;
         let trigger = parse_field(&fm, "trigger").unwrap_or_default();
         let avoidance = parse_field(&fm, "avoidance").unwrap_or_default();
-        let detected_in = parse_list_field(&fm, "detected_in");
+        let detected_in = parse_yaml_array(&fm, "detected_in");
         Some(Self {
             pattern: pattern.trim_matches('"').to_string(),
             trigger: trigger.trim_matches('"').to_string(),
@@ -119,56 +121,6 @@ impl AntiPatternSignal {
             detected_in,
         })
     }
-}
-
-fn extract_frontmatter(content: &str) -> Option<String> {
-    let mut lines = content.lines();
-    let first = lines.next()?.trim();
-    if first != "---" {
-        return None;
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Some(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    None
-}
-
-fn parse_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
-}
-
-fn parse_list_field(frontmatter: &str, key: &str) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut in_list = false;
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&format!("{key}:")) {
-            in_list = true;
-            continue;
-        }
-        if in_list {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                items.push(item.trim().to_string());
-            } else if !trimmed.is_empty() && !trimmed.starts_with('-') {
-                break;
-            }
-        }
-    }
-    items
 }
 
 #[cfg(test)]

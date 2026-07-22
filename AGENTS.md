@@ -82,7 +82,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | Crate | Role | Path |
 |-------|------|------|
 | zen | Binary entry (13-line wrapper) | `crates/zen/` |
-| zen-cli | CLI library (24 commands, TUI, dispatch) | `crates/zen-cli/` |
+| zen-cli | CLI library (29 commands, TUI, dispatch) | `crates/zen-cli/` |
 | zen-core | Config layers, error taxonomy, path scoping, constants (13 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
 | zen-repo | Dual API: sqlx repository + rusqlite schema (FTS5, vec0) | `crates/zen-repo/` |
@@ -119,7 +119,7 @@ zen-provider → zen-core
 ### Binary/Library Split
 
 - **Binary**: `crates/zen/src/main.rs` (13 lines) -- loads `.env`, calls `zen_core::config::load_config()`, then `zen_cli::shell().await`
-- **Library**: `crates/zen-cli/` -- exports `shell()` via `lib.rs`, contains clap Parser, TUI runner, 24 subcommand dispatchers
+- **Library**: `crates/zen-cli/` -- exports `shell()` via `lib.rs`, contains clap Parser, TUI runner, 29 subcommand dispatchers
 - **TUI**: Runs on main thread (ratatui/crossterm) when `cli.command.is_none()`
 
 ### Data Flow
@@ -142,14 +142,14 @@ zen lint run    → zen-vault (Linter, orphan pages, broken wikilinks)
 zenspace/
 ├── crates/                     # 12 workspace crates (binary/library split)
 │   ├── zen/                    # Binary entry (13-line wrapper)
-│   ├── zen-cli/                # CLI library: 24 commands, TUI, clap derive
+│   ├── zen-cli/                # CLI library: 29 commands, TUI, clap derive
 │   │   ├── src/
 │   │   │   ├── lib.rs          # pub use cli::shell
-│   │   │   ├── cli.rs          # clap Parser/Subcommand (24 variants), shell() dispatcher
+│   │   │   ├── cli.rs          # clap Parser/Subcommand (29 variants), shell() dispatcher
 │   │   │   ├── tui/            # ratatui TUI interface
 │   │   │   ├── session.rs      # Session helpers
 │   │   │   ├── sandbox.rs      # Sandbox helpers
-│   │   │   └── cmd/            # 24 *_command.rs dispatchers + mod.rs
+│   │   │   └── cmd/            # 28 *_command.rs dispatchers + mod.rs
 │   │   └── tests/              # Integration tests (ZenTest harness)
 │   ├── zen-core/               # Core infrastructure (13 public modules)
 │   │   └── src/
@@ -302,12 +302,12 @@ cargo fmt --all          # Format
 bin/release patch        # Bump version, tag, push
 ```
 
-### Agentic Commands (24 commands)
+### Agentic Commands (29 commands)
 
 | Command | Description | Dispatch File |
 |---------|-------------|---------------|
 | (no args) | TUI (ratatui interactive) | `tui/run()` |
-| `zen hello <name>` | Greeting | `cli.rs` inline |
+| `zen chat` | Interactive LLM chat | `chat_command.rs` |
 | `zen clean` | Cleanup (trash, cache, all) | `cleanup_command.rs` |
 | `zen starter` | Dev tools/workspace init | `starter_command.rs` |
 | `zen wps` | Work process utilities | `wps_command.rs` |
@@ -322,24 +322,27 @@ bin/release patch        # Bump version, tag, push
 | `zen note` | Create notes | `note_command.rs` |
 | `zen search` | KB search (5-tier) | `search_command.rs` |
 | `zen similar` | Vector similarity | `similar_command.rs` |
-| `zen graph` | Entity graph query | `graph_command.rs` |
-| `zen reindex` | Rebuild index | `reindex_command.rs` |
+| `zen notion` (alias: `graph`) | Entity graph query | `graph_command.rs` |
 | `zen research` | Research tasks | `research_command.rs` |
-| `zen consolidate` | Consolidation pipeline | `consolidate_command.rs` |
-| `zen lint` | Knowledge lint | `lint_command.rs` |
+| `zen logs` | Structured log viewer | `logs_command.rs` |
 | `zen ingest` | Ingest files/feeds | `ingest_command.rs` |
 | `zen routine` | Routine management | `routine_command.rs` |
-| `zen task` | Task management | `task_command.rs` |
+| `zen wiki` | Wiki ops: list, show, reindex, lint, distill | `wiki_command.rs` |
 | `zen brief` | Brief generation | `brief_command.rs` |
+| `zen model` | Model metadata + routing | `model_command.rs` |
 | `zen plugin` | Plugin management | `plugin_command.rs` |
 | `zen auth` | Auth/keychain ops | `auth_command.rs` |
+| `zen habit` | Habit tracking | `habit_command.rs` |
+| `zen goal` | Goal management | `goal_command.rs` |
+| `zen skill` | Skill management | `skill_command.rs` |
+| `zen dispatch` | Task dispatch: run, status, list, cancel | `dispatch_command.rs` |
 
 ## FRAMEWORK PATTERNS
 
 ### clap Derive API (CLI)
 
 - `Parser` derive on `Cli` struct with `#[command(author, version, about)]`
-- `Subcommand` derive on `Commands` enum (24 variants)
+- `Subcommand` derive on `Commands` enum (29 variants)
 - Subcommand structs in `cmd/` modules with `Subcommand` derive (e.g., `SessionCommands`, `NoteCommands`)
 - `clap_verbosity_flag::Verbosity<InfoLevel>` for global `--verbose`
 - `Option<Commands>`: `None` triggers TUI, `Some` triggers dispatch
@@ -431,7 +434,7 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 ## Recent Changes
 
 - Binary/library separation: zen (bin) + zen-cli (lib) architecture documented
-- 24 CLI commands documented with dispatch file paths
+- 29 CLI commands documented with dispatch file paths
 - 5-layer config inheritance model (Default → embedded → global → workspace → env)
 - Dual API data layer: sqlx (repository CRUD) + rusulite (FTS5 + vec0 schema)
 - 5-tier search pipeline: ripgrep → FTS5 → vec0 embeddings → entity graph → LLM
@@ -446,3 +449,8 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
   - Deleted zen-llm directory (legacy subset, no consumers)
   - Deleted rig_ollama.rs/rig_openai.rs stubs (T229/T230 legacy)
   - Constitution principle XI added: Design-First & Reuse Priority
+- **CLI consolidation (2026-07-22)**:
+  - Deleted `zen task` (stub) — `Cancel` subcommand added to `zen dispatch`
+  - Merged `zen reindex` + `zen lint` + `zen distill` into `zen wiki` (subcommands: reindex, lint, distill)
+  - Removed stale `zen hello` + `zen consolidate` from command table (never in Commands enum)
+  - Command count: 33 → 29 (4 top-level commands eliminated, Occam's Razor)

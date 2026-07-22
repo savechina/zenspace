@@ -14,6 +14,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::frontmatter::{extract_frontmatter, parse_field};
+
 // ─── Data types ────────────────────────────────────────────────────────
 
 /// A structured decision record with 5-layer schema.
@@ -401,18 +403,19 @@ impl Decision {
 
     /// Parse decision from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Decision> {
-        let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
-        let title = parse_yaml_field(&fm, "title")
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
+        let id = parse_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
+        let title = parse_field(&fm, "title")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let domain = parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
-        let decided_at = parse_yaml_field(&fm, "decided_at")
+        let domain = parse_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
+        let decided_at = parse_field(&fm, "decided_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let closed_at = parse_yaml_field(&fm, "closed_at")
+        let closed_at = parse_field(&fm, "closed_at")
             .as_deref()
             .and_then(|s| {
                 if s == "null" {
@@ -422,8 +425,8 @@ impl Decision {
                 }
             })
             .map(|dt| dt.with_timezone(&Utc));
-        let confidence = parse_yaml_field(&fm, "confidence").and_then(|s| s.parse().ok());
-        let is_path_not_goal = parse_yaml_field(&fm, "is_path_not_goal")
+        let confidence = parse_field(&fm, "confidence").and_then(|s| s.parse().ok());
+        let is_path_not_goal = parse_field(&fm, "is_path_not_goal")
             .map(|s| s == "true")
             .unwrap_or(false);
 
@@ -477,40 +480,6 @@ impl Decision {
     pub fn run_anti_pattern_check(&self) -> AntiPatternReport {
         crate::decision_check::check_all(self)
     }
-}
-
-// ─── Frontmatter parsing helpers ───────────────────────────────────────
-
-/// Extract the YAML frontmatter block (between first two `---` lines).
-fn extract_frontmatter(content: &str) -> Result<String> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        anyhow::bail!("missing frontmatter opening ---");
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    anyhow::bail!("missing frontmatter closing ---");
-}
-
-/// Parse a simple `key: value` line from frontmatter. Returns the trimmed value.
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 // ─── Body parsing helpers ──────────────────────────────────────────────

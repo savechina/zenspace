@@ -234,6 +234,9 @@ impl AgentExecutor {
             if !identity.agents_content().is_empty() {
                 builder = builder.claude_md(identity.agents_content().to_string());
             }
+            if !identity.memory_content().is_empty() {
+                builder = builder.identity_memory(identity.memory_content().to_string());
+            }
         }
 
         // Section 17: Memory (retrieved knowledge + conversation history)

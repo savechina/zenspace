@@ -89,18 +89,26 @@ impl ConversationStore {
         });
         let line = serde_json::to_string(&event).context("failed to serialize chat/turn event")?;
 
-        std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.file_path)
-            .with_context(|| format!("failed to open session file: {}", self.file_path.display()))?
-            .write_all(format!("{}\n", line).as_bytes())
+            .with_context(|| {
+                format!("failed to open session file: {}", self.file_path.display())
+            })?;
+        file.write_all(format!("{}\n", line).as_bytes())
             .with_context(|| {
                 format!(
                     "failed to write chat/turn event: {}",
                     self.file_path.display()
                 )
             })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "failed to fsync session file: {}",
+                self.file_path.display()
+            )
+        })?;
 
         debug!(
             session_id = %self.session_id,

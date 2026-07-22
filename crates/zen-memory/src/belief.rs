@@ -14,6 +14,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::frontmatter::{extract_frontmatter, parse_field};
+
 // ─── Data types ────────────────────────────────────────────────────────
 
 /// A Bayesian belief tracked through the evolution engine.
@@ -374,33 +376,34 @@ impl Belief {
 
     /// Parse belief from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Belief> {
-        let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
-        let proposition = parse_yaml_field(&fm, "proposition")
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
+        let id = parse_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
+        let proposition = parse_field(&fm, "proposition")
             .map(|s| s.trim_matches('"').to_string())
             .ok_or_else(|| anyhow::anyhow!("missing proposition field"))?;
-        let posterior: f64 = parse_yaml_field(&fm, "posterior")
+        let posterior: f64 = parse_field(&fm, "posterior")
             .ok_or_else(|| anyhow::anyhow!("missing posterior field"))?
             .parse()
             .unwrap_or(0.5);
-        let evidence_count: u32 = parse_yaml_field(&fm, "evidence_count")
+        let evidence_count: u32 = parse_field(&fm, "evidence_count")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let weight: f64 = parse_yaml_field(&fm, "weight")
+        let weight: f64 = parse_field(&fm, "weight")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
-        let domain = parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
-        let created_at = parse_yaml_field(&fm, "created_at")
+        let domain = parse_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
+        let created_at = parse_field(&fm, "created_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let last_updated = parse_yaml_field(&fm, "last_updated")
+        let last_updated = parse_field(&fm, "last_updated")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let last_retrieved = parse_yaml_field(&fm, "last_retrieved")
+        let last_retrieved = parse_field(&fm, "last_retrieved")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
@@ -418,40 +421,6 @@ impl Belief {
             evidence: Vec::new(),
         })
     }
-}
-
-// ─── Frontmatter parsing helpers ───────────────────────────────────────
-
-/// Extract the YAML frontmatter block (between first two `---` lines).
-fn extract_frontmatter(content: &str) -> Result<String> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        anyhow::bail!("missing frontmatter opening ---");
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    anyhow::bail!("missing frontmatter closing ---");
-}
-
-/// Parse a simple `key: value` line from frontmatter. Returns the trimmed value.
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 // ─── Aggregation helpers ───────────────────────────────────────────────

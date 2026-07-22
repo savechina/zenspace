@@ -817,7 +817,7 @@ impl ZenAgent {
         if let Some(ref memories) = memories {
             let memory_text = memories.join("\n");
             ctx.evidence.push(
-                Evidence::new("retrieved-memory", "memvid")
+                Evidence::new("memory-recall", "memvid")
                     .with_detail(json!({ "summary": memory_text })),
             );
         }
@@ -867,7 +867,7 @@ impl ZenAgent {
             ("conversation", _) => 0.98,
             ("identity", _) => 0.95,
             ("self-learning", _) => 0.85,
-            ("retrieved-memory", _) => 0.80,
+            ("memory-recall", _) => 0.80,
             ("knowledge", _) => 0.70,
             _ => 0.50,
         }
@@ -876,6 +876,22 @@ impl ZenAgent {
     fn tier_score_from_source_id(source_id: &str) -> f64 {
         let (skill, label) = source_id.split_once('/').unwrap_or(("_", "_"));
         Self::tier_score(skill, label)
+    }
+
+    fn composite_eviction_score(item: &rig_compose::context::ContextItem) -> f64 {
+        let tier = Self::tier_score_from_source_id(&item.source_id);
+        let relevance = item.score.abs().min(1.0);
+        let sensitivity_bonus = item
+            .metadata
+            .get("sensitivity")
+            .and_then(|v| v.as_str())
+            .map(|s| match s {
+                "Confidential" => 0.15,
+                "Private" => 0.05,
+                _ => 0.0,
+            })
+            .unwrap_or(0.0);
+        tier * 0.6 + relevance * 0.3 + sensitivity_bonus
     }
 
     fn build_system_prompt_with_assembly(
@@ -893,6 +909,9 @@ impl ZenAgent {
             }
             if !identity.agents_content().is_empty() {
                 builder = builder.claude_md(identity.agents_content());
+            }
+            if !identity.memory_content().is_empty() {
+                builder = builder.identity_memory(identity.memory_content());
             }
         }
 
@@ -958,35 +977,42 @@ impl ZenAgent {
     }
 
     fn build_prompt(&self, query: &str, ctx: &InvestigationContext) -> String {
-        let mut items = rig_resources::projection::evidence_to_context_items(ctx);
+        let all_items = rig_resources::projection::evidence_to_context_items(ctx);
 
-        items.sort_by(|a, b| {
-            let ta = Self::tier_score_from_source_id(&a.source_id);
-            let tb = Self::tier_score_from_source_id(&b.source_id);
-            tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
+        let (mut protected, mut normal): (Vec<_>, Vec<_>) = all_items
+            .into_iter()
+            .partition(|item| item.source_id.starts_with("identity/"));
+
+        normal.sort_by(|a, b| {
+            let sa = Self::composite_eviction_score(a);
+            let sb = Self::composite_eviction_score(b);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
-        for (rank, item) in items.iter_mut().enumerate() {
+
+        for (rank, item) in protected.iter_mut().enumerate() {
             item.rank = rank;
         }
+        for (rank, item) in normal.iter_mut().enumerate() {
+            item.rank = rank + protected.len();
+        }
 
-        // Tier 1: Reserve tokens for tool definitions (estimated ~200 tokens per tool).
         let tool_token_reserve = 200 * 5;
-        // Tier 2: Trim conversation history to remaining budget.
-        // The conversation evidence items already carry the session history;
-        // ContextPack will naturally drop lower-tier items when the budget
-        // is tight, so we reduce the budget by the tool reserve.
         let effective_budget = self.context_budget_chars.saturating_sub(tool_token_reserve);
+        let protected_chars: usize = protected.iter().map(|i| i.estimated_chars).sum();
+        let packable_budget = effective_budget.saturating_sub(protected_chars);
 
-        let config = ContextPackConfig::new(effective_budget)
+        let config = ContextPackConfig::new(packable_budget)
             .with_max_items(30)
             .with_reserve_chars(query.chars().count());
 
-        let pack = rig_resources::projection::pack_resource_context(items, config);
+        let pack = rig_resources::projection::pack_resource_context(normal, config);
 
         tracing::info!(
+            protected = protected.len(),
             selected = pack.selected.len(),
             omitted = pack.omitted.len(),
-            "Context pack: selected {} items, omitted {}",
+            "Context pack: {} protected + {} selected, {} omitted",
+            protected.len(),
             pack.selected.len(),
             pack.omitted.len()
         );
@@ -1014,11 +1040,9 @@ impl ZenAgent {
             }
         }
 
-        pack.selected
-            .iter()
-            .map(|i| i.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        let mut sections: Vec<&str> = protected.iter().map(|i| i.text.as_str()).collect();
+        sections.extend(pack.selected.iter().map(|i| i.text.as_str()));
+        sections.join("\n\n")
     }
 
     #[instrument(skip(self, system_prompt, user_message, session), fields(session_id = %session.session_id, query_len = query.len()))]
@@ -1196,7 +1220,7 @@ impl ZenAgent {
         if let Some(ref memories) = memories {
             let memory_text = memories.join("\n");
             ctx.evidence.push(
-                Evidence::new("retrieved-memory", "memvid")
+                Evidence::new("memory-recall", "memvid")
                     .with_detail(json!({ "summary": memory_text })),
             );
         }
@@ -1451,5 +1475,79 @@ mod chain_tests {
         assert_eq!(score, 0.70);
         assert!(score < ZenAgent::tier_score("identity", "soul"));
         assert!(score > ZenAgent::tier_score("skills", "other"));
+    }
+
+    #[test]
+    fn composite_score_weights_tier_and_relevance() {
+        use rig_compose::context::{ContextItem, ContextSourceKind};
+        use serde_json::Value;
+
+        let high_tier = ContextItem {
+            source: ContextSourceKind::Memory,
+            source_id: "identity/soul".to_string(),
+            rank: 0,
+            score: 0.5,
+            text: String::new(),
+            estimated_chars: 100,
+            provenance: Value::Null,
+            metadata: Value::Null,
+        };
+
+        let low_tier = ContextItem {
+            source: ContextSourceKind::Memory,
+            source_id: "skills/misc".to_string(),
+            rank: 0,
+            score: 0.9,
+            text: String::new(),
+            estimated_chars: 100,
+            provenance: Value::Null,
+            metadata: Value::Null,
+        };
+
+        let score_high = ZenAgent::composite_eviction_score(&high_tier);
+        let score_low = ZenAgent::composite_eviction_score(&low_tier);
+
+        assert!(
+            score_high > score_low,
+            "identity items (tier 0.95 + relevance 0.5) should outscore skills items (tier 0.50 + relevance 0.9): {} vs {}",
+            score_high,
+            score_low
+        );
+    }
+
+    #[test]
+    fn composite_score_sensitivity_bonus() {
+        use rig_compose::context::{ContextItem, ContextSourceKind};
+        use serde_json::{json, Value};
+
+        let confidential = ContextItem {
+            source: ContextSourceKind::Memory,
+            source_id: "knowledge/secret".to_string(),
+            rank: 0,
+            score: 0.5,
+            text: String::new(),
+            estimated_chars: 100,
+            provenance: Value::Null,
+            metadata: json!({"sensitivity": "Confidential"}),
+        };
+
+        let public = ContextItem {
+            source: ContextSourceKind::Memory,
+            source_id: "knowledge/public".to_string(),
+            rank: 0,
+            score: 0.5,
+            text: String::new(),
+            estimated_chars: 100,
+            provenance: Value::Null,
+            metadata: json!({"sensitivity": "Public"}),
+        };
+
+        let score_conf = ZenAgent::composite_eviction_score(&confidential);
+        let score_pub = ZenAgent::composite_eviction_score(&public);
+
+        assert!(
+            score_conf > score_pub,
+            "Confidential items should score higher than Public items"
+        );
     }
 }

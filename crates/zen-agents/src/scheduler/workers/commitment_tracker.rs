@@ -215,6 +215,23 @@ impl ZenWorker for CommitmentTracker {
             );
         }
 
+        let okr = zen_memory::compute_commitment_completion_rate(&commitments, 90);
+        info!(
+            total = okr.total_commitments,
+            completed = okr.completed,
+            abandoned = okr.abandoned,
+            active = okr.active,
+            overdue = okr.overdue,
+            rate = format!("{:.1}%", okr.completion_rate * 100.0),
+            "commitment OKR (90-day rolling window)"
+        );
+        if okr.is_below_target() {
+            warn!(
+                rate = format!("{:.1}%", okr.completion_rate * 100.0),
+                "commitment completion rate below 50% target"
+            );
+        }
+
         if total_tracked > 0 {
             info!(
                 tracked = total_tracked,

@@ -708,6 +708,11 @@ Current sensitivity level: {}"#,
     fn build_memory_section(&self) -> String {
         let mut parts = Vec::new();
 
+        if !self.memory_content.is_empty() {
+            parts.push("## Identity Memory (MEMORY.md)".to_string());
+            parts.push(self.memory_content.clone());
+        }
+
         // Retrieved knowledge
         if !self.retrieved_knowledge.is_empty() {
             parts.push("## Retrieved Knowledge".to_string());
@@ -1003,7 +1008,11 @@ impl PromptAssemblyBuilder {
     ) -> Self {
         self.assembly.retrieved_knowledge = knowledge;
         self.assembly.conversation_history = history;
-        // Note: memory field will be set by build_memory_section() during assemble()
+        self
+    }
+
+    pub fn identity_memory(mut self, memory: impl Into<String>) -> Self {
+        self.assembly.memory_content = memory.into();
         self
     }
 

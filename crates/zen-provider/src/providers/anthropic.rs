@@ -46,11 +46,10 @@ impl AnthropicProvider {
 
         let model = client.completion_model(&self.model);
         let mut agent_builder = AgentBuilder::new(model);
+        let max_tokens = options.max_tokens.unwrap_or(4096);
+        agent_builder = agent_builder.max_tokens(max_tokens);
         if let Some(t) = options.temperature {
             agent_builder = agent_builder.temperature(t);
-        }
-        if let Some(m) = options.max_tokens {
-            agent_builder = agent_builder.max_tokens(m);
         }
         let agent = agent_builder.build();
 

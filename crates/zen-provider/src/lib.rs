@@ -11,8 +11,9 @@ pub use embedding::{
     OpenAiEmbeddingProvider, OllamaEmbeddingProvider,
 };
 pub use model_meta::{
-    ComplexityLevel, ModelMetadata, ModelRouter, ModelStats, PromptHookTelemetry, PromptTelemetry,
+    ModelMetadata, ModelRouter, ModelStats, PromptHookTelemetry, PromptTelemetry,
 };
+pub use zen_core::types::ComplexityLevel;
 pub use router::{
     DefaultLlmRetryClassifier, DefaultRouter, LlmConfig, LlmError, LlmRetryClassifier, LlmRouter,
     LlmRouterExt, MockProvider, Provider, TaskRequirements, is_local_llm_available,

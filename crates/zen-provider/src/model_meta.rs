@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zen_core::types::ComplexityLevel;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
@@ -18,14 +19,16 @@ impl ModelMetadata {
     pub fn capability_score(&self) -> usize {
         self.context_window / 1000 + self.capabilities.len() * 10
     }
-}
 
-#[derive(Debug, Clone)]
-pub enum ComplexityLevel {
-    Simple,
-    Standard,
-    Complex,
-    Critical,
+    pub fn total_cost(&self) -> f64 {
+        self.input_cost_per_million + self.output_cost_per_million
+    }
+
+    pub fn cost_efficiency(&self) -> f64 {
+        let cap = self.capability_score().max(1) as f64;
+        let cost = self.total_cost().max(0.001);
+        cap / cost
+    }
 }
 
 pub struct ModelRouter {
@@ -54,20 +57,52 @@ impl ModelRouter {
             .insert(name.to_string(), metadata);
     }
 
-    pub async fn route_task(&self, _complexity: ComplexityLevel) -> anyhow::Result<String> {
+    pub async fn route_task(&self, complexity: ComplexityLevel) -> anyhow::Result<String> {
         let metadata = self.metadata.read().await;
 
         if metadata.is_empty() {
             return Ok(self.default_model.clone());
         }
 
-        let target = metadata
-            .iter()
-            .max_by_key(|(_, m)| m.capability_score())
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| self.default_model.clone());
+        let target = match complexity {
+            ComplexityLevel::Simple => {
+                metadata.iter().min_by(|(_, a), (_, b)| {
+                    let cost_cmp =
+                        a.total_cost().partial_cmp(&b.total_cost()).unwrap_or(std::cmp::Ordering::Equal);
+                    if cost_cmp != std::cmp::Ordering::Equal {
+                        return cost_cmp;
+                    }
+                    b.is_local.cmp(&a.is_local)
+                })
+            }
+            ComplexityLevel::Standard => {
+                metadata.iter().max_by(|(_, a), (_, b)| {
+                    a.cost_efficiency()
+                        .partial_cmp(&b.cost_efficiency())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            }
+            ComplexityLevel::Complex => {
+                metadata.iter().max_by(|(_, a), (_, b)| {
+                    let cap_cmp = a.capability_score().cmp(&b.capability_score());
+                    if cap_cmp != std::cmp::Ordering::Equal {
+                        return cap_cmp;
+                    }
+                    b.total_cost()
+                        .partial_cmp(&a.total_cost())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            }
+            ComplexityLevel::Critical => {
+                metadata
+                    .iter()
+                    .max_by_key(|(_, m)| m.capability_score())
+            }
+        };
 
-        Ok(target)
+        Ok(target
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| self.default_model.clone()))
     }
 
     pub async fn get_metadata(&self, name: &str) -> Option<ModelMetadata> {
@@ -237,5 +272,59 @@ mod tests {
         let stats = telemetry.get_stats("test-model").await;
         assert_eq!(stats.total_requests, 2);
         assert_eq!(stats.avg_latency_ms, 40);
+    }
+
+    fn cheap_local_model() -> ModelMetadata {
+        ModelMetadata {
+            name: "qwen3:8b".to_string(),
+            provider: "ollama".to_string(),
+            context_window: 4096,
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            capabilities: vec!["text".to_string()],
+            is_local: true,
+        }
+    }
+
+    fn expensive_cloud_model() -> ModelMetadata {
+        ModelMetadata {
+            name: "claude-sonnet".to_string(),
+            provider: "anthropic".to_string(),
+            context_window: 200_000,
+            input_cost_per_million: 3.0,
+            output_cost_per_million: 15.0,
+            capabilities: vec!["text", "code", "vision", "tool_use"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            is_local: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn route_simple_picks_cheapest() {
+        let router = ModelRouter::new("fallback");
+        router.register_model("cloud", expensive_cloud_model()).await;
+        router.register_model("local", cheap_local_model()).await;
+
+        let chosen = router.route_task(ComplexityLevel::Simple).await.unwrap();
+        assert_eq!(chosen, "local");
+    }
+
+    #[tokio::test]
+    async fn route_critical_picks_most_capable() {
+        let router = ModelRouter::new("fallback");
+        router.register_model("cloud", expensive_cloud_model()).await;
+        router.register_model("local", cheap_local_model()).await;
+
+        let chosen = router.route_task(ComplexityLevel::Critical).await.unwrap();
+        assert_eq!(chosen, "cloud");
+    }
+
+    #[tokio::test]
+    async fn route_empty_falls_back_to_default() {
+        let router = ModelRouter::new("default-model");
+        let chosen = router.route_task(ComplexityLevel::Standard).await.unwrap();
+        assert_eq!(chosen, "default-model");
     }
 }

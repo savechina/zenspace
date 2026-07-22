@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::frontmatter::{extract_frontmatter, parse_field};
+
 #[derive(Debug, Error)]
 pub enum FeedbackError {
     #[error("IO error: {0}")]
@@ -186,16 +188,17 @@ impl Feedback {
     }
 
     pub fn from_markdown(content: &str) -> Result<Self, FeedbackError> {
-        let fm = extract_frontmatter(content)?;
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| FeedbackError::Parse("missing frontmatter".into()))?;
         let id =
-            parse_yaml_field(&fm, "id").ok_or_else(|| FeedbackError::MissingField("id".into()))?;
-        let source = parse_yaml_field(&fm, "source")
+            parse_field(&fm, "id").ok_or_else(|| FeedbackError::MissingField("id".into()))?;
+        let source = parse_field(&fm, "source")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let content_str = parse_yaml_field(&fm, "content")
+        let content_str = parse_field(&fm, "content")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let disposition = parse_yaml_field(&fm, "disposition")
+        let disposition = parse_field(&fm, "disposition")
             .map(|s| match s.as_str() {
                 "accepted" => FeedbackDisposition::Accepted,
                 "rejected" => FeedbackDisposition::Rejected,
@@ -204,23 +207,23 @@ impl Feedback {
             })
             .unwrap_or(FeedbackDisposition::Pending);
         let properties = FeedbackProperties {
-            timely: parse_yaml_field(&fm, "timely")
+            timely: parse_field(&fm, "timely")
                 .map(|s| s == "true")
                 .unwrap_or(false),
-            reasonable: parse_yaml_field(&fm, "reasonable")
+            reasonable: parse_field(&fm, "reasonable")
                 .map(|s| s == "true")
                 .unwrap_or(false),
-            actionable: parse_yaml_field(&fm, "actionable")
+            actionable: parse_field(&fm, "actionable")
                 .map(|s| s == "true")
                 .unwrap_or(false),
-            constructive: parse_yaml_field(&fm, "constructive")
+            constructive: parse_field(&fm, "constructive")
                 .map(|s| s == "true")
                 .unwrap_or(false),
-            interactive: parse_yaml_field(&fm, "interactive")
+            interactive: parse_field(&fm, "interactive")
                 .map(|s| s == "true")
                 .unwrap_or(false),
         };
-        let created_at = parse_yaml_field(&fm, "created_at")
+        let created_at = parse_field(&fm, "created_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
@@ -235,40 +238,6 @@ impl Feedback {
             created_at,
         })
     }
-}
-
-fn extract_frontmatter(content: &str) -> Result<String, FeedbackError> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        return Err(FeedbackError::Parse(
-            "missing frontmatter opening ---".into(),
-        ));
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    Err(FeedbackError::Parse(
-        "missing frontmatter closing ---".into(),
-    ))
-}
-
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

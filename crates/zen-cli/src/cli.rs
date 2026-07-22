@@ -13,19 +13,16 @@ use crate::cmd::brief_command::{self, BriefCommands};
 use crate::cmd::chat_command::{self, ChatArgs};
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::config_command::{self, ConfigCommands};
-use crate::cmd::distill_command::{self, DistillCommands};
 use crate::cmd::dispatch_command::{self, DispatchCommands};
 use crate::cmd::goal_command::{self, GoalCommands};
 use crate::cmd::graph_command::{self, GraphCommands};
 use crate::cmd::habit_command::{self, HabitCommands};
 use crate::cmd::ingest_command::{self, IngestCommands};
-use crate::cmd::lint_command::{self, LintCommands};
 use crate::cmd::logs_command::{self, LogCommands};
 use crate::cmd::model_command::{self, ModelCommands};
 use crate::cmd::note_command::{self, NoteCommands};
 use crate::cmd::plugin_command::{self, PluginCommands};
 use crate::cmd::provider_command::{self, ProviderCommands};
-use crate::cmd::reindex_command::{self, ReindexCommands};
 use crate::cmd::research_command::{self, ResearchCommands};
 use crate::cmd::routine_command::{self, RoutineCommands};
 use crate::cmd::search_command::{self, SearchCommands};
@@ -34,7 +31,6 @@ use crate::cmd::session_command::{self, SessionCommands};
 use crate::cmd::similar_command::{self, SimilarCommands};
 use crate::cmd::skill_command::{self, SkillCommands};
 use crate::cmd::starter_command::{self, StarterCommands};
-use crate::cmd::task_command::{self, TaskCommands};
 use crate::cmd::wiki_command::{self, WikiCommands};
 use crate::cmd::workspace_command::{self, WorkspaceCommands};
 use crate::cmd::wps_command::{self, WpsCommands};
@@ -118,21 +114,9 @@ enum Commands {
         #[command(subcommand)]
         operation: GraphCommands,
     },
-    Reindex {
-        #[command(subcommand)]
-        operation: ReindexCommands,
-    },
     Research {
         #[command(subcommand)]
         operation: ResearchCommands,
-    },
-    Distill {
-        #[command(subcommand)]
-        operation: DistillCommands,
-    },
-    Lint {
-        #[command(subcommand)]
-        operation: LintCommands,
     },
     Logs {
         /// Number of lines to display (default: 50)
@@ -158,10 +142,6 @@ enum Commands {
     Routine {
         #[command(subcommand)]
         operation: RoutineCommands,
-    },
-    Task {
-        #[command(subcommand)]
-        operation: TaskCommands,
     },
     Wiki {
         #[command(subcommand)]
@@ -294,10 +274,7 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Search { ref operation } => search_command::execute_command(operation).await,
         Commands::Similar { ref operation } => similar_command::execute_command(operation),
         Commands::Notion { ref operation } => graph_command::execute_command(operation),
-        Commands::Reindex { ref operation } => reindex_command::execute_command(operation).await,
         Commands::Research { ref operation } => research_command::execute_command(operation).await,
-        Commands::Distill { ref operation } => distill_command::execute_command(operation),
-        Commands::Lint { ref operation } => lint_command::execute_command(operation),
         Commands::Logs {
             lines,
             level,
@@ -309,8 +286,7 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
             None => logs_command::execute_show(lines, level.as_deref(), follow, json),
         },
         Commands::Ingest { ref operation } => ingest_command::execute_command(operation),
-        Commands::Task { ref operation } => task_command::execute_command(operation),
-        Commands::Wiki { ref operation } => wiki_command::execute_command(operation),
+        Commands::Wiki { ref operation } => wiki_command::execute_command(operation).await,
         Commands::Routine { ref operation } => routine_command::execute_command(operation).await,
         Commands::Brief { ref operation } => brief_command::execute_command(operation),
         Commands::Model { ref operation } => model_command::execute_command(operation),

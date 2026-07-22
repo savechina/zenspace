@@ -3,6 +3,9 @@ use tracing::{info, warn};
 use zen_core::config::ZenConfig;
 
 use crate::router::resolve_api_key;
+use rig::client::{EmbeddingsClient, Nothing};
+use rig::embeddings::EmbeddingModel;
+use rig::providers::{ollama, openai};
 
 pub trait EmbeddingProvider: Send + Sync + std::fmt::Debug {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
@@ -29,28 +32,33 @@ pub enum EmbeddingError {
     NoProvider,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct OllamaEmbedRequest {
     model: String,
     input: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OllamaEmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct OpenAiEmbedRequest {
     model: String,
     input: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OpenAiEmbedResponse {
     data: Vec<OpenAiEmbedData>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OpenAiEmbedData {
     embedding: Vec<f32>,
@@ -70,38 +78,35 @@ impl OllamaEmbeddingProvider {
 
 impl EmbeddingProvider for OllamaEmbeddingProvider {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
-        let payload = OllamaEmbedRequest {
-            model: self.model.clone(),
-            input: vec![text.to_string()],
-        };
+        let base_url = self.base_url.clone();
+        let model = self.model.clone();
+        let text = text.to_string();
 
-        let client = reqwest::blocking::Client::new();
-        let resp = client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .map_err(|e| EmbeddingError::RequestFailed {
-                reason: format!("Ollama request error: {e}"),
-            })?;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let client = ollama::Client::builder()
+                    .api_key(Nothing)
+                    .base_url(&base_url)
+                    .build()
+                    .map_err(|e| EmbeddingError::RequestFailed {
+                        reason: format!("Ollama client init error: {e}"),
+                    })?;
 
-        if !resp.status().is_success() {
-            return Err(EmbeddingError::RequestFailed {
-                reason: format!("Ollama HTTP {}", resp.status()),
-            });
-        }
+                let emb_model = client.embedding_model_with_ndims(&model, 384);
+                let embedding = emb_model.embed_text(&text).await.map_err(|e| {
+                    EmbeddingError::RequestFailed {
+                        reason: format!("Ollama embed error: {e}"),
+                    }
+                })?;
 
-        let response: OllamaEmbedResponse = resp.json().map_err(|e| EmbeddingError::ParseError {
-            reason: format!("Ollama response parse error: {e}"),
-        })?;
-
-        response
-            .embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| EmbeddingError::ParseError {
-                reason: "Ollama returned empty embeddings".to_string(),
+                Ok(embedding.vec.into_iter().map(|x| x as f32).collect())
             })
+        })
+        .join()
+        .map_err(|e| EmbeddingError::RequestFailed {
+            reason: format!("Ollama embed thread panic: {:?}", e),
+        })?
     }
 
     fn provider_name(&self) -> &str {
@@ -132,40 +137,36 @@ impl OpenAiEmbeddingProvider {
 
 impl EmbeddingProvider for OpenAiEmbeddingProvider {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        let url = format!("{}/v1/embeddings", self.base_url.trim_end_matches('/'));
-        let payload = OpenAiEmbedRequest {
-            model: self.model.clone(),
-            input: vec![text.to_string()],
-        };
+        let api_key = self.api_key.clone();
+        let base_url = self.base_url.clone();
+        let model = self.model.clone();
+        let text = text.to_string();
 
-        let client = reqwest::blocking::Client::new();
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&payload)
-            .send()
-            .map_err(|e| EmbeddingError::RequestFailed {
-                reason: format!("OpenAI request error: {e}"),
-            })?;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let mut builder = openai::Client::builder().api_key(&api_key);
+                if base_url != zen_core::constants::OPENAI_API_URL {
+                    builder = builder.base_url(&base_url);
+                }
+                let client = builder.build().map_err(|e| EmbeddingError::RequestFailed {
+                    reason: format!("OpenAI client init error: {e}"),
+                })?;
 
-        if !resp.status().is_success() {
-            return Err(EmbeddingError::RequestFailed {
-                reason: format!("OpenAI HTTP {}", resp.status()),
-            });
-        }
+                let emb_model = client.embedding_model(&model);
+                let embedding = emb_model.embed_text(&text).await.map_err(|e| {
+                    EmbeddingError::RequestFailed {
+                        reason: format!("OpenAI embed error: {e}"),
+                    }
+                })?;
 
-        let response: OpenAiEmbedResponse = resp.json().map_err(|e| EmbeddingError::ParseError {
-            reason: format!("OpenAI response parse error: {e}"),
-        })?;
-
-        response
-            .data
-            .into_iter()
-            .next()
-            .map(|d| d.embedding)
-            .ok_or_else(|| EmbeddingError::ParseError {
-                reason: "OpenAI returned empty embeddings".to_string(),
+                Ok(embedding.vec.into_iter().map(|x| x as f32).collect())
             })
+        })
+        .join()
+        .map_err(|e| EmbeddingError::RequestFailed {
+            reason: format!("OpenAI embed thread panic: {:?}", e),
+        })?
     }
 
     fn provider_name(&self) -> &str {

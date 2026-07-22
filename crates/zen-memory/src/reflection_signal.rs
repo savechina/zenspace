@@ -6,6 +6,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::decision::Severity;
+use crate::frontmatter::{extract_frontmatter, parse_field};
 use crate::virtue_log::VirtueDomain;
 
 // ─── Error type ─────────────────────────────────────────────────────────
@@ -135,36 +136,6 @@ impl ReflectionSignal {
             domain,
         })
     }
-}
-
-fn extract_frontmatter(content: &str) -> Option<String> {
-    let mut lines = content.lines();
-    let first = lines.next()?.trim();
-    if first != "---" {
-        return None;
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Some(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    None
-}
-
-fn parse_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 fn extract_section(content: &str, header: &str) -> Option<String> {

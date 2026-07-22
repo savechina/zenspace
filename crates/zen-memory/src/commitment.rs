@@ -7,6 +7,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::frontmatter::{extract_frontmatter, parse_field};
+
 // ─── GTD lifecycle states ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -459,44 +461,45 @@ impl Commitment {
     }
 
     pub fn from_markdown(content: &str) -> Result<Self, CommitmentError> {
-        let fm = extract_frontmatter(content).map_err(|e| CommitmentError::Parse(e.to_string()))?;
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| CommitmentError::Parse("missing frontmatter".into()))?;
 
-        let id = parse_yaml_field(&fm, "id")
+        let id = parse_field(&fm, "id")
             .ok_or_else(|| CommitmentError::Parse("missing id field".into()))?;
-        let what = parse_yaml_field(&fm, "what")
+        let what = parse_field(&fm, "what")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let state = parse_yaml_field(&fm, "state")
+        let state = parse_field(&fm, "state")
             .and_then(|s| CommitmentState::from_str(&s))
             .unwrap_or(CommitmentState::Drafted);
-        let by_when = parse_yaml_field(&fm, "by_when")
+        let by_when = parse_field(&fm, "by_when")
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok());
-        let review_at = parse_yaml_field(&fm, "review_at")
+        let review_at = parse_field(&fm, "review_at")
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok());
-        let next_action = parse_yaml_field(&fm, "next_action")
+        let next_action = parse_field(&fm, "next_action")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let two_minute_rule = parse_yaml_field(&fm, "two_minute_rule")
+        let two_minute_rule = parse_field(&fm, "two_minute_rule")
             .map(|s| s == "true")
             .unwrap_or(false);
-        let discipline_streak = parse_yaml_field(&fm, "discipline_streak")
+        let discipline_streak = parse_field(&fm, "discipline_streak")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let created_at = parse_yaml_field(&fm, "created_at")
+        let created_at = parse_field(&fm, "created_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let updated_at = parse_yaml_field(&fm, "updated_at")
+        let updated_at = parse_field(&fm, "updated_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let closed_at = parse_yaml_field(&fm, "closed_at")
+        let closed_at = parse_field(&fm, "closed_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
-        let source_journal = parse_yaml_field(&fm, "source_journal");
+        let source_journal = parse_field(&fm, "source_journal");
 
         let body = extract_body(content).map_err(|e| CommitmentError::Parse(e.to_string()))?;
         let milestones = parse_milestones(&body);
@@ -538,38 +541,6 @@ pub fn slugify_text(text: &str) -> String {
         .chars()
         .take(60)
         .collect()
-}
-
-// ─── Frontmatter parsing helpers ───────────────────────────────────────
-
-fn extract_frontmatter(content: &str) -> Result<String> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        anyhow::bail!("missing frontmatter opening ---");
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    anyhow::bail!("missing frontmatter closing ---");
-}
-
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 fn extract_body(content: &str) -> Result<String> {

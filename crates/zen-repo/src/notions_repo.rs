@@ -761,3 +761,179 @@ impl<'a> NotionsRepo<'a> {
         self.pagerank(iterations, damping).await
     }
 }
+
+impl crate::traits::notions::NotionsRepository for NotionsRepo<'_> {
+    async fn insert_entity(
+        &self,
+        id: &str,
+        name: &str,
+        kind: &str,
+        now: &str,
+    ) -> Result<()> {
+        NotionsRepo::insert_entity(self, id, name, kind, now).await
+    }
+
+    async fn insert_entity_with(
+        &self,
+        id: &str,
+        name: &str,
+        kind: &str,
+        now: &str,
+        description: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<()> {
+        NotionsRepo::insert_entity_with(self, id, name, kind, now, description, source, confidence)
+            .await
+    }
+
+    async fn upsert_entity(
+        &self,
+        id: &str,
+        name: &str,
+        kind: &str,
+        created_at: &str,
+        last_updated: &str,
+    ) -> Result<()> {
+        NotionsRepo::upsert_entity(self, id, name, kind, created_at, last_updated).await
+    }
+
+    async fn upsert_entity_with(
+        &self,
+        id: &str,
+        name: &str,
+        kind: &str,
+        created_at: &str,
+        last_updated: &str,
+        description: &str,
+        source: &str,
+        confidence: f64,
+    ) -> Result<()> {
+        NotionsRepo::upsert_entity_with(
+            self, id, name, kind, created_at, last_updated, description, source, confidence,
+        )
+        .await
+    }
+
+    async fn update_entity_timestamp(&self, notion_id: &str, last_updated: &str) -> Result<()> {
+        NotionsRepo::update_entity_timestamp(self, notion_id, last_updated).await
+    }
+
+    async fn update_entity_access(&self, notion_id: &str) -> Result<()> {
+        NotionsRepo::update_entity_access(self, notion_id).await
+    }
+
+    async fn update_entity_confidence(&self, notion_id: &str, confidence: f64) -> Result<()> {
+        NotionsRepo::update_entity_confidence(self, notion_id, confidence).await
+    }
+
+    async fn promote_entity(&self, notion_id: &str) -> Result<()> {
+        NotionsRepo::promote_entity(self, notion_id).await
+    }
+
+    async fn insert_alias(&self, alias: &str, canonical_notion_id: &str) -> Result<()> {
+        NotionsRepo::insert_alias(self, alias, canonical_notion_id).await
+    }
+
+    async fn load_aliases_for_entity(&self, notion_id: &str) -> Result<Vec<String>> {
+        NotionsRepo::load_aliases_for_entity(self, notion_id).await
+    }
+
+    async fn insert_relationship(&self, req: &InsertRelationshipRequest<'_>) -> Result<()> {
+        NotionsRepo::insert_relationship(self, req).await
+    }
+
+    async fn load_known_notion_names(&self) -> Result<Vec<String>> {
+        NotionsRepo::load_known_notion_names(self).await
+    }
+
+    async fn load_all_entities(&self) -> Result<Vec<NotionRow>> {
+        NotionsRepo::load_all_entities(self).await
+    }
+
+    async fn load_entities_updated_since(&self, since: &str) -> Result<Vec<NotionRow>> {
+        NotionsRepo::load_entities_updated_since(self, since).await
+    }
+
+    async fn resolve_alias(&self, alias: &str) -> Result<Option<String>> {
+        NotionsRepo::resolve_alias(self, alias).await
+    }
+
+    async fn load_relationships(&self, notion_id: &str) -> Result<Vec<RelationRow>> {
+        NotionsRepo::load_relationships(self, notion_id).await
+    }
+
+    async fn load_relationships_all(&self, notion_id: &str) -> Result<Vec<RelationRow>> {
+        NotionsRepo::load_relationships_all(self, notion_id).await
+    }
+
+    async fn notion_name(&self, notion_id: &str) -> Result<Option<String>> {
+        NotionsRepo::notion_name(self, notion_id).await
+    }
+
+    async fn find_entity_by_name(&self, name: &str) -> Result<Option<NotionRow>> {
+        NotionsRepo::find_entity_by_name(self, name).await
+    }
+
+    async fn search_notions_fts(&self, query: &str) -> Result<Vec<NotionRow>> {
+        NotionsRepo::search_notions_fts(self, query).await
+    }
+
+    async fn bfs_search(
+        &self,
+        notion_name: &str,
+        max_depth: u32,
+    ) -> Result<Vec<GraphSearchResult>> {
+        NotionsRepo::bfs_search(self, notion_name, max_depth).await
+    }
+
+    async fn bfs_search_filtered(
+        &self,
+        notion_name: &str,
+        max_depth: u32,
+        relation_type_filter: &str,
+    ) -> Result<Vec<GraphSearchResult>> {
+        NotionsRepo::bfs_search_filtered(self, notion_name, max_depth, relation_type_filter).await
+    }
+
+    async fn shortest_paths_all(
+        &self,
+        notion_name: &str,
+        max_depth: u32,
+    ) -> Result<Vec<ShortestPathResult>> {
+        NotionsRepo::shortest_paths_all(self, notion_name, max_depth).await
+    }
+
+    async fn shortest_path(
+        &self,
+        src_name: &str,
+        dst_name: &str,
+        max_depth: u32,
+    ) -> Result<Option<ShortestPathResult>> {
+        NotionsRepo::shortest_path(self, src_name, dst_name, max_depth).await
+    }
+
+    async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>> {
+        NotionsRepo::pagerank(self, iterations, damping).await
+    }
+
+    async fn connected_components(&self) -> Result<Vec<ComponentResult>> {
+        NotionsRepo::connected_components(self).await
+    }
+
+    async fn apply_confidence_decay(&self, half_life_days: f64) -> Result<usize> {
+        NotionsRepo::apply_confidence_decay(self, half_life_days).await
+    }
+
+    async fn auto_promote_entities(&self, access_threshold: i64) -> Result<usize> {
+        NotionsRepo::auto_promote_entities(self, access_threshold).await
+    }
+
+    async fn compute_importance(
+        &self,
+        iterations: usize,
+        damping: f64,
+    ) -> Result<Vec<PageRankResult>> {
+        NotionsRepo::compute_importance(self, iterations, damping).await
+    }
+}

@@ -179,8 +179,8 @@ impl std::ops::DerefMut for InputCell {
 //  ████████  ████████  ███     ██   ████████  ████████   ████████   ████████  ████████
 //       ██   ██        ████    ██   ██        ██    ██   ██    ██   ██        ██
 //      ██    ██████    ██ ██   ██   ████████  ████████   ████████   ██        ██████
-//     ██     ██        ██  ██  ██         ██  ██    ██   ██         ██        ██
-//  ████████  ████████  ██   █████   ████████  ██    ██   ██         ████████  ████████
+//     ██     ██        ██  ██  ██         ██  ██         ██    ██   ██        ██
+//  ████████  ████████  ██   █████   ████████  ██         ██    ██   ████████  ████████
 // "#;
 
 // 3D Shadow ZENSPACE logo for wide terminals (≥90 cols)
@@ -188,9 +188,9 @@ const SPLASH_LOGO_FULL: &str = r#"
  ███████▒ ███████▒ ███▒   ██▒  ███████▒ ███████▒  ███████▒  ███████▒ ███████▒
    ▒▒▒██▒_██▒▒▒▒▒▒_████▒  ██▒__██▒▒▒▒▒▒_██▒▒▒▒██▒_██▒▒▒▒██▒_██▒▒▒▒▒▒_██▒▒▒▒▒▒
      ██▒  ██████▒  ██▒██▒ ██▒  ███████▒ ███████▒  ███████▒  ██▒      ██████▒
-   ██▒    ██▒▒▒▒   ██▒▒██▒██▒  ▒▒▒▒▒██▒ ██▒▒▒▒██▒_██▒▒▒▒▒▒  ██▒      ██▒▒▒▒
- ███████▒ ███████▒ ██▒ ▒████▒  ███████▒ ██▒   ██▒_██▒       ▒██████▒ ███████▒
- ▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒  ▒▒   ▒▒▒▒   ▒▒▒▒▒▒▒  ▒▒    ▒▒  ▒▒         ▒▒▒▒▒▒  ▒▒▒▒▒▒▒
+   ██▒    ██▒▒▒▒   ██▒▒██▒██▒  ▒▒▒▒▒██▒ ██▒▒▒▒▒▒ _██▒▒▒▒██▒ ██▒      ██▒▒▒▒
+ ███████▒ ███████▒ ██▒ ▒████▒  ███████▒ ██▒      _██▒   ██▒ ▒██████▒ ███████▒
+ ▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒  ▒▒   ▒▒▒▒   ▒▒▒▒▒▒▒  ▒▒        ▒▒    ▒▒   ▒▒▒▒▒▒  ▒▒▒▒▒▒▒
 "#;
 
 // Optimized 3D ZENSPACE Logo for Ratatui (Strict 100% Alignment)
@@ -198,9 +198,9 @@ const SPLASH_LOGO_3D: &str = r#"
  ███████░ ███████░ ███░   ██░  ███████░ ███████░  ███████░  ███████░ ███████░
     ███░  ██░      ████░  ██░  ██░      ██░   ██░ ██░   ██░ ██░      ██░
    ███░   ██████░  ██░██░ ██░  ███████░ ███████░  ███████░  ██░      ██████░
-  ███░    ██░      ██░ ██░██░       ██░ ██░   ██░ ██░       ██░      ██░
- ███████░ ███████░ ██░  ████░  ███████░ ██░   ██░ ██░       ░██████░ ███████░
- ░░░░░░░  ░░░░░░░  ░░    ░░░░   ░░░░░░░  ░░    ░░  ░░         ░░░░░░  ░░░░░░░
+  ███░    ██░      ██░ ██░██░       ██░ ██░       ██░   ██░ ██░      ██░
+ ███████░ ███████░ ██░  ████░  ███████░ ██░       ██░   ██░ ░██████░ ███████░
+ ░░░░░░░  ░░░░░░░  ░░    ░░░░   ░░░░░░░  ░░        ░░    ░░   ░░░░░░  ░░░░░░░
 "#;
 
 // Front Notion: RGB(43, 160, 152) | Drop Shadow: RGB(6, 106, 143)
@@ -208,9 +208,9 @@ const LOGO_ZENSPACE_HYBRID: &str = r#"
  ███████░ ███████░ ███░   ██░  ███████░ ███████░  ███████░  ███████░ ███████░
     ███░  ██░      ████░  ██░  ██░      ██░   ██░ ██░   ██░ ██░      ██░
    ███░   ██████░  ██░██░ ██░  ███████░ ███████░  ███████░  ██░      ██████░
-  ███░    ██░      ██░ ██░██░       ██░ ██░   ██░ ██░       ██░      ██░
- ███████░ ███████░ ██░  ████░  ███████░ ██░   ██░ ██░       ░██████░ ███████░
- ░░░░░░░  ░░░░░░░  ░░    ░░░░   ░░░░░░░  ░░    ░░  ░░         ░░░░░░  ░░░░░░░
+  ███░    ██░      ██░ ██░██░       ██░ ██░       ██░   ██░ ██░      ██░
+ ███████░ ███████░ ██░  ████░  ███████░ ██░       ██░   ██░ ░██████░ ███████░
+ ░░░░░░░  ░░░░░░░  ░░    ░░░░   ░░░░░░░  ░░        ░░    ░░   ░░░░░░  ░░░░░░░
 "#;
 
 // const SPLASH_LOGO_FULL: &str = r#"
@@ -258,23 +258,8 @@ const SPLASH_HELP: &str = "\
   Type `/` to see command suggestions.\n";
 
 pub const SLASH_COMMANDS: &[&str] = &[
-    "help",
-    "h",
-    "quit",
-    "q",
-    "exit",
-    "clear",
-    "cls",
-    "thinking",
-    "export",
-    "note",
-    "search",
-    "session",
-    "serve",
-    "config",
-    "model",
-    "distill",
-    "lint",
+    "help", "h", "quit", "q", "exit", "clear", "cls", "thinking", "export", "note", "search",
+    "session", "serve", "config", "model", "distill", "lint",
 ];
 
 pub const CLI_COMMANDS: &[&str] = &[
@@ -870,8 +855,13 @@ Use /thinking to show/hide thinking process."#;
 
         for dir in [paths.inbox(), paths.wiki()] {
             if let Ok(r) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(service.search(query, &dir, client, Some(tier), None))
+                tokio::runtime::Handle::current().block_on(service.search(
+                    query,
+                    &dir,
+                    client,
+                    Some(tier),
+                    None,
+                ))
             }) {
                 results.extend(r);
             }
@@ -905,7 +895,25 @@ Use /thinking to show/hide thinking process."#;
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower
             .split_whitespace()
-            .filter(|s| s.len() >= 3 && !["the", "and", "for", "with", "about", "summary", "summarize", "show", "tell", "me", "this", "that", "above"].contains(s))
+            .filter(|s| {
+                s.len() >= 3
+                    && ![
+                        "the",
+                        "and",
+                        "for",
+                        "with",
+                        "about",
+                        "summary",
+                        "summarize",
+                        "show",
+                        "tell",
+                        "me",
+                        "this",
+                        "that",
+                        "above",
+                    ]
+                    .contains(s)
+            })
             .collect();
 
         if keywords.is_empty() {
@@ -930,10 +938,7 @@ Use /thinking to show/hide thinking process."#;
                     None => continue,
                 };
 
-                let match_score = keywords
-                    .iter()
-                    .filter(|kw| file_name.contains(*kw))
-                    .count();
+                let match_score = keywords.iter().filter(|kw| file_name.contains(*kw)).count();
 
                 if match_score == 0 {
                     continue;
@@ -950,11 +955,14 @@ Use /thinking to show/hide thinking process."#;
                         &content
                     };
                     let snippet: String = body.chars().take(2000).collect();
-                    matches.push((match_score, SearchResult {
-                        file: path,
-                        line: 0,
-                        content: snippet,
-                    }));
+                    matches.push((
+                        match_score,
+                        SearchResult {
+                            file: path,
+                            line: 0,
+                            content: snippet,
+                        },
+                    ));
                 }
             }
         }
@@ -982,7 +990,9 @@ Use /thinking to show/hide thinking process."#;
             Some(o) => o.clone(),
             None => {
                 tracing::warn!("TUI chat: orchestrator not initialized");
-                if let Err(e) = done_tx.send((Err("Orchestrator not initialized".to_string()), None)) {
+                if let Err(e) =
+                    done_tx.send((Err("Orchestrator not initialized".to_string()), None))
+                {
                     tracing::warn!(error = %e, "failed to send orchestrator error to done channel");
                 }
                 return;
@@ -1491,7 +1501,15 @@ Use /thinking to show/hide thinking process."#;
         };
 
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(SearchService::new(self.router.clone()).search(query, &base_dir, client, Some(tier), None))
+            tokio::runtime::Handle::current().block_on(
+                SearchService::new(self.router.clone()).search(
+                    query,
+                    &base_dir,
+                    client,
+                    Some(tier),
+                    None,
+                ),
+            )
         }) {
             Ok(results) => {
                 if results.is_empty() {
@@ -1616,7 +1634,8 @@ Use /thinking to show/hide thinking process."#;
 
             tracing::debug!(session_id = %id, turns = turn_count, "writing daily log entry for session end");
             if let Ok(paths) = ZenPaths::detect()
-                && let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary) {
+                && let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary)
+            {
                 tracing::warn!(error = %e, session_id = %id, "failed to write daily journal entry for session end");
             }
         }
@@ -1745,8 +1764,9 @@ Use /thinking to show/hide thinking process."#;
                 }
                 self.output.clear();
                 self.chat_history.clear();
-                let mut session_ctx = SessionContext::new(session.agent_name.clone(), String::new());
-                
+                let mut session_ctx =
+                    SessionContext::new(session.agent_name.clone(), String::new());
+
                 if let Some(store) = &self.conversation_store
                     && let Ok(entries) = store.load()
                 {
@@ -1756,16 +1776,17 @@ Use /thinking to show/hide thinking process."#;
                             let user_content = entries[i].1.clone();
                             self.push_output(format!("You: {}", user_content), false);
                             session_ctx.add_turn("user", &user_content);
-                            
+
                             if i + 1 < entries.len() && entries[i + 1].0 == "assistant" {
                                 let raw_assistant = entries[i + 1].1.clone();
                                 let normalized = normalize_compact_markdown(&raw_assistant);
                                 self.output.push(OutputCell::Markdown(MarkdownCell::new(
                                     normalized.clone(),
                                 )));
-                                self.chat_history.push((user_content.clone(), normalized.clone()));
+                                self.chat_history
+                                    .push((user_content.clone(), normalized.clone()));
                                 session_ctx.add_turn("assistant", &normalized);
-                                
+
                                 i += 2;
                             } else {
                                 i += 1;
@@ -1775,9 +1796,9 @@ Use /thinking to show/hide thinking process."#;
                         }
                     }
                 }
-                
+
                 self.session = Some(session_ctx);
-                
+
                 let title = session.title.as_deref().unwrap_or("(untitled)");
                 self.push_output(
                     format!("Resumed session: {} ({})", session.id, title),

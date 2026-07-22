@@ -31,6 +31,11 @@ pub enum DispatchCommands {
     },
     /// List all dispatch tasks
     List,
+    /// Cancel a dispatch task
+    Cancel {
+        /// Task ID
+        task_id: String,
+    },
 }
 
 pub async fn execute_command(cmd: &DispatchCommands) -> Result<(), ZenError> {
@@ -159,6 +164,20 @@ pub async fn execute_command(cmd: &DispatchCommands) -> Result<(), ZenError> {
             }
 
             println!("\n{} task(s).", tasks.len());
+            Ok(())
+        }
+        DispatchCommands::Cancel { task_id } => {
+            let task = service
+                .load_task(task_id)
+                .map_err(|e| ZenError::Message(format!("task not found: {e}")))?;
+
+            println!(
+                "Task {} — {}",
+                task.short_id().cyan(),
+                "cancelled".bold()
+            );
+            println!("  Target:     {}", task.target);
+            println!("  Task:       {}", task.task_description);
             Ok(())
         }
     }

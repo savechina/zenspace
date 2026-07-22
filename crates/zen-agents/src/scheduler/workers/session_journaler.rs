@@ -25,11 +25,14 @@ const MIN_TURNS: usize = 3;
 struct PromptContext {
     commitments_section: String,
     beliefs_section: String,
+    anti_patterns_section: String,
 }
 
 impl PromptContext {
     fn is_empty(&self) -> bool {
-        self.commitments_section.is_empty() && self.beliefs_section.is_empty()
+        self.commitments_section.is_empty()
+            && self.beliefs_section.is_empty()
+            && self.anti_patterns_section.is_empty()
     }
 
     fn to_prompt_section(&self) -> String {
@@ -43,6 +46,10 @@ impl PromptContext {
         }
         if !self.beliefs_section.is_empty() {
             s.push_str(&self.beliefs_section);
+            s.push('\n');
+        }
+        if !self.anti_patterns_section.is_empty() {
+            s.push_str(&self.anti_patterns_section);
             s.push('\n');
         }
         s
@@ -247,11 +254,12 @@ async fn process_session(
         matched
     };
 
-    let prompt_context = if fresh_eyes {
-        PromptContext {
-            commitments_section: String::new(),
-            beliefs_section: String::new(),
-        }
+        let prompt_context = if fresh_eyes {
+            PromptContext {
+                commitments_section: String::new(),
+                beliefs_section: String::new(),
+                anti_patterns_section: String::new(),
+            }
     } else {
         load_prompt_context(paths).await
     };
@@ -359,6 +367,17 @@ fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
         belief.posterior = confidence.clamp(0.01, 0.99);
         if let Err(e) = belief.save(&vault.join("wiki/wisdom/beliefs")) {
             warn!(error = %e, statement = %statement, "failed to save belief candidate");
+        }
+    }
+
+    for raw in &signals.facts {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fact = zen_memory::Fact::new(trimmed, "session", Vec::new());
+        if let Err(e) = fact.save(&vault.join("wiki/wisdom/facts")) {
+            warn!(error = %e, what = %trimmed, "failed to save fact");
         }
     }
 }
@@ -817,9 +836,11 @@ fn check_anti_pattern_match(
 async fn load_prompt_context(paths: &ZenPaths) -> PromptContext {
     let commitments_section = load_top_commitments(paths, 5);
     let beliefs_section = load_top_beliefs(paths, 5);
+    let anti_patterns_section = load_top_anti_patterns(paths, 5);
     PromptContext {
         commitments_section,
         beliefs_section,
+        anti_patterns_section,
     }
 }
 
@@ -854,6 +875,23 @@ fn load_top_beliefs(paths: &ZenPaths, n: usize) -> String {
             b.proposition,
             b.posterior * 100.0
         ));
+    }
+    s
+}
+
+fn load_top_anti_patterns(paths: &ZenPaths, n: usize) -> String {
+    let dir = paths.vault().join("wiki/wisdom/anti-patterns");
+    let signals = match zen_memory::AntiPatternSignal::load_all(&dir) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    if signals.is_empty() {
+        return String::new();
+    }
+    let top = signals.iter().take(n);
+    let mut s = String::from("Known anti-patterns to watch for during extraction:\n");
+    for ap in top {
+        s.push_str(&format!("- {} (trigger: {})\n", ap.pattern, ap.trigger));
     }
     s
 }
@@ -1076,6 +1114,7 @@ mod tests {
         let ctx = PromptContext {
             commitments_section: String::new(),
             beliefs_section: String::new(),
+            anti_patterns_section: String::new(),
         };
         assert!(ctx.is_empty());
         assert!(ctx.to_prompt_section().is_empty());
@@ -1086,6 +1125,7 @@ mod tests {
         let ctx = PromptContext {
             commitments_section: "commitments here\n".to_string(),
             beliefs_section: "beliefs here\n".to_string(),
+            anti_patterns_section: String::new(),
         };
         assert!(!ctx.is_empty());
         let section = ctx.to_prompt_section();

@@ -9,6 +9,7 @@ use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
+use zen_memory::{Severity, VirtueDomain};
 use zen_provider::{DefaultRouter, LlmRouterExt};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
@@ -87,6 +88,18 @@ impl ZenWorker for ReflectionWorker {
             match extract_reflections_from_journal(&path) {
                 Ok(reflections) if !reflections.is_empty() => {
                     let (date_str, session_id) = read_frontmatter_meta(&path);
+                    let signals_dir = paths.vault().join("wiki/wisdom/reflection-signals");
+                    for refl in &reflections {
+                        let signal = zen_memory::ReflectionSignal {
+                            what_wrong: refl.clone(),
+                            why: format!("session {session_id}"),
+                            severity: Severity::Med,
+                            domain: VirtueDomain::Resolution,
+                        };
+                        if let Err(e) = signal.save(&signals_dir) {
+                            warn!(error = %e, "failed to persist ReflectionSignal");
+                        }
+                    }
                     // DESIGN.md §3.1: reflections use weekly format {YYYY-Www}.md
                     let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
                         .unwrap_or_else(|_| chrono::Utc::now().date_naive());

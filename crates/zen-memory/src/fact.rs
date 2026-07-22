@@ -15,6 +15,8 @@ use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::frontmatter::{extract_frontmatter, parse_field, parse_yaml_array};
+
 // ─── Error type ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -142,20 +144,21 @@ impl Fact {
 
     /// Parse fact from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Self, FactError> {
-        let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id").ok_or_else(|| FactError::MissingField("id".into()))?;
-        let what = parse_yaml_field(&fm, "what")
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| FactError::Parse("missing frontmatter".into()))?;
+        let id = parse_field(&fm, "id").ok_or_else(|| FactError::MissingField("id".into()))?;
+        let what = parse_field(&fm, "what")
             .map(|s| s.trim_matches('"').to_string())
             .ok_or_else(|| FactError::MissingField("what".into()))?;
-        let source = parse_yaml_field(&fm, "source")
+        let source = parse_field(&fm, "source")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let when = parse_yaml_field(&fm, "when")
+        let when = parse_field(&fm, "when")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let notions = parse_list_field(&fm, "notions");
+        let notions = parse_yaml_array(&fm, "notions");
 
         Ok(Fact {
             id,
@@ -165,58 +168,6 @@ impl Fact {
             source,
         })
     }
-}
-
-// ─── Frontmatter parsing helpers ───────────────────────────────────────
-
-fn extract_frontmatter(content: &str) -> Result<String, FactError> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        return Err(FactError::Parse("missing frontmatter opening ---".into()));
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    Err(FactError::Parse("missing frontmatter closing ---".into()))
-}
-
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
-}
-
-fn parse_list_field(frontmatter: &str, key: &str) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut in_list = false;
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&format!("{key}:")) {
-            in_list = true;
-            continue;
-        }
-        if in_list {
-            if let Some(item) = trimmed.strip_prefix("- ") {
-                items.push(item.trim().to_string());
-            } else if !trimmed.is_empty() && !trimmed.starts_with('-') {
-                break;
-            }
-        }
-    }
-    items
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────

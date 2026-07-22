@@ -1,7 +1,7 @@
 //! 8-layer introspective Self-Model typing system.
 //!
 //! Models the user's identity across 8 hierarchical layers
-//! (Knowledge, Skill, SocialRole, SelfConcept, Trait, Motivation),
+//! (Knowledge, Skill, SocialRole, SelfConcept, Trait, Motivation, Value, Limit),
 //! stored as canonical markdown files following the Belief/Decision pattern.
 //!
 //! Storage: `memories/self-model/{slug}.md`
@@ -14,6 +14,8 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use crate::frontmatter::{extract_frontmatter, parse_field, parse_yaml_array};
 
 pub use zen_core::notion_graph::SelfModelLayer;
 
@@ -227,39 +229,40 @@ impl SelfModelItem {
 
     /// Parse self-model item from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<SelfModelItem> {
-        let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
+        let id = parse_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
         let layer_str =
-            parse_yaml_field(&fm, "layer").ok_or_else(|| anyhow::anyhow!("missing layer field"))?;
+            parse_field(&fm, "layer").ok_or_else(|| anyhow::anyhow!("missing layer field"))?;
         let layer = SelfModelLayer::from_str(layer_str.trim_matches('"'))
             .map_err(|e| anyhow::anyhow!(e))?;
-        let name = parse_yaml_field(&fm, "name")
+        let name = parse_field(&fm, "name")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
-        let domain = parse_yaml_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
-        let source = parse_yaml_field(&fm, "source").unwrap_or_else(|| "manual".to_string());
-        let confidence: f64 = parse_yaml_field(&fm, "confidence")
+        let domain = parse_field(&fm, "domain").unwrap_or_else(|| "uncategorized".to_string());
+        let source = parse_field(&fm, "source").unwrap_or_else(|| "manual".to_string());
+        let confidence: f64 = parse_field(&fm, "confidence")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.5);
-        let created_at = parse_yaml_field(&fm, "created_at")
+        let created_at = parse_field(&fm, "created_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let updated_at = parse_yaml_field(&fm, "updated_at")
+        let updated_at = parse_field(&fm, "updated_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
 
         // Layer-specific optional fields
-        let is_explicit = parse_yaml_field(&fm, "is_explicit").map(|s| s == "true");
-        let controllability = parse_yaml_field(&fm, "controllability").and_then(|s| s.parse().ok());
-        let humility_score = parse_yaml_field(&fm, "humility_score").and_then(|s| s.parse().ok());
+        let is_explicit = parse_field(&fm, "is_explicit").map(|s| s == "true");
+        let controllability = parse_field(&fm, "controllability").and_then(|s| s.parse().ok());
+        let humility_score = parse_field(&fm, "humility_score").and_then(|s| s.parse().ok());
         let optionality_count =
-            parse_yaml_field(&fm, "optionality_count").and_then(|s| s.parse().ok());
+            parse_field(&fm, "optionality_count").and_then(|s| s.parse().ok());
         let core_pursuit =
-            parse_yaml_field(&fm, "core_pursuit").map(|s| s.trim_matches('"').to_string());
+            parse_field(&fm, "core_pursuit").map(|s| s.trim_matches('"').to_string());
         let sufficient_for = parse_yaml_array(&fm, "sufficient_for");
         let necessary_for = parse_yaml_array(&fm, "necessary_for");
         let evidence_refs = parse_yaml_array(&fm, "evidence_refs");
@@ -297,64 +300,8 @@ impl SelfModelItem {
     }
 }
 
-// ─── Frontmatter parsing helpers ───────────────────────────────────────
-
-/// Extract the YAML frontmatter block (between first two `---` lines).
-fn extract_frontmatter(content: &str) -> Result<String> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        anyhow::bail!("missing frontmatter opening ---");
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    anyhow::bail!("missing frontmatter closing ---");
-}
-
-/// Parse a simple `key: value` line from frontmatter. Returns the trimmed value.
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
-}
-
-/// Parse a YAML array field like `key: ["a", "b"]` or `key: []`.
-fn parse_yaml_array(frontmatter: &str, key: &str) -> Vec<String> {
-    let val = match parse_yaml_field(frontmatter, key) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    // Handle empty array
-    let trimmed = val.trim();
-    if trimmed == "[]" {
-        return Vec::new();
-    }
-    // Strip brackets and split by comma
-    let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
-    inner
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-/// Extract everything after the frontmatter closing `---`.
 fn extract_body(content: &str) -> Result<String> {
     let mut lines = content.lines();
-    // Skip opening ---
     lines.next();
     let mut past_frontmatter = false;
     let mut body = String::new();

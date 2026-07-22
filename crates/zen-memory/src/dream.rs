@@ -426,7 +426,21 @@ pub fn update_memory_from_facts(
         return Ok(false);
     }
 
-    let section_header = "## Recent Wisdom";
+    // Route by source type (DESIGN.md §15.3 item 3):
+    // - "Commitment" → "## Active Commitments" section
+    // - "Reflection" → skip (ReflectionWorker handles Stop-Doing/Continue-Doing ledgers)
+    // - Everything else → "## Recent Wisdom" (default)
+    if source == "Reflection" {
+        debug!(
+            "skipping MEMORY.md write for Reflection source — ReflectionWorker handles ledgers"
+        );
+        return Ok(false);
+    }
+    let section_header = if source == "Commitment" {
+        "## Active Commitments"
+    } else {
+        "## Recent Wisdom"
+    };
     let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     let new_entries: Vec<String> = unique_facts

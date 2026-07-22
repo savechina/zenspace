@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::frontmatter::{extract_frontmatter, parse_field};
+
 // ─── Error type ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -106,36 +108,6 @@ impl MentalModelSignal {
             source: source.trim_matches('"').to_string(),
         })
     }
-}
-
-fn extract_frontmatter(content: &str) -> Option<String> {
-    let mut lines = content.lines();
-    let first = lines.next()?.trim();
-    if first != "---" {
-        return None;
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Some(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    None
-}
-
-fn parse_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 fn extract_application(content: &str) -> Option<String> {

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::frontmatter::{extract_frontmatter, parse_field};
+
 #[derive(Debug, Error)]
 pub enum VirtueLogError {
     #[error("IO error: {0}")]
@@ -264,14 +266,15 @@ impl VirtueLog {
     }
 
     pub fn from_markdown(content: &str) -> Result<Self, VirtueLogError> {
-        let fm = extract_frontmatter(content)?;
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| VirtueLogError::Parse("missing frontmatter".into()))?;
         let id =
-            parse_yaml_field(&fm, "id").ok_or_else(|| VirtueLogError::MissingField("id".into()))?;
-        let virtue_slug = parse_yaml_field(&fm, "virtue")
+            parse_field(&fm, "id").ok_or_else(|| VirtueLogError::MissingField("id".into()))?;
+        let virtue_slug = parse_field(&fm, "virtue")
             .ok_or_else(|| VirtueLogError::MissingField("virtue".into()))?;
         let virtue = VirtueDomain::from_slug(&virtue_slug)
             .ok_or_else(|| VirtueLogError::Parse(format!("invalid virtue: {virtue_slug}")))?;
-        let status_str = parse_yaml_field(&fm, "status")
+        let status_str = parse_field(&fm, "status")
             .ok_or_else(|| VirtueLogError::MissingField("status".into()))?;
         let status = match status_str.as_str() {
             "kept" => VirtueStatus::Kept,
@@ -283,14 +286,14 @@ impl VirtueLog {
                 )));
             }
         };
-        let streak: u32 = parse_yaml_field(&fm, "streak")
+        let streak: u32 = parse_field(&fm, "streak")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let date_str = parse_yaml_field(&fm, "date")
+        let date_str = parse_field(&fm, "date")
             .ok_or_else(|| VirtueLogError::MissingField("date".into()))?;
         let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
             .map_err(|e| VirtueLogError::Parse(format!("invalid date: {e}")))?;
-        let created_at = parse_yaml_field(&fm, "created_at")
+        let created_at = parse_field(&fm, "created_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
@@ -338,40 +341,6 @@ fn collect_logs_recursive(dir: &Path, logs: &mut Vec<VirtueLog>) -> Result<(), V
         }
     }
     Ok(())
-}
-
-fn extract_frontmatter(content: &str) -> Result<String, VirtueLogError> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        return Err(VirtueLogError::Parse(
-            "missing frontmatter opening ---".into(),
-        ));
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    Err(VirtueLogError::Parse(
-        "missing frontmatter closing ---".into(),
-    ))
-}
-
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 fn extract_body(content: &str) -> Result<String, VirtueLogError> {

@@ -3,7 +3,7 @@ mod common;
 use common::ZenTest;
 
 // ============================================================================
-// CLI Smoke Tests — all 24+ zen commands
+// CLI Smoke Tests — all 29 zen commands
 //
 // Each test runs `zen <command>` as a subprocess and verifies exit code 0.
 // These supplement the existing integration_test.rs with additional coverage.
@@ -201,10 +201,10 @@ fn test_zen_search_help_shows_subcommands() {
 }
 
 #[test]
-fn test_zen_lint_help_shows_subcommands() {
+fn test_zen_wiki_lint_help_shows_subcommands() {
     let test = ZenTest::new();
-    let output = test.zen(&["lint", "--help"]);
-    assert!(output.success(), "lint --help should succeed");
+    let output = test.zen(&["wiki", "lint", "--help"]);
+    assert!(output.success(), "wiki lint --help should succeed");
 }
 
 // ---------------------------------------------------------------------------
@@ -279,10 +279,10 @@ fn test_zen_graph_help_succeeds() {
 }
 
 #[test]
-fn test_zen_reindex_help_succeeds() {
+fn test_zen_wiki_reindex_help_succeeds() {
     let test = ZenTest::new();
-    let output = test.zen(&["reindex", "--help"]);
-    assert!(output.success(), "reindex --help should succeed");
+    let output = test.zen(&["wiki", "reindex", "--help"]);
+    assert!(output.success(), "wiki reindex --help should succeed");
 }
 
 #[test]
@@ -293,10 +293,10 @@ fn test_zen_research_help_succeeds() {
 }
 
 #[test]
-fn test_zen_distill_help_succeeds() {
+fn test_zen_wiki_distill_help_succeeds() {
     let test = ZenTest::new();
-    let output = test.zen(&["distill", "--help"]);
-    assert!(output.success(), "distill --help should succeed");
+    let output = test.zen(&["wiki", "distill", "--help"]);
+    assert!(output.success(), "wiki distill --help should succeed");
 }
 
 #[test]
@@ -314,10 +314,10 @@ fn test_zen_routine_help_succeeds() {
 }
 
 #[test]
-fn test_zen_task_help_succeeds() {
+fn test_zen_dispatch_help_succeeds() {
     let test = ZenTest::new();
-    let output = test.zen(&["task", "--help"]);
-    assert!(output.success(), "task --help should succeed");
+    let output = test.zen(&["dispatch", "--help"]);
+    assert!(output.success(), "dispatch --help should succeed");
 }
 
 #[test]
@@ -343,4 +343,18 @@ fn test_zen_unknown_command_fails_gracefully() {
     let test = ZenTest::new();
     let output = test.zen(&["nonexistent_subcommand_xyz"]);
     assert!(!output.success(), "unknown command should fail");
+}
+
+#[test]
+fn test_zen_version_completes_within_threshold() {
+    let test = ZenTest::new();
+    let start = std::time::Instant::now();
+    let output = test.zen(&["version"]);
+    let elapsed = start.elapsed();
+    assert!(output.success(), "zen version should succeed");
+    assert!(
+        elapsed.as_millis() < 3000,
+        "cold-start should be <3s (debug build), got {}ms",
+        elapsed.as_millis()
+    );
 }

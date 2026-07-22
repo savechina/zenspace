@@ -405,6 +405,17 @@ fn promote_mental_models(vault: &Path, candidates: &[Value]) -> Result<usize> {
             .with_context(|| format!("failed to write mental model: {}", file_path.display()))?;
         count += 1;
         debug!(model = model_name, path = %file_path.display(), "promoted mental model");
+
+        let signal = zen_memory::MentalModelSignal {
+            model: model_name.to_string(),
+            domain: "wisdom-synth".to_string(),
+            application: pattern.to_string(),
+            source: "self-observation".to_string(),
+        };
+        let signals_dir = vault.join("wiki/wisdom/mental-model-signals");
+        if let Err(e) = signal.save(&signals_dir) {
+            warn!(model = %model_name, error = %e, "failed to persist MentalModelSignal");
+        }
     }
 
     Ok(count)

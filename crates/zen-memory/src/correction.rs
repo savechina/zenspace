@@ -14,6 +14,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::decision::CostBreakdown;
+use crate::frontmatter::{extract_frontmatter, parse_field};
 
 // ─── Error type ─────────────────────────────────────────────────────────
 
@@ -173,37 +174,38 @@ impl Correction {
 
     /// Parse correction from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Self, CorrectionError> {
-        let fm = extract_frontmatter(content)?;
-        let id = parse_yaml_field(&fm, "id")
+        let fm = extract_frontmatter(content)
+            .ok_or_else(|| CorrectionError::Parse("missing frontmatter".into()))?;
+        let id = parse_field(&fm, "id")
             .ok_or_else(|| CorrectionError::MissingField("id".into()))?;
-        let error_ref = parse_yaml_field(&fm, "error_ref")
+        let error_ref = parse_field(&fm, "error_ref")
             .ok_or_else(|| CorrectionError::MissingField("error_ref".into()))?;
-        let fix = parse_yaml_field(&fm, "fix")
+        let fix = parse_field(&fm, "fix")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
         let cost = CostBreakdown {
-            economic: parse_yaml_field(&fm, "cost_economic")
+            economic: parse_field(&fm, "cost_economic")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),
-            time_hours: parse_yaml_field(&fm, "cost_time")
+            time_hours: parse_field(&fm, "cost_time")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),
-            credit: parse_yaml_field(&fm, "cost_credit")
+            credit: parse_field(&fm, "cost_credit")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),
-            sunk: parse_yaml_field(&fm, "cost_sunk")
+            sunk: parse_field(&fm, "cost_sunk")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),
-            is_recoverable: parse_yaml_field(&fm, "is_recoverable")
+            is_recoverable: parse_field(&fm, "is_recoverable")
                 .map(|s| s == "true")
                 .unwrap_or(true),
         };
-        let created_at = parse_yaml_field(&fm, "created_at")
+        let created_at = parse_field(&fm, "created_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let verified_at = parse_yaml_field(&fm, "verified_at")
+        let verified_at = parse_field(&fm, "verified_at")
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
@@ -217,42 +219,6 @@ impl Correction {
             created_at,
         })
     }
-}
-
-// ─── Frontmatter parsing helpers ───────────────────────────────────────
-
-fn extract_frontmatter(content: &str) -> Result<String, CorrectionError> {
-    let mut lines = content.lines();
-    let first = lines.next().unwrap_or("").trim();
-    if first != "---" {
-        return Err(CorrectionError::Parse(
-            "missing frontmatter opening ---".into(),
-        ));
-    }
-    let mut fm = String::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Ok(fm);
-        }
-        fm.push_str(line);
-        fm.push('\n');
-    }
-    Err(CorrectionError::Parse(
-        "missing frontmatter closing ---".into(),
-    ))
-}
-
-fn parse_yaml_field(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            let val = rest.trim().to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
