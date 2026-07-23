@@ -90,6 +90,88 @@ impl MemvidIndexer {
         Ok(report)
     }
 
+    /// Incremental indexing: only re-index files changed since the last run.
+    ///
+    /// Uses a checksum sidecar file (`memories/.index-checksums.json`) to track
+    /// file modification times. Files not in the checksum file or with changed
+    /// mtime are re-indexed. Falls back to `index_all()` if the checksum file
+    /// is missing or unreadable.
+    pub fn index_incremental(&self, store: &mut ZenMemvidStore) -> Result<MemvidIndexReport> {
+        let checksum_path = self.workspace_root.join("memories").join(".index-checksums.json");
+        let previous = load_checksums(&checksum_path);
+
+        if previous.is_empty() {
+            info!("memvid: no previous checksums, falling back to full index_all");
+            let report = self.index_all(store)?;
+            save_checksums(&checksum_path, &collect_current_checksums(&self.workspace_root)?);
+            return Ok(report);
+        }
+
+        let current = collect_current_checksums(&self.workspace_root)?;
+        let changed: Vec<PathBuf> = current
+            .iter()
+            .filter(|(path, mtime)| {
+                match previous.get(*path) {
+                    Some(prev_mtime) => **mtime != *prev_mtime,
+                    None => true,
+                }
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        if changed.is_empty() {
+            info!("memvid: incremental index — no changed files, skipping");
+            return Ok(MemvidIndexReport::default());
+        }
+
+        info!(changed_files = changed.len(), "memvid: incremental index");
+        let mut report = MemvidIndexReport::default();
+
+        for path in &changed {
+            report.files_scanned += 1;
+            match self.index_single_file(store, path) {
+                Ok(chunks) => report.chunks_indexed += chunks,
+                Err(e) => report.errors.push(format!("{}: {e}", path.display())),
+            }
+        }
+
+        save_checksums(&checksum_path, &current);
+        info!(
+            files = report.files_scanned,
+            chunks = report.chunks_indexed,
+            errors = report.errors.len(),
+            "memvid incremental indexing complete"
+        );
+        Ok(report)
+    }
+
+    fn index_single_file(&self, store: &mut ZenMemvidStore, path: &Path) -> Result<usize> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if content.trim().is_empty() {
+            return Ok(0);
+        }
+
+        let relative = path.strip_prefix(&self.workspace_root).unwrap_or(path);
+        let session_id = relative
+            .to_string_lossy()
+            .replace('/', "-")
+            .replace(".md", "");
+
+        let chunks = chunk_by_headers(&content);
+        let mut indexed = 0usize;
+        for chunk in &chunks {
+            if chunk.text.trim().is_empty() {
+                continue;
+            }
+            let label = format!("[{}] {}", chunk.header, chunk.text.trim());
+            if store.persist_structured_turn(&session_id, "system", &label).is_ok() {
+                indexed += 1;
+            }
+        }
+        Ok(indexed)
+    }
+
     // ─── M2 (Episodic) ──────────────────────────────────────────────
 
     /// Index journal files under `memories/journal/*.md`.
@@ -324,6 +406,54 @@ fn chunk_by_headers(content: &str) -> Vec<HeaderChunk> {
     }
 
     chunks
+}
+
+// ─── Incremental indexing helpers ─────────────────────────────────────
+
+type ChecksumMap = std::collections::HashMap<PathBuf, u64>;
+
+fn load_checksums(path: &Path) -> ChecksumMap {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => ChecksumMap::default(),
+    }
+}
+
+fn save_checksums(path: &Path, checksums: &ChecksumMap) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(checksums) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn collect_current_checksums(workspace_root: &Path) -> Result<ChecksumMap> {
+    let mut map = ChecksumMap::new();
+    let dirs = [
+        workspace_root.join("memories").join("journal"),
+        workspace_root.join("wiki").join("notions"),
+        workspace_root.join("wiki").join("wisdom").join("reflections"),
+        workspace_root.join("wiki").join("wisdom").join("anti-patterns"),
+        workspace_root.join("wiki").join("wisdom").join("models"),
+    ];
+    for dir in &dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for path in list_md_files(dir)? {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if let Ok(mtime) = meta.modified() {
+                    let mtime_ms = mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    map.insert(path, mtime_ms);
+                }
+            }
+        }
+    }
+    Ok(map)
 }
 
 fn strip_frontmatter(content: &str) -> &str {

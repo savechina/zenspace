@@ -79,6 +79,7 @@ impl ZenWorker for DreamWorker {
             success: true,
             fact_count: report.facts_extracted,
             duration_ms: start.elapsed().as_millis() as u64,
+            llm_cost_usd: 0.0,
         })
     }
 }

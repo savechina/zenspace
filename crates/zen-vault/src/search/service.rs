@@ -66,7 +66,12 @@ impl SearchService {
                 }),
             3 => {
                 let query_embedding = crate::tindy::compute_embeddings_for_text(query)
-                    .unwrap_or_else(|_| vec![0.0; 384]);
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Tier 3 search failed: embedding computation error for query ({} chars): {e}",
+                            query.len()
+                        )
+                    })?;
                 self.tier3.search(client, &query_embedding, 10).await
             }
             4 => self

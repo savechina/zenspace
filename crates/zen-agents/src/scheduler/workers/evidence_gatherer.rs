@@ -56,6 +56,7 @@ impl ZenWorker for EvidenceGatherer {
                     success: true,
                     fact_count: 0,
                     duration_ms: start.elapsed().as_millis() as u64,
+                    llm_cost_usd: 0.0,
                 });
             }
         };
@@ -72,6 +73,7 @@ impl ZenWorker for EvidenceGatherer {
                 success: true,
                 fact_count: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                llm_cost_usd: 0.0,
             });
         }
 
@@ -108,6 +110,7 @@ impl ZenWorker for EvidenceGatherer {
             success: true,
             fact_count: weak_beliefs.len(),
             duration_ms: start.elapsed().as_millis() as u64,
+            llm_cost_usd: 0.0,
         })
     }
 }

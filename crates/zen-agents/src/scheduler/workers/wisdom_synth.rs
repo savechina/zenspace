@@ -65,6 +65,7 @@ impl ZenWorker for WisdomSynthesizer {
                 success: true,
                 fact_count: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                llm_cost_usd: 0.0,
             });
         }
 
@@ -119,6 +120,7 @@ impl ZenWorker for WisdomSynthesizer {
                 success: true,
                 fact_count: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                llm_cost_usd: 0.0,
             });
         };
 
@@ -272,6 +274,7 @@ Respond with ONLY a JSON object:
             success: true,
             fact_count: total_updates_applied,
             duration_ms: start.elapsed().as_millis() as u64,
+            llm_cost_usd: 0.0,
         })
     }
 }

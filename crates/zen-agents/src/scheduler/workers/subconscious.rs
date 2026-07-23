@@ -72,6 +72,7 @@ impl ZenWorker for SubconsciousWorker {
             success: true,
             fact_count: actions.len(),
             duration_ms: start.elapsed().as_millis() as u64,
+            llm_cost_usd: 0.0,
         })
     }
 }

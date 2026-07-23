@@ -20,7 +20,7 @@ mod workers;
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -56,6 +56,8 @@ pub struct WorkerReport {
     pub success: bool,
     pub fact_count: usize,
     pub duration_ms: u64,
+    /// LLM cost incurred during this execution (USD, 0.0 if no LLM calls).
+    pub llm_cost_usd: f64,
 }
 
 // ─── ZenWorker trait ──────────────────────────────────────────────────
@@ -126,6 +128,10 @@ type RegisteredWorker = (String, Schedule, Arc<dyn ZenWorker>, bool);
 pub struct ZenScheduler {
     workers: HashMap<String, RegisteredWorker>,
     tick_interval: Duration,
+    /// Cumulative LLM cost per worker (USD), reset monthly.
+    worker_costs: Arc<RwLock<HashMap<String, f64>>>,
+    /// Monthly cost cap per worker (USD). Workers exceeding this are skipped.
+    cost_cap_usd: f64,
 }
 
 impl ZenScheduler {
@@ -133,7 +139,20 @@ impl ZenScheduler {
         Self {
             workers: HashMap::new(),
             tick_interval: Duration::from_secs(DEFAULT_TICK_INTERVAL_SECONDS),
+            worker_costs: Arc::new(RwLock::new(HashMap::new())),
+            cost_cap_usd: 10.0,
         }
+    }
+
+    /// Set the per-worker monthly LLM cost cap (USD).
+    pub fn with_cost_cap(mut self, cap_usd: f64) -> Self {
+        self.cost_cap_usd = cap_usd;
+        self
+    }
+
+    /// Get the current per-worker monthly cost cap (USD).
+    pub fn cost_cap(&self) -> f64 {
+        self.cost_cap_usd
     }
 
     /// Set a custom tick interval (default 30s).
@@ -209,6 +228,22 @@ impl ZenScheduler {
         }
 
         for (id, worker, ctx) in to_fire {
+            {
+                let costs = self.worker_costs.read().unwrap();
+                if let Some(&cost) = costs.get(&id) {
+                    if cost >= self.cost_cap_usd {
+                        warn!(
+                            worker = %id,
+                            cost = cost,
+                            cap = self.cost_cap_usd,
+                            "scheduler: skipping worker (monthly LLM cost cap exceeded)"
+                        );
+                        continue;
+                    }
+                }
+            }
+            let cost_cap = self.cost_cap_usd;
+            let costs = Arc::clone(&self.worker_costs);
             tokio::spawn(async move {
                 match worker.execute(&ctx).await {
                     Ok(report) => {
@@ -217,8 +252,22 @@ impl ZenScheduler {
                             success = report.success,
                             facts = report.fact_count,
                             duration_ms = report.duration_ms,
+                            llm_cost_usd = report.llm_cost_usd,
                             "scheduler: worker completed"
                         );
+                        if report.llm_cost_usd > 0.0 {
+                            let mut costs_guard = costs.write().unwrap();
+                            let entry = costs_guard.entry(report.worker_id.clone()).or_insert(0.0);
+                            *entry += report.llm_cost_usd;
+                            if *entry >= cost_cap {
+                                warn!(
+                                    worker = %report.worker_id,
+                                    cumulative_cost = *entry,
+                                    cap = cost_cap,
+                                    "scheduler: worker hit monthly cost cap, will skip next runs"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         error!(worker = %id, error = %e, "scheduler: worker failed");
@@ -316,49 +365,47 @@ pub struct WorkerSummary {
 pub fn create_default_scheduler() -> ZenScheduler {
     let mut scheduler = ZenScheduler::new();
 
-    if let Err(e) = scheduler.register(MemoryCurator::new()) {
-        warn!("scheduler: failed to register memory-curator: {e}");
-    }
+    // ── Critical workers: failure panics (memory pipeline broken without them) ──
+    scheduler
+        .register(SessionJournaler::new())
+        .unwrap_or_else(|e| panic!("FATAL: critical worker 'session-journaler' failed to register: {e}"));
+    scheduler
+        .register(DreamWorker::new())
+        .unwrap_or_else(|e| panic!("FATAL: critical worker 'dream-worker' failed to register: {e}"));
+    scheduler
+        .register(MemoryCurator::new())
+        .unwrap_or_else(|e| panic!("FATAL: critical worker 'memory-curator' failed to register: {e}"));
+    scheduler
+        .register(MemvidIndexerWorker::new())
+        .unwrap_or_else(|e| panic!("FATAL: critical worker 'memvid-indexer' failed to register: {e}"));
+
+    // ── Non-critical workers: failure warns (system continues with reduced capability) ──
     if let Err(e) = scheduler.register(SubconsciousWorker::new()) {
-        warn!("scheduler: failed to register subconscious worker: {e}");
-    }
-    if let Err(e) = scheduler.register(DreamWorker::new()) {
-        warn!("scheduler: failed to register dream worker: {e}");
-    }
-    if let Err(e) = scheduler.register(SessionJournaler::new()) {
-        warn!("scheduler: failed to register session-journaler worker: {e}");
+        warn!("scheduler: failed to register subconscious worker (non-critical): {e}");
     }
     if let Err(e) = scheduler.register(NotionExtractorWorker::new()) {
-        warn!("scheduler: failed to register notion-extractor worker: {e}");
+        warn!("scheduler: failed to register notion-extractor worker (non-critical): {e}");
     }
     if let Err(e) = scheduler.register(WikiCompilerWorker::new()) {
-        warn!("scheduler: failed to register wiki-compiler worker: {e}");
+        warn!("scheduler: failed to register wiki-compiler worker (non-critical): {e}");
     }
     if let Err(e) = scheduler.register(CommitmentTracker::new()) {
-        warn!("scheduler: failed to register commitment-tracker worker: {e}");
+        warn!("scheduler: failed to register commitment-tracker worker (non-critical): {e}");
     }
     if let Err(e) = scheduler.register(ReflectionWorker::new()) {
-        warn!("scheduler: failed to register reflection-worker worker: {e}");
+        warn!("scheduler: failed to register reflection-worker worker (non-critical): {e}");
     }
-
     if let Err(e) = scheduler.register(WisdomSynthesizer::new()) {
-        warn!("scheduler: failed to register wisdom-synth worker: {e}");
+        warn!("scheduler: failed to register wisdom-synth worker (non-critical): {e}");
     }
-
     if let Err(e) = scheduler.register(DecisionTracker::new()) {
-        warn!("scheduler: failed to register decision-tracker worker: {e}");
+        warn!("scheduler: failed to register decision-tracker worker (non-critical): {e}");
     }
-
     if let Err(e) = scheduler.register(ExpressWorker::new()) {
-        warn!("scheduler: failed to register express worker: {e}");
+        warn!("scheduler: failed to register express worker (non-critical): {e}");
     }
-
-    if let Err(e) = scheduler.register(MemvidIndexerWorker::new()) {
-        warn!("scheduler: failed to register memvid-indexer worker: {e}");
-    }
-
     if let Err(e) = scheduler.register(EvidenceGatherer::new()) {
-        warn!("scheduler: failed to register evidence-gatherer worker: {e}");
+        warn!("scheduler: failed to register evidence-gatherer worker (non-critical): {e}");
     }
 
     scheduler
@@ -463,6 +510,7 @@ mod tests {
                 success: true,
                 fact_count: 0,
                 duration_ms: 0,
+                llm_cost_usd: 0.0,
             })
         }
     }

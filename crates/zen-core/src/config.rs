@@ -264,6 +264,10 @@ pub struct CronConfig {
     pub dream_end_hour: Option<u32>,
     pub wisdom_synthesis_schedule: Option<String>,
     pub fresh_eyes_mode: Option<bool>,
+    /// Maximum cumulative LLM cost (USD) per worker per month.
+    /// If a worker's cumulative cost exceeds this cap, it skips execution
+    /// until the next monthly reset. Default: 10.0 (sane for personal use).
+    pub llm_cost_cap_usd: Option<f64>,
 }
 
 /// Plugin system config.
@@ -462,6 +466,7 @@ impl Default for CronConfig {
             dream_end_hour: Some(4),
             wisdom_synthesis_schedule: Some("0 0 2 * * 7".into()),
             fresh_eyes_mode: Some(false),
+            llm_cost_cap_usd: Some(10.0),
         }
     }
 }
@@ -747,6 +752,7 @@ fn merge_cron(base: CronConfig, ov: CronConfig) -> CronConfig {
             ov.wisdom_synthesis_schedule,
         ),
         fresh_eyes_mode: ov.fresh_eyes_mode.or(base.fresh_eyes_mode),
+        llm_cost_cap_usd: ov.llm_cost_cap_usd.or(base.llm_cost_cap_usd),
     }
 }
 
