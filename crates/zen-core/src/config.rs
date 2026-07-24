@@ -54,6 +54,9 @@ pub struct ZenConfig {
     pub tui: TuiConfig,
     #[serde(default)]
     pub history: HistoryConfig,
+    /// Embedding provider selection (standalone from chat providers).
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
 }
 
 /// IM channel configuration — supports multiple platforms.
@@ -119,6 +122,16 @@ pub struct ProviderConfig {
     /// Default model for this provider.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Model used for embeddings (separate from chat default_model).
+    ///
+    /// When set, the embedding router will use this model instead of
+    /// `default_model`. This is important because many providers use
+    /// different models for chat vs embeddings (e.g., Ollama uses
+    /// `qwen3-embedding`, DashScope uses `text-embedding-v3`).
+    /// When unset, the embedding router falls back to a provider-specific
+    /// default (see `DefaultEmbeddingRouter::from_config`).
+    #[serde(default)]
+    pub embedding_model: Option<String>,
     /// API wire protocol: "completions" (default) or "responses".
     #[serde(rename = "wire_api", default)]
     pub wire_api: Option<String>,
@@ -429,6 +442,55 @@ pub struct HistoryConfig {
     pub max_bytes: Option<u32>,
 }
 
+/// Embedding provider selection — standalone config for the embedding pipeline.
+///
+/// Controls which provider and model to use for vector embedding generation,
+/// independently from chat provider configs.
+///
+/// # Modes
+///
+/// - `provider = "local"` — run embeddings locally:
+///   - `local_provider = "fastembed"` → ONNX inference via fastembed crate
+///   - `local_provider = "ollama"` → Ollama API (must be running)
+/// - `provider = "cloud"` — use a remote API (references a key in `[providers]`):
+///   - `api_provider = "aliyun"` → uses that provider's `embedding_model`
+///   - `api_provider = "openai"` → uses that provider's `embedding_model`
+///
+/// # Examples
+///
+/// ```toml
+/// [embeddings]
+/// provider = "local"
+/// local_provider = "fastembed"
+/// model = "BGESmallENV15"
+/// ```
+///
+/// ```toml
+/// [embeddings]
+/// provider = "cloud"
+/// api_provider = "aliyun"
+/// model = "text-embedding-v4"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct EmbeddingsConfig {
+    /// "local" (fastembed or Ollama) or "cloud" (OpenAI-compatible API).
+    pub provider: Option<String>,
+    /// For cloud mode: which named provider from `[providers]` to use.
+    pub api_provider: Option<String>,
+    /// Model name:
+    ///   - cloud: API model name (e.g., "text-embedding-v4")
+    ///   - local + fastembed: EmbeddingModel variant (e.g., "BGESmallENV15")
+    ///   - local + ollama: Ollama model name (e.g., "nomic-embed-text")
+    pub model: Option<String>,
+    /// For local mode: "fastembed" or "ollama".
+    pub local_provider: Option<String>,
+    /// HuggingFace mirror endpoint for fastembed model downloads.
+    /// Used in China where huggingface.co is blocked (set to "https://hf-mirror.com").
+    pub hf_endpoint: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Default values
 // ---------------------------------------------------------------------------
@@ -677,6 +739,7 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         feeds: merge_feeds(base.feeds, override_cfg.feeds),
         tui: merge_tui(base.tui, override_cfg.tui),
         history: merge_history(base.history, override_cfg.history),
+        embeddings: merge_embeddings(base.embeddings, override_cfg.embeddings),
     })
 }
 
@@ -694,6 +757,7 @@ fn merge_providers(
                 existing.api_key = v.api_key.clone().or(existing.api_key.clone());
                 existing.api_key_env = v.api_key_env.clone().or(existing.api_key_env.clone());
                 existing.default_model = v.default_model.clone().or(existing.default_model.clone());
+                existing.embedding_model = v.embedding_model.clone().or(existing.embedding_model.clone());
                 existing.wire_api = v.wire_api.clone().or(existing.wire_api.clone());
                 existing.models = merge_models(existing.models.clone(), v.models.clone());
             })
@@ -807,6 +871,16 @@ fn merge_history(base: HistoryConfig, ov: HistoryConfig) -> HistoryConfig {
     }
 }
 
+fn merge_embeddings(base: EmbeddingsConfig, ov: EmbeddingsConfig) -> EmbeddingsConfig {
+    EmbeddingsConfig {
+        provider: str_merge(base.provider, ov.provider),
+        api_provider: str_merge(base.api_provider, ov.api_provider),
+        model: str_merge(base.model, ov.model),
+        local_provider: str_merge(base.local_provider, ov.local_provider),
+        hf_endpoint: str_merge(base.hf_endpoint, ov.hf_endpoint),
+    }
+}
+
 fn str_merge(base: Option<String>, ov: Option<String>) -> Option<String> {
     ov.or(base)
 }
@@ -827,6 +901,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_plugin_env(&mut config.plugin);
     apply_channels_env(&mut config.channels);
     apply_history_env(&mut config.history);
+    apply_embeddings_env(&mut config.embeddings);
     config
 }
 
@@ -908,6 +983,24 @@ fn env_plugin_field(
 fn apply_history_env(history: &mut HistoryConfig) {
     if let Some(v) = env_u32("ZEN_HISTORY_MAX_BYTES") {
         history.max_bytes = Some(v);
+    }
+}
+
+fn apply_embeddings_env(emb: &mut EmbeddingsConfig) {
+    if let Some(v) = env_str("ZEN_EMBEDDINGS_PROVIDER") {
+        emb.provider = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_EMBEDDINGS_API_PROVIDER") {
+        emb.api_provider = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_EMBEDDINGS_MODEL") {
+        emb.model = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_EMBEDDINGS_LOCAL_PROVIDER") {
+        emb.local_provider = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_EMBEDDINGS_HF_ENDPOINT") {
+        emb.hf_endpoint = Some(v);
     }
 }
 

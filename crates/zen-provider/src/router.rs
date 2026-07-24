@@ -660,6 +660,7 @@ impl DefaultRouter {
                 feeds: Vec::new(),
                 tui: zen_core::config::TuiConfig::default(),
                 history: zen_core::config::HistoryConfig::default(),
+                embeddings: zen_core::config::EmbeddingsConfig::default(),
             },
             mock: MockProvider::default(),
             providers,

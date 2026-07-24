@@ -60,23 +60,28 @@ fn get_embedding_router() -> &'static DefaultEmbeddingRouter {
     })
 }
 
-/// Try to compute an embedding via zen-provider, falling back to local
-/// fastembed, then to hash-based embedding.
+/// System-wide embedding dimension. All vectors are padded to this
+/// dimension before insert / search to support multiple providers with
+/// different native dimensionalities.
+pub const SYSTEM_EMBEDDING_DIM: usize = 4096;
+
+/// Pad or trim a vector to the target dimension.
+/// If the vector is shorter, trailing zeros are appended.
+/// If it is longer, the first `target` elements are kept.
+pub fn pad_to_dim(v: &[f32], target: usize) -> Vec<f32> {
+    let mut out = v.to_vec();
+    out.resize(target, 0.0);
+    out
+}
+
 fn compute_embedding_with_fallback(text: &str) -> Vec<f32> {
     let router = get_embedding_router();
 
-    // 1. Try configured providers via zen-provider
     if let Ok(embedding) = router.embed_sync(text) {
         info!("ComputeEmbeddings: provider returns {}-dim", embedding.len());
-        return embedding;
+        return pad_to_dim(&embedding, SYSTEM_EMBEDDING_DIM);
     }
 
-    // 2. Try local fastembed model
-    if let Some(embedding) = super::local_embedder::try_local_embed(text) {
-        return embedding;
-    }
-
-    // 3. Hash-based fallback (last resort)
     info!("ComputeEmbeddings: falling back to hash-based embedding");
     hash_embedding(text)
 }
@@ -88,8 +93,8 @@ fn compute_embedding_with_fallback(text: &str) -> Vec<f32> {
 pub fn compute_embeddings(text: &str) -> Result<EmbeddingResult> {
     if text.trim().is_empty() {
         return Ok(EmbeddingResult {
-            dimensions: 384,
-            embedding: vec![0.0; 384],
+            dimensions: SYSTEM_EMBEDDING_DIM,
+            embedding: vec![0.0; SYSTEM_EMBEDDING_DIM],
         });
     }
 
@@ -126,7 +131,7 @@ fn chunk_content(content: &str, chunk_size: usize, overlap: usize) -> Vec<String
 }
 
 fn aggregate_chunks(chunks: &[String]) -> Vec<f32> {
-    let dim = 384;
+    let dim = SYSTEM_EMBEDDING_DIM;
     let mut aggregated = vec![0.0f32; dim];
 
     for chunk in chunks {
@@ -151,7 +156,7 @@ pub fn compute_embeddings_for_text(text: &str) -> Result<Vec<f32>> {
     let chunks = chunk_content(text, 400, 80);
     if chunks.is_empty() {
         info!("compute_embeddings_for_text: no chunks");
-        return Ok(vec![0.0; 384]);
+        return Ok(vec![0.0; SYSTEM_EMBEDDING_DIM]);
     }
 
     if chunks.len() == 1 {
@@ -176,7 +181,7 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 fn hash_embedding(content: &str) -> Vec<f32> {
-    const DIM: usize = 384;
+    const DIM: usize = SYSTEM_EMBEDDING_DIM;
     let bytes = content.as_bytes();
     let mut embedding = vec![0.0f32; DIM];
 
@@ -250,14 +255,14 @@ mod tests {
     #[test]
     fn test_compute_embeddings_empty_returns_zero() {
         let result = compute_embeddings("").unwrap();
-        assert_eq!(result.dimensions, 384);
+        assert_eq!(result.dimensions, SYSTEM_EMBEDDING_DIM);
         assert!(result.embedding.iter().all(|x| *x == 0.0));
     }
 
     #[test]
-    fn test_hash_embedding_produces_384_dim() {
+    fn test_hash_embedding_produces_system_dim() {
         let result = compute_embeddings("hello world this is a test").unwrap();
-        assert_eq!(result.dimensions, 384);
+        assert_eq!(result.dimensions, SYSTEM_EMBEDDING_DIM);
         let norm: f32 = result.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
     }

@@ -185,8 +185,16 @@ impl Reindexer {
 
         let (note_id, body_content, tags) = match note::parse_frontmatter(&content) {
             Ok(parsed_note) => {
+                // Guard against empty id — frontmatter may have `id:` with no value,
+                // which produces an empty string. Empty primary keys violate the
+                // UNIQUE constraint on note_embeddings once the second row hits.
+                let id = if parsed_note.id.is_empty() {
+                    format!("auto-{}", file_name)
+                } else {
+                    parsed_note.id
+                };
                 let tags_str = parsed_note.tags.join(",");
-                (parsed_note.id, parsed_note.content, tags_str)
+                (id, parsed_note.content, tags_str)
             }
             Err(e) => {
                 warn!(

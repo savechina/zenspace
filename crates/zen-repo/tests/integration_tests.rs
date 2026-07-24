@@ -246,7 +246,7 @@ async fn test_embeddings_insert_note_embedding_vec0_unavailable() {
     let (client, _dir) = make_client().await;
     let repo = zen_repo::EmbeddingsRepo::new(&client);
 
-    let embedding = vec![0.1_f32; 384];
+    let embedding = vec![0.1_f32; 4096];
     let result = repo
         .insert_note_embedding(InsertNoteEmbeddingRequest {
             note_id: "note1",
@@ -272,7 +272,7 @@ async fn test_embeddings_insert_entity_embedding_vec0_unavailable() {
     let (client, _dir) = make_client().await;
     let repo = zen_repo::EmbeddingsRepo::new(&client);
 
-    let embedding = vec![0.1_f32; 384];
+    let embedding = vec![0.1_f32; 4096];
     let result = repo
         .insert_entity_embedding(InsertNotionEmbeddingRequest {
             notion_id: "ent1",
@@ -297,7 +297,7 @@ async fn test_embeddings_search_nonempty_embedding_vec0_unavailable() {
     let (client, _dir) = make_client().await;
     let repo = zen_repo::EmbeddingsRepo::new(&client);
 
-    let embedding = vec![0.5_f32; 384];
+    let embedding = vec![0.5_f32; 4096];
     let result = repo.search(&embedding, 5).await;
 
     match result {

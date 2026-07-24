@@ -28,6 +28,24 @@ theme = "deep-ocean"
 max_bytes = 1048576
 
 # =============================================================================
+# Embedding provider selection (standalone from chat providers)
+# =============================================================================
+#
+# Two modes:
+#   provider = "local"  → run embeddings locally via fastembed (ONNX) or Ollama
+#   provider = "cloud"  → use a remote API (references a key in [providers])
+#
+# [embeddings]
+# provider = "local"
+# local_provider = "fastembed"
+# model = "BGESmallENV15"
+
+[embeddings]
+provider = "cloud"
+api_provider = "aliyun"
+model = "text-embedding-v4"
+
+# =============================================================================
 # Provider definitions — connection settings (defined once, referenced by name)
 # =============================================================================
 #
@@ -78,6 +96,7 @@ type = "openai-compatible"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 api_key = { env = "DASHSCOPE_API_KEY" }
 default_model = "qwen3.6-plus"
+embedding_model = "text-embedding-v4"
 
 [providers.deepseek]
 type = "openai-compatible"

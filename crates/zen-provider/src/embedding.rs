@@ -1,10 +1,14 @@
+use std::str::FromStr;
+use std::sync::Mutex;
+
+use fastembed::{EmbeddingModel as FastEmbedModel, TextInitOptions};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use zen_core::config::ZenConfig;
 
 use crate::router::resolve_api_key;
 use rig::client::{EmbeddingsClient, Nothing};
-use rig::embeddings::EmbeddingModel;
+use rig::embeddings::EmbeddingModel as RigEmbeddingModel;
 use rig::providers::{ollama, openai};
 
 pub trait EmbeddingProvider: Send + Sync + std::fmt::Debug {
@@ -93,7 +97,7 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
                         reason: format!("Ollama client init error: {e}"),
                     })?;
 
-                let emb_model = client.embedding_model_with_ndims(&model, 384);
+                let emb_model = client.embedding_model_with_ndims(&model, 4096);
                 let embedding = emb_model.embed_text(&text).await.map_err(|e| {
                     EmbeddingError::RequestFailed {
                         reason: format!("Ollama embed error: {e}"),
@@ -114,7 +118,9 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
     }
 
     fn expected_dimension(&self) -> usize {
-        384
+        // System dimension is 4096 — shorter vectors (e.g. 384-dim
+        // from nomic-embed-text) are zero-padded at the application layer.
+        4096
     }
 }
 
@@ -123,6 +129,8 @@ pub struct OpenAiEmbeddingProvider {
     api_key: String,
     model: String,
     base_url: String,
+    /// Human-readable name (e.g., "openai", "aliyun", "deepseek").
+    name: String,
 }
 
 impl OpenAiEmbeddingProvider {
@@ -131,7 +139,14 @@ impl OpenAiEmbeddingProvider {
             api_key,
             model,
             base_url,
+            name: "openai".into(),
         }
+    }
+
+    /// Override the provider name (used for log/error attribution).
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = name.to_owned();
+        self
     }
 }
 
@@ -170,7 +185,7 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
     }
 
     fn provider_name(&self) -> &str {
-        "openai"
+        &self.name
     }
 
     fn expected_dimension(&self) -> usize {
@@ -178,84 +193,237 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Local fastembed provider — ONNX-based local inference (macOS M4 etc.)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct LocalFastembedProvider {
+    /// Optional override model name; `None` uses fastembed's default (BGESmallENV15).
+    model: Option<String>,
+    /// Optional HuggingFace mirror endpoint (e.g., `https://hf-mirror.com`).
+    hf_endpoint: Option<String>,
+}
+
+impl LocalFastembedProvider {
+    pub fn new(model: Option<String>, hf_endpoint: Option<String>) -> Self {
+        Self { model, hf_endpoint }
+    }
+}
+
+impl EmbeddingProvider for LocalFastembedProvider {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        // Set HF_ENDPOINT before fastembed init if configured.
+        // Safety: set_var is unsafe in multithreaded contexts, but this runs
+        // once during model init (or early in the process lifetime), and the
+        // fastembed crate reads HF_ENDPOINT at most once during download.
+        if let Some(endpoint) = &self.hf_endpoint {
+            unsafe { std::env::set_var("HF_ENDPOINT", endpoint) };
+        }
+
+        let init_options: TextInitOptions = match &self.model {
+            Some(name) => {
+                let model = FastEmbedModel::from_str(name)
+                    .map_err(|e| EmbeddingError::RequestFailed {
+                        reason: format!("unknown fastembed model '{name}': {e}"),
+                    })?;
+                TextInitOptions::new(model)
+            }
+            None => Default::default(),
+        };
+
+        let mut embedder = fastembed::TextEmbedding::try_new(init_options)
+            .map_err(|e| EmbeddingError::RequestFailed {
+                reason: format!("fastembed init error: {e}"),
+            })?;
+
+        let input = vec![text.to_string()];
+        let mut vecs = embedder.embed(input, None).map_err(|e| {
+            EmbeddingError::RequestFailed {
+                reason: format!("fastembed embed error: {e}"),
+            }
+        })?;
+
+        vecs.pop()
+            .ok_or_else(|| EmbeddingError::RequestFailed {
+                reason: "fastembed returned empty result".into(),
+            })
+    }
+
+    fn provider_name(&self) -> &str {
+        "fastembed"
+    }
+
+    fn expected_dimension(&self) -> usize {
+        // BGESmallENV15 (fastembed default) outputs 384-dim.
+        384
+    }
+}
+
 #[derive(Debug)]
 pub struct DefaultEmbeddingRouter {
     providers: Vec<Box<dyn EmbeddingProvider>>,
+    /// Tracks which providers have previously failed (by index).
+    /// Once dead, they are skipped on subsequent calls to avoid
+    /// repeated timeouts (e.g., unreachable network, unsupported model).
+    dead: Mutex<Vec<bool>>,
 }
 
 impl DefaultEmbeddingRouter {
+    /// Build an embedding router from the new `[embeddings]` config section.
+    ///
+    /// Selects exactly one provider based on:
+    ///   `provider = "local"`  → local inference (fastembed or Ollama)
+    ///   `provider = "cloud"`  → remote API (referenced by name in [providers])
     pub fn from_config(config: &ZenConfig) -> Self {
-        let mut local: Vec<Box<dyn EmbeddingProvider>> = Vec::new();
-        let mut cloud: Vec<Box<dyn EmbeddingProvider>> = Vec::new();
+        let emb = &config.embeddings;
+        let mode = emb.provider.as_deref().unwrap_or("cloud");
 
-        for (name, cfg) in &config.providers {
-            let provider_type = cfg.provider_type.as_deref().unwrap_or("openai-compatible");
+        let mut providers: Vec<Box<dyn EmbeddingProvider>> = Vec::new();
 
-            match provider_type {
-                "ollama" => {
-                    let base_url = cfg
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| zen_core::constants::OLLAMA_BASE_URL.into());
-                    let model = cfg
-                        .default_model
-                        .clone()
-                        .unwrap_or_else(|| "nomic-embed-text".into());
-                    info!(
-                        provider = name,
-                        base_url = %base_url,
-                        model = %model,
-                        "DefaultEmbeddingRouter: registered Ollama"
-                    );
-                    let p: Box<dyn EmbeddingProvider> =
-                        Box::new(OllamaEmbeddingProvider::new(base_url, model));
-                    local.push(p);
-                }
-                "openai" | "openai-compatible" => {
-                    if let Some(api_key) = resolve_api_key(cfg, name) {
-                        let base_url = cfg
-                            .base_url
-                            .clone()
-                            .unwrap_or_else(|| zen_core::constants::OPENAI_BASE_URL.into());
-                        let model = cfg
-                            .default_model
-                            .clone()
-                            .unwrap_or_else(|| "text-embedding-3-small".into());
+        match mode {
+            "local" => {
+                let local_kind = emb.local_provider.as_deref().unwrap_or("fastembed");
+                let model = emb.model.clone();
+
+                match local_kind {
+                    "fastembed" => {
+                        let p = LocalFastembedProvider::new(model, emb.hf_endpoint.clone());
                         info!(
-                            provider = name,
-                            model = %model,
-                            "DefaultEmbeddingRouter: registered OpenAI"
+                            local_provider = "fastembed",
+                            model = ?emb.model,
+                            "DefaultEmbeddingRouter: registered fastembed"
                         );
-                        let p: Box<dyn EmbeddingProvider> =
-                            Box::new(OpenAiEmbeddingProvider::new(api_key, model, base_url));
-                        cloud.push(p);
-                    } else {
-                        warn!(
-                            provider = name,
-                            "DefaultEmbeddingRouter: no API key, skipping"
-                        );
+                        providers.push(Box::new(p));
+                    }
+                    "ollama" => {
+                        // Find the first ollama provider config.
+                        if let Some((name, cfg)) = config
+                            .providers
+                            .iter()
+                            .find(|(_, c)| c.provider_type.as_deref() == Some("ollama"))
+                        {
+                            let base_url = cfg
+                                .base_url
+                                .clone()
+                                .unwrap_or_else(|| zen_core::constants::OLLAMA_BASE_URL.into());
+                            let m = model
+                                .clone()
+                                .or_else(|| cfg.embedding_model.clone())
+                                .unwrap_or_else(|| "qwen3-embedding".into());
+                            info!(
+                                provider = name,
+                                base_url = %base_url,
+                                model = %m,
+                                "DefaultEmbeddingRouter: registered Ollama (local)"
+                            );
+                            let p: Box<dyn EmbeddingProvider> =
+                                Box::new(OllamaEmbeddingProvider::new(base_url, m));
+                            providers.push(p);
+                        } else {
+                            warn!("DefaultEmbeddingRouter: local=ollama but no ollama provider in config");
+                        }
+                    }
+                    other => {
+                        warn!("DefaultEmbeddingRouter: unknown local_provider={other}, skipping");
                     }
                 }
-                other => {
+            }
+            "cloud" => {
+                let api_provider = emb.api_provider.as_deref().unwrap_or("aliyun");
+                let model = emb.model.clone();
+
+                if let Some((name, cfg)) = config.providers.iter().find(|(n, _)| n == &api_provider)
+                {
+                    let provider_type = cfg.provider_type.as_deref().unwrap_or("openai-compatible");
+                    match provider_type {
+                        "ollama" => {
+                            let base_url = cfg
+                                .base_url
+                                .clone()
+                                .unwrap_or_else(|| zen_core::constants::OLLAMA_BASE_URL.into());
+                            let m = model
+                                .clone()
+                                .or_else(|| cfg.embedding_model.clone())
+                                .unwrap_or_else(|| "qwen3-embedding".into());
+                            info!(
+                                provider = name,
+                                base_url = %base_url,
+                                model = %m,
+                                "DefaultEmbeddingRouter: registered Ollama (cloud)"
+                            );
+                            let p: Box<dyn EmbeddingProvider> =
+                                Box::new(OllamaEmbeddingProvider::new(base_url, m));
+                            providers.push(p);
+                        }
+                        "openai" | "openai-compatible" => {
+                            if let Some(api_key) = resolve_api_key(cfg, name) {
+                                let base_url = cfg
+                                    .base_url
+                                    .clone()
+                                    .unwrap_or_else(|| zen_core::constants::OPENAI_BASE_URL.into());
+                                let m = model
+                                    .clone()
+                                    .or_else(|| cfg.embedding_model.clone())
+                                    .or_else(|| cfg.default_model.clone())
+                                    .unwrap_or_else(|| "text-embedding-3-small".into());
+                                info!(
+                                    provider = name,
+                                    model = %m,
+                                    "DefaultEmbeddingRouter: registered OpenAI"
+                                );
+                                let p: Box<dyn EmbeddingProvider> = Box::new(
+                                    OpenAiEmbeddingProvider::new(api_key, m, base_url)
+                                        .with_name(name),
+                                );
+                                providers.push(p);
+                            } else {
+                                warn!(
+                                    provider = name,
+                                    "DefaultEmbeddingRouter: no API key for {api_provider}"
+                                );
+                            }
+                        }
+                        other => {
+                            warn!(
+                                provider = name,
+                                provider_type = other,
+                                "DefaultEmbeddingRouter: unknown type, skipping"
+                            );
+                        }
+                    }
+                } else {
                     warn!(
-                        provider = name,
-                        provider_type = other,
-                        "DefaultEmbeddingRouter: unknown type, skipping"
+                        api_provider = api_provider,
+                        "DefaultEmbeddingRouter: provider not found in config"
                     );
                 }
             }
+            other => {
+                warn!("DefaultEmbeddingRouter: unknown provider mode={other}, no embeddings available");
+            }
         }
 
-        local.append(&mut cloud);
-        Self { providers: local }
+        Self {
+            dead: Mutex::new(vec![false; providers.len()]),
+            providers,
+        }
     }
 
     pub fn with_providers(providers: Vec<Box<dyn EmbeddingProvider>>) -> Self {
-        Self { providers }
+        Self {
+            dead: Mutex::new(vec![false; providers.len()]),
+            providers,
+        }
     }
 
     fn embed_with_providers(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        for provider in &self.providers {
+        let mut dead = self.dead.lock().unwrap();
+
+        for (i, provider) in self.providers.iter().enumerate() {
+            if i < dead.len() && dead[i] {
+                continue;
+            }
             match provider.embed(text) {
                 Ok(embedding) => {
                     info!(
@@ -269,8 +437,30 @@ impl DefaultEmbeddingRouter {
                     warn!(
                         provider = provider.provider_name(),
                         error = %e,
-                        "DefaultEmbeddingRouter: failed, trying next"
+                        "DefaultEmbeddingRouter: failed, retrying once"
                     );
+                    // Retry once for transient failures (e.g., Ollama runner crash).
+                    // The runner is ephemeral; on retry, Ollama spawns a new one.
+                    match provider.embed(text) {
+                        Ok(embedding) => {
+                            info!(
+                                provider = provider.provider_name(),
+                                dim = embedding.len(),
+                                "DefaultEmbeddingRouter: computed on retry"
+                            );
+                            return Ok(embedding);
+                        }
+                        Err(e2) => {
+                            warn!(
+                                provider = provider.provider_name(),
+                                error = %e2,
+                                "DefaultEmbeddingRouter: retry also failed, marking dead"
+                            );
+                            if i < dead.len() {
+                                dead[i] = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -300,13 +490,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ollama_provider_name() {
+    fn test_ollama_provider() {
         let p = OllamaEmbeddingProvider::new(
             "http://localhost:11434".into(),
             "nomic-embed-text".into(),
         );
         assert_eq!(p.provider_name(), "ollama");
-        assert_eq!(p.expected_dimension(), 384);
+        // System embedding dimension is 4096; shorter vectors are padded.
+        assert_eq!(p.expected_dimension(), 4096);
     }
 
     #[test]

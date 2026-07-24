@@ -10,6 +10,32 @@ impl<'a> EmbeddingsRepo<'a> {
         Self { client }
     }
 
+    /// Ensure vec0 virtual tables exist at the system embedding dimension.
+    ///
+    /// Creates the tables at 4096-dim if they don't exist. If the tables
+    /// already exist from a prior migration (e.g. at 384-dim), they are
+    /// kept as-is for backward compatibility — the application layer
+    /// handles padding shorter vectors to 4096-dim.
+    pub async fn ensure_embedding_tables(&self) -> Result<()> {
+        self.client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS note_embeddings USING vec0(
+                         note_id TEXT PRIMARY KEY,
+                         embedding FLOAT[4096]
+                     );
+                     CREATE VIRTUAL TABLE IF NOT EXISTS notion_embeddings USING vec0(
+                         notion_id TEXT PRIMARY KEY,
+                         embedding FLOAT[4096]
+                     );"
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)
+    }
+
     pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Result<Vec<VecSearchResult>> {
         if query_embedding.is_empty() {
             return Ok(Vec::new());
