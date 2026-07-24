@@ -35,15 +35,22 @@ max_bytes = 1048576
 #   provider = "local"  → run embeddings locally via fastembed (ONNX) or Ollama
 #   provider = "cloud"  → use a remote API (references a key in [providers])
 #
-# [embeddings]
-# provider = "local"
-# local_provider = "fastembed"
-# model = "BGESmallENV15"
-
 [embeddings]
-provider = "cloud"
-api_provider = "aliyun"
-model = "text-embedding-v4"
+provider = "local"
+local_provider = "fastembed"
+model = "BGEM3"
+
+# Cloud reference (Aliyun):
+# [embeddings]
+# provider = "cloud"
+# api_provider = "aliyun"
+# model = "text-embedding-v4"
+
+# Cloud reference (Ollama):
+# [embeddings]
+# provider = "cloud"
+# api_provider = "ollama"
+# model = "qwen3-embedding"
 
 # =============================================================================
 # Provider definitions — connection settings (defined once, referenced by name)
