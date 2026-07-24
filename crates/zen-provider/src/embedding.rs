@@ -223,8 +223,8 @@ impl EmbeddingProvider for LocalFastembedProvider {
 
         let init_options: TextInitOptions = match &self.model {
             Some(name) => {
-                let model = FastEmbedModel::from_str(name)
-                    .map_err(|e| EmbeddingError::RequestFailed {
+                let model =
+                    FastEmbedModel::from_str(name).map_err(|e| EmbeddingError::RequestFailed {
                         reason: format!("unknown fastembed model '{name}': {e}"),
                     })?;
                 TextInitOptions::new(model)
@@ -232,22 +232,22 @@ impl EmbeddingProvider for LocalFastembedProvider {
             None => Default::default(),
         };
 
-        let mut embedder = fastembed::TextEmbedding::try_new(init_options)
-            .map_err(|e| EmbeddingError::RequestFailed {
-                reason: format!("fastembed init error: {e}"),
-            })?;
-
-        let input = vec![text.to_string()];
-        let mut vecs = embedder.embed(input, None).map_err(|e| {
+        let mut embedder = fastembed::TextEmbedding::try_new(init_options).map_err(|e| {
             EmbeddingError::RequestFailed {
-                reason: format!("fastembed embed error: {e}"),
+                reason: format!("fastembed init error: {e}"),
             }
         })?;
 
-        vecs.pop()
-            .ok_or_else(|| EmbeddingError::RequestFailed {
-                reason: "fastembed returned empty result".into(),
-            })
+        let input = vec![text.to_string()];
+        let mut vecs = embedder
+            .embed(input, None)
+            .map_err(|e| EmbeddingError::RequestFailed {
+                reason: format!("fastembed embed error: {e}"),
+            })?;
+
+        vecs.pop().ok_or_else(|| EmbeddingError::RequestFailed {
+            reason: "fastembed returned empty result".into(),
+        })
     }
 
     fn provider_name(&self) -> &str {
@@ -277,7 +277,7 @@ impl DefaultEmbeddingRouter {
     ///   `provider = "cloud"`  → remote API (referenced by name in [providers])
     pub fn from_config(config: &ZenConfig) -> Self {
         let emb = &config.embeddings;
-        let mode = emb.provider.as_deref().unwrap_or("cloud");
+        let mode = emb.provider.as_deref().unwrap_or("local");
 
         let mut providers: Vec<Box<dyn EmbeddingProvider>> = Vec::new();
 
@@ -321,7 +321,9 @@ impl DefaultEmbeddingRouter {
                                 Box::new(OllamaEmbeddingProvider::new(base_url, m));
                             providers.push(p);
                         } else {
-                            warn!("DefaultEmbeddingRouter: local=ollama but no ollama provider in config");
+                            warn!(
+                                "DefaultEmbeddingRouter: local=ollama but no ollama provider in config"
+                            );
                         }
                     }
                     other => {
@@ -400,7 +402,9 @@ impl DefaultEmbeddingRouter {
                 }
             }
             other => {
-                warn!("DefaultEmbeddingRouter: unknown provider mode={other}, no embeddings available");
+                warn!(
+                    "DefaultEmbeddingRouter: unknown provider mode={other}, no embeddings available"
+                );
             }
         }
 
