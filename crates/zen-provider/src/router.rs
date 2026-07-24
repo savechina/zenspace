@@ -469,13 +469,15 @@ impl DefaultRouter {
         name: &str,
         cfg: &zen_core::config::ProviderConfig,
     ) -> Option<ProviderInstance> {
-        // Do NOT resolve API keys during construction — doing so would call macOS
-        // Keychain synchronously for every configured provider, which can block
-        // indefinitely (e.g. Keychain dialog waiting for user interaction).
-        // Key resolution happens lazily when the provider is first used via route().
-        // A None key means the provider will fail at route() time with a clear
-        // "credential not found" error — far better than hanging silently.
-        Self::create_provider_instance_with_key(name, cfg, None)
+        // Resolve API key at construction time. SecretResolver::resolve() checks
+        // env vars FIRST (fast, non-blocking) before falling back to macOS Keychain,
+        // so this does NOT block for users with standard env-var-based config.
+        // Prevents silent provider creation failure (the previous `None` key caused
+        // every cloud provider match arm to short-circuit via `?`, meaning the
+        // provider was never inserted into the map at all — producing misleading
+        // "Provider 'X' not configured" errors at route() time).
+        let api_key = resolve_api_key(cfg, name);
+        Self::create_provider_instance_with_key(name, cfg, api_key)
     }
 
     /// Creates a provider instance with a pre-resolved (possibly None) API key.
@@ -685,7 +687,11 @@ impl DefaultRouter {
             providers.insert(
                 provider_name.into(),
                 ProviderConfig {
-                    provider_type: Some(provider_name.into()),
+                    // Default to "openai-compatible" for custom providers.
+                    // This matches the fallback in create_provider_instance_with_key,
+                    // ensuring unknown provider names get a valid protocol type
+                    // instead of silently failing the match block.
+                    provider_type: Some("openai-compatible".into()),
                     default_model: Some(model_name.into()),
                     ..Default::default()
                 },

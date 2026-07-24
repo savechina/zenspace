@@ -1292,17 +1292,22 @@ Use /thinking to show/hide thinking process."#;
     }
 
     pub fn set_model(&mut self, provider: &str, model: &str) {
-        use zen_core::constants::SUPPORTED_LLM_PROVIDERS;
-
-        let valid_providers = SUPPORTED_LLM_PROVIDERS;
-        let is_valid = valid_providers.contains(&provider) || provider == "mock";
+        // Accept any provider that exists in config, is a known built-in, or is ollama/mock.
+        // Custom providers (e.g. personal model gateways, third-party proxies) are configured
+        // in ~/.zen/config.toml with type = "openai-compatible" or "anthropic-compatible".
+        let known = zen_core::constants::SUPPORTED_LLM_PROVIDERS;
+        let in_config = self.config.providers.contains_key(provider);
+        let is_valid = in_config || known.contains(&provider) || provider == "mock";
 
         if !is_valid {
             self.push_output(
                 format!(
-                    "Unknown provider: {}. Supported: {}",
-                    provider,
-                    "openai, anthropic, deepseek, aliyun, mistral, groq, moonshot, xai, perplexity, gemini, ollama, qqbot, mock"
+                    "Provider '{provider}' not found. Add to ~/.zen/config.toml first, e.g.:\n\
+                     [providers.{provider}]\n\
+                     type = \"openai-compatible\"\n\
+                     base_url = \"https://...\"\n\
+                     api_key = {{ env = \"{}_API_KEY\" }}",
+                    provider.to_uppercase(),
                 ),
                 true,
             );

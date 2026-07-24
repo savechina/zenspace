@@ -689,7 +689,12 @@ fn merge_providers(
         merged
             .entry(k)
             .and_modify(|existing| {
+                existing.provider_type = v.provider_type.clone().or(existing.provider_type.clone());
+                existing.base_url = v.base_url.clone().or(existing.base_url.clone());
+                existing.api_key = v.api_key.clone().or(existing.api_key.clone());
+                existing.api_key_env = v.api_key_env.clone().or(existing.api_key_env.clone());
                 existing.default_model = v.default_model.clone().or(existing.default_model.clone());
+                existing.wire_api = v.wire_api.clone().or(existing.wire_api.clone());
                 existing.models = merge_models(existing.models.clone(), v.models.clone());
             })
             .or_insert(v);
