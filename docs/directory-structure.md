@@ -5,7 +5,7 @@
 ```
 ~/.zen/
 ├── config.toml              # User-level config (overrides embedded)
-├── knowledge/
+├── vault/
 │   ├── inbox/               # New notes land here before consolidation
 │   ├── wiki/                # Curated wiki pages
 │   │   ├── sources/         # Source references
@@ -35,7 +35,7 @@ Each project can have its own `.zen/` directory for workspace-local config and k
 .project/
 └── .zen/
     ├── config.toml          # Workspace-level config
-    ├── knowledge/           # Workspace-local knowledge
+    ├── vault/           # Workspace-local knowledge
     │   ├── inbox/
     │   ├── raw/
     │   └── wiki/

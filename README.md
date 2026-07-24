@@ -1,68 +1,80 @@
 # Zenspace
 
-**Zen** is a local-first Rust CLI knowledge management tool with multi-LLM provider support (Ollama, OpenAI, Anthropic, DeepSeek, and more).
+**Your Personal AI Agentic Workspace** — a self-learning knowledge system that builds your wiki, remembers everything, and gets smarter over time.
 
-[中文文档](README_zh.md)
+> 🧠 **You think. It builds.** Write notes like you always do. Zenspace runs in the background — extracting entities, connecting ideas, building wiki pages, detecting patterns, and learning from your decisions. Short-term memory, long-term wisdom, and an agent team of 13 working for you. Markdown in, Markdown out. Your data stays yours.
 
-## Features
-
-- **Local Knowledge Base** — Markdown files as data source, SQLite FTS5 + vector search for fast retrieval
-- **Multi-Protocol LLM Routing** — Ollama, OpenAI, Anthropic, Gemini, Cohere, Mistral, and OpenAI-compatible APIs
-- **Entity Extraction Pipeline** — Automatic entity extraction from notes, auto-generated Wiki pages
-- **Agentic Sessions** — Session lifecycle management with 13 built-in agents across 4 tiers
-- **5-Tier Search** — ripgrep → FTS5 → vector embeddings → entity graph → LLM fallback
-- **macOS Keychain Integration** — Secure credential storage with automatic fallback
-
-## Installation
-
-### Homebrew (macOS, recommended)
-
-```bash
-brew tap savechina/zenspace
-brew install zenspace
-```
-
-### From Source
-
-```bash
-git clone https://github.com/savechina/zenspace.git
-cd zenspace
-bin/build 
-./target/release/zen --help
-```
-
-### Cargo Install (coming soon)
-
-```bash
-bin/install
-```
-
-### Binary Download
-
-Download pre-built macOS binaries from [GitHub Releases](https://github.com/savechina/zenspace/releases).
-
-## Quick Start
-
-```bash
-# Initialize workspace
-zen workspace init
-
-# Create a note
-zen note create "Design Doc" --tag project
-
-# Search knowledge base
-zen search run "design"
-
-# View configuration
-zen config show
-```
-
-## Documentation
-
-- [README_zh.md](README_zh.md) — 中文文档
-- [AGENTS.md](AGENTS.md) — Architecture guide
-- [config/config.toml](config/config.toml) — Provider configuration examples
+[中文文档](README_zh.md) | [Full User Guide →](https://savechina.github.io/zenspace/)
 
 ---
 
-**GitHub**: https://github.com/savechina/zenspace
+## 10 Things Zenspace Does Differently
+
+### 1. 📝 **Notes That Build Themselves**
+Write normally — agents extract entities, auto-generate wiki pages, detect contradictions, and weave everything into a knowledge graph. Your notes become a living wiki, not a pile of files.
+
+### 2. 🧠 **Three Brains, One System**
+Short-term memory ("what just happened?") → Mid-term knowledge ("what do I know?") → Long-term wisdom ("what have I learned?"). Session context flows naturally upward. No cold starts.
+
+### 3. 📈 **It Learns From You**
+Daily reflection, weekly synthesis, Bayesian belief updates. The system spots recurring patterns, surfaces blind spots, and adapts to your workflow. Every session makes the next one sharper.
+
+### 4. 🔄 **Information → Knowledge → Wisdom**
+5-stage pipeline: **Capture → Tidy → Organize → Distill → Fuse**. From raw notes to polished wiki to deep wisdom. Data in, decisions out.
+
+### 5. 🏛️ **13 Agents, Each an Expert**
+A Greek pantheon of AI specialists: **Sisyphus** orchestrates, **Prometheus** plans, **Momus** gatekeeps quality, **Hephaestus** executes, **Hermes** validates. Each with the right model for the job.
+
+### 6. 🎯 **Smart Model Routing — No Manual Picking**
+Private data → local Ollama. Complex reasoning → Anthropic. Cost-sensitive → DeepSeek. Per-task fallback chains. One config, zero guesswork.
+
+### 7. 💡 **Built-in Decision Engine**
+Log decisions, compute expected value, set stop-loss lines, detect anti-patterns. The system doesn't just remember what you decided — it helps you decide better next time.
+
+### 8. 📚 **Seed Wisdom — 12 Mental Models + 21 Anti-Patterns**
+Pre-loaded thinking frameworks: Map ≠ Territory, Circle of Competence, Second-Order Thinking, Hanlon's Razor, and more. Plus behavioral anti-pattern detection. Thinking tools, not just storage.
+
+### 9. 🔗 **Obsidian + OKF Dual Format**
+All notes are **Obsidian-compatible Markdown** with `[[wikilinks]]` and YAML frontmatter — open `~/.zen/vault/` directly in Obsidian, no import/export. Under the hood, wiki pages follow **OKF v0.1 (Open Knowledge Format)**: typed frontmatter (`type: concept|reference|tool|...`), bundle-relative links, structured index files. Two formats, one knowledge base.
+
+### 10. 🏠 **Your Data, Your Rules**
+Local-first by default. macOS Keychain for secrets. Sensitive data never touches the cloud unless you explicitly allow it. Zero vendor lock-in.
+
+---
+
+## 🚀 Quick Start
+
+```bash
+# Install (macOS)
+brew tap savechina/zenspace
+brew install zenspace
+
+# Initialize
+zen workspace init
+
+# Write a note — the wiki builds itself
+zen note create "Q3 Planning" --tag project
+
+# Ask your knowledge graph
+zen search run "Q3 planning"
+```
+
+[Quick Start Guide →](https://savechina.github.io/zenspace/quickstart.html) | [Installation →](https://savechina.github.io/zenspace/installation.html)
+
+---
+
+## 📖 Documentation
+
+| Section | Description |
+|---------|-------------|
+| [Installation](https://savechina.github.io/zenspace/installation.html) | Homebrew, source, binary |
+| [Quick Start](https://savechina.github.io/zenspace/quickstart.html) | 5-minute walkthrough |
+| [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 29 commands |
+| [Providers & Auth](https://savechina.github.io/zenspace/configuration/providers.html) | 9 protocol types, API keys |
+| [Agent Routing](https://savechina.github.io/zenspace/configuration/agent-routing.html) | Per-agent model assignment |
+| [System Overview](https://savechina.github.io/zenspace/architecture/overview.html) | Architecture & data flow |
+
+---
+
+**GitHub:** https://github.com/savechina/zenspace
+**License:** MIT

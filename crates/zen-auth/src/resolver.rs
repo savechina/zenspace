@@ -56,9 +56,14 @@ impl SecretResolver {
         }
     }
 
-    /// Try Keychain first, then fall back to env var, then fail.
+    /// Try env var first (fast, non-blocking), then Keychain (may prompt), then fail.
     pub fn resolve(&self) -> Result<String, AuthError> {
-        // 1) Keychain — skip if known unavailable for this service (Bug 4 cache)
+        // 1) Environment variable — fast path, avoids macOS Keychain dialog hang
+        if let Ok(val) = std::env::var(&self.env_var) {
+            return Ok(val);
+        }
+
+        // 2) Keychain — skip if known unavailable for this service (Bug 4 cache)
         if !keychain_known_unavailable(&self.keychain_service) {
             match Keychain::retrieve(&self.keychain_service, "zen") {
                 Ok(val) => return Ok(val),
@@ -67,22 +72,11 @@ impl SecretResolver {
                 | Err(AuthError::KeychainUnavailable { .. }) => {
                     mark_keychain_unavailable(&self.keychain_service);
                     tracing::debug!(
-                        "keychain unavailable for '{}', falling back to env var",
+                        "keychain unavailable for '{}', falling back",
                         self.keychain_service
                     );
                 }
                 Err(e) => return Err(e),
-            }
-        }
-
-        // 2) Environment variable
-        match std::env::var(&self.env_var) {
-            Ok(val) => return Ok(val),
-            Err(_) => {
-                tracing::debug!(
-                    "env var '{}' not set, secret resolution failed",
-                    self.env_var
-                );
             }
         }
 

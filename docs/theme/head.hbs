@@ -1,0 +1,69 @@
+<!-- SEO: Meta Description -->
+<meta name="description" content="{{#if description}}{{description}}{{else}}Zenspace — your personal AI agentic workspace. A self-learning knowledge system that builds your wiki, remembers across sessions, and evolves with your decisions. Markdown in, wisdom out.{{/if}}">
+
+<!-- SEO: Canonical URL -->
+{{#if path}}
+<link rel="canonical" href="https://renyan.org/zenspace/{{path}}">
+{{else}}
+<link rel="canonical" href="https://renyan.org/zenspace/">
+{{/if}}
+
+<!-- SEO: Open Graph / Facebook -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://renyan.org/zenspace/{{#if path}}{{path}}{{/if}}">
+<meta property="og:title" content="{{title}}">
+<meta property="og:description" content="{{#if description}}{{description}}{{else}}Zenspace — your personal AI agentic workspace. A self-learning knowledge system that builds your wiki, remembers across sessions, and evolves with your decisions.{{/if}}">
+<meta property="og:image" content="https://renyan.org/zenspace/images/og-cover.png">
+<meta property="og:locale" content="en_US">
+<meta property="og:site_name" content="Zenspace">
+
+<!-- SEO: Additional Meta Tags -->
+<meta name="keywords" content="Zenspace, AI workspace, knowledge management, personal wiki, agentic AI, note-taking, LLM, Rust CLI, Obsidian">
+<meta name="author" content="RenYan Wei">
+<meta name="theme-color" content="#ffffff">
+
+<!-- SEO: JSON-LD Structured Data (WebApplication) -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebApplication",
+  "name": "Zenspace",
+  "description": "Your personal AI agentic workspace — a self-learning knowledge system that builds your wiki, remembers across sessions, and evolves with your decisions.",
+  "url": "https://renyan.org/zenspace/",
+  "inLanguage": "en",
+  "license": "https://opensource.org/licenses/MIT",
+  "creator": {
+    "@type": "Person",
+    "name": "RenYan Wei"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "Zenspace",
+    "url": "https://renyan.org/zenspace/"
+  },
+  "applicationCategory": "Knowledge Management",
+  "operatingSystem": "macOS",
+  "codeRepository": "https://github.com/savechina/zenspace",
+  "featureList": [
+    "AI-powered knowledge management",
+    "13-agent orchestration",
+    "Multi-provider LLM routing",
+    "Obsidian-compatible Markdown",
+    "Local-first data sovereignty"
+  ],
+  "about": {
+    "@type": "Thing",
+    "name": "Agentic Knowledge Management"
+  }
+}
+</script>
+
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-JBDQHSMGWL"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-JBDQHSMGWL');
+</script>

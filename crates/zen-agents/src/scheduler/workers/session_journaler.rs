@@ -20,7 +20,7 @@ use zen_provider::{DefaultRouter, LlmRouterExt};
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::SessionState;
 
-const MIN_TURNS: usize = 3;
+const MIN_TURNS: usize = 1;
 
 struct PromptContext {
     commitments_section: String,
@@ -236,7 +236,11 @@ async fn process_session(
     let turns = store.load()?;
 
     if turns.len() < MIN_TURNS {
-        debug!(session_id = %session_id, turns = turns.len(), "skipping short session");
+        if turns.is_empty() {
+            warn!(session_id = %session_id, "session has 0 turns, nothing to extract");
+        } else {
+            debug!(session_id = %session_id, turns = turns.len(), "skipping short session");
+        }
         return Ok(0);
     }
 

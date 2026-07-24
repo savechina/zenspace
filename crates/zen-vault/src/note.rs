@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tracing::warn;
 use zen_core::paths::ZenPaths;
 use zen_core::types::Sensitivity;
+use zen_repo::{IndexNoteRequest, NotesRepo, SqliteClient};
 
 // ── Domain ──────────────────────────────────────────────────────────
 
@@ -357,8 +359,9 @@ impl NoteService {
 
     /// Create a new note with the given content, tags, and source.
     ///
-    /// Writes the note to `~/.zen/knowledge/inbox/` and returns the created [`Note`].
-    pub fn create_note(
+    /// Writes the note to `~/.zen/vault/inbox/` and automatically indexes it
+    /// into the FTS5 search table so `zen search run` finds it immediately.
+    pub async fn create_note(
         &self,
         content: &str,
         tags: Vec<String>,
@@ -389,6 +392,33 @@ impl NoteService {
         note.file_path = Some(file_path.clone());
 
         tracing::info!("note created: id={} path={}", note.id, file_path.display());
+
+        let db_path = paths.db().join("state.db");
+        match SqliteClient::open(&db_path).await {
+            Ok(client) => {
+                let title: String = content.lines().next().unwrap_or(content).chars().take(200).collect();
+                let tags_str = note.tags.join(",");
+                let file_path_str = file_path.to_string_lossy();
+                if let Err(e) = NotesRepo::new(&client)
+                    .index_note(IndexNoteRequest {
+                        id: &note.id,
+                        title: &title,
+                        content: &note.content,
+                        tags: &tags_str,
+                        file_path: &file_path_str,
+                        source: &note.source,
+                    })
+                    .await
+                {
+                    warn!(error = %e, note_id = %note.id, "FTS5 auto-index failed — note is saved to disk, run `zen wiki reindex` later");
+                } else {
+                    tracing::debug!(note_id = %note.id, "FTS5 auto-indexed");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, note_id = %note.id, "failed to open state.db for FTS5 indexing — note is saved to disk, run `zen wiki reindex` later");
+            }
+        }
 
         Ok(note)
     }
@@ -531,8 +561,8 @@ Body
         assert!(inbox.exists());
     }
 
-    #[test]
-    fn test_create_note_populates_file_path() {
+    #[tokio::test]
+    async fn test_create_note_populates_file_path() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: Single-threaded test, no concurrent env access
         unsafe { std::env::set_var("ZEN_ROOT_DIR", dir.path()) };
@@ -540,6 +570,7 @@ Body
         let service = NoteService::new();
         let note = service
             .create_note("test content", vec!["tag1".to_string()], "test")
+            .await
             .unwrap();
 
         // SAFETY: Single-threaded test, no concurrent env access
@@ -552,8 +583,8 @@ Body
         assert_eq!(note.file_path.as_ref().unwrap().extension().unwrap(), "md");
     }
 
-    #[test]
-    fn test_create_note_returns_correct_source() {
+    #[tokio::test]
+    async fn test_create_note_returns_correct_source() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: Single-threaded test, no concurrent env access
         unsafe { std::env::set_var("ZEN_ROOT_DIR", dir.path()) };
@@ -565,6 +596,7 @@ Body
                 vec!["a".to_string(), "b".to_string()],
                 "my-source",
             )
+            .await
             .unwrap();
 
         // SAFETY: Single-threaded test, no concurrent env access

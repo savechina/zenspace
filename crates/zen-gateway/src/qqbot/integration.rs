@@ -13,7 +13,7 @@ impl QqBotIntegration {
     }
 
     pub async fn create_note(&self, content: &str, tags: Vec<String>) -> Result<Note> {
-        self.note_service.create_note(content, tags, "qq_private")
+        self.note_service.create_note(content, tags, "qq_private").await
     }
 
     pub async fn search_notes(&self, _query: &str) -> Result<Vec<String>> {

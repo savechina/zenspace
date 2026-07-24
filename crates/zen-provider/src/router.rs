@@ -469,6 +469,24 @@ impl DefaultRouter {
         name: &str,
         cfg: &zen_core::config::ProviderConfig,
     ) -> Option<ProviderInstance> {
+        // Do NOT resolve API keys during construction — doing so would call macOS
+        // Keychain synchronously for every configured provider, which can block
+        // indefinitely (e.g. Keychain dialog waiting for user interaction).
+        // Key resolution happens lazily when the provider is first used via route().
+        // A None key means the provider will fail at route() time with a clear
+        // "credential not found" error — far better than hanging silently.
+        Self::create_provider_instance_with_key(name, cfg, None)
+    }
+
+    /// Creates a provider instance with a pre-resolved (possibly None) API key.
+    /// This is the inner implementation — the public-facing [`create_provider_instance`]
+    /// passes `None` to defer resolution, but callers that already have a key
+    /// can bypass resolution.
+    fn create_provider_instance_with_key(
+        _name: &str,
+        cfg: &zen_core::config::ProviderConfig,
+        api_key: Option<String>,
+    ) -> Option<ProviderInstance> {
         let provider_type = cfg.provider_type.as_deref().unwrap_or("openai-compatible");
 
         match provider_type {
@@ -487,7 +505,7 @@ impl DefaultRouter {
             }
             "mock" => Some(ProviderInstance::Mock(MockProvider::default())),
             "anthropic" => {
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let model = cfg
                     .default_model
                     .clone()
@@ -497,7 +515,7 @@ impl DefaultRouter {
                 )))
             }
             "anthropic-compatible" => {
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let base_url = cfg.base_url.clone()?;
                 let model = cfg
                     .default_model
@@ -508,7 +526,7 @@ impl DefaultRouter {
                 ))
             }
             "cohere" => {
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let model = cfg
                     .default_model
                     .clone()
@@ -518,7 +536,7 @@ impl DefaultRouter {
                 )))
             }
             "gemini" => {
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let model = cfg
                     .default_model
                     .clone()
@@ -528,7 +546,7 @@ impl DefaultRouter {
                 )))
             }
             "mistral" => {
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let model = cfg
                     .default_model
                     .clone()
@@ -538,7 +556,7 @@ impl DefaultRouter {
                 )))
             }
             "openai" => {
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let base_url = cfg
                     .base_url
                     .clone()
@@ -552,7 +570,7 @@ impl DefaultRouter {
                 ))
             }
             "openai-compatible" => {
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let base_url = cfg.base_url.clone()?;
                 let model = cfg
                     .default_model
@@ -564,7 +582,7 @@ impl DefaultRouter {
             }
             unknown => {
                 warn!("Unknown provider type '{unknown}', treating as openai-compatible");
-                let api_key = resolve_api_key(cfg, name)?;
+                let api_key = api_key.clone()?;
                 let base_url = cfg.base_url.clone()?;
                 let model = cfg
                     .default_model

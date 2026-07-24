@@ -1,0 +1,21 @@
+[book]
+authors = ["RenYan Wei"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Zenspace — Your Personal AI Agentic Workspace"
+description = "Zenspace is a self-learning knowledge system that builds your wiki, remembers across sessions, and evolves with your decisions. Markdown in, wisdom out."
+
+[preprocessor.admonish]
+assets_version = "3.1.0"
+
+[preprocessor.alerts]
+
+[preprocessor.pagetoc]
+
+[output.html]
+default-theme = "light"
+git-repository-url = "https://github.com/savechina/zenspace"
+git-repository-icon = "fa-github"
+additional-css = ["./theme/pagetoc.css"]
+additional-js = ["./theme/pagetoc.js"]

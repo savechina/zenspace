@@ -33,7 +33,7 @@ struct NoteResponse {
     source: String,
 }
 
-pub fn execute_command(operation: &NoteCommands) -> Result<(), ZenError> {
+pub async fn execute_command(operation: &NoteCommands) -> Result<(), ZenError> {
     match operation {
         NoteCommands::Create {
             content,
@@ -53,6 +53,7 @@ pub fn execute_command(operation: &NoteCommands) -> Result<(), ZenError> {
             let service = NoteService::new();
             let note = service
                 .create_note(content, tag.clone(), src)
+                .await
                 .map_err(|e| ZenError::Service(e.to_string()))?;
 
             if *json {

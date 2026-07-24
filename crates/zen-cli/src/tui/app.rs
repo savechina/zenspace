@@ -1540,7 +1540,11 @@ Use /thinking to show/hide thinking process."#;
             }
         };
         use zen_vault::note::NoteService;
-        match NoteService::new().create_note(content, vec![], "tui") {
+        match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                NoteService::new().create_note(content, vec![], "tui"),
+            )
+        }) {
             Ok(note) => self.push_output(
                 format!("Note created: {} ({})", note.id, note.source),
                 false,

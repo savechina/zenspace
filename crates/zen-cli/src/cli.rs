@@ -270,7 +270,7 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Config { ref operation } => config_command::execute_command(operation),
         Commands::Provider { ref operation } => provider_command::execute_command(operation),
         Commands::Audit { ref operation } => audit_command::execute_command(operation),
-        Commands::Note { ref operation } => note_command::execute_command(operation),
+        Commands::Note { ref operation } => note_command::execute_command(operation).await,
         Commands::Search { ref operation } => search_command::execute_command(operation).await,
         Commands::Similar { ref operation } => similar_command::execute_command(operation),
         Commands::Notion { ref operation } => graph_command::execute_command(operation),
