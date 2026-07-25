@@ -143,23 +143,6 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      # Install x86_64 OpenSSL for cross-compilation (ARM → x86_64)
-      - name: Setup cross-compilation OpenSSL (macOS x86_64)
-        if: contains(join(matrix.targets, ' '), 'x86_64-apple-darwin')
-        run: |
-          # Check if x86_64 Homebrew is available
-          if [ -d "/usr/local/Homebrew" ]; then
-            echo "Using existing x86_64 Homebrew"
-            X86_BREW="/usr/local/bin/brew"
-          else
-            echo "Installing x86_64 Homebrew under Rosetta"
-            /usr/bin/arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-            X86_BREW="/usr/local/bin/brew"
-          fi
-          $X86_BREW install openssl@3
-          echo "OPENSSL_DIR=/usr/local/opt/openssl@3" >> "$GITHUB_ENV"
-          echo "OPENSSL_LIB_DIR=/usr/local/opt/openssl@3/lib" >> "$GITHUB_ENV"
-          echo "OPENSSL_INCLUDE_DIR=/usr/local/opt/openssl@3/include" >> "$GITHUB_ENV"
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

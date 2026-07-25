@@ -16,10 +16,10 @@ jobs:
     strategy:
       matrix:
         os:
-          - macos-13          # mac-x86
-          - macos-latest      # mac-arm
-          - ubuntu-latest     # linux-x86
-          - ubuntu-24.04-arm  # linux-arm
+          - macos-15-intel     # mac-x86
+          - macos-latest       # mac-arm
+          - ubuntu-latest      # linux-x86
+          - ubuntu-24.04-arm   # linux-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Install ripgrep
@@ -39,10 +39,10 @@ jobs:
     strategy:
       matrix:
         os:
-          - macos-13          # mac-x86
-          - macos-latest      # mac-arm
-          - ubuntu-latest     # linux-x86
-          - ubuntu-24.04-arm  # linux-arm
+          - macos-15-intel     # mac-x86
+          - macos-latest       # mac-arm
+          - ubuntu-latest      # linux-x86
+          - ubuntu-24.04-arm   # linux-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - name: Install ripgrep
