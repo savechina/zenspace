@@ -3,6 +3,7 @@ use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
 use std::process::Command;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tracing::warn;
 
 #[derive(Clone)]

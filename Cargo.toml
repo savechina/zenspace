@@ -90,14 +90,14 @@ tui-markdown = { version = "0.3.7", features = ["highlight-code"] }
 ansi-to-tui = "8.0.1"
 
 # HTTP client for LLM providers
-reqwest = { version = "0.13", features = ["json", "blocking", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "blocking", "stream", "rustls"] }
 
 # RSS/Atom feed parsing and HTML-to-markdown conversion
 feed = "2"
 html2md = "0.2"
 
 # WebSocket client for QQ Bot
-tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 # HTTP server for gateway daemon

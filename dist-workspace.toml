@@ -26,6 +26,13 @@ tap = "savechina/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 
+# System dependencies for build
+[dist.dependencies.homebrew]
+openssl = '*'
+
+[dist.dependencies.apt]
+libssl-dev = '*'
+
 # Which binaries to include per target platform
 [dist.binaries]
 "*" = ["zen"]
