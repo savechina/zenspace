@@ -145,7 +145,7 @@ arrow = "59"
 futures = "0.3"
 
 # Fast embed: local ONNX inference for async batch embedding + Rerank pipeline
-fastembed = { version = "5.17" }
+fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "image-models", "ort-load-dynamic"] }
 
 # Plugin system: WASM sandbox + MCP server
 wasmtime = { version = "47", features = ["component-model"] }
