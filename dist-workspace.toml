@@ -27,13 +27,6 @@ tap = "savechina/homebrew-tap"
 publish-jobs = ["homebrew"]
 formula = "zenspace"
 
-# System dependencies for build
-[dist.dependencies.homebrew]
-openssl = '*'
-
-[dist.dependencies.apt]
-libssl-dev = '*'
-
 # Which binaries to include per target platform
 [dist.binaries]
 "*" = ["zen"]

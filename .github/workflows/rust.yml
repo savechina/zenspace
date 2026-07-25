@@ -26,13 +26,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: ripgrep
-      - name: Install OpenSSL (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          brew install openssl@3
-          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include" >> "$GITHUB_ENV"
       - name: Force bfd linker (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: echo "RUSTFLAGS=-D warnings -C link-arg=-fuse-ld=bfd" >> "$GITHUB_ENV"
@@ -56,13 +49,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: ripgrep
-      - name: Install OpenSSL (macOS)
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          brew install openssl@3
-          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          echo "OPENSSL_LIB_DIR=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
-          echo "OPENSSL_INCLUDE_DIR=$(brew --prefix openssl@3)/include" >> "$GITHUB_ENV"
       - name: Force bfd linker (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: echo "RUSTFLAGS=-D warnings -C link-arg=-fuse-ld=bfd" >> "$GITHUB_ENV"

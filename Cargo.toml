@@ -22,7 +22,7 @@ repository = "https://github.com/savechina/zenspace"
 homepage = "https://github.com/savechina/zenspace"
 license = "MIT"
 description = "Zenspace AI Agents productivity suite，个人生产力套件"
-version = "0.0.3"
+version = "0.0.1"
 
 [workspace.dependencies]
 clap = { version = "4.5.39", features = ["derive", "env", "string"] }
@@ -92,8 +92,7 @@ ansi-to-tui = "8.0.1"
 # HTTP client for LLM providers
 reqwest = { version = "0.13", default-features = false, features = ["json", "blocking", "stream", "rustls"] }
 
-# RSS/Atom feed parsing and HTML-to-markdown conversion
-feed = "2"
+# HTML-to-markdown conversion
 html2md = "0.2"
 
 # WebSocket client for QQ Bot
