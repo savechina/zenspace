@@ -37,7 +37,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 thiserror = "2.0.16"
 async-trait = "0.1"
-tera = "1.20.0"
+tera = "2.1"
 include_dir = { version = "0.7.4", features = ["glob", "metadata"] }
 config = "0.15.15"
 anyhow = "1.0.99"
@@ -61,7 +61,7 @@ glob = "0.3.3"
 clap-verbosity-flag = { version = "3.0.4", features = ["tracing"] }
 
 # Scheduler (ZenScheduler — cron expression parsing, D11)
-cron = "0.16"
+cron = "0.17"
 
 # macOS Keychain (FR-061)
 security-framework = "3.0"
@@ -79,7 +79,7 @@ jento-context = { git = "https://github.com/savechina/jento.git", branch = "main
 # TUI (FR-001 — ratatui + crossterm)
 ratatui = "0.30"
 crossterm = "0.29"
-tui-textarea-2 = "0.11"
+tui-textarea-2 = "0.12"
 
 # Syntax highlighting (FR-TUI-022 — syntect + two-face, follows Codex CLI pattern)
 syntect = { version = "5", default-features = false, features = ["default-onig"] }
@@ -97,17 +97,17 @@ feed = "2"
 html2md = "0.2"
 
 # WebSocket client for QQ Bot
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 futures-util = "0.3"
 
 # HTTP server for gateway daemon
 axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # LLM agent orchestration framework
-rig-core = "0.37"
-rig = { version = "0.37", package = "rig-core" }
+rig-core = "0.40"
+rig = { version = "0.40", package = "rig-core" }
 
 # Composable agent kernel: stateless skills, transport-agnostic tools, registry-driven agents
 rig-compose = "0.5"
@@ -125,7 +125,7 @@ rig-tap = "0.3"
 
 # Persistent memory and vector store for Rig agents
 rig-memvid = { version = "0.4.2", features = ["context-projection", "compaction"] }
-rig-sqlite = "0.2.6"
+rig-sqlite = "0.40"
 
 # Utility crates — shared across workspace
 fastrand = "2"
@@ -148,8 +148,8 @@ futures = "0.3"
 fastembed = { version = "5.17" }
 
 # Plugin system: WASM sandbox + MCP server
-wasmtime = "24"
-wasi-common = "24"
+wasmtime = { version = "47", features = ["component-model"] }
+wasmtime-wasi = { version = "47", features = ["p1", "p2", "p3"] }
 
 # Cross-platform system tools
 sysinfo = "0.39"
@@ -159,7 +159,7 @@ time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
 
 # Clipboard (FR-TUI-021 — output auto-copy + paste)
 arboard = "3.6"
-base64 = "0.22"
+base64 = "0.23"
 
 [profile.dist]
 inherits = "release"

@@ -20,6 +20,7 @@ async-trait = { workspace = true }
 rig = { workspace = true }
 rig-compose = { workspace = true }
 fastembed = { workspace = true }
+home = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

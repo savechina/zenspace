@@ -18,7 +18,7 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 home = { workspace = true }
 wasmtime = { workspace = true }
-wasi-common = { workspace = true }
+wasmtime-wasi = { workspace = true }
 rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
 schemars = { workspace = true }

@@ -80,6 +80,30 @@ impl Reindexer {
         self.known_checksums.insert(file_path, checksum);
     }
 
+    /// Rebuild FTS5 indexes via SQLite's standard rebuild command.
+    ///
+    /// Resyncs `notes_fts` and `notions_fts` against their underlying tables
+    /// when sync triggers have drifted (manual SQL edits, partial rollbacks,
+    /// trigger failures). Idempotent: safe to run on healthy tables.
+    /// Required by Constitution Principle XIII #8.
+    pub async fn rebuild_fts_indexes(&self) -> Result<()> {
+        let Some(client) = self.db_client.as_ref() else {
+            return Err(anyhow::anyhow!("rebuild_fts_indexes requires a database client"));
+        };
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO notes_fts(notes_fts) VALUES('rebuild'); \
+                     INSERT INTO notions_fts(notions_fts) VALUES('rebuild');",
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
     /// Walk `knowledge_dir` for `.md` files, decide which need reindexing,
     /// and return a [`ReindexReport`].
     pub async fn reindex(&self, knowledge_dir: &Path) -> Result<ReindexReport> {

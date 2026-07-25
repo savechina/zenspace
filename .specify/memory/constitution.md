@@ -1,8 +1,8 @@
 <!--
 Sync Impact Report:
-- Version: 1.4.0 → 1.5.0 (MINOR - Unified Data Layer Architecture principle added)
+- Version: 1.5.0 → 1.6.0 (MINOR - Data Migration Compatibility principle added)
 - Modified principles: None
-- Added principles: XII. Unified Data Layer Architecture
+- Added principles: XIII. Data Migration Compatibility
 - Removed sections: None
 - Templates requiring updates: None
 - Deferred items: None
@@ -125,6 +125,76 @@ Rationale: Industry best practices reduce maintenance burden, improve reliabilit
 
 Rationale: Unified database eliminates schema sync issues, enables cross-domain queries, and reduces operational complexity. Domain-driven naming improves code readability and maintainability.
 
+### XIII. Data Migration Compatibility
+
+**All schema changes MUST preserve user historical data.** The default is forward-only, additive migration. Destructive operations are forbidden without an explicit, tested backup-restore protocol.
+
+1. **Forward-Only Additive Migrations** — Every schema change MUST be expressible as one of:
+   - `CREATE TABLE IF NOT EXISTS ...` (new table)
+   - `CREATE INDEX IF NOT EXISTS ...` (new index)
+   - `CREATE VIRTUAL TABLE IF NOT EXISTS ...` (new FTS5/vec0)
+   - `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ...` (new column; nullable columns need no default)
+   - `CREATE TRIGGER IF NOT EXISTS ...` (new trigger)
+   Idempotent DDL is mandatory. Every DDL statement MUST be re-runnable without error.
+
+2. **Version Tracking** — Every migration MUST be a numbered file under `crates/zen-repo/migrations/` (`NNN_description.sql`) and applied through `sqlx::migrate!()`. The `_sqlx_migrations` table is the source of truth for what has been applied. No ad-hoc schema mutation outside the migration runner.
+
+3. **Forbidden Without Explicit Exemption**:
+   - `DROP TABLE`
+   - `DROP COLUMN` (and any `ALTER TABLE ... DROP` form)
+   - `DROP INDEX` (except immediately after a same-name `CREATE INDEX` replacement within the same migration, with the rename pattern)
+   - `TRUNCATE`
+   - `DELETE FROM <schema_table>` as part of a migration (operational deletes from application code are separate)
+   These operations destroy data the user cannot recover. If a column or table is no longer used, leave it in place (backward compatibility) — see the `notions.aliases` column precedent in migration 003.
+
+4. **Destructive Migration Protocol (when ALTER is impossible)** — Some changes cannot be expressed additively:
+   - Changing a `vec0` virtual table dimension (vec0 has no `ALTER`)
+   - Changing an `FTS5` virtual table column set (FTS5 has no column-level `ALTER`)
+   - Changing a column type incompatibly (e.g., `TEXT` → `INTEGER`)
+   When unavoidable, the migration MUST follow this exact sequence, all within a single numbered `.sql` file:
+   1. `CREATE TABLE _backup_NNN AS SELECT * FROM <old_table>;` (snapshot)
+   2. `CREATE TABLE <new_table> ...` (or `CREATE VIRTUAL TABLE`)
+   3. `INSERT INTO <new_table> (...) SELECT ... FROM _backup_NNN;` (transform + load)
+   4. `DROP TABLE <old_table>;` (now safe — data is in `_backup_NNN` and `<new_table>`)
+   5. `ALTER TABLE <new_table> RENAME TO <old_table>;`
+   6. Recreate indexes, triggers, FTS5 sync
+   The `_backup_NNN` table MUST be retained (not dropped) until the next migration confirms the cutover succeeded. The migration MUST include a verification `SELECT count(*) FROM <renamed_table>` comment showing expected row count.
+
+5. **Backward Compatibility Window** — When a column or table is deprecated, it MUST remain in the schema for at least one minor release before removal is considered. Application code MUST stop writing to it but continue to tolerate reading it. Removal requires a follow-up migration after the window expires.
+
+6. **Migration Test Verification** — Every new migration file MUST be accompanied by an integration test that:
+   - Seeds a database at the prior schema version with representative data
+   - Applies the new migration
+   - Asserts row counts are preserved (no data loss)
+   - Asserts the new schema elements exist (`PRAGMA table_info`, `SELECT FROM sqlite_master`)
+   - Asserts application queries against the post-migration schema still work
+   The test MUST live in `crates/zen-repo/tests/` and be named `migration_NNN_description.rs`.
+
+7. **Vec0 Dimension Forward-Compatibility** — When declaring `vec0` virtual tables, choose the maximum supported dimension (`FLOAT[4096]`) and handle smaller embedding models via application-layer zero-padding (see `pad_to_dim()` in `zen-vault/src/tindy/embeddings.rs`). This avoids dimension-change migrations entirely. Smaller-dimension tables are a legacy state and MUST be tolerated via `IF NOT EXISTS` (never recreated).
+
+8. **FTS5 Rebuild Capability** — When a migration changes FTS5 sync triggers or underlying columns, the migration MUST include the standard FTS5 rebuild command so any existing rows are reindexed:
+   ```sql
+   INSERT INTO <fts_table>(<fts_table>) VALUES('rebuild');
+   ```
+   This is idempotent and safe to run on a freshly created FTS5 table (no-op).
+
+**Enforcement requirements**:
+- All schema changes MUST go through numbered migration files in `crates/zen-repo/migrations/`
+- `SqliteClient::ensure_schema()` (per Principle XII) MUST run all pending migrations on connect
+- Migration files MUST be reviewed for forbidden statements before merge (CI grep gate recommended)
+- AGENTS.md schema documentation MUST be updated in the same PR that adds or alters tables (documentation drift is a violation)
+- The `migration_NNN_*.rs` integration test MUST pass in CI before the migration ships
+
+**Prohibited patterns**:
+- `DROP TABLE` in a migration without the backup-recreate-reimport sequence above
+- Application code calling `conn.execute("CREATE TABLE ...")` outside the migration runner
+- Skipping the migration test because "the change is trivial"
+- Bumping a vec0 dimension via drop-and-recreate (use application-layer padding instead)
+- Renaming a table without a deprecation alias period (breaks downstream queries)
+- Leaving stale schema docs in AGENTS.md that reference tables/columns that no longer exist or were renamed
+
+Rationale: The knowledge base is the user's accumulated work product. A destructive migration that loses notes, entities, beliefs, or embeddings is not a bug — it is a data loss incident. Additive-only migrations, version tracking, and tested destructive-protocols make "the schema can evolve" a guarantee rather than a hope. The forward-compatibility techniques (max-dim vec0, dead-column tolerance, FTS5 rebuild) cost nothing at write time and eliminate whole classes of future migration pain.
+
 ## Technology Stack
 
 - **Language**: Rust (edition 2024)
@@ -157,4 +227,4 @@ This constitution supersedes all other practices. Amendments require:
 
 All PRs MUST verify compliance with these principles. The AGENTS.md file serves as runtime development guidance.
 
-**Version**: 1.5.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-06-28
+**Version**: 1.6.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-07-25

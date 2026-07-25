@@ -15,19 +15,17 @@ pub struct ZenCompletionResponse {
 }
 
 impl GetTokenUsage for ZenCompletionResponse {
-    fn token_usage(&self) -> Option<Usage> {
+    fn token_usage(&self) -> Usage {
         let n = self.text.len() as u64 / 4; // conservative ~4 chars/token
-        if n == 0 {
-            return None;
-        }
-        Some(Usage {
+        Usage {
             input_tokens: 0,
+            output_tokens: n,
+            total_tokens: n,
             cached_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            output_tokens: n,
+            tool_use_prompt_tokens: 0,
             reasoning_tokens: 0,
-            total_tokens: n,
-        })
+        }
     }
 }
 

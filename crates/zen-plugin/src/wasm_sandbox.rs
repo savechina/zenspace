@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rig_compose::registry::KernelError;
@@ -86,6 +86,56 @@ impl PrecompiledModule {
     }
 }
 
+/// WASI version detected from a compiled wasm module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WasiVersion {
+    /// WASI preview1 — imports from `wasi_snapshot_preview1`
+    P1,
+    /// WASI preview2 core module — imports from `wasi:*` namespaces
+    P2,
+}
+
+/// A compiled wasm binary, either a core module or a component.
+enum CompiledWasm {
+    Core {
+        module: wasmtime::Module,
+        #[allow(dead_code)]
+        version: WasiVersion,
+    },
+    Component {
+        component: wasmtime::component::Component,
+    },
+}
+
+/// Detect the WASI version from a core module's import namespace.
+fn detect_core_version(module: &wasmtime::Module) -> WasiVersion {
+    for import in module.imports() {
+        match import.module() {
+            "wasi_snapshot_preview1" => return WasiVersion::P1,
+            m if m.starts_with("wasi:") => return WasiVersion::P2,
+            _ => {}
+        }
+    }
+    // No WASI imports → safe default
+    WasiVersion::P1
+}
+
+/// Try to compile a wasm binary as either a core module or a component.
+fn compile_wasm(engine: &Engine, wasm_bytes: &[u8]) -> Result<CompiledWasm, WasmSandboxError> {
+    if let Ok(module) = wasmtime::Module::new(engine, wasm_bytes) {
+        let version = detect_core_version(&module);
+        return Ok(CompiledWasm::Core { module, version });
+    }
+
+    if let Ok(component) = wasmtime::component::Component::new(engine, wasm_bytes) {
+        return Ok(CompiledWasm::Component { component });
+    }
+
+    Err(WasmSandboxError::ModuleLoad(
+        "WASM binary is neither a valid core module nor a WASI component".into(),
+    ))
+}
+
 pub struct WasmSandbox {
     engine: Engine,
     limits: ResourceLimits,
@@ -99,7 +149,6 @@ impl WasmSandbox {
     pub fn with_limits(limits: ResourceLimits) -> Self {
         let mut config = Config::new();
         config.consume_fuel(true);
-        config.async_support(true);
 
         let engine = Engine::new(&config).unwrap_or_else(|e| {
             warn!("WASM engine init failed ({e}), falling back to defaults");
@@ -144,10 +193,16 @@ impl WasmSandbox {
     }
 
     pub fn validate_module(&self, wasm_bytes: &[u8]) -> Result<(), WasmSandboxError> {
-        wasmtime::Module::new(&self.engine, wasm_bytes).map_err(|e| {
-            WasmSandboxError::ModuleLoad(format!("WASM module validation failed: {}", e))
-        })?;
-        Ok(())
+        // Accept both core modules and component-model components.
+        if wasmtime::Module::new(&self.engine, wasm_bytes).is_ok() {
+            return Ok(());
+        }
+        if wasmtime::component::Component::new(&self.engine, wasm_bytes).is_ok() {
+            return Ok(());
+        }
+        Err(WasmSandboxError::ModuleLoad(
+            "WASM validation failed: not a valid core module or component".into(),
+        ))
     }
 
     pub async fn execute(
@@ -156,78 +211,85 @@ impl WasmSandbox {
         func_name: &str,
         args: &[String],
     ) -> Result<ExecutionOutput, WasmSandboxError> {
-        use std::io::{Cursor, Write};
+        let compiled = compile_wasm(&self.engine, wasm_bytes)?;
+        match compiled {
+            CompiledWasm::Core { module, version } => {
+                self.execute_core(module, version, func_name, args).await
+            }
+            CompiledWasm::Component { component } => {
+                self.execute_component(component, func_name, args).await
+            }
+        }
+    }
+
+    // ── core module execution (p1 / p2) ──────────────────────────────────
+
+    #[allow(unused_variables)]
+    async fn execute_core(
+        &self,
+        module: wasmtime::Module,
+        version: WasiVersion,
+        func_name: &str,
+        args: &[String],
+    ) -> Result<ExecutionOutput, WasmSandboxError> {
         use std::time::Instant;
+        use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 
         let start = Instant::now();
 
-        let module =
-            wasmtime::Module::new(&self.engine, wasm_bytes).map_err(|e| {
-                WasmSandboxError::ModuleLoad(format!("WASM compile failed: {}", e))
-            })?;
+        let stdout_pipe = MemoryOutputPipe::new(65536);
+        let stderr_pipe = MemoryOutputPipe::new(65536);
 
-        let stdout_buf = Arc::new(Mutex::new(Cursor::new(Vec::<u8>::new())));
-        let stderr_buf = Arc::new(Mutex::new(Cursor::new(Vec::<u8>::new())));
-        let stdout_clone = stdout_buf.clone();
-        let stderr_clone = stderr_buf.clone();
-
-        struct CursorWriter(Arc<Mutex<Cursor<Vec<u8>>>>);
-        impl Write for CursorWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().write(buf)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let mut wasi_builder = wasi_common::sync::WasiCtxBuilder::new();
-        if let Err(e) = wasi_builder.args(args) {
-            warn!(error = ?e, "failed to set WASI arguments");
-        }
-        wasi_builder.stdout(Box::new(wasi_common::pipe::WritePipe::new(CursorWriter(
-            stdout_clone,
-        ))));
-        wasi_builder.stderr(Box::new(wasi_common::pipe::WritePipe::new(CursorWriter(
-            stderr_clone,
-        ))));
-        let wasi_ctx = wasi_builder.build();
+        let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
+        wasi_builder.args(args);
+        wasi_builder.stdout(stdout_pipe.clone());
+        wasi_builder.stderr(stderr_pipe.clone());
+        let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
+        let fuel_budget = (self.limits.max_execution_time_ms as u64)
+            .saturating_mul(1_000_000)
+            .max(10_000_000);
         store
-            .set_fuel(self.limits.max_execution_time_ms / 100)
+            .set_fuel(fuel_budget)
             .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
 
+        // All core modules use the p1 linker (wasi_snapshot_preview1).
+        // Modules with wasi:* namespace imports (P2) will fail at
+        // instantiation with a clear wasmtime error since the p1 linker
+        // doesn't expose those bindings — p2 requires component model
+        // wrapping via wasmtime::component::Linker.
         let mut linker = wasmtime::Linker::new(&self.engine);
-        wasi_common::sync::add_to_linker(&mut linker, |s: &mut wasi_common::WasiCtx| s)
-            .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
+        wasmtime_wasi::p1::add_to_linker_async::<wasmtime_wasi::p1::WasiP1Ctx>(
+            &mut linker,
+            |s| s,
+        )
+        .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
 
         let instance = linker
             .instantiate_async(&mut store, &module)
             .await
             .map_err(|e| WasmSandboxError::Execution(format!("instantiate failed: {}", e)))?;
 
-        let run_func = instance
-            .get_func(&mut store, func_name)
-            .ok_or_else(|| {
-                WasmSandboxError::Execution(format!(
-                    "function '{}' not found in WASM module",
-                    func_name
-                ))
-            })?;
+        let run_func = instance.get_func(&mut store, func_name).ok_or_else(|| {
+            WasmSandboxError::Execution(format!(
+                "function '{}' not found in WASM module",
+                func_name
+            ))
+        })?;
 
         let result = run_func.call_async(&mut store, &[], &mut []).await;
         let elapsed = start.elapsed().as_millis() as u64;
 
         let stdout =
-            String::from_utf8_lossy(stdout_buf.lock().unwrap().get_ref()).into_owned();
+            String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
         let mut stderr =
-            String::from_utf8_lossy(stderr_buf.lock().unwrap().get_ref()).into_owned();
+            String::from_utf8_lossy(&stderr_pipe.contents()).into_owned();
 
         let exit_code = match &result {
             Ok(_) => 0,
             Err(e) => {
-                if let Some(i32_exit) = e.downcast_ref::<wasi_common::I32Exit>() {
+                if let Some(i32_exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                     i32_exit.0
                 } else {
                     use std::fmt::Write as _;
@@ -237,9 +299,86 @@ impl WasmSandbox {
             }
         };
 
-        let fuel_set = self.limits.max_execution_time_ms / 100;
-        let fuel_remaining = store.get_fuel().unwrap_or(fuel_set);
-        let used_fuel = fuel_set.saturating_sub(fuel_remaining);
+        let fuel_remaining = store.get_fuel().unwrap_or(fuel_budget);
+        let used_fuel = fuel_budget.saturating_sub(fuel_remaining);
+
+        Ok(ExecutionOutput {
+            stdout,
+            stderr,
+            exit_code,
+            execution_time_ms: elapsed,
+            memory_used_bytes: used_fuel * 64 * 1024,
+        })
+    }
+
+    // ── component model execution (p3) ───────────────────────────────────
+
+    async fn execute_component(
+        &self,
+        component: wasmtime::component::Component,
+        func_name: &str,
+        args: &[String],
+    ) -> Result<ExecutionOutput, WasmSandboxError> {
+        use std::time::Instant;
+        use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+
+        let start = Instant::now();
+
+        let stdout_pipe = MemoryOutputPipe::new(65536);
+        let stderr_pipe = MemoryOutputPipe::new(65536);
+
+        let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
+        wasi_builder.args(args);
+        wasi_builder.stdout(stdout_pipe.clone());
+        wasi_builder.stderr(stderr_pipe.clone());
+        let wasi_ctx = wasi_builder.build_p1();
+
+        let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
+        let fuel_budget = (self.limits.max_execution_time_ms as u64)
+            .saturating_mul(1_000_000)
+            .max(10_000_000);
+        store
+            .set_fuel(fuel_budget)
+            .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
+
+        let mut linker = wasmtime::component::Linker::new(&self.engine);
+        wasmtime_wasi::p3::add_to_linker::<wasmtime_wasi::p1::WasiP1Ctx>(&mut linker)
+            .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
+
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .map_err(|e| {
+                WasmSandboxError::Execution(format!("component instantiate failed: {}", e))
+            })?;
+
+        let run_func = instance.get_func(&mut store, func_name).ok_or_else(|| {
+            WasmSandboxError::Execution(format!(
+                "function '{}' not found in component",
+                func_name
+            ))
+        })?;
+
+        let result = run_func.call_async(&mut store, &[], &mut []).await;
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        let stdout =
+            String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
+        let mut stderr =
+            String::from_utf8_lossy(&stderr_pipe.contents()).into_owned();
+
+        let exit_code = match &result {
+            Ok(_) => 0,
+            Err(e) => {
+                // Component model doesn't use I32Exit in the same way.
+                use std::fmt::Write as _;
+                let _ = write!(stderr, "{e}");
+                1
+            }
+        };
+
+        let fuel_remaining = store.get_fuel().unwrap_or(fuel_budget);
+        let used_fuel = fuel_budget.saturating_sub(fuel_remaining);
 
         Ok(ExecutionOutput {
             stdout,
@@ -489,6 +628,57 @@ mod tests {
         )
         .unwrap();
         assert!(sandbox.validate_module(&wasm).is_ok());
+    }
+
+    #[test]
+    fn detect_version_p1_wasi_snapshot_preview1() {
+        let sandbox = WasmSandbox::new();
+        // Module importing from wasi_snapshot_preview1 is detected as P1
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "_start"))
+            )
+            "#,
+        )
+        .unwrap();
+        let module = wasmtime::Module::new(sandbox.engine(), &wasm).unwrap();
+        assert_eq!(detect_core_version(&module), WasiVersion::P1);
+    }
+
+    #[test]
+    fn detect_version_p2_wasi_namespace() {
+        let sandbox = WasmSandbox::new();
+        // Module importing from wasi: namespaces is detected as P2
+        // Use a minimal module that just has wasi: prefixed imports
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (import "wasi:io/streams" "read" (func (param i32) (result i32)))
+                (func (export "_start"))
+            )
+            "#,
+        )
+        .unwrap();
+        let module = wasmtime::Module::new(sandbox.engine(), &wasm).unwrap();
+        assert_eq!(detect_core_version(&module), WasiVersion::P2);
+    }
+
+    #[test]
+    fn detect_version_no_imports_defaults_p1() {
+        let sandbox = WasmSandbox::new();
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (func (export "_start"))
+            )
+            "#,
+        )
+        .unwrap();
+        let module = wasmtime::Module::new(sandbox.engine(), &wasm).unwrap();
+        assert_eq!(detect_core_version(&module), WasiVersion::P1);
     }
 
     #[tokio::test]

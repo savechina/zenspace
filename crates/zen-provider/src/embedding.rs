@@ -2,6 +2,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use fastembed::{EmbeddingModel as FastEmbedModel, TextInitOptions};
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use zen_core::config::ZenConfig;
@@ -203,11 +204,43 @@ pub struct LocalFastembedProvider {
     model: Option<String>,
     /// Optional HuggingFace mirror endpoint (e.g., `https://hf-mirror.com`).
     hf_endpoint: Option<String>,
+    /// Cache directory for downloaded model files.
+    /// When `None`, fastembed defaults to `./.fastembed_cache`.
+    cache_dir: Option<PathBuf>,
 }
 
 impl LocalFastembedProvider {
-    pub fn new(model: Option<String>, hf_endpoint: Option<String>) -> Self {
-        Self { model, hf_endpoint }
+    pub fn new(
+        model: Option<String>,
+        hf_endpoint: Option<String>,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            model,
+            hf_endpoint,
+            cache_dir,
+        }
+    }
+
+    /// Resolve the effective cache directory:
+    ///   - configured path (with `~/` expansion) if set,
+    ///   - otherwise `~/.cache/fastembed/` for global sharing across projects.
+    fn effective_cache_dir(&self) -> PathBuf {
+        match &self.cache_dir {
+            Some(dir) => {
+                // Expand leading ~/ to home directory
+                if let Some(rest) = dir.to_str().and_then(|s| s.strip_prefix("~/")) {
+                    home::home_dir()
+                        .map(|h| h.join(rest))
+                        .unwrap_or_else(|| dir.clone())
+                } else {
+                    dir.clone()
+                }
+            }
+            None => home::home_dir()
+                .map(|h| h.join(".cache").join("fastembed"))
+                .unwrap_or_else(|| PathBuf::from(".fastembed_cache")),
+        }
     }
 }
 
@@ -221,15 +254,19 @@ impl EmbeddingProvider for LocalFastembedProvider {
             unsafe { std::env::set_var("HF_ENDPOINT", endpoint) };
         }
 
+        let cache_dir = self.effective_cache_dir();
         let init_options: TextInitOptions = match &self.model {
             Some(name) => {
                 let model =
                     FastEmbedModel::from_str(name).map_err(|e| EmbeddingError::RequestFailed {
                         reason: format!("unknown fastembed model '{name}': {e}"),
                     })?;
-                TextInitOptions::new(model)
+                TextInitOptions::new(model).with_cache_dir(cache_dir)
             }
-            None => Default::default(),
+            None => {
+                let opts: TextInitOptions = Default::default();
+                opts.with_cache_dir(cache_dir)
+            }
         };
 
         let mut embedder = fastembed::TextEmbedding::try_new(init_options).map_err(|e| {
@@ -288,7 +325,8 @@ impl DefaultEmbeddingRouter {
 
                 match local_kind {
                     "fastembed" => {
-                        let p = LocalFastembedProvider::new(model, emb.hf_endpoint.clone());
+                        let cache_dir = emb.cache_dir.as_ref().map(PathBuf::from);
+                        let p = LocalFastembedProvider::new(model, emb.hf_endpoint.clone(), cache_dir);
                         info!(
                             local_provider = "fastembed",
                             model = ?emb.model,
@@ -516,10 +554,12 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_config_creates_empty_router() {
+    fn test_empty_config_creates_default_router() {
         let config = ZenConfig::default();
         let router = DefaultEmbeddingRouter::from_config(&config);
-        assert!(router.providers.is_empty());
+        // Default config creates a local fastembed provider.
+        assert!(!router.providers.is_empty());
+        assert_eq!(router.providers.len(), 1);
     }
 
     #[test]

@@ -203,16 +203,16 @@ async fn test_e2e_m0_m2_m4_consolidation_pipeline() {
     let session_id = "test-e2e-consolidation";
     let store = ConversationStore::with_dir(root.join("sessions"), session_id).unwrap();
     store
-        .append("user", "I should avoid premature optimization and validate requirements first")
+        .append("user", "I completed the requirements review and fixed the premature optimization in the auth module")
         .unwrap();
     store
-        .append("assistant", "Good principle. Let me document this as a learning for the project.")
+        .append("assistant", "Good work. I documented this and updated the project guidelines.")
         .unwrap();
     store
-        .append("user", "Yes, exactly. We need concrete use cases before adding abstraction layers.")
+        .append("user", "Yes. We implemented concrete use cases before designing the abstraction layers.")
         .unwrap();
     store
-        .append("assistant", "Agreed. Validating before optimizing should become a team practice.")
+        .append("assistant", "Agreed. Testing before optimizing has become a solid team practice.")
         .unwrap();
     drop(store);
 

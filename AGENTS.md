@@ -85,9 +85,8 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | zen-cli | CLI library (29 commands, TUI, dispatch) | `crates/zen-cli/` |
 | zen-core | Config layers, error taxonomy, path scoping, constants (13 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
-| zen-repo | Dual API: sqlx repository + rusqlite schema (FTS5, vec0) | `crates/zen-repo/` |
+| zen-repo | Unified data layer: SqliteClient + 9 domain repositories (FTS5, vec0, graph) | `crates/zen-repo/` |
 | zen-vault | 10+ services: note, wiki, 5-tier search, consolidation, lint | `crates/zen-vault/` |
-| zen-memory | Identity context (SOUL.md, MEMORY.md, store, stats) | `crates/zen-memory/` |
 | zen-agents | 13 agents, 4-tier registry, blackboard, QualityPipeline | `crates/zen-agents/` |
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
 | zen-auth | Keychain + SecretRef resolution | `crates/zen-auth/` |
@@ -125,7 +124,7 @@ zen-provider → zen-core
 ### Data Flow
 
 ```
-zen note create → zen-vault (note service) → zen-repo (sqlx repository)
+zen note create → zen-vault (note service) → zen-repo (NotesRepo)
 zen search run  → zen-vault (SearchService) → tier routing → ripgrep/FTS5/vec0/graph/LLM
 zen ingest      → zen-vault (raw directory) → IngestResult → consolidation
 zen consolidate → zen-vault (ConsolidationPipeline) → zen-provider (entity extraction)
@@ -163,14 +162,20 @@ zenspace/
 │   │       ├── sanitize.rs     # Output sanitization
 │   │       └── definition.rs   # AgentDefinition
 │   ├── zen-service/            # Business logic (starter, wps, cleanup)
-│   ├── zen-repo/               # Dual API data layer
+│   ├── zen-repo/               # Unified data layer (SqliteClient + 9 domain repos)
+│   │   ├── migrations/         # sqlx::migrate!() SQL files (001_initial, 002_vec, 003_entity_graph)
 │   │   └── src/
-│   │       ├── pool.rs         # sqlx SqlitePool + create_pool()
-│   │       ├── schema.rs       # sqlx migrations (notes, agent_profiles, audit_logs)
-│   │       ├── repositories.rs # Trait interfaces (NoteRepository, etc.)
-│   │       ├── repo_impl.rs    # sqlx implementations (SqliteNoteRepository)
-│   │       ├── sqlite_repo.rs  # rusqlite wrapper + FTS5/vec0/graph schema
-│   │       └── models.rs       # Note, AgentProfile, AuditLog entities
+│   │       ├── client.rs       # SqliteClient (tokio_rusqlite writer + sqlx pool), run_migrations()
+│   │       ├── types.rs        # Row types + request structs (IndexNoteRequest, InsertRelationshipRequest, etc.)
+│   │       ├── traits/         # Repository trait interfaces (NotionsRepository)
+│   │       ├── notes_repo.rs   # NotesRepo (FTS5 search + index_note)
+│   │       ├── notions_repo.rs # NotionsRepo (entities, relationships, aliases, BFS, PageRank, shortest-path)
+│   │       ├── embeddings_repo.rs # EmbeddingsRepo (vec0 INSERT + similarity search)
+│   │       ├── self_model_repo.rs # SelfModelRepo (self_nodes)
+│   │       ├── goals_repo.rs   # GoalsRepo (goal_nodes, path_nodes)
+│   │       ├── beliefs_repo.rs # BeliefsRepo (Bayesian belief_nodes)
+│   │       ├── dispatch_repo.rs # DispatchRepo (dispatch_tasks queue)
+│   │       └── sessions_repo.rs # SessionsRepo (indexed sessions)
 │   ├── zen-vault/          # 10+ knowledge services
 │   │   └── src/
 │   │       ├── note.rs         # Note, NoteService, frontmatter parsing
@@ -236,12 +241,11 @@ zenspace/
 
 | Task | Location | Notes |
 |------|----------|-------|
-| Add sqlx model | `crates/zen-repo/src/models.rs` + `schema.rs` | Then implement repository trait |
-| Add repository trait | `crates/zen-repo/src/repositories.rs` | Define async trait interface |
-| Implement repository | `crates/zen-repo/src/repo_impl.rs` | SqliteXxxRepository impl |
-| Modify FTS5 schema | `crates/zen-repo/src/sqlite_repo.rs` | init_kb_schema() |
-| Modify vec0 schema | `crates/zen-repo/src/sqlite_repo.rs` | init_vec_schema() |
-| Modify graph schema | `crates/zen-repo/src/sqlite_repo.rs` | init_graph_schema() |
+| Add sqlx migration | `crates/zen-repo/migrations/NNN_name.sql` | Forward-only additive (Principle XIII); ship with `tests/migration_NNN_name.rs` |
+| Modify FTS5 schema | `crates/zen-repo/migrations/NNN_name.sql` | Additive only; use `INSERT INTO <fts>(<fts>) VALUES('rebuild')` when triggers change (Principle XIII #8) |
+| Modify vec0 schema | `crates/zen-repo/migrations/NNN_name.sql` | vec0 has no ALTER — destructive change requires backup-recreate-reimport protocol (Principle XIII #4) |
+| Modify graph schema | `crates/zen-repo/migrations/NNN_name.sql` | ALTER TABLE ADD COLUMN with NOT NULL DEFAULT; deprecated columns stay (Principle XIII #5) |
+| Add repository | `crates/zen-repo/src/<domain>_repo.rs` + export in `lib.rs` | Hold `&SqliteClient`; async methods only (Principle XII) |
 
 ### Knowledge Services
 
@@ -359,9 +363,9 @@ bin/release patch        # Bump version, tag, push
 
 - `SqliteRepo` wraps `rusqlite::Connection` with WAL mode, transactions
 - FTS5 virtual table: `CREATE VIRTUAL TABLE notes_fts USING fts5(...)` with porter tokenizer
-- Embeddings: `vec0` virtual table via sqlite-vec extension (384-dim via ort ONNX)
-- Extension loading: `dlopen` for `libsqlite_vec0.dylib` at runtime
-- Dual API: sqlx for repository CRUD, rusqlite for search/schema operations
+- Embeddings: `vec0` virtual table via sqlite-vec extension (4096-dim max, zero-padded for 384-dim models per Principle XIII #7)
+- Extension loading: `sqlite_vec::sqlite3_vec_init` auto-registered via `sqlite3_auto_extension` at `SqliteClient::open()`
+- Unified data layer: `SqliteClient` (tokio-rusqlite writer + sqlx pool); 9 domain repositories hold `&SqliteClient`
 
 ### Agent Quality Pipeline
 
@@ -420,7 +424,8 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 ## NOTES
 
 - Project uses Rust edition 2024 (stable toolchain, MSRV 1.80+)
-- Gateway/Data crates are active: zen-repo has full sqlx + rusqlite dual API; zen-gateway is still a placeholder
+- zen-repo uses the unified `SqliteClient` (tokio-rusqlite writer + sqlx pool) with 9 domain repositories; zen-gateway is still a placeholder
+- Schema migrations are forward-only additive (Principle XIII); `_sqlx_migrations` tracks applied versions; `sqlx::migrate!()` runs all pending on every `SqliteClient::open()`
 - `docs/specs/001-agentic-foundation/` has extensive architecture docs (~400KB)
 - Karpathy guidelines skill installed at `.opencode/skills/karpathy-guidelines/`
 - zen-llm exists in directory but is not a workspace member (staged for integration)
@@ -436,7 +441,7 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 - Binary/library separation: zen (bin) + zen-cli (lib) architecture documented
 - 29 CLI commands documented with dispatch file paths
 - 5-layer config inheritance model (Default → embedded → global → workspace → env)
-- Dual API data layer: sqlx (repository CRUD) + rusulite (FTS5 + vec0 schema)
+- Unified data layer: `SqliteClient` (tokio-rusqlite writer + sqlx pool); 9 domain repositories (Principle XII)
 - 5-tier search pipeline: ripgrep → FTS5 → vec0 embeddings → entity graph → LLM
 - Provider routing: 13 named providers across 3 protocol types (rig-native, openai-compatible, anthropic-compatible)
 - Agent system: 13 agents in 4 tiers, 3-layer permissions, 4-channel blackboard, QualityPipeline

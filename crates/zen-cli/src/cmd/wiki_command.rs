@@ -24,6 +24,9 @@ pub enum WikiCommands {
         /// Preview actions without modifying anything
         #[arg(short, long)]
         dry_run: bool,
+        /// Rebuild FTS5 indexes only (resync when triggers drift), then exit
+        #[arg(long, help = "Rebuild FTS5 indexes (resync when triggers drift)")]
+        rebuild_fts: bool,
     },
     /// Run the knowledge lint (orphans, broken links, stale claims)
     Lint {
@@ -52,8 +55,28 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             let paths = ZenPaths::detect()?;
             show_wiki_page(&paths.wiki().join("notions"), name)
         }
-        WikiCommands::Reindex { path, dry_run } => {
+        WikiCommands::Reindex {
+            path,
+            dry_run,
+            rebuild_fts,
+        } => {
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
+            let db_path = paths.db().join("state.db");
+            let db_client = zen_repo::SqliteClient::open_lazy(&db_path)
+                .await
+                .map_err(|e| ZenError::Message(format!("Failed to open database: {e}")))?;
+
+            if *rebuild_fts {
+                let reindexer = zen_vault::tindy::Reindexer::with_client(db_client);
+                println!("Rebuilding FTS5 indexes...");
+                reindexer
+                    .rebuild_fts_indexes()
+                    .await
+                    .map_err(|e| ZenError::Message(e.to_string()))?;
+                println!("FTS5 indexes rebuilt.");
+                return Ok(());
+            }
+
             let knowledge_dir = match path {
                 Some(p) => p.clone(),
                 None => paths.vault(),
@@ -68,11 +91,6 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             }
 
             debug!("reindex: path={}", knowledge_dir.display());
-
-            let db_path = paths.db().join("state.db");
-            let db_client = zen_repo::SqliteClient::open_lazy(&db_path)
-                .await
-                .map_err(|e| ZenError::Message(format!("Failed to open database: {e}")))?;
 
             let reindexer = zen_vault::tindy::Reindexer::with_client(db_client);
             println!("Scanning {}...", knowledge_dir.display());

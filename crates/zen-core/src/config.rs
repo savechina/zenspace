@@ -463,6 +463,7 @@ pub struct HistoryConfig {
 /// provider = "local"
 /// local_provider = "fastembed"
 /// model = "BGESmallENV15"
+/// # cache_dir = "~/.cache/fastembed"   # global share across projects
 /// ```
 ///
 /// ```toml
@@ -489,6 +490,11 @@ pub struct EmbeddingsConfig {
     /// HuggingFace mirror endpoint for fastembed model downloads.
     /// Used in China where huggingface.co is blocked (set to "https://hf-mirror.com").
     pub hf_endpoint: Option<String>,
+    /// Cache directory for fastembed model downloads.
+    /// Default: `./.fastembed_cache` (project-local).
+    /// Recommended: `~/.cache/fastembed/` or `~/.zen/.cache/fastembed/` for global sharing.
+    /// Can also be set via `ZEN_EMBEDDINGS_CACHE_DIR` env var.
+    pub cache_dir: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +884,7 @@ fn merge_embeddings(base: EmbeddingsConfig, ov: EmbeddingsConfig) -> EmbeddingsC
         model: str_merge(base.model, ov.model),
         local_provider: str_merge(base.local_provider, ov.local_provider),
         hf_endpoint: str_merge(base.hf_endpoint, ov.hf_endpoint),
+        cache_dir: str_merge(base.cache_dir, ov.cache_dir),
     }
 }
 
@@ -1001,6 +1008,9 @@ fn apply_embeddings_env(emb: &mut EmbeddingsConfig) {
     }
     if let Some(v) = env_str("ZEN_EMBEDDINGS_HF_ENDPOINT") {
         emb.hf_endpoint = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_EMBEDDINGS_CACHE_DIR") {
+        emb.cache_dir = Some(v);
     }
 }
 
