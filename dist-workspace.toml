@@ -25,6 +25,7 @@ github-attestations = true
 tap = "savechina/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+formula = "zenspace"
 
 # System dependencies for build
 [dist.dependencies.homebrew]
