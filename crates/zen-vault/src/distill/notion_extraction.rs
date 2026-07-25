@@ -5,8 +5,8 @@ use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
 use tracing::info;
 
-use crate::notion::{Notion, NotionKind};
 use crate::note::Note;
+use crate::notion::{Notion, NotionKind};
 
 /// Notion extractor — extracts notions from notes.
 ///
@@ -20,16 +20,53 @@ impl NotionExtractor {
     }
 
     const KNOWN_TECHS: &[&str] = &[
-        "rust", "python", "javascript", "typescript", "go", "java", "c++",
-        "react", "vue", "angular", "svelte", "next.js", "node.js",
-        "postgresql", "mysql", "sqlite", "mongodb", "redis",
-        "docker", "kubernetes", "terraform", "aws", "gcp", "azure",
-        "graphql", "rest", "grpc", "websocket",
-        "linux", "macos", "windows",
-        "git", "github", "gitlab",
-        "wasm", "llm", "ai", "ml",
-        "openai", "anthropic", "ollama", "deepseek",
-        "sqlx", "rusqlite", "wasmtime", "rig-core", "rig-compose",
+        "rust",
+        "python",
+        "javascript",
+        "typescript",
+        "go",
+        "java",
+        "c++",
+        "react",
+        "vue",
+        "angular",
+        "svelte",
+        "next.js",
+        "node.js",
+        "postgresql",
+        "mysql",
+        "sqlite",
+        "mongodb",
+        "redis",
+        "docker",
+        "kubernetes",
+        "terraform",
+        "aws",
+        "gcp",
+        "azure",
+        "graphql",
+        "rest",
+        "grpc",
+        "websocket",
+        "linux",
+        "macos",
+        "windows",
+        "git",
+        "github",
+        "gitlab",
+        "wasm",
+        "llm",
+        "ai",
+        "ml",
+        "openai",
+        "anthropic",
+        "ollama",
+        "deepseek",
+        "sqlx",
+        "rusqlite",
+        "wasmtime",
+        "rig-core",
+        "rig-compose",
     ];
 
     /// Extract notions from a single note.
@@ -138,8 +175,7 @@ impl NotionExtractor {
             for tech in Self::KNOWN_TECHS {
                 if content_lower.contains(tech) {
                     let name = capitalize(tech);
-                    let mut notion =
-                        Notion::new(name, NotionKind::Technology, note_id.clone());
+                    let mut notion = Notion::new(name, NotionKind::Technology, note_id.clone());
                     notion.metadata.insert(
                         "extraction_method".to_string(),
                         "skill_heuristic".to_string(),
@@ -296,7 +332,10 @@ mod tests {
         let note = make_note("# Rust Programming\n\nDetails about Rust.");
         let notions = extractor.extract(&note).unwrap();
         let rust_heading = notions.iter().find(|e| e.name == "Rust Programming");
-        assert!(rust_heading.is_some(), "should extract 'Rust Programming' heading");
+        assert!(
+            rust_heading.is_some(),
+            "should extract 'Rust Programming' heading"
+        );
         assert_eq!(rust_heading.unwrap().kind, NotionKind::Technology);
     }
 

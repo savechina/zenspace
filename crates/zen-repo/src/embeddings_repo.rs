@@ -1,5 +1,5 @@
 use crate::client::{Result, SqliteClient, SqliteError};
-use crate::types::{InsertNotionEmbeddingRequest, InsertNoteEmbeddingRequest, VecSearchResult};
+use crate::types::{InsertNoteEmbeddingRequest, InsertNotionEmbeddingRequest, VecSearchResult};
 
 pub struct EmbeddingsRepo<'a> {
     client: &'a SqliteClient,
@@ -28,7 +28,7 @@ impl<'a> EmbeddingsRepo<'a> {
                      CREATE VIRTUAL TABLE IF NOT EXISTS notion_embeddings USING vec0(
                          notion_id TEXT PRIMARY KEY,
                          embedding FLOAT[4096]
-                     );"
+                     );",
                 )?;
                 Ok(())
             })
@@ -36,7 +36,11 @@ impl<'a> EmbeddingsRepo<'a> {
             .map_err(SqliteError::TokioRusqlite)
     }
 
-    pub async fn search(&self, query_embedding: &[f32], top_k: usize) -> Result<Vec<VecSearchResult>> {
+    pub async fn search(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<VecSearchResult>> {
         if query_embedding.is_empty() {
             return Ok(Vec::new());
         }
@@ -64,10 +68,11 @@ impl<'a> EmbeddingsRepo<'a> {
     /// Fetch the stored embedding for a given note ID, if present.
     pub async fn get_note_embedding(&self, note_id: &str) -> Result<Option<Vec<f32>>> {
         let note_id = note_id.to_string();
-        let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT embedding FROM note_embeddings WHERE note_id = ?1")
-            .bind(note_id)
-            .fetch_optional(self.client.pool())
-            .await?;
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT embedding FROM note_embeddings WHERE note_id = ?1")
+                .bind(note_id)
+                .fetch_optional(self.client.pool())
+                .await?;
 
         match row {
             None => Ok(None),
@@ -106,7 +111,10 @@ impl<'a> EmbeddingsRepo<'a> {
         Ok(())
     }
 
-    pub async fn insert_entity_embedding(&self, req: InsertNotionEmbeddingRequest<'_>) -> Result<()> {
+    pub async fn insert_entity_embedding(
+        &self,
+        req: InsertNotionEmbeddingRequest<'_>,
+    ) -> Result<()> {
         let notion_id = req.notion_id.to_string();
         let blob: Vec<u8> = req
             .embedding

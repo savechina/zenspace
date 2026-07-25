@@ -77,10 +77,7 @@ pub trait NotionGraphProvider: Send + Sync {
 
     async fn insert_alias(&self, alias: &str, canonical_notion_id: &str) -> anyhow::Result<()>;
 
-    async fn find_entity_by_name(
-        &self,
-        name: &str,
-    ) -> anyhow::Result<Option<NotionSummary>>;
+    async fn find_entity_by_name(&self, name: &str) -> anyhow::Result<Option<NotionSummary>>;
 
     async fn apply_confidence_decay(&self, half_life_days: f64) -> anyhow::Result<usize>;
 

@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use zen_core::notion_graph::{NotionGraphProvider, NotionSummary, ImportanceScore, SimpleNotion};
+use zen_core::notion_graph::{ImportanceScore, NotionGraphProvider, NotionSummary, SimpleNotion};
 use zen_repo::SqliteClient;
 
 use super::notion::NotionKind;

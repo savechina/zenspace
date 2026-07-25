@@ -59,7 +59,8 @@ pub async fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
                 .await
                 .map_err(|e| ZenError::Message(format!("Database error: {}", e)))?;
 
-            let existing_results = search_existing_content(topic, &wiki_dir, router.clone(), &client).await;
+            let existing_results =
+                search_existing_content(topic, &wiki_dir, router.clone(), &client).await;
 
             let prompt = build_research_prompt(topic, &existing_results);
 

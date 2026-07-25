@@ -104,10 +104,7 @@ impl ConversationStore {
                 )
             })?;
         file.sync_all().with_context(|| {
-            format!(
-                "failed to fsync session file: {}",
-                self.file_path.display()
-            )
+            format!("failed to fsync session file: {}", self.file_path.display())
         })?;
 
         debug!(

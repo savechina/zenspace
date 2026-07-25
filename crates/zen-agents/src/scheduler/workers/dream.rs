@@ -53,7 +53,9 @@ impl ZenWorker for DreamWorker {
                 Ok(client) => {
                     let adapter = zen_vault::NotionGraphAdapter::from_client(client);
                     Some(std::sync::Arc::new(adapter)
-                        as std::sync::Arc<dyn zen_core::notion_graph::NotionGraphProvider>)
+                        as std::sync::Arc<
+                            dyn zen_core::notion_graph::NotionGraphProvider,
+                        >)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to open state.db for dream cycle");

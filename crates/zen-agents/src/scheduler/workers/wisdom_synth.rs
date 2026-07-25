@@ -262,8 +262,17 @@ Respond with ONLY a JSON object:
 
         let suggestions_dir = paths.vault().join("wiki/wisdom/suggestions");
         fs::create_dir_all(&suggestions_dir)?;
-        let suggestion_path = suggestions_dir.join(format!("{date_str}.md", date_str = Utc::now().format("%Y-%m-%d")));
-        if let Err(e) = write_suggestions(&suggestion_path, &models, &anti_patterns, &positive_patterns, &belief_updates) {
+        let suggestion_path = suggestions_dir.join(format!(
+            "{date_str}.md",
+            date_str = Utc::now().format("%Y-%m-%d")
+        ));
+        if let Err(e) = write_suggestions(
+            &suggestion_path,
+            &models,
+            &anti_patterns,
+            &positive_patterns,
+            &belief_updates,
+        ) {
             warn!(path = %suggestion_path.display(), error = %e, "failed to write synthesis suggestions");
         } else {
             info!(path = %suggestion_path.display(), "wisdom synthesis suggestions written");
@@ -463,8 +472,12 @@ fn promote_anti_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
 
 fn promote_positive_patterns(vault: &Path, candidates: &[Value]) -> Result<usize> {
     let pp_dir = vault.join("wiki/wisdom/positive-patterns");
-    fs::create_dir_all(&pp_dir)
-        .with_context(|| format!("failed to create positive-patterns dir: {}", pp_dir.display()))?;
+    fs::create_dir_all(&pp_dir).with_context(|| {
+        format!(
+            "failed to create positive-patterns dir: {}",
+            pp_dir.display()
+        )
+    })?;
 
     let mut count = 0usize;
     let date_str = Utc::now().format("%Y-%m-%d").to_string();
@@ -472,7 +485,9 @@ fn promote_positive_patterns(vault: &Path, candidates: &[Value]) -> Result<usize
     for pp in candidates {
         let pattern_name = pp["pattern"].as_str().unwrap_or("unknown-pattern");
         let trigger = pp["trigger"].as_str().unwrap_or("unknown trigger");
-        let reinforcement = pp["reinforcement"].as_str().unwrap_or("unknown reinforcement");
+        let reinforcement = pp["reinforcement"]
+            .as_str()
+            .unwrap_or("unknown reinforcement");
 
         let slug = slugify(pattern_name);
         let file_path = pp_dir.join(format!("{slug}.md"));
@@ -489,8 +504,9 @@ fn promote_positive_patterns(vault: &Path, candidates: &[Value]) -> Result<usize
             )
         };
 
-        fs::write(&file_path, &content)
-            .with_context(|| format!("failed to write positive-pattern: {}", file_path.display()))?;
+        fs::write(&file_path, &content).with_context(|| {
+            format!("failed to write positive-pattern: {}", file_path.display())
+        })?;
         count += 1;
         debug!(pattern = pattern_name, path = %file_path.display(), "promoted positive-pattern");
     }

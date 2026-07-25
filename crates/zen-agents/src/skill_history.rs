@@ -36,7 +36,9 @@ impl SkillHistory {
     }
 
     pub fn log_execution(&self, record: SkillExecutionRecord) -> anyhow::Result<()> {
-        let path = self.history_dir.join(format!("{}-history.jsonl", record.skill_name));
+        let path = self
+            .history_dir
+            .join(format!("{}-history.jsonl", record.skill_name));
 
         if !self.history_dir.is_dir() {
             fs::create_dir_all(&self.history_dir)?;
@@ -102,7 +104,10 @@ impl SkillHistory {
             .iter()
             .filter_map(|r| r.quality_rating.map(u64::from))
             .sum();
-        let quality_count = history.iter().filter(|r| r.quality_rating.is_some()).count();
+        let quality_count = history
+            .iter()
+            .filter(|r| r.quality_rating.is_some())
+            .count();
         let avg_quality = if quality_count > 0 {
             quality_sum as f64 / quality_count as f64
         } else {

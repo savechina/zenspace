@@ -230,16 +230,16 @@ impl ZenScheduler {
         for (id, worker, ctx) in to_fire {
             {
                 let costs = self.worker_costs.read().unwrap();
-                if let Some(&cost) = costs.get(&id) {
-                    if cost >= self.cost_cap_usd {
-                        warn!(
-                            worker = %id,
-                            cost = cost,
-                            cap = self.cost_cap_usd,
-                            "scheduler: skipping worker (monthly LLM cost cap exceeded)"
-                        );
-                        continue;
-                    }
+                if let Some(&cost) = costs.get(&id)
+                    && cost >= self.cost_cap_usd
+                {
+                    warn!(
+                        worker = %id,
+                        cost = cost,
+                        cap = self.cost_cap_usd,
+                        "scheduler: skipping worker (monthly LLM cost cap exceeded)"
+                    );
+                    continue;
                 }
             }
             let cost_cap = self.cost_cap_usd;
@@ -368,16 +368,22 @@ pub fn create_default_scheduler() -> ZenScheduler {
     // ── Critical workers: failure panics (memory pipeline broken without them) ──
     scheduler
         .register(SessionJournaler::new())
-        .unwrap_or_else(|e| panic!("FATAL: critical worker 'session-journaler' failed to register: {e}"));
-    scheduler
-        .register(DreamWorker::new())
-        .unwrap_or_else(|e| panic!("FATAL: critical worker 'dream-worker' failed to register: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("FATAL: critical worker 'session-journaler' failed to register: {e}")
+        });
+    scheduler.register(DreamWorker::new()).unwrap_or_else(|e| {
+        panic!("FATAL: critical worker 'dream-worker' failed to register: {e}")
+    });
     scheduler
         .register(MemoryCurator::new())
-        .unwrap_or_else(|e| panic!("FATAL: critical worker 'memory-curator' failed to register: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("FATAL: critical worker 'memory-curator' failed to register: {e}")
+        });
     scheduler
         .register(MemvidIndexerWorker::new())
-        .unwrap_or_else(|e| panic!("FATAL: critical worker 'memvid-indexer' failed to register: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("FATAL: critical worker 'memvid-indexer' failed to register: {e}")
+        });
 
     // ── Non-critical workers: failure warns (system continues with reduced capability) ──
     if let Err(e) = scheduler.register(SubconsciousWorker::new()) {

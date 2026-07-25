@@ -81,11 +81,7 @@ pub fn execute_command(cmd: &GoalCommands) -> Result<(), ZenError> {
             println!("{}", format!("Goal '{}'", goal.name).bold());
             println!("  Target:    {}", goal.target);
             println!("  Status:    {}", goal.status);
-            println!(
-                "  Progress:  {:.0}{}",
-                goal.progress * 100.0,
-                "%".green()
-            );
+            println!("  Progress:  {:.0}{}", goal.progress * 100.0, "%".green());
             if let Some(ref deadline) = goal.deadline {
                 println!("  Deadline:  {deadline}");
             }
@@ -98,7 +94,10 @@ pub fn execute_command(cmd: &GoalCommands) -> Result<(), ZenError> {
         GoalCommands::List => {
             let goals = service.load_goals()?;
             if goals.is_empty() {
-                println!("No goals defined. Use {} to add one.", "zen goal set".dimmed());
+                println!(
+                    "No goals defined. Use {} to add one.",
+                    "zen goal set".dimmed()
+                );
                 return Ok(());
             }
 
@@ -131,11 +130,7 @@ pub fn execute_command(cmd: &GoalCommands) -> Result<(), ZenError> {
 
         GoalCommands::Complete { name } => {
             service.complete_goal(name)?;
-            println!(
-                "{} Completed goal '{}'",
-                "✓".green().bold(),
-                name.cyan()
-            );
+            println!("{} Completed goal '{}'", "✓".green().bold(), name.cyan());
             Ok(())
         }
     }

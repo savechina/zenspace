@@ -2,15 +2,15 @@ use anyhow::Result;
 use std::collections::HashSet;
 
 use zen_repo::{
-    BeliefsRepo, NotionsRepo, GoalsRepo, SelfModelRepo, SqliteClient,
+    BeliefsRepo, GoalsRepo, NotionsRepo, SelfModelRepo, SqliteClient,
     types::{
         InsertRelationshipRequest, UpsertBeliefNodeRequest, UpsertGoalNodeRequest,
         UpsertPathNodeRequest,
     },
 };
 
-use crate::tindy::compute_embeddings_for_text;
 use crate::search::Tier3Search;
+use crate::tindy::compute_embeddings_for_text;
 
 use super::notion::{Notion, NotionKind};
 use super::relationship::{RelationKind, Relationship};
@@ -166,10 +166,7 @@ impl NotionService {
                     source_notion_id: notions[i].id.clone(),
                     target_notion_id: notions[j].id.clone(),
                     relation_type: RelationKind::RelatedTo,
-                    description: format!(
-                        "{} relates to {}",
-                        notions[i].name, notions[j].name
-                    ),
+                    description: format!("{} relates to {}", notions[i].name, notions[j].name),
                     source_note_id: notions[i].source_note_id.clone(),
                     created_at: now,
                 });
@@ -202,7 +199,8 @@ impl NotionService {
 
         if let Some(canonical_id) = existing_canonical {
             // Alias found — just update last_updated on the canonical notion
-            repo.update_entity_timestamp(&canonical_id, &last_updated).await?;
+            repo.update_entity_timestamp(&canonical_id, &last_updated)
+                .await?;
             return Ok(());
         }
 
@@ -227,7 +225,11 @@ impl NotionService {
 
     /// Insert a relationship into graph.db.
     /// Confidence defaults to 0.8 for auto-extracted edges.
-    pub async fn insert_relationship(&self, client: &SqliteClient, rel: &Relationship) -> Result<()> {
+    pub async fn insert_relationship(
+        &self,
+        client: &SqliteClient,
+        rel: &Relationship,
+    ) -> Result<()> {
         let type_str = format!("{:?}", rel.relation_type);
         let created = rel.created_at.to_rfc3339();
 
@@ -333,9 +335,7 @@ impl NotionService {
             .metadata
             .insert("layer".to_string(), layer.to_string());
         if let Some(d) = domain {
-            notion
-                .metadata
-                .insert("domain".to_string(), d.to_string());
+            notion.metadata.insert("domain".to_string(), d.to_string());
         }
         self.upsert_entity(client, &notion).await
     }
@@ -424,9 +424,7 @@ impl NotionService {
     ) -> Result<()> {
         let mut notion = Notion::new(name, NotionKind::Decision, "decision-model");
         notion.id = id.to_string();
-        notion
-            .metadata
-            .insert("goal".to_string(), goal.to_string());
+        notion.metadata.insert("goal".to_string(), goal.to_string());
         notion
             .metadata
             .insert("choice".to_string(), choice.to_string());
@@ -530,8 +528,12 @@ impl NotionService {
             .await?;
 
         // Create ServesGoal relationship from this path to the goal
-        if let Some(goal) = goal_entities.iter().find(|e| e.name == normalize_notion_name(serves_goal)) {
-            let rel = Relationship::new(id, goal.id.clone(), RelationKind::ServesGoal, "path-model");
+        if let Some(goal) = goal_entities
+            .iter()
+            .find(|e| e.name == normalize_notion_name(serves_goal))
+        {
+            let rel =
+                Relationship::new(id, goal.id.clone(), RelationKind::ServesGoal, "path-model");
             self.insert_relationship(client, &rel).await?;
         }
 
@@ -557,7 +559,15 @@ impl NotionService {
         id: &str,
     ) -> Result<Option<(String, String, bool, f64, String)>> {
         let row = GoalsRepo::new(client).load_path(id).await?;
-        Ok(row.map(|r| (r.name, r.serves_goal_id.unwrap_or_default(), r.is_default, r.crowdedness, r.alternatives)))
+        Ok(row.map(|r| {
+            (
+                r.name,
+                r.serves_goal_id.unwrap_or_default(),
+                r.is_default,
+                r.crowdedness,
+                r.alternatives,
+            )
+        }))
     }
 
     /// Loads all goal nodes from the goal_nodes table.
@@ -566,7 +576,10 @@ impl NotionService {
         client: &SqliteClient,
     ) -> Result<Vec<(String, String, f64, String, Option<String>)>> {
         let rows = GoalsRepo::new(client).load_all_goals().await?;
-        Ok(rows.into_iter().map(|r| (r.id, r.name, r.controllability, r.core_pursuit, r.deadline)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.id, r.name, r.controllability, r.core_pursuit, r.deadline))
+            .collect())
     }
 
     /// Loads all path nodes from the path_nodes table.
@@ -575,7 +588,19 @@ impl NotionService {
         client: &SqliteClient,
     ) -> Result<Vec<(String, String, Option<String>, bool, f64, String)>> {
         let rows = GoalsRepo::new(client).load_all_paths().await?;
-        Ok(rows.into_iter().map(|r| (r.id, r.name, r.serves_goal_id, r.is_default, r.crowdedness, r.alternatives)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.id,
+                    r.name,
+                    r.serves_goal_id,
+                    r.is_default,
+                    r.crowdedness,
+                    r.alternatives,
+                )
+            })
+            .collect())
     }
 
     /// Loads a belief node from the belief_nodes table.
@@ -586,7 +611,15 @@ impl NotionService {
         id: &str,
     ) -> Result<Option<(String, String, f64, f64, usize)>> {
         let row = BeliefsRepo::new(client).load(id).await?;
-        Ok(row.map(|r| (r.name, r.proposition, r.prior, r.posterior, r.evidence_count as usize)))
+        Ok(row.map(|r| {
+            (
+                r.name,
+                r.proposition,
+                r.prior,
+                r.posterior,
+                r.evidence_count as usize,
+            )
+        }))
     }
 }
 
@@ -613,7 +646,10 @@ mod tests {
         // Combining accent (U+0301) vs precomposed (U+00E9) → same NFC output
         let combining = "cafe\u{0301}";
         let precomposed = "caf\u{00E9}";
-        assert_eq!(normalize_notion_name(combining), normalize_notion_name(precomposed));
+        assert_eq!(
+            normalize_notion_name(combining),
+            normalize_notion_name(precomposed)
+        );
     }
 
     #[tokio::test]
@@ -625,12 +661,20 @@ mod tests {
         let service = NotionService::new();
 
         // Create first notion with name "Rust"
-        let mut entity1 = Notion::new("Rust", super::super::notion::NotionKind::Technology, "note1");
+        let mut entity1 = Notion::new(
+            "Rust",
+            super::super::notion::NotionKind::Technology,
+            "note1",
+        );
         entity1.id = "notion-rust-1".to_string();
         service.upsert_entity(&client, &entity1).await.unwrap();
 
         // Create second notion with name "rust" — should resolve to the same notion
-        let mut entity2 = Notion::new("rust", super::super::notion::NotionKind::Technology, "note2");
+        let mut entity2 = Notion::new(
+            "rust",
+            super::super::notion::NotionKind::Technology,
+            "note2",
+        );
         entity2.id = "notion-rust-2".to_string();
         service.upsert_entity(&client, &entity2).await.unwrap();
 
@@ -736,13 +780,7 @@ mod tests {
         let service = NotionService::new();
 
         service
-            .upsert_self_model_entity(
-                &client,
-                "sm-2",
-                "Curiosity",
-                "Trait",
-                None,
-            )
+            .upsert_self_model_entity(&client, "sm-2", "Curiosity", "Trait", None)
             .await
             .unwrap();
 
@@ -808,7 +846,14 @@ mod tests {
         let service = NotionService::new();
 
         service
-            .upsert_goal_node(&client, "g-1", "Learn Rust", 0.8, "mastery", Some("2026-12-31"))
+            .upsert_goal_node(
+                &client,
+                "g-1",
+                "Learn Rust",
+                0.8,
+                "mastery",
+                Some("2026-12-31"),
+            )
             .await
             .unwrap();
 
@@ -844,7 +889,14 @@ mod tests {
         let service = NotionService::new();
 
         service
-            .upsert_goal_node(&client, "g-3", "Run Marathon", 0.9, "fitness", Some("2027-06-01"))
+            .upsert_goal_node(
+                &client,
+                "g-3",
+                "Run Marathon",
+                0.9,
+                "fitness",
+                Some("2027-06-01"),
+            )
             .await
             .unwrap();
 
@@ -889,7 +941,15 @@ mod tests {
             .unwrap();
 
         service
-            .upsert_path_node(&client, "p-1", "Online Courses", "Learn Rust", true, 0.3, "")
+            .upsert_path_node(
+                &client,
+                "p-1",
+                "Online Courses",
+                "Learn Rust",
+                true,
+                0.3,
+                "",
+            )
             .await
             .unwrap();
 
@@ -912,11 +972,22 @@ mod tests {
             .await
             .unwrap();
         service
-            .upsert_path_node(&client, "p-2", "Cooking Classes", "Master Cooking", false, 0.8, "")
+            .upsert_path_node(
+                &client,
+                "p-2",
+                "Cooking Classes",
+                "Master Cooking",
+                false,
+                0.8,
+                "",
+            )
             .await
             .unwrap();
 
-        let rels = service.load_relationships_for_entity(&client, "p-2").await.unwrap();
+        let rels = service
+            .load_relationships_for_entity(&client, "p-2")
+            .await
+            .unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].1, RelationKind::ServesGoal);
         assert_eq!(rels[0].0, "master cooking");
@@ -930,7 +1001,15 @@ mod tests {
         let service = NotionService::new();
 
         service
-            .upsert_path_node(&client, "p-3", "Mentorship", "Nonexistent Goal", true, 0.5, "")
+            .upsert_path_node(
+                &client,
+                "p-3",
+                "Mentorship",
+                "Nonexistent Goal",
+                true,
+                0.5,
+                "",
+            )
             .await
             .unwrap();
 
@@ -938,7 +1017,10 @@ mod tests {
         assert_eq!(notions.len(), 1);
         assert_eq!(notions[0].kind, NotionKind::Path);
 
-        let rels = service.load_relationships_for_entity(&client, "p-3").await.unwrap();
+        let rels = service
+            .load_relationships_for_entity(&client, "p-3")
+            .await
+            .unwrap();
         assert!(rels.is_empty());
     }
 
@@ -970,17 +1052,29 @@ mod tests {
 
     #[test]
     fn test_new_relation_types_display() {
-        use crate::notion::relationship::{parse_relation_type, RelationKind};
+        use crate::notion::relationship::{RelationKind, parse_relation_type};
 
         assert_eq!(RelationKind::ServesGoal.to_string(), "serves_goal");
         assert_eq!(RelationKind::AlternativeTo.to_string(), "alternative_to");
         assert_eq!(RelationKind::DecidedAbout.to_string(), "decided_about");
         assert_eq!(RelationKind::CorrectedBy.to_string(), "corrected_by");
 
-        assert_eq!(parse_relation_type("serves_goal"), Some(RelationKind::ServesGoal));
-        assert_eq!(parse_relation_type("alternative_to"), Some(RelationKind::AlternativeTo));
-        assert_eq!(parse_relation_type("decided_about"), Some(RelationKind::DecidedAbout));
-        assert_eq!(parse_relation_type("corrected_by"), Some(RelationKind::CorrectedBy));
+        assert_eq!(
+            parse_relation_type("serves_goal"),
+            Some(RelationKind::ServesGoal)
+        );
+        assert_eq!(
+            parse_relation_type("alternative_to"),
+            Some(RelationKind::AlternativeTo)
+        );
+        assert_eq!(
+            parse_relation_type("decided_about"),
+            Some(RelationKind::DecidedAbout)
+        );
+        assert_eq!(
+            parse_relation_type("corrected_by"),
+            Some(RelationKind::CorrectedBy)
+        );
         assert_eq!(parse_relation_type("bogus"), None);
     }
 
@@ -1037,14 +1131,7 @@ mod tests {
         let service = NotionService::new();
 
         service
-            .upsert_decision_node(
-                &client,
-                "d-2",
-                "Pick Language",
-                "Write CLI",
-                "Rust",
-                None,
-            )
+            .upsert_decision_node(&client, "d-2", "Pick Language", "Write CLI", "Rust", None)
             .await
             .unwrap();
 
@@ -1110,11 +1197,27 @@ mod tests {
         let service = NotionService::new();
 
         service
-            .upsert_belief_node(&client, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
+            .upsert_belief_node(
+                &client,
+                "b-2",
+                "TS is safe",
+                "TypeScript catches bugs",
+                0.5,
+                0.8,
+                5,
+            )
             .await
             .unwrap();
         service
-            .upsert_belief_node(&client, "b-2", "TS is safe", "TypeScript catches bugs", 0.5, 0.8, 5)
+            .upsert_belief_node(
+                &client,
+                "b-2",
+                "TS is safe",
+                "TypeScript catches bugs",
+                0.5,
+                0.8,
+                5,
+            )
             .await
             .unwrap();
 
@@ -1126,12 +1229,9 @@ mod tests {
 
     #[test]
     fn test_new_relation_types_extracted_from_and_supports() {
-        use crate::notion::relationship::{parse_relation_type, RelationKind};
+        use crate::notion::relationship::{RelationKind, parse_relation_type};
 
-        assert_eq!(
-            RelationKind::ExtractedFrom.to_string(),
-            "extracted_from"
-        );
+        assert_eq!(RelationKind::ExtractedFrom.to_string(), "extracted_from");
         assert_eq!(RelationKind::Supports.to_string(), "supports");
 
         assert_eq!(
@@ -1178,7 +1278,10 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "sn-1");
         assert_eq!(loaded[0].name, "knows GTD");
-        assert_eq!(loaded[0].layer, crate::notion::self_node::SelfModelLayer::Knowledge);
+        assert_eq!(
+            loaded[0].layer,
+            crate::notion::self_node::SelfModelLayer::Knowledge
+        );
         assert_eq!(loaded[0].is_explicit, Some(true));
         assert_eq!(loaded[0].confidence, 0.9);
         assert_eq!(loaded[0].source, "fact");
@@ -1215,7 +1318,10 @@ mod tests {
         service.upsert_self_node(&client, &s1).await.unwrap();
 
         let knowledge = service
-            .load_self_nodes_by_layer(&client, &crate::notion::self_node::SelfModelLayer::Knowledge)
+            .load_self_nodes_by_layer(
+                &client,
+                &crate::notion::self_node::SelfModelLayer::Knowledge,
+            )
             .await
             .unwrap();
         assert_eq!(knowledge.len(), 2);
@@ -1252,5 +1358,3 @@ mod tests {
         assert_eq!(loaded[0].optionality_count, None);
     }
 }
-
-

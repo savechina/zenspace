@@ -219,8 +219,7 @@ impl JournalEntryState {
             migrated = true;
         }
 
-        if migrated
-            && let Err(e) = state.save(md_path) {
+        if migrated && let Err(e) = state.save(md_path) {
             tracing::warn!(error = %e, path = %md_path.display(), "failed to save migrated marker state");
         }
         migrated

@@ -92,7 +92,9 @@ fn parse_skill_file(name: &str, content: &str) -> anyhow::Result<SkillDefinition
     // Find the opening `---`
     let after_open = trimmed
         .strip_prefix("---")
-        .ok_or_else(|| anyhow::anyhow!("skill file '{name}' missing opening --- frontmatter delimiter"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("skill file '{name}' missing opening --- frontmatter delimiter")
+        })?
         .trim_start();
 
     // Find the closing `---`
@@ -246,12 +248,22 @@ mod tests {
         let skills_dir = dir.path();
 
         // Create some skill files
-        fs::write(skills_dir.join("alpha.md"), "---\nname: alpha\ndescription: A test\n---\nBody").unwrap();
-        fs::write(skills_dir.join("beta.md"), "---\nname: beta\ndescription: B test\n---\nBody").unwrap();
+        fs::write(
+            skills_dir.join("alpha.md"),
+            "---\nname: alpha\ndescription: A test\n---\nBody",
+        )
+        .unwrap();
+        fs::write(
+            skills_dir.join("beta.md"),
+            "---\nname: beta\ndescription: B test\n---\nBody",
+        )
+        .unwrap();
         // Non-.md file should be ignored
         fs::write(skills_dir.join("gamma.txt"), "not a skill").unwrap();
 
-        let loader = SkillLoader { skills_dir: skills_dir.to_path_buf() };
+        let loader = SkillLoader {
+            skills_dir: skills_dir.to_path_buf(),
+        };
         let mut skills = loader.list_skills().unwrap();
 
         skills.sort();
@@ -278,13 +290,18 @@ This is the skill body in Markdown."#;
 
         fs::write(skills_dir.join("weekly-review.md"), skill_content).unwrap();
 
-        let loader = SkillLoader { skills_dir: skills_dir.to_path_buf() };
+        let loader = SkillLoader {
+            skills_dir: skills_dir.to_path_buf(),
+        };
         let skill = loader.load_skill("weekly-review").unwrap();
 
         assert_eq!(skill.name, "weekly-review");
         assert_eq!(skill.description, "Run a weekly knowledge review");
         assert_eq!(skill.tools, vec!["search", "wiki"]);
-        assert_eq!(skill.context_files, vec![PathBuf::from("wiki/review-template.md")]);
+        assert_eq!(
+            skill.context_files,
+            vec![PathBuf::from("wiki/review-template.md")]
+        );
         assert_eq!(skill.prompt, "Review the past week...");
         assert!(skill.body.contains("# Skill body"));
     }

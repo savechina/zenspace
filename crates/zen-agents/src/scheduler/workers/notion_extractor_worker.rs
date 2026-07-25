@@ -10,7 +10,7 @@ use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_provider::{DefaultRouter, LlmRouterExt};
-use zen_vault::notion::{Notion, NotionService, NotionKind};
+use zen_vault::notion::{Notion, NotionKind, NotionService};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
@@ -91,7 +91,10 @@ impl ZenWorker for NotionExtractorWorker {
 
         let entries = scan_journal_entries(&journal_dir)?;
         if entries.is_empty() {
-            debug!("no journal entries found in {}, nothing to extract", journal_dir.display());
+            debug!(
+                "no journal entries found in {}, nothing to extract",
+                journal_dir.display()
+            );
             return Ok(WorkerReport {
                 worker_id: self.id().to_string(),
                 success: true,
@@ -117,7 +120,10 @@ impl ZenWorker for NotionExtractorWorker {
         };
         let svc = NotionService::new();
 
-        let mut known = svc.load_known_notion_names(&client).await.unwrap_or_default();
+        let mut known = svc
+            .load_known_notion_names(&client)
+            .await
+            .unwrap_or_default();
         for kw in TECH_KEYWORDS {
             known.insert((*kw).to_string());
         }
@@ -159,7 +165,10 @@ impl ZenWorker for NotionExtractorWorker {
                 "notion-extractor tick complete"
             );
         } else {
-            debug!("notion-extractor tick: {} entries scanned, none needed processing (all previously extracted or empty)", entries.len());
+            debug!(
+                "notion-extractor tick: {} entries scanned, none needed processing (all previously extracted or empty)",
+                entries.len()
+            );
         }
 
         Ok(WorkerReport {

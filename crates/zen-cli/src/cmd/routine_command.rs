@@ -56,13 +56,22 @@ pub async fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
                         })
                     })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&json_arr).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_arr).unwrap_or_default()
+                );
             } else {
-                println!("{:<15} {:<22} {:<7} DESCRIPTION", "WORKER", "SCHEDULE", "ENABLED");
+                println!(
+                    "{:<15} {:<22} {:<7} DESCRIPTION",
+                    "WORKER", "SCHEDULE", "ENABLED"
+                );
                 println!("{}", "-".repeat(80));
                 for w in &workers {
                     let status = if w.enabled { "✓" } else { "✗" };
-                    println!("{:<15} {:<22} {:<7} {}", w.id, w.schedule, status, w.description);
+                    println!(
+                        "{:<15} {:<22} {:<7} {}",
+                        w.id, w.schedule, status, w.description
+                    );
                 }
                 println!("\n{} worker(s) registered.", workers.len());
             }
@@ -94,11 +103,9 @@ pub async fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
                     println!("✓ Worker '{name}' enabled");
                     Ok(())
                 }
-                Err(_) => {
-                    Err(ZenError::Message(format!(
-                        "worker '{name}' not registered — run `zen routine list` to see registered workers"
-                    )))
-                }
+                Err(_) => Err(ZenError::Message(format!(
+                    "worker '{name}' not registered — run `zen routine list` to see registered workers"
+                ))),
             }
         }
 
@@ -109,11 +116,9 @@ pub async fn execute_command(cmd: &RoutineCommands) -> Result<(), ZenError> {
                     println!("✓ Worker '{name}' disabled");
                     Ok(())
                 }
-                Err(_) => {
-                    Err(ZenError::Message(format!(
-                        "worker '{name}' not registered — run `zen routine list` to see registered workers"
-                    )))
-                }
+                Err(_) => Err(ZenError::Message(format!(
+                    "worker '{name}' not registered — run `zen routine list` to see registered workers"
+                ))),
             }
         }
     }

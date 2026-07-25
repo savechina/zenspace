@@ -50,7 +50,10 @@ pub fn execute_command(cmd: &HabitCommands) -> Result<(), ZenError> {
         HabitCommands::List => {
             let habits = service.load_habits()?;
             if habits.is_empty() {
-                println!("No habits defined. Use {} to add one.", "zen habit add".dimmed());
+                println!(
+                    "No habits defined. Use {} to add one.",
+                    "zen habit add".dimmed()
+                );
                 return Ok(());
             }
 
@@ -95,11 +98,7 @@ pub fn execute_command(cmd: &HabitCommands) -> Result<(), ZenError> {
                 println!("  Target:     {target}");
             }
             println!("  Streak:     {} days", streak.to_string().green());
-            println!(
-                "  Completion: {:.0}% (last {} days)",
-                rate * 100.0,
-                days
-            );
+            println!("  Completion: {:.0}% (last {} days)", rate * 100.0, days);
             println!("  Check-ins:  {}", checkins.len());
 
             Ok(())
@@ -129,11 +128,7 @@ pub fn execute_command(cmd: &HabitCommands) -> Result<(), ZenError> {
 
         HabitCommands::Remove { name } => {
             service.remove_habit(name)?;
-            println!(
-                "{} Removed habit '{}'",
-                "✓".green().bold(),
-                name.cyan()
-            );
+            println!("{} Removed habit '{}'", "✓".green().bold(), name.cyan());
             Ok(())
         }
     }

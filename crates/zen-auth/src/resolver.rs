@@ -18,7 +18,10 @@ fn keychain_known_unavailable(service: &str) -> bool {
 }
 
 fn mark_keychain_unavailable(service: &str) {
-    KEYCHAIN_UNAVAILABLE.lock().unwrap().insert(service.to_string());
+    KEYCHAIN_UNAVAILABLE
+        .lock()
+        .unwrap()
+        .insert(service.to_string());
 }
 
 pub fn resolve_secret_ref(ref_: &SecretRef) -> Result<String, AuthError> {

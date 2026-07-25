@@ -2,8 +2,8 @@ use std::path::Path;
 use std::sync::Once;
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use tokio_rusqlite::Connection;
 use thiserror::Error;
+use tokio_rusqlite::Connection;
 
 #[derive(Debug, Error)]
 pub enum SqliteError {
@@ -28,9 +28,9 @@ fn register_sqlite_vec() {
     REGISTER_VEC_EXTENSION.call_once(|| {
         #[allow(clippy::missing_transmute_annotations)]
         unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(
-                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()),
-            ));
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
         }
     });
 }
@@ -76,9 +76,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
                 );
                 Ok(())
             } else {
-                Err(SqliteError::Sqlx(sqlx::Error::Io(
-                    std::io::Error::other(msg),
-                )))
+                Err(SqliteError::Sqlx(sqlx::Error::Io(std::io::Error::other(
+                    msg,
+                ))))
             }
         }
     }

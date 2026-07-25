@@ -268,8 +268,7 @@ impl VirtueLog {
     pub fn from_markdown(content: &str) -> Result<Self, VirtueLogError> {
         let fm = extract_frontmatter(content)
             .ok_or_else(|| VirtueLogError::Parse("missing frontmatter".into()))?;
-        let id =
-            parse_field(&fm, "id").ok_or_else(|| VirtueLogError::MissingField("id".into()))?;
+        let id = parse_field(&fm, "id").ok_or_else(|| VirtueLogError::MissingField("id".into()))?;
         let virtue_slug = parse_field(&fm, "virtue")
             .ok_or_else(|| VirtueLogError::MissingField("virtue".into()))?;
         let virtue = VirtueDomain::from_slug(&virtue_slug)
@@ -289,8 +288,8 @@ impl VirtueLog {
         let streak: u32 = parse_field(&fm, "streak")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let date_str = parse_field(&fm, "date")
-            .ok_or_else(|| VirtueLogError::MissingField("date".into()))?;
+        let date_str =
+            parse_field(&fm, "date").ok_or_else(|| VirtueLogError::MissingField("date".into()))?;
         let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
             .map_err(|e| VirtueLogError::Parse(format!("invalid date: {e}")))?;
         let created_at = parse_field(&fm, "created_at")

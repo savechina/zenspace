@@ -22,7 +22,9 @@ use super::render::normalize_compact_markdown;
 use super::session_picker::SessionPickerState;
 use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::MarkdownStreamCollector;
-use super::theme::{OutputTheme, ZenTheme, auto_select as theme_auto_select, from_name as theme_from_name};
+use super::theme::{
+    OutputTheme, ZenTheme, auto_select as theme_auto_select, from_name as theme_from_name,
+};
 use zen_memory::conversation::ConversationStore;
 use zen_memory::history::HistoryStore;
 
@@ -458,11 +460,17 @@ impl App {
             String::from(" Select: ↑↓/jk nav · y yank · Esc exit ")
         };
         let (border_char, title) = match mode {
-            InputMode::Default => (">", String::from(" Input (Enter=send, Ctrl+D=exit, Ctrl+X=cmd) ")),
+            InputMode::Default => (
+                ">",
+                String::from(" Input (Enter=send, Ctrl+D=exit, Ctrl+X=cmd) "),
+            ),
             InputMode::Paste => ("|", String::from(" Paste ")),
             InputMode::History => ("←", String::from(" History (↑↓ browse, Enter=load) ")),
             InputMode::Selection => ("▐", cell_info),
-            InputMode::Command => ("⌘", String::from(" Command (v=select · j/k=scroll · Esc=back) ")),
+            InputMode::Command => (
+                "⌘",
+                String::from(" Command (v=select · j/k=scroll · Esc=back) "),
+            ),
         };
         let bg_style = ratatui::style::Style::default().bg(self.theme.bg());
         let block = Block::default()
@@ -1186,8 +1194,9 @@ Use /thinking to show/hide thinking process."#;
                 }
 
                 if let Some(done_result) = result.done_result {
-                    self.output
-                        .retain(|c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")));
+                    self.output.retain(
+                        |c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")),
+                    );
                     if let Some(pos) = self.output.iter().position(|cell| {
                         matches!(cell, OutputCell::Plain(p) if p.text.contains("Thinking..."))
                     }) {
@@ -1563,9 +1572,11 @@ Use /thinking to show/hide thinking process."#;
         };
         use zen_vault::note::NoteService;
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                NoteService::new().create_note(content, vec![], "tui"),
-            )
+            tokio::runtime::Handle::current().block_on(NoteService::new().create_note(
+                content,
+                vec![],
+                "tui",
+            ))
         }) {
             Ok(note) => self.push_output(
                 format!("Note created: {} ({})", note.id, note.source),

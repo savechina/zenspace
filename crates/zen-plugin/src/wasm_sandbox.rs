@@ -247,7 +247,8 @@ impl WasmSandbox {
         let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
-        let fuel_budget = self.limits
+        let fuel_budget = self
+            .limits
             .max_execution_time_ms
             .saturating_mul(1_000_000)
             .max(10_000_000);
@@ -261,11 +262,8 @@ impl WasmSandbox {
         // doesn't expose those bindings — p2 requires component model
         // wrapping via wasmtime::component::Linker.
         let mut linker = wasmtime::Linker::new(&self.engine);
-        wasmtime_wasi::p1::add_to_linker_async::<wasmtime_wasi::p1::WasiP1Ctx>(
-            &mut linker,
-            |s| s,
-        )
-        .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
+        wasmtime_wasi::p1::add_to_linker_async::<wasmtime_wasi::p1::WasiP1Ctx>(&mut linker, |s| s)
+            .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
 
         let instance = linker
             .instantiate_async(&mut store, &module)
@@ -282,10 +280,8 @@ impl WasmSandbox {
         let result = run_func.call_async(&mut store, &[], &mut []).await;
         let elapsed = start.elapsed().as_millis() as u64;
 
-        let stdout =
-            String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
-        let mut stderr =
-            String::from_utf8_lossy(&stderr_pipe.contents()).into_owned();
+        let stdout = String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
+        let mut stderr = String::from_utf8_lossy(&stderr_pipe.contents()).into_owned();
 
         let exit_code = match &result {
             Ok(_) => 0,
@@ -335,7 +331,8 @@ impl WasmSandbox {
         let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
-        let fuel_budget = self.limits
+        let fuel_budget = self
+            .limits
             .max_execution_time_ms
             .saturating_mul(1_000_000)
             .max(10_000_000);
@@ -355,19 +352,14 @@ impl WasmSandbox {
             })?;
 
         let run_func = instance.get_func(&mut store, func_name).ok_or_else(|| {
-            WasmSandboxError::Execution(format!(
-                "function '{}' not found in component",
-                func_name
-            ))
+            WasmSandboxError::Execution(format!("function '{}' not found in component", func_name))
         })?;
 
         let result = run_func.call_async(&mut store, &[], &mut []).await;
         let elapsed = start.elapsed().as_millis() as u64;
 
-        let stdout =
-            String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
-        let mut stderr =
-            String::from_utf8_lossy(&stderr_pipe.contents()).into_owned();
+        let stdout = String::from_utf8_lossy(&stdout_pipe.contents()).into_owned();
+        let mut stderr = String::from_utf8_lossy(&stderr_pipe.contents()).into_owned();
 
         let exit_code = match &result {
             Ok(_) => 0,
@@ -399,8 +391,7 @@ impl Default for WasmSandbox {
 }
 
 const NAME: &str = "plugin.wasm_sandbox";
-const DESCRIPTION: &str =
-    "Execute WASM plugin in sandboxed environment with permission gating";
+const DESCRIPTION: &str = "Execute WASM plugin in sandboxed environment with permission gating";
 
 static ARGS_SCHEMA: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
     json!({
@@ -575,7 +566,11 @@ mod tests {
     #[test]
     fn wasm_sandbox_creation() {
         let sandbox = WasmSandbox::new();
-        assert!(sandbox.validate_module(&wat::parse_str("(module)").unwrap()).is_ok());
+        assert!(
+            sandbox
+                .validate_module(&wat::parse_str("(module)").unwrap())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -606,14 +601,22 @@ mod tests {
         let perms = WasmPermissions::default();
         assert!(sandbox.check_permission(&perms, "network").is_err());
         assert!(sandbox.check_permission(&perms, "filesystem:read").is_err());
-        assert!(sandbox.check_permission(&perms, "filesystem:write").is_err());
+        assert!(
+            sandbox
+                .check_permission(&perms, "filesystem:write")
+                .is_err()
+        );
         assert!(sandbox.check_permission(&perms, "system").is_err());
     }
 
     #[test]
     fn validate_module_rejects_garbage() {
         let sandbox = WasmSandbox::new();
-        assert!(sandbox.validate_module(&[0x00, 0x61, 0x73, 0x6d, 0xff]).is_err());
+        assert!(
+            sandbox
+                .validate_module(&[0x00, 0x61, 0x73, 0x6d, 0xff])
+                .is_err()
+        );
     }
 
     #[test]

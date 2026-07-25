@@ -75,11 +75,8 @@ pub trait NotionsRepository {
 
     async fn search_notions_fts(&self, query: &str) -> Result<Vec<NotionRow>>;
 
-    async fn bfs_search(
-        &self,
-        notion_name: &str,
-        max_depth: u32,
-    ) -> Result<Vec<GraphSearchResult>>;
+    async fn bfs_search(&self, notion_name: &str, max_depth: u32)
+    -> Result<Vec<GraphSearchResult>>;
 
     async fn bfs_search_filtered(
         &self,

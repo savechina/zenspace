@@ -64,7 +64,12 @@ impl WikiStructure {
     /// Create all wiki subdirectories.
     pub fn ensure_directories(&self) -> Result<()> {
         let dirs = [
-            "sources", "notions/technology", "notions/concepts", "coding", "research", "reports",
+            "sources",
+            "notions/technology",
+            "notions/concepts",
+            "coding",
+            "research",
+            "reports",
             "topics",
         ];
         for dir in &dirs {

@@ -97,24 +97,28 @@ impl MemvidIndexer {
     /// mtime are re-indexed. Falls back to `index_all()` if the checksum file
     /// is missing or unreadable.
     pub fn index_incremental(&self, store: &mut ZenMemvidStore) -> Result<MemvidIndexReport> {
-        let checksum_path = self.workspace_root.join("memories").join(".index-checksums.json");
+        let checksum_path = self
+            .workspace_root
+            .join("memories")
+            .join(".index-checksums.json");
         let previous = load_checksums(&checksum_path);
 
         if previous.is_empty() {
             info!("memvid: no previous checksums, falling back to full index_all");
             let report = self.index_all(store)?;
-            save_checksums(&checksum_path, &collect_current_checksums(&self.workspace_root)?);
+            save_checksums(
+                &checksum_path,
+                &collect_current_checksums(&self.workspace_root)?,
+            );
             return Ok(report);
         }
 
         let current = collect_current_checksums(&self.workspace_root)?;
         let changed: Vec<PathBuf> = current
             .iter()
-            .filter(|(path, mtime)| {
-                match previous.get(*path) {
-                    Some(prev_mtime) => **mtime != *prev_mtime,
-                    None => true,
-                }
+            .filter(|(path, mtime)| match previous.get(*path) {
+                Some(prev_mtime) => **mtime != *prev_mtime,
+                None => true,
             })
             .map(|(path, _)| path.clone())
             .collect();
@@ -146,8 +150,8 @@ impl MemvidIndexer {
     }
 
     fn index_single_file(&self, store: &mut ZenMemvidStore, path: &Path) -> Result<usize> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         if content.trim().is_empty() {
             return Ok(0);
         }
@@ -165,7 +169,10 @@ impl MemvidIndexer {
                 continue;
             }
             let label = format!("[{}] {}", chunk.header, chunk.text.trim());
-            if store.persist_structured_turn(&session_id, "system", &label).is_ok() {
+            if store
+                .persist_structured_turn(&session_id, "system", &label)
+                .is_ok()
+            {
                 indexed += 1;
             }
         }
@@ -433,8 +440,14 @@ fn collect_current_checksums(workspace_root: &Path) -> Result<ChecksumMap> {
     let dirs = [
         workspace_root.join("memories").join("journal"),
         workspace_root.join("wiki").join("notions"),
-        workspace_root.join("wiki").join("wisdom").join("reflections"),
-        workspace_root.join("wiki").join("wisdom").join("anti-patterns"),
+        workspace_root
+            .join("wiki")
+            .join("wisdom")
+            .join("reflections"),
+        workspace_root
+            .join("wiki")
+            .join("wisdom")
+            .join("anti-patterns"),
         workspace_root.join("wiki").join("wisdom").join("models"),
     ];
     for dir in &dirs {
@@ -442,14 +455,14 @@ fn collect_current_checksums(workspace_root: &Path) -> Result<ChecksumMap> {
             continue;
         }
         for path in list_md_files(dir)? {
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if let Ok(mtime) = meta.modified() {
-                    let mtime_ms = mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    map.insert(path, mtime_ms);
-                }
+            if let Ok(meta) = std::fs::metadata(&path)
+                && let Ok(mtime) = meta.modified()
+            {
+                let mtime_ms = mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                map.insert(path, mtime_ms);
             }
         }
     }

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
-use zen_core::paths::ZenPaths;
 use zen_core::notion_graph::{NotionGraphProvider, SimpleNotion};
+use zen_core::paths::ZenPaths;
 
 // ─── ExtractedSignals — Typed signals from session conversations ─────────
 
@@ -431,9 +431,7 @@ pub fn update_memory_from_facts(
     // - "Reflection" → skip (ReflectionWorker handles Stop-Doing/Continue-Doing ledgers)
     // - Everything else → "## Recent Wisdom" (default)
     if source == "Reflection" {
-        debug!(
-            "skipping MEMORY.md write for Reflection source — ReflectionWorker handles ledgers"
-        );
+        debug!("skipping MEMORY.md write for Reflection source — ReflectionWorker handles ledgers");
         return Ok(false);
     }
     let section_header = if source == "Commitment" {
@@ -664,13 +662,19 @@ async fn run_graph_maintenance(
         .apply_confidence_decay(30.0)
         .await
         .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
-    debug!(decayed, "run_graph_maintenance: applied confidence decay (30-day half-life)");
+    debug!(
+        decayed,
+        "run_graph_maintenance: applied confidence decay (30-day half-life)"
+    );
 
     let promoted = graph
         .auto_promote_entities(3)
         .await
         .map_err(|e| DreamError::KnowledgeGraphPersist(e.to_string()))?;
-    debug!(promoted, "run_graph_maintenance: auto-promoted notions (access_count >= 3)");
+    debug!(
+        promoted,
+        "run_graph_maintenance: auto-promoted notions (access_count >= 3)"
+    );
 
     let top_entities = graph
         .compute_importance(40, 0.85)
@@ -680,14 +684,15 @@ async fn run_graph_maintenance(
             warn!(error = %e, "run_graph_maintenance: PageRank computation failed, returning empty");
             Vec::new()
         });
-    debug!(top = top_entities.len(), "run_graph_maintenance: computed PageRank importance");
+    debug!(
+        top = top_entities.len(),
+        "run_graph_maintenance: computed PageRank importance"
+    );
 
     Ok((decayed, promoted, top_entities))
 }
 
-fn parse_entity_file(
-    path: &std::path::Path,
-) -> Result<(String, String, Vec<String>), DreamError> {
+fn parse_entity_file(path: &std::path::Path) -> Result<(String, String, Vec<String>), DreamError> {
     let content = fs::read_to_string(path).map_err(DreamError::Io)?;
 
     let mut in_frontmatter = false;
@@ -717,10 +722,7 @@ fn parse_entity_file(
         DreamError::WikiCompile(format!("missing 'name' in frontmatter: {}", path.display()))
     })?;
     let kind = kind_str.ok_or_else(|| {
-        DreamError::WikiCompile(format!(
-            "missing 'kind' in frontmatter: {}",
-            path.display()
-        ))
+        DreamError::WikiCompile(format!("missing 'kind' in frontmatter: {}", path.display()))
     })?;
 
     let aliases: Vec<String> = aliases_str

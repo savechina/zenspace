@@ -160,8 +160,16 @@ mod tests {
         ).unwrap();
 
         let results = vec![
-            SearchResult { file: work_file.clone(), line: 1, content: "work".to_string() },
-            SearchResult { file: personal_file.clone(), line: 1, content: "personal".to_string() },
+            SearchResult {
+                file: work_file.clone(),
+                line: 1,
+                content: "work".to_string(),
+            },
+            SearchResult {
+                file: personal_file.clone(),
+                line: 1,
+                content: "personal".to_string(),
+            },
         ];
 
         let filtered = filter_by_domain(results, "work").unwrap();
@@ -169,8 +177,16 @@ mod tests {
         assert_eq!(filtered[0].file, work_file);
 
         let results2 = vec![
-            SearchResult { file: work_file, line: 1, content: "work".to_string() },
-            SearchResult { file: personal_file, line: 1, content: "personal".to_string() },
+            SearchResult {
+                file: work_file,
+                line: 1,
+                content: "work".to_string(),
+            },
+            SearchResult {
+                file: personal_file,
+                line: 1,
+                content: "personal".to_string(),
+            },
         ];
         let filtered2 = filter_by_domain(results2, "personal").unwrap();
         assert_eq!(filtered2.len(), 1);

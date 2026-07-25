@@ -190,8 +190,7 @@ impl Feedback {
     pub fn from_markdown(content: &str) -> Result<Self, FeedbackError> {
         let fm = extract_frontmatter(content)
             .ok_or_else(|| FeedbackError::Parse("missing frontmatter".into()))?;
-        let id =
-            parse_field(&fm, "id").ok_or_else(|| FeedbackError::MissingField("id".into()))?;
+        let id = parse_field(&fm, "id").ok_or_else(|| FeedbackError::MissingField("id".into()))?;
         let source = parse_field(&fm, "source")
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();

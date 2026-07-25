@@ -42,20 +42,18 @@ fn get_embedding_router() -> &'static DefaultEmbeddingRouter {
 
 #[cfg(not(test))]
 fn get_embedding_router() -> &'static DefaultEmbeddingRouter {
-    EMBEDDING_ROUTER.get_or_init(|| {
-        match zen_core::config::load_config() {
-            Ok(config) => {
-                let router = DefaultEmbeddingRouter::from_config(config);
-                info!(
-                    providers = router.list_providers().len(),
-                    "Embedding router initialized from config"
-                );
-                router
-            }
-            Err(e) => {
-                warn!("Failed to load config for embedding router: {e}");
-                DefaultEmbeddingRouter::with_providers(vec![])
-            }
+    EMBEDDING_ROUTER.get_or_init(|| match zen_core::config::load_config() {
+        Ok(config) => {
+            let router = DefaultEmbeddingRouter::from_config(config);
+            info!(
+                providers = router.list_providers().len(),
+                "Embedding router initialized from config"
+            );
+            router
+        }
+        Err(e) => {
+            warn!("Failed to load config for embedding router: {e}");
+            DefaultEmbeddingRouter::with_providers(vec![])
         }
     })
 }
@@ -78,7 +76,10 @@ fn compute_embedding_with_fallback(text: &str) -> Vec<f32> {
     let router = get_embedding_router();
 
     if let Ok(embedding) = router.embed_sync(text) {
-        info!("ComputeEmbeddings: provider returns {}-dim", embedding.len());
+        info!(
+            "ComputeEmbeddings: provider returns {}-dim",
+            embedding.len()
+        );
         return pad_to_dim(&embedding, SYSTEM_EMBEDDING_DIM);
     }
 

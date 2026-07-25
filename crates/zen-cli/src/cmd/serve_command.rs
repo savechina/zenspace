@@ -260,8 +260,7 @@ fn run_foreground(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<
     write_pid(path).ok();
 
     let zen_config = zen_core::config::load_config()?;
-    let scheduler =
-        zen_agents::scheduler::create_configured_scheduler(&zen_config.cron);
+    let scheduler = zen_agents::scheduler::create_configured_scheduler(&zen_config.cron);
     tokio::spawn(async move {
         scheduler.run().await;
     });

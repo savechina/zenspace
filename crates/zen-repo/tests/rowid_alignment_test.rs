@@ -82,7 +82,11 @@ async fn insert_or_replace_preserves_fts_rowid_alignment() {
     );
 
     let hits_second = notes.search("alpha", 10).await.unwrap();
-    assert_eq!(hits_second.len(), 1, "search must still resolve after REPLACE");
+    assert_eq!(
+        hits_second.len(),
+        1,
+        "search must still resolve after REPLACE"
+    );
     assert_eq!(
         hits_second[0].path, "/second.md",
         "search must return the replaced file_path"

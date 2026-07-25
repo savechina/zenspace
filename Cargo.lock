@@ -9999,7 +9999,7 @@ dependencies = [
 
 [[package]]
 name = "zen"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "dotenvy",
  "tempfile",
@@ -10010,7 +10010,7 @@ dependencies = [
 
 [[package]]
 name = "zen-agents"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10046,7 +10046,7 @@ dependencies = [
 
 [[package]]
 name = "zen-auth"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "security-framework",
@@ -10059,7 +10059,7 @@ dependencies = [
 
 [[package]]
 name = "zen-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -10106,7 +10106,7 @@ dependencies = [
 
 [[package]]
 name = "zen-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10133,7 +10133,7 @@ dependencies = [
 
 [[package]]
 name = "zen-gateway"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -10161,7 +10161,7 @@ dependencies = [
 
 [[package]]
 name = "zen-memory"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10182,7 +10182,7 @@ dependencies = [
 
 [[package]]
 name = "zen-plugin"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10210,7 +10210,7 @@ dependencies = [
 
 [[package]]
 name = "zen-provider"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10233,7 +10233,7 @@ dependencies = [
 
 [[package]]
 name = "zen-repo"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "chrono 0.4.45",
@@ -10253,7 +10253,7 @@ dependencies = [
 
 [[package]]
 name = "zen-service"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "chrono 0.4.45",
@@ -10277,7 +10277,7 @@ dependencies = [
 
 [[package]]
 name = "zen-vault"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -90,7 +90,9 @@ impl<M: CompletionModel> AgentHook<M> for ZenHook {
                     );
                     Flow::cont()
                 }
-                StepEvent::ToolCall { tool_name, args, .. } => {
+                StepEvent::ToolCall {
+                    tool_name, args, ..
+                } => {
                     let tool_name_owned = tool_name.to_owned();
                     let allowed = allowed_tools.contains(tool_name);
                     let confidential = sensitivity == Sensitivity::Confidential;
@@ -146,7 +148,10 @@ impl<M: CompletionModel> AgentHook<M> for ZenHook {
     }
 
     fn observes(&self, kind: StepEventKind) -> bool {
-        matches!(kind, StepEventKind::CompletionCall | StepEventKind::ToolCall)
+        matches!(
+            kind,
+            StepEventKind::CompletionCall | StepEventKind::ToolCall
+        )
     }
 }
 

@@ -763,7 +763,10 @@ fn merge_providers(
                 existing.api_key = v.api_key.clone().or(existing.api_key.clone());
                 existing.api_key_env = v.api_key_env.clone().or(existing.api_key_env.clone());
                 existing.default_model = v.default_model.clone().or(existing.default_model.clone());
-                existing.embedding_model = v.embedding_model.clone().or(existing.embedding_model.clone());
+                existing.embedding_model = v
+                    .embedding_model
+                    .clone()
+                    .or(existing.embedding_model.clone());
                 existing.wire_api = v.wire_api.clone().or(existing.wire_api.clone());
                 existing.models = merge_models(existing.models.clone(), v.models.clone());
             })

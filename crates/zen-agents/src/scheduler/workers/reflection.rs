@@ -604,8 +604,12 @@ fn write_positive_patterns(reflections_dir: &Path, candidates: &[Value]) -> Resu
         .map(|p| p.join("positive-patterns"))
         .unwrap_or_else(|| reflections_dir.join("../positive-patterns"));
 
-    fs::create_dir_all(&pp_dir)
-        .with_context(|| format!("failed to create positive-patterns dir: {}", pp_dir.display()))?;
+    fs::create_dir_all(&pp_dir).with_context(|| {
+        format!(
+            "failed to create positive-patterns dir: {}",
+            pp_dir.display()
+        )
+    })?;
 
     let mut count = 0usize;
     let date_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -613,7 +617,9 @@ fn write_positive_patterns(reflections_dir: &Path, candidates: &[Value]) -> Resu
     for pp in candidates {
         let pattern_name = pp["pattern"].as_str().unwrap_or("unknown-pattern");
         let trigger = pp["trigger"].as_str().unwrap_or("unknown trigger");
-        let reinforcement = pp["reinforcement"].as_str().unwrap_or("unknown reinforcement");
+        let reinforcement = pp["reinforcement"]
+            .as_str()
+            .unwrap_or("unknown reinforcement");
         let refs = pp["evidence_refs"]
             .as_array()
             .map(|arr| {
@@ -639,8 +645,9 @@ fn write_positive_patterns(reflections_dir: &Path, candidates: &[Value]) -> Resu
             )
         };
 
-        fs::write(&file_path, &content)
-            .with_context(|| format!("failed to write positive-pattern: {}", file_path.display()))?;
+        fs::write(&file_path, &content).with_context(|| {
+            format!("failed to write positive-pattern: {}", file_path.display())
+        })?;
         count += 1;
         debug!(pattern = pattern_name, path = %file_path.display(), "wrote positive-pattern candidate");
     }

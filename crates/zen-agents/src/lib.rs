@@ -20,10 +20,10 @@ pub mod review;
 pub mod safety_hook;
 pub mod sandbox;
 pub mod scheduler;
-pub mod wiring;
-pub mod zen_agent;
 pub mod skill_history;
 pub mod skill_loader;
+pub mod wiring;
+pub mod zen_agent;
 pub mod zen_skill;
 
 pub use agent_profile::{

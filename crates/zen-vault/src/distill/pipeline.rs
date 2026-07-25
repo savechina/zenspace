@@ -16,7 +16,6 @@ use super::wiki_compile::WikiCompiler;
 use crate::note::{Note, parse_frontmatter};
 use crate::wiki::WikiPage;
 
-
 #[derive(Debug, Clone)]
 pub struct DistillationReport {
     pub notes_processed: usize,
@@ -91,10 +90,9 @@ pub fn auto_link_wikilinks(content: &str, known_entities: &[String]) -> String {
             if remaining_lower.starts_with(&entity_lower) {
                 // Ensure word boundary
                 let end = i + entity.len();
-                let before_ok = i == 0
-                    || !result.as_bytes()[i - 1].is_ascii_alphanumeric();
-                let after_ok = end >= result.len()
-                    || !result.as_bytes()[end].is_ascii_alphanumeric();
+                let before_ok = i == 0 || !result.as_bytes()[i - 1].is_ascii_alphanumeric();
+                let after_ok =
+                    end >= result.len() || !result.as_bytes()[end].is_ascii_alphanumeric();
 
                 if before_ok && after_ok {
                     new_result.push_str(&format!("[[{entity}]]"));
@@ -123,7 +121,11 @@ fn migrate_inbox_to_wiki(notes: &[Note], wiki_dir: &Path) -> Vec<(PathBuf, PathB
             _ => continue,
         };
 
-        let domain_dir = note.domain.first().map(|d| d.to_string()).unwrap_or_else(|| "general".to_string());
+        let domain_dir = note
+            .domain
+            .first()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "general".to_string());
         let dest_dir = wiki_dir.join(&domain_dir);
 
         if let Err(e) = std::fs::create_dir_all(&dest_dir) {
@@ -142,7 +144,12 @@ fn migrate_inbox_to_wiki(notes: &[Note], wiki_dir: &Path) -> Vec<(PathBuf, PathB
             let stem = source.file_stem().unwrap_or_default();
             let ext = source.extension().unwrap_or_default();
             let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-            dest = dest_dir.join(format!("{}_{}.{}", stem.to_string_lossy(), ts, ext.to_string_lossy()));
+            dest = dest_dir.join(format!(
+                "{}_{}.{}",
+                stem.to_string_lossy(),
+                ts,
+                ext.to_string_lossy()
+            ));
         }
 
         match std::fs::rename(&source, &dest) {
@@ -694,7 +701,10 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let content = "Rust and Tokio are great for async programming.";
         let entities = vec!["Rust".to_string(), "Tokio".to_string()];
         let result = auto_link_wikilinks(content, &entities);
-        assert_eq!(result, "[[Rust]] and [[Tokio]] are great for async programming.");
+        assert_eq!(
+            result,
+            "[[Rust]] and [[Tokio]] are great for async programming."
+        );
     }
 
     #[test]
@@ -760,7 +770,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         assert_eq!(migrated.len(), 1);
         let (src, dst) = &migrated[0];
         assert_eq!(src, &source);
-        assert!(dst.starts_with(&wiki_dir.join("work")));
+        assert!(dst.starts_with(wiki_dir.join("work")));
         assert!(!source.exists(), "inbox file should be gone");
         assert!(dst.exists(), "wiki file should exist");
     }
@@ -787,7 +797,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
 
         assert_eq!(migrated.len(), 1);
         let (_, dst) = &migrated[0];
-        assert!(dst.starts_with(&wiki_dir.join("general")));
+        assert!(dst.starts_with(wiki_dir.join("general")));
         assert!(dst.exists());
     }
 
@@ -819,7 +829,10 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let (_, dst) = &migrated[0];
         assert!(work_dir.join("duplicate.md").exists());
         let dst_name = dst.file_name().unwrap().to_string_lossy();
-        assert!(dst_name.starts_with("duplicate_"), "expected timestamp suffix: {dst_name}");
+        assert!(
+            dst_name.starts_with("duplicate_"),
+            "expected timestamp suffix: {dst_name}"
+        );
         assert!(dst.exists());
     }
 
@@ -862,6 +875,9 @@ updated_at: "2026-05-23T15:00:00+00:00"
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(inbox_entries.is_empty(), "inbox should be empty after migration");
+        assert!(
+            inbox_entries.is_empty(),
+            "inbox should be empty after migration"
+        );
     }
 }

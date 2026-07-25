@@ -11,8 +11,8 @@ use rig_core::streaming::StreamedAssistantContent;
 use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
 use tracing::{debug, instrument, warn};
-use zen_core::paths::ZenPaths;
 use zen_core::notion_graph::NotionGraphProvider;
+use zen_core::paths::ZenPaths;
 use zen_core::types::SessionContext;
 use zen_provider::DefaultRouter;
 
@@ -1023,7 +1023,10 @@ impl ZenAgent {
                 let hook = zen_memory::memvid::MemvidDemotionHook::new(zen_store);
                 match hook.persist_evicted(&ctx.entity_id, &pack.omitted) {
                     Ok(count) => {
-                        debug!(persisted = count, "Demoted context items persisted to memvid");
+                        debug!(
+                            persisted = count,
+                            "Demoted context items persisted to memvid"
+                        );
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to persist demoted context items");
@@ -1053,9 +1056,9 @@ impl ZenAgent {
         user_message: &str,
         session: &SessionContext,
     ) -> Result<String> {
+        use rig_core::OneOrMany;
         use rig_core::completion::CompletionRequest;
         use rig_core::message::Message;
-        use rig_core::OneOrMany;
         use std::time::Instant;
 
         let model_name = self.completion_model.provider_name();
@@ -1076,7 +1079,10 @@ impl ZenAgent {
             match compactor.compact() {
                 Ok((turns, persisted_count)) => {
                     if persisted_count > 0 {
-                        debug!(persisted = persisted_count, "Evicted turns shadow-written to memvid");
+                        debug!(
+                            persisted = persisted_count,
+                            "Evicted turns shadow-written to memvid"
+                        );
                     }
                     turns
                 }
@@ -1263,9 +1269,9 @@ impl ZenAgent {
         session: &SessionContext,
         mut on_token: impl FnMut(&str),
     ) -> Result<String> {
+        use rig_core::OneOrMany;
         use rig_core::completion::{CompletionModel, CompletionRequest};
         use rig_core::message::Message;
-        use rig_core::OneOrMany;
 
         let model_name = self.completion_model.provider_name();
         let conversation_id = session.session_id.to_string();
@@ -1284,7 +1290,10 @@ impl ZenAgent {
             match compactor.compact() {
                 Ok((turns, persisted_count)) => {
                     if persisted_count > 0 {
-                        debug!(persisted = persisted_count, "Evicted turns shadow-written to memvid");
+                        debug!(
+                            persisted = persisted_count,
+                            "Evicted turns shadow-written to memvid"
+                        );
                     }
                     turns
                 }
@@ -1370,13 +1379,7 @@ impl ZenAgent {
             }
         }
 
-        crate::observability::emit_prompt_completed(
-            model_name,
-            &conversation_id,
-            None,
-            None,
-            None,
-        );
+        crate::observability::emit_prompt_completed(model_name, &conversation_id, None, None, None);
 
         tracing::info!(
             response_len = full_response.len(),
@@ -1518,7 +1521,7 @@ mod chain_tests {
     #[test]
     fn composite_score_sensitivity_bonus() {
         use rig_compose::context::{ContextItem, ContextSourceKind};
-        use serde_json::{json, Value};
+        use serde_json::{Value, json};
 
         let confidential = ContextItem {
             source: ContextSourceKind::Memory,

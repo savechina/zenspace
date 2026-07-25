@@ -376,8 +376,8 @@ impl Belief {
 
     /// Parse belief from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Belief> {
-        let fm = extract_frontmatter(content)
-            .ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
+        let fm =
+            extract_frontmatter(content).ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
         let id = parse_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
         let proposition = parse_field(&fm, "proposition")
             .map(|s| s.trim_matches('"').to_string())

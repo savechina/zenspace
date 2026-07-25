@@ -99,9 +99,8 @@ impl ZenMemvidStore {
     ///
     /// Returns the frame ID of the persisted text frame.
     pub fn put_entry(&self, entry: &MemoryEntry) -> Result<u64> {
-        let json = serde_json::to_string(entry).map_err(|e| {
-            anyhow::anyhow!("Failed to serialize MemoryEntry: {e}")
-        })?;
+        let json = serde_json::to_string(entry)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize MemoryEntry: {e}"))?;
 
         let opts = memvid_core::PutOptions::builder()
             .uri(&entry.session_id)
@@ -214,7 +213,10 @@ impl EnrichedMemory {
                 "[{}] {}={}: {} (notion: {}, importance: {:.2})",
                 self.kind, self.notion, self.slot, self.value, ctx.name, ctx.importance_score
             ),
-            None => format!("[{}] {}={}: {}", self.kind, self.notion, self.slot, self.value),
+            None => format!(
+                "[{}] {}={}: {}",
+                self.kind, self.notion, self.slot, self.value
+            ),
         }
     }
 }
@@ -264,10 +266,7 @@ impl ZenMemvidStore {
             let mut entity_ctx = None;
             for name in &candidates {
                 if let Ok(Some(summary)) = graph.find_entity_by_name(name).await {
-                    let aliases = graph
-                        .load_aliases(&summary.id)
-                        .await
-                        .unwrap_or_default();
+                    let aliases = graph.load_aliases(&summary.id).await.unwrap_or_default();
                     let importance = importance_map.get(&summary.name).copied().unwrap_or(0.0);
                     entity_ctx = Some(NotionContext {
                         notion_id: summary.id,
@@ -310,7 +309,10 @@ fn extract_candidate_names(notion: &str, slot: &str, value: &str) -> Vec<String>
     }
 
     for word in value.split_whitespace() {
-        let clean: String = word.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect();
+        let clean: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .collect();
         if clean.len() >= 2
             && let Some(first) = clean.chars().next()
             && first.is_uppercase()
@@ -543,7 +545,9 @@ impl ContextProjector {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use zen_core::notion_graph::{NotionGraphProvider, NotionSummary, ImportanceScore, SimpleNotion};
+    use zen_core::notion_graph::{
+        ImportanceScore, NotionGraphProvider, NotionSummary, SimpleNotion,
+    };
 
     struct MockEntityGraph {
         notions: std::collections::HashMap<String, NotionSummary>,
@@ -797,27 +801,15 @@ mod tests {
 
         let items = vec![
             OmittedContextItem {
-                item: ContextItem::new(
-                    ContextSourceKind::Memory,
-                    "frame-1",
-                    "demoted content A",
-                ),
+                item: ContextItem::new(ContextSourceKind::Memory, "frame-1", "demoted content A"),
                 reason: ContextOmissionReason::OverBudget,
             },
             OmittedContextItem {
-                item: ContextItem::new(
-                    ContextSourceKind::Memory,
-                    "frame-2",
-                    "demoted content B",
-                ),
+                item: ContextItem::new(ContextSourceKind::Memory, "frame-2", "demoted content B"),
                 reason: ContextOmissionReason::MaxItems,
             },
             OmittedContextItem {
-                item: ContextItem::new(
-                    ContextSourceKind::Memory,
-                    "frame-3",
-                    "should not persist",
-                ),
+                item: ContextItem::new(ContextSourceKind::Memory, "frame-3", "should not persist"),
                 reason: ContextOmissionReason::OverBudget,
             },
         ];

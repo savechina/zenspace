@@ -144,7 +144,10 @@ pub fn persist_anti_pattern_wiki_page(
     decision_id: &str,
 ) -> Result<bool, std::io::Error> {
     let slug = slugify_pattern_id(&violation.pattern_id);
-    let target_dir = wiki_dir.join("wisdom").join("anti-patterns").join("decisions");
+    let target_dir = wiki_dir
+        .join("wisdom")
+        .join("anti-patterns")
+        .join("decisions");
     let target_path = target_dir.join(format!("{slug}.md"));
 
     if target_path.exists() {
@@ -818,8 +821,7 @@ mod tests {
         let created = persist_anti_pattern_wiki_page(&wiki_dir, &violation, "dec-123").unwrap();
         assert!(created, "file should have been created");
 
-        let target = wiki_dir
-            .join("wisdom/anti-patterns/decisions/sunk-cost-fallacy.md");
+        let target = wiki_dir.join("wisdom/anti-patterns/decisions/sunk-cost-fallacy.md");
         assert!(target.exists(), "target file should exist");
         let body = std::fs::read_to_string(&target).unwrap();
         assert!(body.contains("id: sunk-cost-fallacy"));
@@ -870,9 +872,12 @@ mod tests {
             message: "Trusting authority without verification".into(),
         };
 
-        let created =
-            persist_anti_pattern_wiki_page(&wiki_dir, &violation, "dec-9").unwrap();
+        let created = persist_anti_pattern_wiki_page(&wiki_dir, &violation, "dec-9").unwrap();
         assert!(created);
-        assert!(wiki_dir.join("wisdom/anti-patterns/decisions/authority-blindness.md").exists());
+        assert!(
+            wiki_dir
+                .join("wisdom/anti-patterns/decisions/authority-blindness.md")
+                .exists()
+        );
     }
 }

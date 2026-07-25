@@ -66,7 +66,10 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
         };
 
         for dir in [paths.inbox(), paths.wiki()] {
-            if let Ok(results) = service.search(message, &dir, &client, Some(tier), None).await {
+            if let Ok(results) = service
+                .search(message, &dir, &client, Some(tier), None)
+                .await
+            {
                 for r in results {
                     if seen.insert(r.file.clone()) {
                         session.knowledge.push(zen_core::types::RetrievedNote {

@@ -122,10 +122,7 @@ impl ZeusEscalation {
         if has_budget_risk {
             findings.push(ZeusFinding {
                 finding_type: ZeusFindingType::GoalConformanceFailure,
-                description: format!(
-                    "Token budget {} exceeds 100K threshold",
-                    ctx.token_budget
-                ),
+                description: format!("Token budget {} exceeds 100K threshold", ctx.token_budget),
                 requires_escalation: false,
             });
         }
@@ -252,10 +249,12 @@ mod tests {
         let review = zeus.final_review(&ctx);
         assert!(review.approved);
         assert!(review.escalated);
-        assert!(review.findings.iter().any(|f| matches!(
-            f.finding_type,
-            ZeusFindingType::ValueMisalignment
-        )));
+        assert!(
+            review
+                .findings
+                .iter()
+                .any(|f| matches!(f.finding_type, ZeusFindingType::ValueMisalignment))
+        );
     }
 
     #[test]
@@ -265,10 +264,12 @@ mod tests {
         let review = zeus.final_review(&ctx);
         assert!(review.approved);
         assert!(review.escalated);
-        assert!(review.findings.iter().any(|f| matches!(
-            f.finding_type,
-            ZeusFindingType::GoalConformanceFailure
-        )));
+        assert!(
+            review
+                .findings
+                .iter()
+                .any(|f| matches!(f.finding_type, ZeusFindingType::GoalConformanceFailure))
+        );
     }
 
     #[test]
@@ -279,10 +280,12 @@ mod tests {
         assert!(!review.approved);
         assert!(review.escalated);
         assert!(review.athena_shield.is_some());
-        assert!(review.findings.iter().any(|f| matches!(
-            f.finding_type,
-            ZeusFindingType::UnrecoverableConflict
-        )));
+        assert!(
+            review
+                .findings
+                .iter()
+                .any(|f| matches!(f.finding_type, ZeusFindingType::UnrecoverableConflict))
+        );
     }
 
     #[test]

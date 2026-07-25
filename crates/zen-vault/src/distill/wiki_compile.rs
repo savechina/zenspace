@@ -7,8 +7,8 @@ use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
 use tracing::info;
 
-use crate::notion::NotionData;
 use crate::note::Note;
+use crate::notion::NotionData;
 use crate::wiki::{WikiIndex, WikiLog, WikiPage, WikiStructure};
 
 /// Known technology keywords for notion classification.
@@ -732,7 +732,12 @@ mod tests {
         )];
 
         let pages = compiler.compile(&notes, dir.path()).unwrap();
-        assert!(pages[0].path.to_string_lossy().starts_with("notions/technology/"));
+        assert!(
+            pages[0]
+                .path
+                .to_string_lossy()
+                .starts_with("notions/technology/")
+        );
     }
 
     #[test]
@@ -745,7 +750,12 @@ mod tests {
         )];
 
         let pages = compiler.compile(&notes, dir.path()).unwrap();
-        assert!(pages[0].path.to_string_lossy().starts_with("notions/concepts/"));
+        assert!(
+            pages[0]
+                .path
+                .to_string_lossy()
+                .starts_with("notions/concepts/")
+        );
     }
 
     #[test]
@@ -758,7 +768,12 @@ mod tests {
         )];
 
         let pages = compiler.compile(&notes, dir.path()).unwrap();
-        assert!(pages[0].path.to_string_lossy().starts_with("notions/technology/"));
+        assert!(
+            pages[0]
+                .path
+                .to_string_lossy()
+                .starts_with("notions/technology/")
+        );
     }
 
     #[test]

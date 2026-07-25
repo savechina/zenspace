@@ -108,7 +108,10 @@ pub fn execute_command(operation: &AgentCommands) -> Result<(), ZenError> {
                         })
                     })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&json_arr).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_arr).unwrap_or_default()
+                );
             } else {
                 println!("{}", "🤖 Available Agents".bold());
                 for agent in &agents {

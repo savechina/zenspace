@@ -31,7 +31,7 @@ impl DispatchTarget {
         }
     }
 
-#[allow(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "codex" => Ok(DispatchTarget::Codex),
@@ -143,8 +143,9 @@ impl DispatchService {
         let mut task_record = DispatchTask::new(task, &target);
 
         // Ensure coding directory exists
-        std::fs::create_dir_all(&self.coding_dir)
-            .with_context(|| format!("failed to create coding dir: {}", self.coding_dir.display()))?;
+        std::fs::create_dir_all(&self.coding_dir).with_context(|| {
+            format!("failed to create coding dir: {}", self.coding_dir.display())
+        })?;
 
         // Save initial pending state
         self.save_task(&task_record)?;
@@ -170,9 +171,7 @@ impl DispatchService {
             ));
             task_record.completed_at = Some(Utc::now().to_rfc3339());
             self.save_task(&task_record)?;
-            anyhow::bail!(
-                "Binary '{binary}' not found in PATH. Install it to use dispatch."
-            );
+            anyhow::bail!("Binary '{binary}' not found in PATH. Install it to use dispatch.");
         }
 
         // Spawn subprocess
@@ -186,7 +185,8 @@ impl DispatchService {
 
         // Write context to stdin if child has stdin
         if let Some(mut stdin) = child.stdin.take()
-            && let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stdin, context.as_bytes()).await
+            && let Err(e) =
+                tokio::io::AsyncWriteExt::write_all(&mut stdin, context.as_bytes()).await
         {
             warn!(error = %e, "failed to write context to subprocess stdin");
         }
@@ -268,8 +268,8 @@ impl DispatchService {
     /// Load a task from its markdown file.
     pub fn load_task(&self, task_id: &str) -> Result<DispatchTask> {
         let path = self.coding_dir.join(format!("{task_id}.md"));
-        let content =
-            std::fs::read_to_string(&path).with_context(|| format!("task file: {}", path.display()))?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("task file: {}", path.display()))?;
 
         Self::parse_task_markdown(&content)
     }

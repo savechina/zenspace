@@ -61,7 +61,8 @@ impl ChatImporter {
                 .as_str()
                 .map(|s| format!("**{}** ({})  \n", s, role))
                 .unwrap_or_else(|| format!("**{}**  \n", role));
-            let body = format!("---\nsource: chat-import\nrole: {role}\n---\n\n{header}{content}\n");
+            let body =
+                format!("---\nsource: chat-import\nrole: {role}\n---\n\n{header}{content}\n");
 
             fs::write(&dest, &body)
                 .with_context(|| format!("write chat note: {}", dest.display()))?;

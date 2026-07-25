@@ -141,7 +141,10 @@ fn evaluate_soul_goals(zen_paths: &ZenPaths, date: NaiveDate) -> Option<MicroAct
             .filter(|w| w.len() > 3)
             .collect();
 
-        let match_count = keywords.iter().filter(|kw| recent_lower.contains(*kw)).count();
+        let match_count = keywords
+            .iter()
+            .filter(|kw| recent_lower.contains(*kw))
+            .count();
         if match_count == 0 {
             return Some(MicroAction::Remind(format!(
                 "Goal misalignment: '{}' has no matching journal entries in the last 7 days",
@@ -261,7 +264,8 @@ mod tests {
 
     #[test]
     fn test_parse_soul_goals_goal_prefix() {
-        let content = "# My Goals\n\n- Goal: Ship the feature by Friday\n- Intention: Learn Rust async";
+        let content =
+            "# My Goals\n\n- Goal: Ship the feature by Friday\n- Intention: Learn Rust async";
         let goals = parse_soul_goals(content);
         assert_eq!(goals.len(), 3);
         assert!(goals.contains(&"My Goals".to_string()));
@@ -279,7 +283,8 @@ mod tests {
 
     #[test]
     fn test_parse_soul_goals_mixed() {
-        let content = "# Overall Direction\n\n- Goal: Improve code quality\n- Intention: Write more tests";
+        let content =
+            "# Overall Direction\n\n- Goal: Improve code quality\n- Intention: Write more tests";
         let goals = parse_soul_goals(content);
         assert_eq!(goals.len(), 3);
     }

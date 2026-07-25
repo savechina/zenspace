@@ -217,7 +217,8 @@ impl ZenWiring {
         let store_path = paths.memory().join(MEMVID_STORE_FILE);
 
         if let Some(parent) = store_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent) {
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
             debug!(path = %parent.display(), error = %e, "ZenWiring: failed to create memvid parent dir");
             return None;
         }

@@ -241,7 +241,9 @@ impl ZenWorker for WikiCompilerWorker {
         };
         let svc = NotionService::new();
 
-        let notions = svc.load_entities_updated_since(&client, state.last_compile_time).await?;
+        let notions = svc
+            .load_entities_updated_since(&client, state.last_compile_time)
+            .await?;
         if notions.is_empty() {
             debug!(
                 since = %state.last_compile_time,

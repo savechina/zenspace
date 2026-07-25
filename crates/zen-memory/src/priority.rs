@@ -357,10 +357,7 @@ pub fn reinforce_beliefs<'a>(
         })
         .collect();
 
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     tracing::debug!(
         reinforced = scored.len(),

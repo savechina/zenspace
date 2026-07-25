@@ -31,7 +31,10 @@ async fn migration_002_creates_vec0_tables_preserving_existing_rows() {
         .fetch_one(client.pool())
         .await
         .unwrap();
-    assert_eq!(notes_count, 3, "3 notes seeded before asserting migration 002 state");
+    assert_eq!(
+        notes_count, 3,
+        "3 notes seeded before asserting migration 002 state"
+    );
 
     let note_emb_exists: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='note_embeddings'",
@@ -47,7 +50,10 @@ async fn migration_002_creates_vec0_tables_preserving_existing_rows() {
     .fetch_one(client.pool())
     .await
     .unwrap();
-    assert_eq!(notion_emb_exists, 1, "notion_embeddings vec0 table must exist");
+    assert_eq!(
+        notion_emb_exists, 1,
+        "notion_embeddings vec0 table must exist"
+    );
 
     let notes_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes_meta")
         .fetch_one(client.pool())
@@ -58,12 +64,11 @@ async fn migration_002_creates_vec0_tables_preserving_existing_rows() {
         "migration 002 vec0 tables must not disturb notes_meta rows"
     );
 
-    let applied: Option<String> = sqlx::query_scalar(
-        "SELECT description FROM _sqlx_migrations WHERE version = 2",
-    )
-    .fetch_optional(client.pool())
-    .await
-    .unwrap();
+    let applied: Option<String> =
+        sqlx::query_scalar("SELECT description FROM _sqlx_migrations WHERE version = 2")
+            .fetch_optional(client.pool())
+            .await
+            .unwrap();
     assert!(
         applied.is_some(),
         "_sqlx_migrations must record migration 002"

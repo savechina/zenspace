@@ -403,8 +403,8 @@ impl Decision {
 
     /// Parse decision from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<Decision> {
-        let fm = extract_frontmatter(content)
-            .ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
+        let fm =
+            extract_frontmatter(content).ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
         let id = parse_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
         let title = parse_field(&fm, "title")
             .map(|s| s.trim_matches('"').to_string())

@@ -208,7 +208,10 @@ impl Gateway for HttpGateway {
                 Some(Arc::new(AgentOrchestrator::new(router)))
             }
             Err(e) => {
-                warn!("Failed to load config for orchestrator, chat will be unavailable: {}", e);
+                warn!(
+                    "Failed to load config for orchestrator, chat will be unavailable: {}",
+                    e
+                );
                 None
             }
         };

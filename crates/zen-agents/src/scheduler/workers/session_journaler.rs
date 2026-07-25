@@ -261,12 +261,12 @@ async fn process_session(
         matched
     };
 
-        let prompt_context = if fresh_eyes {
-            PromptContext {
-                commitments_section: String::new(),
-                beliefs_section: String::new(),
-                anti_patterns_section: String::new(),
-            }
+    let prompt_context = if fresh_eyes {
+        PromptContext {
+            commitments_section: String::new(),
+            beliefs_section: String::new(),
+            anti_patterns_section: String::new(),
+        }
     } else {
         load_prompt_context(paths).await
     };
@@ -860,7 +860,10 @@ fn load_top_commitments(paths: &ZenPaths, n: usize) -> String {
     let top: Vec<&CommitmentSummary> = items.iter().take(n).collect();
     let mut s = String::from("User's active commitments (prioritize signals relevant to these):\n");
     for item in top {
-        s.push_str(&format!("- {} [{}, review: {}]\n", item.text, item.status, item.review_at));
+        s.push_str(&format!(
+            "- {} [{}, review: {}]\n",
+            item.text, item.status, item.review_at
+        ));
     }
     s
 }

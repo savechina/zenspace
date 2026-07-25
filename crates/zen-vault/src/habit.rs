@@ -57,12 +57,9 @@ impl HabitService {
         if !self.habits_path.exists() {
             return Ok(Vec::new());
         }
-        let content =
-            fs::read_to_string(&self.habits_path).map_err(ZenError::Io)?;
-        let parsed: HabitsToml =
-            toml::from_str(&content).map_err(|e| ZenError::Message(format!(
-                "failed to parse habits.toml: {e}"
-            )))?;
+        let content = fs::read_to_string(&self.habits_path).map_err(ZenError::Io)?;
+        let parsed: HabitsToml = toml::from_str(&content)
+            .map_err(|e| ZenError::Message(format!("failed to parse habits.toml: {e}")))?;
         Ok(parsed.habits)
     }
 
@@ -85,9 +82,7 @@ impl HabitService {
         let before = habits.len();
         habits.retain(|h| h.name != name);
         if habits.len() == before {
-            return Err(ZenError::Message(format!(
-                "habit '{name}' not found"
-            )));
+            return Err(ZenError::Message(format!("habit '{name}' not found")));
         }
         self.write_habits(&habits)
     }
@@ -95,9 +90,7 @@ impl HabitService {
     pub fn check_in(&self, name: &str, note: Option<String>) -> Result<(), ZenError> {
         let habits = self.load_habits()?;
         if !habits.iter().any(|h| h.name == name) {
-            return Err(ZenError::Message(format!(
-                "habit '{name}' not found"
-            )));
+            return Err(ZenError::Message(format!("habit '{name}' not found")));
         }
 
         let record = HabitCheckIn {
@@ -218,10 +211,8 @@ impl HabitService {
         let toml_struct = HabitsToml {
             habits: habits.to_vec(),
         };
-        let content =
-            toml::to_string_pretty(&toml_struct).map_err(|e| ZenError::Message(format!(
-                "failed to serialize habits: {e}"
-            )))?;
+        let content = toml::to_string_pretty(&toml_struct)
+            .map_err(|e| ZenError::Message(format!("failed to serialize habits: {e}")))?;
 
         if let Some(parent) = self.habits_path.parent() {
             fs::create_dir_all(parent).map_err(ZenError::Io)?;

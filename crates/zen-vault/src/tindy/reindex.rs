@@ -88,7 +88,9 @@ impl Reindexer {
     /// Required by Constitution Principle XIII #8.
     pub async fn rebuild_fts_indexes(&self) -> Result<()> {
         let Some(client) = self.db_client.as_ref() else {
-            return Err(anyhow::anyhow!("rebuild_fts_indexes requires a database client"));
+            return Err(anyhow::anyhow!(
+                "rebuild_fts_indexes requires a database client"
+            ));
         };
         client
             .writer()
@@ -162,7 +164,10 @@ impl Reindexer {
             }
 
             // Process: parse frontmatter, FTS5 index, embedding index, update checksum.
-            match self.process_file(file_path, &current_checksum, &mut report).await {
+            match self
+                .process_file(file_path, &current_checksum, &mut report)
+                .await
+            {
                 Ok(()) => {
                     info!("Reindexed: {}", file_display);
                     report.files_updated += 1;
@@ -260,7 +265,10 @@ impl Reindexer {
             if self.embed {
                 match compute_embeddings_for_text(&body_content) {
                     Ok(embedding) if !embedding.is_empty() => {
-                        match Tier3Search.insert_embedding(client, &note_id, &embedding).await {
+                        match Tier3Search
+                            .insert_embedding(client, &note_id, &embedding)
+                            .await
+                        {
                             Ok(()) => {
                                 report.files_embedded += 1;
                                 debug!(

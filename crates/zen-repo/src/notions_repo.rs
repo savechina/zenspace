@@ -4,14 +4,24 @@ use sqlx::Row;
 
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{
-    ComponentResult, NotionRow, GraphSearchResult, InsertRelationshipRequest, PageRankResult,
+    ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionRow, PageRankResult,
     RelationRow, ShortestPathResult,
 };
 
 pub fn normalize_alias(raw: &str) -> String {
     let mut s = raw.trim().to_lowercase();
 
-    for suffix in &[".js", ".rs", ".py", "-lang", " language", ".ts", ".go", ".java", ".rb"] {
+    for suffix in &[
+        ".js",
+        ".rs",
+        ".py",
+        "-lang",
+        " language",
+        ".ts",
+        ".go",
+        ".java",
+        ".rb",
+    ] {
         if let Some(stripped) = s.strip_suffix(suffix) {
             s = stripped.to_string();
             break;
@@ -30,13 +40,7 @@ impl<'a> NotionsRepo<'a> {
         Self { client }
     }
 
-    pub async fn insert_entity(
-        &self,
-        id: &str,
-        name: &str,
-        kind: &str,
-        now: &str,
-    ) -> Result<()> {
+    pub async fn insert_entity(&self, id: &str, name: &str, kind: &str, now: &str) -> Result<()> {
         self.insert_entity_with(id, name, kind, now, "", "manual", 0.5)
             .await
     }
@@ -165,11 +169,7 @@ impl<'a> NotionsRepo<'a> {
         Ok(())
     }
 
-    pub async fn update_entity_confidence(
-        &self,
-        notion_id: &str,
-        confidence: f64,
-    ) -> Result<()> {
+    pub async fn update_entity_confidence(&self, notion_id: &str, confidence: f64) -> Result<()> {
         let notion_id = notion_id.to_string();
 
         self.client
@@ -257,8 +257,17 @@ impl<'a> NotionsRepo<'a> {
                       source_note_ids, created_at, description, valid_from, valid_until, weight) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     rusqlite::params![
-                        id, source_id, target_id, rel_type, confidence,
-                        source_note_ids, created_at, description, valid_from, valid_until, weight
+                        id,
+                        source_id,
+                        target_id,
+                        rel_type,
+                        confidence,
+                        source_note_ids,
+                        created_at,
+                        description,
+                        valid_from,
+                        valid_until,
+                        weight
                     ],
                 )?;
                 Ok(())
@@ -525,11 +534,7 @@ impl<'a> NotionsRepo<'a> {
         Ok(all.into_iter().find(|r| r.notion == dst_name))
     }
 
-    pub async fn pagerank(
-        &self,
-        iterations: usize,
-        damping: f64,
-    ) -> Result<Vec<PageRankResult>> {
+    pub async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>> {
         let notion_rows = sqlx::query("SELECT id, name FROM notions ORDER BY name")
             .fetch_all(self.client.pool())
             .await?;
@@ -568,9 +573,7 @@ impl<'a> NotionsRepo<'a> {
         let mut inbound: Vec<Vec<usize>> = vec![Vec::new(); n];
 
         for (src, tgt) in &edges {
-            if let (Some(&src_idx), Some(&tgt_idx)) =
-                (id_to_idx.get(src), id_to_idx.get(tgt))
-            {
+            if let (Some(&src_idx), Some(&tgt_idx)) = (id_to_idx.get(src), id_to_idx.get(tgt)) {
                 out_degree[src_idx] += 1;
                 inbound[tgt_idx].push(src_idx);
             }
@@ -763,13 +766,7 @@ impl<'a> NotionsRepo<'a> {
 }
 
 impl crate::traits::notions::NotionsRepository for NotionsRepo<'_> {
-    async fn insert_entity(
-        &self,
-        id: &str,
-        name: &str,
-        kind: &str,
-        now: &str,
-    ) -> Result<()> {
+    async fn insert_entity(&self, id: &str, name: &str, kind: &str, now: &str) -> Result<()> {
         NotionsRepo::insert_entity(self, id, name, kind, now).await
     }
 
@@ -810,7 +807,15 @@ impl crate::traits::notions::NotionsRepository for NotionsRepo<'_> {
         confidence: f64,
     ) -> Result<()> {
         NotionsRepo::upsert_entity_with(
-            self, id, name, kind, created_at, last_updated, description, source, confidence,
+            self,
+            id,
+            name,
+            kind,
+            created_at,
+            last_updated,
+            description,
+            source,
+            confidence,
         )
         .await
     }

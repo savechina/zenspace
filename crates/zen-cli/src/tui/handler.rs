@@ -29,8 +29,7 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.scroll_offset = app.scroll_offset.saturating_sub(1);
                 KeyAction::Continue
             }
-            (KeyCode::Char('G'), KeyModifiers::NONE)
-            | (KeyCode::End, KeyModifiers::NONE) => {
+            (KeyCode::Char('G'), KeyModifiers::NONE) | (KeyCode::End, KeyModifiers::NONE) => {
                 app.auto_scroll = true;
                 KeyAction::Continue
             }
@@ -44,8 +43,7 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.scroll_offset = 0;
                 KeyAction::Continue
             }
-            (KeyCode::Esc, KeyModifiers::NONE)
-            | (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
+            (KeyCode::Esc, KeyModifiers::NONE) | (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
                 app.input.exit_command_mode();
                 KeyAction::Continue
             }

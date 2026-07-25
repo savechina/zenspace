@@ -38,8 +38,12 @@ fn test_m0_session_persistence_survives() {
     let sessions_dir = tmp.path().join("sessions");
     let store = ConversationStore::with_dir(sessions_dir.clone(), "test-session").unwrap();
 
-    store.append("user", "I should avoid premature optimization").unwrap();
-    store.append("assistant", "Noted. Let me document this.").unwrap();
+    store
+        .append("user", "I should avoid premature optimization")
+        .unwrap();
+    store
+        .append("assistant", "Noted. Let me document this.")
+        .unwrap();
 
     let turns = store.load().unwrap();
     assert_eq!(turns.len(), 2);
@@ -49,7 +53,11 @@ fn test_m0_session_persistence_survives() {
     drop(store);
     let store2 = ConversationStore::with_dir(sessions_dir, "test-session").unwrap();
     let turns2 = store2.load().unwrap();
-    assert_eq!(turns2.len(), 2, "turns must survive store drop/recreate (M0 durability)");
+    assert_eq!(
+        turns2.len(),
+        2,
+        "turns must survive store drop/recreate (M0 durability)"
+    );
 }
 
 #[test]
@@ -70,9 +78,18 @@ fn test_m0_to_m2_journal_exists() {
 
     assert!(journal_path.exists(), "M2 journal entry must exist");
     let content = fs::read_to_string(&journal_path).unwrap();
-    assert!(content.contains("## Facts"), "journal must have Facts section");
-    assert!(content.contains("## Reflections"), "journal must have Reflections section");
-    assert!(content.contains("## Commitments"), "journal must have Commitments section");
+    assert!(
+        content.contains("## Facts"),
+        "journal must have Facts section"
+    );
+    assert!(
+        content.contains("## Reflections"),
+        "journal must have Reflections section"
+    );
+    assert!(
+        content.contains("## Commitments"),
+        "journal must have Commitments section"
+    );
 }
 
 #[test]
@@ -82,8 +99,18 @@ fn test_m4_memory_md_has_required_sections() {
 
     let content = fs::read_to_string(&memory_path).unwrap();
 
-    for section in ["## Identity", "## Active Commitments", "## Stop-Doing Ledger", "## Continue-Doing Ledger", "## Active Mental Models", "## Recent Wisdom"] {
-        assert!(content.contains(section), "MEMORY.md must contain section: {section}");
+    for section in [
+        "## Identity",
+        "## Active Commitments",
+        "## Stop-Doing Ledger",
+        "## Continue-Doing Ledger",
+        "## Active Mental Models",
+        "## Recent Wisdom",
+    ] {
+        assert!(
+            content.contains(section),
+            "MEMORY.md must contain section: {section}"
+        );
     }
 }
 
@@ -99,10 +126,19 @@ fn test_m2_to_m4_reflection_signal_persistence() {
     )
     .unwrap();
 
-    assert!(signal_path.exists(), "M4 reflection signal must be persisted");
+    assert!(
+        signal_path.exists(),
+        "M4 reflection signal must be persisted"
+    );
     let content = fs::read_to_string(&signal_path).unwrap();
-    assert!(content.contains("What went wrong"), "reflection must have problem description");
-    assert!(content.contains("Avoidance"), "reflection must have avoidance strategy");
+    assert!(
+        content.contains("What went wrong"),
+        "reflection must have problem description"
+    );
+    assert!(
+        content.contains("Avoidance"),
+        "reflection must have avoidance strategy"
+    );
 }
 
 #[test]
@@ -119,8 +155,14 @@ fn test_m5_commitment_lifecycle() {
 
     assert!(commitment_path.exists(), "M5 commitment must be persisted");
     let content = fs::read_to_string(&commitment_path).unwrap();
-    assert!(content.contains("review_at"), "commitment must have review_at timestamp");
-    assert!(content.contains("status: executing"), "commitment must have lifecycle status");
+    assert!(
+        content.contains("review_at"),
+        "commitment must have review_at timestamp"
+    );
+    assert!(
+        content.contains("status: executing"),
+        "commitment must have lifecycle status"
+    );
 }
 
 #[test]
@@ -135,7 +177,10 @@ fn test_worker_report_has_llm_cost_field() {
         llm_cost_usd: 0.0,
     };
 
-    assert_eq!(report.llm_cost_usd, 0.0, "WorkerReport must have llm_cost_usd field (A4 fix)");
+    assert_eq!(
+        report.llm_cost_usd, 0.0,
+        "WorkerReport must have llm_cost_usd field (A4 fix)"
+    );
 }
 
 #[test]
@@ -143,7 +188,11 @@ fn test_scheduler_has_cost_cap() {
     use zen_agents::scheduler::ZenScheduler;
 
     let scheduler = ZenScheduler::new().with_cost_cap(5.0);
-    assert_eq!(scheduler.cost_cap(), 5.0, "scheduler must support per-worker cost cap (A4 fix)");
+    assert_eq!(
+        scheduler.cost_cap(),
+        5.0,
+        "scheduler must support per-worker cost cap (A4 fix)"
+    );
 }
 
 #[test]
@@ -157,7 +206,10 @@ fn test_memvid_incremental_indexing_method_exists() {
     let mut store = ZenMemvidStore::new(db_path).unwrap();
 
     let report = indexer.index_incremental(&mut store).unwrap();
-    assert_eq!(report.files_scanned, 0, "incremental index on empty workspace should scan 0 files");
+    assert_eq!(
+        report.files_scanned, 0,
+        "incremental index on empty workspace should scan 0 files"
+    );
 }
 
 /// E2E test: M0→M2→M4 consolidation pipeline.
@@ -206,28 +258,47 @@ async fn test_e2e_m0_m2_m4_consolidation_pipeline() {
         .append("user", "I completed the requirements review and fixed the premature optimization in the auth module")
         .unwrap();
     store
-        .append("assistant", "Good work. I documented this and updated the project guidelines.")
+        .append(
+            "assistant",
+            "Good work. I documented this and updated the project guidelines.",
+        )
         .unwrap();
     store
-        .append("user", "Yes. We implemented concrete use cases before designing the abstraction layers.")
+        .append(
+            "user",
+            "Yes. We implemented concrete use cases before designing the abstraction layers.",
+        )
         .unwrap();
     store
-        .append("assistant", "Agreed. Testing before optimizing has become a solid team practice.")
+        .append(
+            "assistant",
+            "Agreed. Testing before optimizing has become a solid team practice.",
+        )
         .unwrap();
     drop(store);
 
     // Verify M0 persistence
     let verify_store = ConversationStore::with_dir(root.join("sessions"), session_id).unwrap();
     let turns = verify_store.load().unwrap();
-    assert_eq!(turns.len(), 4, "M0: session conversation must persist 4 turns");
+    assert_eq!(
+        turns.len(),
+        4,
+        "M0: session conversation must persist 4 turns"
+    );
     drop(verify_store);
 
     // 4. Run SessionJournaler (M0→M2)
     // With no valid provider config, router will be None → keyword-only extraction
     let journaler = SessionJournaler::new();
     let ctx = WorkerContext::new(chrono::Utc::now());
-    let journal_report = journaler.execute(&ctx).await.expect("SessionJournaler should succeed");
-    assert!(journal_report.success, "M2: SessionJournaler must report success");
+    let journal_report = journaler
+        .execute(&ctx)
+        .await
+        .expect("SessionJournaler should succeed");
+    assert!(
+        journal_report.success,
+        "M2: SessionJournaler must report success"
+    );
 
     // 5. Verify journal entry was created (M2)
     let journal_dir = root.join("memories").join("journal");
@@ -238,7 +309,10 @@ async fn test_e2e_m0_m2_m4_consolidation_pipeline() {
         .collect();
     entries.sort_by_key(|e| e.path());
 
-    assert!(!entries.is_empty(), "M2: SessionJournaler must create at least one journal entry");
+    assert!(
+        !entries.is_empty(),
+        "M2: SessionJournaler must create at least one journal entry"
+    );
 
     let journal_path = entries[0].path();
     let journal_content = fs::read_to_string(&journal_path).unwrap();
@@ -268,8 +342,14 @@ async fn test_e2e_m0_m2_m4_consolidation_pipeline() {
 
     // 6. Run MemoryCurator (M2→M4)
     let curator = MemoryCurator::new();
-    let curator_report = curator.execute(&ctx).await.expect("MemoryCurator should succeed");
-    assert!(curator_report.success, "M4: MemoryCurator must report success");
+    let curator_report = curator
+        .execute(&ctx)
+        .await
+        .expect("MemoryCurator should succeed");
+    assert!(
+        curator_report.success,
+        "M4: MemoryCurator must report success"
+    );
 
     // 7. Verify MEMORY.md was updated (M4)
     let memory_path = root.join("memories").join("MEMORY.md");

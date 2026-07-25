@@ -229,8 +229,8 @@ impl SelfModelItem {
 
     /// Parse self-model item from markdown string (frontmatter + body).
     pub fn from_markdown(content: &str) -> Result<SelfModelItem> {
-        let fm = extract_frontmatter(content)
-            .ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
+        let fm =
+            extract_frontmatter(content).ok_or_else(|| anyhow::anyhow!("missing frontmatter"))?;
         let id = parse_field(&fm, "id").ok_or_else(|| anyhow::anyhow!("missing id field"))?;
         let layer_str =
             parse_field(&fm, "layer").ok_or_else(|| anyhow::anyhow!("missing layer field"))?;
@@ -259,8 +259,7 @@ impl SelfModelItem {
         let is_explicit = parse_field(&fm, "is_explicit").map(|s| s == "true");
         let controllability = parse_field(&fm, "controllability").and_then(|s| s.parse().ok());
         let humility_score = parse_field(&fm, "humility_score").and_then(|s| s.parse().ok());
-        let optionality_count =
-            parse_field(&fm, "optionality_count").and_then(|s| s.parse().ok());
+        let optionality_count = parse_field(&fm, "optionality_count").and_then(|s| s.parse().ok());
         let core_pursuit =
             parse_field(&fm, "core_pursuit").map(|s| s.trim_matches('"').to_string());
         let sufficient_for = parse_yaml_array(&fm, "sufficient_for");

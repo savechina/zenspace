@@ -1033,7 +1033,9 @@ impl LlmRouter for DefaultRouter {
                 }
             });
         } else {
-            if let Err(e) = done_tx.send(Err(format!("Provider '{}' not configured", provider_name))) {
+            if let Err(e) =
+                done_tx.send(Err(format!("Provider '{}' not configured", provider_name)))
+            {
                 warn!("provider error done channel closed: {:?}", e);
             }
         }

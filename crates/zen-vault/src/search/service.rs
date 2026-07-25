@@ -129,7 +129,10 @@ impl SearchService {
     }
 }
 
-pub(crate) fn filter_by_domain(results: Vec<SearchResult>, domain: &str) -> Result<Vec<SearchResult>> {
+pub(crate) fn filter_by_domain(
+    results: Vec<SearchResult>,
+    domain: &str,
+) -> Result<Vec<SearchResult>> {
     let domain_lower = domain.to_lowercase();
     let mut filtered = Vec::new();
     for r in results {
@@ -139,10 +142,7 @@ pub(crate) fn filter_by_domain(results: Vec<SearchResult>, domain: &str) -> Resu
         if let Ok(content) = std::fs::read_to_string(&r.file)
             && let Ok(note) = crate::note::parse_frontmatter(&content)
         {
-            let has_domain = note
-                .domain
-                .iter()
-                .any(|d| d.to_string() == domain_lower);
+            let has_domain = note.domain.iter().any(|d| d.to_string() == domain_lower);
             if has_domain {
                 filtered.push(r);
             }

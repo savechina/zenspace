@@ -116,7 +116,10 @@ impl ZenWorker for DecisionTracker {
                         let signal = zen_memory::AntiPatternSignal {
                             pattern: violation.pattern_id.clone(),
                             trigger: violation.message.clone(),
-                            avoidance: format!("see wiki/wisdom/anti-patterns/{}", violation.pattern_id),
+                            avoidance: format!(
+                                "see wiki/wisdom/anti-patterns/{}",
+                                violation.pattern_id
+                            ),
                             detected_in: vec![decision.id.clone()],
                         };
                         let signals_dir = wiki_dir.join("wisdom/anti-patterns");

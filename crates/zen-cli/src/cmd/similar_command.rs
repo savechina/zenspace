@@ -23,7 +23,11 @@ pub enum SimilarCommands {
 
 pub fn execute_command(cmd: &SimilarCommands) -> Result<(), ZenError> {
     match cmd {
-        SimilarCommands::Find { note_id, limit, json } => {
+        SimilarCommands::Find {
+            note_id,
+            limit,
+            json,
+        } => {
             let k = limit.unwrap_or(5);
             debug!("similar: note_id={} limit={} json={}", note_id, k, json);
 
@@ -78,13 +82,17 @@ pub fn execute_command(cmd: &SimilarCommands) -> Result<(), ZenError> {
                         })
                     })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&json_arr).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_arr).unwrap_or_default()
+                );
             } else {
                 println!("Top {} similar notes to '{note_id}':", results.len());
                 println!("{}", "-".repeat(80));
                 for (i, r) in results.iter().enumerate() {
                     println!("{:>2}. {}", i + 1, r.file.display());
-                    let preview: String = r.content.lines().take(2).collect::<Vec<_>>().join("\n    ");
+                    let preview: String =
+                        r.content.lines().take(2).collect::<Vec<_>>().join("\n    ");
                     if !preview.is_empty() {
                         println!("    {preview}");
                     }

@@ -124,7 +124,10 @@ impl AgentOrchestrator {
     async fn build_agent(&self, agent_name: &str) -> Result<ZenAgent> {
         let skills = delegate_tools::resolve_skill_ids_for_agent(agent_name);
         let tools = delegate_tools::resolve_tool_ids_for_agent(agent_name);
-        debug!("building agent: {}", delegate_tools::describe_agent(agent_name, &self.registry));
+        debug!(
+            "building agent: {}",
+            delegate_tools::describe_agent(agent_name, &self.registry)
+        );
 
         let mut builder = ZenAgent::builder(agent_name);
         for skill_id in &skills {

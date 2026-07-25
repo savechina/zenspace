@@ -54,7 +54,9 @@ impl<'a> SelfModelRepo<'a> {
         .fetch_all(self.client.pool())
         .await?;
 
-        rows.into_iter().map(|row| parse_self_node_row(&row)).collect()
+        rows.into_iter()
+            .map(|row| parse_self_node_row(&row))
+            .collect()
     }
 
     pub async fn load_by_layer(&self, layer: &str) -> Result<Vec<SelfNodeRow>> {
@@ -69,7 +71,9 @@ impl<'a> SelfModelRepo<'a> {
         .fetch_all(self.client.pool())
         .await?;
 
-        rows.into_iter().map(|row| parse_self_node_row(&row)).collect()
+        rows.into_iter()
+            .map(|row| parse_self_node_row(&row))
+            .collect()
     }
 }
 

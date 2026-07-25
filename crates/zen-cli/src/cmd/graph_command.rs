@@ -79,10 +79,7 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
             })?;
 
             let filtered: Vec<_> = match relation_type {
-                Some(rt) => results
-                    .into_iter()
-                    .filter(|r| r.relation == *rt)
-                    .collect(),
+                Some(rt) => results.into_iter().filter(|r| r.relation == *rt).collect(),
                 None => results,
             };
 
@@ -231,7 +228,10 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
                 return Ok(());
             }
 
-            println!("{:<36} {:<30} {:<36} {:<10}", "ID", "Name", "Serves Goal", "Default");
+            println!(
+                "{:<36} {:<30} {:<36} {:<10}",
+                "ID", "Name", "Serves Goal", "Default"
+            );
             println!("{}", "-".repeat(100));
             for (id, name, serves_goal, is_default, _crowdedness, _alternatives) in &path_nodes {
                 let goal_str = serves_goal.as_deref().unwrap_or("-");

@@ -88,8 +88,16 @@ mod tests {
 
         // Page A links to B, but C has no incoming links (orphan)
         write_page(&wiki, "A", "See [[B]] for details.");
-        write_page(&wiki, "B", "This is page B with enough words to not be thin. Contains extra content here.");
-        write_page(&wiki, "C", "I link to [[B]] but nobody links to me. Extra words here too.");
+        write_page(
+            &wiki,
+            "B",
+            "This is page B with enough words to not be thin. Contains extra content here.",
+        );
+        write_page(
+            &wiki,
+            "C",
+            "I link to [[B]] but nobody links to me. Extra words here too.",
+        );
 
         let linter = Linter::new();
         let result = linter.run(&wiki).expect("lint run");
@@ -120,13 +128,17 @@ mod tests {
         );
 
         // Normal page (not thin, not broken, not orphan)
+        write_page(&wiki, "A", "Link to [[B]] and [[C]] here.");
         write_page(
             &wiki,
-            "A",
-            "Link to [[B]] and [[C]] here.",
+            "B",
+            "Page B has enough content. Extra words to fill out here too.",
         );
-        write_page(&wiki, "B", "Page B has enough content. Extra words to fill out here too.");
-        write_page(&wiki, "C", "Page C has enough content. Extra words to fill out here too.");
+        write_page(
+            &wiki,
+            "C",
+            "Page C has enough content. Extra words to fill out here too.",
+        );
 
         let linter = Linter::new();
         let result = linter.run(&wiki).expect("lint run");

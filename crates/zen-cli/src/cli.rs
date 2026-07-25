@@ -295,8 +295,6 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Habit { ref operation } => habit_command::execute_command(operation),
         Commands::Goal { ref operation } => goal_command::execute_command(operation),
         Commands::Skill { ref operation } => skill_command::execute_command(operation).await,
-        Commands::Dispatch { ref operation } => {
-            dispatch_command::execute_command(operation).await
-        }
+        Commands::Dispatch { ref operation } => dispatch_command::execute_command(operation).await,
     }
 }

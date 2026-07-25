@@ -396,7 +396,13 @@ impl NoteService {
         let db_path = paths.data().join("state.db");
         match SqliteClient::open(&db_path).await {
             Ok(client) => {
-                let title: String = content.lines().next().unwrap_or(content).chars().take(200).collect();
+                let title: String = content
+                    .lines()
+                    .next()
+                    .unwrap_or(content)
+                    .chars()
+                    .take(200)
+                    .collect();
                 let tags_str = note.tags.join(",");
                 let file_path_str = file_path.to_string_lossy();
                 if let Err(e) = NotesRepo::new(&client)

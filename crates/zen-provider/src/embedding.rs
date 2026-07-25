@@ -2,8 +2,8 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use fastembed::{EmbeddingModel as FastEmbedModel, TextInitOptions};
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tracing::{info, warn};
 use zen_core::config::ZenConfig;
 
@@ -326,7 +326,8 @@ impl DefaultEmbeddingRouter {
                 match local_kind {
                     "fastembed" => {
                         let cache_dir = emb.cache_dir.as_ref().map(PathBuf::from);
-                        let p = LocalFastembedProvider::new(model, emb.hf_endpoint.clone(), cache_dir);
+                        let p =
+                            LocalFastembedProvider::new(model, emb.hf_endpoint.clone(), cache_dir);
                         info!(
                             local_provider = "fastembed",
                             model = ?emb.model,

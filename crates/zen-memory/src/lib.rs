@@ -45,7 +45,7 @@ pub use history::HistoryStore;
 pub use memory_service::IdentityContext;
 pub use memvid::TRIPLET_MIN_CONFIDENCE;
 pub use memvid::{
-    ContextProjector, EntityType, MemvidDemotionHook, MemvidStoringCompactor, MemoryEntry,
+    ContextProjector, EntityType, MemoryEntry, MemvidDemotionHook, MemvidStoringCompactor,
     ZenMemvidStore, create_persist_hook, default_memory_config,
 };
 pub use memvid_index::{MemvidIndexReport, MemvidIndexer};

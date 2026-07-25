@@ -88,7 +88,7 @@ pub(crate) fn args_schema_entity() -> Value {
 
 // Schema helpers for future tool implementations. Kept as public crate
 // API so tool authors don't need to rewrite JSON schema definitions.
-#[expect(dead_code, reason = "infrastructure for future tool args_schema")]
+#[allow(dead_code)]
 pub(crate) fn args_schema_file_path() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -101,7 +101,7 @@ pub(crate) fn args_schema_file_path() -> Value {
     json_schema_object(props, vec!["file_path"])
 }
 
-#[expect(dead_code, reason = "infrastructure for future search-insert tool")]
+#[allow(dead_code)]
 pub(crate) fn args_schema_search_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -131,7 +131,7 @@ pub(crate) fn args_schema_search_insert() -> Value {
     json_schema_object(props, vec!["id", "title", "content", "file_path", "source"])
 }
 
-#[expect(dead_code, reason = "infrastructure for future graph-insert tool")]
+#[allow(dead_code)]
 pub(crate) fn args_schema_graph_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -149,7 +149,7 @@ pub(crate) fn args_schema_graph_insert() -> Value {
     json_schema_object(props, vec!["id", "name", "kind"])
 }
 
-#[expect(dead_code, reason = "infrastructure for future relationship-insert tool")]
+#[allow(dead_code)]
 pub(crate) fn args_schema_relationship_insert() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
@@ -249,11 +249,7 @@ mod tests {
             ("graph_insert", args_schema_graph_insert()),
             ("relationship_insert", args_schema_relationship_insert()),
         ] {
-            assert!(
-                schema.is_object(),
-                "{} should return a JSON object",
-                name
-            );
+            assert!(schema.is_object(), "{} should return a JSON object", name);
         }
     }
 }

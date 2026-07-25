@@ -65,39 +65,31 @@ impl ModelRouter {
         }
 
         let target = match complexity {
-            ComplexityLevel::Simple => {
-                metadata.iter().min_by(|(_, a), (_, b)| {
-                    let cost_cmp =
-                        a.total_cost().partial_cmp(&b.total_cost()).unwrap_or(std::cmp::Ordering::Equal);
-                    if cost_cmp != std::cmp::Ordering::Equal {
-                        return cost_cmp;
-                    }
-                    b.is_local.cmp(&a.is_local)
-                })
-            }
-            ComplexityLevel::Standard => {
-                metadata.iter().max_by(|(_, a), (_, b)| {
-                    a.cost_efficiency()
-                        .partial_cmp(&b.cost_efficiency())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            }
-            ComplexityLevel::Complex => {
-                metadata.iter().max_by(|(_, a), (_, b)| {
-                    let cap_cmp = a.capability_score().cmp(&b.capability_score());
-                    if cap_cmp != std::cmp::Ordering::Equal {
-                        return cap_cmp;
-                    }
-                    b.total_cost()
-                        .partial_cmp(&a.total_cost())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            }
-            ComplexityLevel::Critical => {
-                metadata
-                    .iter()
-                    .max_by_key(|(_, m)| m.capability_score())
-            }
+            ComplexityLevel::Simple => metadata.iter().min_by(|(_, a), (_, b)| {
+                let cost_cmp = a
+                    .total_cost()
+                    .partial_cmp(&b.total_cost())
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                if cost_cmp != std::cmp::Ordering::Equal {
+                    return cost_cmp;
+                }
+                b.is_local.cmp(&a.is_local)
+            }),
+            ComplexityLevel::Standard => metadata.iter().max_by(|(_, a), (_, b)| {
+                a.cost_efficiency()
+                    .partial_cmp(&b.cost_efficiency())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            ComplexityLevel::Complex => metadata.iter().max_by(|(_, a), (_, b)| {
+                let cap_cmp = a.capability_score().cmp(&b.capability_score());
+                if cap_cmp != std::cmp::Ordering::Equal {
+                    return cap_cmp;
+                }
+                b.total_cost()
+                    .partial_cmp(&a.total_cost())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            ComplexityLevel::Critical => metadata.iter().max_by_key(|(_, m)| m.capability_score()),
         };
 
         Ok(target
@@ -304,7 +296,9 @@ mod tests {
     #[tokio::test]
     async fn route_simple_picks_cheapest() {
         let router = ModelRouter::new("fallback");
-        router.register_model("cloud", expensive_cloud_model()).await;
+        router
+            .register_model("cloud", expensive_cloud_model())
+            .await;
         router.register_model("local", cheap_local_model()).await;
 
         let chosen = router.route_task(ComplexityLevel::Simple).await.unwrap();
@@ -314,7 +308,9 @@ mod tests {
     #[tokio::test]
     async fn route_critical_picks_most_capable() {
         let router = ModelRouter::new("fallback");
-        router.register_model("cloud", expensive_cloud_model()).await;
+        router
+            .register_model("cloud", expensive_cloud_model())
+            .await;
         router.register_model("local", cheap_local_model()).await;
 
         let chosen = router.route_task(ComplexityLevel::Critical).await.unwrap();

@@ -103,9 +103,7 @@ impl WasmSandbox {
             CompiledWasm::Core { module, version } => {
                 self.execute_core(module, version, args).await
             }
-            CompiledWasm::Component { component } => {
-                self.execute_component(component, args).await
-            }
+            CompiledWasm::Component { component } => self.execute_component(component, args).await,
         }
     }
 
@@ -131,7 +129,9 @@ impl WasmSandbox {
         let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
-        let fuel_budget = (self.limits.max_execution_time_ms as u64)
+        let fuel_budget = self
+            .limits
+            .max_execution_time_ms
             .saturating_mul(1_000_000)
             .max(10_000_000);
         store.set_fuel(fuel_budget)?;
@@ -142,10 +142,7 @@ impl WasmSandbox {
         // doesn't expose those bindings — p2 requires component model
         // wrapping via wasmtime::component::Linker.
         let mut linker = wasmtime::Linker::new(&self.engine);
-        wasmtime_wasi::p1::add_to_linker_async::<wasmtime_wasi::p1::WasiP1Ctx>(
-            &mut linker,
-            |s| s,
-        )?;
+        wasmtime_wasi::p1::add_to_linker_async::<wasmtime_wasi::p1::WasiP1Ctx>(&mut linker, |s| s)?;
 
         let instance = linker.instantiate_async(&mut store, &module).await?;
 
@@ -206,7 +203,9 @@ impl WasmSandbox {
         let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
-        let fuel_budget = (self.limits.max_execution_time_ms as u64)
+        let fuel_budget = self
+            .limits
+            .max_execution_time_ms
             .saturating_mul(1_000_000)
             .max(10_000_000);
         store.set_fuel(fuel_budget)?;

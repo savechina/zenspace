@@ -75,7 +75,12 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
                 );
             }
 
-            let para_dirs = ["vault/projects", "vault/areas", "vault/resources", "vault/archive"];
+            let para_dirs = [
+                "vault/projects",
+                "vault/areas",
+                "vault/resources",
+                "vault/archive",
+            ];
             for dir in &para_dirs {
                 let full = format!("{}/{}", zen_dir, dir);
                 fs::create_dir_all(&full)?;
@@ -89,12 +94,20 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
                         for file in &["SOUL.md", "MEMORY.md", "AGENTS.md"] {
                             let path = identity.join(file);
                             if path.exists() {
-                                println!("  {} {}", "✓".green().bold(), path.display().to_string().dimmed());
+                                println!(
+                                    "  {} {}",
+                                    "✓".green().bold(),
+                                    path.display().to_string().dimmed()
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        println!("  {} Failed to init identity files: {}", "⚠".yellow().bold(), e);
+                        println!(
+                            "  {} Failed to init identity files: {}",
+                            "⚠".yellow().bold(),
+                            e
+                        );
                     }
                 }
                 let _ = paths.ensure_runtime_dirs();

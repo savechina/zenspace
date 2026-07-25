@@ -271,10 +271,8 @@ impl InferenceGateway {
 
         for req in batch {
             let response = if let Some(ref orchestrator) = self.orchestrator {
-                let mut session = SessionContext::new(
-                    "inference-gateway".to_string(),
-                    String::new(),
-                );
+                let mut session =
+                    SessionContext::new("inference-gateway".to_string(), String::new());
                 match orchestrator.execute(&mut session, &req.prompt).await {
                     Ok(execution) => Ok(execution.response),
                     Err(e) => {

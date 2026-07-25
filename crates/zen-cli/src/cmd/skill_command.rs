@@ -65,11 +65,7 @@ pub async fn execute_command(cmd: &SkillCommands) -> Result<(), ZenError> {
             Ok(())
         }
 
-        SkillCommands::Run {
-            name,
-            input,
-            rate,
-        } => {
+        SkillCommands::Run { name, input, rate } => {
             let loader = SkillLoader::new(&paths);
 
             if !loader.skill_exists(name) {
@@ -80,11 +76,7 @@ pub async fn execute_command(cmd: &SkillCommands) -> Result<(), ZenError> {
                 .load_skill(name)
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 
-            println!(
-                "{} {}",
-                "Skill:".bold(),
-                def.name.green().bold()
-            );
+            println!("{} {}", "Skill:".bold(), def.name.green().bold());
             println!("{}\n", def.description.dimmed());
 
             for ctx_file in &def.context_files {
@@ -92,7 +84,11 @@ pub async fn execute_command(cmd: &SkillCommands) -> Result<(), ZenError> {
                 if full_path.is_file() {
                     match std::fs::read_to_string(&full_path) {
                         Ok(content) => {
-                            println!("{} {}", "Context:".bold(), ctx_file.display().to_string().cyan());
+                            println!(
+                                "{} {}",
+                                "Context:".bold(),
+                                ctx_file.display().to_string().cyan()
+                            );
                             println!("{content}\n");
                         }
                         Err(e) => {
@@ -175,15 +171,15 @@ pub async fn execute_command(cmd: &SkillCommands) -> Result<(), ZenError> {
             println!("{} {}", "Description:".bold(), def.description);
 
             if !def.tools.is_empty() {
-                println!(
-                    "{} {}",
-                    "Tools:".bold(),
-                    def.tools.join(", ").cyan()
-                );
+                println!("{} {}", "Tools:".bold(), def.tools.join(", ").cyan());
             }
 
             if !def.context_files.is_empty() {
-                let files: Vec<String> = def.context_files.iter().map(|p| p.display().to_string()).collect();
+                let files: Vec<String> = def
+                    .context_files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
                 println!("{} {}", "Context files:".bold(), files.join(", ").cyan());
             }
 

@@ -45,12 +45,9 @@ impl GoalService {
         if !self.goals_path.exists() {
             return Ok(Vec::new());
         }
-        let content =
-            fs::read_to_string(&self.goals_path).map_err(ZenError::Io)?;
-        let parsed: GoalsToml =
-            toml::from_str(&content).map_err(|e| ZenError::Message(format!(
-                "failed to parse goals.toml: {e}"
-            )))?;
+        let content = fs::read_to_string(&self.goals_path).map_err(ZenError::Io)?;
+        let parsed: GoalsToml = toml::from_str(&content)
+            .map_err(|e| ZenError::Message(format!("failed to parse goals.toml: {e}")))?;
         Ok(parsed.goals)
     }
 
@@ -101,10 +98,8 @@ impl GoalService {
         let toml_struct = GoalsToml {
             goals: goals.to_vec(),
         };
-        let content =
-            toml::to_string_pretty(&toml_struct).map_err(|e| ZenError::Message(format!(
-                "failed to serialize goals: {e}"
-            )))?;
+        let content = toml::to_string_pretty(&toml_struct)
+            .map_err(|e| ZenError::Message(format!("failed to serialize goals: {e}")))?;
 
         if let Some(parent) = self.goals_path.parent() {
             fs::create_dir_all(parent).map_err(ZenError::Io)?;
@@ -231,11 +226,13 @@ mod tests {
     fn multiple_goals_coexist() {
         let (service, _tmp) = setup_service();
         service.set_goal(sample_goal("fitness")).unwrap();
-        service.set_goal(Goal {
-            name: "reading".to_string(),
-            target: "read 12 books".to_string(),
-            ..sample_goal("fitness")
-        }).unwrap();
+        service
+            .set_goal(Goal {
+                name: "reading".to_string(),
+                target: "read 12 books".to_string(),
+                ..sample_goal("fitness")
+            })
+            .unwrap();
 
         let goals = service.load_goals().unwrap();
         assert_eq!(goals.len(), 2);

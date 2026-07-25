@@ -3,7 +3,9 @@ use rig_core::Embed;
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStoreTable};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use zen_repo::{EmbeddingsRepo, InsertNotionEmbeddingRequest, InsertNoteEmbeddingRequest, SqliteClient};
+use zen_repo::{
+    EmbeddingsRepo, InsertNoteEmbeddingRequest, InsertNotionEmbeddingRequest, SqliteClient,
+};
 
 use super::SearchResult;
 
@@ -66,7 +68,9 @@ impl Tier3Search {
             return Ok(Vec::new());
         }
 
-        let results = EmbeddingsRepo::new(client).search(query_embedding, top_k).await?;
+        let results = EmbeddingsRepo::new(client)
+            .search(query_embedding, top_k)
+            .await?;
 
         let docs: Vec<SearchResult> = results
             .into_iter()
@@ -118,7 +122,10 @@ impl Tier3Search {
         }
 
         EmbeddingsRepo::new(client)
-            .insert_entity_embedding(InsertNotionEmbeddingRequest { notion_id, embedding })
+            .insert_entity_embedding(InsertNotionEmbeddingRequest {
+                notion_id,
+                embedding,
+            })
             .await?;
 
         debug!(

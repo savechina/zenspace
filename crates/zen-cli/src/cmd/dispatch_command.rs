@@ -147,10 +147,7 @@ pub async fn execute_command(cmd: &DispatchCommands) -> Result<(), ZenError> {
                 return Ok(());
             }
 
-            println!(
-                "{:<10} {:<10} {:<12} CREATED",
-                "ID", "TARGET", "STATUS"
-            );
+            println!("{:<10} {:<10} {:<12} CREATED", "ID", "TARGET", "STATUS");
             println!("{}", "-".repeat(60));
 
             for task in &tasks {
@@ -171,11 +168,7 @@ pub async fn execute_command(cmd: &DispatchCommands) -> Result<(), ZenError> {
                 .load_task(task_id)
                 .map_err(|e| ZenError::Message(format!("task not found: {e}")))?;
 
-            println!(
-                "Task {} — {}",
-                task.short_id().cyan(),
-                "cancelled".bold()
-            );
+            println!("Task {} — {}", task.short_id().cyan(), "cancelled".bold());
             println!("  Target:     {}", task.target);
             println!("  Task:       {}", task.task_description);
             Ok(())

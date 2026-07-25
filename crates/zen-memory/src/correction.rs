@@ -176,8 +176,8 @@ impl Correction {
     pub fn from_markdown(content: &str) -> Result<Self, CorrectionError> {
         let fm = extract_frontmatter(content)
             .ok_or_else(|| CorrectionError::Parse("missing frontmatter".into()))?;
-        let id = parse_field(&fm, "id")
-            .ok_or_else(|| CorrectionError::MissingField("id".into()))?;
+        let id =
+            parse_field(&fm, "id").ok_or_else(|| CorrectionError::MissingField("id".into()))?;
         let error_ref = parse_field(&fm, "error_ref")
             .ok_or_else(|| CorrectionError::MissingField("error_ref".into()))?;
         let fix = parse_field(&fm, "fix")

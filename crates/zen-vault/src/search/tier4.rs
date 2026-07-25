@@ -4,8 +4,8 @@ use tracing::debug;
 
 use crate::tools::{ZenTool, ZenToolError, ZenToolResult, args_schema_entity, result_schema_array};
 use zen_repo::{
-    ComponentResult, NotionsRepo, GraphSearchResult, InsertRelationshipRequest,
-    PageRankResult, ShortestPathResult, SqliteClient,
+    ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionsRepo, PageRankResult,
+    ShortestPathResult, SqliteClient,
 };
 
 pub struct GraphResult {
@@ -45,7 +45,9 @@ impl Tier4Search {
             return Ok(Vec::new());
         }
 
-        let results = NotionsRepo::new(client).bfs_search(notion_name, max_depth).await?;
+        let results = NotionsRepo::new(client)
+            .bfs_search(notion_name, max_depth)
+            .await?;
 
         let graph_results: Vec<GraphResult> = results.into_iter().map(GraphResult::from).collect();
 
@@ -169,9 +171,7 @@ impl ZenTool for Tier4Search {
 
         let client = zen_repo::SqliteClient::open(std::path::Path::new(db_path))
             .await
-            .map_err(|e| {
-                ZenToolError::ExecutionFailed(format!("failed to open state db: {e}"))
-            })?;
+            .map_err(|e| ZenToolError::ExecutionFailed(format!("failed to open state db: {e}")))?;
 
         let results = self
             .search(&client, notion_name, max_depth)
