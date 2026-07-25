@@ -3,14 +3,16 @@ use ratatui::text::Line;
 
 pub struct MarkdownStreamCollector {
     buffer: String,
-    committed_line_count: usize,
+    committed_chars: usize,
+    committed_lines: Vec<Line<'static>>,
 }
 
 impl MarkdownStreamCollector {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
-            committed_line_count: 0,
+            committed_chars: 0,
+            committed_lines: Vec::new(),
         }
     }
 
@@ -19,27 +21,29 @@ impl MarkdownStreamCollector {
     }
 
     pub fn commit_complete_lines(&mut self) -> (Vec<Line<'static>>, String) {
-        let source = self.buffer.clone();
-        let last_newline = source.rfind('\n');
+        let last_newline = self.buffer.rfind('\n');
 
-        let renderable = if let Some(idx) = last_newline {
-            source[..=idx].to_string()
-        } else {
-            return (Vec::new(), String::new());
+        let renderable_end = match last_newline {
+            Some(idx) => idx + 1,
+            None => return (Vec::new(), String::new()),
         };
 
-        let lines = render_markdown_with_thoughts(&renderable);
-        let complete_count = lines.len();
-
-        if self.committed_line_count >= complete_count {
+        if renderable_end <= self.committed_chars {
             return (Vec::new(), String::new());
         }
 
-        let out: Vec<Line<'static>> = lines[self.committed_line_count..complete_count].to_vec();
-        let raw_text = renderable.clone();
+        let renderable = &self.buffer[..renderable_end];
+        let all_lines = render_markdown_with_thoughts(renderable);
 
-        self.committed_line_count = complete_count;
-        (out, raw_text)
+        let old_line_count = self.committed_lines.len();
+        if all_lines.len() > old_line_count {
+            let new_lines = all_lines[old_line_count..].to_vec();
+            self.committed_lines = all_lines;
+            self.committed_chars = renderable_end;
+            (new_lines, renderable.to_string())
+        } else {
+            (Vec::new(), String::new())
+        }
     }
 
     pub fn finalize_and_drain(&mut self) -> (Vec<Line<'static>>, String) {
@@ -48,11 +52,12 @@ impl MarkdownStreamCollector {
             source.push('\n');
         }
 
-        let lines = render_markdown_with_thoughts(&source);
-        let out = if self.committed_line_count >= lines.len() {
-            Vec::new()
+        let all_lines = render_markdown_with_thoughts(&source);
+        let old_line_count = self.committed_lines.len();
+        let out: Vec<Line<'static>> = if all_lines.len() > old_line_count {
+            all_lines[old_line_count..].to_vec()
         } else {
-            lines[self.committed_line_count..].to_vec()
+            all_lines
         };
         let raw_text = source.clone();
 
@@ -62,7 +67,8 @@ impl MarkdownStreamCollector {
 
     pub fn clear(&mut self) {
         self.buffer.clear();
-        self.committed_line_count = 0;
+        self.committed_chars = 0;
+        self.committed_lines.clear();
     }
 
     pub fn buffer(&self) -> &str {

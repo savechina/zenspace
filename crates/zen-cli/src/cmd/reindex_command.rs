@@ -40,7 +40,7 @@ pub async fn execute_command(cmd: &ReindexCommands) -> Result<(), ZenError> {
 
             debug!("reindex: path={}", knowledge_dir.display());
 
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
             let db_client = SqliteClient::open_lazy(&db_path)
                 .await
                 .map_err(|e| ZenError::Message(format!("Failed to open database: {e}")))?;

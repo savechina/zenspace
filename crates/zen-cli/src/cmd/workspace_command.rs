@@ -82,6 +82,24 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
                 println!("  {} {}", "✓".green().bold(), full.dimmed());
             }
 
+            if let Ok(paths) = ZenPaths::detect() {
+                match paths.ensure_identity_files() {
+                    Ok(()) => {
+                        let identity = paths.identity();
+                        for file in &["SOUL.md", "MEMORY.md", "AGENTS.md"] {
+                            let path = identity.join(file);
+                            if path.exists() {
+                                println!("  {} {}", "✓".green().bold(), path.display().to_string().dimmed());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} Failed to init identity files: {}", "⚠".yellow().bold(), e);
+                    }
+                }
+                let _ = paths.ensure_runtime_dirs();
+            }
+
             Ok(())
         }
         WorkspaceCommands::Status => {

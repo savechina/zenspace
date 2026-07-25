@@ -279,7 +279,7 @@ impl SessionRecord {
             self.id,
         );
 
-        if let Ok(index) = SessionIndex::open(&paths.db())
+        if let Ok(index) = SessionIndex::open(&paths.data())
             && let Err(e) = index.upsert(
                 &self.id,
                 &relative_path,
@@ -301,7 +301,7 @@ impl SessionRecord {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
 
         // Fast path: SessionIndex → .jsonl
-        if let Ok(index) = SessionIndex::open(&paths.db())
+        if let Ok(index) = SessionIndex::open(&paths.data())
             && let Ok(Some(relative_path)) = index.find(id)
         {
             let file_path = paths.sessions().join(&relative_path);
@@ -405,7 +405,7 @@ impl SessionRecord {
         let mut sessions: Vec<SessionRecord> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        if let Ok(index) = SessionIndex::open(&paths.db())
+        if let Ok(index) = SessionIndex::open(&paths.data())
             && let Ok(indexed) = index.list_all()
         {
             for row in indexed {
@@ -421,7 +421,7 @@ impl SessionRecord {
                     seen_ids.insert(session.id.clone());
                     sessions.push(session);
                 } else if let Some(repaired) =
-                    Self::repair_indexed_session(&sessions_root, &row.id, &paths.db())
+                    Self::repair_indexed_session(&sessions_root, &row.id, &paths.data())
                 {
                     seen_ids.insert(repaired.id.clone());
                     sessions.push(repaired);

@@ -393,7 +393,7 @@ impl NoteService {
 
         tracing::info!("note created: id={} path={}", note.id, file_path.display());
 
-        let db_path = paths.db().join("state.db");
+        let db_path = paths.data().join("state.db");
         match SqliteClient::open(&db_path).await {
             Ok(client) => {
                 let title: String = content.lines().next().unwrap_or(content).chars().take(200).collect();

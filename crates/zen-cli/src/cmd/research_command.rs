@@ -54,7 +54,7 @@ pub async fn execute_command(cmd: &ResearchCommands) -> Result<(), ZenError> {
             let config = load_config()?;
             let router = DefaultRouter::from_agentic(config);
 
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
             let client = zen_repo::SqliteClient::open(&db_path)
                 .await
                 .map_err(|e| ZenError::Message(format!("Database error: {}", e)))?;

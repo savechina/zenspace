@@ -22,7 +22,7 @@ use super::render::normalize_compact_markdown;
 use super::session_picker::SessionPickerState;
 use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::MarkdownStreamCollector;
-use super::theme::{OutputTheme, ZenTheme, from_name as theme_from_name};
+use super::theme::{OutputTheme, ZenTheme, auto_select as theme_auto_select, from_name as theme_from_name};
 use zen_memory::conversation::ConversationStore;
 use zen_memory::history::HistoryStore;
 
@@ -57,6 +57,7 @@ pub enum InputMode {
     Paste,
     History,
     Selection,
+    Command,
 }
 
 pub struct InputCell {
@@ -107,6 +108,16 @@ impl InputCell {
 
     pub fn enter_history_mode(&mut self) {
         self.mode = InputMode::History;
+    }
+
+    pub fn enter_command_mode(&mut self) {
+        self.mode = InputMode::Command;
+    }
+
+    pub fn exit_command_mode(&mut self) {
+        if self.mode == InputMode::Command {
+            self.mode = InputMode::Default;
+        }
     }
 
     pub fn enter_selection_mode(&mut self, cell_count: usize) {
@@ -447,10 +458,11 @@ impl App {
             String::from(" Select: ↑↓/jk nav · y yank · Esc exit ")
         };
         let (border_char, title) = match mode {
-            InputMode::Default => (">", String::from(" Input (Enter=send, Ctrl+D=exit) ")),
+            InputMode::Default => (">", String::from(" Input (Enter=send, Ctrl+D=exit, Ctrl+X=cmd) ")),
             InputMode::Paste => ("|", String::from(" Paste ")),
             InputMode::History => ("←", String::from(" History (↑↓ browse, Enter=load) ")),
             InputMode::Selection => ("▐", cell_info),
+            InputMode::Command => ("⌘", String::from(" Command (v=select · j/k=scroll · Esc=back) ")),
         };
         let bg_style = ratatui::style::Style::default().bg(self.theme.bg());
         let block = Block::default()
@@ -835,7 +847,7 @@ Use /thinking to show/hide thinking process."#;
         let tier = TierSelector::select_tier(query);
 
         if self.db_client.is_none() {
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
             self.db_client = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
@@ -1174,6 +1186,8 @@ Use /thinking to show/hide thinking process."#;
                 }
 
                 if let Some(done_result) = result.done_result {
+                    self.output
+                        .retain(|c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")));
                     if let Some(pos) = self.output.iter().position(|cell| {
                         matches!(cell, OutputCell::Plain(p) if p.text.contains("Thinking..."))
                     }) {
@@ -1201,6 +1215,9 @@ Use /thinking to show/hide thinking process."#;
                                     super::cell::MarkdownCell::from_lines(remaining, raw_text),
                                 ));
                             }
+                            self.output
+                                .push(OutputCell::Plain(super::cell::PlainCell::new("")));
+                            self.auto_scroll = true;
                             self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {
                                 if let Err(e) = store.append("user", &_query) {
@@ -1490,7 +1507,7 @@ Use /thinking to show/hide thinking process."#;
         let base_dir = paths.inbox();
 
         if self.db_client.is_none() {
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
             self.db_client = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
@@ -1569,10 +1586,11 @@ Use /thinking to show/hide thinking process."#;
         let manager = SessionManager::new();
         match manager.create_session("tui", ".") {
             Ok(mut session) => {
-                let title = if first_message.len() > 60 {
-                    format!("{}...", &first_message[..60])
+                let title: String = first_message.chars().take(60).collect();
+                let title = if title.len() < first_message.len() {
+                    format!("{}...", title)
                 } else {
-                    first_message.to_string()
+                    title
                 };
                 session.title = Some(title);
                 if let Err(e) = session.save() {
@@ -2041,6 +2059,8 @@ pub fn run_app(
     let mut app = App::new(config);
     if let Some(theme) = config.tui_theme() {
         app.with_theme(theme);
+    } else {
+        app.theme = theme_auto_select();
     }
     app.push_splash();
     app.init_orchestrator(config);
@@ -2077,6 +2097,7 @@ pub fn run_app(
                             }
                             app.input.exit_mode();
                             app.input = App::create_input_textarea("");
+                            app.auto_scroll = true;
                             app.handle_command(&cmd);
                         }
                         crate::tui::handler::KeyAction::Quit => {

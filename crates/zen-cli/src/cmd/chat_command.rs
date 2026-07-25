@@ -56,7 +56,7 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
         let tier = TierSelector::select_tier(message);
         let mut seen = std::collections::HashSet::new();
 
-        let db_path = paths.db().join("state.db");
+        let db_path = paths.data().join("state.db");
         let client = match zen_repo::SqliteClient::open(&db_path).await {
             Ok(c) => c,
             Err(e) => {

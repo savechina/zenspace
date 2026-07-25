@@ -28,7 +28,7 @@ pub fn execute_command(cmd: &SimilarCommands) -> Result<(), ZenError> {
             debug!("similar: note_id={} limit={} json={}", note_id, k, json);
 
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
 
             let results = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {

@@ -247,7 +247,8 @@ impl WasmSandbox {
         let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
-        let fuel_budget = (self.limits.max_execution_time_ms as u64)
+        let fuel_budget = self.limits
+            .max_execution_time_ms
             .saturating_mul(1_000_000)
             .max(10_000_000);
         store
@@ -334,7 +335,8 @@ impl WasmSandbox {
         let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
-        let fuel_budget = (self.limits.max_execution_time_ms as u64)
+        let fuel_budget = self.limits
+            .max_execution_time_ms
             .saturating_mul(1_000_000)
             .max(10_000_000);
         store

@@ -80,6 +80,23 @@ pub fn from_name(name: &str) -> Box<dyn OutputTheme> {
     }
 }
 
+pub fn supports_truecolor() -> bool {
+    match std::env::var("COLORTERM") {
+        Ok(v) => v == "truecolor" || v == "24bit",
+        Err(_) => match std::env::var("TERM") {
+            Ok(v) => v.contains("256") || v.contains("color"),
+            Err(_) => false,
+        },
+    }
+}
+
+pub fn auto_select() -> Box<dyn OutputTheme> {
+    if !supports_truecolor() {
+        return Box::new(EinkTheme);
+    }
+    Box::new(ZenTheme)
+}
+
 // ---------------------------------------------------------------------------
 // Zen — Wabi-sabi natural palette (DEFAULT)
 // Inspired by Japanese temple aesthetics: moss, sand, wood, stone.

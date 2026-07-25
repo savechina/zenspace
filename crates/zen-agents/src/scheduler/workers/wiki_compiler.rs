@@ -223,7 +223,7 @@ impl ZenWorker for WikiCompilerWorker {
         let state = CompilerState::load(&state_path);
         debug!(last_compile_time = %state.last_compile_time, "loaded compiler state");
 
-        let state_db = paths.db().join("state.db");
+        let state_db = paths.data().join("state.db");
         let wiki_dir = paths.vault().join("wiki");
 
         let client = match zen_vault::SqliteClient::open(&state_db).await {

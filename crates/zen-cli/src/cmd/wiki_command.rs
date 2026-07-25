@@ -61,7 +61,7 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             rebuild_fts,
         } => {
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
             let db_client = zen_repo::SqliteClient::open_lazy(&db_path)
                 .await
                 .map_err(|e| ZenError::Message(format!("Failed to open database: {e}")))?;
@@ -243,10 +243,11 @@ fn get_page_summary(path: &std::path::Path) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if after_frontmatter && !trimmed.is_empty() && !trimmed.starts_with('#') {
-            let summary = if trimmed.len() > 60 {
-                format!("{}...", &trimmed[..57])
+            let summary: String = trimmed.chars().take(60).collect();
+            let summary = if summary.len() < trimmed.len() {
+                format!("{}...", summary)
             } else {
-                trimmed.to_string()
+                summary
             };
             return Some(summary);
         }

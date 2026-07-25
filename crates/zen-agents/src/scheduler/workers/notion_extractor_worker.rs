@@ -101,7 +101,7 @@ impl ZenWorker for NotionExtractorWorker {
             });
         }
 
-        let state_db = paths.db().join("state.db");
+        let state_db = paths.data().join("state.db");
         let client = match zen_vault::SqliteClient::open(&state_db).await {
             Ok(c) => c,
             Err(e) => {

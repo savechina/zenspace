@@ -47,7 +47,7 @@ impl ZenWorker for DreamWorker {
         let paths = ZenPaths::detect()?;
         let today = Utc::now().date_naive();
 
-        let state_db = paths.db().join("state.db");
+        let state_db = paths.data().join("state.db");
         let notion_graph = if state_db.exists() {
             match zen_repo::SqliteClient::open(&state_db).await {
                 Ok(client) => {

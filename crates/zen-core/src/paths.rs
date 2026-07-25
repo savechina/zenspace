@@ -99,6 +99,10 @@ impl ZenPaths {
         self.global_root.join(DB_DIR)
     }
 
+    pub fn data(&self) -> PathBuf {
+        self.global_root.join(DB_DIR)
+    }
+
     pub fn sessions(&self) -> PathBuf {
         self.global_root.join(SESSIONS_DIR)
     }
@@ -143,6 +147,47 @@ impl ZenPaths {
 
     pub fn identity(&self) -> PathBuf {
         self.global_root.join(IDENTITY_DIR)
+    }
+
+    pub fn ensure_identity_files(&self) -> std::io::Result<()> {
+        let identity_dir = self.identity();
+        std::fs::create_dir_all(&identity_dir)?;
+
+        let soul_path = identity_dir.join("SOUL.md");
+        if !soul_path.exists() {
+            std::fs::write(&soul_path, DEFAULT_SOUL_MD)?;
+        }
+
+        let memory_path = identity_dir.join("MEMORY.md");
+        if !memory_path.exists() {
+            std::fs::write(&memory_path, DEFAULT_MEMORY_MD)?;
+        }
+
+        let agents_path = identity_dir.join("AGENTS.md");
+        if !agents_path.exists() {
+            std::fs::write(&agents_path, DEFAULT_AGENTS_MD)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn ensure_runtime_dirs(&self) -> std::io::Result<()> {
+        for dir in &[
+            self.data(),
+            self.sessions(),
+            self.memory(),
+            self.logs(),
+            self.identity(),
+            self.cache(""),
+            self.vault(),
+            self.inbox(),
+            self.raw(),
+            self.wiki(),
+            self.skills(),
+        ] {
+            std::fs::create_dir_all(dir)?;
+        }
+        Ok(())
     }
 
     pub fn logs(&self) -> PathBuf {
@@ -201,6 +246,12 @@ impl ZenPaths {
         None
     }
 }
+
+const DEFAULT_SOUL_MD: &str = "# Soul\n\nYou are Zen, a personal AI agentic workspace assistant.\nYou help capture notes, build knowledge, and learn from every interaction.\n\n## Core Values\n\n- Honesty over comfort\n- Simplicity over cleverness\n- Action over analysis paralysis\n";
+
+const DEFAULT_MEMORY_MD: &str = "# Memory\n\n## Identity\n\n## Active Commitments\n\n## Stop-Doing Ledger\n\n## Continue-Doing Ledger\n\n## Active Mental Models\n\n## Recent Wisdom\n";
+
+const DEFAULT_AGENTS_MD: &str = "# Agent Behavior\n\n- Be concise and direct\n- Ask for clarification when requirements are ambiguous\n- Follow existing codebase patterns\n- Surface assumptions explicitly\n";
 
 #[cfg(test)]
 mod tests {

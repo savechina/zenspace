@@ -76,7 +76,7 @@ pub async fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
             let router = DefaultRouter::from_agentic(config);
             let service = SearchService::new(router);
 
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
             let client = zen_repo::SqliteClient::open(&db_path)
                 .await
                 .map_err(|e| ZenError::Message(format!("Database error: {}", e)))?;

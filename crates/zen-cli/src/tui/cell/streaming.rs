@@ -22,10 +22,12 @@ impl StreamingCell {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         if !self.buffer.is_empty() {
-            lines.push(Line::from(Span::styled(
-                self.buffer.clone(),
-                self.buffer_style,
-            )));
+            for segment in self.buffer.lines() {
+                lines.push(Line::from(Span::styled(
+                    segment.to_string(),
+                    self.buffer_style,
+                )));
+            }
         }
 
         lines.push(Line::from(Span::styled("▌", self.cursor_style)));

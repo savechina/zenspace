@@ -63,7 +63,7 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
             );
 
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
 
             let results = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -125,7 +125,7 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
             let id = format!("goal-{}", uuid::Uuid::now_v7());
 
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
 
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -155,7 +155,7 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
             let goal = serves_goal.as_deref().unwrap_or("");
 
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
 
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -178,7 +178,7 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
         }
         GraphCommands::GoalList => {
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
 
             let goals = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -210,7 +210,7 @@ pub fn execute_command(cmd: &GraphCommands) -> Result<(), ZenError> {
         }
         GraphCommands::PathList => {
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
-            let db_path = paths.db().join("state.db");
+            let db_path = paths.data().join("state.db");
 
             let path_nodes = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {

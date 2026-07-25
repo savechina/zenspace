@@ -10,6 +10,52 @@ pub enum KeyAction {
 }
 
 pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
+    if app.input.effective_mode() == InputMode::Command {
+        return match (key.code, key.modifiers) {
+            (KeyCode::Char('v'), KeyModifiers::NONE) => {
+                app.input.exit_command_mode();
+                if !app.output.is_empty() {
+                    app.enter_selection();
+                }
+                KeyAction::Continue
+            }
+            (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                app.auto_scroll = false;
+                app.scroll_offset = app.scroll_offset.saturating_add(1);
+                KeyAction::Continue
+            }
+            (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                app.auto_scroll = false;
+                app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                KeyAction::Continue
+            }
+            (KeyCode::Char('G'), KeyModifiers::NONE)
+            | (KeyCode::End, KeyModifiers::NONE) => {
+                app.auto_scroll = true;
+                KeyAction::Continue
+            }
+            (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                app.auto_scroll = false;
+                app.scroll_offset = 0;
+                KeyAction::Continue
+            }
+            (KeyCode::Home, KeyModifiers::NONE) => {
+                app.auto_scroll = false;
+                app.scroll_offset = 0;
+                KeyAction::Continue
+            }
+            (KeyCode::Esc, KeyModifiers::NONE)
+            | (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
+                app.input.exit_command_mode();
+                KeyAction::Continue
+            }
+            _ => {
+                app.input.exit_command_mode();
+                KeyAction::Continue
+            }
+        };
+    }
+
     if app.input.effective_mode() == InputMode::Selection {
         return match (key.code, key.modifiers) {
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
@@ -102,6 +148,10 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         }
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyAction::Quit,
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => return KeyAction::Quit,
+        (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
+            app.input.enter_command_mode();
+            return KeyAction::Continue;
+        }
         (KeyCode::Up, KeyModifiers::NONE) => {
             if app.session_picker.visible {
                 app.session_picker.move_up();
@@ -232,28 +282,6 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         (KeyCode::PageDown, KeyModifiers::NONE) => {
             app.scroll_offset = app.scroll_offset.saturating_add(10);
             return KeyAction::Continue;
-        }
-        (KeyCode::Char('v'), KeyModifiers::NONE) => {
-            if app.input.take_just_exited_selection() {
-                app.input.input(Input {
-                    key: Key::Char('v'),
-                    ctrl: false,
-                    alt: false,
-                    shift: false,
-                });
-                return KeyAction::Continue;
-            }
-            if app.input.lines().join("\n").is_empty() && !app.output.is_empty() {
-                app.enter_selection();
-                return KeyAction::Continue;
-            }
-            app.input.input(Input {
-                key: Key::Char('v'),
-                ctrl: false,
-                alt: false,
-                shift: false,
-            });
-            KeyAction::Continue
         }
         (KeyCode::Char(c), KeyModifiers::NONE) => {
             if app.session_picker.rename_mode {

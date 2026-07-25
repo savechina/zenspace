@@ -22,6 +22,11 @@ pub fn run(config: &'static zen_core::config::ZenConfig) -> Result<(), anyhow::E
     use ratatui::backend::CrosstermBackend;
     use std::io;
 
+    if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+        let _ = paths.ensure_identity_files();
+        let _ = paths.ensure_runtime_dirs();
+    }
+
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
