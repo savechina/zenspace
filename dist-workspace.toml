@@ -26,6 +26,7 @@ tap = "savechina/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 formula = "zenspace"
+allow-dirty = ["ci"]
 
 # Which binaries to include per target platform
 [dist.binaries]
