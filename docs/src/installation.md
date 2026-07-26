@@ -8,8 +8,7 @@
 ## Homebrew (macOS, Recommended)
 
 ```bash
-brew tap savechina/zenspace
-brew install zenspace
+brew install savechina/tap/zenspace
 ```
 
 ## From Source

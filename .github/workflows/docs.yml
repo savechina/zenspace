@@ -1,6 +1,6 @@
 # Build and deploy mdBook documentation to GitHub Pages
 #
-name: Deploy Docs
+name: Docs
 
 on:
   push:

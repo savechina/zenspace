@@ -46,8 +46,7 @@
 
 ```bash
 # 安装（macOS）
-brew tap savechina/zenspace
-brew install zenspace
+brew install savechina/tap/zenspace
 
 # 初始化
 zen workspace init

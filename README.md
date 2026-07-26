@@ -46,8 +46,7 @@ Local-first by default. macOS Keychain for secrets. Sensitive data never touches
 
 ```bash
 # Install (macOS)
-brew tap savechina/zenspace
-brew install zenspace
+brew install savechina/tap/zenspace
 
 # Initialize
 zen workspace init
