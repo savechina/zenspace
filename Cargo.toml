@@ -85,9 +85,10 @@ tui-textarea-2 = "0.12"
 syntect = { version = "5", default-features = false, features = ["default-onig"] }
 two-face = { version = "0.5", features = ["syntect-default-onig"] }
 
-# Markdown rendering (FR-TUI-023 — tui-markdown + ansi-to-tui)
-tui-markdown = { version = "0.3.7", features = ["highlight-code"] }
+# Markdown rendering (FR-TUI-023 — tui-markdown 0.3.9 wraps pulldown-cmark, supports headings/tables/code highlight)
+tui-markdown = { version = "0.3.9", features = ["highlight-code"] }
 ansi-to-tui = "8.0.1"
+ratatui-themes = "0.2.0"
 
 # HTTP client for LLM providers
 reqwest = { version = "0.13", default-features = false, features = ["json", "blocking", "stream", "rustls"] }

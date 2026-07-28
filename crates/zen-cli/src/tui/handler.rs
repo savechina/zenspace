@@ -1,7 +1,8 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tui_textarea::{Input, Key};
 
 use super::app::InputMode;
+use super::selection::{Selection, TextPosition};
 
 pub enum KeyAction {
     Submit,
@@ -10,6 +11,10 @@ pub enum KeyAction {
 }
 
 pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
+    if app.text_selection.is_some() {
+        return handle_text_selection_key(key, app);
+    }
+
     if app.input.effective_mode() == InputMode::Command {
         return match (key.code, key.modifiers) {
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
@@ -123,6 +128,18 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         };
     }
 
+    if !app.output.is_empty() && key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::NONE {
+        let all_lines = super::ui::build_output_lines(app);
+        let last_line = all_lines.len().saturating_sub(1);
+        app.text_selection = Some(Selection::new(
+            TextPosition::new(last_line, 0),
+            TextPosition::new(last_line, 0),
+        ));
+        app.auto_scroll = true;
+        app.refresh_input_border();
+        return KeyAction::Continue;
+    }
+
     let action = match (key.code, key.modifiers) {
         (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
             if app.session_picker.visible && !app.session_picker.rename_mode {
@@ -144,10 +161,37 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             }
             return KeyAction::Continue;
         }
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return KeyAction::Quit,
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) && !app.output.is_empty() {
+                app.enter_selection();
+                app.yank_selected_cell();
+                return KeyAction::Continue;
+            }
+            return KeyAction::Quit;
+        }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => return KeyAction::Quit,
         (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
             app.input.enter_command_mode();
+            return KeyAction::Continue;
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_sub(10);
+            return KeyAction::Continue;
+        }
+        (KeyCode::PageDown, KeyModifiers::NONE) => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_add(10);
+            return KeyAction::Continue;
+        }
+        (KeyCode::Up, KeyModifiers::CONTROL) => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            return KeyAction::Continue;
+        }
+        (KeyCode::Down, KeyModifiers::CONTROL) => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_add(3);
             return KeyAction::Continue;
         }
         (KeyCode::Up, KeyModifiers::NONE) => {
@@ -272,15 +316,6 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             }
             return KeyAction::Continue;
         }
-        (KeyCode::PageUp, KeyModifiers::NONE) => {
-            app.auto_scroll = false;
-            app.scroll_offset = app.scroll_offset.saturating_sub(10);
-            return KeyAction::Continue;
-        }
-        (KeyCode::PageDown, KeyModifiers::NONE) => {
-            app.scroll_offset = app.scroll_offset.saturating_add(10);
-            return KeyAction::Continue;
-        }
         (KeyCode::Char(c), KeyModifiers::NONE) => {
             if app.session_picker.rename_mode {
                 app.session_picker.rename_input_char(c);
@@ -348,3 +383,207 @@ pub fn handle_paste(pasted: &str, app: &mut super::app::App) {
     app.input.enter_paste_mode();
     app.refresh_input_border();
 }
+
+pub fn handle_mouse(mouse: MouseEvent, app: &mut super::app::App) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_sub(5);
+        }
+        MouseEventKind::ScrollDown => {
+            app.auto_scroll = false;
+            app.scroll_offset = app.scroll_offset.saturating_add(5);
+        }
+        MouseEventKind::Down(_) => {
+            if !app.output.is_empty() && let Some(chat_area) = app.chat_area {
+                let all_lines = super::ui::build_output_lines(app);
+                let inner_width = chat_area.width.saturating_sub(2) as usize;
+                if let Some(pos) = super::selection::mouse_to_position(
+                    mouse.column,
+                    mouse.row,
+                    chat_area,
+                    app.scroll_offset,
+                    inner_width,
+                    &all_lines,
+                ) {
+                    app.text_selection = Some(Selection::new(pos, pos));
+                    app.auto_scroll = false;
+                }
+            }
+        }
+        MouseEventKind::Drag(_) => {
+            let maybe_pos = app.chat_area.and_then(|chat_area| {
+                let all_lines = super::ui::build_output_lines(app);
+                let inner_width = chat_area.width.saturating_sub(2) as usize;
+                super::selection::mouse_to_position(
+                    mouse.column,
+                    mouse.row,
+                    chat_area,
+                    app.scroll_offset,
+                    inner_width,
+                    &all_lines,
+                )
+            });
+            if let (Some(pos), Some(sel)) = (maybe_pos, &mut app.text_selection) {
+                sel.cursor = pos;
+            }
+        }
+        MouseEventKind::Up(_) => {
+            if let Some(sel) = &app.text_selection && sel.anchor == sel.cursor {
+                app.text_selection = None;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_text_selection_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
+    let all_lines = super::ui::build_output_lines(app);
+    let line_count = all_lines.len();
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
+            app.text_selection = None;
+            app.refresh_input_border();
+            KeyAction::Continue
+        }
+        (KeyCode::Char('y'), KeyModifiers::NONE) => {
+            if let Some(sel) = &app.text_selection {
+                let text = sel.selected_text(&all_lines);
+                if text.is_empty() {
+                    app.show_toast("No text selected");
+                } else {
+                    let preview: String = text.chars().take(30).collect();
+                    let suffix = if text.chars().count() > 30 { "…" } else { "" };
+                    if crate::tui::clipboard::write_text(&text).is_ok() {
+                        app.show_toast(format!("✓ Copied: {}{}", preview, suffix));
+                    } else {
+                        app.show_toast("✗ Clipboard unavailable");
+                    }
+                }
+            }
+            app.text_selection = None;
+            app.refresh_input_border();
+            KeyAction::Continue
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+            if let Some(sel) = &mut app.text_selection {
+                let cur = &mut sel.cursor;
+                if cur.line_idx > 0 {
+                    cur.line_idx -= 1;
+                    let line_text = all_lines
+                        .get(cur.line_idx)
+                        .map(super::selection::line_text)
+                        .unwrap_or_default();
+                    cur.char_idx = cur.char_idx.min(line_text.chars().count());
+                }
+                ensure_visible(sel.cursor, app, &all_lines);
+            }
+            KeyAction::Continue
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+            if let Some(sel) = &mut app.text_selection {
+                let cur = &mut sel.cursor;
+                if cur.line_idx + 1 < line_count {
+                    cur.line_idx += 1;
+                    let line_text = all_lines
+                        .get(cur.line_idx)
+                        .map(super::selection::line_text)
+                        .unwrap_or_default();
+                    cur.char_idx = cur.char_idx.min(line_text.chars().count());
+                }
+                ensure_visible(sel.cursor, app, &all_lines);
+            }
+            KeyAction::Continue
+        }
+        (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
+            if let Some(sel) = &mut app.text_selection {
+                let cur = &mut sel.cursor;
+                if cur.char_idx > 0 {
+                    cur.char_idx -= 1;
+                } else if cur.line_idx > 0 {
+                    cur.line_idx -= 1;
+                    let line_text = all_lines
+                        .get(cur.line_idx)
+                        .map(super::selection::line_text)
+                        .unwrap_or_default();
+                    cur.char_idx = line_text.chars().count();
+                }
+                ensure_visible(sel.cursor, app, &all_lines);
+            }
+            KeyAction::Continue
+        }
+        (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => {
+            if let Some(sel) = &mut app.text_selection {
+                let cur = &mut sel.cursor;
+                let line_text = all_lines
+                    .get(cur.line_idx)
+                    .map(super::selection::line_text)
+                    .unwrap_or_default();
+                let max_char = line_text.chars().count();
+                if cur.char_idx < max_char {
+                    cur.char_idx += 1;
+                } else if cur.line_idx + 1 < line_count {
+                    cur.line_idx += 1;
+                    cur.char_idx = 0;
+                }
+                ensure_visible(sel.cursor, app, &all_lines);
+            }
+            KeyAction::Continue
+        }
+        (KeyCode::Char('v'), KeyModifiers::NONE) => {
+            app.text_selection = None;
+            app.refresh_input_border();
+            KeyAction::Continue
+        }
+        _ => KeyAction::Continue,
+    }
+}
+
+fn ensure_visible(
+    pos: TextPosition,
+    app: &mut super::app::App,
+    all_lines: &[ratatui::text::Line<'static>],
+) {
+    use crate::tui::selection::line_text;
+    use unicode_width::UnicodeWidthChar;
+
+    let chat_area = app.chat_area.unwrap_or(ratatui::layout::Rect::new(0, 0, 82, 22));
+    let inner_width = chat_area.width.saturating_sub(2) as usize;
+    let visible_height = chat_area.height.saturating_sub(2) as usize;
+    let mut visual_row: usize = 0;
+    for (line_idx, line) in all_lines.iter().enumerate() {
+        if line_idx == pos.line_idx {
+            let text = line_text(line);
+            let mut col: usize = 0;
+            let mut visual_in_line: usize = 0;
+            for (ci, ch) in text.chars().enumerate() {
+                if ci == pos.char_idx {
+                    break;
+                }
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                col += cw;
+                if col >= inner_width {
+                    col = 0;
+                    visual_in_line += 1;
+                }
+            }
+            let target_visual = visual_row + visual_in_line;
+            if target_visual < app.scroll_offset {
+                app.scroll_offset = target_visual;
+            } else if target_visual >= app.scroll_offset + visible_height {
+                app.scroll_offset = target_visual.saturating_sub(visible_height - 1);
+            }
+            app.auto_scroll = false;
+            return;
+        }
+        let line_width = line.width();
+        let wrapped = if line_width == 0 || inner_width == 0 {
+            1
+        } else {
+            line_width.div_ceil(inner_width)
+        };
+        visual_row += wrapped;
+    }
+}
+

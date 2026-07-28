@@ -1,4 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
+use ratatui_themes::{ThemeName, ThemePalette};
 
 /// Color layer architecture for theme system.
 ///
@@ -67,6 +68,172 @@ pub trait OutputTheme {
 
     /// Layer 2: Info accent color (tooltips, info boxes)
     fn info_accent(&self) -> Color;
+
+    /// User message background: 12% white blend on theme bg
+    fn user_bg(&self) -> Color {
+        blend_toward_white(self.bg(), 12)
+    }
+
+    /// User message prefix glyph style (dim + bold)
+    fn user_prefix(&self) -> Style {
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::DIM)
+    }
+
+    /// Agent message prefix glyph style (dim bullet)
+    fn agent_prefix(&self) -> Style {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+
+    /// Turn separator style — dim + accent color for visual distinction
+    fn separator(&self) -> Style {
+        Style::default()
+            .fg(self.info_accent())
+            .add_modifier(Modifier::DIM)
+    }
+
+    /// Text selection background color (highlighted region)
+    fn selection_bg(&self) -> Color {
+        self.info_accent()
+    }
+
+    /// Text selection foreground color (highlighted region)
+    fn selection_fg(&self) -> Color {
+        Color::Black
+    }
+}
+
+fn blend_toward_white(color: Color, pct: u8) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => {
+            let p = pct as u16;
+            Color::Rgb(
+                (r as u16 + ((255 - r as u16) * p / 100)) as u8,
+                (g as u16 + ((255 - g as u16) * p / 100)) as u8,
+                (b as u16 + ((255 - b as u16) * p / 100)) as u8,
+            )
+        }
+        _ => Color::Rgb(30, 30, 30),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ratatui Themes Bridge — adapts ratatui-themes ThemePalette to OutputTheme
+// Maps semantic palette fields to our 24-method OutputTheme trait.
+// ---------------------------------------------------------------------------
+
+pub struct RatatuiThemesBridge {
+    palette: ThemePalette,
+}
+
+impl RatatuiThemesBridge {
+    pub fn from_theme_name(name: ThemeName) -> Self {
+        Self {
+            palette: name.palette(),
+        }
+    }
+}
+
+impl OutputTheme for RatatuiThemesBridge {
+    fn heading(&self, level: u8) -> Style {
+        match level {
+            1 => Style::default()
+                .fg(self.palette.accent)
+                .add_modifier(Modifier::BOLD),
+            2 => Style::default()
+                .fg(self.palette.accent)
+                .add_modifier(Modifier::BOLD),
+            3 => Style::default()
+                .fg(self.palette.secondary)
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .fg(self.palette.fg)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn bold(&self) -> Style {
+        Style::default()
+            .fg(self.palette.fg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn italic(&self) -> Style {
+        Style::default()
+            .fg(self.palette.muted)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    fn code_inline(&self) -> Style {
+        Style::default().fg(self.palette.accent)
+    }
+
+    fn code_block_border(&self) -> Style {
+        Style::default().fg(self.palette.muted)
+    }
+
+    fn code_block_lang(&self) -> Style {
+        Style::default().fg(self.palette.secondary)
+    }
+
+    fn table_border(&self) -> Style {
+        Style::default().fg(self.palette.muted)
+    }
+
+    fn table_header(&self) -> Style {
+        Style::default()
+            .fg(self.palette.fg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default().fg(self.palette.success)
+    }
+
+    fn list_bullet(&self) -> Style {
+        Style::default().fg(self.palette.secondary)
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(self.palette.accent)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn error(&self) -> Style {
+        Style::default().fg(self.palette.error)
+    }
+
+    fn streaming_cursor(&self) -> Style {
+        Style::default()
+            .fg(self.palette.selection)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn bg(&self) -> Color {
+        self.palette.bg
+    }
+
+    fn zen_core_light(&self) -> Color {
+        self.palette.accent
+    }
+
+    fn zen_core_dark(&self) -> Color {
+        self.palette.secondary
+    }
+
+    fn shadow(&self) -> Color {
+        self.palette.muted
+    }
+
+    fn text_muted(&self) -> Style {
+        Style::default().fg(self.palette.muted)
+    }
+
+    fn info_accent(&self) -> Color {
+        self.palette.accent
+    }
 }
 
 pub fn from_name(name: &str) -> Box<dyn OutputTheme> {
@@ -76,6 +243,42 @@ pub fn from_name(name: &str) -> Box<dyn OutputTheme> {
         "deep-ocean" => Box::new(DeepOceanTheme),
         "cyber-purple" => Box::new(CyberPurpleTheme),
         "eink" => Box::new(EinkTheme),
+        // ratatui-themes names
+        "dracula" => Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::Dracula)),
+        "one-dark-pro" | "onedarkpro" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::OneDarkPro))
+        }
+        "nord" => Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::Nord)),
+        "catppuccin-mocha" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::CatppuccinMocha))
+        }
+        "catppuccin-latte" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::CatppuccinLatte))
+        }
+        "gruvbox-dark" | "gruvbox" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::GruvboxDark))
+        }
+        "gruvbox-light" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::GruvboxLight))
+        }
+        "tokyo-night" | "tokyonight" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::TokyoNight))
+        }
+        "solarized-dark" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::SolarizedDark))
+        }
+        "solarized-light" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::SolarizedLight))
+        }
+        "monokai-pro" | "monokai" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::MonokaiPro))
+        }
+        "rose-pine" | "rosepine" => {
+            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::RosePine))
+        }
+        "kanagawa" => Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::Kanagawa)),
+        "everforest" => Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::Everforest)),
+        "cyberpunk" => Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::Cyberpunk)),
         _ => Box::new(ZenTheme),
     }
 }
@@ -784,6 +987,12 @@ mod tests {
             let _ = theme.shadow();
             let _ = theme.text_muted();
             let _ = theme.info_accent();
+            let _ = theme.user_bg();
+            let _ = theme.user_prefix();
+            let _ = theme.agent_prefix();
+            let _ = theme.separator();
+            let _ = theme.selection_bg();
+            let _ = theme.selection_fg();
         }
     }
 

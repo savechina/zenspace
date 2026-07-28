@@ -1,51 +1,31 @@
 use crate::tui::theme::OutputTheme;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, Text};
 
 #[derive(Debug, Clone)]
 pub struct StreamingCell {
-    pub buffer: String,
-    pub buffer_style: Style,
+    pub unstable_text: Text<'static>,
     pub cursor_style: Style,
 }
 
 impl StreamingCell {
-    pub fn new(buffer: impl Into<String>, theme: &dyn OutputTheme) -> Self {
+    pub fn new(unstable_text: Text<'static>, theme: &dyn OutputTheme) -> Self {
         Self {
-            buffer: buffer.into(),
-            buffer_style: theme.text_muted().add_modifier(Modifier::ITALIC),
+            unstable_text,
             cursor_style: theme.streaming_cursor(),
         }
     }
 
     pub fn display_lines(&self) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut lines = self.unstable_text.lines.clone();
 
-        if !self.buffer.is_empty() {
-            for segment in self.buffer.lines() {
-                lines.push(Line::from(Span::styled(
-                    segment.to_string(),
-                    self.buffer_style,
-                )));
-            }
+        if let Some(last) = lines.last_mut() {
+            last.spans
+                .push(Span::styled("▌", self.cursor_style));
+        } else {
+            lines.push(Line::from(Span::styled("▌", self.cursor_style)));
         }
 
-        lines.push(Line::from(Span::styled("▌", self.cursor_style)));
-
         lines
-    }
-}
-
-impl From<String> for StreamingCell {
-    fn from(s: String) -> Self {
-        use crate::tui::theme::ZenTheme;
-        Self::new(s, &ZenTheme)
-    }
-}
-
-impl From<&str> for StreamingCell {
-    fn from(s: &str) -> Self {
-        use crate::tui::theme::ZenTheme;
-        Self::new(s, &ZenTheme)
     }
 }

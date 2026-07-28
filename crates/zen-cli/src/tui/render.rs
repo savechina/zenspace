@@ -1,121 +1,197 @@
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
-
-pub fn render_markdown_to_lines(content: &str) -> Vec<Line<'static>> {
-    let text = tui_markdown::from_str(content);
-    text.lines
-        .into_iter()
-        .map(|line| {
-            Line::from(
-                line.spans
-                    .into_iter()
-                    .map(|span| Span::styled(span.content.to_string(), span.style))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect()
-}
-
-pub fn render_markdown_with_thoughts(content: &str) -> Vec<Line<'static>> {
-    let thought_open = "<think>";
-    let thought_close = "</think>";
-
-    if !content.contains(thought_open) && !content.contains(thought_close) {
-        return render_markdown_to_lines(content);
-    }
-
-    let mut all_lines: Vec<Line<'static>> = Vec::new();
-    let mut remaining = content;
-
-    while !remaining.is_empty() {
-        if let Some(open_pos) = remaining.find(thought_open) {
-            if open_pos > 0 {
-                let before = &remaining[..open_pos];
-                all_lines.extend(render_markdown_to_lines(before));
-            }
-
-            let after_open = &remaining[open_pos + thought_open.len()..];
-            if let Some(close_pos) = after_open.find(thought_close) {
-                let thought_content = &after_open[..close_pos];
-                let dimmed_style = Style::default().fg(Color::DarkGray);
-                let thought_lines = render_markdown_to_lines(thought_content);
-                for line in thought_lines {
-                    let dimmed_spans: Vec<Span<'static>> = line
-                        .spans
-                        .into_iter()
-                        .map(|span| Span::styled(span.content.clone(), dimmed_style))
-                        .collect();
-                    all_lines.push(Line::from(dimmed_spans));
-                }
-
-                remaining = &after_open[close_pos + thought_close.len()..];
-            } else {
-                let dimmed_style = Style::default().fg(Color::DarkGray);
-                let rest_lines = render_markdown_to_lines(after_open);
-                for line in rest_lines {
-                    let dimmed_spans: Vec<Span<'static>> = line
-                        .spans
-                        .into_iter()
-                        .map(|span| Span::styled(span.content.clone(), dimmed_style))
-                        .collect();
-                    all_lines.push(Line::from(dimmed_spans));
-                }
-                break;
-            }
-        } else {
-            all_lines.extend(render_markdown_to_lines(remaining));
-            break;
-        }
-    }
-
-    all_lines
-}
-
+/// Normalize compact markdown by inserting blank lines before block elements.
+///
+/// Handles headings (`#`), code fences (` ``` `), list items (`- `, `* `, `+ `, `N. `),
+/// blockquotes (`>`), and table rows (`|`). Respects inline code boundaries and avoids
+/// false positives like `this - that` being turned into list items.
 pub fn normalize_compact_markdown(content: &str) -> String {
     if content.contains("\n\n") || !content.contains(' ') {
         return content.to_string();
     }
-    let s = content.replace(" #", "\n\n#");
-    let s = s.replace(" ```", "\n\n```");
-    let s = s.replace(" - ", "\n- ");
-    s.replace(" | ", "\n| ")
+
+    let chars: Vec<char> = content.chars().collect();
+    let len = chars.len();
+    let mut result = String::with_capacity(len + 64);
+    let mut i = 0;
+    let mut in_inline_code = false;
+    let mut in_code_fence = false;
+
+    while i < len {
+        let ch = chars[i];
+
+        // --- Backtick handling (inline code + code fences) ---
+        if ch == '`' {
+            if i + 2 < len && chars[i + 1] == '`' && chars[i + 2] == '`' {
+                if !in_code_fence {
+                    if !result.is_empty() && !result.ends_with('\n') {
+                        result.push_str("\n\n");
+                    }
+                    result.push_str("```");
+                    in_code_fence = true;
+                    i += 3;
+                    continue;
+                } else {
+                    result.push_str("```");
+                    in_code_fence = false;
+                    i += 3;
+                    if i < len && !chars[i].is_whitespace() {
+                        result.push_str("\n\n");
+                    }
+                    continue;
+                }
+            }
+            // Single backtick: toggle inline code
+            in_inline_code = !in_inline_code;
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // Skip content inside inline code or code fences
+        if in_inline_code || in_code_fence {
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // --- Heading: '#' at word boundary (start or after space), followed by space ---
+        if ch == '#' {
+            let at_boundary = i == 0 || chars[i - 1] == ' ';
+            let followed_by_space = i + 1 < len && chars[i + 1] == ' ';
+            if at_boundary && followed_by_space
+                && !result.is_empty() && !result.ends_with('\n')
+            {
+                result.push_str("\n\n");
+            }
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // --- Unordered list: '-', '*', '+' followed by space ---
+        if (ch == '-' || ch == '*' || ch == '+') && i + 1 < len && chars[i + 1] == ' ' {
+            let mut j = i;
+            while j > 0 && chars[j - 1] == ' ' {
+                j -= 1;
+            }
+            let is_list = j == 0 || !chars[j - 1].is_alphanumeric();
+            let on_table_row = result
+                .rsplit('\n')
+                .next()
+                .map(|line| line.trim().starts_with('|'))
+                .unwrap_or(false);
+            if is_list && !on_table_row && !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // --- Ordered list: digit + '.' + ' ' ---
+        if ch.is_ascii_digit() && i + 2 < len && chars[i + 1] == '.' && chars[i + 2] == ' ' {
+            let is_list = i == 0 || !chars[i - 1].is_alphanumeric();
+            if is_list && !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        // --- Blockquote: '>' at start or after space ---
+        if ch == '>' && (i == 0 || chars[i - 1] == ' ') {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push(ch);
+            i += 1;
+            continue;
+        }
+
+        result.push(ch);
+        i += 1;
+    }
+
+    insert_table_separators(&result)
+}
+
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.ends_with('|')
+        && trimmed.matches('|').count() >= 2
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+        return false;
+    }
+    trimmed[1..trimmed.len() - 1]
+        .split('|')
+        .all(|cell| cell.trim().chars().all(|c| c == '-' || c == ':' || c.is_whitespace()))
+}
+
+fn make_separator_row(header_row: &str) -> String {
+    let trimmed = header_row.trim();
+    let cells: Vec<&str> = trimmed.split('|').collect();
+    let parts: Vec<String> = cells
+        .iter()
+        .skip(1)
+        .take(cells.len().saturating_sub(2))
+        .map(|cell| {
+            let width = cell.trim().chars().count().max(3);
+            "-".repeat(width)
+        })
+        .collect();
+    format!("|{}|", parts.join("|"))
+}
+
+/// Insert a markdown table separator row after the first row of any group of
+/// consecutive table rows that lacks one. pulldown-cmark (and therefore
+/// tui-markdown) requires a separator to recognize a block as a table.
+fn insert_table_separators(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 2 {
+        return content.to_string();
+    }
+
+    let mut result: Vec<String> = Vec::with_capacity(lines.len() + 4);
+    let mut i = 0;
+
+    while i < lines.len() {
+        if is_table_row(lines[i]) {
+            let start = i;
+            while i < lines.len() && is_table_row(lines[i]) {
+                i += 1;
+            }
+            let end = i;
+            let row_count = end - start;
+            let has_separator = lines[start..end].iter().any(|l| is_table_separator(l));
+
+            if row_count >= 2 && !has_separator {
+                result.push(lines[start].to_string());
+                result.push(make_separator_row(lines[start]));
+                for line in &lines[start + 1..end] {
+                    result.push(line.to_string());
+                }
+            } else {
+                for line in &lines[start..end] {
+                    result.push(line.to_string());
+                }
+            }
+        } else {
+            result.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+
+    result.join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn well_formed_markdown_renders_multi_line() {
-        let md = "# Introduction\n\nRust is a **bold** text.\n\n## Hello\n\n- Item 1\n- Item 2";
-        let lines = render_markdown_to_lines(md);
-        assert!(
-            lines.len() >= 5,
-            "expected multi-line render, got {} lines",
-            lines.len()
-        );
-        let first: String = lines[0]
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
-        assert!(
-            first.contains("Introduction"),
-            "heading should be present, got {:?}",
-            first
-        );
-    }
-
-    #[test]
-    fn single_line_no_newlines_renders_as_one() {
-        let md = "# Title body text";
-        let lines = render_markdown_to_lines(md);
-        assert_eq!(
-            lines.len(),
-            1,
-            "single-line input should produce single output line"
-        );
-    }
 
     #[test]
     fn normalize_compact_markdown_inserts_blank_lines() {
@@ -153,26 +229,106 @@ mod tests {
     }
 
     #[test]
-    fn thought_tags_render_dimmed() {
-        let content = "Before <think>thinking content </think> After";
-        let lines = render_markdown_with_thoughts(content);
-        assert!(!lines.is_empty());
-        let all_text: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
-            .collect();
-        assert!(all_text.contains("Before"));
-        assert!(all_text.contains("thinking content"));
-        assert!(all_text.contains("After"));
-        assert!(!all_text.contains("<think>"));
-        assert!(!all_text.contains("</think>"));
+    fn normalize_heading_inside_inline_code_ignored() {
+        let input = "text `# not a heading` more";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            !normalized.contains("\n\n#"),
+            "should not insert blank line before # inside inline code"
+        );
     }
 
     #[test]
-    fn no_thought_tags_renders_normally() {
-        let content = "Normal **markdown** content";
-        let lines = render_markdown_with_thoughts(content);
-        let normal_lines = render_markdown_to_lines(content);
-        assert_eq!(lines.len(), normal_lines.len());
+    fn normalize_code_fence_inside_inline_code_ignored() {
+        let input = "text `not a fence` more";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            !normalized.contains("\n\n`"),
+            "should not insert blank line before content inside inline code"
+        );
+    }
+
+    #[test]
+    fn normalize_prose_dash_not_list() {
+        let input = "this - that";
+        let normalized = normalize_compact_markdown(input);
+        assert_eq!(
+            normalized, "this - that",
+            "should not turn prose dash into list item"
+        );
+    }
+
+    #[test]
+    fn normalize_ordered_list() {
+        let input = "text 1. first 2. second";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            normalized.contains("\n1."),
+            "should insert newline before ordered list item"
+        );
+    }
+
+    #[test]
+    fn normalize_blockquote() {
+        let input = "text > quote";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            normalized.contains("\n>"),
+            "should insert newline before blockquote"
+        );
+    }
+
+    #[test]
+    fn normalize_table_row_not_broken() {
+        let input = "| a | b | c |";
+        let normalized = normalize_compact_markdown(input);
+        assert_eq!(normalized, "| a | b | c |", "single table row should stay intact");
+    }
+
+    #[test]
+    fn normalize_inserts_table_separator() {
+        let input = "| a | b |\n| c | d |";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            normalized.contains("|---|"),
+            "should insert separator row for multi-line table: got {}",
+            normalized
+        );
+        assert!(
+            normalized.contains("| a | b |"),
+            "should preserve header row"
+        );
+        assert!(
+            normalized.contains("| c | d |"),
+            "should preserve data row"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_existing_table_separator() {
+        let input = "| a | b |\n|---|---|\n| c | d |";
+        let normalized = normalize_compact_markdown(input);
+        assert_eq!(
+            normalized, input,
+            "already-valid table should not be modified"
+        );
+    }
+
+    #[test]
+    fn normalize_does_not_corrupt_table_separator_with_spaces() {
+        let input = "| a | b |\n| --- | --- |\n| c | d |";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            normalized.contains("| --- | --- |"),
+            "separator row with spaces should stay intact: got {}",
+            normalized
+        );
+    }
+
+    #[test]
+    fn normalize_heading_at_start() {
+        let input = "# Heading text";
+        let normalized = normalize_compact_markdown(input);
+        assert_eq!(normalized, "# Heading text");
     }
 }

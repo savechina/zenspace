@@ -16,9 +16,10 @@ default_model = "qwen3.6:35b-mlx"
 
 [tui]
 theme = "deep-ocean"
-# theme = "catppuccin"
-# theme = "eink"
-# theme = "cyber-purple"
+# Built-in themes: zen, classic, catppuccin, deep-ocean, cyber-purple, eink
+# ratatui-themes: dracula, one-dark-pro, nord, catppuccin-mocha, catppuccin-latte,
+#   gruvbox-dark, gruvbox-light, tokyo-night, solarized-dark, solarized-light,
+#   monokai-pro, rose-pine, kanagawa, everforest, cyberpunk
 
 # =============================================================================
 # Global command history (history.jsonl)

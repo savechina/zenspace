@@ -19,9 +19,10 @@ use zen_provider::DefaultRouter;
 use super::cell::{BannerCell, ErrorCell, MarkdownCell, OutputCell, PlainCell};
 use super::model_picker::ModelPickerState;
 use super::render::normalize_compact_markdown;
+use super::selection::Selection;
 use super::session_picker::SessionPickerState;
 use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
-use super::stream::MarkdownStreamCollector;
+use super::stream::StreamCollector;
 use super::theme::{
     OutputTheme, ZenTheme, auto_select as theme_auto_select, from_name as theme_from_name,
 };
@@ -327,7 +328,7 @@ pub struct App {
     pub current_variant: Option<String>,
     pub scroll_offset: usize,
     pub auto_scroll: bool,
-    pub stream_collector: MarkdownStreamCollector,
+    pub stream_collector: StreamCollector,
     pub theme: Box<dyn OutputTheme>,
     pub slash_state: SlashState,
     pub slash_registry: SlashCommandRegistry,
@@ -338,6 +339,15 @@ pub struct App {
     conversation_store: Option<ConversationStore>,
     history_store: HistoryStore,
     db_client: Option<zen_repo::SqliteClient>,
+    pub turn_started_at: Option<Instant>,
+    pub tool_call_count: u32,
+    /// Whether the welcome splash banner is still showing. Set to `false` once
+    /// the first user or agent message arrives so the large banner does not
+    /// permanently consume the chat area.
+    pub show_splash: bool,
+    /// Last rendered chat area rectangle, used to map mouse coordinates.
+    pub chat_area: Option<ratatui::layout::Rect>,
+    pub text_selection: Option<Selection>,
 }
 
 impl App {
@@ -389,7 +399,7 @@ impl App {
             current_variant: None,
             scroll_offset: 0,
             auto_scroll: true,
-            stream_collector: MarkdownStreamCollector::new(),
+            stream_collector: StreamCollector::new(),
             theme: Box::new(ZenTheme),
             slash_state: SlashState::new(),
             slash_registry: create_default_registry(),
@@ -406,6 +416,11 @@ impl App {
                     )
                 }),
             db_client: None,
+            turn_started_at: None,
+            tool_call_count: 0,
+            show_splash: true,
+            chat_area: None,
+            text_selection: None,
         };
         app.load_command_history();
         app
@@ -833,8 +848,10 @@ Use /thinking to show/hide thinking process."#;
             "TUI chat: dispatching"
         );
 
-        self.push_output(format!("You: {}", query), false);
-        self.push_output(format!("[{}] Thinking...", specialist), false);
+        self.turn_started_at = Some(Instant::now());
+        self.tool_call_count = 0;
+        self.show_splash = false;
+        self.output.push(OutputCell::user(query));
         self.start_llm_call_via_orchestrator(query, &context);
     }
 
@@ -1172,37 +1189,7 @@ Use /thinking to show/hide thinking process."#;
                     self.stream_collector.push_delta(token);
                 }
 
-                let (completed_lines, raw_text) = self.stream_collector.commit_complete_lines();
-                if !completed_lines.is_empty() {
-                    self.output
-                        .push(OutputCell::Markdown(super::cell::MarkdownCell::from_lines(
-                            completed_lines,
-                            raw_text,
-                        )));
-                }
-
-                let partial = self.stream_collector.buffer().to_string();
-                if !partial.is_empty() {
-                    self.output.retain(
-                        |c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")),
-                    );
-                    self.output
-                        .push(OutputCell::Plain(super::cell::PlainCell::new(format!(
-                            "[streaming] {}",
-                            partial
-                        ))));
-                }
-
                 if let Some(done_result) = result.done_result {
-                    self.output.retain(
-                        |c| !matches!(c, OutputCell::Plain(p) if p.text.starts_with("[streaming]")),
-                    );
-                    if let Some(pos) = self.output.iter().position(|cell| {
-                        matches!(cell, OutputCell::Plain(p) if p.text.contains("Thinking..."))
-                    }) {
-                        self.output.remove(pos);
-                    }
-
                     match done_result {
                         (Ok(response), returned_session) => {
                             if let Some(s) = returned_session {
@@ -1218,14 +1205,19 @@ Use /thinking to show/hide thinking process."#;
                                 response_len = response.len(),
                                 "TUI chat: LLM response complete"
                             );
-                            let (remaining, raw_text) = self.stream_collector.finalize_and_drain();
-                            if !remaining.is_empty() {
-                                self.output.push(OutputCell::Markdown(
-                                    super::cell::MarkdownCell::from_lines(remaining, raw_text),
-                                ));
+                            let (raw_text, reasoning) = self.stream_collector.finalize_and_drain();
+                            let elapsed = self.turn_started_at.map(|t| t.elapsed());
+                            let label = match (elapsed, self.tool_call_count) {
+                                (Some(e), 0) => Some(format!("{:.1}s", e.as_secs_f64())),
+                                (Some(e), n) => {
+                                    Some(format!("{:.1}s • {} tool calls", e.as_secs_f64(), n))
+                                }
+                                (None, _) => None,
+                            };
+                            self.output.push(OutputCell::separator(label));
+                            if !raw_text.is_empty() || reasoning.is_some() {
+                                self.output.push(OutputCell::agent(raw_text, reasoning));
                             }
-                            self.output
-                                .push(OutputCell::Plain(super::cell::PlainCell::new("")));
                             self.auto_scroll = true;
                             self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {
@@ -1474,14 +1466,7 @@ Use /thinking to show/hide thinking process."#;
         let output_text: Vec<String> = self
             .output
             .iter()
-            .map(|cell| match cell {
-                OutputCell::Banner(b) => b.text.clone(),
-                OutputCell::Markdown(m) => m.content.clone(),
-                OutputCell::Code(c) => format!("```{}\n{}\n```", c.lang, c.code),
-                OutputCell::Error(e) => e.message.clone(),
-                OutputCell::Streaming(s) => s.buffer.clone(),
-                OutputCell::Plain(p) => p.text.clone(),
-            })
+            .map(|cell| cell.raw_text())
             .collect();
         let content = output_text.join("\n");
         let timestamp = chrono::Utc::now().format("%Y-%m-%d-%H%M%S");
@@ -2092,9 +2077,9 @@ pub fn run_app(
         app.poll_llm_response();
         app.refresh_input_border();
         let active_toast = app.get_active_toast();
-        terminal.draw(|frame| crate::tui::ui::render(frame, &app, active_toast.as_deref()))?;
+        terminal.draw(|frame| crate::tui::ui::render(frame, &mut app, active_toast.as_deref()))?;
 
-        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+        if crossterm::event::poll(std::time::Duration::from_millis(30))? {
             match crossterm::event::read()? {
                 crossterm::event::Event::Key(key)
                     if key.kind == crossterm::event::KeyEventKind::Press =>
@@ -2123,6 +2108,9 @@ pub fn run_app(
                 }
                 crossterm::event::Event::Paste(text) => {
                     crate::tui::handler::handle_paste(&text, &mut app);
+                }
+                crossterm::event::Event::Mouse(mouse) => {
+                    crate::tui::handler::handle_mouse(mouse, &mut app);
                 }
                 _ => {} // Release, Repeat, Mouse, Focus — ignore
             }

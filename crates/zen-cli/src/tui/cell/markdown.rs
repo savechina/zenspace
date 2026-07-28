@@ -1,34 +1,30 @@
-use crate::tui::render::render_markdown_with_thoughts;
+use crate::tui::markdown::render_markdown;
+use crate::tui::render::normalize_compact_markdown;
 use ratatui::text::Line;
-use std::cell::OnceCell;
 
 #[derive(Debug, Clone)]
 pub struct MarkdownCell {
     pub content: String,
-    rendered: OnceCell<Vec<Line<'static>>>,
+    cached_lines: Vec<Line<'static>>,
 }
 
 impl MarkdownCell {
     pub fn new(content: impl Into<String>) -> Self {
+        let raw = content.into();
+        let normalized = normalize_compact_markdown(&raw);
+        let cached_lines = render_markdown(&normalized);
         Self {
-            content: content.into(),
-            rendered: OnceCell::new(),
+            content: normalized,
+            cached_lines,
         }
     }
 
-    pub fn from_lines(lines: Vec<Line<'static>>, raw_text: String) -> Self {
-        let cell = Self {
-            content: raw_text,
-            rendered: OnceCell::new(),
-        };
-        let _ = cell.rendered.set(lines);
-        cell
+    pub fn from_lines(_lines: Vec<Line<'static>>, raw_text: String) -> Self {
+        Self::new(raw_text)
     }
 
     pub fn display_lines(&self) -> Vec<Line<'static>> {
-        self.rendered
-            .get_or_init(|| render_markdown_with_thoughts(&self.content))
-            .clone()
+        self.cached_lines.clone()
     }
 }
 
@@ -49,45 +45,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_cell_has_no_cached_render() {
-        let cell = MarkdownCell::new("# Hello\n\nWorld");
-        assert!(
-            cell.rendered.get().is_none(),
-            "new cell should not have cached render"
-        );
-    }
-
-    #[test]
-    fn display_lines_caches_result() {
-        let cell = MarkdownCell::new("# Hello\n\nWorld");
-        let first = cell.display_lines();
-        let second = cell.display_lines();
-        assert_eq!(
-            first.len(),
-            second.len(),
-            "repeated display should return same length"
-        );
-        assert!(
-            cell.rendered.get().is_some(),
-            "after display, cache should be populated"
-        );
-    }
-
-    #[test]
-    fn from_lines_uses_pre_rendered() {
-        let pre = vec![Line::raw("pre-rendered")];
-        let cell = MarkdownCell::from_lines(pre.clone(), "raw content".into());
-        let displayed = cell.display_lines();
-        assert_eq!(displayed.len(), 1);
-        let text: String = displayed[0]
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
-        assert_eq!(text, "pre-rendered");
-    }
-
-    #[test]
     fn new_cell_renders_on_display() {
         let cell = MarkdownCell::new("# Heading\n\nParagraph");
         let displayed = cell.display_lines();
@@ -95,5 +52,26 @@ mod tests {
             displayed.len() >= 2,
             "heading + paragraph should render as 2+ lines"
         );
+    }
+
+    #[test]
+    fn cell_normalizes_compact_markdown() {
+        let cell = MarkdownCell::new("text. # Heading");
+        let displayed = cell.display_lines();
+        assert!(
+            displayed.len() >= 2,
+            "compact markdown should be normalized and rendered as 2+ lines"
+        );
+    }
+
+    #[test]
+    fn cell_caches_rendered_lines() {
+        let cell = MarkdownCell::new("# Heading\n\nParagraph");
+        let lines1 = cell.display_lines();
+        let lines2 = cell.display_lines();
+        assert_eq!(lines1.len(), lines2.len());
+        for (a, b) in lines1.iter().zip(lines2.iter()) {
+            assert_eq!(a.spans.len(), b.spans.len());
+        }
     }
 }
