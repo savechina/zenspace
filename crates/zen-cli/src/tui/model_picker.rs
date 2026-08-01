@@ -197,6 +197,33 @@ pub fn render_model_picker(
     let popup_y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
+    render_model_picker_in_area(frame, state, popup_area, theme, false);
+}
+
+pub fn render_model_picker_inline(
+    frame: &mut ratatui::Frame,
+    state: &ModelPickerState,
+    popup_area: Rect,
+    theme: &dyn crate::tui::theme::OutputTheme,
+) {
+    if !state.visible {
+        return;
+    }
+    render_model_picker_in_area(frame, state, popup_area, theme, true);
+}
+
+fn render_model_picker_in_area(
+    frame: &mut ratatui::Frame,
+    state: &ModelPickerState,
+    popup_area: Rect,
+    theme: &dyn crate::tui::theme::OutputTheme,
+    inline: bool,
+) {
+    let items = state.current_items();
+    if items.is_empty() && state.stage == PickerStage::Provider {
+        return;
+    }
+
     frame.render_widget(Clear, popup_area);
 
     let accent = Style::default().fg(theme.info_accent());
@@ -218,18 +245,33 @@ pub fn render_model_picker(
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
+    let show_help = !inline;
+    let constraints = if show_help {
+        vec![Constraint::Min(1), Constraint::Length(1)]
+    } else {
+        vec![Constraint::Min(1)]
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints(constraints)
         .split(inner);
 
-    let visible_items = &items[state.scroll_offset..state.scroll_offset + visible_count];
+    let list_area_height = chunks[0].height as usize;
+    let visible_count = items.len().min(list_area_height.max(1));
+    let start = if state.selected >= visible_count {
+        state.selected - visible_count + 1
+    } else {
+        0
+    };
+
+    let visible_items = &items[start..(start + visible_count).min(items.len())];
 
     let list_items: Vec<ListItem> = visible_items
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            let global_idx = idx + state.scroll_offset;
+            let global_idx = idx + start;
             let is_selected = global_idx == state.selected;
             let style = if is_selected {
                 accent.add_modifier(Modifier::BOLD)
@@ -247,29 +289,31 @@ pub fn render_model_picker(
     );
 
     let mut list_state = ListState::default();
-    list_state.select(Some(state.selected - state.scroll_offset));
+    list_state.select(Some(state.selected.saturating_sub(start)));
 
     frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    let help = match state.stage {
-        PickerStage::Provider => Line::from(vec![
-            Span::styled("↑↓", muted),
-            Span::styled(" nav ", accent),
-            Span::styled("↵", muted),
-            Span::styled(" pick ", accent),
-            Span::styled("esc", muted),
-            Span::styled(" cancel", accent),
-        ]),
-        PickerStage::Model | PickerStage::Variant => Line::from(vec![
-            Span::styled("↑↓", muted),
-            Span::styled(" nav ", accent),
-            Span::styled("↵", muted),
-            Span::styled(" pick ", accent),
-            Span::styled("←", muted),
-            Span::styled(" back ", accent),
-            Span::styled("esc", muted),
-            Span::styled(" cancel", accent),
-        ]),
-    };
-    frame.render_widget(ratatui::widgets::Paragraph::new(help), chunks[1]);
+    if show_help {
+        let help = match state.stage {
+            PickerStage::Provider => Line::from(vec![
+                Span::styled("↑↓", muted),
+                Span::styled(" nav ", accent),
+                Span::styled("↵", muted),
+                Span::styled(" pick ", accent),
+                Span::styled("esc", muted),
+                Span::styled(" cancel", accent),
+            ]),
+            PickerStage::Model | PickerStage::Variant => Line::from(vec![
+                Span::styled("↑↓", muted),
+                Span::styled(" nav ", accent),
+                Span::styled("↵", muted),
+                Span::styled(" pick ", accent),
+                Span::styled("←", muted),
+                Span::styled(" back ", accent),
+                Span::styled("esc", muted),
+                Span::styled(" cancel", accent),
+            ]),
+        };
+        frame.render_widget(ratatui::widgets::Paragraph::new(help), chunks[1]);
+    }
 }

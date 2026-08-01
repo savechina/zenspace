@@ -23,8 +23,8 @@ impl MarkdownCell {
         Self::new(raw_text)
     }
 
-    pub fn display_lines(&self) -> Vec<Line<'static>> {
-        self.cached_lines.clone()
+    pub fn display_lines(&self) -> &[Line<'static>] {
+        &self.cached_lines
     }
 }
 

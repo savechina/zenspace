@@ -43,6 +43,16 @@ impl SlashCommandRegistry {
             .and_then(|&idx| self.commands.get(idx))
     }
 
+    pub fn filter_indices(&self, prefix: &str) -> Vec<usize> {
+        self.commands
+            .iter()
+            .enumerate()
+            .filter(|(_, cmd)| cmd.name.starts_with(prefix))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    #[allow(dead_code)]
     pub fn filter(&self, prefix: &str) -> Vec<&SlashCommand> {
         self.commands
             .iter()
@@ -188,16 +198,7 @@ impl SlashState {
     }
 
     fn recompute_filtered(&mut self, registry: &SlashCommandRegistry) {
-        let filtered = registry.filter(&self.filter);
-        self.filtered_indices = filtered
-            .into_iter()
-            .filter_map(|cmd| {
-                registry
-                    .all_commands()
-                    .iter()
-                    .position(|c| std::ptr::eq(c, cmd))
-            })
-            .collect();
+        self.filtered_indices = registry.filter_indices(&self.filter);
     }
 
     pub fn move_up(&mut self) {
@@ -246,6 +247,14 @@ impl SlashState {
     pub fn visible_count(&self) -> usize {
         self.filtered_indices.len().min(MAX_POPUP_ROWS)
     }
+
+    pub fn at_first(&self) -> bool {
+        self.selected == 0
+    }
+
+    pub fn at_last(&self) -> bool {
+        self.selected + 1 >= self.filtered_indices.len()
+    }
 }
 
 impl Default for SlashState {
@@ -271,6 +280,32 @@ pub fn render_slash_popup(
     let popup_area =
         ratatui::layout::Rect::new(input_area.x, popup_y, input_area.width, popup_height);
 
+    render_slash_popup_inner(frame, state, popup_area, theme, registry, MAX_POPUP_ROWS);
+}
+
+const INLINE_POPUP_ROWS: usize = 4;
+
+pub fn render_slash_popup_inline(
+    frame: &mut ratatui::Frame,
+    state: &SlashState,
+    popup_area: ratatui::layout::Rect,
+    theme: &dyn OutputTheme,
+    registry: &SlashCommandRegistry,
+) {
+    if !state.visible || state.filtered_indices.is_empty() {
+        return;
+    }
+    render_slash_popup_inner(frame, state, popup_area, theme, registry, INLINE_POPUP_ROWS);
+}
+
+fn render_slash_popup_inner(
+    frame: &mut ratatui::Frame,
+    state: &SlashState,
+    popup_area: ratatui::layout::Rect,
+    theme: &dyn OutputTheme,
+    registry: &SlashCommandRegistry,
+    max_rows: usize,
+) {
     frame.render_widget(ratatui::widgets::Clear, popup_area);
 
     let bg_color = theme.bg();
@@ -283,8 +318,9 @@ pub fn render_slash_popup(
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    let start = if state.selected >= MAX_POPUP_ROWS {
-        state.selected - MAX_POPUP_ROWS + 1
+    let visible_count = state.filtered_indices.len().min(max_rows);
+    let start = if state.selected >= max_rows {
+        state.selected - max_rows + 1
     } else {
         0
     };
@@ -332,6 +368,9 @@ pub fn render_slash_popup(
 
         let line = Line::from(spans);
 
+        if row as u16 >= inner.height {
+            break;
+        }
         let row_area = ratatui::layout::Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
         frame.render_widget(ratatui::widgets::Paragraph::new(line), row_area);
     }

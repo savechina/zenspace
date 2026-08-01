@@ -1,26 +1,40 @@
-use crate::tui::markdown::IncrementalMarkdownRenderer;
+use crate::tui::markdown::StreamingMarkdown;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 pub struct StreamCollector {
     buffer: String,
-    text_renderer: IncrementalMarkdownRenderer,
-    reasoning_renderer: IncrementalMarkdownRenderer,
+    text_renderer: StreamingMarkdown,
+    reasoning_renderer: StreamingMarkdown,
     reasoning_active: bool,
+    buffer_changed_since_render: bool,
+    last_reasoning_split: Option<(String, String, bool)>,
 }
 
 impl StreamCollector {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
-            text_renderer: IncrementalMarkdownRenderer::new(),
-            reasoning_renderer: IncrementalMarkdownRenderer::new(),
+            text_renderer: StreamingMarkdown::new(),
+            reasoning_renderer: StreamingMarkdown::new(),
             reasoning_active: false,
+            buffer_changed_since_render: false,
+            last_reasoning_split: None,
         }
     }
 
     pub fn push_delta(&mut self, delta: &str) {
         self.buffer.push_str(delta);
+        self.buffer_changed_since_render = true;
+    }
+
+    pub(crate) fn buffer(&self) -> &str {
+        &self.buffer
+    }
+
+    #[allow(dead_code)]
+    pub fn buffer_changed(&self) -> bool {
+        self.buffer_changed_since_render
     }
 
     fn split_reasoning(content: &str) -> (String, String, bool) {
@@ -39,61 +53,113 @@ impl StreamCollector {
                     text.push_str(remaining);
                     break;
                 }
+            } else if let Some(end) = remaining.find("</think>") {
+                reasoning.push_str(&remaining[..end]);
+                remaining = &remaining[end + 8..];
+                in_think = false;
             } else {
-                if let Some(end) = remaining.find("</think>") {
-                    reasoning.push_str(&remaining[..end]);
-                    remaining = &remaining[end + 8..];
-                    in_think = false;
-                } else {
-                    reasoning.push_str(remaining);
-                    break;
-                }
+                reasoning.push_str(remaining);
+                break;
             }
         }
 
         (text, reasoning, in_think)
     }
 
+    fn get_or_compute_split(&mut self, buffer: &str) -> (String, String, bool) {
+        if self.buffer_changed_since_render || self.last_reasoning_split.is_none() {
+            let result = Self::split_reasoning(buffer);
+            self.last_reasoning_split = Some(result.clone());
+            self.buffer_changed_since_render = false;
+            result
+        } else {
+            self.last_reasoning_split.clone().unwrap()
+        }
+    }
+
+    /// Render the entire current streaming state into lines.
     pub fn render(&mut self, reasoning_style: Style) -> Vec<Line<'static>> {
+        let (committed, pending) = self.split_render(reasoning_style);
+        let mut lines = committed;
+        lines.extend(pending);
+        lines
+    }
+
+    /// Drain newly-committed lines that can be moved into terminal scrollback,
+    /// and return the remaining pending tail that should stay in the inline
+    /// viewport.
+    pub fn drain_and_tail(
+        &mut self,
+        reasoning_style: Style,
+    ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+        self.split_render(reasoning_style)
+    }
+
+    fn split_render(&mut self, reasoning_style: Style) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         if self.buffer.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
-        let (text, reasoning, in_think) = Self::split_reasoning(&self.buffer);
+        let (text, reasoning, in_think) = self.get_or_compute_split(&self.buffer.clone());
         self.reasoning_active = in_think;
 
-        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut committed: Vec<Line<'static>> = Vec::new();
+        let mut pending: Vec<Line<'static>> = Vec::new();
 
         if !reasoning.is_empty() {
-            let header_text = if in_think {
-                "Thinking...".to_string()
-            } else {
-                "Thought".to_string()
-            };
-            lines.push(Line::from(Span::styled(
-                header_text,
-                reasoning_style,
-            )));
+            let header_text = if in_think { "Thinking..." } else { "Thought" };
+            let header = Line::from(Span::styled(header_text, reasoning_style));
 
-            let reasoning_lines = self.reasoning_renderer.update(&reasoning);
-            for rl in reasoning_lines {
-                let indented_spans: Vec<Span<'static>> = std::iter::once(Span::raw("  "))
-                    .chain(rl.spans)
-                    .collect();
-                lines.push(Line::from(indented_spans));
+            let reasoning_update = self.reasoning_renderer.append(&reasoning);
+
+            let reasoning_committed: Vec<Line<'static>> = reasoning_update
+                .committed
+                .iter()
+                .flat_map(|b| b.lines.iter().cloned())
+                .map(|l| Self::indent_line(l))
+                .collect();
+
+            if !reasoning_committed.is_empty() {
+                committed.push(header.clone());
+                committed.extend(reasoning_committed);
             }
 
-            if !in_think {
-                lines.push(Line::from(Span::raw("")));
+            if let Some(pending_block) = &reasoning_update.pending {
+                if committed.is_empty() {
+                    pending.push(header);
+                }
+                for rl in &pending_block.lines {
+                    pending.push(Self::indent_line(rl.clone()));
+                }
+            }
+
+            if !in_think && (!committed.is_empty() || !pending.is_empty()) {
+                let target = if pending.is_empty() {
+                    &mut committed
+                } else {
+                    &mut pending
+                };
+                target.push(Line::from(Span::raw("")));
             }
         }
 
         if !text.is_empty() {
-            let text_lines = self.text_renderer.update(&text);
-            lines.extend(text_lines);
+            let text_update = self.text_renderer.append(&text);
+            for block in &text_update.committed {
+                committed.extend(block.lines.iter().cloned());
+            }
+            if let Some(pending_block) = &text_update.pending {
+                pending.extend(pending_block.lines.iter().cloned());
+            }
         }
 
-        lines
+        (committed, pending)
+    }
+
+    fn indent_line(line: Line<'static>) -> Line<'static> {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(line.spans);
+        Line::from(spans)
     }
 
     pub fn finalize_and_drain(&mut self) -> (String, Option<String>) {
@@ -101,6 +167,8 @@ impl StreamCollector {
         self.text_renderer.clear();
         self.reasoning_renderer.clear();
         self.reasoning_active = false;
+        self.buffer_changed_since_render = false;
+        self.last_reasoning_split = None;
         let (text, reasoning, _) = Self::split_reasoning(&raw);
         let reasoning = if reasoning.is_empty() {
             None
@@ -115,6 +183,8 @@ impl StreamCollector {
         self.text_renderer.clear();
         self.reasoning_renderer.clear();
         self.reasoning_active = false;
+        self.buffer_changed_since_render = false;
+        self.last_reasoning_split = None;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -235,5 +305,22 @@ mod tests {
         let (finalized, reasoning) = collector.finalize_and_drain();
         assert_eq!(finalized, "just plain text");
         assert!(reasoning.is_none());
+    }
+
+    #[test]
+    fn buffer_changed_flag_set_on_push() {
+        let mut collector = StreamCollector::new();
+        assert!(!collector.buffer_changed());
+        collector.push_delta("test");
+        assert!(collector.buffer_changed());
+    }
+
+    #[test]
+    fn buffer_changed_flag_cleared_on_render() {
+        let mut collector = StreamCollector::new();
+        collector.push_delta("test");
+        assert!(collector.buffer_changed());
+        collector.render(Style::default());
+        assert!(!collector.buffer_changed());
     }
 }

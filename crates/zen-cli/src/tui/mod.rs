@@ -3,9 +3,13 @@ pub mod cell;
 mod clipboard;
 mod handler;
 mod highlight;
+mod inline;
+mod inline_handler;
+mod inline_ui;
 pub mod markdown;
 pub mod model_picker;
-pub mod render;
+mod render;
+pub mod scrollback_inserter;
 pub mod selection;
 pub mod session_picker;
 pub mod slash;
@@ -13,13 +17,14 @@ pub mod stream;
 pub mod theme;
 mod ui;
 
+#[expect(dead_code)]
 pub fn run(config: &'static zen_core::config::ZenConfig) -> Result<(), anyhow::Error> {
     use crossterm::event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     };
-    use crossterm::execute;
     use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::execute;
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
@@ -58,4 +63,8 @@ pub fn run(config: &'static zen_core::config::ZenConfig) -> Result<(), anyhow::E
     )?;
     crossterm::terminal::disable_raw_mode()?;
     result
+}
+
+pub fn run_inline(config: &'static zen_core::config::ZenConfig) -> Result<(), anyhow::Error> {
+    inline::run_inline(config)
 }

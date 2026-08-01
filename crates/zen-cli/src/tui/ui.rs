@@ -1,5 +1,4 @@
 use super::app::{App, InputMode};
-use super::cell::OutputCell;
 use super::model_picker::render_model_picker;
 use super::selection::highlight_line;
 use super::session_picker::render_session_picker;
@@ -9,57 +8,27 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
-pub fn build_output_lines(app: &App) -> Vec<Line<'static>> {
-    let theme = app.theme.as_ref();
-    let bg_color = theme.bg();
-    let blank_line = Line::styled("", Style::default().bg(bg_color));
-    let mut all_lines: Vec<Line<'static>> = Vec::new();
-
-    for cell in &app.output {
-        if !app.show_splash && matches!(cell, OutputCell::Banner(_)) {
-            continue;
-        }
-        let cell_lines = cell.display_lines(theme, app.show_thinking);
-        if !cell_lines.is_empty() {
-            all_lines.extend(cell_lines);
-            all_lines.push(blank_line.clone());
-        }
-    }
-
-    all_lines
-}
-
-fn compute_selected_cell_line(app: &App) -> Option<usize> {
+fn compute_selected_cell_line(app: &mut App) -> Option<usize> {
     if app.input.effective_mode() != InputMode::Selection || app.output.is_empty() {
         return None;
     }
     let target_idx = app.input.selected_cell_idx();
-    let theme = app.theme.as_ref();
-    let mut line_offset: usize = 0;
-
-    for (cell_idx, cell) in app.output.iter().enumerate() {
-        if !app.show_splash && matches!(cell, OutputCell::Banner(_)) {
-            continue;
-        }
-        let cell_lines = cell.display_lines(theme, app.show_thinking);
-        if !cell_lines.is_empty() {
-            if cell_idx == target_idx {
-                return Some(line_offset);
-            }
-            line_offset += cell_lines.len() + 1;
-        }
-    }
-    None
+    let offsets = app.cell_line_offsets();
+    offsets.get(target_idx).copied()
 }
 
 pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
-    let theme = app.theme.as_ref();
-    let muted = theme.text_muted();
-    let accent_fg = Style::default().fg(theme.info_accent());
-    let bg_color = theme.bg();
+    let muted = app.theme.as_ref().text_muted();
+    let accent_color = app.theme.as_ref().info_accent();
+    let accent_fg = Style::default().fg(accent_color);
+    let bg_color = app.theme.as_ref().bg();
     let chat_block_bg = Style::default().bg(bg_color);
+    let selection_bg = app.theme.as_ref().selection_bg();
+    let selection_fg = app.theme.as_ref().selection_fg();
 
     let queue_height = if app.message_queue.is_empty() {
         0
@@ -81,7 +50,7 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
         " Zen ",
         Style::default()
             .fg(Color::Black)
-            .bg(theme.info_accent())
+            .bg(accent_color)
             .add_modifier(Modifier::BOLD),
     );
     let mut status_spans: Vec<Span<'static>> = vec![brand_badge];
@@ -90,7 +59,7 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
     if app.is_streaming {
         status_spans.push(Span::styled(
             " | ⏳ Processing...",
-            theme.text_muted().add_modifier(Modifier::BOLD),
+            muted.add_modifier(Modifier::BOLD),
         ));
     }
     if app.show_thinking {
@@ -112,7 +81,7 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
             sel_text,
             Style::default()
                 .fg(Color::Black)
-                .bg(theme.info_accent())
+                .bg(accent_color)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -121,7 +90,7 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
             " | ✂ TEXT SEL ",
             Style::default()
                 .fg(Color::Black)
-                .bg(theme.selection_bg())
+                .bg(selection_bg)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -130,26 +99,27 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
     frame.render_widget(status_bar, chunks[0]);
 
     let mut all_lines = {
-        let theme = app.theme.as_ref();
-        let mut lines = build_output_lines(app);
+        let mut lines = app.all_lines().to_vec();
         if app.is_streaming && !app.stream_collector.is_empty() {
-            let reasoning_style = theme.text_muted().add_modifier(Modifier::ITALIC);
+            let reasoning_style = app
+                .theme
+                .as_ref()
+                .text_muted()
+                .add_modifier(Modifier::ITALIC);
             let mut stream_lines = app.stream_collector.render(reasoning_style);
             if let Some(last) = stream_lines.last_mut() {
                 last.spans
-                    .push(Span::styled("▌", theme.streaming_cursor()));
+                    .push(Span::styled("▌", app.theme.as_ref().streaming_cursor()));
             }
             lines.extend(stream_lines);
         }
         lines
     };
     app.chat_area = Some(chunks[1]);
+    let selected_cell_line = compute_selected_cell_line(app);
 
     if let Some(sel) = &app.text_selection {
-        let theme = app.theme.as_ref();
-        let highlight_style = Style::default()
-            .bg(theme.selection_bg())
-            .fg(theme.selection_fg());
+        let highlight_style = Style::default().bg(selection_bg).fg(selection_fg);
         let end_idx = sel.end().line_idx.min(all_lines.len().saturating_sub(1));
         let line_indices: Vec<usize> = (sel.start().line_idx..=end_idx).collect();
         for line_idx in line_indices {
@@ -236,8 +206,7 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
                         let visible_y =
                             inner_area_y as i32 + (cursor_visual_row as i32 - scroll as i32);
                         if visible_y >= inner_area_y as i32
-                            && visible_y
-                                < (inner_area_y as i32 + visible_height as i32)
+                            && visible_y < (inner_area_y as i32 + visible_height as i32)
                         {
                             let cx = chunks[1].x + border_width + col_offset as u16;
                             let cursor_area = Rect::new(cx, visible_y as u16, 1, 1);
@@ -245,8 +214,8 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
                                 Paragraph::new(Span::styled(
                                     "▌",
                                     Style::default()
-                                        .fg(theme.selection_fg())
-                                        .bg(theme.selection_bg())
+                                        .fg(selection_fg)
+                                        .bg(selection_bg)
                                         .add_modifier(Modifier::BOLD),
                                 )),
                                 cursor_area,
@@ -266,25 +235,21 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
         }
     }
 
-    if let Some(line_idx) = compute_selected_cell_line(app) {
+    if let Some(line_idx) = selected_cell_line {
         let border_width = 1;
         let inner_area_y = chunks[1].y + border_width;
         let mut visual_row_offset: usize = 0;
         for (li, line) in all_lines.iter().enumerate() {
             if li == line_idx {
-                let visible_y =
-                    inner_area_y as i32 + (visual_row_offset as i32 - scroll as i32);
+                let visible_y = inner_area_y as i32 + (visual_row_offset as i32 - scroll as i32);
                 if visible_y >= inner_area_y as i32
                     && visible_y < (inner_area_y as i32 + visible_height as i32)
                 {
-                    let marker_area =
-                        Rect::new(chunks[1].x + border_width, visible_y as u16, 1, 1);
+                    let marker_area = Rect::new(chunks[1].x + border_width, visible_y as u16, 1, 1);
                     frame.render_widget(
                         Paragraph::new(Span::styled(
                             "▶",
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(theme.info_accent()),
+                            Style::default().fg(Color::Black).bg(accent_color),
                         )),
                         marker_area,
                     );
@@ -328,12 +293,17 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
         frame,
         &app.slash_state,
         input_chunk,
-        theme,
+        app.theme.as_ref(),
         &app.slash_registry,
     );
-    render_session_picker(frame, &app.session_picker, app.session_id.as_deref(), theme);
-    render_model_picker(frame, &app.model_picker, theme);
-    render_toast_banner(frame, active_toast, theme);
+    render_session_picker(
+        frame,
+        &app.session_picker,
+        app.session_id.as_deref(),
+        app.theme.as_ref(),
+    );
+    render_model_picker(frame, &app.model_picker, app.theme.as_ref());
+    render_toast_banner(frame, active_toast, app.theme.as_ref());
 }
 
 fn render_toast_banner(frame: &mut Frame, active_toast: Option<&str>, theme: &dyn OutputTheme) {

@@ -39,6 +39,7 @@ tui-textarea-2 = { workspace = true }
 syntect = { workspace = true }
 two-face = { workspace = true }
 tui-markdown = { workspace = true }
+mdstream = { workspace = true }
 ansi-to-tui = { workspace = true }
 ratatui-themes = { workspace = true }
 tokio = { workspace = true }

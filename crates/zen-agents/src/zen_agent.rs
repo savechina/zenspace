@@ -1141,6 +1141,7 @@ impl ZenAgent {
             tool_choice: None,
             additional_params: None,
             output_schema: None,
+            record_telemetry_content: false,
         };
 
         let result = self.completion_model.completion(request).await;
@@ -1359,6 +1360,7 @@ impl ZenAgent {
             tool_choice: None,
             additional_params: None,
             output_schema: None,
+            record_telemetry_content: false,
         };
 
         let mut stream = self.completion_model.stream(request).await?;

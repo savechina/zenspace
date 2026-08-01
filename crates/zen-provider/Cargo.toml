@@ -18,6 +18,7 @@ futures-util = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 rig = { workspace = true }
+rig-agent = { workspace = true }
 rig-compose = { workspace = true }
 fastembed = { workspace = true }
 home = { workspace = true }

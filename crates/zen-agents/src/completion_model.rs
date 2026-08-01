@@ -272,6 +272,7 @@ mod tests {
             tool_choice: None,
             additional_params: None,
             output_schema: None,
+            record_telemetry_content: false,
         };
 
         let response = model.completion(request).await.expect("completion");
@@ -298,6 +299,7 @@ mod tests {
             tool_choice: None,
             additional_params: None,
             output_schema: None,
+            record_telemetry_content: false,
         };
 
         let prompt = extract_last_user_prompt(&request);
@@ -318,6 +320,7 @@ mod tests {
             tool_choice: None,
             additional_params: None,
             output_schema: None,
+            record_telemetry_content: false,
         };
 
         let prompt = extract_last_user_prompt(&request);

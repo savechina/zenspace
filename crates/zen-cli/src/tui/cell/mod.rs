@@ -8,6 +8,7 @@ pub mod streaming;
 use crate::tui::theme::OutputTheme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::borrow::Cow;
 
 pub use banner::BannerCell;
 pub use code::CodeCell;
@@ -43,57 +44,32 @@ impl OutputCell {
         &self,
         theme: &dyn OutputTheme,
         show_reasoning: bool,
-    ) -> Vec<Line<'static>> {
+    ) -> Cow<'_, [Line<'static>]> {
         match self {
-            Self::Banner(b) => b.display_lines(),
-            Self::Markdown(m) => m.display_lines(),
-            Self::Code(c) => c.display_lines(),
-            Self::Error(e) => e.display_lines(),
-            Self::Streaming(s) => s.display_lines(),
-            Self::Plain(p) => p.display_lines(),
-            Self::User { text } => render_user_lines(text, theme),
+            Self::Banner(b) => Cow::Borrowed(b.display_lines()),
+            Self::Markdown(m) => Cow::Borrowed(m.display_lines()),
+            Self::Code(c) => Cow::Borrowed(c.display_lines()),
+            Self::Error(e) => Cow::Owned(e.display_lines()),
+            Self::Streaming(s) => Cow::Owned(s.display_lines()),
+            Self::Plain(p) => Cow::Owned(p.display_lines()),
+            Self::User { text } => Cow::Owned(render_user_lines(text, theme)),
             Self::Agent {
                 text: _,
                 reasoning: _,
                 cached_text_lines,
                 cached_reasoning_lines,
-            } => {
-                let prefix_style = theme.agent_prefix();
-                let mut result: Vec<Line<'static>> = Vec::new();
-
-                if show_reasoning
-                    && let Some(r_lines) = cached_reasoning_lines
-                {
-                    let reasoning_style = theme.text_muted().add_modifier(Modifier::ITALIC);
-                    result.push(Line::from(Span::styled("Thought", reasoning_style)));
-                    for rl in r_lines {
-                        let indented_spans: Vec<Span<'static>> =
-                            std::iter::once(Span::raw("  "))
-                                .chain(rl.spans.clone())
-                                .collect();
-                        result.push(Line::from(indented_spans));
-                    }
-                    result.push(Line::from(Span::raw("")));
-                }
-
-                for (i, line) in cached_text_lines.iter().enumerate() {
-                    let mut spans: Vec<Span<'static>> = Vec::new();
-                    if i == 0 {
-                        spans.push(Span::styled("• ".to_string(), prefix_style));
-                    } else {
-                        spans.push(Span::styled("  ".to_string(), Style::default()));
-                    }
-                    spans.extend(line.spans.clone());
-                    result.push(Line::from(spans));
-                }
-                result
-            }
+            } => Cow::Owned(render_agent_lines(
+                cached_text_lines,
+                cached_reasoning_lines.as_deref(),
+                theme,
+                show_reasoning,
+            )),
             Self::Separator { label } => {
                 let content = match label {
                     Some(l) => format!("── {} ──", l),
                     None => "───".to_string(),
                 };
-                vec![Line::from(Span::styled(content, theme.separator()))]
+                Cow::Owned(vec![Line::from(Span::styled(content, theme.separator()))])
             }
         }
     }
@@ -132,15 +108,9 @@ fn render_user_lines(text: &str, theme: &dyn OutputTheme) -> Vec<Line<'static>> 
     for (i, line) in lines.iter().enumerate() {
         let mut spans: Vec<Span<'static>> = Vec::new();
         if i == 0 {
-            spans.push(Span::styled(
-                "› ".to_string(),
-                prefix_style.bg(bg),
-            ));
+            spans.push(Span::styled("› ".to_string(), prefix_style.bg(bg)));
         } else {
-            spans.push(Span::styled(
-                "  ".to_string(),
-                prefix_bg,
-            ));
+            spans.push(Span::styled("  ".to_string(), prefix_bg));
         }
         spans.push(Span::styled(line.to_string(), text_style));
         result.push(Line::from(spans));
@@ -156,10 +126,44 @@ fn render_user_lines(text: &str, theme: &dyn OutputTheme) -> Vec<Line<'static>> 
     result
 }
 
+fn render_agent_lines(
+    cached_text_lines: &[Line<'static>],
+    cached_reasoning_lines: Option<&[Line<'static>]>,
+    theme: &dyn OutputTheme,
+    show_reasoning: bool,
+) -> Vec<Line<'static>> {
+    let prefix_style = theme.agent_prefix();
+    let mut result: Vec<Line<'static>> = Vec::new();
+
+    if show_reasoning && let Some(r_lines) = cached_reasoning_lines {
+        let reasoning_style = theme.text_muted().add_modifier(Modifier::ITALIC);
+        result.push(Line::from(Span::styled("Thought", reasoning_style)));
+        for rl in r_lines {
+            let indented_spans: Vec<Span<'static>> = std::iter::once(Span::raw("  "))
+                .chain(rl.spans.clone())
+                .collect();
+            result.push(Line::from(indented_spans));
+        }
+        result.push(Line::from(Span::raw("")));
+    }
+
+    for (i, line) in cached_text_lines.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if i == 0 {
+            spans.push(Span::styled("• ".to_string(), prefix_style));
+        } else {
+            spans.push(Span::styled("  ".to_string(), Style::default()));
+        }
+        spans.extend(line.spans.clone());
+        result.push(Line::from(spans));
+    }
+    result
+}
+
 impl From<OutputCell> for Vec<Line<'static>> {
     fn from(cell: OutputCell) -> Self {
         use crate::tui::theme::ZenTheme;
-        cell.display_lines(&ZenTheme, false)
+        cell.display_lines(&ZenTheme, false).into_owned()
     }
 }
 
@@ -230,6 +234,8 @@ impl OutputCell {
     }
 
     pub fn separator(label: impl Into<Option<String>>) -> Self {
-        Self::Separator { label: label.into() }
+        Self::Separator {
+            label: label.into(),
+        }
     }
 }

@@ -189,6 +189,30 @@ pub fn render_session_picker(
     let popup_y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
+    render_session_picker_in_area(frame, state, current_session_id, popup_area, theme, false);
+}
+
+pub fn render_session_picker_inline(
+    frame: &mut ratatui::Frame,
+    state: &SessionPickerState,
+    current_session_id: Option<&str>,
+    popup_area: Rect,
+    theme: &dyn OutputTheme,
+) {
+    if !state.visible || state.sessions.is_empty() {
+        return;
+    }
+    render_session_picker_in_area(frame, state, current_session_id, popup_area, theme, true);
+}
+
+fn render_session_picker_in_area(
+    frame: &mut ratatui::Frame,
+    state: &SessionPickerState,
+    current_session_id: Option<&str>,
+    popup_area: Rect,
+    theme: &dyn OutputTheme,
+    inline: bool,
+) {
     frame.render_widget(Clear, popup_area);
 
     let muted = theme.text_muted();
@@ -212,14 +236,18 @@ pub fn render_session_picker(
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    let constraints = if state.rename_mode {
+    let show_help = !inline;
+    let in_rename = state.rename_mode && !inline;
+    let constraints = if in_rename {
         vec![
             Constraint::Min(1),
             Constraint::Length(3),
             Constraint::Length(1),
         ]
-    } else {
+    } else if show_help {
         vec![Constraint::Min(1), Constraint::Length(1)]
+    } else {
+        vec![Constraint::Min(1)]
     };
 
     let chunks = Layout::default()
@@ -227,14 +255,22 @@ pub fn render_session_picker(
         .constraints(constraints)
         .split(inner);
 
+    let list_area_height = chunks[0].height as usize;
+    let visible_count = state.sessions.len().min(list_area_height.max(1));
+    let start = if state.selected >= visible_count {
+        state.selected - visible_count + 1
+    } else {
+        0
+    };
+
     let visible_sessions =
-        &state.sessions[state.scroll_offset..state.scroll_offset + state.visible_count()];
+        &state.sessions[start..(start + visible_count).min(state.sessions.len())];
 
     let items: Vec<ListItem> = visible_sessions
         .iter()
         .enumerate()
         .map(|(idx, session)| {
-            let global_idx = idx + state.scroll_offset;
+            let global_idx = idx + start;
             let is_selected = global_idx == state.selected;
             let is_current = current_session_id == Some(&session.id);
             let is_archive_pending = state.archive_pending.as_deref() == Some(&session.id);
@@ -278,11 +314,11 @@ pub fn render_session_picker(
     );
 
     let mut list_state = ListState::default();
-    list_state.select(Some(state.selected - state.scroll_offset));
+    list_state.select(Some(state.selected.saturating_sub(start)));
 
     frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
-    if state.rename_mode {
+    if in_rename {
         let rename_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
@@ -307,7 +343,7 @@ pub fn render_session_picker(
             Span::styled(" cancel", accent_style),
         ]);
         frame.render_widget(Paragraph::new(help_text), chunks[2]);
-    } else {
+    } else if show_help {
         let help_text = Line::from(vec![
             Span::styled("↑↓", muted),
             Span::styled(" navigate ", accent_style),

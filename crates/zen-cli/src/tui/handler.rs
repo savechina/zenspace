@@ -128,8 +128,11 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         };
     }
 
-    if !app.output.is_empty() && key.code == KeyCode::Char('v') && key.modifiers == KeyModifiers::NONE {
-        let all_lines = super::ui::build_output_lines(app);
+    if !app.output.is_empty()
+        && key.code == KeyCode::Char('v')
+        && key.modifiers == KeyModifiers::NONE
+    {
+        let all_lines = app.all_lines().to_vec();
         let last_line = all_lines.len().saturating_sub(1);
         app.text_selection = Some(Selection::new(
             TextPosition::new(last_line, 0),
@@ -395,8 +398,10 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut super::app::App) {
             app.scroll_offset = app.scroll_offset.saturating_add(5);
         }
         MouseEventKind::Down(_) => {
-            if !app.output.is_empty() && let Some(chat_area) = app.chat_area {
-                let all_lines = super::ui::build_output_lines(app);
+            if !app.output.is_empty()
+                && let Some(chat_area) = app.chat_area
+            {
+                let all_lines = app.all_lines().to_vec();
                 let inner_width = chat_area.width.saturating_sub(2) as usize;
                 if let Some(pos) = super::selection::mouse_to_position(
                     mouse.column,
@@ -413,7 +418,7 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut super::app::App) {
         }
         MouseEventKind::Drag(_) => {
             let maybe_pos = app.chat_area.and_then(|chat_area| {
-                let all_lines = super::ui::build_output_lines(app);
+                let all_lines = app.all_lines().to_vec();
                 let inner_width = chat_area.width.saturating_sub(2) as usize;
                 super::selection::mouse_to_position(
                     mouse.column,
@@ -429,7 +434,9 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut super::app::App) {
             }
         }
         MouseEventKind::Up(_) => {
-            if let Some(sel) = &app.text_selection && sel.anchor == sel.cursor {
+            if let Some(sel) = &app.text_selection
+                && sel.anchor == sel.cursor
+            {
                 app.text_selection = None;
             }
         }
@@ -438,7 +445,7 @@ pub fn handle_mouse(mouse: MouseEvent, app: &mut super::app::App) {
 }
 
 fn handle_text_selection_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
-    let all_lines = super::ui::build_output_lines(app);
+    let all_lines = app.all_lines().to_vec();
     let line_count = all_lines.len();
 
     match (key.code, key.modifiers) {
@@ -548,7 +555,9 @@ fn ensure_visible(
     use crate::tui::selection::line_text;
     use unicode_width::UnicodeWidthChar;
 
-    let chat_area = app.chat_area.unwrap_or(ratatui::layout::Rect::new(0, 0, 82, 22));
+    let chat_area = app
+        .chat_area
+        .unwrap_or(ratatui::layout::Rect::new(0, 0, 82, 22));
     let inner_width = chat_area.width.saturating_sub(2) as usize;
     let visible_height = chat_area.height.saturating_sub(2) as usize;
     let mut visual_row: usize = 0;
@@ -586,4 +595,3 @@ fn ensure_visible(
         visual_row += wrapped;
     }
 }
-

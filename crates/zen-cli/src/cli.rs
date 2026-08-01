@@ -192,7 +192,7 @@ pub async fn shell() -> Result<(), ZenError> {
         init_tracing(filter, true)?;
         let config = zen_core::config::load_config()
             .map_err(|e| ZenError::Message(format!("Config error: {}", e)))?;
-        crate::tui::run(config).map_err(|e| ZenError::Message(format!("TUI error: {}", e)))
+        crate::tui::run_inline(config).map_err(|e| ZenError::Message(format!("TUI error: {}", e)))
     } else if let Some(cmd) = cli.command {
         init_tracing(filter, false)?;
         dispatch_command(cmd).await
@@ -202,6 +202,7 @@ pub async fn shell() -> Result<(), ZenError> {
 }
 
 fn init_tracing(filter: EnvFilter, use_file: bool) -> Result<(), ZenError> {
+    #[allow(deprecated)]
     let time_fmt =
         time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap();
 

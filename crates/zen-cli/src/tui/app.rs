@@ -4,8 +4,23 @@ use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::symbols::border;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use std::collections::VecDeque;
+
+pub struct ScrollbackEntry {
+    pub lines: Vec<Line<'static>>,
+    pub wrap: bool,
+}
+
+struct OutputCache {
+    lines: Vec<Line<'static>>,
+    cell_line_offsets: Vec<usize>,
+    show_splash: bool,
+    show_thinking: bool,
+    theme_generation: u64,
+}
+
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -25,6 +40,7 @@ use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::StreamCollector;
 use super::theme::{
     OutputTheme, ZenTheme, auto_select as theme_auto_select, from_name as theme_from_name,
+    no_color as theme_no_color,
 };
 use zen_memory::conversation::ConversationStore;
 use zen_memory::history::HistoryStore;
@@ -341,6 +357,7 @@ pub struct App {
     db_client: Option<zen_repo::SqliteClient>,
     pub turn_started_at: Option<Instant>,
     pub tool_call_count: u32,
+    pub current_response_tokens: usize,
     /// Whether the welcome splash banner is still showing. Set to `false` once
     /// the first user or agent message arrives so the large banner does not
     /// permanently consume the chat area.
@@ -348,6 +365,13 @@ pub struct App {
     /// Last rendered chat area rectangle, used to map mouse coordinates.
     pub chat_area: Option<ratatui::layout::Rect>,
     pub text_selection: Option<Selection>,
+    pub scrollback_queue: VecDeque<ScrollbackEntry>,
+    /// Single-source-of-truth pending tail. Written only by the event loop's
+    /// drain, read non-consuming by the viewport. Prevents duplicate-drain race.
+    pub viewport_tail: Vec<Line<'static>>,
+    pub inline_mode: bool,
+    output_cache: Option<OutputCache>,
+    theme_generation: u64,
 }
 
 impl App {
@@ -361,7 +385,7 @@ impl App {
             .title(" Input (Enter=send, Ctrl+D=exit) ")
     }
 
-    fn create_input_textarea(text: impl Into<String>) -> InputCell {
+    pub(crate) fn create_input_textarea(text: impl Into<String>) -> InputCell {
         InputCell::new(text)
     }
 
@@ -418,9 +442,15 @@ impl App {
             db_client: None,
             turn_started_at: None,
             tool_call_count: 0,
+            current_response_tokens: 0,
             show_splash: true,
             chat_area: None,
             text_selection: None,
+            scrollback_queue: VecDeque::new(),
+            viewport_tail: Vec::new(),
+            inline_mode: false,
+            output_cache: None,
+            theme_generation: 0,
         };
         app.load_command_history();
         app
@@ -428,11 +458,81 @@ impl App {
 
     pub fn with_theme(&mut self, name: &str) -> &mut Self {
         self.theme = theme_from_name(name);
+        self.theme_generation = self.theme_generation.wrapping_add(1);
+        self.invalidate_output_cache();
         let bg_color = self.theme.bg();
         let bg_style = ratatui::style::Style::default().bg(bg_color);
         self.input.set_style(bg_style);
         self.refresh_input_border();
         self
+    }
+
+    pub fn invalidate_output_cache(&mut self) {
+        self.output_cache = None;
+    }
+
+    fn ensure_output_cache(&mut self) {
+        if self.output_cache.is_none() {
+            self.output_cache = Some(self.build_output_cache());
+        }
+    }
+
+    fn build_output_cache(&self) -> OutputCache {
+        let theme = self.theme.as_ref();
+        let bg_color = theme.bg();
+        let blank_line = Line::styled("", ratatui::style::Style::default().bg(bg_color));
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut cell_line_offsets: Vec<usize> = Vec::with_capacity(self.output.len());
+
+        for cell in &self.output {
+            cell_line_offsets.push(lines.len());
+            if !self.show_splash && matches!(cell, OutputCell::Banner(_)) {
+                continue;
+            }
+            let cell_lines = cell.display_lines(theme, self.show_thinking);
+            if !cell_lines.is_empty() {
+                lines.extend(cell_lines.into_owned());
+                lines.push(blank_line.clone());
+            }
+        }
+
+        OutputCache {
+            lines,
+            cell_line_offsets,
+            show_splash: self.show_splash,
+            show_thinking: self.show_thinking,
+            theme_generation: self.theme_generation,
+        }
+    }
+
+    fn output_cache_is_stale(&self, cache: &OutputCache) -> bool {
+        cache.show_splash != self.show_splash
+            || cache.show_thinking != self.show_thinking
+            || cache.theme_generation != self.theme_generation
+    }
+
+    pub fn all_lines(&mut self) -> &[Line<'static>] {
+        let is_stale = self.output_cache.as_ref().is_none_or(|cache| {
+            cache.show_splash != self.show_splash
+                || cache.show_thinking != self.show_thinking
+                || cache.theme_generation != self.theme_generation
+        });
+        if is_stale {
+            self.output_cache = Some(self.build_output_cache());
+        }
+        &self.output_cache.as_ref().unwrap().lines
+    }
+
+    pub fn cell_line_offsets(&mut self) -> &[usize] {
+        let is_stale = self.output_cache.as_ref().is_none_or(|cache| {
+            cache.show_splash != self.show_splash
+                || cache.show_thinking != self.show_thinking
+                || cache.theme_generation != self.theme_generation
+        });
+        if is_stale {
+            self.output_cache = Some(self.build_output_cache());
+        }
+        &self.output_cache.as_ref().unwrap().cell_line_offsets
     }
 
     pub fn show_toast(&mut self, msg: impl Into<String>) {
@@ -558,7 +658,7 @@ impl App {
         }
     }
 
-    fn push_splash(&mut self) {
+    pub(crate) fn push_splash(&mut self) {
         use crossterm::terminal::size;
 
         let width = size().map(|(w, _)| w).unwrap_or(80);
@@ -583,6 +683,96 @@ impl App {
         info.push('\n');
         info.push_str(SPLASH_HELP);
         self.output.push(OutputCell::Plain(PlainCell::new(info)));
+        self.invalidate_output_cache();
+    }
+
+    pub fn is_inline_mode(&self) -> bool {
+        self.inline_mode
+    }
+
+    pub fn enqueue_scrollback(&mut self, lines: Vec<Line<'static>>) {
+        self.scrollback_queue
+            .push_back(ScrollbackEntry { lines, wrap: true });
+    }
+
+    pub fn enqueue_scrollback_unwrapped(&mut self, lines: Vec<Line<'static>>) {
+        self.scrollback_queue
+            .push_back(ScrollbackEntry { lines, wrap: false });
+    }
+
+    pub fn enqueue_welcome_banner(&mut self) {
+        use crossterm::terminal::size;
+
+        let width = size().map(|(w, _)| w).unwrap_or(80);
+        let logo = match width {
+            w if w >= 90 => SPLASH_LOGO_FULL,
+            w if w >= 70 => SPLASH_LOGO_MINIMAL,
+            w if w >= 50 => SPLASH_LOGO_MINIMAL,
+            _ => "",
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        if !logo.is_empty() {
+            let banner = BannerCell::new(logo, self.theme.as_ref());
+            lines.extend(banner.display_lines().iter().cloned());
+        }
+
+        let version_str = format!("  Zen v{}", env!("CARGO_PKG_VERSION"));
+        let info = format!(
+            "{}\n{}\n{}\n{}",
+            SPLASH_PET.trim_end(),
+            SPLASH_TAGLINE.trim_end(),
+            version_str,
+            SPLASH_HELP.trim_end()
+        );
+        for line in info.lines() {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                self.theme.as_ref().text_muted(),
+            )));
+        }
+
+        if !lines.is_empty() {
+            self.scrollback_queue
+                .push_back(ScrollbackEntry { lines, wrap: false });
+        }
+    }
+
+    fn render_user_lines_for_scrollback(&self, text: &str) -> Vec<Line<'static>> {
+        let theme = self.theme.as_ref();
+        let bg = theme.user_bg();
+        let prefix_style = theme.user_prefix();
+        let text_style = ratatui::style::Style::default().bg(bg);
+
+        let user_lines: Vec<&str> = text.lines().collect();
+        let mut result = Vec::with_capacity(user_lines.len().max(1));
+
+        for (i, line) in user_lines.iter().enumerate() {
+            let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+            if i == 0 {
+                spans.push(ratatui::text::Span::styled(
+                    "> ".to_string(),
+                    prefix_style.bg(bg),
+                ));
+            } else {
+                spans.push(ratatui::text::Span::styled(
+                    "  ".to_string(),
+                    ratatui::style::Style::default().bg(bg),
+                ));
+            }
+            spans.push(ratatui::text::Span::styled(line.to_string(), text_style));
+            result.push(Line::from(spans));
+        }
+
+        if result.is_empty() {
+            result.push(Line::from(ratatui::text::Span::styled(
+                "> ".to_string(),
+                prefix_style.bg(bg),
+            )));
+        }
+
+        result
     }
 
     pub fn init_orchestrator(&mut self, config: &'static zen_core::config::ZenConfig) {
@@ -619,6 +809,22 @@ impl App {
     }
 
     pub fn push_output(&mut self, text: String, is_error: bool) {
+        if self.is_inline_mode() {
+            let theme = self.theme.as_ref();
+            if is_error {
+                let cell = ErrorCell::new(text, theme);
+                let lines = cell.display_lines().to_vec();
+                self.enqueue_scrollback(lines);
+            } else {
+                let lines = super::markdown::render_markdown(&text);
+                if lines.is_empty() {
+                    self.enqueue_scrollback(vec![Line::from("")]);
+                } else {
+                    self.enqueue_scrollback(lines);
+                }
+            }
+            return;
+        }
         if is_error {
             self.output
                 .push(OutputCell::Error(ErrorCell::new(text, self.theme.as_ref())));
@@ -631,6 +837,7 @@ impl App {
         while self.output.len() > 500 {
             self.output.remove(0);
         }
+        self.invalidate_output_cache();
     }
 
     pub fn push_history(&mut self, cmd: &str) {
@@ -728,13 +935,17 @@ impl App {
                 self.message_queue.push_back(cmd.to_string());
             }
         } else {
+            if self.is_inline_mode() {
+                let user_lines = self.render_user_lines_for_scrollback(cmd);
+                self.enqueue_scrollback(user_lines);
+            }
             self.ensure_session(cmd);
             self.current_query = cmd.to_string();
             self.execute_chat(cmd);
         }
     }
 
-    fn handle_slash_command(&mut self, cmd: &str) {
+    pub(crate) fn handle_slash_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
         let command_name = self
             .slash_registry
@@ -749,8 +960,19 @@ impl App {
             }
             "help" => self.show_help(),
             "clear" => {
-                self.output.clear();
-                self.stream_collector.clear();
+                if self.is_inline_mode() {
+                    self.scrollback_queue.clear();
+                    self.output.clear();
+                    self.stream_collector.clear();
+                    self.enqueue_scrollback(vec![Line::from(ratatui::text::Span::styled(
+                        "(screen cleared)",
+                        self.theme.as_ref().text_muted(),
+                    ))]);
+                } else {
+                    self.output.clear();
+                    self.stream_collector.clear();
+                }
+                self.invalidate_output_cache();
             }
             "thinking" => {
                 self.show_thinking = !self.show_thinking;
@@ -823,6 +1045,10 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_chat(&mut self, query: &str) {
+        if self.orchestrator.is_none() {
+            self.init_orchestrator(self.config);
+        }
+
         let specialist = self
             .orchestrator
             .as_ref()
@@ -835,10 +1061,12 @@ Use /thinking to show/hide thinking process."#;
                 count = context.len(),
                 "TUI chat: knowledge context injected"
             );
-            self.push_output(
-                format!("[Knowledge] Found {} relevant notes", context.len()),
-                false,
-            );
+            if !self.is_inline_mode() {
+                self.push_output(
+                    format!("[Knowledge] Found {} relevant notes", context.len()),
+                    false,
+                );
+            }
         }
 
         tracing::debug!(
@@ -850,8 +1078,12 @@ Use /thinking to show/hide thinking process."#;
 
         self.turn_started_at = Some(Instant::now());
         self.tool_call_count = 0;
+        self.current_response_tokens = 0;
         self.show_splash = false;
-        self.output.push(OutputCell::user(query));
+        if !self.is_inline_mode() {
+            self.output.push(OutputCell::user(query));
+            self.invalidate_output_cache();
+        }
         self.start_llm_call_via_orchestrator(query, &context);
     }
 
@@ -1188,6 +1420,7 @@ Use /thinking to show/hide thinking process."#;
                 for token in &result.tokens {
                     self.stream_collector.push_delta(token);
                 }
+                self.current_response_tokens = self.stream_collector.buffer().len() / 4;
 
                 if let Some(done_result) = result.done_result {
                     match done_result {
@@ -1205,7 +1438,6 @@ Use /thinking to show/hide thinking process."#;
                                 response_len = response.len(),
                                 "TUI chat: LLM response complete"
                             );
-                            let (raw_text, reasoning) = self.stream_collector.finalize_and_drain();
                             let elapsed = self.turn_started_at.map(|t| t.elapsed());
                             let label = match (elapsed, self.tool_call_count) {
                                 (Some(e), 0) => Some(format!("{:.1}s", e.as_secs_f64())),
@@ -1214,10 +1446,36 @@ Use /thinking to show/hide thinking process."#;
                                 }
                                 (None, _) => None,
                             };
-                            self.output.push(OutputCell::separator(label));
-                            if !raw_text.is_empty() || reasoning.is_some() {
-                                self.output.push(OutputCell::agent(raw_text, reasoning));
+                            if self.is_inline_mode() {
+                                let reasoning_style = self
+                                    .theme
+                                    .as_ref()
+                                    .text_muted()
+                                    .add_modifier(ratatui::style::Modifier::ITALIC);
+                                let (committed, pending) =
+                                    self.stream_collector.drain_and_tail(reasoning_style);
+                                let mut remaining = committed;
+                                remaining.extend(pending);
+                                if !remaining.is_empty() {
+                                    self.enqueue_scrollback(remaining);
+                                }
+                                if let Some(l) = &label {
+                                    let separator_line = Line::from(ratatui::text::Span::styled(
+                                        format!("── {} ──", l),
+                                        self.theme.as_ref().separator(),
+                                    ));
+                                    self.enqueue_scrollback(vec![separator_line]);
+                                }
                             }
+                            let (raw_text, reasoning) = self.stream_collector.finalize_and_drain();
+                            if !self.is_inline_mode() {
+                                self.output.push(OutputCell::separator(label));
+                                if !raw_text.is_empty() || reasoning.is_some() {
+                                    self.output.push(OutputCell::agent(raw_text, reasoning));
+                                }
+                                self.invalidate_output_cache();
+                            }
+                            self.current_response_tokens = response.len() / 4;
                             self.auto_scroll = true;
                             self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {
@@ -1463,11 +1721,7 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn execute_export(&mut self) {
-        let output_text: Vec<String> = self
-            .output
-            .iter()
-            .map(|cell| cell.raw_text())
-            .collect();
+        let output_text: Vec<String> = self.output.iter().map(|cell| cell.raw_text()).collect();
         let content = output_text.join("\n");
         let timestamp = chrono::Utc::now().format("%Y-%m-%d-%H%M%S");
         let filename = format!("chat-{}.md", timestamp);
@@ -1613,7 +1867,7 @@ Use /thinking to show/hide thinking process."#;
         }
     }
 
-    fn save_session_state(&mut self) {
+    pub(crate) fn save_session_state(&mut self) {
         if let Some(ref id) = self.session_id
             && let Ok(mut notion) = zen_core::types::SessionRecord::load(id)
         {
@@ -1676,6 +1930,7 @@ Use /thinking to show/hide thinking process."#;
                 }
                 self.session = Some(SessionContext::new(session.agent_name, String::new()));
                 self.output.clear();
+                self.invalidate_output_cache();
                 self.chat_history.clear();
                 self.push_output(format!("New session started: {}", session.id), false);
             }
@@ -1714,6 +1969,7 @@ Use /thinking to show/hide thinking process."#;
                 }
                 self.session = Some(SessionContext::new(forked.agent_name, String::new()));
                 self.output.clear();
+                self.invalidate_output_cache();
                 self.chat_history.clear();
                 self.push_output(
                     format!("Session forked: {} (from {})", forked.id, current_id),
@@ -1767,6 +2023,7 @@ Use /thinking to show/hide thinking process."#;
                 self.push_output(format!("Session archived: {}", current_id), false);
                 self.session_id = None;
                 self.output.clear();
+                self.invalidate_output_cache();
                 self.chat_history.clear();
             }
             Err(e) => self.push_output(format!("Archive error: {}", e), true),
@@ -1786,6 +2043,7 @@ Use /thinking to show/hide thinking process."#;
                         ConversationStore::with_dir(date_dir, &session.id).ok();
                 }
                 self.output.clear();
+                self.invalidate_output_cache();
                 self.chat_history.clear();
                 let mut session_ctx =
                     SessionContext::new(session.agent_name.clone(), String::new());
@@ -1806,6 +2064,7 @@ Use /thinking to show/hide thinking process."#;
                                 self.output.push(OutputCell::Markdown(MarkdownCell::new(
                                     normalized.clone(),
                                 )));
+                                self.invalidate_output_cache();
                                 self.chat_history
                                     .push((user_content.clone(), normalized.clone()));
                                 session_ctx.add_turn("assistant", &normalized);
@@ -2053,13 +2312,14 @@ pub fn run_app(
     config: &'static zen_core::config::ZenConfig,
 ) -> Result<()> {
     let mut app = App::new(config);
-    if let Some(theme) = config.tui_theme() {
+    if std::env::var("NO_COLOR").is_ok() {
+        app.theme = theme_no_color();
+    } else if let Some(theme) = config.tui_theme() {
         app.with_theme(theme);
     } else {
         app.theme = theme_auto_select();
     }
     app.push_splash();
-    app.init_orchestrator(config);
     app.push_output(
         "Zen Agentic TUI - type /help for commands, /thinking to show thinking, Ctrl+D to exit"
             .into(),
@@ -2073,11 +2333,22 @@ pub fn run_app(
         scheduler.run().await;
     });
 
+    let mut dirty = true;
     loop {
+        let prev_streaming = app.is_streaming;
+        let prev_output_len = app.output.len();
         app.poll_llm_response();
+        if app.is_streaming != prev_streaming || app.output.len() != prev_output_len {
+            dirty = true;
+        }
+
         app.refresh_input_border();
         let active_toast = app.get_active_toast();
-        terminal.draw(|frame| crate::tui::ui::render(frame, &mut app, active_toast.as_deref()))?;
+        if dirty {
+            terminal
+                .draw(|frame| crate::tui::ui::render(frame, &mut app, active_toast.as_deref()))?;
+            dirty = false;
+        }
 
         if crossterm::event::poll(std::time::Duration::from_millis(30))? {
             match crossterm::event::read()? {
@@ -2102,17 +2373,23 @@ pub fn run_app(
                         }
                         crate::tui::handler::KeyAction::Continue => {}
                     }
+                    dirty = true;
                     if !app.running {
                         break;
                     }
                 }
                 crossterm::event::Event::Paste(text) => {
                     crate::tui::handler::handle_paste(&text, &mut app);
+                    dirty = true;
                 }
                 crossterm::event::Event::Mouse(mouse) => {
                     crate::tui::handler::handle_mouse(mouse, &mut app);
+                    dirty = true;
                 }
-                _ => {} // Release, Repeat, Mouse, Focus — ignore
+                crossterm::event::Event::Resize(_, _) => {
+                    dirty = true;
+                }
+                _ => {}
             }
         }
     }

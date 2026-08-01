@@ -20,8 +20,7 @@ impl StreamingCell {
         let mut lines = self.unstable_text.lines.clone();
 
         if let Some(last) = lines.last_mut() {
-            last.spans
-                .push(Span::styled("▌", self.cursor_style));
+            last.spans.push(Span::styled("▌", self.cursor_style));
         } else {
             lines.push(Line::from(Span::styled("▌", self.cursor_style)));
         }

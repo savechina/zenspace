@@ -8,27 +8,35 @@ pub struct BannerCell {
     pub zen_core_light: Color,
     pub zen_core_dark: Color,
     pub shadow: Color,
+    cached_lines: Vec<Line<'static>>,
 }
 
 impl BannerCell {
     pub fn new(text: impl Into<String>, theme: &dyn OutputTheme) -> Self {
+        let text = text.into();
+        let cached_lines = Self::render(&text, theme);
         Self {
-            text: text.into(),
+            text,
             zen_core_light: theme.zen_core_light(),
             zen_core_dark: theme.zen_core_dark(),
             shadow: theme.shadow(),
+            cached_lines,
         }
     }
 
-    pub fn display_lines(&self) -> Vec<Line<'static>> {
-        let rows: Vec<&str> = self.text.lines().collect();
+    pub fn display_lines(&self) -> &[Line<'static>] {
+        &self.cached_lines
+    }
+
+    fn render(text: &str, theme: &dyn OutputTheme) -> Vec<Line<'static>> {
+        let rows: Vec<&str> = text.lines().collect();
         let total = rows.len();
         if total == 0 {
             return Vec::new();
         }
 
-        let light = rgb_or_default(self.zen_core_light);
-        let dark = rgb_or_default(self.zen_core_dark);
+        let light = rgb_or_default(theme.zen_core_light());
+        let dark = rgb_or_default(theme.zen_core_dark());
         let body_style_for = |row_idx: usize| {
             let frac = if total <= 1 {
                 0.0
@@ -38,7 +46,7 @@ impl BannerCell {
             let (r, g, b) = lerp_rgb(light, dark, frac.clamp(0.0, 1.0));
             Style::default().fg(Color::Rgb(r, g, b))
         };
-        let shadow_style = Style::default().fg(self.shadow);
+        let shadow_style = Style::default().fg(theme.shadow());
         let filler_style = Style::default().fg(Color::Indexed(234));
 
         rows.into_iter()

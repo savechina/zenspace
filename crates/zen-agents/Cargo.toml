@@ -20,6 +20,7 @@ cron = { workspace = true }
 uuid = { workspace = true }
 fastrand = { workspace = true }
 rig-core = { workspace = true }
+rig-agent = { workspace = true }
 rig-compose = { workspace = true }
 rig-resources = { workspace = true }
 rig-mcp = { workspace = true }

@@ -1,7 +1,19 @@
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use mdstream::{BlockId, BlockKind, DocumentState, MdStream, Options};
 use ratatui::text::{Line, Span};
+use tui_markdown::StyleSheet;
+
+#[derive(Clone, Copy)]
+struct NoMarkerStyleSheet;
+
+impl StyleSheet for NoMarkerStyleSheet {
+    fn heading_marker(&self, _level: u8) -> &str {
+        ""
+    }
+}
 
 fn hash_string(s: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -24,7 +36,8 @@ fn convert_text_to_owned_lines(text: ratatui::text::Text) -> Vec<Line<'static>> 
 }
 
 fn render_block_via_tui_markdown(raw: &str) -> Vec<Line<'static>> {
-    let text = tui_markdown::from_str(raw);
+    let options = tui_markdown::Options::new(NoMarkerStyleSheet);
+    let text = tui_markdown::from_str_with_options(raw, &options);
     convert_text_to_owned_lines(text)
 }
 
@@ -39,9 +52,7 @@ pub struct IncrementalMarkdownRenderer {
 
 impl IncrementalMarkdownRenderer {
     pub fn new() -> Self {
-        Self {
-            blocks: Vec::new(),
-        }
+        Self { blocks: Vec::new() }
     }
 
     pub fn update(&mut self, content: &str) -> Vec<Line<'static>> {
@@ -64,7 +75,14 @@ impl IncrementalMarkdownRenderer {
                 continue;
             }
 
-            let lines = render_block_via_tui_markdown(raw);
+            let is_last_block = i == raw_blocks.len() - 1;
+            let render_content = if is_last_block {
+                maybe_close_unclosed_fences(raw)
+            } else {
+                raw.clone()
+            };
+
+            let lines = render_block_via_tui_markdown(&render_content);
             result.extend(lines.iter().cloned());
             new_blocks.push(RenderedBlock { hash: h, lines });
         }
@@ -73,6 +91,7 @@ impl IncrementalMarkdownRenderer {
         result
     }
 
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.blocks.clear();
     }
@@ -103,17 +122,17 @@ fn is_continuation_line(line: &str) -> bool {
 }
 
 fn is_table_row(trimmed: &str) -> bool {
-    trimmed.starts_with('|')
-        && trimmed.ends_with('|')
-        && trimmed.matches('|').count() >= 2
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 2
 }
 
 fn is_table_separator(trimmed: &str) -> bool {
     trimmed.starts_with('|')
         && trimmed.ends_with('|')
-        && trimmed[1..trimmed.len() - 1]
-            .split('|')
-            .all(|cell| cell.trim().chars().all(|c| c == '-' || c == ':' || c.is_whitespace()))
+        && trimmed[1..trimmed.len() - 1].split('|').all(|cell| {
+            cell.trim()
+                .chars()
+                .all(|c| c == '-' || c == ':' || c.is_whitespace())
+        })
 }
 
 fn split_top_level_blocks(content: &str) -> Vec<String> {
@@ -169,9 +188,107 @@ fn split_top_level_blocks(content: &str) -> Vec<String> {
     blocks
 }
 
+fn maybe_close_unclosed_fences(block: &str) -> String {
+    let fence_count = block.matches("```").count();
+    if fence_count % 2 == 1 {
+        return format!("{}\n```", block);
+    }
+    block.to_string()
+}
+
 pub fn render_markdown(content: &str) -> Vec<Line<'static>> {
+    let normalized = crate::tui::render::normalize_compact_markdown(content);
     let mut renderer = IncrementalMarkdownRenderer::new();
-    renderer.update(content)
+    renderer.update(&normalized)
+}
+
+#[allow(dead_code)]
+pub struct CommittedBlock {
+    pub id: BlockId,
+    pub kind: BlockKind,
+    pub raw: String,
+    pub display: String,
+    pub lines: Vec<Line<'static>>,
+}
+
+pub struct PendingBlock {
+    pub lines: Vec<Line<'static>>,
+}
+
+pub struct StreamingMarkdown {
+    stream: MdStream,
+    state: DocumentState,
+    committed_cache: HashMap<BlockId, Vec<Line<'static>>>,
+}
+
+impl StreamingMarkdown {
+    pub fn new() -> Self {
+        Self {
+            stream: MdStream::new(Options::default()),
+            state: DocumentState::new(),
+            committed_cache: HashMap::new(),
+        }
+    }
+
+    pub fn append(&mut self, chunk: &str) -> StreamingUpdate {
+        let update = self.stream.append(chunk);
+        let _applied = self.state.apply(update);
+
+        let committed: Vec<CommittedBlock> = self
+            .state
+            .committed()
+            .iter()
+            .filter_map(|block| {
+                let id = block.id;
+                if self.committed_cache.contains_key(&id) {
+                    return None;
+                }
+                let display = block.display_or_raw().to_string();
+                let raw = block.raw.to_string();
+                let lines = block_to_lines(&display);
+                self.committed_cache.insert(id, lines.clone());
+                Some(CommittedBlock {
+                    id,
+                    kind: block.kind,
+                    raw,
+                    display,
+                    lines,
+                })
+            })
+            .collect();
+
+        let pending = self.state.pending().map(|block| {
+            let display = block.display_or_raw().to_string();
+            let lines = block_to_lines(&display);
+            PendingBlock { lines }
+        });
+
+        StreamingUpdate { committed, pending }
+    }
+
+    pub fn clear(&mut self) {
+        self.stream.reset();
+        self.state.clear();
+        self.committed_cache.clear();
+    }
+}
+
+impl Default for StreamingMarkdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct StreamingUpdate {
+    pub committed: Vec<CommittedBlock>,
+    pub pending: Option<PendingBlock>,
+}
+
+fn block_to_lines(block_display_text: &str) -> Vec<Line<'static>> {
+    if block_display_text.is_empty() {
+        return Vec::new();
+    }
+    render_markdown(block_display_text)
 }
 
 #[cfg(test)]
@@ -210,7 +327,11 @@ mod tests {
     fn split_preserves_list_across_blank_lines() {
         let content = "- Item 1\n\n- Item 2\n\n- Item 3";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 1, "list items with blank lines should be one block");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "list items with blank lines should be one block"
+        );
         assert!(blocks[0].contains("Item 1"));
         assert!(blocks[0].contains("Item 3"));
     }
@@ -219,14 +340,22 @@ mod tests {
     fn split_preserves_mixed_list_markers_across_blank_lines() {
         let content = "- Dash item\n\n* Star item\n\n+ Plus item";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 1, "mixed list markers with blank lines should be one block");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "mixed list markers with blank lines should be one block"
+        );
     }
 
     #[test]
     fn split_preserves_numbered_list_across_blank_lines() {
         let content = "1. First\n\n2. Second\n\n3. Third";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 1, "numbered list items with blank lines should be one block");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "numbered list items with blank lines should be one block"
+        );
     }
 
     #[test]
@@ -240,7 +369,11 @@ mod tests {
     fn split_preserves_table_across_blank_lines() {
         let content = "| Header |\n\n| Cell |";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 1, "table rows with blank lines should be one block");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "table rows with blank lines should be one block"
+        );
         assert!(blocks[0].contains("Header"));
         assert!(blocks[0].contains("Cell"));
     }
@@ -249,14 +382,22 @@ mod tests {
     fn split_preserves_table_with_separator_across_blank_lines() {
         let content = "| Header |\n\n|--------|\n\n| Cell |";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 1, "table with separator rows should be one block");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "table with separator rows should be one block"
+        );
     }
 
     #[test]
     fn split_separates_paragraph_from_list() {
         let content = "Paragraph text.\n\n- Item 1\n- Item 2";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 2, "paragraph and list should be separate blocks");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "paragraph and list should be separate blocks"
+        );
         assert!(blocks[0].contains("Paragraph"));
         assert!(blocks[1].contains("Item 1"));
     }
@@ -265,7 +406,11 @@ mod tests {
     fn split_separates_list_from_paragraph() {
         let content = "- Item 1\n- Item 2\n\nParagraph text.";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 2, "list and paragraph should be separate blocks");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "list and paragraph should be separate blocks"
+        );
         assert!(blocks[0].contains("Item 1"));
         assert!(blocks[1].contains("Paragraph"));
     }
@@ -274,7 +419,11 @@ mod tests {
     fn split_heading_paragraph_list() {
         let content = "# Title\n\nBody paragraph.\n\n- Item 1\n- Item 2\n\nFinal paragraph.";
         let blocks = split_top_level_blocks(content);
-        assert_eq!(blocks.len(), 4, "heading, paragraph, list, paragraph should be 4 blocks");
+        assert_eq!(
+            blocks.len(),
+            4,
+            "heading, paragraph, list, paragraph should be 4 blocks"
+        );
         assert!(blocks[0].contains("# Title"));
         assert!(blocks[1].contains("Body paragraph."));
         assert!(blocks[2].contains("Item 1"));
@@ -320,18 +469,25 @@ mod tests {
     #[test]
     fn heading_and_paragraph_produce_separate_lines() {
         let lines = render_markdown("# Title\n\nBody paragraph.");
-        assert!(lines.len() >= 2, "heading + paragraph should be >= 2 lines, got {}", lines.len());
+        assert!(
+            lines.len() >= 2,
+            "heading + paragraph should be >= 2 lines, got {}",
+            lines.len()
+        );
     }
 
     #[test]
     fn list_items_render_as_lines() {
         let lines = render_markdown("- One\n- Two\n- Three");
-        assert!(lines.len() >= 3, "3 list items should be >= 3 lines, got {}", lines.len());
+        assert!(
+            lines.len() >= 3,
+            "3 list items should be >= 3 lines, got {}",
+            lines.len()
+        );
     }
 
     #[test]
     fn no_backslash_hack_in_output() {
-        // Verify preserve_line_breaks is gone — no `\` at end of lines
         let lines = render_markdown("Line one\nLine two");
         for line in &lines {
             for span in &line.spans {
@@ -342,5 +498,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn extract_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn heading_marker_stripped() {
+        let lines = render_markdown("# Heading\n\nBody.");
+        let text = extract_text(&lines);
+        assert!(
+            !text.contains('#'),
+            "heading marker # should be stripped, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn compact_heading_normalized() {
+        let lines = render_markdown("# Heading\nSome text.");
+        let text = extract_text(&lines);
+        assert!(
+            !text.contains('#'),
+            "compact heading should be normalized, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn bold_marker_stripped() {
+        let lines = render_markdown("**bold**");
+        let text = extract_text(&lines);
+        assert!(
+            !text.contains('*'),
+            "bold markers should be stripped, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn inline_code_marker_stripped() {
+        let lines = render_markdown("Use `cargo` to build.");
+        let text = extract_text(&lines);
+        assert!(
+            !text.contains('`'),
+            "backticks should be stripped, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_markdown_empty_initial() {
+        let sm = StreamingMarkdown::new();
+        assert!(sm.committed_cache.is_empty());
+    }
+
+    #[test]
+    fn streaming_markdown_append_single_paragraph() {
+        let mut sm = StreamingMarkdown::new();
+        let update = sm.append("Hello world\n\n");
+        let total_lines: usize = update
+            .committed
+            .iter()
+            .map(|b| b.lines.len())
+            .sum::<usize>()
+            + update.pending.as_ref().map(|p| p.lines.len()).unwrap_or(0);
+        assert!(total_lines > 0, "should have rendered lines");
+    }
+
+    #[test]
+    fn streaming_markdown_clear_resets_state() {
+        let mut sm = StreamingMarkdown::new();
+        sm.append("Some text.\n\n");
+        sm.clear();
+        assert!(sm.committed_cache.is_empty());
+    }
+
+    #[test]
+    fn streaming_markdown_code_fence_pending() {
+        let mut sm = StreamingMarkdown::new();
+        let update = sm.append("```rust\nfn main() {\n");
+        assert!(update.pending.is_some());
+        let pending = update.pending.unwrap();
+        let text: String = pending
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("fn main"));
     }
 }

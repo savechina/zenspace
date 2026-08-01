@@ -157,12 +157,10 @@ pub fn highlight_line(
                 .or(span.style.bg)
                 .map(|bg| {
                     Style::default()
-                        .fg(
-                            highlight
-                                .fg
-                                .or(span.style.fg)
-                                .unwrap_or(ratatui::style::Color::Reset),
-                        )
+                        .fg(highlight
+                            .fg
+                            .or(span.style.fg)
+                            .unwrap_or(ratatui::style::Color::Reset))
                         .bg(bg)
                 })
                 .unwrap_or(highlight);
@@ -183,12 +181,10 @@ pub fn highlight_line(
                     .or(span.style.bg)
                     .map(|bg| {
                         Style::default()
-                            .fg(
-                                highlight
-                                    .fg
-                                    .or(span.style.fg)
-                                    .unwrap_or(ratatui::style::Color::Reset),
-                            )
+                            .fg(highlight
+                                .fg
+                                .or(span.style.fg)
+                                .unwrap_or(ratatui::style::Color::Reset))
                             .bg(bg)
                     })
                     .unwrap_or(highlight);
@@ -209,10 +205,7 @@ pub fn highlight_line(
 /// Compute a `TextPosition` from a character offset within the concatenated text
 /// of all lines.
 #[allow(dead_code)]
-pub fn char_offset_to_position(
-    all_lines: &[Line<'static>],
-    target_offset: usize,
-) -> TextPosition {
+pub fn char_offset_to_position(all_lines: &[Line<'static>], target_offset: usize) -> TextPosition {
     let mut offset = 0usize;
     for (line_idx, line) in all_lines.iter().enumerate() {
         let text = line_text(line);

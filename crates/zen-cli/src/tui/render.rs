@@ -4,7 +4,7 @@
 /// blockquotes (`>`), and table rows (`|`). Respects inline code boundaries and avoids
 /// false positives like `this - that` being turned into list items.
 pub fn normalize_compact_markdown(content: &str) -> String {
-    if content.contains("\n\n") || !content.contains(' ') {
+    if !content.contains(' ') {
         return content.to_string();
     }
 
@@ -53,13 +53,11 @@ pub fn normalize_compact_markdown(content: &str) -> String {
             continue;
         }
 
-        // --- Heading: '#' at word boundary (start or after space), followed by space ---
+        // --- Heading: '#' at word boundary (start, after space, or after newline), followed by space ---
         if ch == '#' {
-            let at_boundary = i == 0 || chars[i - 1] == ' ';
+            let at_boundary = i == 0 || chars[i - 1] == ' ' || chars[i - 1] == '\n';
             let followed_by_space = i + 1 < len && chars[i + 1] == ' ';
-            if at_boundary && followed_by_space
-                && !result.is_empty() && !result.ends_with('\n')
-            {
+            if at_boundary && followed_by_space && !result.is_empty() && !result.ends_with('\n') {
                 result.push_str("\n\n");
             }
             result.push(ch);
@@ -117,9 +115,7 @@ pub fn normalize_compact_markdown(content: &str) -> String {
 
 fn is_table_row(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.starts_with('|')
-        && trimmed.ends_with('|')
-        && trimmed.matches('|').count() >= 2
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.matches('|').count() >= 2
 }
 
 fn is_table_separator(line: &str) -> bool {
@@ -127,9 +123,11 @@ fn is_table_separator(line: &str) -> bool {
     if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
         return false;
     }
-    trimmed[1..trimmed.len() - 1]
-        .split('|')
-        .all(|cell| cell.trim().chars().all(|c| c == '-' || c == ':' || c.is_whitespace()))
+    trimmed[1..trimmed.len() - 1].split('|').all(|cell| {
+        cell.trim()
+            .chars()
+            .all(|c| c == '-' || c == ':' || c.is_whitespace())
+    })
 }
 
 fn make_separator_row(header_row: &str) -> String {
@@ -282,7 +280,10 @@ mod tests {
     fn normalize_table_row_not_broken() {
         let input = "| a | b | c |";
         let normalized = normalize_compact_markdown(input);
-        assert_eq!(normalized, "| a | b | c |", "single table row should stay intact");
+        assert_eq!(
+            normalized, "| a | b | c |",
+            "single table row should stay intact"
+        );
     }
 
     #[test]
@@ -298,10 +299,7 @@ mod tests {
             normalized.contains("| a | b |"),
             "should preserve header row"
         );
-        assert!(
-            normalized.contains("| c | d |"),
-            "should preserve data row"
-        );
+        assert!(normalized.contains("| c | d |"), "should preserve data row");
     }
 
     #[test]

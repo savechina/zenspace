@@ -1,8 +1,9 @@
 use crate::Role;
-use rig_core::{
-    agent::{AgentHook, Flow, HookContext, StepEvent, StepEventKind},
-    completion::CompletionModel,
+use rig_agent::agent::{
+    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, ToolCall as ToolCallEvent,
+    ToolCallAction,
 };
+use rig_core::wasm_compat::WasmCompatSend;
 use std::collections::HashSet;
 use zen_core::types::Sensitivity;
 
@@ -68,90 +69,85 @@ fn is_cloud_tool(tool_name: &str) -> bool {
         || lower.contains("network")
 }
 
-impl<M: CompletionModel> AgentHook<M> for ZenHook {
-    fn on_event(
+impl AgentHook for ZenHook {
+    fn on_completion_call(
         &self,
         _ctx: &HookContext,
-        event: StepEvent<'_, M>,
-    ) -> impl std::future::Future<Output = Flow> + std::marker::Send {
+        event: CompletionCallEvent<'_>,
+    ) -> impl std::future::Future<Output = CompletionCallAction> + WasmCompatSend {
+        let agent_id = self.agent_id.clone();
+        let sensitivity = self.sensitivity;
+        let prompt_debug = format!("{:?}", event.prompt);
+        let turn = event.turn;
+        async move {
+            tracing::info!(
+                agent_id = %agent_id,
+                sensitivity = %sensitivity,
+                turn = turn,
+                "on_completion_call: prompt={prompt_debug}",
+            );
+            CompletionCallAction::Continue
+        }
+    }
+
+    fn on_tool_call(
+        &self,
+        _ctx: &HookContext,
+        event: ToolCallEvent<'_>,
+    ) -> impl std::future::Future<Output = ToolCallAction> + WasmCompatSend {
         let agent_id = self.agent_id.clone();
         let agent_role = self.agent_role.clone();
         let allowed_tools = self.allowed_tools.clone();
         let sensitivity = self.sensitivity;
+        let tool_name = event.tool_name.to_owned();
+        let args = event.args.to_owned();
         async move {
-            match event {
-                StepEvent::CompletionCall { prompt, turn, .. } => {
-                    let prompt_debug = format!("{prompt:?}");
-                    tracing::info!(
-                        agent_id = %agent_id,
-                        sensitivity = %sensitivity,
-                        turn = turn,
-                        "on_completion_call: prompt={prompt_debug}",
-                    );
-                    Flow::cont()
-                }
-                StepEvent::ToolCall {
-                    tool_name, args, ..
-                } => {
-                    let tool_name_owned = tool_name.to_owned();
-                    let allowed = allowed_tools.contains(tool_name);
-                    let confidential = sensitivity == Sensitivity::Confidential;
-                    let cloud = is_cloud_tool(&tool_name_owned);
+            let allowed = allowed_tools.contains(&tool_name);
+            let confidential = sensitivity == Sensitivity::Confidential;
+            let cloud = is_cloud_tool(&tool_name);
 
-                    if !allowed {
-                        return Flow::skip(format!(
-                            "Tool '{tool_name_owned}' not permitted for agent '{agent_id}'"
-                        ));
-                    }
-
-                    if confidential && cloud {
-                        return Flow::skip(format!(
-                            "Cloud tool '{tool_name_owned}' blocked for confidential data"
-                        ));
-                    }
-
-                    if matches!(agent_role, Role::Planner | Role::Orchestrator)
-                        && ZenHook::is_mutation_tool(&tool_name_owned)
-                    {
-                        return Flow::skip(format!(
-                            "Planner/Orchestrator agent '{agent_id}' cannot use mutation tool '{tool_name_owned}'"
-                        ));
-                    }
-
-                    if matches!(agent_role, Role::Worker)
-                        && ZenHook::is_strategy_tool(&tool_name_owned)
-                    {
-                        return Flow::skip(format!(
-                            "Worker agent '{agent_id}' cannot use strategy tool '{tool_name_owned}'"
-                        ));
-                    }
-
-                    let report = detect_prompt_injection(args);
-                    if report.is_suspicious {
-                        tracing::warn!(
-                            agent_id = %agent_id,
-                            risk_score = report.risk_score,
-                            patterns = ?report.detected_patterns.iter().map(|p| p.pattern_type.clone()).collect::<Vec<_>>(),
-                            "suspicious input detected in tool args"
-                        );
-                        return Flow::skip(format!(
-                            "Suspicious input detected (risk {:.2}): possible prompt injection in tool '{tool_name_owned}'",
-                            report.risk_score
-                        ));
-                    }
-
-                    Flow::cont()
-                }
-                _ => Flow::cont(),
+            if !allowed {
+                return ToolCallAction::skip(format!(
+                    "Tool '{tool_name}' not permitted for agent '{agent_id}'"
+                ));
             }
-        }
-    }
 
-    fn observes(&self, kind: StepEventKind) -> bool {
-        matches!(
-            kind,
-            StepEventKind::CompletionCall | StepEventKind::ToolCall
-        )
+            if confidential && cloud {
+                return ToolCallAction::skip(format!(
+                    "Cloud tool '{tool_name}' blocked for confidential data"
+                ));
+            }
+
+            if matches!(agent_role, Role::Planner | Role::Orchestrator)
+                && ZenHook::is_mutation_tool(&tool_name)
+            {
+                return ToolCallAction::skip(format!(
+                    "Planner/Orchestrator agent '{agent_id}' cannot use mutation tool '{tool_name}'"
+                ));
+            }
+
+            if matches!(agent_role, Role::Worker) && ZenHook::is_strategy_tool(&tool_name) {
+                return ToolCallAction::skip(format!(
+                    "Worker agent '{agent_id}' cannot use strategy tool '{tool_name}'"
+                ));
+            }
+
+            let report = detect_prompt_injection(&args);
+            if report.is_suspicious {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    risk_score = report.risk_score,
+                    patterns = ?report.detected_patterns.iter().map(|p| p.pattern_type.clone()).collect::<Vec<_>>(),
+                    "suspicious input detected in tool args"
+                );
+                return ToolCallAction::skip(format!(
+                    "Suspicious input detected (risk {:.2}): possible prompt injection in tool '{tool_name}'",
+                    report.risk_score
+                ));
+            }
+
+            ToolCallAction::Run
+        }
     }
 }
 

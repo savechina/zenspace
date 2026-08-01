@@ -1,7 +1,7 @@
-use rig::agent::AgentBuilder;
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::openai;
+use rig_agent::AgentBuilder;
+use rig_agent::completion::Prompt;
 use tokio::sync::mpsc;
 use tracing::info;
 

@@ -249,27 +249,27 @@ pub fn from_name(name: &str) -> Box<dyn OutputTheme> {
             Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::OneDarkPro))
         }
         "nord" => Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::Nord)),
-        "catppuccin-mocha" => {
-            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::CatppuccinMocha))
-        }
-        "catppuccin-latte" => {
-            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::CatppuccinLatte))
-        }
+        "catppuccin-mocha" => Box::new(RatatuiThemesBridge::from_theme_name(
+            ThemeName::CatppuccinMocha,
+        )),
+        "catppuccin-latte" => Box::new(RatatuiThemesBridge::from_theme_name(
+            ThemeName::CatppuccinLatte,
+        )),
         "gruvbox-dark" | "gruvbox" => {
             Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::GruvboxDark))
         }
-        "gruvbox-light" => {
-            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::GruvboxLight))
-        }
+        "gruvbox-light" => Box::new(RatatuiThemesBridge::from_theme_name(
+            ThemeName::GruvboxLight,
+        )),
         "tokyo-night" | "tokyonight" => {
             Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::TokyoNight))
         }
-        "solarized-dark" => {
-            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::SolarizedDark))
-        }
-        "solarized-light" => {
-            Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::SolarizedLight))
-        }
+        "solarized-dark" => Box::new(RatatuiThemesBridge::from_theme_name(
+            ThemeName::SolarizedDark,
+        )),
+        "solarized-light" => Box::new(RatatuiThemesBridge::from_theme_name(
+            ThemeName::SolarizedLight,
+        )),
         "monokai-pro" | "monokai" => {
             Box::new(RatatuiThemesBridge::from_theme_name(ThemeName::MonokaiPro))
         }
@@ -298,6 +298,10 @@ pub fn auto_select() -> Box<dyn OutputTheme> {
         return Box::new(EinkTheme);
     }
     Box::new(ZenTheme)
+}
+
+pub fn no_color() -> Box<dyn OutputTheme> {
+    Box::new(NoColorTheme)
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +953,93 @@ impl OutputTheme for EinkTheme {
 }
 
 impl Default for EinkTheme {
+    fn default() -> Self {
+        Self
+    }
+}
+
+pub struct NoColorTheme;
+
+impl OutputTheme for NoColorTheme {
+    fn heading(&self, level: u8) -> Style {
+        let modifier = if level <= 2 {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
+        Style::default().add_modifier(modifier)
+    }
+
+    fn bold(&self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    fn italic(&self) -> Style {
+        Style::default().add_modifier(Modifier::ITALIC)
+    }
+
+    fn code_inline(&self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    fn code_block_border(&self) -> Style {
+        Style::default()
+    }
+
+    fn code_block_lang(&self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    fn table_border(&self) -> Style {
+        Style::default()
+    }
+
+    fn table_header(&self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default().add_modifier(Modifier::ITALIC)
+    }
+
+    fn list_bullet(&self) -> Style {
+        Style::default()
+    }
+
+    fn link(&self) -> Style {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn error(&self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    fn streaming_cursor(&self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    fn zen_core_light(&self) -> Color {
+        Color::Reset
+    }
+
+    fn zen_core_dark(&self) -> Color {
+        Color::Reset
+    }
+
+    fn shadow(&self) -> Color {
+        Color::Reset
+    }
+
+    fn text_muted(&self) -> Style {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+
+    fn info_accent(&self) -> Color {
+        Color::Reset
+    }
+}
+
+impl Default for NoColorTheme {
     fn default() -> Self {
         Self
     }
