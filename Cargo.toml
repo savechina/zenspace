@@ -77,7 +77,12 @@ jento-core = { git = "https://github.com/savechina/jento.git", branch = "main" }
 jento-context = { git = "https://github.com/savechina/jento.git", branch = "main" }
 
 # TUI (FR-001 — ratatui + crossterm)
-ratatui = { version = "0.30", features = ["scrolling-regions"] }
+# NOTE: scrolling-regions feature intentionally NOT enabled. It makes
+# Terminal::insert_before scroll via CSI S region scrolling, which DISCARDS
+# rows scrolled past the region top instead of pushing them into the native
+# terminal scrollback. The inline TUI needs full-screen append_lines scrolling
+# so banner + output stay selectable/copyable in scrollback (codex-style).
+ratatui = { version = "0.30" }
 crossterm = "0.29"
 tui-textarea-2 = "0.12"
 
