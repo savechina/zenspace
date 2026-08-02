@@ -17,7 +17,6 @@ pub mod stream;
 pub mod theme;
 mod ui;
 
-#[expect(dead_code)]
 pub fn run(config: &'static zen_core::config::ZenConfig) -> Result<(), anyhow::Error> {
     use crossterm::event::{
         DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
