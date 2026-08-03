@@ -22,7 +22,7 @@ repository = "https://github.com/savechina/zenspace"
 homepage = "https://github.com/savechina/zenspace"
 license = "MIT"
 description = "Zenspace AI Agents productivity suite，个人生产力套件"
-version = "0.0.3"
+version = "0.0.4"
 
 [workspace.dependencies]
 clap = { version = "4.5.39", features = ["derive", "env", "string"] }
