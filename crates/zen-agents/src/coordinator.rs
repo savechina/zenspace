@@ -116,37 +116,88 @@ impl ZenCoordinator {
 
         let researcher = GenericAgent::builder("researcher")
             .with_skills(["zen-notion-extraction"])
-            .with_tools(["tier2_search", "tier4_search"])
+            .with_tools([
+                "tier2_search",
+                "tier4_search",
+                "fs.read",
+                "fs.list",
+                "fs.glob",
+                "fs.grep",
+                "web.fetch",
+                "web.search",
+            ])
             .build(&wiring.skills, &wiring.tools)
             .expect("researcher build");
 
         let coder = GenericAgent::builder("coder")
             .with_skills(["zen-wiki-compilation"])
-            .with_tools(["compute_embeddings"])
+            .with_tools([
+                "compute_embeddings",
+                "fs.read",
+                "fs.list",
+                "fs.glob",
+                "fs.grep",
+                "fs.write",
+                "fs.edit",
+                "fs.delete",
+                "fs.move",
+                "fs.copy",
+                "web.fetch",
+                "web.search",
+            ])
             .build(&wiring.skills, &wiring.tools)
             .expect("coder build");
 
         let analyst = GenericAgent::builder("analyst")
             .with_skills(["zen-contradiction-detection", "zen-vault-learning-loop"])
-            .with_tools(["tier2_search"])
+            .with_tools([
+                "tier2_search",
+                "fs.read",
+                "fs.list",
+                "fs.glob",
+                "fs.grep",
+                "web.fetch",
+                "web.search",
+            ])
             .build(&wiring.skills, &wiring.tools)
             .expect("analyst build");
 
         let consolidator = GenericAgent::builder("consolidator")
             .with_skills(["zen-consolidation-pipeline"])
-            .with_tools(Vec::<String>::new())
+            .with_tools([
+                "fs.read",
+                "fs.list",
+                "fs.glob",
+                "fs.grep",
+                "web.fetch",
+                "web.search",
+            ])
             .build(&wiring.skills, &wiring.tools)
             .expect("consolidator build");
 
         let conversation = GenericAgent::builder("conversation")
             .with_skills(Vec::<String>::new())
-            .with_tools(Vec::<String>::new())
+            .with_tools([
+                "fs.read",
+                "fs.list",
+                "fs.glob",
+                "fs.grep",
+                "web.fetch",
+                "web.search",
+            ])
             .build(&wiring.skills, &wiring.tools)
             .expect("conversation build");
 
         let system = GenericAgent::builder("system")
             .with_skills(Vec::<String>::new())
-            .with_tools(Vec::<String>::new())
+            .with_tools([
+                "fs.read",
+                "fs.list",
+                "fs.glob",
+                "fs.grep",
+                "web.fetch",
+                "web.search",
+            ])
             .build(&wiring.skills, &wiring.tools)
             .expect("system build");
 
@@ -681,7 +732,7 @@ fn extract_response_string(value: &Value) -> String {
 mod tests {
     use async_trait::async_trait;
     use rig_compose::context::InvestigationContext;
-    use rig_compose::registry::{KernelError, SkillRegistry, ToolRegistry};
+    use rig_compose::registry::{KernelError, ToolRegistry};
     use rig_compose::skill::{Skill, SkillOutcome};
     use zen_provider::{DefaultRouter, LlmConfig};
 
@@ -714,7 +765,7 @@ mod tests {
     }
 
     fn wiring_with_skills() -> ZenWiring {
-        let skills = SkillRegistry::new();
+        let wiring = ZenWiring::new();
         for id in [
             "zen-notion-extraction",
             "zen-wiki-compilation",
@@ -722,14 +773,9 @@ mod tests {
             "zen-vault-learning-loop",
             "zen-consolidation-pipeline",
         ] {
-            skills.register(Arc::new(NoopSkill(id)));
+            wiring.skills.register(Arc::new(NoopSkill(id)));
         }
-        ZenWiring {
-            skills,
-            tools: ToolRegistry::new(),
-            delegates: rig_compose::delegate::DelegateRegistry::new(),
-            memvid_store: None,
-        }
+        wiring
     }
 
     fn mock_router() -> DefaultRouter {

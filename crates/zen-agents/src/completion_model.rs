@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zen_provider::LlmRouter;
 
+/// Max silence between streamed tokens before the unfold fails the stream.
+const STREAM_INACTIVITY_TIMEOUT_SECS: u64 = 120;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ZenCompletionResponse {
     text: String,
@@ -149,8 +152,13 @@ impl CompletionModel for ZenCompletionModel {
         > = Box::pin(futures::stream::unfold(
             state,
             |(mut token_rx, mut done_rx, mut collected, mut token_count, provider_name)| async move {
-                match token_rx.recv().await {
-                    Some(token) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(STREAM_INACTIVITY_TIMEOUT_SECS),
+                    token_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(token)) => {
                         collected.push_str(&token);
                         token_count += 1;
                         Some((
@@ -158,7 +166,7 @@ impl CompletionModel for ZenCompletionModel {
                             (token_rx, done_rx, collected, token_count, provider_name),
                         ))
                     }
-                    None => {
+                    Ok(None) => {
                         let result = done_rx.try_recv().unwrap_or(Ok(()));
                         let text = std::mem::take(&mut collected);
                         match result {
@@ -192,6 +200,20 @@ impl CompletionModel for ZenCompletionModel {
                                 ))
                             }
                         }
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            provider = %provider_name,
+                            token_count,
+                            response_len = collected.len(),
+                            "completion_model: LLM stream timed out waiting for tokens"
+                        );
+                        Some((
+                            Err(CompletionError::ProviderError(
+                                "streaming timed out: no tokens received".into(),
+                            )),
+                            (token_rx, done_rx, collected, token_count, provider_name),
+                        ))
                     }
                 }
             },

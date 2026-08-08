@@ -9,6 +9,7 @@ zen-core = { path = "../zen-core" }
 zen-memory = { path = "../zen-memory" }
 zen-provider = { path = "../zen-provider" }
 zen-repo = { path = "../zen-repo" }
+zen-plugin = { path = "../zen-plugin" }
 zen-vault = { path = "../zen-vault" }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

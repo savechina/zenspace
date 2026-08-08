@@ -12,7 +12,8 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use zen_core::sandbox::{
-    SandboxMode, SandboxValidator, SeatbeltHook, SeatbeltPolicy, apply_resource_limits,
+    ApprovalCallback, SandboxMode, SandboxValidator, SeatbeltHook, SeatbeltPolicy,
+    apply_resource_limits,
 };
 
 pub struct SandboxConfig {
@@ -137,6 +138,8 @@ pub struct SandboxManager {
     policy: SeatbeltPolicy,
     rate_limit_hook: Box<dyn ToolDispatchHook>,
     seatbelt_hook: SeatbeltHook,
+    audit_hook: Box<dyn ToolDispatchHook>,
+    approval_hook: zen_plugin::tools::approval_hook::AskApprovalHook,
     window_prune: WindowPruneGuard,
 }
 
@@ -153,12 +156,26 @@ impl SandboxManager {
 
         let seatbelt_hook = SeatbeltHook::new(policy.clone());
 
+        let audit_log_path = config
+            .workspace_roots
+            .first()
+            .map(|root| root.join("logs").join("audit.jsonl"))
+            .unwrap_or_else(|| PathBuf::from("logs/audit.jsonl"));
+
+        let audit_hook: Box<dyn ToolDispatchHook> = Box::new(
+            zen_plugin::tools::audit_hook::ToolAuditHook::new(audit_log_path),
+        );
+
+        let approval_hook = zen_plugin::tools::approval_hook::AskApprovalHook::new(config.mode);
+
         Self {
             config,
             validator,
             policy,
             rate_limit_hook: Box::new(dispatch_budget_hook),
             seatbelt_hook,
+            audit_hook,
+            approval_hook,
             window_prune: WindowPruneGuard::new(window_arc, Duration::from_secs(60)),
         }
     }
@@ -187,7 +204,17 @@ impl SandboxManager {
     pub fn hooks(&self) -> Vec<&dyn ToolDispatchHook> {
         let rate_limit: &dyn ToolDispatchHook = &*self.rate_limit_hook;
         let seatbelt: &dyn ToolDispatchHook = &self.seatbelt_hook;
-        vec![rate_limit, seatbelt]
+        let audit: &dyn ToolDispatchHook = &*self.audit_hook;
+        let approval: &dyn ToolDispatchHook = &self.approval_hook;
+        vec![rate_limit, seatbelt, audit, approval]
+    }
+
+    /// Register an interactive approval callback for `SandboxMode::Ask`.
+    ///
+    /// Without a callback, `Ask` mode terminates every tool invocation with a
+    /// "no approval callback" error, making the mode unusable interactively.
+    pub fn set_approval_callback(&mut self, callback: ApprovalCallback) {
+        self.approval_hook.set_callback(callback);
     }
 
     pub fn generate_sandbox_profile(&self) -> String {

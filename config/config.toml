@@ -370,3 +370,19 @@ enabled = true
 base_currency = "CNY"
 disclaimer_acknowledged = false
 # tracked_categories = ["food", "transport", "entertainment"]
+
+# =============================================================================
+# MCP Servers (FR-013)
+#   The agent can connect to external MCP servers (stdio transport) to expose
+#   additional tools. Servers must be trusted before use:
+#       zen plugin mcp list        ← show servers + trust status
+#       zen plugin mcp trust <name>  ← allow the agent to use the server's tools
+#       zen plugin mcp untrust <name>
+#   Example (Brave Search):
+#   [[mcp_servers]]
+#   name = "brave"
+#   transport = "stdio"
+#   command = "npx"
+#   args = ["-y", "@modelcontextprotocol/server-brave-search"]
+#   env = { BRAVE_API_KEY = "..." }
+# =============================================================================

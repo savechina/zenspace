@@ -57,6 +57,12 @@ pub struct ZenConfig {
     /// Embedding provider selection (standalone from chat providers).
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub web_fetch: WebFetchConfig,
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 /// IM channel configuration — supports multiple platforms.
@@ -359,6 +365,26 @@ fn default_true() -> bool {
     true
 }
 
+fn default_web_fetch_max_size() -> u32 {
+    50
+}
+
+fn default_web_fetch_max_lines() -> u32 {
+    2000
+}
+
+fn default_web_fetch_timeout() -> u64 {
+    10000
+}
+
+fn default_jina_threshold() -> u32 {
+    500
+}
+
+fn default_web_fetch_user_agent() -> String {
+    "zen-agent/1.0".to_string()
+}
+
 /// Multi-model catalog entry — defines a model variant within a provider.
 ///
 /// Each entry specifies the API model name, default generation parameters,
@@ -495,6 +521,110 @@ pub struct EmbeddingsConfig {
     /// Recommended: `~/.cache/fastembed/` or `~/.zen/.cache/fastembed/` for global sharing.
     /// Can also be set via `ZEN_EMBEDDINGS_CACHE_DIR` env var.
     pub cache_dir: Option<String>,
+}
+
+/// Web fetch tool configuration — controls content extraction limits and fallback behavior.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WebFetchConfig {
+    /// Maximum content size in KB to fetch and process.
+    #[serde(default = "default_web_fetch_max_size")]
+    pub max_content_size_kb: u32,
+    /// Maximum number of lines to extract from fetched content.
+    #[serde(default = "default_web_fetch_max_lines")]
+    pub max_lines: u32,
+    /// HTTP request timeout in milliseconds.
+    #[serde(default = "default_web_fetch_timeout")]
+    pub timeout_ms: u64,
+    /// Enable Jina Reader API fallback for JS-rendered pages.
+    #[serde(default = "default_true")]
+    pub jina_fallback: bool,
+    /// Character threshold below which Jina fallback is used.
+    #[serde(default = "default_jina_threshold")]
+    pub jina_fallback_threshold_chars: u32,
+    /// User-Agent header for direct HTTP fetches.
+    #[serde(default = "default_web_fetch_user_agent")]
+    pub user_agent: String,
+}
+
+/// Web search tool configuration — provider selection and API keys.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WebSearchConfig {
+    /// Explicit provider override: "duckduckgo" | "brave" | "tavily".
+    #[serde(default)]
+    pub default_provider: Option<String>,
+    /// Brave Search API key (falls back to `BRAVE_SEARCH_API_KEY` env).
+    #[serde(default)]
+    pub api_key_brave: Option<String>,
+    /// Tavily API key (falls back to `TAVILY_API_KEY` env).
+    #[serde(default)]
+    pub api_key_tavily: Option<String>,
+}
+
+/// Persistent trust store for MCP server trust decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpTrustStore {
+    #[serde(default)]
+    pub trusted_servers: HashMap<String, bool>,
+}
+
+impl McpTrustStore {
+    pub fn load(paths: &ZenPaths) -> Result<Self, ZenError> {
+        let path = paths.global_root().join("mcp_trust.json");
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(store) => Ok(store),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "MCP trust store corrupted, starting fresh"
+                    );
+                    Ok(Self::default())
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn is_trusted(&self, server_name: &str) -> bool {
+        *self.trusted_servers.get(server_name).unwrap_or(&false)
+    }
+
+    pub fn set_trusted(&mut self, server_name: &str, trusted: bool) {
+        self.trusted_servers
+            .insert(server_name.to_string(), trusted);
+    }
+
+    pub fn save(&self, paths: &ZenPaths) -> Result<(), ZenError> {
+        let path = paths.global_root().join("mcp_trust.json");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub transport: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_refresh: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +876,9 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         tui: merge_tui(base.tui, override_cfg.tui),
         history: merge_history(base.history, override_cfg.history),
         embeddings: merge_embeddings(base.embeddings, override_cfg.embeddings),
+        web_fetch: merge_web_fetch(base.web_fetch, override_cfg.web_fetch),
+        web_search: merge_web_search(base.web_search, override_cfg.web_search),
+        mcp_servers: merge_mcp_servers(base.mcp_servers, override_cfg.mcp_servers),
     })
 }
 
@@ -889,6 +1022,60 @@ fn merge_embeddings(base: EmbeddingsConfig, ov: EmbeddingsConfig) -> EmbeddingsC
         hf_endpoint: str_merge(base.hf_endpoint, ov.hf_endpoint),
         cache_dir: str_merge(base.cache_dir, ov.cache_dir),
     }
+}
+
+fn merge_web_fetch(base: WebFetchConfig, override_cfg: WebFetchConfig) -> WebFetchConfig {
+    WebFetchConfig {
+        max_content_size_kb: override_cfg.max_content_size_kb,
+        max_lines: override_cfg.max_lines,
+        timeout_ms: override_cfg.timeout_ms,
+        jina_fallback: override_cfg.jina_fallback,
+        jina_fallback_threshold_chars: override_cfg.jina_fallback_threshold_chars,
+        user_agent: if override_cfg.user_agent != default_web_fetch_user_agent() {
+            override_cfg.user_agent
+        } else {
+            base.user_agent
+        },
+    }
+}
+
+fn merge_web_search(base: WebSearchConfig, override_cfg: WebSearchConfig) -> WebSearchConfig {
+    WebSearchConfig {
+        default_provider: override_cfg
+            .default_provider
+            .clone()
+            .or_else(|| base.default_provider.clone()),
+        api_key_brave: override_cfg
+            .api_key_brave
+            .clone()
+            .or_else(|| base.api_key_brave.clone()),
+        api_key_tavily: override_cfg
+            .api_key_tavily
+            .clone()
+            .or_else(|| base.api_key_tavily.clone()),
+    }
+}
+
+fn merge_mcp_servers(
+    base: Vec<McpServerConfig>,
+    override_cfg: Vec<McpServerConfig>,
+) -> Vec<McpServerConfig> {
+    let mut merged: Vec<McpServerConfig> = base;
+    for server in override_cfg {
+        if let Some(existing) = merged.iter_mut().find(|s| s.name == server.name) {
+            existing.transport = server.transport;
+            existing.command = server.command.or(existing.command.clone());
+            existing.args = server.args.or(existing.args.clone());
+            existing.env = server.env.or(existing.env.clone());
+            existing.url = server.url.or(existing.url.clone());
+            existing.headers = server.headers.or(existing.headers.clone());
+            existing.enabled = server.enabled;
+            existing.auto_refresh = server.auto_refresh;
+        } else {
+            merged.push(server);
+        }
+    }
+    merged
 }
 
 fn str_merge(base: Option<String>, ov: Option<String>) -> Option<String> {
@@ -1185,8 +1372,13 @@ pub fn default_daily_log_schedule() -> &'static str {
 }
 
 /// Generate the default night-dream schedule expression.
+///
+/// This is the fallback used when no config-driven value is available.
+/// Fires once at 2:00 AM: a `2-4` hour range would run the consolidation
+/// cycle three times per night (2:00/3:00/4:00), tripling LLM calls and
+/// duplicate memory writes.
 pub fn default_night_dream_schedule() -> &'static str {
-    "0 0 2-4 * * *"
+    "0 0 2 * * *"
 }
 
 pub fn default_wisdom_synthesis_schedule() -> &'static str {

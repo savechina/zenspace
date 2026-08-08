@@ -431,6 +431,8 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 - zen-llm exists in directory but is not a workspace member (staged for integration)
 
 ## Active Technologies
+- Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
+- No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)
 
 - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.37 (LLM abstraction), rig-compose 0.4 (agent kernel), rig-sqlite 0.2 (vector store), rig-tap 0.1 (observability), rig-mcp 0.2 (MCP bridge), jento-core/jento-context (DI + plugin lifecycle), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
 - SQLite for derived indexes (FTS5, vector embeddings via sqlite-vec, entity graph, habits, finance), Markdown files as canonical source of truth, TOML for config (config.toml), habits (habits.toml), goals (goals.toml), budgets (budgets.toml), routines (routines.toml)

@@ -448,8 +448,8 @@ pub fn update_memory_from_facts(
 
     let mut filtered_entries = Vec::new();
     for entry in &new_entries {
-        if let Some(text) = entry.split("**] ").nth(1) {
-            let text_without_date = text.rsplit_once(" (").map(|(t, _)| t).unwrap_or(text);
+        if let Some(text) = entry.split("]** ").nth(1) {
+            let text_without_date = text.strip_suffix(&format!(" ({now})")).unwrap_or(text);
             if content.contains(text_without_date) {
                 debug!("fact already present in MEMORY.md, skipping: {text_without_date}");
                 continue;

@@ -1,9 +1,13 @@
 use rig::client::{CompletionClient, Nothing};
+use rig::completion::CompletionModel;
 use rig::providers::ollama;
+use rig::streaming::StreamedAssistantContent;
 use rig_agent::AgentBuilder;
 use rig_agent::completion::Prompt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+use futures_util::StreamExt;
 
 use crate::router::LlmError;
 
@@ -80,19 +84,55 @@ impl OllamaProvider {
         token_tx: mpsc::UnboundedSender<String>,
         options: &zen_core::config::ModelOptions,
     ) -> Result<(), LlmError> {
-        let response = self.complete_async(prompt, options).await?;
+        let client = ollama::Client::builder()
+            .api_key(Nothing)
+            .base_url(&self.base_url)
+            .build()
+            .map_err(|e| LlmError::Call {
+                reason: format!("Failed to create Ollama client: {}", e),
+            })?;
 
-        let words: Vec<&str> = response.split_whitespace().collect();
-        let mut buf = String::new();
-        for word in words {
-            buf.push_str(word);
-            buf.push(' ');
-            let chunk = buf.clone();
-            buf.clear();
-            if token_tx.send(chunk).is_err() {
-                break;
+        let model = client.completion_model(&self.model);
+
+        let mut request = model.completion_request(prompt.to_string());
+        if let Some(t) = options.temperature {
+            request = request.temperature(t);
+        }
+        if let Some(m) = options.max_tokens {
+            request = request.max_tokens(m);
+        }
+        let request = request.build();
+
+        let mut stream = model.stream(request).await.map_err(|e| LlmError::Call {
+            reason: format!("Ollama stream failed: {}", e),
+        })?;
+
+        let mut full_response = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamedAssistantContent::Text(text)) => {
+                    let chunk = text.text.clone();
+                    full_response.push_str(&chunk);
+                    if token_tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+                Ok(StreamedAssistantContent::Final(_)) => break,
+                Ok(_) => {
+                    // Tool-call / reasoning deltas are not forwarded as text.
+                }
+                Err(e) => {
+                    warn!(error = %e, "Ollama streaming error");
+                    break;
+                }
             }
         }
+
+        info!(
+            model = self.model,
+            response_len = full_response.len(),
+            "OllamaProvider stream complete"
+        );
         Ok(())
     }
 

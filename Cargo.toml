@@ -103,6 +103,16 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "blo
 # HTML-to-markdown conversion
 html2md = "0.2"
 
+# Agent tools (003-agentic-plugin): HTML parsing, article extraction, diff patching
+scraper = "0.27"
+htmd = "0.5"
+readabilityrs = "0.1"
+# FR-021 unified-diff apply for fs.edit. NOTE: `similar` (spec's original pick)
+# only *emits* diffs — it has no parser/applyer in any version (2.x/3.x).
+# `diffy` is the maintained library with Patch::from_str + apply().
+diffy = "0.5"
+regex = "1"
+
 # WebSocket client for QQ Bot
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"

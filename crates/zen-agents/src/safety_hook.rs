@@ -7,6 +7,12 @@ use rig_core::wasm_compat::WasmCompatSend;
 use std::collections::HashSet;
 use zen_core::types::Sensitivity;
 
+// FR-009 is enforced at dispatch time via `ConfidentialityHook`
+// (zen-plugin, wired first in `ZenWiring::build_sandbox_hooks`; sensitivity
+// set per-session by `AgentOrchestrator::execute` via `ZenWiring::set_sensitivity`).
+// `ZenHook` is the `rig_agent::AgentHook` variant — currently unused in the live
+// dispatch path but retained: its helpers (`is_mutation_tool`, `is_strategy_tool`,
+// `detect_prompt_injection`) are reused by the dispatch hook and its own tests.
 #[derive(Clone)]
 pub struct ZenHook {
     agent_id: String,

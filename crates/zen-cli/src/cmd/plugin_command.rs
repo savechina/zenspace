@@ -39,6 +39,32 @@ pub enum PluginCommands {
     },
     /// Discover and load plugins from plugin directory
     Discover,
+    /// List all registered agent tools
+    Tools,
+    /// Manage MCP server trust (which servers the agent may connect to)
+    Mcp {
+        #[command(subcommand)]
+        operation: McpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommands {
+    /// List configured MCP servers and their trust status
+    List,
+    /// Trust an MCP server by name
+    Trust {
+        /// MCP server name (must exist in config mcp_servers)
+        name: String,
+        /// Skip the interactive confirmation prompt (FR-018)
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Revoke trust from an MCP server by name
+    Untrust {
+        /// MCP server name
+        name: String,
+    },
 }
 
 pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
@@ -259,6 +285,157 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                     format!("{:?}", entry.manifest.kind).to_lowercase()
                 );
             }
+            Ok(())
+        }
+
+        PluginCommands::Tools => {
+            let wiring = zen_agents::wiring::ZenWiring::new();
+            println!(
+                "{} Registered Agent Tools ({} total)\n",
+                "─".dimmed(),
+                wiring.tools.len()
+            );
+            for (name, sensitivity) in &wiring.tool_sensitivity {
+                let sens_label = match sensitivity {
+                    zen_core::types::Sensitivity::Public => "PUBLIC".green(),
+                    zen_core::types::Sensitivity::Private => "PRIVATE".yellow(),
+                    zen_core::types::Sensitivity::Confidential => "CONFIDENTIAL".red(),
+                };
+                let exists = wiring.tools.get(name).is_ok();
+                if exists {
+                    println!("  {} [{}] {}", name.cyan(), sens_label, "✓".green());
+                }
+            }
+            Ok(())
+        }
+
+        PluginCommands::Mcp { operation } => execute_mcp_command(operation),
+    }
+}
+
+fn execute_mcp_command(operation: &McpCommands) -> Result<(), ZenError> {
+    let paths = zen_core::paths::ZenPaths::detect()
+        .map_err(|e| ZenError::Service(format!("Failed to detect zen paths: {}", e)))?;
+    let config = zen_core::config::load_config()
+        .map_err(|e| ZenError::Service(format!("Failed to load config: {}", e)))?;
+    let mut trust_store = zen_core::config::McpTrustStore::load(&paths)
+        .map_err(|e| ZenError::Service(format!("Failed to load MCP trust store: {}", e)))?;
+
+    match operation {
+        McpCommands::List => {
+            if config.mcp_servers.is_empty() {
+                println!(
+                    "{} No MCP servers configured. Add a [mcp_servers] section to config.toml.",
+                    "⛔".red()
+                );
+                return Ok(());
+            }
+            println!("{}", "MCP Servers".bold());
+            for server in &config.mcp_servers {
+                let trusted = trust_store.is_trusted(&server.name);
+                let trust_label = if trusted {
+                    "trusted".green()
+                } else {
+                    "untrusted".red()
+                };
+                let enabled_label = if server.enabled {
+                    "enabled".green()
+                } else {
+                    "disabled".yellow()
+                };
+                let transport = &server.transport;
+                let command = server.command.as_deref().unwrap_or("-");
+                println!(
+                    "  {} {} [{}] [{}] (transport: {}, cmd: {})",
+                    if trusted { "🔓" } else { "🔒" },
+                    server.name.cyan().bold(),
+                    trust_label,
+                    enabled_label,
+                    transport.dimmed(),
+                    command.dimmed()
+                );
+            }
+            println!(
+                "\n  Trust a server with: {}",
+                "zen plugin mcp trust <name>".green()
+            );
+            Ok(())
+        }
+
+        McpCommands::Trust { name, yes } => {
+            let server = match config.mcp_servers.iter().find(|s| s.name == *name) {
+                Some(s) => s,
+                None => {
+                    println!(
+                        "{} MCP server '{}' not found in config mcp_servers.",
+                        "✗".red().bold(),
+                        name.cyan()
+                    );
+                    println!(
+                        "  Configured servers: {}",
+                        config
+                            .mcp_servers
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    return Ok(());
+                }
+            };
+
+            // FR-018: show the subprocess that will be launched and require
+            // confirmation unless --yes was passed.
+            if !*yes {
+                let command = server.command.as_deref().unwrap_or("(none)");
+                let args = server.args.clone().unwrap_or_default().join(" ");
+                println!(
+                    "{} Server '{}' will launch subprocess '{} {}'.",
+                    "⚠️".yellow(),
+                    name.cyan().bold(),
+                    command,
+                    args
+                );
+                print!("Trust this server? [y/N] ");
+                use std::io::{BufRead, Write};
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                if std::io::stdin().lock().read_line(&mut line).is_err() {
+                    println!("{} trust cancelled (no input)", "✗".red());
+                    return Ok(());
+                }
+                let confirmed = matches!(
+                    line.trim().to_ascii_lowercase().as_str(),
+                    "y" | "yes"
+                );
+                if !confirmed {
+                    println!("{} trust cancelled", "✗".red());
+                    return Ok(());
+                }
+            }
+
+            trust_store.set_trusted(name, true);
+            trust_store
+                .save(&paths)
+                .map_err(|e| ZenError::Service(format!("Failed to save trust store: {}", e)))?;
+            println!(
+                "{} MCP server '{}' trusted — its tools will be registered for agent use.",
+                "✓".green().bold(),
+                name.cyan().bold()
+            );
+            Ok(())
+        }
+
+        McpCommands::Untrust { name } => {
+            trust_store.set_trusted(name, false);
+            trust_store
+                .save(&paths)
+                .map_err(|e| ZenError::Service(format!("Failed to save trust store: {}", e)))?;
+            println!(
+                "{} MCP server '{}' untrusted — its tools will be skipped.",
+                "✓".green().bold(),
+                name.cyan().bold()
+            );
             Ok(())
         }
     }

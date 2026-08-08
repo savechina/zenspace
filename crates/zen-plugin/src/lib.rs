@@ -1,5 +1,6 @@
 pub mod platform;
 pub mod registry;
+pub mod tools;
 pub mod wasm_sandbox;
 
 pub use platform::{Platform, detect_platform};

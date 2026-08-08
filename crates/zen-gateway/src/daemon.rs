@@ -257,13 +257,16 @@ impl Gateway for HttpGateway {
             }
         });
 
-        let mcp_server = McpServer::new(McpConfig::default());
+        let wiring = zen_agents::wiring::ZenWiring::new();
+        let registry = wiring.build_mcp_registry();
+        let tool_count = registry.len();
+        let mcp_server = McpServer::with_registry(McpConfig::default(), registry);
         tokio::spawn(async move {
             if let Err(e) = mcp_server.start_stdio().await {
                 warn!("MCP stdio server stopped: {}", e);
             }
         });
-        info!("MCP server started (stdio transport)");
+        info!("MCP server started (stdio transport, {tool_count} tools)");
 
         Ok(())
     }

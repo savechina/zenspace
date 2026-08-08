@@ -39,7 +39,7 @@ impl ZenWorker for DreamWorker {
     }
 
     fn schedule(&self) -> &'static str {
-        self.scheduled.unwrap_or("0 0 2-4 * * *")
+        self.scheduled.unwrap_or("0 0 2 * * *")
     }
 
     async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {

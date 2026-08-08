@@ -352,7 +352,7 @@ pub struct WorkerSummary {
 /// Registers:
 /// - `memory-curator` (MemoryCurator): runs every 5 minutes, checks daily log, updates MEMORY.md
 /// - `subconscious`: runs every 5 minutes, evaluates workspace state
-/// - `dream`: runs 2-4AM, executes the nightly consolidation cycle
+/// - `dream`: runs 2AM, executes the nightly consolidation cycle
 /// - `session-journaler`: runs every 5 minutes, extracts journal entries from session conversations
 /// - `notion-extractor`: runs every 10 minutes, extracts notions from journal entries into state.db
 /// - `wiki-compiler`: runs every 30 minutes, compiles wiki pages from state.db notions

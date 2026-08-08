@@ -20,11 +20,19 @@ home = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 rig-compose = { workspace = true }
-rig-mcp = { workspace = true }
+rig-mcp = { workspace = true, features = ["stdio"] }
 schemars = { workspace = true }
 notify = { workspace = true }
 notify-rust = { workspace = true }
 sysinfo = { workspace = true }
+reqwest = { workspace = true }
+scraper = { workspace = true }
+htmd = { workspace = true }
+readabilityrs = { workspace = true }
+diffy = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+glob = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

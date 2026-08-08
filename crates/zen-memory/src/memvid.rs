@@ -1,5 +1,5 @@
 use anyhow::Result;
-use memvid_core::MemoryCardBuilder;
+use memvid_core::{MemoryCardBuilder, Ticket};
 use rig_memvid::memvid_core;
 use rig_memvid::{MemoryConfig, MemvidPersistHook, MemvidStore, WritePolicy};
 use std::collections::HashMap;
@@ -12,6 +12,12 @@ use zen_core::notion_graph::NotionGraphProvider;
 /// The RulesEngine typically produces 0.7-0.9 confidence; we keep >=0.8.
 pub const TRIPLET_MIN_CONFIDENCE: f32 = 0.8;
 
+/// Storage capacity granted to the memvid store via an unsigned ticket.
+/// The default Free-tier ticket caps stores at 50MB and `MemvidStore` exposes
+/// no ticket API, so a store growing past ~50MB fails every write with
+/// CapacityExceeded. We open the raw `Memvid` and raise the cap before wrapping.
+pub const MEMVID_CAPACITY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 pub struct ZenMemvidStore {
     store: MemvidStore,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
@@ -19,10 +25,29 @@ pub struct ZenMemvidStore {
 
 impl ZenMemvidStore {
     pub fn new(memory_path: std::path::PathBuf) -> Result<Self> {
-        let store = MemvidStore::builder()
-            .path(memory_path)
-            .enable_lex()
-            .open_or_create()?;
+        // Open or create the raw Memvid so we can apply a capacity ticket
+        // before wrapping. `MemvidStore::builder().open_or_create()` defaults
+        // to the Free-tier 50MB ticket, which made every write fail with
+        // CapacityExceeded once the store grew past that limit.
+        let mut memvid = if memory_path.exists() {
+            memvid_core::Memvid::open(&memory_path)?
+        } else {
+            memvid_core::Memvid::create(&memory_path)?
+        };
+
+        memvid.enable_lex()?;
+
+        // Raised only when needed (idempotent across opens): the ticket seq
+        // must strictly increase, so derive it from the current ticket.
+        let current = memvid.current_ticket();
+        if current.capacity_bytes < MEMVID_CAPACITY_BYTES {
+            let ticket =
+                Ticket::new("zen-memory", current.seq_no + 1).capacity_bytes(MEMVID_CAPACITY_BYTES);
+            #[allow(deprecated)]
+            memvid.apply_ticket(ticket)?;
+        }
+
+        let store = MemvidStore::from_memvid(memvid);
 
         Ok(Self {
             store,
@@ -831,6 +856,39 @@ mod tests {
         let (turns, persisted) = compactor.compact().unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(persisted, 0);
+    }
+
+    #[test]
+    fn memvid_store_new_raises_capacity_above_free_tier() {
+        let dir = tempdir().unwrap();
+        let memory_path = dir.path().join("test_capacity.mv2");
+
+        // Fresh store: capacity must be raised past the Free-tier 50MB default,
+        // otherwise every write fails with CapacityExceeded once the store grows.
+        let store = ZenMemvidStore::new(memory_path.clone()).unwrap();
+        let stats = store.store().stats().unwrap();
+        assert!(
+            stats.capacity_bytes >= MEMVID_CAPACITY_BYTES,
+            "expected capacity >= 2GiB, got {} bytes",
+            stats.capacity_bytes
+        );
+
+        // A write must succeed at the raised limit.
+        store
+            .store()
+            .put_text("regression payload", memvid_core::PutOptions::default())
+            .unwrap();
+        drop(store);
+
+        // Reopening an existing store must re-raise capacity (idempotent),
+        // deriving seq_no from the current ticket so apply_ticket succeeds.
+        let reopened = ZenMemvidStore::new(memory_path).unwrap();
+        let stats = reopened.store().stats().unwrap();
+        assert!(
+            stats.capacity_bytes >= MEMVID_CAPACITY_BYTES,
+            "reopen: expected capacity >= 2GiB, got {} bytes",
+            stats.capacity_bytes
+        );
     }
 
     #[test]

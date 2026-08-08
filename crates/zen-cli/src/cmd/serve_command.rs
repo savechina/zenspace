@@ -22,6 +22,9 @@ pub enum ServeCommands {
         /// Port (default: 9876)
         #[arg(long)]
         port: Option<u16>,
+        /// Start as MCP stdio server (for external MCP clients)
+        #[arg(long)]
+        mcp: bool,
     },
     /// Stop the gateway server
     Stop,
@@ -85,7 +88,11 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             foreground,
             bind,
             port,
+            mcp,
         } => {
+            if *mcp {
+                return run_mcp_stdio().await;
+            }
             let path = pid_path()?;
             check_stale_pid(&path)?;
 
@@ -420,6 +427,23 @@ fn block_until_signal() {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
+}
+
+async fn run_mcp_stdio() -> Result<(), ZenError> {
+    use zen_gateway::McpServer;
+
+    let wiring = zen_agents::wiring::ZenWiring::new();
+    let registry = wiring.build_mcp_registry();
+    let server = McpServer::with_registry(Default::default(), registry);
+
+    println!(
+        "Starting MCP stdio server ({} tools)",
+        server.registry().len()
+    );
+    server
+        .start_stdio()
+        .await
+        .map_err(|e| ZenError::Service(e.to_string()))
 }
 
 fn fetch_http_body(host: &str, port: u16, path: &str) -> Option<String> {

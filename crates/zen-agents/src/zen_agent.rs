@@ -6,7 +6,7 @@ use futures::stream::StreamExt;
 use rig_compose::ContextPackConfig;
 use rig_compose::agent::{Agent, GenericAgent};
 use rig_compose::context::{Evidence, InvestigationContext, Signal};
-use rig_core::completion::CompletionModel;
+use rig_core::completion::{CompletionModel, ToolDefinition};
 use rig_core::streaming::StreamedAssistantContent;
 use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
@@ -894,6 +894,14 @@ impl ZenAgent {
         tier * 0.6 + relevance * 0.3 + sensitivity_bonus
     }
 
+    /// Truncate `text` to at most `max_chars` characters (keeping the head).
+    fn truncate_chars(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+        text.chars().take(max_chars).collect::<String>() + "\n\n[truncated]"
+    }
+
     fn build_system_prompt_with_assembly(
         &self,
         session: &SessionContext,
@@ -965,12 +973,28 @@ impl ZenAgent {
             }
         }
 
-        let prompt = builder.build().assemble();
+        let mut prompt = builder.build().assemble();
+
+        // Inject the agent-scoped tool manifest. Without this the streaming
+        // path (zen chat / TUI / gateway) never advertises tools, so the
+        // AGENT_TOOLS whitelist is dead weight. Mirrors executor.rs:225-235.
+        let tool_manifest = self.tool_manifest();
+        if !tool_manifest.is_empty() {
+            prompt.push_str("\n\n## Available tools\n");
+            prompt.push_str(
+                "You can call tools to read/write files, fetch web pages, search the web, \
+                 and more. To call a tool, emit a fenced ```json block with the shape \
+                 {\"tool\": \"<name>\", \"args\": { ... }} (or an array of such objects). \
+                 The runtime parses, dispatches, and feeds results back for the next round.\n\n",
+            );
+            prompt.push_str(&tool_manifest);
+        }
 
         tracing::info!(
             prompt_len = prompt.len(),
             has_cache_boundary = prompt.contains(zen_memory::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
-            "build_system_prompt_with_assembly: assembled PromptAssembly"
+            tool_count = self.generic.tools().schemas().len(),
+            "build_system_prompt_with_assembly: assembled PromptAssembly + tool manifest"
         );
 
         prompt
@@ -998,7 +1022,31 @@ impl ZenAgent {
 
         let tool_token_reserve = 200 * 5;
         let effective_budget = self.context_budget_chars.saturating_sub(tool_token_reserve);
-        let protected_chars: usize = protected.iter().map(|i| i.estimated_chars).sum();
+
+        // Protected (identity) items are always included, but they must not
+        // starve the packable budget: cap their total at a fraction of the
+        // budget, truncating oversized items so an ever-growing MEMORY.md
+        // cannot crowd out retrieved knowledge.
+        const PROTECTED_BUDGET_RATIO: f64 = 0.6;
+        let protected_cap = (effective_budget as f64 * PROTECTED_BUDGET_RATIO) as usize;
+
+        let mut protected_chars = 0usize;
+        for item in &mut protected {
+            let remaining = protected_cap.saturating_sub(protected_chars);
+            if item.estimated_chars > remaining {
+                let truncated = Self::truncate_chars(&item.text, remaining);
+                tracing::warn!(
+                    source_id = %item.source_id,
+                    from_chars = item.estimated_chars,
+                    to_chars = truncated.chars().count(),
+                    "Protected identity item truncated to fit context budget"
+                );
+                item.text = truncated;
+                item.estimated_chars = item.text.chars().count();
+            }
+            protected_chars += item.estimated_chars;
+        }
+
         let packable_budget = effective_budget.saturating_sub(protected_chars);
 
         let config = ContextPackConfig::new(packable_budget)
@@ -1121,6 +1169,7 @@ impl ZenAgent {
             .filter_map(|(role, content)| match role.as_str() {
                 "user" => Some(Message::user(content)),
                 "assistant" => Some(Message::assistant(content)),
+                "system" | "tool" => Some(Message::system(content)),
                 _ => None,
             })
             .collect();
@@ -1135,7 +1184,7 @@ impl ZenAgent {
             preamble: Some(system_prompt.to_string()),
             chat_history,
             documents: Vec::new(),
-            tools: Vec::new(),
+            tools: self.tool_definitions(),
             temperature: None,
             max_tokens: Some(2048),
             tool_choice: None,
@@ -1179,12 +1228,35 @@ impl ZenAgent {
         session: &mut SessionContext,
         on_token: impl FnMut(&str),
     ) -> Result<String> {
+        let response = self
+            .execute_stream_round(query, session, None, on_token)
+            .await?;
+        session.add_turn("user", query);
+        session.add_turn("assistant", &response);
+        Ok(response)
+    }
+
+    /// One streaming LLM round without session-turn bookkeeping.
+    ///
+    /// `tool_results`, when non-empty, is injected into the user message so
+    /// the model can continue after a tool-dispatch round. Callers driving a
+    /// multi-round tool loop own turn management themselves (see
+    /// `AgentOrchestrator::execute_stream`).
+    #[instrument(skip(self, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
+    pub async fn execute_stream_round(
+        &self,
+        query: &str,
+        session: &mut SessionContext,
+        tool_results: Option<&str>,
+        on_token: impl FnMut(&str),
+    ) -> Result<String> {
         let session_id = session.session_id.to_string();
         let conv_len = session.conversation.len();
         tracing::info!(
             session_id = %session_id,
             conversation_turns = conv_len,
-            "execute_stream: starting with PromptAssembly + rig projection merge"
+            has_tool_results = tool_results.is_some(),
+            "execute_stream_round: starting with PromptAssembly + rig projection merge"
         );
 
         let mut ctx = InvestigationContext::new(&session_id, "query");
@@ -1236,27 +1308,38 @@ impl ZenAgent {
 
         ctx.signals.push(Signal::new("knowledge-query"));
 
-        let _step_result = self.generic.step(&mut ctx).await?;
+        let step_result = self.generic.step(&mut ctx).await?;
+        tracing::debug!(
+            skills_run = ?step_result.skills_run,
+            confidence = step_result.confidence,
+            concluded = step_result.concluded,
+            "execute_stream_round: skills pass completed"
+        );
 
         let system_prompt = self.build_system_prompt_with_assembly(session, memories.as_deref());
 
         let dynamic_context = self.build_prompt(query, &ctx);
 
-        let user_message = if dynamic_context.is_empty() || dynamic_context == query {
-            query.to_string()
-        } else {
-            format!(
+        let user_message = match (
+            dynamic_context.is_empty() || dynamic_context == query,
+            tool_results,
+        ) {
+            (true, None) => query.to_string(),
+            (false, None) => format!(
                 "## Retrieved Context\n\n{}\n\n## Current Query\n{}",
                 dynamic_context, query
-            )
+            ),
+            (true, Some(results)) => {
+                format!("## Tool Results\n\n{results}\n\n## Current Query\n{query}")
+            }
+            (false, Some(results)) => format!(
+                "## Retrieved Context\n\n{dynamic_context}\n\n## Tool Results\n\n{results}\n\n## Current Query\n{query}"
+            ),
         };
 
         let response = self
             .call_llm_stream_with_assembly(query, &system_prompt, &user_message, session, on_token)
             .await?;
-
-        session.add_turn("user", query);
-        session.add_turn("assistant", &response);
 
         Ok(response)
     }
@@ -1333,6 +1416,7 @@ impl ZenAgent {
             .filter_map(|(role, content)| match role.as_str() {
                 "user" => Some(Message::user(content)),
                 "assistant" => Some(Message::assistant(content)),
+                "system" | "tool" => Some(Message::system(content)),
                 _ => None,
             })
             .collect();
@@ -1354,7 +1438,7 @@ impl ZenAgent {
             preamble: Some(system_prompt.to_string()),
             chat_history,
             documents: Vec::new(),
-            tools: Vec::new(),
+            tools: self.tool_definitions(),
             temperature: None,
             max_tokens: Some(2048),
             tool_choice: None,
@@ -1470,6 +1554,45 @@ impl ZenAgentBuilder {
     }
 }
 
+impl ZenAgent {
+    /// Render the agent-scoped tool manifest for system-prompt injection.
+    ///
+    /// Unlike `ZenWiring::tool_manifest()` (which lists every registered
+    /// tool), this honours the per-agent whitelist: only the tools granted
+    /// to this agent via `ZenAgentBuilder::with_tool` are advertised, so the
+    /// model can only emit fenced-JSON calls for tools the agent actually
+    /// holds (scoped registry from `GenericAgentBuilder::build`).
+    pub fn tool_manifest(&self) -> String {
+        let mut lines = Vec::new();
+        for schema in self.generic.tools().schemas() {
+            lines.push(format!(
+                "- {}: {} (args: {})",
+                schema.name, schema.description, schema.args_schema
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// Build native `ToolDefinition`s for provider-managed function calling.
+    ///
+    /// Populates `CompletionRequest.tools` so providers that support structured
+    /// tool-calling (OpenAI, Anthropic, etc.) send `ToolCall` as a separate
+    /// stream variant instead of embedding fenced-JSON in the text. The scoped
+    /// registry honours the same per-agent whitelist as `tool_manifest()`.
+    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.generic
+            .tools()
+            .schemas()
+            .iter()
+            .map(|schema| ToolDefinition {
+                name: schema.name.clone(),
+                description: schema.description.clone(),
+                parameters: schema.args_schema.clone(),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod chain_tests {
     use super::*;
@@ -1554,5 +1677,72 @@ mod chain_tests {
             score_conf > score_pub,
             "Confidential items should score higher than Public items"
         );
+    }
+
+    #[test]
+    fn build_system_prompt_injects_agent_scoped_tool_manifest() {
+        use crate::wiring::ZenWiring;
+
+        let wiring = ZenWiring::new();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let agent = ZenAgent::builder("Sisyphus")
+            .with_tool("fs.read")
+            .with_tool("web.fetch")
+            .with_tool("web.search")
+            .build(&wiring, &router)
+            .expect("agent build");
+
+        let session = SessionContext::new("s1".into(), "ignored".into());
+        let prompt = agent.build_system_prompt_with_assembly(&session, None);
+
+        assert!(
+            prompt.contains("## Available tools"),
+            "streaming prompt missing tool manifest header"
+        );
+        assert!(
+            prompt.contains("fs.read"),
+            "granted fs.read not advertised in streaming prompt"
+        );
+        assert!(
+            prompt.contains("web.search"),
+            "granted web.search not advertised in streaming prompt"
+        );
+        assert!(
+            prompt.contains("web.fetch"),
+            "granted web.fetch not advertised in streaming prompt"
+        );
+        assert!(
+            !prompt.contains("fs.write"),
+            "non-granted fs.write leaked into scoped manifest"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_omits_manifest_when_agent_has_no_tools() {
+        use crate::wiring::ZenWiring;
+
+        let wiring = ZenWiring::new();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let agent = ZenAgent::builder("Bare")
+            .build(&wiring, &router)
+            .expect("agent build");
+
+        let session = SessionContext::new("s2".into(), "ignored".into());
+        let prompt = agent.build_system_prompt_with_assembly(&session, None);
+
+        assert!(
+            !prompt.contains("## Available tools"),
+            "tool manifest injected for an agent with zero tools"
+        );
+    }
+
+    #[test]
+    fn truncate_chars_keeps_head_with_marker() {
+        let text = "abcdefghij";
+        assert_eq!(ZenAgent::truncate_chars(text, 20), text);
+        let truncated = ZenAgent::truncate_chars(text, 4);
+        assert_eq!(truncated, "abcd\n\n[truncated]");
+        assert!(truncated.starts_with("abcd"));
+        assert!(truncated.ends_with("[truncated]"));
     }
 }

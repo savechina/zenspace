@@ -146,6 +146,23 @@ impl AgentExecutor {
         context: &AgentContext,
         agent: &crate::ZenAgent,
     ) -> Result<AgentExecution> {
+        self.execute_round(context, agent, "", "")
+    }
+
+    /// Execute one agent round with a tool manifest and prior tool results.
+    ///
+    /// Used by the orchestrator's agentic tool loop: the manifest advertises
+    /// the available tools (fenced-JSON calling convention) on the first
+    /// round, and `tool_results` feeds back prior dispatch outputs on
+    /// subsequent rounds.
+    #[instrument(skip(self, context, agent), fields(agent_name = %context.agent_profile.name, sensitivity = ?context.sensitivity, round_has_results = !tool_results.is_empty()))]
+    pub fn execute_round(
+        &self,
+        context: &AgentContext,
+        agent: &crate::ZenAgent,
+        tool_manifest: &str,
+        tool_results: &str,
+    ) -> Result<AgentExecution> {
         let start = Instant::now();
         let agent_name = context.agent_profile.name.clone();
         let sensitivity = context.sensitivity;
@@ -171,7 +188,7 @@ impl AgentExecutor {
             });
 
         // Build prompt with agent identity (SOUL.md/MEMORY.md/AGENTS.md)
-        let prompt = self.build_prompt_with_identity(context, agent);
+        let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
         let (response, tokens) = self.execute_with_retry(&provider, &prompt, &agent_name)?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -197,14 +214,37 @@ impl AgentExecutor {
         &self,
         context: &AgentContext,
         agent: &crate::ZenAgent,
+        tool_manifest: &str,
+        tool_results: &str,
     ) -> String {
         let system_prompt = self.assemble_system_prompt_with_identity(context, agent);
         let sanitizer = InputSanitizer::new();
         let sanitized_query = sanitizer.strip_dangerous_patterns(&context.user_query);
-        format!(
-            "{}\n\nUser: [USER_CONTENT_START]{}[USER_CONTENT_END]\n\nAssistant:",
-            system_prompt, sanitized_query
-        )
+
+        let mut prompt = system_prompt;
+        if !tool_manifest.is_empty() {
+            prompt.push_str(
+                "\n\n## Available tools\n\
+                 You can call tools to read/write files, fetch web pages, search the web, and more.\n\
+                 When you need a tool, respond with ONLY a fenced JSON block:\n\
+                 ```json\n{\"tool\": \"<tool_name>\", \"args\": { ... }}\n```\n\
+                 You may include multiple calls as a JSON array. After receiving results,\
+                 continue the conversation normally.\n\
+                 Tools:\n",
+            );
+            prompt.push_str(tool_manifest);
+        }
+        prompt.push_str(&format!(
+            "\n\nUser: [USER_CONTENT_START]{}[USER_CONTENT_END]",
+            sanitized_query
+        ));
+        if !tool_results.is_empty() {
+            prompt.push_str("\n\n## Tool results from previous round\n");
+            prompt.push_str(tool_results);
+            prompt.push_str("\n\nBased on the results above, continue. If you need more tools, emit another fenced JSON block; otherwise answer directly.");
+        }
+        prompt.push_str("\n\nAssistant:");
+        prompt
     }
 
     // ADR-013: Using zen_memory::PromptAssembly 18-section tiered system

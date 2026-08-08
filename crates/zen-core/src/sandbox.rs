@@ -15,14 +15,24 @@ pub enum SandboxMode {
     ReadOnly,
     #[default]
     WorkspaceWrite,
+    Ask,
     DangerFullAccess,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Allow,
+    Deny,
+}
+
+pub type ApprovalCallback = Arc<dyn Fn(&ToolInvocation) -> ApprovalDecision + Send + Sync>;
 
 impl SandboxMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             SandboxMode::ReadOnly => "read-only",
             SandboxMode::WorkspaceWrite => "workspace-write",
+            SandboxMode::Ask => "ask",
             SandboxMode::DangerFullAccess => "danger-full-access",
         }
     }
@@ -31,6 +41,7 @@ impl SandboxMode {
         match s {
             "read-only" | "readonly" | "ro" => Some(SandboxMode::ReadOnly),
             "workspace-write" | "workspacemode" | "ww" => Some(SandboxMode::WorkspaceWrite),
+            "ask" | "askme" => Some(SandboxMode::Ask),
             "danger-full-access" | "full" | "unsafe" => Some(SandboxMode::DangerFullAccess),
             _ => None,
         }
@@ -43,17 +54,25 @@ impl std::fmt::Display for SandboxMode {
     }
 }
 
-pub const PROTECTED_PATHS: &[&str] = &[".git", ".zen", ".ssh", ".aws", ".gnupg"];
+pub const PROTECTED_PATHS: &[&str] = &[".git", ".zen", ".ssh", ".aws", ".gnupg", ".env"];
 
 pub const BLOCKED_COMMAND_PATTERNS: &[&str] = &["rm -rf /", "rm -rf ~", "sudo ", "chmod 777"];
 
 pub const BLOCKED_NETWORK_COMMANDS: &[&str] = &["curl", "wget"];
 
-pub fn is_metadata_path(path: &Path) -> bool {
+pub fn is_env_file(path: &Path) -> bool {
     path.components().any(|c| {
         let name = c.as_os_str().to_string_lossy();
-        PROTECTED_PATHS.contains(&name.as_ref())
+        name == ".env" || name.starts_with(".env.") || name.ends_with(".env")
     })
+}
+
+pub fn is_metadata_path(path: &Path) -> bool {
+    is_env_file(path)
+        || path.components().any(|c| {
+            let name = c.as_os_str().to_string_lossy();
+            PROTECTED_PATHS.contains(&name.as_ref())
+        })
 }
 
 pub fn is_blocked_command(cmd: &str) -> Option<&'static str> {
@@ -304,6 +323,7 @@ impl ToolDispatchHook for SeatbeltHook {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SandboxValidator {
     mode: SandboxMode,
     workspace_roots: Vec<PathBuf>,
@@ -340,6 +360,13 @@ impl SandboxValidator {
             return Ok(());
         }
 
+        if is_env_file(path) {
+            return Err(format!(
+                "write blocked: {} is an environment file",
+                path.display()
+            ));
+        }
+
         let path_str = path.to_string_lossy();
         for component in path.components() {
             let name = component.as_os_str().to_string_lossy();
@@ -364,6 +391,31 @@ impl SandboxValidator {
                 "write denied: {} is not under any workspace root",
                 path_str
             ));
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_path_for_read(&self, path: &Path) -> Result<(), String> {
+        if self.mode == SandboxMode::DangerFullAccess {
+            return Ok(());
+        }
+
+        if is_env_file(path) {
+            return Err(format!(
+                "read blocked: {} is an environment file",
+                path.display()
+            ));
+        }
+
+        for component in path.components() {
+            let name = component.as_os_str().to_string_lossy();
+            if self.protected_set.contains(name.as_ref()) {
+                return Err(format!(
+                    "read blocked: {} is a protected metadata path",
+                    path.display()
+                ));
+            }
         }
 
         Ok(())
@@ -437,6 +489,60 @@ mod tests {
             "/home/user/projects/readme.md"
         )));
         assert!(!is_metadata_path(&PathBuf::from("/home/user/.gitignore")));
+
+        assert!(is_env_file(&PathBuf::from("/project/.env")));
+        assert!(is_env_file(&PathBuf::from("/project/.env.local")));
+        assert!(is_env_file(&PathBuf::from("/project/.env.production")));
+        assert!(is_env_file(&PathBuf::from("/project/production.env")));
+        assert!(!is_env_file(&PathBuf::from("/project/env.txt")));
+    }
+
+    #[test]
+    fn test_sandbox_validator_blocks_env_files() {
+        let validator = SandboxValidator::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        );
+        assert!(
+            validator
+                .validate_path_for_write(&PathBuf::from("/workspace/.env"))
+                .is_err()
+        );
+        assert!(
+            validator
+                .validate_path_for_write(&PathBuf::from("/workspace/.env.local"))
+                .is_err()
+        );
+        assert!(
+            validator
+                .validate_path_for_read(&PathBuf::from("/workspace/.env"))
+                .is_err()
+        );
+        assert!(
+            validator
+                .validate_path_for_read(&PathBuf::from("/workspace/.git/config"))
+                .is_err()
+        );
+        assert!(
+            validator
+                .validate_path_for_read(&PathBuf::from("/workspace/notes.md"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_ask_mode_allows_workspace_writes() {
+        let validator = SandboxValidator::new(SandboxMode::Ask, vec![PathBuf::from("/workspace")]);
+        assert!(
+            validator
+                .validate_path_for_write(&PathBuf::from("/workspace/notes.md"))
+                .is_ok()
+        );
+        assert!(
+            validator
+                .validate_path_for_write(&PathBuf::from("/workspace/.git/config"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -454,6 +560,7 @@ mod tests {
     fn test_sandbox_mode_display() {
         assert_eq!(SandboxMode::ReadOnly.as_str(), "read-only");
         assert_eq!(SandboxMode::WorkspaceWrite.as_str(), "workspace-write");
+        assert_eq!(SandboxMode::Ask.as_str(), "ask");
         assert_eq!(SandboxMode::DangerFullAccess.as_str(), "danger-full-access");
     }
 
@@ -468,6 +575,8 @@ mod tests {
             SandboxMode::parse_str("workspace-write"),
             Some(SandboxMode::WorkspaceWrite)
         );
+        assert_eq!(SandboxMode::parse_str("ask"), Some(SandboxMode::Ask));
+        assert_eq!(SandboxMode::parse_str("askme"), Some(SandboxMode::Ask));
         assert_eq!(
             SandboxMode::parse_str("danger-full-access"),
             Some(SandboxMode::DangerFullAccess)
