@@ -104,9 +104,7 @@ async fn handle_rate_limit(resp: &mut reqwest::Response) -> Option<String> {
 }
 
 fn parse_retry_after(value: Option<&str>) -> u64 {
-    value
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(60)
+    value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(60)
 }
 
 async fn search_brave(
@@ -310,9 +308,7 @@ impl Tool for WebSearchTool {
         let (results, provider) = match override_provider {
             "brave" => {
                 let key = brave_key.as_deref().ok_or_else(|| {
-                    KernelError::ToolFailed(
-                        "API key not configured for provider 'brave'".into(),
-                    )
+                    KernelError::ToolFailed("API key not configured for provider 'brave'".into())
                 })?;
                 let r = search_brave(&self.client, query, max, key)
                     .await
@@ -321,9 +317,7 @@ impl Tool for WebSearchTool {
             }
             "tavily" => {
                 let key = tavily_key.as_deref().ok_or_else(|| {
-                    KernelError::ToolFailed(
-                        "API key not configured for provider 'tavily'".into(),
-                    )
+                    KernelError::ToolFailed("API key not configured for provider 'tavily'".into())
                 })?;
                 let r = search_tavily(&self.client, query, max, key)
                     .await

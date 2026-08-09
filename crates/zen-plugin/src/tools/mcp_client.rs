@@ -24,6 +24,11 @@ type SpawnFuture = Pin<Box<dyn Future<Output = Result<Arc<dyn McpTransport>, Str
 /// captures.
 type SpawnFactory = Arc<dyn Fn() -> SpawnFuture + Send + Sync>;
 
+/// First-run trust prompt (FR-018): called with a server config, returns
+/// `true` to trust it. `None` means no prompt is available (headless
+/// orchestrator) — untrusted servers are then skipped non-fatally.
+type TrustPrompt = Option<Arc<dyn Fn(&zen_core::config::McpServerConfig) -> bool + Send + Sync>>;
+
 struct McpProxyTool {
     transport: Arc<dyn McpTransport>,
     original_name: String,
@@ -182,7 +187,7 @@ pub async fn bootstrap_mcp_clients(
     mcp_servers: &[zen_core::config::McpServerConfig],
     trust_store: &mut zen_core::config::McpTrustStore,
     paths: &zen_core::paths::ZenPaths,
-    prompt: Option<Arc<dyn Fn(&zen_core::config::McpServerConfig) -> bool + Send + Sync>>,
+    prompt: TrustPrompt,
 ) {
     for server in mcp_servers {
         if !server.enabled {
@@ -291,7 +296,10 @@ async fn connect_stdio(
     });
 
     let reconnecting = Arc::new(ReconnectingMcpTransport::new(
-        server_name, endpoint, spawn, initial,
+        server_name,
+        endpoint,
+        spawn,
+        initial,
     ));
 
     // TODO(FR-015): list_changed auto-refresh. rig-mcp 0.2.5's

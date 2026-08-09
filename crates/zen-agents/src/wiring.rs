@@ -334,9 +334,8 @@ impl ZenWiring {
             .map(|root| root.join("logs").join("audit.jsonl"))
             .unwrap_or_else(|| std::path::PathBuf::from("logs/audit.jsonl"));
 
-        let confidentiality = zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(
-            Sensitivity::Private,
-        );
+        let confidentiality =
+            zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(Sensitivity::Private);
         let shared = confidentiality.shared_sensitivity();
 
         (

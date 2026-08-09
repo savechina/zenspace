@@ -404,10 +404,7 @@ fn execute_mcp_command(operation: &McpCommands) -> Result<(), ZenError> {
                     println!("{} trust cancelled (no input)", "✗".red());
                     return Ok(());
                 }
-                let confirmed = matches!(
-                    line.trim().to_ascii_lowercase().as_str(),
-                    "y" | "yes"
-                );
+                let confirmed = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
                 if !confirmed {
                     println!("{} trust cancelled", "✗".red());
                     return Ok(());
