@@ -26,8 +26,9 @@ type SpawnFuture = Pin<Box<dyn Future<Output = Result<Arc<dyn McpTransport>, Str
 /// captures.
 type SpawnFactory = Arc<dyn Fn() -> SpawnFuture + Send + Sync>;
 
-/// Optional interactive trust prompt. When `None` (headless orchestrator),
-/// untrusted servers are skipped with a warning instead of prompting.
+/// First-run trust prompt (FR-018): called with a server config, returns
+/// `true` to trust it. `None` means no prompt is available (headless
+/// orchestrator) — untrusted servers are then skipped non-fatally.
 pub type TrustPrompt =
     Option<Arc<dyn Fn(&zen_core::config::McpServerConfig) -> bool + Send + Sync>>;
 
