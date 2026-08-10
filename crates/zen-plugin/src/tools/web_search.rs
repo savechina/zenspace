@@ -74,6 +74,7 @@ struct SearchResult {
 }
 
 const DEFAULT_MAX_RESULTS: usize = 5;
+const MAX_RESULTS_LIMIT: usize = 50;
 
 fn url_encode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -87,6 +88,51 @@ fn url_encode(s: &str) -> String {
         }
     }
     result
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Extracts and decodes the `uddg=` target parameter from a DuckDuckGo
+/// redirect URL. Returns the real target URL, or `None` if `uddg=` is absent.
+fn extract_uddg(href: &str) -> Option<String> {
+    let key = "uddg=";
+    let idx = href.find(key)?;
+    let after = &href[idx + key.len()..];
+    let encoded = after.split('&').next()?;
+    if encoded.is_empty() {
+        return None;
+    }
+    Some(percent_decode(encoded))
 }
 
 async fn handle_rate_limit(resp: &mut reqwest::Response) -> Option<String> {
@@ -104,9 +150,7 @@ async fn handle_rate_limit(resp: &mut reqwest::Response) -> Option<String> {
 }
 
 fn parse_retry_after(value: Option<&str>) -> u64 {
-    value
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(60)
+    value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(60)
 }
 
 async fn search_brave(
@@ -213,7 +257,11 @@ async fn search_ddg(
     max: usize,
 ) -> Result<Vec<SearchResult>, String> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+
+    if let Some(rate_err) = handle_rate_limit(&mut resp).await {
+        return Err(rate_err);
+    }
 
     let html = resp.text().await.map_err(|e| e.to_string())?;
     let document = scraper::Html::parse_document(&html);
@@ -237,17 +285,7 @@ async fn search_ddg(
             .select(&title_selector)
             .next()
             .and_then(|el| el.value().attr("href"))
-            .map(|h| {
-                if h.starts_with("//duckduckgo.com/l/?uddg=") {
-                    h.split("=")
-                        .nth(1)
-                        .and_then(|s| s.split('&').next())
-                        .unwrap_or(h)
-                        .to_string()
-                } else {
-                    h.to_string()
-                }
-            })
+            .map(|h| extract_uddg(h).unwrap_or_else(|| h.to_string()))
             .unwrap_or_default();
 
         let snippet = result_el
@@ -289,7 +327,8 @@ impl Tool for WebSearchTool {
         let max = args
             .get("max_results")
             .and_then(|v| v.as_i64())
-            .unwrap_or(DEFAULT_MAX_RESULTS as i64) as usize;
+            .unwrap_or(DEFAULT_MAX_RESULTS as i64)
+            .clamp(1, MAX_RESULTS_LIMIT as i64) as usize;
 
         let config = zen_core::config::load_config().ok();
         let configured = config.as_ref().map(|c| &c.web_search);
@@ -310,9 +349,7 @@ impl Tool for WebSearchTool {
         let (results, provider) = match override_provider {
             "brave" => {
                 let key = brave_key.as_deref().ok_or_else(|| {
-                    KernelError::ToolFailed(
-                        "API key not configured for provider 'brave'".into(),
-                    )
+                    KernelError::ToolFailed("API key not configured for provider 'brave'".into())
                 })?;
                 let r = search_brave(&self.client, query, max, key)
                     .await
@@ -321,9 +358,7 @@ impl Tool for WebSearchTool {
             }
             "tavily" => {
                 let key = tavily_key.as_deref().ok_or_else(|| {
-                    KernelError::ToolFailed(
-                        "API key not configured for provider 'tavily'".into(),
-                    )
+                    KernelError::ToolFailed("API key not configured for provider 'tavily'".into())
                 })?;
                 let r = search_tavily(&self.client, query, max, key)
                     .await
@@ -331,16 +366,16 @@ impl Tool for WebSearchTool {
                 (r, "tavily")
             }
             _ => {
-                if let Some(key) = &tavily_key {
-                    let r = search_tavily(&self.client, query, max, key)
-                        .await
-                        .map_err(KernelError::ToolFailed)?;
-                    (r, "tavily")
-                } else if let Some(key) = &brave_key {
+                if let Some(key) = &brave_key {
                     let r = search_brave(&self.client, query, max, key)
                         .await
                         .map_err(KernelError::ToolFailed)?;
                     (r, "brave")
+                } else if let Some(key) = &tavily_key {
+                    let r = search_tavily(&self.client, query, max, key)
+                        .await
+                        .map_err(KernelError::ToolFailed)?;
+                    (r, "tavily")
                 } else {
                     let r = search_ddg(&self.client, query, max)
                         .await
@@ -383,5 +418,42 @@ mod tests {
         assert_eq!(parse_retry_after(Some("30")), 30);
         assert_eq!(parse_retry_after(Some("abc")), 60);
         assert_eq!(parse_retry_after(None), 60);
+    }
+
+    #[test]
+    fn test_percent_decode() {
+        assert_eq!(percent_decode("hello"), "hello");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(
+            percent_decode("https%3A%2F%2Fexample.com%2Fpath"),
+            "https://example.com/path"
+        );
+        assert_eq!(percent_decode("%E4%B8%AD"), "中");
+        assert_eq!(percent_decode("trailing%2"), "trailing%2");
+    }
+
+    #[test]
+    fn test_extract_uddg() {
+        assert_eq!(
+            extract_uddg("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fp&rut=abc"),
+            Some("https://example.com/p".to_string())
+        );
+        assert_eq!(
+            extract_uddg("/l/?uddg=https%3A%2F%2Ffoo.bar&a=1"),
+            Some("https://foo.bar".to_string())
+        );
+        assert_eq!(extract_uddg("https://example.com/no-redirect"), None);
+        assert_eq!(extract_uddg("//duckduckgo.com/l/?uddg=&rut=x"), None);
+    }
+
+    #[test]
+    fn test_max_results_clamp() {
+        let clamp = |v: i64| v.clamp(1, MAX_RESULTS_LIMIT as i64) as usize;
+        assert_eq!(clamp(0), 1);
+        assert_eq!(clamp(5), 5);
+        assert_eq!(clamp(50), 50);
+        assert_eq!(clamp(1000), 50);
+        assert_eq!(clamp(-3), 1);
     }
 }

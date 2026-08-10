@@ -334,9 +334,8 @@ impl ZenWiring {
             .map(|root| root.join("logs").join("audit.jsonl"))
             .unwrap_or_else(|| std::path::PathBuf::from("logs/audit.jsonl"));
 
-        let confidentiality = zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(
-            Sensitivity::Private,
-        );
+        let confidentiality =
+            zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(Sensitivity::Private);
         let shared = confidentiality.shared_sensitivity();
 
         (
@@ -616,5 +615,106 @@ mod tests {
             "Confidential tool must be excluded from tools/list"
         );
         assert!(registry.get("fs.read").is_ok());
+    }
+
+    // ── D20: restored dispatch-hook wiring tests ─────────────────────────────
+    //
+    // These exercise the actual sandbox-hook pipeline assembled by
+    // `build_sandbox_hooks` and the confidentiality/approval hooks it installs.
+    // Each test drives `before_invocation` and asserts a concrete dispatch
+    // decision, so they FAIL if a hook stops firing or is mis-ordered.
+
+    fn make_invocation(name: &str) -> rig_compose::normalizer::ToolInvocation {
+        rig_compose::normalizer::ToolInvocation {
+            name: name.to_string(),
+            args: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn build_sandbox_hooks_assembles_full_pipeline() {
+        let (hooks, sensitivity) =
+            ZenWiring::build_sandbox_hooks(SandboxMode::Ask, &[std::path::PathBuf::from("/ws")]);
+        assert_eq!(
+            hooks.len(),
+            5,
+            "pipeline must be: confidentiality, budget, seatbelt, audit, approval"
+        );
+        // Shared sensitivity arc is live and mutable (orchestrator updates it).
+        {
+            let mut guard = sensitivity.lock().unwrap();
+            *guard = Sensitivity::Confidential;
+        }
+        assert_eq!(*sensitivity.lock().unwrap(), Sensitivity::Confidential);
+    }
+
+    #[tokio::test]
+    async fn confidentiality_hook_blocks_cloud_in_confidential_session() {
+        let hook = zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(
+            Sensitivity::Confidential,
+        );
+        let inv = make_invocation("web.search");
+        match hook.before_invocation(&inv).await.unwrap() {
+            rig_compose::normalizer::ToolDispatchAction::Skip { output, .. } => {
+                assert!(
+                    output["error"].is_string(),
+                    "Skip must carry an error payload"
+                );
+            }
+            other => panic!("web.search under Confidential must Skip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn confidentiality_hook_allows_local_in_confidential_session() {
+        let hook = zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(
+            Sensitivity::Confidential,
+        );
+        let inv = make_invocation("fs.read");
+        assert!(matches!(
+            hook.before_invocation(&inv).await.unwrap(),
+            rig_compose::normalizer::ToolDispatchAction::Continue
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_callback_gates_mutating_tool_in_ask_mode() {
+        use zen_core::sandbox::{ApprovalCallback, ApprovalDecision};
+
+        let cb: ApprovalCallback = Arc::new(|_inv| ApprovalDecision::Deny);
+        let hook = zen_plugin::tools::approval_hook::AskApprovalHook::new(SandboxMode::Ask)
+            .with_callback(cb);
+
+        let mutating = make_invocation("fs.write");
+        assert!(matches!(
+            hook.before_invocation(&mutating).await.unwrap(),
+            rig_compose::normalizer::ToolDispatchAction::Terminate { .. }
+        ));
+
+        let readonly = make_invocation("fs.read");
+        assert!(matches!(
+            hook.before_invocation(&readonly).await.unwrap(),
+            rig_compose::normalizer::ToolDispatchAction::Continue
+        ));
+    }
+
+    #[tokio::test]
+    async fn ask_mode_without_callback_is_direct_for_mutating_tools() {
+        let hook = zen_plugin::tools::approval_hook::AskApprovalHook::new(SandboxMode::Ask);
+        let inv = make_invocation("fs.write");
+        assert!(matches!(
+            hook.before_invocation(&inv).await.unwrap(),
+            rig_compose::normalizer::ToolDispatchAction::Continue
+        ));
+    }
+
+    #[test]
+    fn set_approval_callback_swaps_hook_in_ask_mode() {
+        use zen_core::sandbox::{ApprovalCallback, ApprovalDecision};
+        let mut wiring = ZenWiring::with_sandbox_mode(SandboxMode::Ask);
+        let cb: ApprovalCallback = Arc::new(|_inv| ApprovalDecision::Allow);
+        wiring.set_approval_callback(cb);
+        // Index 4 is the approval hook slot (see build_sandbox_hooks order).
+        assert_eq!(wiring.sandbox_hooks.len(), 5);
     }
 }

@@ -75,6 +75,44 @@ pub fn is_metadata_path(path: &Path) -> bool {
         })
 }
 
+/// Lexically normalize a path: collapse `.` components and resolve `..`
+/// against the accumulating prefix (clamped at the path's own root anchor so
+/// `..` can never pop above an absolute root). Does NOT touch the filesystem,
+/// so it is safe for paths that do not yet exist (e.g. a file about to be
+/// written). Symlink resolution requires `std::fs::canonicalize` and is
+/// intentionally not performed here.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(Component::Normal(_)) = out.last() {
+                    out.pop();
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut normalized = PathBuf::new();
+    for c in &out {
+        normalized.push(c.as_os_str());
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    normalized
+}
+
+/// Whether `path` stays within `root` after lexical normalization. Rejects
+/// `..` traversal that would escape the configured root (D8: root-bound path
+/// validation). Both operands are normalized, so a workspace root that itself
+/// contains a `..` is handled correctly.
+fn is_within_root(path: &Path, root: &Path) -> bool {
+    lexical_normalize(path).starts_with(lexical_normalize(root))
+}
+
 pub fn is_blocked_command(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
 
@@ -229,7 +267,7 @@ impl SeatbeltPolicy {
 
         self.workspace_roots
             .iter()
-            .any(|root| path.starts_with(root))
+            .any(|root| is_within_root(path, root))
     }
 
     pub fn validate_invocation(
@@ -360,15 +398,17 @@ impl SandboxValidator {
             return Ok(());
         }
 
-        if is_env_file(path) {
+        let normalized = lexical_normalize(path);
+
+        if is_env_file(&normalized) {
             return Err(format!(
                 "write blocked: {} is an environment file",
                 path.display()
             ));
         }
 
-        let path_str = path.to_string_lossy();
-        for component in path.components() {
+        let path_str = normalized.to_string_lossy();
+        for component in normalized.components() {
             let name = component.as_os_str().to_string_lossy();
             if self.protected_set.contains(name.as_ref()) {
                 return Err(format!(
@@ -385,7 +425,7 @@ impl SandboxValidator {
         let allowed = self
             .workspace_roots
             .iter()
-            .any(|root| path.starts_with(root));
+            .any(|root| is_within_root(path, root));
         if !allowed {
             return Err(format!(
                 "write denied: {} is not under any workspace root",
@@ -401,14 +441,16 @@ impl SandboxValidator {
             return Ok(());
         }
 
-        if is_env_file(path) {
+        let normalized = lexical_normalize(path);
+
+        if is_env_file(&normalized) {
             return Err(format!(
                 "read blocked: {} is an environment file",
                 path.display()
             ));
         }
 
-        for component in path.components() {
+        for component in normalized.components() {
             let name = component.as_os_str().to_string_lossy();
             if self.protected_set.contains(name.as_ref()) {
                 return Err(format!(
@@ -651,5 +693,44 @@ mod tests {
         };
         let result = rt.block_on(hook.before_invocation(&invocation)).unwrap();
         assert!(matches!(result, ToolDispatchAction::Terminate { .. }));
+    }
+
+    #[test]
+    fn test_root_bound_rejects_traversal_escape() {
+        let validator = SandboxValidator::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        );
+        assert!(
+            validator
+                .validate_path_for_write(&PathBuf::from("/workspace/../../etc/passwd"))
+                .is_err(),
+            "traversal escaping the workspace root must be rejected"
+        );
+        assert!(
+            validator
+                .validate_path_for_read(&PathBuf::from("/workspace/../.ssh/id_rsa"))
+                .is_err(),
+            "traversal into a protected path must be rejected"
+        );
+        assert!(
+            validator
+                .validate_path_for_write(&PathBuf::from("/workspace/sub/../notes.md"))
+                .is_ok(),
+            "traversal that stays inside the root must be allowed"
+        );
+
+        let policy = SeatbeltPolicy::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        );
+        assert!(
+            !policy.is_write_allowed(&PathBuf::from("/workspace/../etc/passwd")),
+            "seatbelt must not allow traversal escape"
+        );
+        assert!(
+            policy.is_write_allowed(&PathBuf::from("/workspace/sub/../notes.md")),
+            "seatbelt must allow in-root traversal"
+        );
     }
 }

@@ -211,8 +211,16 @@ impl SandboxManager {
 
     /// Register an interactive approval callback for `SandboxMode::Ask`.
     ///
-    /// Without a callback, `Ask` mode terminates every tool invocation with a
-    /// "no approval callback" error, making the mode unusable interactively.
+    /// `Ask` mode is usable in two regimes (D29):
+    /// - **direct** (no callback wired): mutating/cloud tools run without a
+    ///   prompt. This is the default so an unattended `Ask` session never
+    ///   dead-locks on a missing prompt.
+    /// - **prompt** (callback wired by the TUI): mutating/cloud tools consult
+    ///   the callback (e.g. a prompt rendered on the main thread, possibly fed
+    ///   by a oneshot channel) and are allowed or denied accordingly.
+    ///
+    /// Read-only local tools (`fs.read`, `fs.list`, ...) always bypass
+    /// approval in `Ask` mode.
     pub fn set_approval_callback(&mut self, callback: ApprovalCallback) {
         self.approval_hook.set_callback(callback);
     }
@@ -387,6 +395,50 @@ mod tests {
                 .check_path_write(Path::new("/workspace/notes.md"))
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ask_mode_without_callback_runs_mutating_tools_directly() {
+        use rig_compose::normalizer::{ToolDispatchAction, ToolInvocation};
+
+        let config =
+            SandboxConfig::new(SandboxMode::Ask).with_workspaces(vec![PathBuf::from("/workspace")]);
+        let manager = SandboxManager::new(config);
+        // hooks() order: [rate_limit, seatbelt, audit, approval]
+        let approval_hook = manager.hooks()[3];
+
+        let mutating = ToolInvocation {
+            name: "fs.write".into(),
+            args: serde_json::json!({"path": "/workspace/a.md", "content": "x"}),
+        };
+        let action = approval_hook.before_invocation(&mutating).await.unwrap();
+        assert!(
+            matches!(action, ToolDispatchAction::Continue),
+            "Ask mode without a callback must be direct (allow mutating tool), got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ask_mode_with_deny_callback_terminates_mutating_tools() {
+        use rig_compose::normalizer::{ToolDispatchAction, ToolInvocation};
+        use zen_core::sandbox::{ApprovalCallback, ApprovalDecision};
+
+        let config =
+            SandboxConfig::new(SandboxMode::Ask).with_workspaces(vec![PathBuf::from("/workspace")]);
+        let mut manager = SandboxManager::new(config);
+        let cb: ApprovalCallback = Arc::new(|_inv| ApprovalDecision::Deny);
+        manager.set_approval_callback(cb);
+
+        let approval_hook = manager.hooks()[3];
+        let mutating = ToolInvocation {
+            name: "fs.write".into(),
+            args: serde_json::json!({"path": "/workspace/a.md", "content": "x"}),
+        };
+        let action = approval_hook.before_invocation(&mutating).await.unwrap();
+        assert!(
+            matches!(action, ToolDispatchAction::Terminate { .. }),
+            "Ask mode with a Deny callback must terminate mutating tool, got {action:?}"
         );
     }
 }

@@ -65,6 +65,11 @@ pub enum McpCommands {
         /// MCP server name
         name: String,
     },
+    /// Force a reconnect (connectivity smoke test) to an MCP server (D4)
+    Reconnect {
+        /// MCP server name (must exist in config mcp_servers)
+        name: String,
+    },
 }
 
 pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
@@ -404,10 +409,7 @@ fn execute_mcp_command(operation: &McpCommands) -> Result<(), ZenError> {
                     println!("{} trust cancelled (no input)", "✗".red());
                     return Ok(());
                 }
-                let confirmed = matches!(
-                    line.trim().to_ascii_lowercase().as_str(),
-                    "y" | "yes"
-                );
+                let confirmed = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
                 if !confirmed {
                     println!("{} trust cancelled", "✗".red());
                     return Ok(());
@@ -437,6 +439,79 @@ fn execute_mcp_command(operation: &McpCommands) -> Result<(), ZenError> {
                 name.cyan().bold()
             );
             Ok(())
+        }
+
+        McpCommands::Reconnect { name } => {
+            let server = match config.mcp_servers.iter().find(|s| s.name == *name) {
+                Some(s) => s,
+                None => {
+                    println!(
+                        "{} MCP server '{}' not found in config mcp_servers.",
+                        "✗".red().bold(),
+                        name.cyan()
+                    );
+                    println!(
+                        "  Configured servers: {}",
+                        config
+                            .mcp_servers
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    return Ok(());
+                }
+            };
+
+            // Warn if untrusted but don't block — the user explicitly
+            // asked to reconnect, so this doubles as a connectivity test.
+            if !trust_store.is_trusted(name) {
+                println!(
+                    "{} Server '{}' is untrusted — run `zen plugin mcp trust {}` first to register its tools.",
+                    "⚠️".yellow(),
+                    name.cyan().bold(),
+                    name
+                );
+            }
+
+            println!(
+                "{} Reconnecting to MCP server '{}' (transport: {})…",
+                "→".cyan(),
+                name.cyan().bold(),
+                server.transport.dimmed()
+            );
+
+            let server_clone = server.clone();
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    zen_plugin::tools::mcp_client::reconnect_mcp_server(&server_clone),
+                )
+            });
+
+            match result {
+                Ok(count) => {
+                    println!(
+                        "{} MCP server '{}' reachable — {} tool(s) discovered.",
+                        "✓".green().bold(),
+                        name.cyan().bold(),
+                        count.to_string().green().bold()
+                    );
+                    println!(
+                        "  {} Tools will be registered on next agent start.",
+                        "ℹ".dimmed()
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    println!(
+                        "{} Reconnect failed for '{}': {}",
+                        "✗".red().bold(),
+                        name.cyan().bold(),
+                        e
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 }

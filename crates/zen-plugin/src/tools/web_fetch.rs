@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
+use zen_core::config::WebFetchConfig;
 
 const NAME: &str = "web.fetch";
 const DESCRIPTION: &str = "Fetch a URL and extract its content as Markdown";
@@ -38,7 +39,12 @@ static RESULT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 #[derive(Clone)]
 pub struct WebFetchTool {
     client: reqwest::Client,
-    jina_fallback_threshold_chars: usize,
+    max_content_size_kb: u32,
+    max_lines: u32,
+    timeout_ms: u64,
+    jina_fallback: bool,
+    jina_fallback_threshold_chars: u32,
+    user_agent: String,
 }
 
 impl Default for WebFetchTool {
@@ -49,20 +55,39 @@ impl Default for WebFetchTool {
 
 impl WebFetchTool {
     pub fn new() -> Self {
+        Self::with_config(WebFetchConfig::default())
+    }
+
+    pub fn with_config(cfg: WebFetchConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("zen-agent/1.0")
+            .timeout(Duration::from_millis(cfg.timeout_ms))
+            .user_agent(cfg.user_agent.clone())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             client,
-            jina_fallback_threshold_chars: 500,
+            max_content_size_kb: cfg.max_content_size_kb,
+            max_lines: cfg.max_lines,
+            timeout_ms: cfg.timeout_ms,
+            jina_fallback: cfg.jina_fallback,
+            jina_fallback_threshold_chars: cfg.jina_fallback_threshold_chars,
+            user_agent: cfg.user_agent,
+        }
+    }
+
+    pub fn config(&self) -> WebFetchConfig {
+        WebFetchConfig {
+            max_content_size_kb: self.max_content_size_kb,
+            max_lines: self.max_lines,
+            timeout_ms: self.timeout_ms,
+            jina_fallback: self.jina_fallback,
+            jina_fallback_threshold_chars: self.jina_fallback_threshold_chars,
+            user_agent: self.user_agent.clone(),
         }
     }
 }
 
-const DEFAULT_MAX_LINES: usize = 2000;
-const MAX_CONTENT_BYTES: usize = 51200;
+const TRUNCATION_MARKER: &str = "...(truncated)";
 
 fn convert_html_to_markdown(html: &str) -> String {
     htmd::convert(html).unwrap_or_else(|_| html.to_string())
@@ -101,8 +126,11 @@ impl Tool for WebFetchTool {
 
         let max_lines = args
             .get("max_lines")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(DEFAULT_MAX_LINES as i64) as usize;
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(self.max_lines as usize);
+
+        let max_bytes = (self.max_content_size_kb as usize).saturating_mul(1024);
 
         let resp = self
             .client
@@ -139,39 +167,50 @@ impl Tool for WebFetchTool {
             body
         };
 
-        let (final_content, used_fallback) = if markdown.len() < self.jina_fallback_threshold_chars
+        let needs_fallback = self.jina_fallback
             && content_type.contains("text/html")
-        {
+            && markdown.len() < self.jina_fallback_threshold_chars as usize;
+        let (final_content, used_fallback) = if needs_fallback {
+            tracing::warn!(
+                url = url,
+                chars = markdown.len(),
+                threshold = self.jina_fallback_threshold_chars,
+                "web.fetch content below readability threshold, falling back to Jina Reader"
+            );
             match fetch_jina(&self.client, url).await {
                 Ok(jina_content) => (jina_content, true),
-                Err(_) => (markdown, false),
+                Err(e) => {
+                    tracing::warn!(url = url, error = %e, "Jina Reader fallback failed, using raw extract");
+                    (markdown, false)
+                }
             }
         } else {
             (markdown, false)
         };
 
-        let truncated_bytes = final_content.len().min(MAX_CONTENT_BYTES);
-        let mut truncated = final_content.len() > MAX_CONTENT_BYTES;
-        let content = if truncated {
-            // Byte-slicing a String can panic when the boundary splits a
-            // multi-byte UTF-8 char; floor_char_boundary lands on a safe edge.
-            let end = final_content.floor_char_boundary(truncated_bytes);
-            final_content[..end].to_string()
-        } else {
-            final_content
-        };
+        let mut truncated = false;
+        let mut content = final_content;
+        if content.len() > max_bytes {
+            truncated = true;
+            let end = content.floor_char_boundary(max_bytes);
+            content.truncate(end);
+        }
 
         let lines: Vec<&str> = content.lines().collect();
-        let line_count = lines.len();
-        if line_count > max_lines {
+        if lines.len() > max_lines {
             truncated = true;
+            content = lines
+                .iter()
+                .take(max_lines)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
         }
-        let content: String = lines
-            .iter()
-            .take(max_lines)
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n");
+
+        if truncated {
+            content.push('\n');
+            content.push_str(TRUNCATION_MARKER);
+        }
 
         Ok(json!({
             "url": url,

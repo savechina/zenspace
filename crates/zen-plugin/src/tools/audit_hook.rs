@@ -7,6 +7,7 @@ use rig_compose::registry::KernelError;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -14,6 +15,7 @@ use tracing::warn;
 pub struct ToolAuditHook {
     log_path: PathBuf,
     writer: Arc<Mutex<()>>,
+    start_time: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ToolAuditHook {
@@ -21,6 +23,7 @@ impl ToolAuditHook {
         Self {
             log_path,
             writer: Arc::new(Mutex::new(())),
+            start_time: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -38,14 +41,27 @@ fn arg_keys(args: &Value) -> Vec<String> {
     }
 }
 
-fn build_record(invocation: &ToolInvocation, success: bool, error: Option<&KernelError>) -> Value {
-    json!({
+/// Build a JSONL audit record. `duration_ms` is `None` when no matching
+/// `before_invocation` start was captured (e.g. an error path that bypassed
+/// the before hook); the field is omitted from the JSON in that case to keep
+/// the shape backward-compatible with older readers.
+fn build_record(
+    invocation: &ToolInvocation,
+    success: bool,
+    error: Option<&KernelError>,
+    duration_ms: Option<u64>,
+) -> Value {
+    let mut record = json!({
         "timestamp": Utc::now().to_rfc3339(),
         "tool": invocation.name,
         "args_summary": arg_keys(&invocation.args),
         "success": success,
         "error": error.map(|e| e.to_string()),
-    })
+    });
+    if let Some(ms) = duration_ms {
+        record["duration_ms"] = json!(ms);
+    }
+    record
 }
 
 fn append_record(record: &Value, log_path: &PathBuf) {
@@ -94,11 +110,14 @@ impl ToolDispatchHook for ToolAuditHook {
         &self,
         _invocation: &ToolInvocation,
     ) -> Result<ToolDispatchAction, KernelError> {
+        let mut guard = self.start_time.lock().await;
+        *guard = Some(Instant::now());
         Ok(ToolDispatchAction::Continue)
     }
 
     async fn after_invocation(&self, result: &ToolInvocationResult) -> Result<(), KernelError> {
-        let record = build_record(&result.invocation, true, None);
+        let duration_ms = self.take_elapsed().await.map(|e| e.as_millis() as u64);
+        let record = build_record(&result.invocation, true, None, duration_ms);
         let _guard = self.writer.lock().await;
         append_record(&record, &self.log_path);
         Ok(())
@@ -109,9 +128,94 @@ impl ToolDispatchHook for ToolAuditHook {
         invocation: &ToolInvocation,
         error: &KernelError,
     ) -> Result<(), KernelError> {
-        let record = build_record(invocation, false, Some(error));
+        let duration_ms = self.take_elapsed().await.map(|e| e.as_millis() as u64);
+        let record = build_record(invocation, false, Some(error), duration_ms);
         let _guard = self.writer.lock().await;
         append_record(&record, &self.log_path);
         Ok(())
+    }
+}
+
+impl ToolAuditHook {
+    async fn take_elapsed(&self) -> Option<Duration> {
+        let mut guard = self.start_time.lock().await;
+        guard
+            .take()
+            .map(|start| Instant::now().saturating_duration_since(start))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_invocation(name: &str) -> ToolInvocation {
+        ToolInvocation {
+            name: name.to_string(),
+            args: json!({"path": "/workspace/notes.md"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_includes_duration_ms_after_normal_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "zen_audit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("audit.jsonl");
+        let hook = ToolAuditHook::new(log_path.clone());
+
+        let inv = make_invocation("fs.write");
+        hook.before_invocation(&inv).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let result = ToolInvocationResult {
+            invocation: inv,
+            output: json!({"bytes_written": 4}),
+        };
+        hook.after_invocation(&result).await.unwrap();
+
+        let written = std::fs::read_to_string(&log_path).unwrap();
+        assert!(written.contains("\"duration_ms\""), "line: {written}");
+        let parsed: Value = serde_json::from_str(written.trim()).unwrap();
+        assert_eq!(parsed["tool"], "fs.write");
+        let ms = parsed["duration_ms"].as_u64();
+        assert!(
+            ms.is_some_and(|m| m < 60_000),
+            "duration_ms out of range: {ms:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn record_omits_duration_when_before_did_not_fire() {
+        let dir = std::env::temp_dir().join(format!(
+            "zen_audit_nostart_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("audit.jsonl");
+        let hook = ToolAuditHook::new(log_path.clone());
+
+        let inv = make_invocation("fs.read");
+        let result = ToolInvocationResult {
+            invocation: inv,
+            output: json!({}),
+        };
+        hook.after_invocation(&result).await.unwrap();
+
+        let written = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: Value = serde_json::from_str(written.trim()).unwrap();
+        assert!(parsed.get("duration_ms").is_none(), "line: {written}");
+        assert_eq!(parsed["tool"], "fs.read");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

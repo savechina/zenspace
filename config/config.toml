@@ -29,6 +29,23 @@ theme = "deep-ocean"
 max_bytes = 1048576
 
 # =============================================================================
+# Web fetch tool (zen web.fetch) — URL content extraction
+# =============================================================================
+#
+# Controls the HTTP client and content extraction limits for the web.fetch
+# agent tool. The Jina Reader (r.jina.ai) is used as a fallback when a page's
+# extracted text is shorter than `jina_fallback_threshold_chars` (typical for
+# JS-rendered pages whose body is mostly boilerplate).
+#
+[web_fetch]
+max_content_size_kb = 50
+max_lines = 2000
+timeout_ms = 10000
+jina_fallback = true
+jina_fallback_threshold_chars = 500
+user_agent = "zen-agent/1.0"
+
+# =============================================================================
 # Embedding provider selection (standalone from chat providers)
 # =============================================================================
 #

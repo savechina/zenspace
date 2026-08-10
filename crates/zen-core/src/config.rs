@@ -524,7 +524,10 @@ pub struct EmbeddingsConfig {
 }
 
 /// Web fetch tool configuration — controls content extraction limits and fallback behavior.
-#[derive(Debug, Clone, Deserialize, Default)]
+///
+/// `Default` is implemented by hand to match the `#[serde(default = "...")]`
+/// helpers; `#[derive(Default)]` would yield zeroed fields (e.g. `timeout_ms = 0`).
+#[derive(Debug, Clone, Deserialize)]
 pub struct WebFetchConfig {
     /// Maximum content size in KB to fetch and process.
     #[serde(default = "default_web_fetch_max_size")]
@@ -544,6 +547,19 @@ pub struct WebFetchConfig {
     /// User-Agent header for direct HTTP fetches.
     #[serde(default = "default_web_fetch_user_agent")]
     pub user_agent: String,
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        Self {
+            max_content_size_kb: default_web_fetch_max_size(),
+            max_lines: default_web_fetch_max_lines(),
+            timeout_ms: default_web_fetch_timeout(),
+            jina_fallback: default_true(),
+            jina_fallback_threshold_chars: default_jina_threshold(),
+            user_agent: default_web_fetch_user_agent(),
+        }
+    }
 }
 
 /// Web search tool configuration — provider selection and API keys.

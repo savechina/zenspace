@@ -9,6 +9,156 @@ use std::sync::{Arc, Mutex};
 
 use zen_core::types::Sensitivity;
 
+// ---------------------------------------------------------------------------
+// Tool metadata manifest (D28)
+// ---------------------------------------------------------------------------
+//
+// Replaces the previous fragile tool-name string matching for confidentiality
+// (and approval) classification. A static manifest is the simplest fit for this
+// codebase: the tool set is fixed at compile time (see `wiring.rs` tool
+// catalogue) and the classification fields (`cloud`, `mutating`, `io`,
+// `confidence`) are stable. Dynamic per-invocation fields (`path`, `args`,
+// `model_meta`) are intentionally not part of the static manifest — they are
+// already carried by `ToolInvocation` itself and consulted at runtime.
+//
+// Both `ConfidentialityHook` (cloud gating, FR-009) and `AskApprovalHook`
+// (mutating/cloud gating, FR-019) consume this table via the
+// [`tool_metadata`] / [`is_cloud_tool`] / [`is_mutating_tool`] helpers.
+
+/// Static classification metadata for a registered tool.
+///
+/// Fields mirror the D28 spec shape, restricted to what is statically knowable
+/// and consumed by the dispatch hooks (dynamic `path`/`args`/`model_meta` are
+/// per-invocation and live on `ToolInvocation`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToolMetadata {
+    /// Canonical tool name (matches the `ToolRegistry` key).
+    pub name: &'static str,
+    /// Reaches an external/cloud service (web.search, web.fetch, ...).
+    pub cloud: bool,
+    /// Mutates filesystem or external state (fs.write/edit/delete/move/copy).
+    pub mutating: bool,
+    /// Performs I/O that may leak content beyond the process boundary.
+    pub io: bool,
+    /// Baseline confidence weight for routing heuristics (0.0..=1.0).
+    pub confidence: f32,
+}
+
+/// Static manifest of tool classification. Tools not listed here fall back to
+/// conservative heuristics in [`is_cloud_tool`] / [`is_mutating_tool`] so
+/// unknown `web.*` / `http*` tools are still treated as cloud.
+pub static TOOL_METADATA: &[ToolMetadata] = &[
+    ToolMetadata {
+        name: "fs.read",
+        cloud: false,
+        mutating: false,
+        io: false,
+        confidence: 0.9,
+    },
+    ToolMetadata {
+        name: "fs.list",
+        cloud: false,
+        mutating: false,
+        io: false,
+        confidence: 0.9,
+    },
+    ToolMetadata {
+        name: "fs.grep",
+        cloud: false,
+        mutating: false,
+        io: false,
+        confidence: 0.9,
+    },
+    ToolMetadata {
+        name: "fs.glob",
+        cloud: false,
+        mutating: false,
+        io: false,
+        confidence: 0.9,
+    },
+    ToolMetadata {
+        name: "fs.write",
+        cloud: false,
+        mutating: true,
+        io: false,
+        confidence: 0.8,
+    },
+    ToolMetadata {
+        name: "fs.edit",
+        cloud: false,
+        mutating: true,
+        io: false,
+        confidence: 0.8,
+    },
+    ToolMetadata {
+        name: "fs.delete",
+        cloud: false,
+        mutating: true,
+        io: false,
+        confidence: 0.8,
+    },
+    ToolMetadata {
+        name: "fs.move",
+        cloud: false,
+        mutating: true,
+        io: false,
+        confidence: 0.8,
+    },
+    ToolMetadata {
+        name: "fs.copy",
+        cloud: false,
+        mutating: true,
+        io: false,
+        confidence: 0.8,
+    },
+    ToolMetadata {
+        name: "web.fetch",
+        cloud: true,
+        mutating: false,
+        io: true,
+        confidence: 0.7,
+    },
+    ToolMetadata {
+        name: "web.search",
+        cloud: true,
+        mutating: false,
+        io: true,
+        confidence: 0.7,
+    },
+];
+
+/// Look up the static metadata for a registered tool.
+pub fn tool_metadata(name: &str) -> Option<&'static ToolMetadata> {
+    TOOL_METADATA.iter().find(|m| m.name == name)
+}
+
+/// Whether a tool reaches an external/cloud service.
+///
+/// Metadata-driven for known tools; falls back to a conservative name
+/// heuristic for tools absent from [`TOOL_METADATA`] so unknown `web.*` /
+/// `http*` / `*network*` tools are still classified as cloud.
+pub fn is_cloud_tool(tool_name: &str) -> bool {
+    if let Some(m) = tool_metadata(tool_name) {
+        return m.cloud;
+    }
+    let lower = tool_name.to_lowercase();
+    lower.starts_with("web.")
+        || lower.contains("http")
+        || lower.contains("network")
+        || lower.contains("cloud")
+}
+
+/// Whether a tool mutates filesystem or external state.
+///
+/// Metadata-driven for known tools; unknown tools default to non-mutating
+/// (read-only) so they are not needlessly gated by the approval hook.
+pub fn is_mutating_tool(tool_name: &str) -> bool {
+    match tool_metadata(tool_name) {
+        Some(m) => m.mutating,
+        None => false,
+    }
+}
+
 /// Blocks cloud tools (web search, web fetch) when the active session is
 /// tagged `Confidential` (FR-009).
 ///
@@ -20,14 +170,6 @@ use zen_core::types::Sensitivity;
 #[derive(Clone)]
 pub struct ConfidentialityHook {
     sensitivity: Arc<Mutex<Sensitivity>>,
-}
-
-fn is_cloud_tool(tool_name: &str) -> bool {
-    let lower = tool_name.to_lowercase();
-    lower.starts_with("web.")
-        || lower.contains("http")
-        || lower.contains("network")
-        || lower.contains("cloud")
 }
 
 impl ConfidentialityHook {

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,6 +25,11 @@ type SpawnFuture = Pin<Box<dyn Future<Output = Result<Arc<dyn McpTransport>, Str
 /// `StdioTransport::spawn` again with the original args, which this closure
 /// captures.
 type SpawnFactory = Arc<dyn Fn() -> SpawnFuture + Send + Sync>;
+
+/// Optional interactive trust prompt. When `None` (headless orchestrator),
+/// untrusted servers are skipped with a warning instead of prompting.
+pub type TrustPrompt =
+    Option<Arc<dyn Fn(&zen_core::config::McpServerConfig) -> bool + Send + Sync>>;
 
 struct McpProxyTool {
     transport: Arc<dyn McpTransport>,
@@ -171,6 +178,284 @@ impl McpTransport for ReconnectingMcpTransport {
     }
 }
 
+// =============================================================================
+// HttpMcpTransport — Streamable HTTP client transport (D25 / FR-014)
+// =============================================================================
+//
+// Design-First & Reuse note (Constitution Principle XI):
+// rig-mcp 0.2.5 ships only StdioTransport + LoopbackTransport — NO HTTP/SSE
+// client transport (verified: `rig-mcp-0.2.5/src/transport.rs` defines the
+// McpTransport trait with no HTTP impl; `src/stdio.rs` is the only wire
+// transport). The MCP Streamable HTTP spec (2024-11-05 revision) requires:
+// POST JSON-RPC to the server endpoint with
+// `Accept: application/json, text/event-stream`, parse the response as either
+// a single JSON document or an SSE event stream, and echo back the
+// `Mcp-Session-Id` header if the server issues one.
+//
+// This implementation reuses `reqwest` (already a workspace dep with json +
+// stream + rustls features) — no new crate dependencies. It is intentionally
+// minimal: one POST per JSON-RPC call, single response parsed. Servers that
+// require server-initiated SSE notifications (e.g.
+// `notifications/tools/list_changed`) are better served by the stdio
+// transport; this HTTP path targets the common request-response MCP-over-HTTP
+// pattern.
+
+/// Minimal Streamable HTTP MCP client transport (D25 / FR-014).
+struct HttpMcpTransport {
+    endpoint: String,
+    client: reqwest::Client,
+    extra_headers: Vec<(String, String)>,
+    /// Stored after the first response, echoed on subsequent requests per
+    /// the MCP Streamable HTTP spec's optional session management.
+    session_id: Mutex<Option<String>>,
+    next_id: AtomicU64,
+}
+
+impl HttpMcpTransport {
+    /// Send a JSON-RPC request and return the `result` object. Handles
+    /// both `application/json` (single envelope) and `text/event-stream`
+    /// (SSE-parsed) response content types per the MCP Streamable HTTP spec.
+    async fn rpc(&self, method: &str, params: Option<Value>) -> Result<Value, KernelError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+        });
+        if let Some(p) = params {
+            request_body["params"] = p;
+        }
+
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&request_body);
+
+        if let Some(sid) = self.session_id.lock().await.as_ref() {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            KernelError::ToolFailed(format!(
+                "MCP HTTP request to '{}' failed: {}",
+                self.endpoint, e
+            ))
+        })?;
+
+        // Capture Mcp-Session-Id if the server issues one.
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            *self.session_id.lock().await = Some(sid.to_string());
+        }
+
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| KernelError::ToolFailed(format!("MCP HTTP body read failed: {}", e)))?;
+
+        if !status.is_success() {
+            let snippet = body.chars().take(300).collect::<String>();
+            return Err(KernelError::ToolFailed(format!(
+                "MCP HTTP {} from '{}' (Content-Type: {}): {}",
+                status, self.endpoint, content_type, snippet
+            )));
+        }
+
+        if content_type.contains("text/event-stream") {
+            parse_sse_response(&body, id)
+        } else {
+            let envelope: Value = serde_json::from_str(&body).map_err(|e| {
+                KernelError::ToolFailed(format!("MCP HTTP JSON parse failed: {}", e))
+            })?;
+            extract_rpc_result(&envelope, id)
+        }
+    }
+}
+
+/// Extract the `result` field from a JSON-RPC envelope, validating the
+/// response ID and surfacing any `error` object.
+fn extract_rpc_result(envelope: &Value, expected_id: u64) -> Result<Value, KernelError> {
+    if let Some(resp_id) = envelope.get("id")
+        && resp_id.as_u64() != Some(expected_id)
+    {
+        return Err(KernelError::ToolFailed(format!(
+            "MCP JSON-RPC id mismatch: expected {}, got {:?}",
+            expected_id, resp_id
+        )));
+    }
+    if let Some(err) = envelope.get("error") {
+        return Err(KernelError::ToolFailed(format!(
+            "MCP JSON-RPC error from server: {}",
+            err
+        )));
+    }
+    envelope
+        .get("result")
+        .cloned()
+        .ok_or_else(|| KernelError::ToolFailed("MCP JSON-RPC response missing 'result'".into()))
+}
+
+/// Parse a `text/event-stream` body and return the JSON-RPC `result`
+/// matching `expected_id`. Iterates all event blocks, collecting `data:`
+/// lines, and returns the first response (result/error) with a matching id.
+/// Notifications (no id match, or events without result/error) are ignored.
+fn parse_sse_response(body: &str, expected_id: u64) -> Result<Value, KernelError> {
+    let mut last_err: Option<String> = None;
+
+    for event_block in body.split("\n\n") {
+        let data: String = event_block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(|d| d.trim().to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            continue;
+        }
+        if let Ok(envelope) = serde_json::from_str::<Value>(&data)
+            && (envelope.get("result").is_some() || envelope.get("error").is_some())
+        {
+            match extract_rpc_result(&envelope, expected_id) {
+                Ok(r) => return Ok(r),
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            // Notifications are ignored — FR-015 future work.
+        }
+    }
+
+    Err(KernelError::ToolFailed(format!(
+        "MCP SSE stream had no result for request id {}{}",
+        expected_id,
+        last_err
+            .map(|e| format!(" (last error: {})", e))
+            .unwrap_or_default()
+    )))
+}
+
+#[async_trait]
+impl McpTransport for HttpMcpTransport {
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    async fn list_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
+        let result = self.rpc("tools/list", None).await?;
+        let tools = result
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| {
+                KernelError::ToolFailed("MCP tools/list: missing 'tools' array".into())
+            })?;
+        Ok(tools.iter().map(http_tool_to_schema).collect())
+    }
+
+    async fn call_tool(&self, name: &str, args: Value) -> Result<Value, KernelError> {
+        let arguments = if args.is_null() {
+            Value::Object(serde_json::Map::new())
+        } else {
+            args
+        };
+        let params = serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        });
+        let result = self.rpc("tools/call", Some(params)).await?;
+
+        // MCP spec: prefer structuredContent, then text content parsed as JSON.
+        if let Some(sc) = result.get("structuredContent") {
+            return Ok(sc.clone());
+        }
+        if result
+            .get("isError")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let msg = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| {
+                    arr.iter().find_map(|c| {
+                        c.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .unwrap_or_else(|| "MCP tool returned error".to_string());
+            return Err(KernelError::ToolFailed(msg));
+        }
+        if let Some(text) = result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| {
+                arr.iter().find_map(|c| {
+                    c.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                })
+            })
+        {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                return Ok(parsed);
+            }
+            return Ok(Value::String(text));
+        }
+        Ok(result)
+    }
+}
+
+/// Map a raw MCP tool descriptor (JSON from `tools/list`) to a [`ToolSchema`].
+fn http_tool_to_schema(t: &Value) -> ToolSchema {
+    ToolSchema {
+        name: t
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        description: t
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        args_schema: t.get("inputSchema").cloned().unwrap_or(Value::Null),
+        result_schema: t.get("outputSchema").cloned().unwrap_or(Value::Null),
+    }
+}
+
+/// Construct an [`HttpMcpTransport`] for the given endpoint URL.
+async fn spawn_http(
+    url: &str,
+    extra_headers: Option<&HashMap<String, String>>,
+) -> Result<HttpMcpTransport, KernelError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| KernelError::ToolFailed(format!("HTTP client build failed: {}", e)))?;
+    let headers_vec: Vec<(String, String)> = extra_headers
+        .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    Ok(HttpMcpTransport {
+        endpoint: url.to_string(),
+        client,
+        extra_headers: headers_vec,
+        session_id: Mutex::new(None),
+        next_id: AtomicU64::new(0),
+    })
+}
+
 /// Bootstrap MCP clients for every enabled, trusted server (FR-013/FR-018).
 ///
 /// Untrusted servers are skipped unless `prompt` returns `true`, in which
@@ -182,7 +467,7 @@ pub async fn bootstrap_mcp_clients(
     mcp_servers: &[zen_core::config::McpServerConfig],
     trust_store: &mut zen_core::config::McpTrustStore,
     paths: &zen_core::paths::ZenPaths,
-    prompt: Option<Arc<dyn Fn(&zen_core::config::McpServerConfig) -> bool + Send + Sync>>,
+    prompt: TrustPrompt,
 ) {
     for server in mcp_servers {
         if !server.enabled {
@@ -205,10 +490,13 @@ pub async fn bootstrap_mcp_clients(
                 }
                 info!(server = %server.name, "MCP server trusted via first-run prompt");
             } else {
+                // D27: when prompt is None (headless / library default),
+                // untrusted servers are skipped with a clear actionable
+                // hint — never a blocking prompt.
                 warn!(
                     server = %server.name,
-                    hint = format!("zen plugin mcp trust {}", server.name),
-                    "MCP server not trusted, skipping"
+                    "MCP server not trusted, skipping — run `zen plugin mcp trust {}` to trust it",
+                    server.name
                 );
                 continue;
             }
@@ -236,15 +524,37 @@ pub async fn bootstrap_mcp_clients(
                 }
             }
             "http" | "https" => {
-                // TODO(FR-014): rig-mcp 0.2.5 ships no HTTP/SSE client transport
-                // (only stdio + in-process loopback). When a future rig-mcp adds
-                // one, wire it here and reuse `ReconnectingMcpTransport` with an
-                // HTTP-backed spawn factory so FR-013 crash recovery applies.
-                warn!(
-                    server = %server.name,
-                    transport = "http",
-                    "HTTP MCP transport not yet supported (FR-014 pending rig-mcp HTTP client)"
-                );
+                // D25 / FR-014: HTTP transport via HttpMcpTransport (see above).
+                let url = match &server.url {
+                    Some(u) => u.clone(),
+                    None => {
+                        warn!(
+                            server = %server.name,
+                            transport = %server.transport,
+                            "MCP {} server missing 'url'",
+                            server.transport
+                        );
+                        continue;
+                    }
+                };
+                match connect_http(registry, &server.name, &url, server.headers.as_ref()).await {
+                    Ok(count) => {
+                        info!(
+                            server = %server.name,
+                            url = %url,
+                            tools = count,
+                            "MCP HTTP client connected"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            server = %server.name,
+                            url = %url,
+                            error = %e,
+                            "MCP HTTP connection failed"
+                        );
+                    }
+                }
             }
             other => {
                 warn!(
@@ -291,7 +601,10 @@ async fn connect_stdio(
     });
 
     let reconnecting = Arc::new(ReconnectingMcpTransport::new(
-        server_name, endpoint, spawn, initial,
+        server_name,
+        endpoint,
+        spawn,
+        initial,
     ));
 
     // TODO(FR-015): list_changed auto-refresh. rig-mcp 0.2.5's
@@ -301,6 +614,15 @@ async fn connect_stdio(
     // background task that re-runs `list_tools()`, diffs old vs new
     // schemas, and registers/unregisters `McpProxyTool` entries to keep
     // the tool set live without a restart.
+    //
+    // D5 note — stdout deadlock avoidance: `ReconnectingMcpTransport`
+    // deliberately does NOT read child stdout directly; all pipe I/O is
+    // delegated to `StdioTransport` (rig-mcp), which owns the child
+    // handle and its stdout drain. Any future implementation that
+    // subscribes to server notifications (FR-015) MUST spawn a dedicated
+    // tokio reader task that continuously drains the child stdout pipe
+    // into a channel — reading inline on the call path would block on
+    // pipe-buffer fill (64 KiB on most OSes) and deadlock the transport.
     let count = schemas.len();
     for schema in schemas {
         let original_name = schema.name.clone();
@@ -321,6 +643,124 @@ async fn connect_stdio(
     }
 
     Ok(count)
+}
+
+/// Connect to an HTTP/HTTPS MCP server, wrap in [`ReconnectingMcpTransport`]
+/// (so FR-013 crash recovery applies), and register all discovered tools.
+/// Mirrors [`connect_stdio`] structurally.
+async fn connect_http(
+    registry: &ToolRegistry,
+    server_name: &str,
+    url: &str,
+    extra_headers: Option<&HashMap<String, String>>,
+) -> Result<usize, String> {
+    let initial: Arc<dyn McpTransport> = Arc::new(
+        spawn_http(url, extra_headers)
+            .await
+            .map_err(|e| format!("spawn failed: {}", e))?,
+    );
+    info!(server = server_name, url = %url, "MCP HTTP transport connected");
+
+    let schemas = initial
+        .list_tools()
+        .await
+        .map_err(|e| format!("list_tools failed: {}", e))?;
+
+    let url_factory = url.to_string();
+    let headers_factory: HashMap<String, String> = extra_headers.cloned().unwrap_or_default();
+    let spawn: SpawnFactory = Arc::new(move || {
+        let url = url_factory.clone();
+        let headers = headers_factory.clone();
+        Box::pin(async move {
+            spawn_http(&url, Some(&headers))
+                .await
+                .map(|t| Arc::new(t) as Arc<dyn McpTransport>)
+                .map_err(|e| e.to_string())
+        })
+    });
+
+    let reconnecting = Arc::new(ReconnectingMcpTransport::new(
+        server_name,
+        url,
+        spawn,
+        initial,
+    ));
+
+    let count = schemas.len();
+    for schema in schemas {
+        let original_name = schema.name.clone();
+        let namespaced_schema = ToolSchema {
+            name: namespaced_tool_name(server_name, &original_name),
+            description: schema.description,
+            args_schema: schema.args_schema,
+            result_schema: schema.result_schema,
+        };
+
+        let proxy = Arc::new(McpProxyTool {
+            transport: reconnecting.clone(),
+            original_name,
+            schema: namespaced_schema,
+        });
+
+        registry.register(proxy);
+    }
+
+    Ok(count)
+}
+
+/// Smoke-test connectivity to a single MCP server (D4 / `zen plugin mcp
+/// reconnect <name>`). Spawns (stdio) or connects (HTTP), calls
+/// `tools/list`, and returns the discovered tool count. Does NOT register
+/// tools — tool registration happens in the running agent process via
+/// [`bootstrap_mcp_clients`]. This exercises the same spawn + list_tools
+/// path that auto-reconnect (FR-013) uses on failure, giving the user
+/// immediate feedback on whether a server is reachable and correctly
+/// configured.
+pub async fn reconnect_mcp_server(
+    server: &zen_core::config::McpServerConfig,
+) -> Result<usize, String> {
+    match server.transport.as_str() {
+        "stdio" => {
+            let command = server
+                .command
+                .clone()
+                .ok_or_else(|| format!("server '{}' (stdio) has no 'command'", server.name))?;
+            let args = server.args.clone().unwrap_or_default();
+            let endpoint = format!("stdio://{}", server.name);
+            let transport: Arc<dyn McpTransport> = Arc::new(
+                spawn_stdio(&endpoint, &command, &args)
+                    .await
+                    .map_err(|e| format!("spawn failed: {}", e))?,
+            );
+            let schemas = transport
+                .list_tools()
+                .await
+                .map_err(|e| format!("list_tools failed: {}", e))?;
+            Ok(schemas.len())
+        }
+        "http" | "https" => {
+            let url = server.url.clone().ok_or_else(|| {
+                format!(
+                    "server '{}' ({}) has no 'url'",
+                    server.name, server.transport
+                )
+            })?;
+            let transport: Arc<dyn McpTransport> = Arc::new(
+                spawn_http(&url, server.headers.as_ref())
+                    .await
+                    .map_err(|e| format!("connect failed: {}", e))?,
+            );
+            let schemas = transport
+                .list_tools()
+                .await
+                .map_err(|e| format!("list_tools failed: {}", e))?;
+            Ok(schemas.len())
+        }
+        other => Err(format!(
+            "unknown transport '{}' for server '{}'",
+            other, server.name
+        )),
+    }
 }
 
 async fn spawn_stdio(
