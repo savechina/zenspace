@@ -7,81 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — Critical Memory System Gap Fixes (2026-06-27)
+### Added
 
-Second audit pass identified and fixed 7 critical implementation gaps across the self-learning memory system:
+- **Post-implementation review fix batch** (branch `003-agentic-plugin`, follows
+  the v0.0.5 release) — reconciles the 27 findings from the 2026-08-09
+  `/plan-eng-review` of the shipped agentic plugin:
+  - `HttpMcpTransport` — Streamable HTTP client transport for remote MCP servers
+    (FR-014): JSON-RPC POST with `Accept: application/json, text/event-stream`,
+    SSE response parsing, `Mcp-Session-Id` echo, and JSON-RPC id validation.
+    (Hand-rolled per Constitution XI: `rig-mcp` 0.2.5 ships no HTTP client.)
+  - `zen plugin mcp reconnect <name>` — connectivity smoke-test CLI (FR-013).
+  - Lexical path-traversal protection in the sandbox: `..` escapes from the
+    workspace root are rejected on read/write, even for not-yet-existing files
+    (FR-004 hardening).
+  - Web search provider precedence corrected to Brave → Tavily → DuckDuckGo;
+    DuckDuckGo now handles 429/Retry-After and percent-decodes `uddg=` redirect
+    URLs; `max_results` clamped to [1, 50] (FR-008).
+  - `WebFetchConfig` wired into `web.fetch` with a `[web_fetch]` config section
+    (FR-011); audit records now include call duration (FR-020).
+  - Approval/confidentiality hooks wired through `build_sandbox_hooks`;
+    mutating tools gated in `Ask` mode, cloud tools gated under `Confidential`
+    sessions (FR-018/FR-019).
 
-#### Signal Persistence & Data Model
+## [0.0.5] - 2026-08-09
 
-- **Fact struct implementation (G1)**: DESIGN.md §4 Phase C specified `Fact` as the core extracted knowledge type, but the struct was missing. Created `fact.rs` with full markdown persistence (`save()`/`load()`/`load_all()`), YAML frontmatter + body format, UUID-based IDs, entity associations, and 12 unit tests. Exported as `pub use fact::Fact` from zen-memory.
-- **Signal persistence wiring (G3)**: Three signal types had `to_markdown()`/`from_markdown()` but no file persistence. Added `save(dir)`/`load(path)`/`load_all(dir)` methods to `ReflectionSignal`, `AntiPatternSignal`, and `MentalModelSignal`, following the exact pattern from `correction.rs`. Signals can now be written to and loaded from disk.
+### Added — Agentic Plugin (File I/O, Web Tools, MCP Integration)
 
-#### Search Tier Consistency
+First release of the agentic plugin surface: the agent can now touch the
+workspace and the web, and connect to external MCP servers — all behind the
+existing permission/sandbox pipeline. (Spec: `docs/specs/003-agentic-plugin/`.)
 
-- **Tier3 table name fix (G2)**: `tier3.rs` queried `note_meta` but schema creates `notes_meta` (plural). Fixed table name and added JOIN with `notes_fts` to retrieve the `content` column (which exists in FTS5 table but not in metadata table).
-- **FTS5 table name unification (G5)**: `tier2.rs` created its own `note_fts` table (6 columns) but `init_kb_schema` creates `notes_fts` (4 columns). Aligned Tier2 to use `notes_fts` + `notes_meta` matching the schema, with proper JOIN for file_path retrieval.
+- **File I/O tools** (FR-001..FR-005, FR-021, FR-022):
+  - `fs.read` — read any text file under the configured workspace root.
+  - `fs.write` — create/overwrite files, subject to sandbox mode.
+  - `fs.list` — list directory entries within the workspace root.
+  - `fs.edit` — surgical unified-diff edits (via `diffy`), with atomic
+    write + `.bak` backup guarantee.
+  - `fs.delete` / `fs.move` / `fs.copy` — full OS-level file operations.
+  - `fs.grep` / `fs.glob` — pattern search and path globbing.
+  - Protected paths rejected in all modes: `.git/`, `.zen/`, `~/.ssh/`,
+    `~/.aws/`, `~/.gnupg/`, `.env` (and `*.env` variants), Keychain (FR-004).
+  - Read-only sandbox mode rejects writes with a clear report (FR-005).
+- **Web search** (FR-006..FR-009):
+  - `web.search` with three pluggable providers: DuckDuckGo (zero-config
+    default), Brave Search API (auto-upgrade when `BRAVE_SEARCH_API_KEY` set),
+    Tavily API (auto-upgrade when `TAVILY_API_KEY` set). Provider overridable
+    per-call via config. Results include title, URL, snippet.
+  - Blocked entirely when the session is tagged `Confidential`.
+- **Web content scraper** (FR-010..FR-012):
+  - `web.fetch` — URL → primary human-readable Markdown via `reqwest` +
+    `readabilityrs` + `htmd`, with a Jina Reader fallback for JS-rendered
+    pages (`"source": "jina_reader"` annotated).
+  - Truncation at 50KB / 2000 lines (configurable) with explicit truncation
+    notice; non-HTML resources return metadata (content-type, size).
+- **MCP client integration** (FR-013, FR-014):
+  - Connect to external MCP servers declared in config via stdio (launched as
+    subprocess) with crash recovery: auto-restart with exponential backoff
+    (1s → 2s → 4s, max 3 attempts), tools marked unavailable after 3
+    consecutive failures.
+  - First-trust prompt persisted per-server in `~/.zen/mcp_trust.json`;
+    untrusted servers skipped with a warning (FR-018).
+- **Safety & permission integration** (FR-018..FR-020):
+  - All new tools pass through the allow/deny/ask hook pipeline — no bypass.
+  - New `Ask` sandbox mode: mutating tools (`fs.write`, `fs.edit`,
+    `fs.delete`, `fs.move`, `fs.copy`, `web.search`, `web.fetch`) require
+    explicit approval via an `ApprovalCallback` (TUI prompt in the CLI,
+    auto-deny in the gateway).
+  - Every tool invocation (success or failure) recorded to `logs/audit.jsonl`
+    with sanitized arguments and outcome (FR-020).
 
-#### Dead Code Cleanup & Naming
-
-- **Dead code removal (G6)**: Removed `update_knowledge()` function (~120 lines including `TECH_KEYWORDS` constant and `find_entity_match()` helper) from `dream.rs`. Cleaned up unused imports (`HashMap`, `EntityData`, `RelationType`, `Relationship`, `WikiCompiler`). Updated doc comments to reference `recompute_entities()` instead.
-- **JournalWorker → MemoryCurator rename (G7)**: DESIGN.md §10.1 specifies `MemoryCurator` name. Renamed struct, file (`journal_worker.rs` → `memory_curator.rs`), worker ID (`journal-worker` → `memory-curator`), and all references in `workers/mod.rs`, `scheduler/mod.rs`, `dream.rs`, and `marker_state.rs`.
-- **recompute_entities doc fix (G8)**: Doc comment incorrectly stated function was a no-op stub returning `Ok(0)`. Implementation was already correct (scans `wiki/entities/*.md` and upserts to graph.db). Fixed doc to accurately describe the real behavior.
-
-### Added — Self-Learning Memory Integration Audit Fixes (2026-06-27)
-
-Reverse audit of self-learning memory system against DESIGN.md identified 15 issues across 3 review lenses (Engineering, CEO, Memory Design). All fixable issues addressed.
-
-#### Signal Flow Wiring
-
-- **Priority scoring injection (E1)**: `priority_items` was computed every session via `format_priority_for_prompt()` but never injected into the prompt. Added `PromptAssemblyBuilder::priority_items()` builder method and wired `signals.priority_items` into executor injection loop. DESIGN.md §8.4 attention allocation now functional.
-- **Signal sections in all prompt paths (E2)**: Self-learning signal sections (corrections, feedback, beliefs, virtue_logs, reflections, mental_models, decisions) were only rendered in `build_default_18_sections()`. Coordinator, agent-definition, and custom prompt paths silently dropped all signals. Added signal section rendering to all 4 prompt assembly paths.
-- **Reinforcement tracker wiring (C7)**: `ReinforcementTracker::record_retrieval()` existed but was never called. Wired into `SelfLearningSignals::load()` so every signal retrieval increments hit-count. DESIGN.md §8.2 reinforcement/decay rules now active.
-
-#### Write/Read Path Corrections
-
-- **Mental model promotion (E3)**: WisdomSynthesizer wrote mental model candidates to `wiki/wisdom/suggestions/` but `SelfLearningSignals::load_mental_models()` read from `wiki/wisdom/models/`. Fixed write path to write accepted candidates directly to `wiki/wisdom/models/{slug}.md`.
-- **Anti-pattern promotion (E4)**: Same disconnection — WisdomSynthesizer wrote to `suggestions/`, SessionJournaler's `check_anti_pattern_match()` read from `wiki/wisdom/anti-patterns/`. Fixed write path to write to `wiki/wisdom/anti-patterns/{slug}.md`.
-- **Dead memory_content removal (E5)**: `SelfLearningSignals::memory_content` was loaded but never used (IdentityContext handles MEMORY.md injection separately). Removed field and load function to eliminate redundant file I/O.
-
-#### KPI and Product Features
-
-- **Commitment completion rate KPI (C1)**: DESIGN.md §15.2 defines `commitment_completion_rate` as the system's success metric. Implemented `compute_commitment_completion_rate()` in new `kpi.rs` module. KPI = (commitments with >=1 milestone achieved within review_at window) / (total commitments). Exposed via `zen memory kpi` command.
-- **Anti-talk indicator (C2)**: DESIGN.md §8.5 defines `mention_to_achievement_ratio`. Ratio > 5 triggers "空谈警报". Implemented in `CommitmentTracker::compute_anti_talk_indicator()`.
-- **Echo chamber mitigation (C6)**: Added monthly "fresh-eyes" extraction mode to SessionJournaler. When `fresh_eyes_mode = true`, M4/M5 context injection is skipped, allowing unbiased extraction. DESIGN.md §15.1 risk #3 mitigation.
-
-#### Worker Fixes
-
-- **ReflectionWorker LLM synthesis (E7)**: DESIGN.md §10.2 specifies ReflectionWorker as "Yes LLM" — synthesize M2 reflections into M4 anti-pattern candidates. Was a pure file parser. Added LLM synthesis call that generates anti-pattern candidates from aggregated reflections.
-- **recompute_entities() implementation (E6)**: Was a stub returning `Ok(0)`. Implemented graph rebuild logic: scan `wiki/entities/*.md` frontmatter, upsert entities into graph.db, normalize via `entity_aliases` table.
-- **Prompt injection detection (E8)**: `safety_hook.rs:134` TODO. Implemented pattern-based detection for common prompt injection patterns in tool arguments (role hijacking, delimiter injection, instruction override).
+## [0.0.4] - 2026-08-03
 
 ### Changed
 
-- `PromptAssemblyBuilder` now has 8 signal section builder methods (was 7). Added `priority_items()`.
-- `SelfLearningSignals` now has 8 fields (was 9). Removed `memory_content`, added `priority_items` injection.
-- `WisdomSynthesizer` writes mental models to `wiki/wisdom/models/{slug}.md` and anti-patterns to `wiki/wisdom/anti-patterns/{slug}.md` (was `wiki/wisdom/suggestions/{date}.md` for both).
-- `SessionJournaler` accepts `fresh_eyes_mode: bool` parameter. When true, skips M4/M5 injection.
+- TUI: inline stream mode for agent responses (`zen` with no subcommand).
+- Upgraded `rig` to the current release (LLM abstraction layer).
+- Fixed TUI display issues in stream mode.
+- Updated install documentation.
 
-### Deprecated
+## [0.0.3] - 2026-07-26
 
-- `SelfLearningSignals::memory_content` field — removed (was dead code, IdentityContext handles MEMORY.md).
+### Changed
 
-### Known Limitations (Documented for Future Phases)
+- Release workflow + CI build pipeline fixes (GitHub Actions).
+- Fixed lint errors (including `fastembed` feature-gated code).
 
-- **Self-Model 6-layer axis (C3)**: DESIGN.md §5.2 specifies 6 introspective layers for `self` entity (Knowledge, Skill, SocialRole, SelfConcept, Trait, Motivation) with `humility_score` and `optionality_count`. Not yet implemented — Phase E+ feature.
-- **GoalNode/PathNode/BeliefNode graph types (C4)**: DESIGN.md §6.1 specifies 3 new graph node types. Not yet implemented — Phase E+ feature.
-- **PARA directory structure (C5)**: DESIGN.md §5.1 specifies projects/areas/resources/archive structure. Deferred per DESIGN.md §15.2 recommendation "tags first, physical restructure later."
-
-## [0.1.0] - 2026-05-15
+## [0.0.2] - 2026-07-25
 
 ### Added
 
-- Initial release of Zen CLI productivity suite
-- 12 workspace crates with binary/library split
-- 24 CLI commands with clap derive
-- 5-tier search pipeline (ripgrep → FTS5 → vec0 → graph → LLM)
-- 13 LLM providers across 3 protocol types
-- 13 agents in 4 tiers with 4-channel blackboard
-- Self-learning memory system: 10 signal types, 14 workers, 3 quality gates
-- WASM sandbox via wasmtime, MCP server support
-- macOS Keychain integration
+- **Self-learning memory audit fixes** (two audit passes, 2026-06-27):
+  - `Fact` struct with full Markdown persistence (`save`/`load`/`load_all`),
+    YAML frontmatter + body format, UUID ids, entity associations.
+  - Signal persistence for `ReflectionSignal`, `AntiPatternSignal`,
+    `MentalModelSignal` (`to_markdown`/`from_markdown` → disk).
+  - Priority scoring (`priority_items`) injected into prompt assembly;
+    signal sections rendered in all four prompt paths.
+  - Reinforcement tracker wired into `SelfLearningSignals::load()`.
+  - Mental model / anti-pattern promotion: accepted candidates now written
+    directly to `wiki/wisdom/models/` and `wiki/wisdom/anti-patterns/`.
+  - KPI module (`CommitmentOkr` + `compute_commitment_completion_rate`):
+    commitment-completion rate consumed by the `CommitmentTracker` worker;
+    anti-talk indicator (mention→achievement ratio > 5 warns).
+  - ReflectionWorker now synthesizes M4 anti-pattern candidates via LLM.
+  - Prompt-injection detection in tool arguments (role hijacking, delimiter
+    injection, instruction override).
+  - `JournalWorker` renamed to `MemoryCurator` per DESIGN.md §10.1.
+- **Vault / knowledge graph**: entity-graph rebuild logic
+  (`recompute_entities`), FTS5 tier consistency fixes (`notes_fts` table name
+  unification, Tier3 `notes_meta` join).
+
+### Changed
+
+- `PromptAssemblyBuilder` — renders 8 self-learning signal sections into all
+  four prompt assembly paths (default, coordinator, agent, custom).
+- `WisdomSynthesizer` — writes to `wiki/wisdom/models/{slug}.md` and
+  `wiki/wisdom/anti-patterns/{slug}.md` (was dated suggestion files).
+- `SessionJournaler` — accepts `fresh_eyes_mode` for unbiased extraction.
+
+## [0.0.1] - 2026-06-07
+
+### Added
+
+- Initial release of Zen CLI productivity suite.
+- 12 workspace crates with binary/library split (`zen` binary → `zen-cli` lib).
+- 27 CLI commands with clap derive; no-arg invocation launches the agentic TUI.
+- 5-tier search pipeline: ripgrep → FTS5 → vec0 embeddings → entity graph → LLM
+  synthesis (FR-007..FR-011 of 001-agentic-foundation).
+- 13 LLM providers across 3 protocol types (rig-native, openai-compatible,
+  anthropic-compatible) with 4-tier auth resolution.
+- 13 agents in 4 tiers, 3-layer permission model, 4-channel blackboard,
+  QualityPipeline (Metis → Momus → Hermes → Zeus).
+- Memory foundation: daily logs (`zen-memory`), `MEMORY.md` identity context
+  (SOUL.md / MEMORY.md / AGENTS.md), session lifecycle management.
+- WASM sandboxed plugins via `wasmtime` (FR-036..FR-039); MCP server support
+  via the gateway (FR-035).
+- macOS Keychain credential storage via `security-framework` (FR-061).
+- 3-layer sandbox: `read-only` / `workspace-write` / `danger-full-access`
+  modes (FR-059), metadata-path protection `.git/` `.zen/` `.ssh/` `.aws/`
+  `.gnupg/` (FR-060), and resource limits: `setrlimit` (RLIMIT_NPROC=50,
+  RLIMIT_NOFILE=256, RLIMIT_CORE=0), 300s timeout, 20 exec/min rate limit
+  (FR-064).
