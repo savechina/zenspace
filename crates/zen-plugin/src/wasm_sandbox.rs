@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -114,28 +113,6 @@ struct SandboxState {
 impl wasmtime_wasi::WasiView for SandboxState {
     fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
         self.wasi.ctx()
-    }
-}
-
-pub struct PrecompiledModule {
-    pub wasm_bytes: Vec<u8>,
-    pub permissions: WasmPermissions,
-}
-
-impl PrecompiledModule {
-    pub fn from_file(path: &PathBuf) -> Result<Self, WasmSandboxError> {
-        let wasm_bytes = std::fs::read(path).map_err(|e| {
-            WasmSandboxError::ModuleLoad(format!("failed to read WASM file: {}", e))
-        })?;
-        Ok(Self {
-            wasm_bytes,
-            permissions: WasmPermissions::default(),
-        })
-    }
-
-    pub fn with_permissions(mut self, permissions: WasmPermissions) -> Self {
-        self.permissions = permissions;
-        self
     }
 }
 
@@ -275,6 +252,29 @@ impl WasmSandbox {
         ))
     }
 
+    /// Enumerate the exported functions of a core module that are callable
+    /// through [`Self::execute`] (T089). Excludes `_start` and other
+    /// underscore-prefixed internal exports, and keeps only `() -> ()`
+    /// signatures — the sole shape the `execute` path invokes (arguments
+    /// reach the module as WASI argv, not wasm params).
+    pub fn exported_functions(&self, wasm_bytes: &[u8]) -> Result<Vec<String>, WasmSandboxError> {
+        let module = wasmtime::Module::new(&self.engine, wasm_bytes).map_err(|e| {
+            WasmSandboxError::ModuleLoad(format!("failed to compile core module: {}", e))
+        })?;
+
+        let mut names = Vec::new();
+        for export in module.exports() {
+            if let wasmtime::ExternType::Func(func_type) = export.ty()
+                && !export.name().starts_with('_')
+                && func_type.params().next().is_none()
+                && func_type.results().next().is_none()
+            {
+                names.push(export.name().to_string());
+            }
+        }
+        Ok(names)
+    }
+
     pub async fn execute(
         &self,
         wasm_bytes: &[u8],
@@ -290,6 +290,25 @@ impl WasmSandbox {
                 self.execute_component(component, func_name, args).await
             }
         }
+    }
+
+    /// Execute a function from an already-compiled core module (FR-051).
+    ///
+    /// `wasmtime::Module` compilation costs ~10-100ms; callers that invoke
+    /// the same module repeatedly (e.g. [`crate::plugin_wasm::WasmPluginTool`],
+    /// which caches the `Module` in a `OnceLock` per tool instance) reuse
+    /// this entry point so compilation happens once per tool instance
+    /// instead of once per invocation. `Module` is cheaply cloneable
+    /// (Arc-backed internally).
+    pub async fn execute_module(
+        &self,
+        module: &wasmtime::Module,
+        func_name: &str,
+        args: &[String],
+    ) -> Result<ExecutionOutput, WasmSandboxError> {
+        let version = detect_core_version(module);
+        self.execute_core(module.clone(), version, func_name, args)
+            .await
     }
 
     // ── core module execution (p1 / p2) ──────────────────────────────────
@@ -741,6 +760,39 @@ mod tests {
         )
         .unwrap();
         assert!(sandbox.validate_module(&wasm).is_ok());
+    }
+
+    #[test]
+    fn exported_functions_filters_internal_exports_and_signatures() {
+        let sandbox = WasmSandbox::new();
+        let wasm = wat::parse_str(
+            r#"
+            (module
+                (func (export "_start"))
+                (func (export "_internal"))
+                (func (export "ping"))
+                (func (export "with_result") (result i32)
+                    i32.const 1
+                )
+                (func (export "with_param") (param i32))
+                (memory (export "memory") 1)
+            )
+            "#,
+        )
+        .unwrap();
+
+        let funcs = sandbox.exported_functions(&wasm).unwrap();
+        assert_eq!(funcs, vec!["ping".to_string()]);
+    }
+
+    #[test]
+    fn exported_functions_rejects_garbage_bytes() {
+        let sandbox = WasmSandbox::new();
+        assert!(
+            sandbox
+                .exported_functions(&[0x00, 0x61, 0x73, 0x6d, 0xff])
+                .is_err()
+        );
     }
 
     #[test]

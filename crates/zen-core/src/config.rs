@@ -26,43 +26,150 @@ static CONFIG_CACHE: OnceLock<ZenConfig> = OnceLock::new();
 // ---------------------------------------------------------------------------
 
 /// Root configuration for the Agentic module.
-#[derive(Debug, Clone, Deserialize, Default)]
+///
+/// Deserialization is manual (see the `impl Deserialize` below) so the
+/// `[agents]` table can carry both the task-routing map and the FR-046
+/// `tools` overlay array; absent fields default via [`Default`].
+#[derive(Debug, Clone, Default)]
 pub struct ZenConfig {
     /// Default provider name (references a key in `providers`).
-    #[serde(default)]
     pub default_provider: Option<String>,
     /// Default model to use when no task-specific model is set.
-    #[serde(default)]
     pub default_model: Option<String>,
     /// Named provider definitions — connection settings defined once.
-    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     /// Agent task routing — which provider/model per task.
-    #[serde(default)]
     pub agents: HashMap<String, AgentConfig>,
-    #[serde(default)]
+    /// Agent tool-grant overlay (FR-046, TOML `[agents] tools = [...]`).
+    ///
+    /// Additive on top of the builtin per-agent grant map. Entries are
+    /// exact tool names, `prefix.*` wildcards, or the special `plugin:*`
+    /// pattern (every plugin-registered tool). Empty (the default) leaves
+    /// the builtin grant set unchanged.
+    pub agents_tools: Vec<String>,
     pub features: FeatureConfig,
-    #[serde(default)]
     pub channels: ChannelsConfig,
-    #[serde(default)]
     pub cron: CronConfig,
-    #[serde(default)]
     pub plugin: PluginConfig,
-    #[serde(default)]
     pub feeds: Vec<FeedConfig>,
-    #[serde(default)]
     pub tui: TuiConfig,
-    #[serde(default)]
     pub history: HistoryConfig,
     /// Embedding provider selection (standalone from chat providers).
-    #[serde(default)]
     pub embeddings: EmbeddingsConfig,
-    #[serde(default)]
     pub web_fetch: WebFetchConfig,
-    #[serde(default)]
     pub web_search: WebSearchConfig,
-    #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Sandbox hardening (`[sandbox.*]`).
+    pub sandbox: SandboxConfig,
+}
+
+/// Sandbox hardening config — `[sandbox.*]` sections (T091).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SandboxConfig {
+    /// WASM sandbox permission policy (`[sandbox.wasm]`).
+    #[serde(default)]
+    pub wasm: WasmSandboxConfig,
+}
+
+/// Manual [`Deserialize`] for [`ZenConfig`] (FR-046): the `[agents]` table
+/// carries both the task-routing map (`[agents.<task>]` tables, parsed as
+/// before) and the `tools` overlay array, which is lifted into
+/// [`ZenConfig::agents_tools`] instead of being rejected as a task entry.
+/// Field defaults match the per-field `#[serde(default)]`s the derived
+/// impl used to apply.
+impl<'de> Deserialize<'de> for ZenConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct ZenConfigShadow {
+            default_provider: Option<String>,
+            default_model: Option<String>,
+            providers: HashMap<String, ProviderConfig>,
+            agents: AgentsSectionShadow,
+            features: FeatureConfig,
+            channels: ChannelsConfig,
+            cron: CronConfig,
+            plugin: PluginConfig,
+            feeds: Vec<FeedConfig>,
+            tui: TuiConfig,
+            history: HistoryConfig,
+            embeddings: EmbeddingsConfig,
+            web_fetch: WebFetchConfig,
+            web_search: WebSearchConfig,
+            mcp_servers: Vec<McpServerConfig>,
+            sandbox: SandboxConfig,
+        }
+
+        let shadow = ZenConfigShadow::deserialize(deserializer)?;
+        Ok(ZenConfig {
+            default_provider: shadow.default_provider,
+            default_model: shadow.default_model,
+            providers: shadow.providers,
+            agents: shadow.agents.tasks,
+            agents_tools: shadow.agents.tools,
+            features: shadow.features,
+            channels: shadow.channels,
+            cron: shadow.cron,
+            plugin: shadow.plugin,
+            feeds: shadow.feeds,
+            tui: shadow.tui,
+            history: shadow.history,
+            embeddings: shadow.embeddings,
+            web_fetch: shadow.web_fetch,
+            web_search: shadow.web_search,
+            mcp_servers: shadow.mcp_servers,
+            sandbox: shadow.sandbox,
+        })
+    }
+}
+
+/// `[agents]` section deserialization helper (FR-046): extracts the `tools`
+/// overlay array; every other key deserializes into the task-routing map.
+#[derive(Default)]
+struct AgentsSectionShadow {
+    tasks: HashMap<String, AgentConfig>,
+    tools: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for AgentsSectionShadow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            tools: Vec<String>,
+            #[serde(flatten)]
+            tasks: HashMap<String, AgentConfig>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            tasks: raw.tasks,
+            tools: raw.tools,
+        })
+    }
+}
+
+/// WASM sandbox permission policy (T091, FR-029).
+///
+/// Every flag defaults to `false` (deny-all), matching the pre-config
+/// behavior: a plugin whose manifest declares a permission only loads
+/// when the policy grants it.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WasmSandboxConfig {
+    #[serde(default)]
+    pub allow_filesystem_read: bool,
+    #[serde(default)]
+    pub allow_filesystem_write: bool,
+    #[serde(default)]
+    pub allow_network: bool,
+    #[serde(default)]
+    pub allow_system: bool,
 }
 
 /// IM channel configuration — supports multiple platforms.
@@ -699,6 +806,20 @@ impl Default for PluginConfig {
 }
 
 impl PluginConfig {
+    /// Resolve `base_path` to a concrete directory, expanding a leading `~`
+    /// against the user's home directory. Unresolvable home → the raw path.
+    pub fn resolved_base_path(&self) -> Option<PathBuf> {
+        self.base_path.as_ref().map(|p| {
+            if let Some(rest) = p.strip_prefix('~') {
+                home::home_dir()
+                    .map(|h| h.join(rest.trim_start_matches('/')))
+                    .unwrap_or_else(|| PathBuf::from(p))
+            } else {
+                PathBuf::from(p)
+            }
+        })
+    }
+
     /// Retrieve a typed plugin configuration.
     ///
     /// Deserializes the plugin's `config` JSON blob into the requested type `T`.
@@ -884,6 +1005,7 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         default_model: str_merge(base.default_model, override_cfg.default_model),
         providers: merge_providers(base.providers, override_cfg.providers),
         agents: merge_agents(base.agents, override_cfg.agents),
+        agents_tools: merge_agents_tools(base.agents_tools, override_cfg.agents_tools),
         features: merge_features(base.features, override_cfg.features),
         channels: merge_channels(base.channels, override_cfg.channels),
         cron: merge_cron(base.cron, override_cfg.cron),
@@ -895,7 +1017,22 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         web_fetch: merge_web_fetch(base.web_fetch, override_cfg.web_fetch),
         web_search: merge_web_search(base.web_search, override_cfg.web_search),
         mcp_servers: merge_mcp_servers(base.mcp_servers, override_cfg.mcp_servers),
+        sandbox: merge_sandbox(base.sandbox, override_cfg.sandbox),
     })
+}
+
+/// Grants accumulate across config layers: any layer enabling a WASM
+/// permission keeps it enabled (absent sections parse as all-false).
+fn merge_sandbox(base: SandboxConfig, ov: SandboxConfig) -> SandboxConfig {
+    SandboxConfig {
+        wasm: WasmSandboxConfig {
+            allow_filesystem_read: base.wasm.allow_filesystem_read || ov.wasm.allow_filesystem_read,
+            allow_filesystem_write: base.wasm.allow_filesystem_write
+                || ov.wasm.allow_filesystem_write,
+            allow_network: base.wasm.allow_network || ov.wasm.allow_network,
+            allow_system: base.wasm.allow_system || ov.wasm.allow_system,
+        },
+    }
 }
 
 fn merge_providers(
@@ -944,6 +1081,18 @@ fn merge_agents(
         merged.entry(k).or_insert(v);
     }
     merged
+}
+
+/// FR-046: tool-grant overlays accumulate across config layers — a grant
+/// from a lower layer stays in force, later layers append entries not
+/// already present, and absent overlays stay empty (builtin set unchanged).
+fn merge_agents_tools(mut base: Vec<String>, ov: Vec<String>) -> Vec<String> {
+    for entry in ov {
+        if !base.contains(&entry) {
+            base.push(entry);
+        }
+    }
+    base
 }
 
 fn merge_features(base: FeatureConfig, ov: FeatureConfig) -> FeatureConfig {
@@ -1447,4 +1596,122 @@ pub fn save_model_selection(provider: &str, model: &str) -> Result<(), ZenError>
             reason: e.to_string(),
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wasm_sandbox_config_absent_section_defaults_deny_all() {
+        let config: ZenConfig = toml::from_str("").unwrap();
+        assert!(!config.sandbox.wasm.allow_filesystem_read);
+        assert!(!config.sandbox.wasm.allow_filesystem_write);
+        assert!(!config.sandbox.wasm.allow_network);
+        assert!(!config.sandbox.wasm.allow_system);
+    }
+
+    #[test]
+    fn wasm_sandbox_config_parses_present_section() {
+        let config: ZenConfig = toml::from_str(
+            r#"
+[sandbox.wasm]
+allow_network = true
+allow_system = true
+"#,
+        )
+        .unwrap();
+        assert!(config.sandbox.wasm.allow_network);
+        assert!(config.sandbox.wasm.allow_system);
+        assert!(!config.sandbox.wasm.allow_filesystem_read);
+        assert!(!config.sandbox.wasm.allow_filesystem_write);
+    }
+
+    #[test]
+    fn wasm_sandbox_config_partial_section_defaults_unset_keys() {
+        let config: ZenConfig =
+            toml::from_str("[sandbox.wasm]\nallow_filesystem_read = true\n").unwrap();
+        assert!(config.sandbox.wasm.allow_filesystem_read);
+        assert!(!config.sandbox.wasm.allow_filesystem_write);
+        assert!(!config.sandbox.wasm.allow_network);
+        assert!(!config.sandbox.wasm.allow_system);
+    }
+
+    #[test]
+    fn merge_sandbox_accumulates_grants_across_layers() {
+        let base: ZenConfig = toml::from_str("[sandbox.wasm]\nallow_network = true\n").unwrap();
+        let ov: ZenConfig = toml::from_str("[sandbox.wasm]\nallow_system = true\n").unwrap();
+        let merged = merge_configs(base, ov).unwrap();
+        assert!(merged.sandbox.wasm.allow_network);
+        assert!(merged.sandbox.wasm.allow_system);
+    }
+
+    #[test]
+    fn agents_tools_absent_section_defaults_empty() {
+        let config: ZenConfig = toml::from_str("").unwrap();
+        assert!(config.agents_tools.is_empty());
+    }
+
+    #[test]
+    fn agents_tools_parses_overlay_alongside_task_entries() {
+        let config: ZenConfig = toml::from_str(
+            r#"
+[agents]
+tools = ["plugin:*", "fs.*"]
+
+[agents.synthesis]
+provider = "ollama"
+
+[agents.Sisyphus]
+provider = "anthropic"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.agents_tools, vec!["plugin:*", "fs.*"]);
+        assert_eq!(
+            config
+                .agents
+                .get("synthesis")
+                .and_then(|a| a.provider.as_deref()),
+            Some("ollama")
+        );
+        assert_eq!(
+            config
+                .agents
+                .get("Sisyphus")
+                .and_then(|a| a.provider.as_deref()),
+            Some("anthropic")
+        );
+    }
+
+    #[test]
+    fn merge_agents_tools_accumulates_across_layers() {
+        let base: ZenConfig = toml::from_str("[agents]\ntools = [\"fs.*\"]\n").unwrap();
+        let ov: ZenConfig = toml::from_str("[agents]\ntools = [\"plugin:*\", \"fs.*\"]\n").unwrap();
+        let merged = merge_configs(base, ov).unwrap();
+        assert_eq!(merged.agents_tools, vec!["fs.*", "plugin:*"]);
+    }
+
+    #[test]
+    fn resolved_base_path_expands_tilde() {
+        let plugin = PluginConfig {
+            base_path: Some("~/.zen/plugins".into()),
+            ..PluginConfig::default()
+        };
+        let path = plugin.resolved_base_path().unwrap();
+        assert_ne!(path, PathBuf::from("~/.zen/plugins"));
+        assert!(path.ends_with(".zen/plugins"), "got: {}", path.display());
+    }
+
+    #[test]
+    fn resolved_base_path_keeps_absolute_path() {
+        let plugin = PluginConfig {
+            base_path: Some("/opt/zen/plugins".into()),
+            ..PluginConfig::default()
+        };
+        assert_eq!(
+            plugin.resolved_base_path(),
+            Some(PathBuf::from("/opt/zen/plugins"))
+        );
+    }
 }

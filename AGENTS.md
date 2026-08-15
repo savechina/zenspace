@@ -90,8 +90,8 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | zen-agents | 13 agents, 4-tier registry, blackboard, QualityPipeline | `crates/zen-agents/` |
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
 | zen-auth | Keychain + SecretRef resolution | `crates/zen-auth/` |
-| zen-plugin | WASM sandbox (wasmtime) + MCP server | `crates/zen-plugin/` |
-| zen-gateway | HTTP daemon (axum, placeholder) | `crates/zen-gateway/` |
+| zen-plugin | Agent tools, WASM sandbox (wasmtime), MCP client, plugin registry | `crates/zen-plugin/` |
+| zen-gateway | HTTP daemon (axum) + MCP server (stdio) | `crates/zen-gateway/` |
 
 ### Dependency Graph
 
@@ -334,7 +334,7 @@ bin/release patch        # Bump version, tag, push
 | `zen wiki` | Wiki ops: list, show, reindex, lint, distill | `wiki_command.rs` |
 | `zen brief` | Brief generation | `brief_command.rs` |
 | `zen model` | Model metadata + routing | `model_command.rs` |
-| `zen plugin` | Plugin management | `plugin_command.rs` |
+| `zen plugin` | Plugin management (install, enable, disable, rehash, tools list) | `plugin_command.rs` |
 | `zen auth` | Auth/keychain ops | `auth_command.rs` |
 | `zen habit` | Habit tracking | `habit_command.rs` |
 | `zen goal` | Goal management | `goal_command.rs` |
@@ -375,6 +375,15 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 - **Process hardening** (FR-044): `zen-core/src/process_hardening.rs` — PT_DENY_ATTACH/prctl, RLIMIT_CORE=0, LD_*/DYLD_* strip at startup
 - **Plugin framework** (FR-032..034): `Plugin` trait + `PluginApi`; `ZenWiring::with_sandbox_mode` accepts `Option<&PluginRegistry>` (FR-033 bridge); PluginKind pruned to Tool/Hook
 - **Plugin integrity** (FR-043): manifest `sha256` verified (HashMismatch rejection); macOS `.dylib` codesign-verified
+
+### Plugin Runtime Hardening (v0.0.6, FR-046..051)
+
+- **Config-driven agent grants** (FR-046): `[agents.tools]` overlay in 5-layer config merges builtin defaults with user patterns; supports exact names, `prefix.*`, and `plugin:*` wildcards (excludes reserved namespaces and builtin collisions)
+- **Strict sha256 + rehash recovery** (FR-049): manifest `sha256` is required for `*.wasm` entries; missing hash rejected with `MissingHash`; `zen plugin install` auto-writes hash; `zen plugin rehash <id>` recomputes after deliberate updates
+- **state.json persistence** (FR-047): `zen plugin enable/disable` writes to `{plugin-dir}/state.json` (`{"disabled": [...]}`); takes effect next session, no hot-unload; corrupt file fails open with a loud `warn`
+- **Plugin hook isolation** (FR-048): every plugin hook wrapped in fail-closed adapter; hook `Err` denies that invocation only (audit-correlated record), never aborts the round; plugin hooks invisible to `Confidential` invocations
+- **Plugin id validation + reserved namespaces** (FR-050): ids must match `^[a-z0-9_-]+$`; reserved prefixes (`fs`, `web`, `system`, `plugin`, `shell`) rejected at registration; spoofed builtin names blocked per-tool with `warn`
+- **Lazy WASM precompile** (FR-051): `WasmPluginTool` caches compiled `Module` via `OnceLock`; first invoke compiles, subsequent invocations reuse; wasm bytes held as `Arc<Vec<u8>>`
 
 ## FRAMEWORK PATTERNS
 

@@ -748,13 +748,22 @@ pub fn apply_resource_limits() -> Result<(), std::io::Error> {
     {
         use libc::{RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_NPROC, getrlimit, rlimit, setrlimit};
 
+        // libc types the rlimit resource argument per-target: glibc Linux uses
+        // `__rlimit_resource_t` (u32) for both the fns and the RLIMIT_* consts,
+        // while macOS/musl/BSD use `c_int`. Aliasing to libc's own type keeps
+        // `soft_cap` and the constants type-identical on every unix target.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        type RlimitResource = libc::__rlimit_resource_t;
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        type RlimitResource = libc::c_int;
+
         // Lower only the SOFT limit and keep the existing (or infinite) HARD
         // limit: setting rlim_max == rlim_cur made the cap irreversible, so a
         // busy process (tokio workers + reqwest pool + sqlx) that legitimately
         // exceeded NOFILE=256 or NPROC=50 failed with EMFILE/EAGAIN forever.
         // Soft-only caps still constrain the process and every descendant that
         // does not explicitly raise them.
-        fn soft_cap(resource: libc::c_int, cur: libc::rlim_t) -> Result<(), std::io::Error> {
+        fn soft_cap(resource: RlimitResource, cur: libc::rlim_t) -> Result<(), std::io::Error> {
             // SAFETY: getrlimit/setrlimit read/write the fully-initialized
             // stack struct below; no pointers escape. Return values checked.
             unsafe {

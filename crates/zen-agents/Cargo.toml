@@ -38,3 +38,4 @@ fs2 = { workspace = true }
 rig-core = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
 wat = "1"
+sha2 = { workspace = true }

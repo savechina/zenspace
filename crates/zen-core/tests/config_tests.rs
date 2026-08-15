@@ -567,3 +567,42 @@ fn llm_preference_eq_hash() {
     set.insert(LlmPreference::Any);
     assert_eq!(set.len(), 4);
 }
+
+// ============================================================================
+// FR-046: [agents.tools] grant overlay
+// ============================================================================
+
+#[test]
+fn embedded_config_agents_tools_overlay_defaults_empty() {
+    let config = load_embedded_config().expect("Embedded config should load");
+    assert!(
+        config.agents_tools.is_empty(),
+        "embedded default overlay must be empty (builtin grant set unchanged)"
+    );
+    assert!(
+        config.agents.contains_key("synthesis"),
+        "task entries must still parse alongside the overlay block"
+    );
+}
+
+#[test]
+fn agents_tools_overlay_parses_from_toml() {
+    let config: ZenConfig = toml::from_str(
+        r#"
+[agents]
+tools = ["plugin:*"]
+
+[agents.research]
+provider = "ollama"
+"#,
+    )
+    .expect("overlay TOML must parse");
+    assert_eq!(config.agents_tools, vec!["plugin:*"]);
+    assert!(config.agents.contains_key("research"));
+}
+
+#[test]
+fn agents_tools_default_constructs_empty() {
+    let config = ZenConfig::default();
+    assert!(config.agents_tools.is_empty());
+}

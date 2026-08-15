@@ -33,8 +33,9 @@ use zen_core::sandbox::{
 };
 use zen_core::types::Sensitivity;
 use zen_memory::ZenMemvidStore;
-use zen_plugin::registry::PluginEntry;
-use zen_plugin::{Plugin, PluginApi};
+use zen_plugin::registry::{Lifecycle, PluginEntry};
+use zen_plugin::wasm_sandbox::{WasmPermissions, WasmSandbox};
+use zen_plugin::{Plugin, PluginApi, WasmPlugin};
 use zen_vault::tools::{ZenTool, ZenToolError};
 
 // Re-exports for consumers
@@ -168,23 +169,21 @@ impl Skill for DistillationPipelineSkillAdapter {
 // Plugin instantiation (FR-033)
 // ---------------------------------------------------------------------------
 
-/// Instantiate a plugin from a registry entry.
+/// Instantiate a plugin from a registry entry (T089).
 ///
-/// MVP scope: native (`.dylib`/`.so`) loading is not yet supported and
-/// returns an error (logged, never fatal). `.wasm` entries are deferred to
-/// the WASM executor integration — logged and skipped so a plugin directory
-/// with wasm plugins does not block wiring construction.
-fn instantiate_plugin(entry: &PluginEntry) -> Result<Option<Box<dyn Plugin>>, String> {
+/// `.wasm` entries load through [`WasmPlugin::from_entry`] under the
+/// wiring's WASM permission policy. Native (`.dylib`/`.so`) loading is
+/// out of scope and returns an error (logged, never fatal).
+fn instantiate_plugin(
+    entry: &PluginEntry,
+    policy: &WasmPermissions,
+) -> Result<Option<Box<dyn Plugin>>, String> {
     let Some(entry_file) = &entry.manifest.entry else {
         return Err("plugin has no entry file".to_string());
     };
 
     if entry_file.ends_with(".wasm") {
-        tracing::info!(
-            plugin = %entry.manifest.id,
-            "wasm plugin loading deferred to WASM executor integration"
-        );
-        return Ok(None);
+        return WasmPlugin::from_entry(entry, policy).map(|p| Some(Box::new(p) as Box<dyn Plugin>));
     }
 
     Err("native plugin loading not yet supported".to_string())
@@ -259,6 +258,10 @@ impl ZenWiring {
             Err(e) => tracing::warn!("failed to apply resource limits: {}", e),
         }
 
+        // T091: `[sandbox.wasm]` permission policy (deny-all by default).
+        // Shared by the `plugin.wasm_sandbox` tool and every `.wasm` plugin.
+        let wasm_policy = Self::load_wasm_policy();
+
         let skills = SkillRegistry::new();
         let mut tools = ToolRegistry::new();
         let delegates = DelegateRegistry::new();
@@ -284,7 +287,11 @@ impl ZenWiring {
         tools.register(Arc::new(
             zen_plugin::platform::fs_watcher::FsWatcherTool::new(),
         ));
-        tools.register(Arc::new(zen_plugin::wasm_sandbox::WasmSandboxTool::new()));
+        tools.register(Arc::new(
+            zen_plugin::wasm_sandbox::WasmSandboxTool::with_sandbox(
+                WasmSandbox::new().with_policy(wasm_policy.clone()),
+            ),
+        ));
 
         let sandbox_validator = SandboxValidator::new(mode, workspace_roots.clone());
 
@@ -353,36 +360,79 @@ impl ZenWiring {
         let (mut sandbox_hooks, confidentiality_sensitivity) =
             Self::build_sandbox_hooks(mode, &workspace_roots);
 
-        if let Some(registry) = plugins {
-            let enabled: Vec<_> = registry.list_enabled().collect();
-            let workspace_root = workspace_roots
-                .first()
-                .map(|p| p.as_path())
-                .unwrap_or_else(|| std::path::Path::new(""));
-            for entry in enabled {
-                match instantiate_plugin(entry) {
-                    Ok(Some(plugin)) => {
-                        let mut api =
-                            PluginApi::new(&mut tools, &mut sandbox_hooks, workspace_root);
-                        match plugin.activate(&mut api) {
-                            Ok(()) => {
-                                tracing::info!(plugin = %entry.manifest.id, "plugin activated")
-                            }
-                            Err(e) => tracing::warn!(
-                                plugin = %entry.manifest.id,
-                                error = %e,
-                                "plugin activate failed"
-                            ),
+        // T099/FR-050b: plugin tools must not spoof builtin names — every
+        // PluginApi gets the builtin tool list for the collision guard.
+        let builtin_tool_names: Vec<String> = tools
+            .schemas()
+            .iter()
+            .map(|schema| schema.name.clone())
+            .collect();
+
+        // T101–T103/FR-048: hook-isolation config — the sensitivity table
+        // that keeps Confidential invocations (shell.exec) invisible to
+        // plugin hooks, and the audit log shared with the builtin audit
+        // hook so denial records land in the same audit trail.
+        let plugin_hook_sensitivity: Arc<HashMap<String, Sensitivity>> =
+            Arc::new(tool_sensitivity.clone());
+        let plugin_audit_log_path = Self::audit_log_path(&workspace_roots);
+
+        // T088: resolve the plugin registry — self-discover from
+        // `[plugin] base_path` when none is passed (production path);
+        // snapshot the caller's registry otherwise so lifecycle
+        // transitions can be recorded without mutating the input.
+        let mut plugin_registry = match plugins {
+            Some(registry) => Self::snapshot_plugin_registry(registry),
+            None => Self::discover_plugin_registry(),
+        };
+
+        // Entries marked Failed by discovery-time integrity verification
+        // (FR-043 sha256 mismatch) must never activate, even though their
+        // `enabled` flag is still set.
+        let enabled: Vec<PluginEntry> = plugin_registry
+            .list_enabled()
+            .filter(|entry| entry.lifecycle != Lifecycle::Failed)
+            .cloned()
+            .collect();
+        let workspace_root = workspace_roots
+            .first()
+            .map(|p| p.as_path())
+            .unwrap_or_else(|| std::path::Path::new(""));
+        for entry in enabled {
+            let id = entry.manifest.id.clone();
+            match instantiate_plugin(&entry, &wasm_policy) {
+                Ok(Some(plugin)) => {
+                    let mut api =
+                        PluginApi::new(&id, &mut tools, &mut sandbox_hooks, workspace_root)
+                            .with_builtin_tool_names(builtin_tool_names.clone())
+                            .with_isolation(
+                                Arc::clone(&plugin_hook_sensitivity),
+                                plugin_audit_log_path.clone(),
+                            );
+                    match plugin.activate(&mut api) {
+                        Ok(()) => {
+                            tracing::info!(plugin = %id, "plugin activated");
+                            let _ = plugin_registry.set_lifecycle(&id, Lifecycle::Running);
+                        }
+                        Err(e) => {
+                            tracing::warn!(plugin = %id, error = %e, "plugin activate failed");
+                            let _ = plugin_registry.set_lifecycle(&id, Lifecycle::Failed);
                         }
                     }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(
-                        plugin = %entry.manifest.id,
-                        error = %e,
-                        "plugin instantiation failed"
-                    ),
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(plugin = %id, error = %e, "plugin instantiation failed");
+                    let _ = plugin_registry.set_lifecycle(&id, Lifecycle::Failed);
                 }
             }
+        }
+
+        // Plugin-registered tools default to Private sensitivity so the MCP
+        // exposure filter (build_mcp_registry) treats them safely.
+        for schema in tools.schemas() {
+            tool_sensitivity
+                .entry(schema.name)
+                .or_insert(Sensitivity::Private);
         }
 
         Self {
@@ -396,6 +446,75 @@ impl ZenWiring {
             mcp_connected: Arc::new(AtomicBool::new(false)),
             confidentiality_sensitivity,
         }
+    }
+
+    /// Load the `[sandbox.wasm]` permission policy from the merged zen
+    /// config (T091). Absent section → deny-all (preserves pre-config
+    /// behavior); config load failure is non-fatal and also deny-all.
+    fn load_wasm_policy() -> WasmPermissions {
+        match zen_core::config::load_config() {
+            Ok(config) => {
+                let wasm = &config.sandbox.wasm;
+                WasmPermissions {
+                    allow_filesystem_read: wasm.allow_filesystem_read,
+                    allow_filesystem_write: wasm.allow_filesystem_write,
+                    allow_network: wasm.allow_network,
+                    allow_system: wasm.allow_system,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ZenWiring: config unavailable, using deny-all WASM policy"
+                );
+                WasmPermissions::default()
+            }
+        }
+    }
+
+    /// Self-discover the plugin registry at construction time (T088).
+    /// Prefers `[plugin] base_path` from the loaded config (tilde-expanded),
+    /// falling back to `PluginRegistry::new()`'s default location.
+    fn discover_plugin_registry() -> zen_plugin::registry::PluginRegistry {
+        let plugin_dir = zen_core::config::load_config()
+            .ok()
+            .and_then(|config| config.plugin.resolved_base_path());
+        Self::discover_plugins_in_dir(plugin_dir)
+    }
+
+    /// Discover plugins in `dir` (`None` → default plugin dir). Discovery
+    /// failures are logged at warn and never fatal — wiring construction
+    /// continues with whatever was discovered (possibly nothing).
+    fn discover_plugins_in_dir(dir: Option<PathBuf>) -> zen_plugin::registry::PluginRegistry {
+        use zen_plugin::registry::PluginRegistry;
+
+        let mut registry = match dir {
+            Some(dir) => PluginRegistry::with_plugin_dir(dir),
+            None => PluginRegistry::new(),
+        };
+
+        if let Err(e) = registry.discover() {
+            tracing::warn!(
+                error = %e,
+                "ZenWiring: plugin discovery failed, continuing without plugins"
+            );
+        }
+        registry
+    }
+
+    /// Copy a caller-supplied registry into an owned one so the activation
+    /// loop can record lifecycle transitions without mutating the input.
+    fn snapshot_plugin_registry(
+        registry: &zen_plugin::registry::PluginRegistry,
+    ) -> zen_plugin::registry::PluginRegistry {
+        use zen_plugin::registry::PluginRegistry;
+
+        let mut snapshot = PluginRegistry::with_plugin_dir(registry.plugin_dir().clone());
+        for entry in registry.list() {
+            // Duplicate ids cannot occur: the source is keyed by plugin id.
+            let _ = snapshot.register(entry.clone());
+        }
+        snapshot
     }
 
     /// Build the per-tool arg-key registry for the seatbelt (FR-035).
@@ -432,6 +551,16 @@ impl ZenWiring {
         registry
     }
 
+    /// Resolve the dispatch audit log path for a workspace scope. Shared
+    /// by the builtin audit hook and the FR-048 plugin-hook isolation
+    /// adapter so denial records land in the same audit trail.
+    fn audit_log_path(workspace_roots: &[std::path::PathBuf]) -> std::path::PathBuf {
+        workspace_roots
+            .first()
+            .map(|root| root.join("logs").join("audit.jsonl"))
+            .unwrap_or_else(|| std::path::PathBuf::from("logs/audit.jsonl"))
+    }
+
     /// Build the dispatch-time sandbox hook pipeline.
     ///
     /// Order matters: confidentiality gate blocks cloud tools in
@@ -448,10 +577,7 @@ impl ZenWiring {
         let policy = SeatbeltPolicy::new(mode, workspace_roots.to_vec())
             .with_timeout(300)
             .with_arg_registry(Self::build_tool_arg_registry());
-        let audit_log_path = workspace_roots
-            .first()
-            .map(|root| root.join("logs").join("audit.jsonl"))
-            .unwrap_or_else(|| std::path::PathBuf::from("logs/audit.jsonl"));
+        let audit_log_path = Self::audit_log_path(workspace_roots);
 
         let confidentiality =
             zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(Sensitivity::Private);
@@ -886,6 +1012,160 @@ mod tests {
         assert_eq!(wiring.tools.len(), 21);
     }
 
+    fn write_wasm_plugin(dir: &std::path::Path, id: &str) {
+        use sha2::{Digest, Sha256};
+
+        let plugin_dir = dir.join(id);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let wasm =
+            wat::parse_str(r#"(module (func (export "ping")) (func (export "_start")))"#).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), &wasm).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm);
+        let sha256: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "id = \"{id}\"\nname = \"Demo\"\nversion = \"0.1.0\"\ntype = \"tool\"\n\
+                 permissions = []\nentry = \"plugin.wasm\"\nsha256 = \"{sha256}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn with_sandbox_mode_loads_discovered_wasm_plugin_as_namespaced_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        write_wasm_plugin(dir.path(), "demo_plugin");
+
+        let mut registry =
+            zen_plugin::registry::PluginRegistry::with_plugin_dir(dir.path().to_path_buf());
+        registry.discover().unwrap();
+
+        let wiring = ZenWiring::with_sandbox_mode(
+            SandboxMode::WorkspaceWrite,
+            vec![dir.path().to_path_buf()],
+            Some(&registry),
+        );
+
+        // Exported func registered under {plugin_id}.{func}; _start excluded.
+        assert!(wiring.tools.get("demo_plugin.ping").is_ok());
+        assert!(wiring.tools.get("demo_plugin._start").is_err());
+        assert_eq!(wiring.tools.len(), 22);
+
+        // Plugin tools default to Private sensitivity and stay MCP-exposed
+        // (non-Confidential) per build_mcp_registry filtering.
+        assert_eq!(
+            wiring.tool_sensitivity("demo_plugin.ping"),
+            Sensitivity::Private
+        );
+        assert!(wiring.build_mcp_registry().get("demo_plugin.ping").is_ok());
+    }
+
+    #[test]
+    fn with_sandbox_mode_self_discovers_when_no_registry_passed() {
+        // T088: None → wiring self-discovers from the configured plugin dir
+        // (empty on this machine). An empty/missing dir must not break
+        // construction — discovery is never fatal.
+        let wiring = ZenWiring::with_sandbox_mode(SandboxMode::WorkspaceWrite, Vec::new(), None);
+        assert!(wiring.tools.get("plugin.wasm_sandbox").is_ok());
+        assert!(wiring.tools.get("fs.read").is_ok());
+    }
+
+    #[test]
+    fn discover_plugins_in_dir_failure_is_nonfatal() {
+        // A plugin dir path occupied by a regular file makes discover()
+        // fail; the helper must return an empty registry without panicking.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let registry = ZenWiring::discover_plugins_in_dir(Some(file.path().to_path_buf()));
+        assert_eq!(registry.count(), 0);
+    }
+
+    // ── SC-013 (FR-033 completion gate): drop-in plugin → discovered →
+    //    namespaced tool → callable through the wiring ToolRegistry ────────
+
+    #[tokio::test]
+    async fn sc013_echo_plugin_discovered_and_callable() {
+        use sha2::{Digest, Sha256};
+        use zen_plugin::registry::Lifecycle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let echo_dir = dir.path().join("echo");
+        std::fs::create_dir_all(&echo_dir).unwrap();
+        let wasm = wat::parse_str(r#"(module (func (export "hello")))"#).unwrap();
+        std::fs::write(echo_dir.join("echo.wasm"), &wasm).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&wasm);
+        let sha256: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+
+        std::fs::write(
+            echo_dir.join("manifest.toml"),
+            format!(
+                "id = \"echo\"\nname = \"Echo\"\nversion = \"0.1.0\"\ntype = \"tool\"\n\
+                 permissions = []\nentry = \"echo.wasm\"\nsha256 = \"{sha256}\"\n"
+            ),
+        )
+        .unwrap();
+
+        // Failure-isolation fixture: same valid wasm, sha256 that cannot match.
+        let bogus_dir = dir.path().join("bogus");
+        std::fs::create_dir_all(&bogus_dir).unwrap();
+        std::fs::write(bogus_dir.join("bogus.wasm"), &wasm).unwrap();
+        std::fs::write(
+            bogus_dir.join("manifest.toml"),
+            "id = \"bogus\"\nname = \"Bogus\"\nversion = \"0.1.0\"\ntype = \"tool\"\n\
+             permissions = []\nentry = \"bogus.wasm\"\nsha256 = \"deadbeef\"\n",
+        )
+        .unwrap();
+
+        let mut registry =
+            zen_plugin::registry::PluginRegistry::with_plugin_dir(dir.path().to_path_buf());
+        assert_eq!(
+            registry.discover().unwrap(),
+            1,
+            "integrity-failed plugins are not counted"
+        );
+        assert_ne!(
+            registry.get("echo").unwrap().lifecycle,
+            Lifecycle::Failed,
+            "echo integrity must pass"
+        );
+        assert_eq!(
+            registry.get("bogus").unwrap().lifecycle,
+            Lifecycle::Failed,
+            "sha256 mismatch must mark the plugin Failed"
+        );
+
+        let wiring = ZenWiring::with_sandbox_mode(
+            SandboxMode::WorkspaceWrite,
+            vec![dir.path().to_path_buf()],
+            Some(&registry),
+        );
+
+        let tool = wiring
+            .tools
+            .get("echo.hello")
+            .expect("echo.hello must be registered as a namespaced tool");
+        let result = tool.invoke(serde_json::json!({})).await.unwrap();
+        assert_eq!(result["output"]["exit_code"], 0);
+        assert_eq!(result["metrics"]["plugin"], "echo");
+        assert_eq!(result["metrics"]["func_name"], "hello");
+
+        // Integrity-failed plugin is isolated: no tools, echo unaffected.
+        assert!(wiring.tools.get("bogus.hello").is_err());
+        assert_eq!(wiring.tools.len(), 22, "21 builtin tools + echo.hello");
+    }
+
     // ── FR-035: arg-registry end-to-end via ZenWiring hook pipeline ─────────
 
     #[tokio::test]
@@ -963,5 +1243,306 @@ mod tests {
             ),
             "write to metadata path via wasm_path must be blocked, got {action:?}"
         );
+    }
+
+    // ── FR-048 (Lane C): plugin hook isolation through the real pipeline ──
+    //
+    // These build the exact assembly `with_sandbox_mode` produces — the
+    // 5-hook builtin pipeline plus a plugin hook registered through
+    // `PluginApi` with wiring-injected isolation config — and drive a full
+    // dispatch round through `rig_compose`'s hook runner.
+
+    struct ProbeTool(&'static str);
+
+    #[async_trait]
+    impl Tool for ProbeTool {
+        fn schema(&self) -> rig_compose::tool::ToolSchema {
+            rig_compose::tool::ToolSchema {
+                name: self.0.to_string(),
+                description: self.0.to_string(),
+                args_schema: serde_json::json!({}),
+                result_schema: serde_json::json!({}),
+            }
+        }
+
+        async fn invoke(&self, _args: Value) -> Result<Value, KernelError> {
+            Ok(serde_json::json!({ "ran": self.0 }))
+        }
+    }
+
+    /// Plugin hook fixture that errors on `deny_target` (T109).
+    struct GlitchyHook {
+        deny_target: String,
+    }
+
+    #[async_trait]
+    impl ToolDispatchHook for GlitchyHook {
+        async fn before_invocation(
+            &self,
+            invocation: &rig_compose::normalizer::ToolInvocation,
+        ) -> Result<rig_compose::normalizer::ToolDispatchAction, KernelError> {
+            if invocation.name == self.deny_target {
+                return Err(KernelError::ToolFailed("plugin hook exploded".to_string()));
+            }
+            Ok(rig_compose::normalizer::ToolDispatchAction::Continue)
+        }
+    }
+
+    /// Plugin hook fixture that records every observation (Confidential
+    /// invisibility spy).
+    struct ObservingHook {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ToolDispatchHook for ObservingHook {
+        async fn before_invocation(
+            &self,
+            invocation: &rig_compose::normalizer::ToolInvocation,
+        ) -> Result<rig_compose::normalizer::ToolDispatchAction, KernelError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("before:{}", invocation.name));
+            Ok(rig_compose::normalizer::ToolDispatchAction::Continue)
+        }
+
+        async fn after_invocation(
+            &self,
+            result: &rig_compose::normalizer::ToolInvocationResult,
+        ) -> Result<(), KernelError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("after:{}", result.invocation.name));
+            Ok(())
+        }
+    }
+
+    fn wiring_style_sensitivity() -> Arc<HashMap<String, Sensitivity>> {
+        // Mirrors the entries wiring injects for the tools under test.
+        let mut map = HashMap::new();
+        map.insert("shell.exec".to_string(), Sensitivity::Confidential);
+        map.insert("fs.read".to_string(), Sensitivity::Public);
+        Arc::new(map)
+    }
+
+    fn hook_refs<'h>(
+        builtin: &'h [Box<dyn ToolDispatchHook>],
+        plugin: &'h [Box<dyn ToolDispatchHook>],
+    ) -> Vec<&'h dyn ToolDispatchHook> {
+        builtin
+            .iter()
+            .chain(plugin.iter())
+            .map(|hook| hook.as_ref() as &dyn ToolDispatchHook)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn t109_plugin_hook_error_denies_only_its_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = ZenWiring::audit_log_path(&[dir.path().to_path_buf()]);
+        let (sandbox_hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
+            SandboxMode::WorkspaceWrite,
+            &[dir.path().to_path_buf()],
+        );
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ProbeTool("alpha.echo")));
+        tools.register(Arc::new(ProbeTool("beta.echo")));
+
+        let mut plugin_hooks: Vec<Box<dyn ToolDispatchHook>> = Vec::new();
+        let mut api = PluginApi::new("glitchy", &mut tools, &mut plugin_hooks, dir.path())
+            .with_isolation(wiring_style_sensitivity(), audit.clone());
+        api.register_hook(Box::new(GlitchyHook {
+            deny_target: "alpha.echo".to_string(),
+        }));
+
+        let invocations = vec![
+            rig_compose::normalizer::ToolInvocation {
+                name: "alpha.echo".to_string(),
+                args: serde_json::json!({}),
+            },
+            rig_compose::normalizer::ToolInvocation {
+                name: "beta.echo".to_string(),
+                args: serde_json::json!({}),
+            },
+        ];
+        let all_hooks = hook_refs(&sandbox_hooks, &plugin_hooks);
+        let results = rig_compose::normalizer::dispatch_tool_invocations_with_hooks(
+            &tools,
+            &invocations,
+            &all_hooks,
+        )
+        .await
+        .expect("round must not abort on plugin hook Err (FR-048a)");
+
+        assert_eq!(results.len(), 2);
+        // Denying hook: THIS invocation is denied fail-closed...
+        assert!(
+            results[0].output["error"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("denied by plugin hook 'glitchy'")),
+            "denied output: {}",
+            results[0].output
+        );
+        // ...while the sibling in the same round executed for real.
+        assert_eq!(results[1].output["ran"], "beta.echo");
+
+        // FR-048c: the denial is audit-correlated.
+        let audit_text = std::fs::read_to_string(&audit).unwrap();
+        let denial: serde_json::Value = audit_text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| record["outcome"] == "denied_by_plugin_hook")
+            .expect("audit must contain a denied_by_plugin_hook record");
+        assert_eq!(denial["tool"], "alpha.echo");
+        assert_eq!(denial["plugin"], "glitchy");
+        assert_eq!(denial["success"], false);
+    }
+
+    #[tokio::test]
+    async fn confidential_invocations_are_invisible_to_plugin_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = ZenWiring::audit_log_path(&[dir.path().to_path_buf()]);
+        let (sandbox_hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
+            SandboxMode::WorkspaceWrite,
+            &[dir.path().to_path_buf()],
+        );
+
+        // Dummy tools named after real sensitivity entries; dispatching
+        // through the pipeline exercises the wiring-shaped sensitivity map.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(ProbeTool("shell.exec")));
+        tools.register(Arc::new(ProbeTool("fs.read")));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut plugin_hooks: Vec<Box<dyn ToolDispatchHook>> = Vec::new();
+        let mut api = PluginApi::new("spy", &mut tools, &mut plugin_hooks, dir.path())
+            .with_isolation(wiring_style_sensitivity(), audit);
+        api.register_hook(Box::new(ObservingHook {
+            seen: Arc::clone(&seen),
+        }));
+
+        let invocations = vec![
+            rig_compose::normalizer::ToolInvocation {
+                name: "shell.exec".to_string(),
+                args: serde_json::json!({}),
+            },
+            rig_compose::normalizer::ToolInvocation {
+                name: "fs.read".to_string(),
+                args: serde_json::json!({}),
+            },
+        ];
+        let all_hooks = hook_refs(&sandbox_hooks, &plugin_hooks);
+        let results = rig_compose::normalizer::dispatch_tool_invocations_with_hooks(
+            &tools,
+            &invocations,
+            &all_hooks,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 2, "both invocations must dispatch");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["before:fs.read", "after:fs.read"],
+            "plugin hook must observe nothing for the Confidential invocation"
+        );
+    }
+    #[test]
+    fn t112_reserved_prefix_plugin_rejected_via_wiring() {
+        use sha2::{Digest, Sha256};
+        use zen_plugin::registry::PluginRegistry;
+
+        fn write_hashed_wasm_plugin(dir: &std::path::Path, id: &str, func: &str) {
+            let plugin_dir = dir.join(id);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            let wasm = wat::parse_str(format!(
+                r#"(module (func (export "{func}")) (func (export "_start")))"#
+            ))
+            .unwrap();
+            std::fs::write(plugin_dir.join("plugin.wasm"), &wasm).unwrap();
+
+            let mut hasher = Sha256::new();
+            hasher.update(&wasm);
+            let sha256: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    "id = \"{id}\"\nname = \"Demo\"\nversion = \"0.1.0\"\ntype = \"tool\"\n\
+                     permissions = []\nentry = \"plugin.wasm\"\nsha256 = \"{sha256}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // "fs" is a valid-charset id but a reserved top-level namespace:
+        // its tools would spoof the fs.* builtin namespace.
+        write_hashed_wasm_plugin(dir.path(), "fs", "spoof");
+        write_hashed_wasm_plugin(dir.path(), "good", "ping");
+
+        let mut registry = PluginRegistry::with_plugin_dir(dir.path().to_path_buf());
+        registry.discover().unwrap();
+
+        let wiring = ZenWiring::with_sandbox_mode(
+            SandboxMode::WorkspaceWrite,
+            vec![dir.path().to_path_buf()],
+            Some(&registry),
+        );
+
+        assert!(
+            wiring.tools.get("fs.spoof").is_err(),
+            "reserved-prefix plugin tool must be rejected (FR-050b)"
+        );
+        assert!(
+            wiring.tools.get("good.ping").is_ok(),
+            "sibling plugin's tools must still register"
+        );
+        assert_eq!(wiring.tools.len(), 22, "21 builtin tools + good.ping only");
+    }
+
+    // ── FR-046c(4): grant overlay does not change MCP exposure ───────────
+
+    #[test]
+    fn fr046_grant_overlay_leaves_mcp_exposure_filter_unchanged() {
+        use crate::delegate_tools::resolve_agent_tool_grants;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_wasm_plugin(dir.path(), "demo_plugin");
+        let mut registry =
+            zen_plugin::registry::PluginRegistry::with_plugin_dir(dir.path().to_path_buf());
+        registry.discover().unwrap();
+
+        let wiring = ZenWiring::with_sandbox_mode(
+            SandboxMode::WorkspaceWrite,
+            vec![dir.path().to_path_buf()],
+            Some(&registry),
+        );
+
+        let overlay = vec!["plugin:*".to_string()];
+        let granted = resolve_agent_tool_grants("Sisyphus", &overlay, &wiring.tools);
+        assert!(
+            granted.contains(&"demo_plugin.ping".to_string()),
+            "plugin:* overlay must grant the plugin tool to the agent"
+        );
+
+        // FR-017 regression: grants only widen agent-side reach; the
+        // external MCP registry keeps filtering Confidential regardless.
+        let mcp = wiring.build_mcp_registry();
+        assert!(
+            mcp.get("demo_plugin.ping").is_ok(),
+            "Private plugin tool stays MCP-exposed"
+        );
+        assert!(
+            mcp.get("shell.exec").is_err(),
+            "Confidential builtin must stay excluded from MCP exposure"
+        );
+        assert!(mcp.get("fs.read").is_ok());
     }
 }

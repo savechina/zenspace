@@ -172,6 +172,20 @@ default_model = "command-r"
 # Agent task routing — which provider/model per task
 # =============================================================================
 
+# Agent tool-grant overlay (FR-046). Additive on top of the builtin
+# per-agent grant map; entries are:
+#   - exact tool names   (e.g. "shell.exec")
+#   - prefix wildcards   (e.g. "fs.*" — every tool whose name starts with "fs.")
+#   - "plugin:*"         — every plugin-registered tool, EXCLUDING names under
+#                          reserved namespaces (fs/web/system/plugin/shell)
+#                          and builtin tool names
+# A pattern matching nothing (e.g. a plugin not yet installed) is silently
+# idle — grants may precede plugin installation. Empty (default) keeps the
+# builtin grant set unchanged. Overlays accumulate across config layers.
+
+[agents]
+tools = []
+
 # Knowledge pipeline tasks (legacy)
 [agents.notion_extraction]
 provider = "ollama"
@@ -425,6 +439,15 @@ disclaimer_acknowledged = false
 # RFC1918 ranges; allow_hosts exempts specific hosts (local providers).
 # allow_hosts = ["localhost", "127.0.0.1"]
 # allow_private_ranges = false
+
+[sandbox.wasm]
+# WASM sandbox permission policy (T091, FR-029). Plugins declare permissions
+# in their manifest.toml; a plugin loads only if this policy grants every
+# declared permission. Defaults are deny-all — uncomment to grant.
+# allow_filesystem_read = false
+# allow_filesystem_write = false
+# allow_network = false
+# allow_system = false
 
 [session]
 # Drain window for SIGINT/SIGTERM graceful shutdown (FR-041).

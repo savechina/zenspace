@@ -34,7 +34,9 @@ impl Default for ToolAuditHook {
     }
 }
 
-fn arg_keys(args: &Value) -> Vec<String> {
+// FR-048c: the hook-isolation adapter (hook_isolation.rs) must write denial
+// records through this same append path so all audit lines stay uniform.
+pub(crate) fn arg_keys(args: &Value) -> Vec<String> {
     match args {
         Value::Object(map) => map.keys().cloned().collect(),
         _ => vec![],
@@ -64,7 +66,8 @@ fn build_record(
     record
 }
 
-fn append_record(record: &Value, log_path: &PathBuf) {
+// FR-048c: shared with the hook-isolation adapter for uniform audit appends.
+pub(crate) fn append_record(record: &Value, log_path: &PathBuf) {
     let line = match serde_json::to_string(record) {
         Ok(mut s) => {
             s.push('\n');

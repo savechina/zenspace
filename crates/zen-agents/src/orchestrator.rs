@@ -41,6 +41,9 @@ pub struct AgentOrchestrator {
     memvid_store: Option<rig_memvid::MemvidStore>,
     persist_hook: Option<MemvidPersistHook<rig_core::completion::CompletionRequest>>,
     quality_pipeline: QualityPipeline,
+    /// FR-046 `[agents] tools` overlay applied on top of the builtin
+    /// per-agent grant map when building agents and delegates.
+    tool_overlay: Vec<String>,
 }
 
 impl AgentOrchestrator {
@@ -55,7 +58,8 @@ impl AgentOrchestrator {
         if memvid_store.is_some() {
             debug!("AgentOrchestrator: auto-wired memvid store from ZenWiring");
         }
-        let delegates = ZenDelegateTools::new(&wiring, &router);
+        let tool_overlay = delegate_tools::load_tool_grant_overlay();
+        let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(100_000));
         Self {
@@ -67,6 +71,7 @@ impl AgentOrchestrator {
             memvid_store,
             persist_hook,
             quality_pipeline: QualityPipeline::new(),
+            tool_overlay,
         }
     }
 
@@ -78,7 +83,8 @@ impl AgentOrchestrator {
             let config = zen_memory::default_memory_config();
             zen_memory::create_persist_hook(store.clone(), config)
         });
-        let delegates = ZenDelegateTools::new(&wiring, &router);
+        let tool_overlay = delegate_tools::load_tool_grant_overlay();
+        let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(capacity));
         Self {
@@ -90,6 +96,7 @@ impl AgentOrchestrator {
             memvid_store,
             persist_hook,
             quality_pipeline: QualityPipeline::new(),
+            tool_overlay,
         }
     }
 
@@ -144,7 +151,11 @@ impl AgentOrchestrator {
 
     async fn build_agent(&self, agent_name: &str) -> Result<ZenAgent> {
         let skills = delegate_tools::resolve_skill_ids_for_agent(agent_name);
-        let tools = delegate_tools::resolve_tool_ids_for_agent(agent_name);
+        let tools = delegate_tools::resolve_agent_tool_grants(
+            agent_name,
+            &self.tool_overlay,
+            &self.wiring.tools,
+        );
         debug!(
             "building agent: {}",
             delegate_tools::describe_agent(agent_name, &self.registry)

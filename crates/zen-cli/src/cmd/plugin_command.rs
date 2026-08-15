@@ -5,6 +5,7 @@ use colored::Colorize;
 use tracing::{debug, warn};
 
 use zen_core::errors::ZenError;
+use zen_plugin::registry::PluginState;
 use zen_plugin::{Lifecycle, PluginEntry, PluginKind, PluginRegistry};
 
 #[derive(Subcommand)]
@@ -27,14 +28,23 @@ pub enum PluginCommands {
         /// Plugin ID to remove
         id: String,
     },
-    /// Enable a plugin
+    /// Enable a plugin (persists to state.json; takes effect at next session
+    /// start — running sessions are not hot-reloaded)
     Enable {
         /// Plugin ID to enable
         id: String,
     },
-    /// Disable a plugin
+    /// Disable a plugin (persists to state.json; takes effect at next
+    /// session start — no hot-unload of running sessions)
     Disable {
         /// Plugin ID to disable
+        id: String,
+    },
+    /// Recompute a plugin's entry sha256 and rewrite its manifest — the
+    /// recovery path after a deliberate plugin update (integrity failures
+    /// reject the plugin until you rehash)
+    Rehash {
+        /// Plugin ID whose entry hash should be recomputed
         id: String,
     },
     /// Discover and load plugins from plugin directory
@@ -171,6 +181,33 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
 
             let target_dir = registry.plugin_dir().join(&plugin_id);
             if target_dir.exists() {
+                // T094 (FR-049b): the early return used to skip hash work
+                // entirely — make sure the already-installed manifest carries
+                // a hash (recompute + rewrite when missing).
+                let installed_manifest = target_dir.join("manifest.toml");
+                match PluginEntry::from_manifest_path(&installed_manifest) {
+                    Ok(installed) => {
+                        if installed.manifest.sha256.is_none() && installed.manifest.entry.is_some()
+                        {
+                            installed.rehash_manifest().map_err(|e| {
+                                ZenError::Service(format!(
+                                    "Failed to write sha256 for installed plugin '{}': {}",
+                                    plugin_id, e
+                                ))
+                            })?;
+                            println!(
+                                "  {} Wrote missing sha256 into installed manifest",
+                                "✓".green().bold()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Installed plugin '{}' has an unreadable manifest: {}",
+                            plugin_id, e
+                        );
+                    }
+                }
                 println!(
                     "{} Plugin '{}' is already installed at: {}",
                     "⚠️".yellow(),
@@ -188,6 +225,32 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
 
             // FR-043: verify integrity of the installed copy before declaring success.
             let installed_manifest_path = target_dir.join("manifest.toml");
+            let installed_entry = match PluginEntry::from_manifest_path(&installed_manifest_path) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    registry.unregister(&plugin_id).ok();
+                    std::fs::remove_dir_all(&target_dir).ok();
+                    return Err(ZenError::Service(format!(
+                        "Failed to load installed manifest: {}",
+                        e
+                    )));
+                }
+            };
+
+            // T094 (FR-049b): always auto-write the entry sha256 into the
+            // installed manifest — users never hand-compute hashes.
+            if installed_entry.manifest.entry.is_some()
+                && let Err(e) = installed_entry.rehash_manifest()
+            {
+                registry.unregister(&plugin_id).ok();
+                std::fs::remove_dir_all(&target_dir).ok();
+                return Err(ZenError::Service(format!(
+                    "Failed to write sha256 into installed manifest for '{}': {}",
+                    plugin_id, e
+                )));
+            }
+
+            // Reload so verification checks the freshly written hash.
             let installed_entry = match PluginEntry::from_manifest_path(&installed_manifest_path) {
                 Ok(entry) => entry,
                 Err(e) => {
@@ -252,16 +315,25 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
         PluginCommands::Enable { id } => {
             debug!("enabling plugin: {}", id);
 
-            registry
-                .discover()
-                .map_err(|e| ZenError::Service(format!("Failed to discover plugins: {}", e)))?;
+            let plugin_dir = registry.plugin_dir().join(id);
+            if !plugin_dir.join("manifest.toml").exists() {
+                return Err(ZenError::Service(format!(
+                    "Plugin '{}' not found at: {}",
+                    id,
+                    plugin_dir.display()
+                )));
+            }
 
-            registry
-                .enable(id)
-                .map_err(|e| ZenError::Service(format!("Failed to enable plugin: {}", e)))?;
+            // T097 (FR-047b): persist across sessions — state.json at the
+            // plugin dir root is the source of truth, not in-memory state.
+            let mut state = PluginState::load(registry.plugin_dir());
+            state.enable(id);
+            state
+                .save(registry.plugin_dir())
+                .map_err(|e| ZenError::Service(format!("Failed to persist plugin state: {}", e)))?;
 
             println!(
-                "{} Plugin '{}' enabled",
+                "{} Plugin '{}' enabled — takes effect at next session start",
                 "✓".green().bold(),
                 id.cyan().bold()
             );
@@ -271,19 +343,85 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
         PluginCommands::Disable { id } => {
             debug!("disabling plugin: {}", id);
 
-            registry
-                .discover()
-                .map_err(|e| ZenError::Service(format!("Failed to discover plugins: {}", e)))?;
+            let plugin_dir = registry.plugin_dir().join(id);
+            if !plugin_dir.join("manifest.toml").exists() {
+                return Err(ZenError::Service(format!(
+                    "Plugin '{}' not found at: {}",
+                    id,
+                    plugin_dir.display()
+                )));
+            }
 
-            registry
-                .disable(id)
-                .map_err(|e| ZenError::Service(format!("Failed to disable plugin: {}", e)))?;
+            // T097 (FR-047b): persist across sessions — state.json at the
+            // plugin dir root is the source of truth, not in-memory state.
+            let mut state = PluginState::load(registry.plugin_dir());
+            state.disable(id);
+            state
+                .save(registry.plugin_dir())
+                .map_err(|e| ZenError::Service(format!("Failed to persist plugin state: {}", e)))?;
 
             println!(
-                "{} Plugin '{}' disabled",
+                "{} Plugin '{}' disabled — takes effect at next session start (no hot-unload)",
                 "✓".green().bold(),
                 id.cyan().bold()
             );
+            Ok(())
+        }
+
+        PluginCommands::Rehash { id } => {
+            debug!("rehashing plugin: {}", id);
+
+            let plugin_dir = registry.plugin_dir().join(id);
+            let manifest_path = plugin_dir.join("manifest.toml");
+            if !manifest_path.exists() {
+                println!(
+                    "{} Plugin '{}' not found at: {}",
+                    "✗".red().bold(),
+                    id,
+                    plugin_dir.display()
+                );
+                return Ok(());
+            }
+
+            let entry = PluginEntry::from_manifest_path(&manifest_path)
+                .map_err(|e| ZenError::Service(format!("Failed to load manifest: {}", e)))?;
+            let hash = entry.rehash_manifest().map_err(|e| {
+                ZenError::Service(format!("Failed to rehash plugin '{}': {}", id, e))
+            })?;
+
+            // T095: re-run discovery to verify the plugin loads with the
+            // freshly written hash.
+            let mut verify_registry =
+                PluginRegistry::with_plugin_dir(registry.plugin_dir().clone());
+            verify_registry
+                .discover()
+                .map_err(|e| ZenError::Service(format!("Plugin discovery failed: {}", e)))?;
+
+            if verify_registry.get(id).is_some() {
+                println!(
+                    "{} Plugin '{}' rehashed and verified to load (sha256: {})",
+                    "✓".green().bold(),
+                    id.cyan().bold(),
+                    hash.dimmed()
+                );
+            } else {
+                let state = PluginState::load(registry.plugin_dir());
+                if state.is_disabled(id) {
+                    println!(
+                        "{} Plugin '{}' hash updated (sha256: {}) — plugin is disabled, enable it to load it again",
+                        "⚠️".yellow(),
+                        id.cyan().bold(),
+                        hash.dimmed()
+                    );
+                } else {
+                    println!(
+                        "{} Plugin '{}' hash updated (sha256: {}) but the plugin did not load — check discovery warnings above",
+                        "⚠️".yellow(),
+                        id.cyan().bold(),
+                        hash.dimmed()
+                    );
+                }
+            }
             Ok(())
         }
 

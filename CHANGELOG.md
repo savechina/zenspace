@@ -28,6 +28,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Approval/confidentiality hooks wired through `build_sandbox_hooks`;
     mutating tools gated in `Ask` mode, cloud tools gated under `Confidential`
     sessions (FR-018/FR-019).
+- **Plugin runtime bridge** (FR-033/FR-034, spec `003-agentic-plugin`
+  Phase 13b) — plugins now load at agent wiring construction, closing the
+  "scaffolding-only" gap found by the 2026-08-15 `/speckit.analyze`:
+  - `WasmPlugin` adapter: a manifest `type = "tool"` plugin with a `.wasm`
+    entry has its exported `() -> ()` functions registered as namespaced
+    tools (`{plugin_id}.{func}`, e.g. `echo.hello`) and executed through the
+    WASM sandbox; manifest permissions are checked against the configured
+    policy at load and re-checked per invoke (FR-029), and entries that
+    failed sha256 integrity at discovery (`Lifecycle::Failed`) are excluded
+    from activation (FR-043).
+  - `ZenWiring::with_sandbox_mode` self-discovers plugins from
+    `[plugin] base_path` when no registry is passed; per-plugin activation
+    failures are isolated (warn + `Lifecycle::Failed`, remaining plugins
+    continue) and plugin-registered tools default to `Private` sensitivity.
+  - New `[sandbox.wasm]` config section (4 permission booleans, default
+    deny-all) drives both the `plugin.wasm_sandbox` tool policy and plugin
+    loading — the deny-all-in-production gap is closed.
+  - SC-013 integration test: an `echo` plugin dropped in the plugin dir is
+    discovered, `echo.hello` is registered and callable; a bad-sha256
+    neighbor is isolated.
+- **Plugin runtime hardening** (FR-046..051, spec `003-agentic-plugin`
+  Phase 18) — production-grade security and lifecycle for the plugin bridge:
+  - Config-driven agent tool grants via `[agents.tools]` overlay: exact
+    names, `prefix.*` wildcards, and `plugin:*` (excludes reserved
+    namespaces and builtin collisions) merged through 5-layer config
+    (FR-046).
+  - Strict `sha256` integrity required for `*.wasm` plugin entries;
+    `zen plugin install` auto-writes the hash; `zen plugin rehash <id>`
+    recomputes after deliberate updates (FR-049).
+  - `zen plugin enable/disable` persists to `{plugin-dir}/state.json`
+    (`{"disabled": [...]}`); takes effect at next session start, no
+    hot-unload; corrupt file fails open with a loud `warn` (FR-047).
+  - Plugin dispatch hooks wrapped in a fail-closed isolation adapter:
+    hook `Err` denies that invocation only (audit-correlated), never
+    aborts the round; plugin hooks invisible to `Confidential`
+    invocations (FR-048).
+  - Plugin id validation (`^[a-z0-9_-]+$`) plus reserved namespace
+    prefixes (`fs`, `web`, `system`, `plugin`, `shell`) rejected at
+    registration; spoofed builtin names blocked per-tool (FR-050).
+  - Lazy WASM module precompile: `WasmPluginTool` caches compiled
+    `Module` via `OnceLock`, wasm bytes held as `Arc<Vec<u8>>`
+    (FR-051).
+
+### Fixed
+
+- Linux (glibc) build: `apply_resource_limits` typed the rlimit resource as
+  `libc::c_int`, which glibc's `getrlimit`/`setrlimit` reject (they take
+  `__rlimit_resource_t`/u32). Now aliased to libc's per-target type.
 
 ## [0.0.5] - 2026-08-09
 
