@@ -341,6 +341,41 @@ bin/release patch        # Bump version, tag, push
 | `zen skill` | Skill management | `skill_command.rs` |
 | `zen dispatch` | Task dispatch: run, status, list, cancel | `dispatch_command.rs` |
 
+## AGENT TOOL INVENTORY (v0.0.6)
+
+All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), dispatched through the 5-hook pipeline (confidentiality → budget → seatbelt → audit → approval) plus plugin hooks.
+
+| Tool | Sensitivity | Source | Notes |
+|------|-------------|--------|-------|
+| `fs.read` | Public | zen-plugin/tools/fs_read.rs | Byte-range + max_bytes 1MB streaming (FR-023), base64 binary mode (FR-027) |
+| `fs.write` | Private | zen-plugin/tools/fs_write.rs | SandboxValidator-gated |
+| `fs.edit` | Private | zen-plugin/tools/fs_edit.rs | diffy unified diff, atomic write + TempfileDropGuard (FR-021/040) |
+| `fs.delete` | Private | zen-plugin/tools/fs_delete.rs | Workspace-root guard + clear_contents mode (FR-026) |
+| `fs.move` | Private | zen-plugin/tools/fs_move.rs | Source+dest validated |
+| `fs.copy` | Private | zen-plugin/tools/fs_copy.rs | Dest validated |
+| `fs.list` | Public | zen-plugin/tools/fs_list.rs | depth/glob/include_hidden, symlink-consistent is_dir (FR-025) |
+| `fs.grep` | Public | zen-plugin/tools/fs_grep.rs | Regex content search |
+| `fs.glob` | Public | zen-plugin/tools/fs_glob.rs | Pattern matching |
+| `web.fetch` | Private | zen-plugin/tools/web_fetch.rs | NetworkPolicy-validated (FR-036), Jina fallback |
+| `web.search` | Private | zen-plugin/tools/web_search.rs | DDG/Brave/Tavily tiers, NetworkPolicy-validated |
+| `shell.exec` | **Confidential** | zen-plugin/tools/shell_exec.rs | Structured binary+args (no shell string), env scrubbed, timeout SIGTERM→SIGKILL process-group, excluded from external MCP (FR-028) |
+| `system.*` (5 tools) | Public/Private | zen-plugin/platform/ | health/notifications/calendar/daemon/fs_watcher — fs_watcher capped at 8 (FR-045), seatbelt arg-registry mediated (FR-035) |
+| `plugin.wasm_sandbox` | Private | zen-plugin/wasm_sandbox.rs | Permission gate on every invoke (FR-029), StoreLimits memory cap (FR-030), single impl (FR-031) |
+| `tier2_search`/`tier4_search`/`compute_embeddings` | Private | zen-vault | KB search tools via ZenTool adapter |
+
+### Host-OS Safety Hardening (v0.0.6, FR-035..045)
+
+- **Symlink canonicalization** (FR-024): `SandboxValidator` resolves symlinks, rejects escapes to protected paths/workspace-exit; macOS `/tmp → /private/tmp` root-canonicalization handled
+- **Per-tool arg registry** (FR-035): `ToolArgRegistry` maps tool → path/command-bearing arg keys; no tool bypasses seatbelt
+- **Network egress policy** (FR-036): `zen-core/src/network_policy.rs` — denies link-local/loopback/RFC1918 + metadata hostnames; allowlist via `[sandbox.network_policy]`
+- **Env scrubbing** (FR-037): `zen-core/src/env_scrub.rs` — child processes never inherit `*_API_KEY`-style vars; `shell.exec` `env` param is the only injection path
+- **RLIMIT wiring** (FR-038): `apply_resource_limits()` called in `ZenWiring` construction (NPROC=50/NOFILE=256/CORE=0)
+- **Tempfile lifecycle** (FR-040): `zen-core/src/tempfile_lifecycle.rs` — DropGuard + boot-time sweep
+- **Signal drain** (FR-041): SIGINT/SIGTERM 5s drain window in TUI session
+- **Process hardening** (FR-044): `zen-core/src/process_hardening.rs` — PT_DENY_ATTACH/prctl, RLIMIT_CORE=0, LD_*/DYLD_* strip at startup
+- **Plugin framework** (FR-032..034): `Plugin` trait + `PluginApi`; `ZenWiring::with_sandbox_mode` accepts `Option<&PluginRegistry>` (FR-033 bridge); PluginKind pruned to Tool/Hook
+- **Plugin integrity** (FR-043): manifest `sha256` verified (HashMismatch rejection); macOS `.dylib` codesign-verified
+
 ## FRAMEWORK PATTERNS
 
 ### clap Derive API (CLI)
@@ -434,7 +469,7 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
 - No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)
 
-- Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.37 (LLM abstraction), rig-compose 0.4 (agent kernel), rig-sqlite 0.2 (vector store), rig-tap 0.1 (observability), rig-mcp 0.2 (MCP bridge), jento-core/jento-context (DI + plugin lifecycle), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
+ - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.37 (LLM abstraction), rig-compose 0.4 (agent kernel), rig-sqlite 0.2 (vector store), rig-tap 0.1 (observability), rig-mcp 0.2 (MCP bridge), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
 - SQLite for derived indexes (FTS5, vector embeddings via sqlite-vec, entity graph, habits, finance), Markdown files as canonical source of truth, TOML for config (config.toml), habits (habits.toml), goals (goals.toml), budgets (budgets.toml), routines (routines.toml)
 - Binary/library split: `zen` binary (13 lines) → `zen-cli` library (exporting `shell()`)
 

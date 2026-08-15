@@ -6,6 +6,7 @@ use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
 use zen_core::config::WebFetchConfig;
+use zen_core::network_policy::NetworkPolicy;
 
 const NAME: &str = "web.fetch";
 const DESCRIPTION: &str = "Fetch a URL and extract its content as Markdown";
@@ -45,6 +46,7 @@ pub struct WebFetchTool {
     jina_fallback: bool,
     jina_fallback_threshold_chars: u32,
     user_agent: String,
+    network_policy: NetworkPolicy,
 }
 
 impl Default for WebFetchTool {
@@ -59,9 +61,24 @@ impl WebFetchTool {
     }
 
     pub fn with_config(cfg: WebFetchConfig) -> Self {
+        // Redirect hops are policy-validated (FR-036): reqwest's default
+        // redirect-following would silently bypass the pre-dispatch
+        // NetworkPolicy check (public URL 302 → 169.254.169.254 = SSRF).
+        // Each hop re-validates; a blocked target stops the chain with an
+        // error instead of fetching it.
+        let policy = Self::default_policy();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms))
             .user_agent(cfg.user_agent.clone())
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() > 10 {
+                    return attempt.error("too many redirects");
+                }
+                if let Err(reason) = policy.validate_url(attempt.url().as_str()) {
+                    return attempt.error(format!("redirect blocked by network policy: {reason}"));
+                }
+                attempt.follow()
+            }))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -72,7 +89,12 @@ impl WebFetchTool {
             jina_fallback: cfg.jina_fallback,
             jina_fallback_threshold_chars: cfg.jina_fallback_threshold_chars,
             user_agent: cfg.user_agent,
+            network_policy: Self::default_policy(),
         }
+    }
+
+    fn default_policy() -> NetworkPolicy {
+        NetworkPolicy::with_allow_hosts(vec!["localhost".into(), "127.0.0.1".into()])
     }
 
     pub fn config(&self) -> WebFetchConfig {
@@ -123,6 +145,12 @@ impl Tool for WebFetchTool {
         let url = args["url"]
             .as_str()
             .ok_or_else(|| KernelError::InvalidArgument("Missing or invalid 'url' field".into()))?;
+
+        // FR-036: network egress policy — block SSRF vectors (metadata
+        // endpoints, private ranges) before any request leaves the process.
+        if let Err(reason) = self.network_policy.validate_url(url) {
+            return Ok(json!({ "error": reason }));
+        }
 
         let max_lines = args
             .get("max_lines")
@@ -232,5 +260,36 @@ fn extract_title(html: &str) -> Option<String> {
         None
     } else {
         Some(title.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_metadata_url_by_network_policy() {
+        let tool = WebFetchTool::new();
+        let res = tool
+            .invoke(json!({
+                "url": "http://169.254.169.254/latest/meta-data/"
+            }))
+            .await
+            .unwrap();
+        let err = res["error"].as_str().expect("expected error JSON");
+        assert!(err.contains("blocked by network policy"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn allows_loopback_url_by_network_policy() {
+        let tool = WebFetchTool::new();
+        // Validation passes for the default allowlist; the request itself
+        // fails to connect (no server), proving we got past the policy gate.
+        let res = tool.invoke(json!({ "url": "http://127.0.0.1:1/" })).await;
+        assert!(
+            res.is_err(),
+            "should fail at HTTP, not at policy: {:?}",
+            res
+        );
     }
 }

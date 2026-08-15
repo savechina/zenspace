@@ -1,4 +1,3 @@
-use crate::sandbox::{ExecutionOutput, ResourceLimits, WasmSandbox};
 use std::fmt;
 use zen_core::types::Task;
 
@@ -211,19 +210,11 @@ impl MomusReviewer {
         findings
     }
 
-    pub fn validate_via_wasm(&self, wasm_bytes: &[u8]) -> Result<ExecutionOutput, String> {
-        let sandbox = WasmSandbox::new(ResourceLimits::default())
-            .map_err(|e| format!("WasmSandbox creation failed: {e}"))?;
+    pub fn validate_via_wasm(&self, wasm_bytes: &[u8]) -> Result<(), String> {
+        let sandbox = zen_plugin::wasm_sandbox::WasmSandbox::new();
         sandbox
             .validate_module(wasm_bytes)
-            .map_err(|e| format!("WASM validation failed: {e}"))?;
-        Ok(ExecutionOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: 0,
-            execution_time_ms: 0,
-            memory_used_bytes: 0,
-        })
+            .map_err(|e| format!("WASM validation failed: {e}"))
     }
 
     pub fn can_veto(&self, review: &MomusReview) -> bool {

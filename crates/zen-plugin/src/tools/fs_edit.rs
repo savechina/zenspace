@@ -8,6 +8,7 @@ use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
 
 use zen_core::sandbox::SandboxValidator;
+use zen_core::tempfile_lifecycle::TempfileDropGuard;
 
 #[derive(Clone)]
 pub struct FsEditTool {
@@ -129,6 +130,9 @@ impl Tool for FsEditTool {
             "{}.bak",
             path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
         ));
+        // FR-040: guard the backup so a failure later in the sequence (temp
+        // write, rename) removes the stale .bak instead of leaving it behind.
+        let mut backup_guard = TempfileDropGuard::new(&backup_path);
         tokio::fs::copy(&path, &backup_path)
             .await
             .map_err(|e| KernelError::ToolFailed(format!("Failed to create backup: {}", e)))?;
@@ -137,6 +141,10 @@ impl Tool for FsEditTool {
             "{}.tmp",
             path.extension().and_then(|e| e.to_str()).unwrap_or("edit")
         ));
+
+        // FR-040: guard the temp file so a failed write or rename removes the
+        // stale .tmp instead of leaving it behind.
+        let mut temp_guard = TempfileDropGuard::new(&temp_path);
 
         {
             let mut temp_file = std::fs::File::create(&temp_path).map_err(|e| {
@@ -151,9 +159,14 @@ impl Tool for FsEditTool {
         }
 
         std::fs::rename(&temp_path, &path).map_err(|e| {
-            let _ = std::fs::remove_file(&temp_path);
             KernelError::ToolFailed(format!("Failed to atomically replace file: {}", e))
         })?;
+
+        // Edit fully succeeded: the temp file has been renamed into place and
+        // the .bak backup is intentionally retained (returned to the caller).
+        // Disarm both guards so Drop leaves them alone.
+        temp_guard.disarm();
+        backup_guard.disarm();
 
         Ok(json!({
             "path": path_str,
@@ -263,5 +276,53 @@ mod tests {
         });
         assert!(block_on(tool.invoke(args)).is_err());
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn failed_edit_leaves_no_temp_artifacts() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let tool = FsEditTool::new(make_validator(dir.path()));
+        // Patch parses but does not apply → ToolFailed after reading the file.
+        let args = json!({
+            "path": file.to_string_lossy(),
+            "diff": "@@ -1 +1 @@\n-b\n+c\n",
+        });
+        assert!(block_on(tool.invoke(args)).is_err());
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp") || n.ends_with(".bak"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed edit must leave no .tmp/.bak: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn failed_edit_cleans_up_backup_when_temp_write_fails() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "hello world\n").unwrap();
+        // Pre-create a directory at the temp path so File::create fails after
+        // the backup has already been written — exercising the backup guard's
+        // Drop cleanup.
+        let temp_dir = dir.path().join("note.md.tmp");
+        std::fs::create_dir(&temp_dir).unwrap();
+        let tool = FsEditTool::new(make_validator(dir.path()));
+        let args = json!({
+            "path": file.to_string_lossy(),
+            "old_text": "world",
+            "new_text": "rust",
+        });
+        assert!(block_on(tool.invoke(args)).is_err());
+        assert!(
+            !dir.path().join("note.md.bak").exists(),
+            "stale .bak must be removed by the backup guard"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world\n");
     }
 }

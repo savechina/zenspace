@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -69,6 +69,13 @@ struct ReconnectingMcpTransport {
     /// Per-attempt delays before each re-spawn (FR-013). Injectable so tests
     /// can exercise the full retry sequence without real sleeping.
     backoffs: Vec<Duration>,
+    /// Last-known tool set from `tools/list`, used by [`Self::refresh_tools`]
+    /// to diff added/removed tools after a `notifications/tools/list_changed`.
+    ///
+    /// `#[allow(dead_code)]`: only read by `refresh_tools`, which is exercised
+    /// by tests but not yet wired to a notification reader (FR-015 hook point).
+    #[allow(dead_code)]
+    last_tools: Mutex<Vec<ToolSchema>>,
 }
 
 impl ReconnectingMcpTransport {
@@ -88,6 +95,7 @@ impl ReconnectingMcpTransport {
             spawn,
             current: Mutex::new(Some(initial)),
             backoffs,
+            last_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -99,6 +107,43 @@ impl ReconnectingMcpTransport {
                 self.server_name, MAX_RECONNECT_ATTEMPTS
             ))),
         }
+    }
+
+    /// Re-issue `tools/list` and diff the result against the last-known tool
+    /// set, logging added/removed tools at info level (FR-015).
+    ///
+    /// The registered `McpProxyTool` set lives in the shared `ToolRegistry`,
+    /// which rig-compose exposes no `unregister` for — so this method cannot
+    /// mutate the live tool set. It is the honest partial: it detects and
+    /// reports the change; a full re-registration requires a reconnect +
+    /// re-bootstrap of the server.
+    ///
+    /// `#[allow(dead_code)]`: exercised by tests but not yet wired to a
+    /// notification reader (FR-015 hook point).
+    #[allow(dead_code)]
+    async fn refresh_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
+        let transport = self.current_transport().await?;
+        let schemas = transport.list_tools().await?;
+
+        let mut known = self.last_tools.lock().await;
+        let prev: HashSet<String> = known.iter().map(|s| s.name.clone()).collect();
+        let next: HashSet<String> = schemas.iter().map(|s| s.name.clone()).collect();
+        for added in next.difference(&prev) {
+            info!(
+                server = %self.server_name,
+                tool = %added,
+                "MCP tool added after list_changed — refresh requires reconnect"
+            );
+        }
+        for removed in prev.difference(&next) {
+            info!(
+                server = %self.server_name,
+                tool = %removed,
+                "MCP tool removed after list_changed — refresh requires reconnect"
+            );
+        }
+        *known = schemas.clone();
+        Ok(schemas)
     }
 
     async fn reconnect(&self) -> Result<Arc<dyn McpTransport>, KernelError> {
@@ -441,6 +486,18 @@ async fn spawn_http(
     url: &str,
     extra_headers: Option<&HashMap<String, String>>,
 ) -> Result<HttpMcpTransport, KernelError> {
+    // FR-036: network egress policy — block SSRF vectors (metadata endpoints,
+    // private ranges) before connecting to a configured MCP HTTP endpoint.
+    let policy = zen_core::network_policy::NetworkPolicy::with_allow_hosts(vec![
+        "localhost".into(),
+        "127.0.0.1".into(),
+    ]);
+    if let Err(reason) = policy.validate_url(url) {
+        return Err(KernelError::ToolFailed(format!(
+            "MCP HTTP endpoint '{}' blocked by network policy: {}",
+            url, reason
+        )));
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -770,6 +827,11 @@ async fn spawn_stdio(
     args: &[String],
 ) -> Result<StdioTransport, KernelError> {
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    // TODO(FR-037): rig-mcp StdioTransport does not expose env control; the
+    // child inherits the parent env (secrets included). Blocked upstream —
+    // rig-mcp 0.2.5 `StdioTransport::spawn` builds its own
+    // `tokio::process::Command` with no env parameter. Revisit when rig-mcp
+    // adds env support.
     StdioTransport::spawn(endpoint, program, &arg_refs).await
 }
 
@@ -852,6 +914,7 @@ mod tests {
             spawn,
             current: Mutex::new(Some(failing_transport())),
             backoffs: instant_backoffs(),
+            last_tools: Mutex::new(Vec::new()),
         };
 
         let err = transport.call_tool("ping", Value::Null).await.unwrap_err();
@@ -885,6 +948,7 @@ mod tests {
             spawn,
             current: Mutex::new(Some(failing_transport())),
             backoffs: instant_backoffs(),
+            last_tools: Mutex::new(Vec::new()),
         };
 
         let result = transport.call_tool("ping", Value::Null).await;
@@ -909,10 +973,91 @@ mod tests {
             spawn,
             current: Mutex::new(Some(healthy_transport())),
             backoffs: instant_backoffs(),
+            last_tools: Mutex::new(Vec::new()),
         };
 
         let result = transport.call_tool("ping", Value::Null).await;
         assert!(result.is_ok());
         assert_eq!(attempts.load(Ordering::Relaxed), 0, "no spawn should occur");
+    }
+
+    /// Mock transport whose `tools/list` result is driven by a shared list of
+    /// tool names, so a test can mutate the server's tool set between calls.
+    struct ListMock {
+        tools: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl McpTransport for ListMock {
+        fn endpoint(&self) -> &str {
+            "mock://list"
+        }
+
+        async fn list_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
+            Ok(self
+                .tools
+                .lock()
+                .await
+                .iter()
+                .map(|n| ToolSchema {
+                    name: n.clone(),
+                    description: String::new(),
+                    args_schema: Value::Null,
+                    result_schema: Value::Null,
+                })
+                .collect())
+        }
+
+        async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, KernelError> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_tools_diffs_and_updates_known_set() {
+        let tools = Arc::new(Mutex::new(vec!["a".to_string(), "b".to_string()]));
+        let transport = ReconnectingMcpTransport {
+            server_name: "srv-list".into(),
+            endpoint: "stdio://srv-list".into(),
+            spawn: Arc::new(|| {
+                Box::pin(async { Err::<Arc<dyn McpTransport>, String>("unused".into()) })
+            }),
+            current: Mutex::new(Some(Arc::new(ListMock {
+                tools: tools.clone(),
+            }) as Arc<dyn McpTransport>)),
+            backoffs: instant_backoffs(),
+            last_tools: Mutex::new(Vec::new()),
+        };
+
+        let first = transport.refresh_tools().await.unwrap();
+        assert_eq!(first.len(), 2);
+
+        *tools.lock().await = vec!["b".to_string(), "c".to_string()];
+        let second = transport.refresh_tools().await.unwrap();
+        let names: Vec<String> = second.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["b", "c"]);
+
+        let known: Vec<String> = transport
+            .last_tools
+            .lock()
+            .await
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(
+            known,
+            vec!["b", "c"],
+            "last-known set must track the latest list"
+        );
+    }
+
+    #[test]
+    fn parse_sse_handles_list_changed_notification_without_panic() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+        let result = parse_sse_response(body, 1);
+        assert!(
+            result.is_err(),
+            "a notification-only stream has no result for the request id"
+        );
     }
 }

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
+use zen_core::network_policy::NetworkPolicy;
 
 const NAME: &str = "web.search";
 const DESCRIPTION: &str =
@@ -47,6 +48,7 @@ static RESULT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 #[derive(Clone)]
 pub struct WebSearchTool {
     client: reqwest::Client,
+    network_policy: NetworkPolicy,
 }
 
 impl Default for WebSearchTool {
@@ -62,7 +64,13 @@ impl WebSearchTool {
             .user_agent("zen-agent/1.0")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self {
+            client,
+            network_policy: NetworkPolicy::with_allow_hosts(vec![
+                "localhost".into(),
+                "127.0.0.1".into(),
+            ]),
+        }
     }
 }
 
@@ -155,6 +163,7 @@ fn parse_retry_after(value: Option<&str>) -> u64 {
 
 async fn search_brave(
     client: &reqwest::Client,
+    policy: &NetworkPolicy,
     query: &str,
     max: usize,
     api_key: &str,
@@ -164,6 +173,7 @@ async fn search_brave(
         url_encode(query),
         max
     );
+    policy.validate_url(&url).map_err(|e| e.to_string())?;
     let mut resp = client
         .get(&url)
         .header("X-Subscription-Token", api_key)
@@ -203,6 +213,7 @@ async fn search_brave(
 
 async fn search_tavily(
     client: &reqwest::Client,
+    policy: &NetworkPolicy,
     query: &str,
     max: usize,
     api_key: &str,
@@ -213,8 +224,10 @@ async fn search_tavily(
         "include_answer": false
     });
 
+    let endpoint = "https://api.tavily.com/search";
+    policy.validate_url(endpoint).map_err(|e| e.to_string())?;
     let mut resp = client
-        .post("https://api.tavily.com/search")
+        .post(endpoint)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&body)
@@ -253,10 +266,12 @@ async fn search_tavily(
 
 async fn search_ddg(
     client: &reqwest::Client,
+    policy: &NetworkPolicy,
     query: &str,
     max: usize,
 ) -> Result<Vec<SearchResult>, String> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    policy.validate_url(&url).map_err(|e| e.to_string())?;
     let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
 
     if let Some(rate_err) = handle_rate_limit(&mut resp).await {
@@ -351,7 +366,7 @@ impl Tool for WebSearchTool {
                 let key = brave_key.as_deref().ok_or_else(|| {
                     KernelError::ToolFailed("API key not configured for provider 'brave'".into())
                 })?;
-                let r = search_brave(&self.client, query, max, key)
+                let r = search_brave(&self.client, &self.network_policy, query, max, key)
                     .await
                     .map_err(KernelError::ToolFailed)?;
                 (r, "brave")
@@ -360,24 +375,24 @@ impl Tool for WebSearchTool {
                 let key = tavily_key.as_deref().ok_or_else(|| {
                     KernelError::ToolFailed("API key not configured for provider 'tavily'".into())
                 })?;
-                let r = search_tavily(&self.client, query, max, key)
+                let r = search_tavily(&self.client, &self.network_policy, query, max, key)
                     .await
                     .map_err(KernelError::ToolFailed)?;
                 (r, "tavily")
             }
             _ => {
                 if let Some(key) = &brave_key {
-                    let r = search_brave(&self.client, query, max, key)
+                    let r = search_brave(&self.client, &self.network_policy, query, max, key)
                         .await
                         .map_err(KernelError::ToolFailed)?;
                     (r, "brave")
                 } else if let Some(key) = &tavily_key {
-                    let r = search_tavily(&self.client, query, max, key)
+                    let r = search_tavily(&self.client, &self.network_policy, query, max, key)
                         .await
                         .map_err(KernelError::ToolFailed)?;
                     (r, "tavily")
                 } else {
-                    let r = search_ddg(&self.client, query, max)
+                    let r = search_ddg(&self.client, &self.network_policy, query, max)
                         .await
                         .map_err(KernelError::ToolFailed)?;
                     (r, "duckduckgo")
@@ -455,5 +470,17 @@ mod tests {
         assert_eq!(clamp(50), 50);
         assert_eq!(clamp(1000), 50);
         assert_eq!(clamp(-3), 1);
+    }
+
+    #[test]
+    fn provider_endpoints_pass_default_policy() {
+        let policy = NetworkPolicy::with_allow_hosts(vec!["localhost".into(), "127.0.0.1".into()]);
+        for url in [
+            "https://api.search.brave.com/res/v1/web/search?q=x&count=5",
+            "https://api.tavily.com/search",
+            "https://html.duckduckgo.com/html/?q=x",
+        ] {
+            assert!(policy.validate_url(url).is_ok(), "{url}");
+        }
     }
 }

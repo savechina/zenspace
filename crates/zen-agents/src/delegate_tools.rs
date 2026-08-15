@@ -82,6 +82,7 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
             "fs.copy",
             "web.fetch",
             "web.search",
+            "shell.exec",
             "system.health",
             "system.notifications",
             "system.calendar",

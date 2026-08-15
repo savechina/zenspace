@@ -10,6 +10,7 @@
 //! with `memvid_store: None`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,9 +27,14 @@ use serde_json::Value;
 use tracing::debug;
 use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::paths::ZenPaths;
-use zen_core::sandbox::{SandboxMode, SandboxValidator, SeatbeltHook, SeatbeltPolicy};
+use zen_core::sandbox::{
+    SandboxMode, SandboxValidator, SeatbeltHook, SeatbeltPolicy, ToolArgRegistry,
+    apply_resource_limits,
+};
 use zen_core::types::Sensitivity;
 use zen_memory::ZenMemvidStore;
+use zen_plugin::registry::PluginEntry;
+use zen_plugin::{Plugin, PluginApi};
 use zen_vault::tools::{ZenTool, ZenToolError};
 
 // Re-exports for consumers
@@ -159,6 +165,32 @@ impl Skill for DistillationPipelineSkillAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Plugin instantiation (FR-033)
+// ---------------------------------------------------------------------------
+
+/// Instantiate a plugin from a registry entry.
+///
+/// MVP scope: native (`.dylib`/`.so`) loading is not yet supported and
+/// returns an error (logged, never fatal). `.wasm` entries are deferred to
+/// the WASM executor integration — logged and skipped so a plugin directory
+/// with wasm plugins does not block wiring construction.
+fn instantiate_plugin(entry: &PluginEntry) -> Result<Option<Box<dyn Plugin>>, String> {
+    let Some(entry_file) = &entry.manifest.entry else {
+        return Err("plugin has no entry file".to_string());
+    };
+
+    if entry_file.ends_with(".wasm") {
+        tracing::info!(
+            plugin = %entry.manifest.id,
+            "wasm plugin loading deferred to WASM executor integration"
+        );
+        return Ok(None);
+    }
+
+    Err("native plugin loading not yet supported".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // ZenWiring
 // ---------------------------------------------------------------------------
 
@@ -198,7 +230,12 @@ impl ZenWiring {
     /// - `compute_embeddings` → `ComputeEmbeddings` (via adapter)
     #[must_use]
     pub fn new() -> Self {
-        Self::with_sandbox_mode(SandboxMode::WorkspaceWrite)
+        let workspace_roots = ZenPaths::detect()
+            .ok()
+            .and_then(|p| p.workspace_root().cloned())
+            .map(|w| vec![w])
+            .unwrap_or_default();
+        Self::with_sandbox_mode(SandboxMode::WorkspaceWrite, workspace_roots, None)
     }
 
     /// Create a `ZenWiring` with the given sandbox mode.
@@ -208,9 +245,22 @@ impl ZenWiring {
     /// (rate limit → seatbelt → audit → approval) that runs before every
     /// tool invocation. Default is [`SandboxMode::WorkspaceWrite`].
     #[must_use]
-    pub fn with_sandbox_mode(mode: SandboxMode) -> Self {
+    pub fn with_sandbox_mode(
+        mode: SandboxMode,
+        workspace_roots: Vec<PathBuf>,
+        plugins: Option<&zen_plugin::registry::PluginRegistry>,
+    ) -> Self {
+        // FR-038: Apply rlimits early so the agent process and all its
+        // descendants (shell.exec subprocesses, MCP stdio children, WASM-
+        // forked processes) are resource-capped. Defense-in-depth — a
+        // failure to set limits is logged but does not abort construction.
+        match apply_resource_limits() {
+            Ok(()) => debug!("resource limits applied: NPROC=50, NOFILE=256, CORE=0"),
+            Err(e) => tracing::warn!("failed to apply resource limits: {}", e),
+        }
+
         let skills = SkillRegistry::new();
-        let tools = ToolRegistry::new();
+        let mut tools = ToolRegistry::new();
         let delegates = DelegateRegistry::new();
 
         skills.register(Arc::new(zen_vault::WikiCompiler::new()));
@@ -236,11 +286,6 @@ impl ZenWiring {
         ));
         tools.register(Arc::new(zen_plugin::wasm_sandbox::WasmSandboxTool::new()));
 
-        let workspace_roots = ZenPaths::detect()
-            .ok()
-            .and_then(|p| p.workspace_root().cloned())
-            .map(|w| vec![w])
-            .unwrap_or_default();
         let sandbox_validator = SandboxValidator::new(mode, workspace_roots.clone());
 
         tools.register(Arc::new(zen_plugin::tools::fs_read::FsReadTool::new(
@@ -254,6 +299,7 @@ impl ZenWiring {
         )));
         tools.register(Arc::new(zen_plugin::tools::fs_delete::FsDeleteTool::new(
             sandbox_validator.clone(),
+            workspace_roots.first().cloned(),
         )));
         tools.register(Arc::new(zen_plugin::tools::fs_move::FsMoveTool::new(
             sandbox_validator.clone(),
@@ -275,6 +321,10 @@ impl ZenWiring {
 
         tools.register(Arc::new(zen_plugin::tools::web_search::WebSearchTool::new()));
 
+        tools.register(Arc::new(zen_plugin::tools::shell_exec::ShellExecTool::new(
+            workspace_roots.first().cloned().unwrap_or_default(),
+        )));
+
         let memvid_store = Self::try_open_memvid_store();
 
         let mut tool_sensitivity = HashMap::new();
@@ -295,12 +345,45 @@ impl ZenWiring {
         tool_sensitivity.insert("fs.copy".to_string(), Sensitivity::Private);
         tool_sensitivity.insert("fs.list".to_string(), Sensitivity::Public);
         tool_sensitivity.insert("fs.grep".to_string(), Sensitivity::Public);
+        tool_sensitivity.insert("shell.exec".to_string(), Sensitivity::Confidential);
         tool_sensitivity.insert("fs.glob".to_string(), Sensitivity::Public);
         tool_sensitivity.insert("web.fetch".to_string(), Sensitivity::Private);
         tool_sensitivity.insert("web.search".to_string(), Sensitivity::Private);
 
-        let (sandbox_hooks, confidentiality_sensitivity) =
+        let (mut sandbox_hooks, confidentiality_sensitivity) =
             Self::build_sandbox_hooks(mode, &workspace_roots);
+
+        if let Some(registry) = plugins {
+            let enabled: Vec<_> = registry.list_enabled().collect();
+            let workspace_root = workspace_roots
+                .first()
+                .map(|p| p.as_path())
+                .unwrap_or_else(|| std::path::Path::new(""));
+            for entry in enabled {
+                match instantiate_plugin(entry) {
+                    Ok(Some(plugin)) => {
+                        let mut api =
+                            PluginApi::new(&mut tools, &mut sandbox_hooks, workspace_root);
+                        match plugin.activate(&mut api) {
+                            Ok(()) => {
+                                tracing::info!(plugin = %entry.manifest.id, "plugin activated")
+                            }
+                            Err(e) => tracing::warn!(
+                                plugin = %entry.manifest.id,
+                                error = %e,
+                                "plugin activate failed"
+                            ),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        plugin = %entry.manifest.id,
+                        error = %e,
+                        "plugin instantiation failed"
+                    ),
+                }
+            }
+        }
 
         Self {
             skills,
@@ -313,6 +396,40 @@ impl ZenWiring {
             mcp_connected: Arc::new(AtomicBool::new(false)),
             confidentiality_sensitivity,
         }
+    }
+
+    /// Build the per-tool arg-key registry for the seatbelt (FR-035).
+    ///
+    /// Tools whose sensitive args are not named `command` or `path` bypassed
+    /// the seatbelt entirely before this registry existed. Each entry maps a
+    /// tool name to the arg keys that carry paths or commands requiring
+    /// validation.
+    fn build_tool_arg_registry() -> ToolArgRegistry {
+        let mut registry = ToolArgRegistry::new();
+
+        registry.register_tool_args("system.daemon", &[], &["daemon_action", "action"]);
+        registry.register_tool_args("shell.exec", &["cwd"], &["binary"]);
+        registry.register_tool_args("plugin.wasm_sandbox", &["wasm_path"], &[]);
+
+        // fs.* tools already match the default `path` fallback; register
+        // explicitly so the seatbelt still inspects them if the fallback is
+        // ever removed.
+        let fs_path_arg = &["path"];
+        for fs_tool in [
+            "fs.read",
+            "fs.write",
+            "fs.edit",
+            "fs.delete",
+            "fs.move",
+            "fs.copy",
+            "fs.list",
+            "fs.grep",
+            "fs.glob",
+        ] {
+            registry.register_tool_args(fs_tool, fs_path_arg, &[]);
+        }
+
+        registry
     }
 
     /// Build the dispatch-time sandbox hook pipeline.
@@ -328,7 +445,9 @@ impl ZenWiring {
         workspace_roots: &[std::path::PathBuf],
     ) -> (Vec<Box<dyn ToolDispatchHook>>, Arc<Mutex<Sensitivity>>) {
         let budget = Arc::new(AtomicBudget::new(20));
-        let policy = SeatbeltPolicy::new(mode, workspace_roots.to_vec()).with_timeout(300);
+        let policy = SeatbeltPolicy::new(mode, workspace_roots.to_vec())
+            .with_timeout(300)
+            .with_arg_registry(Self::build_tool_arg_registry());
         let audit_log_path = workspace_roots
             .first()
             .map(|root| root.join("logs").join("audit.jsonl"))
@@ -528,7 +647,7 @@ mod tests {
     #[test]
     fn zen_wiring_registers_all_tools() {
         let wiring = ZenWiring::new();
-        assert_eq!(wiring.tools.len(), 20);
+        assert_eq!(wiring.tools.len(), 21);
 
         assert!(wiring.tools.get("tier2_search").is_ok());
         assert!(wiring.tools.get("tier4_search").is_ok());
@@ -539,6 +658,7 @@ mod tests {
         assert!(wiring.tools.get("system.daemon").is_ok());
         assert!(wiring.tools.get("system.fs_watcher").is_ok());
         assert!(wiring.tools.get("plugin.wasm_sandbox").is_ok());
+        assert!(wiring.tools.get("shell.exec").is_ok());
     }
 
     #[test]
@@ -711,10 +831,137 @@ mod tests {
     #[test]
     fn set_approval_callback_swaps_hook_in_ask_mode() {
         use zen_core::sandbox::{ApprovalCallback, ApprovalDecision};
-        let mut wiring = ZenWiring::with_sandbox_mode(SandboxMode::Ask);
+        let mut wiring = ZenWiring::with_sandbox_mode(SandboxMode::Ask, Vec::new(), None);
         let cb: ApprovalCallback = Arc::new(|_inv| ApprovalDecision::Allow);
         wiring.set_approval_callback(cb);
         // Index 4 is the approval hook slot (see build_sandbox_hooks order).
         assert_eq!(wiring.sandbox_hooks.len(), 5);
+    }
+
+    #[test]
+    fn with_sandbox_mode_isolates_plugin_failures() {
+        use zen_plugin::registry::{Manifest, PluginKind, PluginRegistry};
+
+        let mut registry =
+            PluginRegistry::with_plugin_dir(std::path::PathBuf::from("/nonexistent"));
+        // A `.wasm` entry that does not exist on disk → deferred, no panic.
+        registry
+            .register(PluginEntry::new(
+                Manifest {
+                    id: "bogus_wasm".to_string(),
+                    name: "Bogus Wasm".to_string(),
+                    version: "0.1.0".to_string(),
+                    kind: PluginKind::Tool,
+                    permissions: vec![],
+                    config_schema: None,
+                    entry: Some("missing.wasm".to_string()),
+                    sha256: None,
+                },
+                std::path::PathBuf::from("/nonexistent"),
+            ))
+            .unwrap();
+        // A native entry → instantiation error, logged, no panic.
+        registry
+            .register(PluginEntry::new(
+                Manifest {
+                    id: "bogus_native".to_string(),
+                    name: "Bogus Native".to_string(),
+                    version: "0.1.0".to_string(),
+                    kind: PluginKind::Tool,
+                    permissions: vec![],
+                    config_schema: None,
+                    entry: Some("missing.dylib".to_string()),
+                    sha256: None,
+                },
+                std::path::PathBuf::from("/nonexistent"),
+            ))
+            .unwrap();
+
+        let wiring = ZenWiring::with_sandbox_mode(
+            SandboxMode::WorkspaceWrite,
+            vec![std::path::PathBuf::from("/ws")],
+            Some(&registry),
+        );
+        // Failure is isolated: wiring still constructs with all builtin tools.
+        assert_eq!(wiring.tools.len(), 21);
+    }
+
+    // ── FR-035: arg-registry end-to-end via ZenWiring hook pipeline ─────────
+
+    #[tokio::test]
+    async fn seatbelt_via_wiring_blocks_dangerous_daemon_action() {
+        // Confirms build_tool_arg_registry is wired into the seatbelt hook
+        // assembled by build_sandbox_hooks (catches regressions where the
+        // registry is built but not attached).
+        let (hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
+            SandboxMode::WorkspaceWrite,
+            &[std::path::PathBuf::from("/ws")],
+        );
+
+        // hooks[2] is the seatbelt (see build_sandbox_hooks order).
+        let seatbelt = &hooks[2];
+        let inv = rig_compose::normalizer::ToolInvocation {
+            name: "system.daemon".to_string(),
+            args: serde_json::json!({
+                "action": "sudo systemctl stop sshd",
+                "name": "sshd",
+            }),
+        };
+        let action = seatbelt.before_invocation(&inv).await.unwrap();
+        assert!(
+            matches!(
+                action,
+                rig_compose::normalizer::ToolDispatchAction::Terminate { .. }
+            ),
+            "dangerous daemon action must be blocked via wired registry, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seatbelt_via_wiring_allows_benign_daemon_status() {
+        let (hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
+            SandboxMode::WorkspaceWrite,
+            &[std::path::PathBuf::from("/ws")],
+        );
+        let seatbelt = &hooks[2];
+        let inv = rig_compose::normalizer::ToolInvocation {
+            name: "system.daemon".to_string(),
+            args: serde_json::json!({
+                "action": "status",
+                "name": "nginx",
+            }),
+        };
+        let action = seatbelt.before_invocation(&inv).await.unwrap();
+        assert!(
+            matches!(
+                action,
+                rig_compose::normalizer::ToolDispatchAction::Continue
+            ),
+            "benign daemon status must continue, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seatbelt_via_wiring_blocks_wasm_sandbox_metadata_path() {
+        let (hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
+            SandboxMode::WorkspaceWrite,
+            &[std::path::PathBuf::from("/ws")],
+        );
+        let seatbelt = &hooks[2];
+        let inv = rig_compose::normalizer::ToolInvocation {
+            name: "plugin.wasm_sandbox".to_string(),
+            args: serde_json::json!({
+                "wasm_path": "/ws/.ssh/evil.wasm",
+                "operation": "write",
+            }),
+        };
+        let action = seatbelt.before_invocation(&inv).await.unwrap();
+        assert!(
+            matches!(
+                action,
+                rig_compose::normalizer::ToolDispatchAction::Terminate { .. }
+            ),
+            "write to metadata path via wasm_path must be blocked, got {action:?}"
+        );
     }
 }

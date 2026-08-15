@@ -109,7 +109,7 @@ impl AgentOrchestrator {
     /// The mode drives the fs-tool path validators and the dispatch-time
     /// sandbox hook pipeline (rate limit → seatbelt → audit → approval).
     pub fn with_sandbox_mode(mut self, mode: zen_core::sandbox::SandboxMode) -> Self {
-        self.wiring = ZenWiring::with_sandbox_mode(mode);
+        self.wiring = ZenWiring::with_sandbox_mode(mode, Vec::new(), None);
         self
     }
 

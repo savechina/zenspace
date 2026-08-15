@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -113,6 +113,53 @@ fn is_within_root(path: &Path, root: &Path) -> bool {
     lexical_normalize(path).starts_with(lexical_normalize(root))
 }
 
+/// FR-024 — Canonicalize a path that may have a non-existent tail.
+///
+/// `std::fs::canonicalize` fails on paths whose final component does not
+/// exist (e.g. a file about to be written through a symlinked directory).
+/// For sandbox verification we still need to resolve the symlinked prefix
+/// so we can check the eventual target. This helper walks up the path to
+/// the deepest existing ancestor, canonicalizes that prefix, then re-appends
+/// the missing tail. If the entire path exists it short-circuits to a plain
+/// `canonicalize` call.
+fn canonicalize_for_check(path: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return Ok(c);
+    }
+    // If the final component is itself a symlink that fails to resolve, it's
+    // a broken symlink — surface the error rather than walking up, since
+    // following a broken link at runtime will fail anyway.
+    let is_broken_symlink = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_broken_symlink {
+        return std::fs::canonicalize(path);
+    }
+    // Otherwise the tail doesn't exist (likely a write target). Walk up to
+    // the deepest existing ancestor, canonicalize that prefix, then re-append
+    // the missing tail.
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        let parent = match current.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => return std::fs::canonicalize(path),
+        };
+        if let Some(name) = current.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if std::fs::symlink_metadata(&parent).is_ok() {
+            let canonical_parent = std::fs::canonicalize(&parent)?;
+            let mut result = canonical_parent;
+            for name in missing.iter().rev() {
+                result.push(name);
+            }
+            return Ok(result);
+        }
+        current = parent;
+    }
+}
+
 pub fn is_blocked_command(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
 
@@ -143,11 +190,29 @@ pub fn is_dangerous_network_target(cmd: &str) -> bool {
         "raw.githubusercontent.com",
     ];
 
+    let cmd_trimmed = cmd.trim();
+    // First token covers both command strings ("curl http://…") and the bare
+    // or path-qualified binary the structured shell.exec registry passes
+    // ("curl", "/usr/bin/curl"). Without this, the trailing-space pattern
+    // below let bare binary names through (FR-028 pre-dispatch gap).
+    let first_token = cmd_trimmed.split_whitespace().next().unwrap_or("");
+    let binary_name = first_token.rsplit('/').next().unwrap_or(first_token);
+
     for host in BLOCKED_NETWORK_COMMANDS {
         let pattern = format!("{} ", host);
-        if cmd.contains(&pattern) {
-            let after_cmd_start = cmd.find(&pattern).unwrap_or(0) + pattern.len();
-            let after_cmd = &cmd[after_cmd_start..];
+        // Bare binary via shell.exec arg registry: the seatbelt passes `binary`
+        // alone as cmd_trimmed; args[] is never joined here, so there's no URL
+        // to inspect — block the binary (FR-028). The agent uses
+        // web.fetch/web.search (which go through NetworkPolicy) for HTTP.
+        if binary_name == *host && cmd_trimmed == first_token {
+            return true;
+        }
+        if cmd_trimmed.contains(&pattern) {
+            let next = cmd_trimmed.find(&pattern).unwrap_or(0) + pattern.len();
+            if next > cmd_trimmed.len() {
+                return true;
+            }
+            let after_cmd = &cmd_trimmed[next..];
             let url_or_arg = after_cmd.split_whitespace().next().unwrap_or("");
             let host_part = url_or_arg
                 .trim_start_matches("http://")
@@ -165,11 +230,63 @@ pub fn is_dangerous_network_target(cmd: &str) -> bool {
     false
 }
 
+/// FR-035 — Per-tool arg-key registry mapping tool name → arg keys that
+/// carry paths or commands. Tools whose sensitive args are not named
+/// `command` or `path` (e.g. `system.daemon` uses `daemon_action`,
+/// `plugin.wasm_sandbox` uses `wasm_path`) bypassed `SeatbeltPolicy`
+/// validation entirely before this registry existed.
+#[derive(Debug, Clone, Default)]
+pub struct ToolArgRegistry {
+    entries: HashMap<String, ToolArgEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolArgEntry {
+    path_args: Vec<String>,
+    command_args: Vec<String>,
+}
+
+impl ToolArgRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Register the path-bearing and command-bearing arg keys for a tool.
+    /// Path args are validated via [`is_metadata_path`] on mutating ops;
+    /// command args are validated via [`is_blocked_command`] +
+    /// [`is_dangerous_network_target`].
+    pub fn register_tool_args(
+        &mut self,
+        tool_name: &str,
+        path_args: &[&str],
+        command_args: &[&str],
+    ) {
+        self.entries.insert(
+            tool_name.to_string(),
+            ToolArgEntry {
+                path_args: path_args.iter().map(|s| s.to_string()).collect(),
+                command_args: command_args.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+    }
+
+    fn get(&self, tool_name: &str) -> Option<&ToolArgEntry> {
+        self.entries.get(tool_name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SeatbeltPolicy {
     pub mode: SandboxMode,
     pub workspace_roots: Vec<PathBuf>,
     pub timeout_secs: u64,
+    pub arg_registry: ToolArgRegistry,
 }
 
 impl SeatbeltPolicy {
@@ -178,11 +295,19 @@ impl SeatbeltPolicy {
             mode,
             workspace_roots,
             timeout_secs: 300,
+            arg_registry: ToolArgRegistry::new(),
         }
     }
 
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Attach a per-tool arg-key registry (FR-035) so the seatbelt inspects
+    /// arg names other than the default `command` / `path`.
+    pub fn with_arg_registry(mut self, registry: ToolArgRegistry) -> Self {
+        self.arg_registry = registry;
         self
     }
 
@@ -274,36 +399,70 @@ impl SeatbeltPolicy {
         &self,
         invocation: &ToolInvocation,
     ) -> Result<ToolDispatchAction, KernelError> {
-        if let Some(args_str) = invocation.args.get("command").and_then(|v| v.as_str()) {
-            if let Some(pattern) = is_blocked_command(args_str) {
-                return Ok(ToolDispatchAction::Terminate {
-                    reason: format!("sandbox blocked command matching pattern: \"{}\"", pattern),
-                });
-            }
+        // FR-035: prefer per-tool registered arg keys; fall back to the
+        // legacy `command` / `path` keys for unregistered tools.
+        let (command_keys, path_keys): (Vec<&str>, Vec<&str>) =
+            match self.arg_registry.get(&invocation.name) {
+                Some(entry) => (
+                    entry.command_args.iter().map(|s| s.as_str()).collect(),
+                    entry.path_args.iter().map(|s| s.as_str()).collect(),
+                ),
+                None => (vec!["command"], vec!["path"]),
+            };
 
-            if is_dangerous_network_target(args_str) && self.mode != SandboxMode::DangerFullAccess {
-                return Ok(ToolDispatchAction::Terminate {
-                    reason: "sandbox blocked network command to unknown host".to_string(),
-                });
+        for key in &command_keys {
+            if let Some(args_str) = invocation.args.get(*key).and_then(|v| v.as_str())
+                && let Some(termination) = self.check_command_arg(args_str)
+            {
+                return Ok(termination);
             }
         }
 
-        if let Some(path_str) = invocation.args.get("path").and_then(|v| v.as_str()) {
-            let path = PathBuf::from(path_str);
-            if is_metadata_path(&path)
-                && let Some(op) = invocation.args.get("operation").and_then(|v| v.as_str())
-                && matches!(op, "write" | "delete" | "remove" | "modify")
+        for key in &path_keys {
+            if let Some(path_str) = invocation.args.get(*key).and_then(|v| v.as_str())
+                && let Some(termination) = self.check_path_arg(invocation, path_str)
             {
-                return Ok(ToolDispatchAction::Terminate {
-                    reason: format!(
-                        "sandbox blocked write operation on metadata path: \"{}\"",
-                        path_str
-                    ),
-                });
+                return Ok(termination);
             }
         }
 
         Ok(ToolDispatchAction::Continue)
+    }
+
+    fn check_command_arg(&self, args_str: &str) -> Option<ToolDispatchAction> {
+        if let Some(pattern) = is_blocked_command(args_str) {
+            return Some(ToolDispatchAction::Terminate {
+                reason: format!("sandbox blocked command matching pattern: \"{}\"", pattern),
+            });
+        }
+
+        if is_dangerous_network_target(args_str) && self.mode != SandboxMode::DangerFullAccess {
+            return Some(ToolDispatchAction::Terminate {
+                reason: "sandbox blocked network command to unknown host".to_string(),
+            });
+        }
+
+        None
+    }
+
+    fn check_path_arg(
+        &self,
+        invocation: &ToolInvocation,
+        path_str: &str,
+    ) -> Option<ToolDispatchAction> {
+        let path = PathBuf::from(path_str);
+        if is_metadata_path(&path)
+            && let Some(op) = invocation.args.get("operation").and_then(|v| v.as_str())
+            && matches!(op, "write" | "delete" | "remove" | "modify")
+        {
+            return Some(ToolDispatchAction::Terminate {
+                reason: format!(
+                    "sandbox blocked write operation on metadata path: \"{}\"",
+                    path_str
+                ),
+            });
+        }
+        None
     }
 }
 
@@ -433,6 +592,13 @@ impl SandboxValidator {
             ));
         }
 
+        // FR-024: After lexical checks pass, verify no symlink component
+        // silently redirects the path outside the workspace root or onto a
+        // protected path. Only fires when the path actually exists and
+        // contains symlinks (detected via `symlink_metadata`); non-existent
+        // paths (about-to-be-written files) skip this step.
+        self.check_symlink_escape(path)?;
+
         Ok(())
     }
 
@@ -460,7 +626,108 @@ impl SandboxValidator {
             }
         }
 
+        // FR-024: After lexical checks pass, verify no symlink component
+        // silently redirects the path onto a protected target. See
+        // `validate_path_for_write` for the full rationale.
+        self.check_symlink_escape(path)?;
+
         Ok(())
+    }
+
+    /// FR-024 — Symlink escape check.
+    ///
+    /// Walks `path` component-by-component via `symlink_metadata` to detect
+    /// any symlink component (intermediate or terminal). If a symlink is
+    /// present AND the path exists, the path is canonicalized transitively
+    /// (`std::fs::canonicalize` resolves symlink chains) and the canonical
+    /// target is re-checked against:
+    ///   1. `PROTECTED_PATHS` / env files (always — a symlink landing on
+    ///      `~/.ssh/id_rsa` or `.env` is blocked regardless of mode),
+    ///   2. Workspace root containment (when roots are configured — a
+    ///      symlink escaping the workspace root is blocked).
+    ///
+    /// Policy (per Clarifications 2026-08-11): FOLLOW symlinks rather than
+    /// rejecting all symlinks, so legitimate workflows (Obsidian vaults with
+    /// symlinked folders, monorepo workspaces) keep working — but reject if
+    /// the canonical target escapes the workspace root or lands on a
+    /// protected path.
+    ///
+    /// Non-existent paths (about-to-be-written files) skip canonicalization
+    /// entirely — `lexical_normalize` already handles `..` traversal for
+    /// those, and `canonicalize` would fail anyway.
+    fn check_symlink_escape(&self, path: &Path) -> Result<(), String> {
+        if !self.path_contains_symlink(path) {
+            return Ok(());
+        }
+
+        let canonical = match canonicalize_for_check(path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!(
+                    "sandbox blocked: cannot canonicalize symlink path {}: {}",
+                    path.display(),
+                    e
+                ));
+            }
+        };
+
+        if is_env_file(&canonical) {
+            return Err(format!(
+                "sandbox blocked: symlink {} resolves to environment file {}",
+                path.display(),
+                canonical.display()
+            ));
+        }
+
+        for component in canonical.components() {
+            let name = component.as_os_str().to_string_lossy();
+            if self.protected_set.contains(name.as_ref()) {
+                return Err(format!(
+                    "sandbox blocked: symlink {} resolves to protected path {}",
+                    path.display(),
+                    canonical.display()
+                ));
+            }
+        }
+
+        // Root containment is only enforced when roots are configured; an
+        // empty root set keeps the existing permissive read semantics.
+        // Both sides are canonicalized for comparison so platforms that
+        // rewrite paths via system symlinks (macOS `/tmp` → `/private/tmp`)
+        // do not trigger false-positive escapes.
+        if !self.workspace_roots.is_empty() {
+            let inside = self.workspace_roots.iter().any(|root| {
+                let root_cmp = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                is_within_root(&canonical, &root_cmp)
+            });
+            if !inside {
+                return Err(format!(
+                    "sandbox blocked: symlink {} escapes workspace root (resolves to {})",
+                    path.display(),
+                    canonical.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Walk `path` from its root anchor through every component, returning
+    /// `true` if any prefix is a symlink. Stops at the first prefix that
+    /// does not exist on disk — beyond that point no symlink is possible.
+    /// Uses `symlink_metadata` (not `metadata`) so symlinks themselves are
+    /// NOT followed during detection.
+    fn path_contains_symlink(&self, path: &Path) -> bool {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+        false
     }
 
     pub fn validate_command(&self, cmd: &str) -> Result<(), String> {
@@ -479,25 +746,41 @@ impl SandboxValidator {
 pub fn apply_resource_limits() -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
-        use libc::{RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_NPROC, rlimit, setrlimit};
+        use libc::{RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_NPROC, getrlimit, rlimit, setrlimit};
 
+        // Lower only the SOFT limit and keep the existing (or infinite) HARD
+        // limit: setting rlim_max == rlim_cur made the cap irreversible, so a
+        // busy process (tokio workers + reqwest pool + sqlx) that legitimately
+        // exceeded NOFILE=256 or NPROC=50 failed with EMFILE/EAGAIN forever.
+        // Soft-only caps still constrain the process and every descendant that
+        // does not explicitly raise them.
+        fn soft_cap(resource: libc::c_int, cur: libc::rlim_t) -> Result<(), std::io::Error> {
+            // SAFETY: getrlimit/setrlimit read/write the fully-initialized
+            // stack struct below; no pointers escape. Return values checked.
+            unsafe {
+                let mut current = rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if getrlimit(resource, &mut current) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let capped = rlimit {
+                    rlim_cur: cur.min(current.rlim_max),
+                    rlim_max: current.rlim_max,
+                };
+                if setrlimit(resource, &capped) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        // SAFETY: RLIMIT writes use the fully-initialized stack struct; the
+        // core-dump hard-zero has no legitimate reason to be raisable.
         unsafe {
-            let rlimit_nproc = rlimit {
-                rlim_cur: 50,
-                rlim_max: 50,
-            };
-            if setrlimit(RLIMIT_NPROC, &rlimit_nproc) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-
-            let rlimit_nofile = rlimit {
-                rlim_cur: 256,
-                rlim_max: 256,
-            };
-            if setrlimit(RLIMIT_NOFILE, &rlimit_nofile) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-
+            soft_cap(RLIMIT_NPROC, 50)?;
+            soft_cap(RLIMIT_NOFILE, 256)?;
             let rlimit_core = rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -599,6 +882,21 @@ mod tests {
     }
 
     #[test]
+    fn dangerous_network_target_matches_bare_binary_name() {
+        // FR-028: the structured shell.exec registry passes just the binary
+        // string — bare and path-qualified curl/wget must be rejected.
+        assert!(is_dangerous_network_target("curl"));
+        assert!(is_dangerous_network_target("wget"));
+        assert!(is_dangerous_network_target("/usr/bin/curl"));
+        assert!(is_dangerous_network_target("curl http://169.254.169.254/"));
+        // Known hosts still pass in full command-string form.
+        assert!(!is_dangerous_network_target(
+            "curl https://api.openai.com/v1"
+        ));
+        assert!(!is_dangerous_network_target("git status"));
+    }
+
+    #[test]
     fn test_sandbox_mode_display() {
         assert_eq!(SandboxMode::ReadOnly.as_str(), "read-only");
         assert_eq!(SandboxMode::WorkspaceWrite.as_str(), "workspace-write");
@@ -695,6 +993,101 @@ mod tests {
         assert!(matches!(result, ToolDispatchAction::Terminate { .. }));
     }
 
+    // ── FR-035: ToolArgRegistry seatbelt extension ───────────────────────────
+
+    #[test]
+    fn arg_registry_blocks_dangerous_daemon_action() {
+        // Without registration, system.daemon's `action` arg bypasses the
+        // seatbelt entirely (it only inspects args named `command`/`path`).
+        let mut registry = ToolArgRegistry::new();
+        registry.register_tool_args("system.daemon", &[], &["daemon_action", "action"]);
+
+        let policy = SeatbeltPolicy::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        )
+        .with_arg_registry(registry);
+
+        let invocation = ToolInvocation {
+            name: "system.daemon".to_string(),
+            args: serde_json::json!({
+                "action": "sudo systemctl stop sshd",
+                "name": "sshd",
+            }),
+        };
+        let result = policy.validate_invocation(&invocation).unwrap();
+        assert!(
+            matches!(result, ToolDispatchAction::Terminate { .. }),
+            "dangerous daemon_action must be blocked via registry, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn arg_registry_blocks_wasm_sandbox_protected_path() {
+        let mut registry = ToolArgRegistry::new();
+        registry.register_tool_args("plugin.wasm_sandbox", &["wasm_path"], &[]);
+
+        let policy = SeatbeltPolicy::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        )
+        .with_arg_registry(registry);
+
+        let invocation = ToolInvocation {
+            name: "plugin.wasm_sandbox".to_string(),
+            args: serde_json::json!({
+                "wasm_path": "/workspace/.git/evil.wasm",
+                "operation": "write",
+            }),
+        };
+        let result = policy.validate_invocation(&invocation).unwrap();
+        assert!(
+            matches!(result, ToolDispatchAction::Terminate { .. }),
+            "write to metadata path via wasm_path must be blocked, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn arg_registry_allows_benign_invocation() {
+        let mut registry = ToolArgRegistry::new();
+        registry.register_tool_args("system.daemon", &[], &["daemon_action", "action"]);
+
+        let policy = SeatbeltPolicy::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        )
+        .with_arg_registry(registry);
+
+        let invocation = ToolInvocation {
+            name: "system.daemon".to_string(),
+            args: serde_json::json!({
+                "action": "status",
+                "name": "nginx",
+            }),
+        };
+        let result = policy.validate_invocation(&invocation).unwrap();
+        assert!(
+            matches!(result, ToolDispatchAction::Continue),
+            "benign daemon status must continue, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn unregistered_tool_falls_back_to_legacy_arg_keys() {
+        // Unregistered tools still get the legacy `command`/`path` check.
+        let policy = SeatbeltPolicy::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        );
+
+        let invocation = ToolInvocation {
+            name: "shell".to_string(),
+            args: serde_json::json!({"command": "rm -rf /"}),
+        };
+        let result = policy.validate_invocation(&invocation).unwrap();
+        assert!(matches!(result, ToolDispatchAction::Terminate { .. }));
+    }
+
     #[test]
     fn test_root_bound_rejects_traversal_escape() {
         let validator = SandboxValidator::new(
@@ -731,6 +1124,173 @@ mod tests {
         assert!(
             policy.is_write_allowed(&PathBuf::from("/workspace/sub/../notes.md")),
             "seatbelt must allow in-root traversal"
+        );
+    }
+
+    // ── FR-024: Symlink canonicalization ──────────────────────────────────────
+
+    #[cfg(unix)]
+    fn make_symlink_validator() -> (SandboxValidator, tempfile::TempDir, PathBuf) {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let ws_root = workspace.path().to_path_buf();
+        let validator = SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![ws_root.clone()]);
+        (validator, workspace, ws_root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_protected_path_rejected_on_read() {
+        use std::os::unix::fs::symlink;
+
+        let (_guard, _workspace, ws_root) = make_symlink_validator();
+
+        // Place the fake secret INSIDE the workspace so the lexical check
+        // (which only sees `workspace/shortcut`) passes; only canonicalize
+        // can catch it.
+        let fake_secret_dir = ws_root.join(".ssh");
+        std::fs::create_dir_all(&fake_secret_dir).unwrap();
+        let fake_secret = fake_secret_dir.join("id_rsa");
+        std::fs::write(&fake_secret, "PRIVATE").unwrap();
+
+        let shortcut = ws_root.join("shortcut");
+        symlink(&fake_secret, &shortcut).unwrap();
+
+        let validator = SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![ws_root.clone()]);
+        let err = validator
+            .validate_path_for_read(&shortcut)
+            .expect_err("symlink to protected path must be rejected");
+        assert!(
+            err.contains("protected path"),
+            "error must mention protected path, got: {err}"
+        );
+
+        let err = validator
+            .validate_path_for_write(&shortcut)
+            .expect_err("symlink to protected path must be rejected on write");
+        assert!(
+            err.contains("protected path"),
+            "write error must mention protected path, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legitimate_workspace_symlink_allowed() {
+        use std::os::unix::fs::symlink;
+
+        let (_guard, _workspace, ws_root) = make_symlink_validator();
+
+        let real_dir = ws_root.join("real_data");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("notes.md"), "ok").unwrap();
+
+        // Obsidian-style vault symlink: target stays inside workspace.
+        let vault = ws_root.join("vault");
+        symlink(&real_dir, &vault).unwrap();
+
+        let validator = SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![ws_root.clone()]);
+        validator
+            .validate_path_for_read(&vault.join("notes.md"))
+            .expect("legitimate workspace-local symlink must be allowed");
+        validator
+            .validate_path_for_write(&vault.join("new.md"))
+            .expect("legitimate workspace-local symlink must be writable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_chain_to_protected_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let (_guard, _workspace, ws_root) = make_symlink_validator();
+
+        // Chain: workspace/a → workspace/b → workspace/.aws/credentials
+        let aws_dir = ws_root.join(".aws");
+        std::fs::create_dir_all(&aws_dir).unwrap();
+        let secret = aws_dir.join("credentials");
+        std::fs::write(&secret, "KEY").unwrap();
+
+        let link_b = ws_root.join("b");
+        symlink(&secret, &link_b).unwrap();
+
+        let link_a = ws_root.join("a");
+        symlink(&link_b, &link_a).unwrap();
+
+        let validator = SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![ws_root.clone()]);
+        let err = validator
+            .validate_path_for_read(&link_a)
+            .expect_err("symlink chain to protected path must be rejected");
+        assert!(
+            err.contains("protected path"),
+            "chain error must mention protected path, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_workspace_root_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws_root = workspace.path().to_path_buf();
+        let out_root = outside.path().to_path_buf();
+
+        std::fs::write(out_root.join("outside.txt"), "x").unwrap();
+
+        let escape = ws_root.join("escape");
+        symlink(out_root.join("outside.txt"), &escape).unwrap();
+
+        let validator = SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![ws_root.clone()]);
+        let err = validator
+            .validate_path_for_read(&escape)
+            .expect_err("symlink escaping workspace root must be rejected");
+        assert!(
+            err.contains("escapes workspace root"),
+            "escape error must mention workspace root, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ws_root = workspace.path().to_path_buf();
+
+        let dangling = ws_root.join("dangling");
+        symlink(ws_root.join("does_not_exist"), &dangling).unwrap();
+
+        let validator = SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![ws_root.clone()]);
+        let err = validator
+            .validate_path_for_read(&dangling)
+            .expect_err("broken symlink must be rejected");
+        assert!(
+            err.contains("cannot canonicalize"),
+            "broken symlink error must mention canonicalize, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_path_skips_canonicalize() {
+        // Non-existent paths (about-to-be-written files) skip canonicalize;
+        // `lexical_normalize` already handles `..` traversal for those.
+        let validator = SandboxValidator::new(
+            SandboxMode::WorkspaceWrite,
+            vec![PathBuf::from("/workspace")],
+        );
+        assert!(
+            validator
+                .validate_path_for_write(&PathBuf::from("/workspace/brand_new.md"))
+                .is_ok(),
+            "non-existent path must skip canonicalize and pass"
+        );
+        assert!(
+            validator
+                .validate_path_for_read(&PathBuf::from("/workspace/never_existed.md"))
+                .is_ok(),
+            "non-existent read path must skip canonicalize and pass"
         );
     }
 }

@@ -113,6 +113,18 @@ pub fn execute_command(operation: &WorkspaceCommands) -> Result<(), ZenError> {
                 let _ = paths.ensure_runtime_dirs();
             }
 
+            // FR-040: sweep for stale tempfile artifacts (.bak/.tmp) left by
+            // crashed operations. Best-effort; runs after workspace open/init.
+            if let Ok(paths) = ZenPaths::detect()
+                && let Some(root) = paths.workspace_root()
+            {
+                tracing::info!(
+                    workspace = %root.display(),
+                    "boot_time_sweep: sweeping workspace for stale tempfiles"
+                );
+                zen_core::tempfile_lifecycle::boot_time_sweep(root);
+            }
+
             Ok(())
         }
         WorkspaceCommands::Status => {

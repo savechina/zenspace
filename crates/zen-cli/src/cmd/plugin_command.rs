@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 use colored::Colorize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use zen_core::errors::ZenError;
 use zen_plugin::{Lifecycle, PluginEntry, PluginKind, PluginRegistry};
@@ -91,13 +91,9 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 let kind = match kind_str.as_str() {
                     "tool" => PluginKind::Tool,
                     "hook" => PluginKind::Hook,
-                    "service" => PluginKind::Service,
-                    "provider" => PluginKind::Provider,
                     _ => {
-                        return Err(ZenError::Service(format!(
-                            "Unknown plugin kind: {}",
-                            kind_str
-                        )));
+                        warn!("Unknown plugin kind: {}, defaulting to tool", kind_str);
+                        PluginKind::Tool
                     }
                 };
                 if *enabled {
@@ -188,6 +184,28 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
             if let Err(e) = copy_dir_all(path, &target_dir) {
                 registry.unregister(&plugin_id).ok();
                 return Err(ZenError::Service(format!("Failed to copy plugin: {}", e)));
+            }
+
+            // FR-043: verify integrity of the installed copy before declaring success.
+            let installed_manifest_path = target_dir.join("manifest.toml");
+            let installed_entry = match PluginEntry::from_manifest_path(&installed_manifest_path) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    registry.unregister(&plugin_id).ok();
+                    std::fs::remove_dir_all(&target_dir).ok();
+                    return Err(ZenError::Service(format!(
+                        "Failed to load installed manifest: {}",
+                        e
+                    )));
+                }
+            };
+            if let Err(e) = installed_entry.verify_integrity() {
+                registry.unregister(&plugin_id).ok();
+                std::fs::remove_dir_all(&target_dir).ok();
+                return Err(ZenError::Service(format!(
+                    "Plugin '{}' failed integrity verification: {}",
+                    plugin_id, e
+                )));
             }
 
             println!(
@@ -300,15 +318,34 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 "─".dimmed(),
                 wiring.tools.len()
             );
-            for (name, sensitivity) in &wiring.tool_sensitivity {
+            let mut names: Vec<&String> = wiring.tool_sensitivity.keys().collect();
+            names.sort();
+            for name in names {
+                let sensitivity = &wiring.tool_sensitivity[name];
                 let sens_label = match sensitivity {
                     zen_core::types::Sensitivity::Public => "PUBLIC".green(),
                     zen_core::types::Sensitivity::Private => "PRIVATE".yellow(),
                     zen_core::types::Sensitivity::Confidential => "CONFIDENTIAL".red(),
                 };
-                let exists = wiring.tools.get(name).is_ok();
-                if exists {
-                    println!("  {} [{}] {}", name.cyan(), sens_label, "✓".green());
+                if wiring.tools.get(name).is_ok() {
+                    let source = if name.contains('.')
+                        && !name.starts_with("fs.")
+                        && !name.starts_with("web.")
+                        && !name.starts_with("system.")
+                        && !name.starts_with("plugin.")
+                        && !name.starts_with("shell.")
+                    {
+                        "plugin"
+                    } else {
+                        "builtin"
+                    };
+                    println!(
+                        "  {} [{}] [{}] {}",
+                        name.cyan(),
+                        sens_label,
+                        source,
+                        "✓".green()
+                    );
                 }
             }
             Ok(())

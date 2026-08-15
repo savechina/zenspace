@@ -5,14 +5,17 @@ use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 #[derive(Clone)]
 pub struct FsWatcherTool {
     watchers: Arc<Mutex<Vec<(RecommendedWatcher, String)>>>,
+    active_watchers: Arc<AtomicUsize>,
 }
 
 const NAME: &str = "system.fs_watcher";
+const MAX_WATCHERS: usize = 8;
 const DESCRIPTION: &str = "File system monitoring - watch paths for changes";
 
 static ARGS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
@@ -58,6 +61,7 @@ impl FsWatcherTool {
     pub fn new() -> Self {
         FsWatcherTool {
             watchers: Arc::new(Mutex::new(Vec::new())),
+            active_watchers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -108,6 +112,15 @@ impl Tool for FsWatcherTool {
                 let path_str = args["path"].as_str().ok_or_else(|| {
                     KernelError::InvalidArgument("Missing 'path' field for watch action".into())
                 })?;
+
+                // Reject protected paths (e.g. ~/.ssh, .git, .env) before any
+                // registration work.
+                if zen_core::sandbox::is_metadata_path(Path::new(path_str)) {
+                    return Err(KernelError::InvalidArgument(format!(
+                        "Path is protected and cannot be watched: {path_str}"
+                    )));
+                }
+
                 let recursive = args
                     .get("recursive")
                     .and_then(|v| v.as_bool())
@@ -118,20 +131,37 @@ impl Tool for FsWatcherTool {
                     RecursiveMode::NonRecursive
                 };
 
+                // Enforce the per-instance watcher cap. Reserve a slot first so
+                // concurrent invocations cannot overshoot the limit.
+                let current = self.active_watchers.fetch_add(1, Ordering::SeqCst);
+                if current >= MAX_WATCHERS {
+                    self.active_watchers.fetch_sub(1, Ordering::SeqCst);
+                    return Err(KernelError::InvalidArgument(
+                        "watcher limit reached (max 8)".into(),
+                    ));
+                }
+
                 let (tx, rx) = mpsc::channel();
-                let mut watcher = RecommendedWatcher::new(tx, Config::default())
-                    .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+                let mut watcher = match RecommendedWatcher::new(tx, Config::default()) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        self.active_watchers.fetch_sub(1, Ordering::SeqCst);
+                        return Err(KernelError::ToolFailed(e.to_string()));
+                    }
+                };
 
                 let path = Path::new(path_str);
                 if !path.exists() {
+                    self.active_watchers.fetch_sub(1, Ordering::SeqCst);
                     return Err(KernelError::InvalidArgument(format!(
                         "Path does not exist: {path_str}"
                     )));
                 }
 
-                watcher
-                    .watch(path, mode)
-                    .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+                if let Err(e) = watcher.watch(path, mode) {
+                    self.active_watchers.fetch_sub(1, Ordering::SeqCst);
+                    return Err(KernelError::ToolFailed(e.to_string()));
+                }
 
                 let tool_clone = self.clone();
                 std::thread::spawn(move || {
@@ -158,6 +188,9 @@ impl Tool for FsWatcherTool {
                 let before = watchers.len();
                 watchers.retain(|(_, p)| p != path_str);
                 let removed = before - watchers.len();
+                if removed > 0 {
+                    self.active_watchers.fetch_sub(removed, Ordering::SeqCst);
+                }
 
                 Ok(json!({
                     "action": "unwatch",
@@ -179,5 +212,74 @@ impl Tool for FsWatcherTool {
                 "Invalid action: {action}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn watch_args(path: &str) -> Value {
+        json!({
+            "action": "watch",
+            "path": path,
+            "recursive": false
+        })
+    }
+
+    #[tokio::test]
+    async fn ninth_watcher_rejected() {
+        let tool = FsWatcherTool::new();
+        let dirs: Vec<_> = (0..MAX_WATCHERS)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect();
+        for d in &dirs {
+            let res = tool.invoke(watch_args(d.path().to_str().unwrap())).await;
+            assert!(
+                res.is_ok(),
+                "watch {} should succeed: {:?}",
+                d.path().display(),
+                res
+            );
+        }
+        assert_eq!(tool.active_watchers.load(Ordering::SeqCst), MAX_WATCHERS);
+
+        let extra = tempfile::tempdir().unwrap();
+        let err = tool
+            .invoke(watch_args(extra.path().to_str().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("watcher limit reached"),
+            "expected limit error, got: {err}"
+        );
+        assert_eq!(tool.active_watchers.load(Ordering::SeqCst), MAX_WATCHERS);
+    }
+
+    #[tokio::test]
+    async fn protected_ssh_path_rejected() {
+        let tool = FsWatcherTool::new();
+        let err = tool.invoke(watch_args("~/.ssh")).await.unwrap_err();
+        assert!(
+            err.to_string().contains("protected"),
+            "expected protected-path error, got: {err}"
+        );
+        assert_eq!(tool.active_watchers.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unwatch_releases_slot() {
+        let tool = FsWatcherTool::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        tool.invoke(watch_args(path)).await.unwrap();
+        assert_eq!(tool.active_watchers.load(Ordering::SeqCst), 1);
+
+        let res = tool
+            .invoke(json!({ "action": "unwatch", "path": path }))
+            .await
+            .unwrap();
+        assert_eq!(res["removed"], 1);
+        assert_eq!(tool.active_watchers.load(Ordering::SeqCst), 0);
     }
 }

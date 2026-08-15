@@ -403,3 +403,33 @@ disclaimer_acknowledged = false
 #   args = ["-y", "@modelcontextprotocol/server-brave-search"]
 #   env = { BRAVE_API_KEY = "..." }
 # =============================================================================
+
+# =============================================================================
+# Sandbox Hardening (FR-036/037/038/041/045, v0.0.6)
+# =============================================================================
+
+[sandbox.rlimits]
+# Applied at ZenWiring construction (FR-038). Defaults: NPROC=50, NOFILE=256, CORE=0.
+# max_processes = 50
+# max_open_files = 256
+# max_core_size = 0
+
+[sandbox.env_scrub]
+# Secret-bearing env vars are stripped from child processes (shell.exec, MCP
+# stdio). Pattern-matched: *_API_KEY, *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIAL.
+# extra_scrub = ["MY_EXTRA_SECRET_VAR"]
+# allowlist = ["PUBLICLY_SAFE_TOKEN"]
+
+[sandbox.network_policy]
+# Default denies link-local (169.254/16 incl. cloud metadata), loopback, and
+# RFC1918 ranges; allow_hosts exempts specific hosts (local providers).
+# allow_hosts = ["localhost", "127.0.0.1"]
+# allow_private_ranges = false
+
+[session]
+# Drain window for SIGINT/SIGTERM graceful shutdown (FR-041).
+drain_timeout_secs = 5
+
+[tools.fs_watcher]
+# Per-session watcher cap (FR-045).
+max_watchers = 8

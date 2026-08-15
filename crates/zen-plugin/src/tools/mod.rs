@@ -36,5 +36,8 @@ pub mod fs_move;
 pub mod fs_read;
 pub mod fs_write;
 pub mod mcp_client;
+pub mod shell_exec;
 pub mod web_fetch;
 pub mod web_search;
+
+pub use shell_exec::ShellExecTool;

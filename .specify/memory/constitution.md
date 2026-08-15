@@ -1,14 +1,16 @@
 <!--
 Sync Impact Report:
-- Version: 1.5.0 → 1.6.0 (MINOR - Data Migration Compatibility principle added)
+- Version: 1.6.0 → 1.7.0-pending (MINOR - Agent Safety principle proposed)
 - Modified principles: None
-- Added principles: XIII. Data Migration Compatibility
+- Added principles: XIV. Agent Safety (PROPOSED 2026-08-11, pending ratification PR per Governance §"Amendments require")
 - Removed sections: None
-- Templates requiring updates: None
-- Deferred items: None
+- Templates requiring updates: plan.md Constitution Check tables across feature specs (add XIV row)
+- Deferred items: Principle XIV ratification requires a dedicated PR with review and explicit approval; spec 003-agentic-plugin FR-035..045 anticipate the principle and implement its intent ahead of ratification. Plan gate is conditional until the amendment lands.
 -->
 
 # ZenSpace Constitution
+
+> **v1.7.0-pending** — Principle XIV (Agent Safety) proposed 2026-08-11, pending ratification PR. Spec 003-agentic-plugin FR-004, FR-018..020, FR-023..045 implement the principle's intent ahead of formal ratification. See Governance section for amendment procedure.
 
 ## Core Principles
 
@@ -195,6 +197,62 @@ Rationale: Unified database eliminates schema sync issues, enables cross-domain 
 
 Rationale: The knowledge base is the user's accumulated work product. A destructive migration that loses notes, entities, beliefs, or embeddings is not a bug — it is a data loss incident. Additive-only migrations, version tracking, and tested destructive-protocols make "the schema can evolve" a guarantee rather than a hope. The forward-compatibility techniques (max-dim vec0, dead-column tolerance, FTS5 rebuild) cost nothing at write time and eliminate whole classes of future migration pain.
 
+### XIV. Agent Safety *(PROPOSED 2026-08-11 — pending ratification PR)*
+
+**Status**: PROPOSED. This principle was identified as missing during the 2026-08-11 `/speckit.analyze` audit of 003-agentic-plugin, which surfaced 25 safety FRs without a constitution-level anchor. Per Governance below, amendment requires a dedicated PR with documented review and explicit approval. Until ratification, the principle is informational; the spec FRs (FR-004, FR-018..020, FR-023..045) carry the binding force. Once ratified, all agent-bearing features MUST comply.
+
+**The agent runs on the user's host operating system. Every host-OS touch point MUST be mediated by an explicit, auditable safety layer. "The user installed zen" is not authorization for the agent to read secrets, spawn arbitrary subprocesses, exfiltrate data, or persist state outside its workspace.**
+
+The agent's host-OS surface MUST be designed against the threat model: a **misled or compromised LLM** (prompt injection, malicious MCP server, poisoned plugin, adversarial web content) attempting to (a) read credentials, (b) spawn malicious subprocesses, (c) probe internal network, (d) destroy user data, or (e) persist beyond the session.
+
+1. **Path-Bounded File Access** — All file operations MUST be scoped to a configured workspace root. Paths MUST be canonicalized before validation to defeat symlink escapes (per spec FR-024). A closed protected-path list (`PROTECTED_PATHS` per FR-004) MUST block credential directories regardless of sandbox mode; the list is fixed in code, not user-configurable (per `/speckit.clarify` 2026-08-11).
+
+2. **Subprocess Sandbox** — Any agent-initiated subprocess (`shell.exec`, MCP stdio transport, plugin-loaded native code) MUST run inside an OS-level sandbox: macOS Seatbelt, Linux Bubblewrap+Landlock, Windows AppContainer. Bare `tokio::process::Command` without sandbox wrapping is forbidden on the agent path. Resource limits (RLIMIT_NPROC, RLIMIT_NOFILE, RLIMIT_CORE) MUST be applied to the agent process at wiring time.
+
+3. **Network Egress Policy** — All outbound network calls from agent-reachable tools (web fetch/search, MCP HTTP, LLM providers) MUST pass a domain/IP allowlist. Link-local (169.254.0.0/16 cloud metadata), loopback (127.0.0.0/8 except explicitly-allowlisted provider hosts), and RFC1918 ranges MUST be denied by default to prevent SSRF. Per-domain overrides require explicit user approval.
+
+4. **Environment Scrubbing** — Subprocess spawn (shell.exec, MCP stdio) MUST scrub the parent environment of secret-bearing variables (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`) before exec. The child env is reconstructed explicitly via tool args, never inherited verbatim.
+
+5. **Permission Pipeline** — Every tool invocation MUST pass through a multi-stage hook pipeline (confidentiality → budget → seatbelt → audit → approval) before dispatch. No tool may bypass the pipeline. Mutating tools MUST require interactive approval when the session is in `Ask` mode (FR-019). The pipeline MUST cover **every registered tool's** path/command-bearing args, regardless of arg name (per FR-035).
+
+6. **Audit Trail** — Every tool invocation — successful, failed, or cancelled — MUST produce an audit record with metadata (tool name, args redacted of secrets, outcome, duration, caller, sandbox mode). For privacy-bearing tools (`fs.read`), the record MUST NOT include file content, hashes, or byte previews (per `/speckit.clarify` 2026-08-11). Audit logs MUST be append-only and safe to ship to shared telemetry.
+
+7. **Plugin Integrity** — Loaded plugins (WASM or native) MUST declare their entry-point hash in the manifest; the loader MUST verify the hash before instantiation (FR-043). Native `.dylib`/`.so` plugins MUST additionally pass code-signing verification on platforms that support it (macOS `codesign --verify --strict`). Unsigned or hash-mismatched plugins MUST be rejected.
+
+8. **Process Hardening** — The zen process MUST harden itself at startup: disable core dumps (RLIMIT_CORE=0), deny debugger/ptrace attachment (Linux `PR_SET_DUMPABLE=0`, macOS `PT_DENY_ATTACH`), and strip library-injection env vars (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`) from its own environment before any other code runs (FR-044).
+
+9. **Graceful Drain** — The session MUST install SIGINT/SIGTERM handlers that drain in-flight tool calls within a configurable window (default 5s) rather than killing the process mid-dispatch. Cancellation MUST produce an `outcome: "cancelled"` audit record per interrupted call and clean up child processes via process-group signal (FR-041).
+
+10. **Tempfile Lifecycle** — All temporary files (`.bak`, `.tmp`) created by tools MUST be managed by `Drop` guards that remove them on early-return or panic, AND swept at workspace-open time to recover from prior crashes (FR-040).
+
+11. **Default Deny** — When a new tool is added and its safety posture is unclear, the default is `Sensitivity::Confidential` (excluded from external MCP clients) and `SandboxMode::Ask` (prompt before each invocation). Promotion to `Public`/`Private` and `WorkspaceWrite` requires explicit spec-level justification.
+
+**Enforcement requirements**:
+- All agent-bearing features MUST enumerate their host-OS touch points in the feature spec and map each to a safety FR.
+- Cross-artifact analysis (`/speckit.analyze`) MUST be run before `/speckit.implement` and MUST verify safety-FR coverage.
+- The audit log MUST be inspectable via `zen audit` and shipped safely to shared telemetry without redaction post-processing.
+- New tools MUST declare their path/command-bearing arg names in the seatbelt arg registry (FR-035); tools that fail to do so are rejected at wiring time.
+- New subprocess-spawning paths MUST be reviewed against principles 2 (sandbox), 4 (env scrub), and 9 (drain).
+- Principle IX (UX Consistency) remains in force — safety prompts MUST be human-readable, with the full `binary + args + cwd` or `path + operation` displayed.
+
+**Prohibited patterns**:
+- Bare `tokio::process::Command::new(...).spawn()` in agent-reachable code without a sandbox wrapper.
+- `tokio::fs::read(path)` where `path` came from agent input and was not canonicalized first.
+- Inheriting the parent env verbatim when spawning child processes from agent tools.
+- New tools registered with bypassed or partial hook-pipeline wiring.
+- Storing file content in the audit log for `fs.read` calls.
+- Loading `.wasm`/`.dylib`/`.so` plugins without a verified `sha256` in the manifest.
+- Adding a new agent tool without listing its path/command-bearing args in the seatbelt arg registry.
+
+**Reference systems** (consulted during principle formulation, 2026-08-11):
+- **OpenAI Codex CLI** — strongest sandbox: Seatbelt + Bubblewrap + Landlock + AppContainer; Starlark exec-policy engine; in-process MITM network proxy; `process-hardening` via `#[ctor::ctor]`; tree-sitter compound-command decomposition.
+- **Anthropic Claude Code** — richest permission UX: 6 permission modes; per-tool glob rules; `sandbox.credentials.files` + `envVars` deny list; `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`; managed settings for org lockdown.
+- **sst/opencode** — minimal-but-clean permission model: `allow`/`deny`/`ask` with `once`/`always` persistence; `.env` denied by default; `external_directory` gating; doom-loop detection.
+- **Aider** — explicit anti-pattern: no sandbox, no permission system; safety relies on git undo. NOT a model for zen.
+- **Block Goose** — anti-pattern by default (YOLO mode); opt-in macOS Seatbelt is the right direction but too little by default.
+
+Rationale: The agent is the highest-privilege software most users will ever run on their workstation — it reads what they read, writes what they write, and (post-FR-028) executes what they execute. Without an anchored safety principle, every feature spec re-litigates the same tradeoffs and every regression weakens the floor. A constitution-level mandate makes "is this safe?" a gate, not a question.
+
 ## Technology Stack
 
 - **Language**: Rust (edition 2024)
@@ -227,4 +285,7 @@ This constitution supersedes all other practices. Amendments require:
 
 All PRs MUST verify compliance with these principles. The AGENTS.md file serves as runtime development guidance.
 
-**Version**: 1.6.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-07-25
+**Pending amendments**:
+- **v1.7.0 — Principle XIV: Agent Safety** (proposed 2026-08-11). Pending: dedicated PR with documented review. The principle text is in this file under §XIV but is informational until the PR merges. Spec 003-agentic-plugin FR-004, FR-018..020, FR-023..045 implement the principle's intent ahead of ratification. Once ratified, all agent-bearing feature specs MUST pass a Principle XIV compliance check in their plan.md Constitution Check table.
+
+**Version**: 1.7.0-pending | **Ratified**: 2026-02-24 | **Last Amended**: 2026-07-25 (v1.6.0 — Principle XIII Data Migration Compatibility) | **Pending Amendment**: 2026-08-11 (v1.7.0 — Principle XIV Agent Safety)

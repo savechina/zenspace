@@ -24,6 +24,16 @@ pub enum PluginRegistryError {
     #[error("plugin error: {id}: {reason}")]
     PluginError { id: String, reason: String },
 
+    #[error("sha256 mismatch for plugin entry {path}: expected {expected}, got {actual}")]
+    HashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("code signature invalid for {path}: {reason}")]
+    CodeSignInvalid { path: String, reason: String },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -33,8 +43,6 @@ pub enum PluginRegistryError {
 pub enum PluginKind {
     Tool,
     Hook,
-    Service,
-    Provider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +55,12 @@ pub struct Manifest {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub config_schema: Option<serde_json::Value>,
+    /// Path to the plugin entry file (`.wasm` or `.so`/`.dylib`), relative to the plugin dir.
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// SHA-256 of the entry file. Absent → integrity unverified (warn only, FR-043).
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +112,78 @@ impl PluginEntry {
 
         Ok(Self::new(manifest, dir))
     }
+
+    /// Verify entry-file integrity (FR-043): SHA-256 against the manifest's
+    /// `sha256` field when declared, plus `codesign --verify --strict` for
+    /// native `.dylib` entries on macOS. Absent `sha256` → warn and allow.
+    pub fn verify_integrity(&self) -> Result<(), PluginRegistryError> {
+        let id = &self.manifest.id;
+
+        if let Some(entry) = &self.manifest.entry
+            && entry.ends_with(".dylib")
+        {
+            verify_codesign(&self.dir.join(entry))?;
+        }
+
+        let Some(expected) = &self.manifest.sha256 else {
+            warn!("plugin {id} has no sha256 in manifest — integrity unverified");
+            return Ok(());
+        };
+
+        let entry_name =
+            self.manifest
+                .entry
+                .as_ref()
+                .ok_or_else(|| PluginRegistryError::InvalidManifest {
+                    path: self.dir.join("manifest.toml").display().to_string(),
+                    reason: "sha256 declared but manifest has no entry file".to_string(),
+                })?;
+
+        let entry_path = self.dir.join(entry_name);
+        let actual = compute_sha256(&entry_path)?;
+        if actual != *expected {
+            return Err(PluginRegistryError::HashMismatch {
+                path: entry_path.display().to_string(),
+                expected: expected.clone(),
+                actual,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+fn compute_sha256(path: &Path) -> Result<String, PluginRegistryError> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).map_err(PluginRegistryError::Io)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_codesign(path: &Path) -> Result<(), PluginRegistryError> {
+    let output = std::process::Command::new("codesign")
+        .args(["--verify", "--strict"])
+        .arg(path)
+        .output()
+        .map_err(PluginRegistryError::Io)?;
+    if !output.status.success() {
+        return Err(PluginRegistryError::CodeSignInvalid {
+            path: path.display().to_string(),
+            reason: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_codesign(_path: &Path) -> Result<(), PluginRegistryError> {
+    Ok(())
 }
 
 pub struct PluginRegistry {
@@ -158,8 +244,14 @@ impl PluginRegistry {
             }
 
             match PluginEntry::from_manifest_path(&manifest_path) {
-                Ok(entry) => {
+                Ok(mut entry) => {
                     let id = entry.manifest.id.clone();
+                    if let Err(e) = entry.verify_integrity() {
+                        warn!("Plugin {} failed integrity verification: {}", id, e);
+                        entry.lifecycle = Lifecycle::Failed;
+                        self.plugins.insert(id.clone(), entry);
+                        continue;
+                    }
                     self.plugins.insert(id.clone(), entry);
                     count += 1;
                     debug!(

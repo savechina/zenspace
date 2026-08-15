@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tracing::warn;
-use wasmtime::{Config, Engine};
+use wasmtime::{Config, Engine, ResourceLimiter};
 
 #[derive(Debug, Error)]
 pub enum WasmSandboxError {
@@ -62,6 +62,59 @@ pub struct WasmPermissions {
     pub allow_filesystem_write: bool,
     pub allow_network: bool,
     pub allow_system: bool,
+}
+
+/// Resource limiter enforcing the sandbox's memory cap (FR-030).
+///
+/// Tracks the largest memory size requested so `memory_used_bytes` can be
+/// reported post-execution without walking the instance's exports.
+#[derive(Default)]
+struct StoreLimits {
+    max_memory_bytes: usize,
+    last_desired_bytes: usize,
+}
+
+impl StoreLimits {
+    fn new(max_memory_bytes: usize) -> Self {
+        Self {
+            max_memory_bytes,
+            last_desired_bytes: 0,
+        }
+    }
+}
+
+impl ResourceLimiter for StoreLimits {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.last_desired_bytes = desired;
+        Ok(desired <= self.max_memory_bytes)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true) // tables unrestricted for now
+    }
+}
+
+/// Store state: the WASI context plus the resource limiter. The limiter must
+/// live inside the store's data so `Store::limiter` can reach it.
+struct SandboxState {
+    wasi: wasmtime_wasi::p1::WasiP1Ctx,
+    limits: StoreLimits,
+}
+
+impl wasmtime_wasi::WasiView for SandboxState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        self.wasi.ctx()
+    }
 }
 
 pub struct PrecompiledModule {
@@ -139,6 +192,7 @@ fn compile_wasm(engine: &Engine, wasm_bytes: &[u8]) -> Result<CompiledWasm, Wasm
 pub struct WasmSandbox {
     engine: Engine,
     limits: ResourceLimits,
+    policy: WasmPermissions,
 }
 
 impl WasmSandbox {
@@ -155,7 +209,11 @@ impl WasmSandbox {
             Engine::default()
         });
 
-        Self { engine, limits }
+        Self {
+            engine,
+            limits,
+            policy: WasmPermissions::default(),
+        }
     }
 
     pub fn engine(&self) -> &Engine {
@@ -164,6 +222,18 @@ impl WasmSandbox {
 
     pub fn limits(&self) -> &ResourceLimits {
         &self.limits
+    }
+
+    /// Configure the permission policy this sandbox enforces (FR-029).
+    /// Defaults to deny-all; invocations may only declare permissions the
+    /// policy grants.
+    pub fn with_policy(mut self, policy: WasmPermissions) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> &WasmPermissions {
+        &self.policy
     }
 
     pub fn check_permission(
@@ -246,7 +316,14 @@ impl WasmSandbox {
         wasi_builder.stderr(stderr_pipe.clone());
         let wasi_ctx = wasi_builder.build_p1();
 
-        let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
+        let mut store = wasmtime::Store::new(
+            &self.engine,
+            SandboxState {
+                wasi: wasi_ctx,
+                limits: StoreLimits::new(self.limits.max_memory_bytes as usize),
+            },
+        );
+        store.limiter(|state| &mut state.limits);
         let fuel_budget = self
             .limits
             .max_execution_time_ms
@@ -262,7 +339,7 @@ impl WasmSandbox {
         // doesn't expose those bindings — p2 requires component model
         // wrapping via wasmtime::component::Linker.
         let mut linker = wasmtime::Linker::new(&self.engine);
-        wasmtime_wasi::p1::add_to_linker_async::<wasmtime_wasi::p1::WasiP1Ctx>(&mut linker, |s| s)
+        wasmtime_wasi::p1::add_to_linker_async::<SandboxState>(&mut linker, |s| &mut s.wasi)
             .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
 
         let instance = linker
@@ -296,15 +373,17 @@ impl WasmSandbox {
             }
         };
 
-        let fuel_remaining = store.get_fuel().unwrap_or(fuel_budget);
-        let used_fuel = fuel_budget.saturating_sub(fuel_remaining);
+        let memory_used_bytes = instance
+            .get_memory(&mut store, "memory")
+            .map(|m| m.data_size(&store) as u64)
+            .unwrap_or_else(|| store.data().limits.last_desired_bytes as u64);
 
         Ok(ExecutionOutput {
             stdout,
             stderr,
             exit_code,
             execution_time_ms: elapsed,
-            memory_used_bytes: used_fuel * 64 * 1024,
+            memory_used_bytes,
         })
     }
 
@@ -330,7 +409,14 @@ impl WasmSandbox {
         wasi_builder.stderr(stderr_pipe.clone());
         let wasi_ctx = wasi_builder.build_p1();
 
-        let mut store = wasmtime::Store::new(&self.engine, wasi_ctx);
+        let mut store = wasmtime::Store::new(
+            &self.engine,
+            SandboxState {
+                wasi: wasi_ctx,
+                limits: StoreLimits::new(self.limits.max_memory_bytes as usize),
+            },
+        );
+        store.limiter(|state| &mut state.limits);
         let fuel_budget = self
             .limits
             .max_execution_time_ms
@@ -341,7 +427,7 @@ impl WasmSandbox {
             .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
 
         let mut linker = wasmtime::component::Linker::new(&self.engine);
-        wasmtime_wasi::p3::add_to_linker::<wasmtime_wasi::p1::WasiP1Ctx>(&mut linker)
+        wasmtime_wasi::p3::add_to_linker::<SandboxState>(&mut linker)
             .map_err(|e| WasmSandboxError::Wasmtime(e.to_string()))?;
 
         let instance = linker
@@ -371,15 +457,14 @@ impl WasmSandbox {
             }
         };
 
-        let fuel_remaining = store.get_fuel().unwrap_or(fuel_budget);
-        let used_fuel = fuel_budget.saturating_sub(fuel_remaining);
+        let memory_used_bytes = store.data().limits.last_desired_bytes as u64;
 
         Ok(ExecutionOutput {
             stdout,
             stderr,
             exit_code,
             execution_time_ms: elapsed,
-            memory_used_bytes: used_fuel * 64 * 1024,
+            memory_used_bytes,
         })
     }
 }
@@ -459,6 +544,12 @@ impl WasmSandboxTool {
             sandbox: Arc::new(tokio::sync::Mutex::new(WasmSandbox::new())),
         }
     }
+
+    pub fn with_sandbox(sandbox: WasmSandbox) -> Self {
+        Self {
+            sandbox: Arc::new(tokio::sync::Mutex::new(sandbox)),
+        }
+    }
 }
 
 impl Default for WasmSandboxTool {
@@ -514,6 +605,23 @@ impl Tool for WasmSandboxTool {
         })?;
 
         let sandbox = self.sandbox.lock().await;
+
+        // FR-029: declared permissions must be a subset of the sandbox policy.
+        // check_permission is the load-bearing gate on every invoke.
+        for (resource, declared) in [
+            ("filesystem:read", permissions.allow_filesystem_read),
+            ("filesystem:write", permissions.allow_filesystem_write),
+            ("network", permissions.allow_network),
+            ("system", permissions.allow_system),
+        ] {
+            if declared {
+                sandbox
+                    .check_permission(sandbox.policy(), resource)
+                    .map_err(|e| {
+                        KernelError::ToolFailed(format!("WASM permission denied: {}", e))
+                    })?;
+            }
+        }
 
         if let Err(e) = sandbox.validate_module(&wasm_bytes) {
             return Err(KernelError::ToolFailed(format!(
@@ -763,5 +871,76 @@ mod tests {
         assert_eq!(schema.name, "plugin.wasm_sandbox");
         assert!(schema.args_schema.get("properties").is_some());
         assert!(schema.result_schema.get("properties").is_some());
+    }
+
+    #[tokio::test]
+    async fn permission_gate_rejects_undeclared() {
+        let tool = WasmSandboxTool::new(); // default policy: deny-all
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("empty.wasm");
+        std::fs::write(&wasm_path, wat::parse_str("(module)").unwrap()).unwrap();
+
+        let result = tool
+            .invoke(json!({
+                "wasm_path": wasm_path.to_str().unwrap(),
+                "func_name": "_start",
+                "permissions": { "network": true }
+            }))
+            .await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("permission denied"), "got: {err}");
+        assert!(err.contains("network"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn permission_gate_allows_declared() {
+        let sandbox = WasmSandbox::new().with_policy(WasmPermissions {
+            allow_network: true,
+            ..Default::default()
+        });
+        let tool = WasmSandboxTool::with_sandbox(sandbox);
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("empty.wasm");
+        std::fs::write(
+            &wasm_path,
+            wat::parse_str(r#"(module (func (export "_start")))"#).unwrap(),
+        )
+        .unwrap();
+
+        let result = tool
+            .invoke(json!({
+                "wasm_path": wasm_path.to_str().unwrap(),
+                "func_name": "_start",
+                "permissions": { "network": true }
+            }))
+            .await;
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn memory_limit_traps_oversized_module() {
+        let limits = ResourceLimits {
+            max_memory_bytes: 64 * 1024 * 1024,
+            ..ResourceLimits::default()
+        };
+        let sandbox = WasmSandbox::with_limits(limits);
+        // 65536 pages × 64 KiB = 4 GiB minimum memory
+        let wasm = wat::parse_str(r#"(module (memory 65536) (func (export "_start")))"#).unwrap();
+
+        let result = sandbox.execute(&wasm, "_start", &[]).await;
+        assert!(result.is_err(), "oversized module should be rejected");
+    }
+
+    #[test]
+    fn store_limits_denies_oversized_growth() {
+        let mut limits = StoreLimits::new(64 * 1024 * 1024);
+        assert!(limits.memory_growing(0, 1024 * 1024, None).unwrap());
+        assert!(
+            !limits
+                .memory_growing(0, 4 * 1024 * 1024 * 1024, None)
+                .unwrap()
+        );
+        assert!(limits.table_growing(0, 100, None).unwrap());
     }
 }

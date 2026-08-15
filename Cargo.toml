@@ -70,11 +70,8 @@ toml = "1.1.2"
 rusqlite = { version = "0.32", features = ["bundled", "functions", "uuid"] }
 tokio-rusqlite = "0.6"
 libc = "0.2"
+url = "2"
 sqlite-vec = "0.1"
-
-# Jento DI framework (spec.md Gap 5 — plugin lifecycle pattern)
-jento-core = { git = "https://github.com/savechina/jento.git", branch = "main" }
-jento-context = { git = "https://github.com/savechina/jento.git", branch = "main" }
 
 # TUI (FR-001 — ratatui + crossterm)
 # NOTE: scrolling-regions feature intentionally NOT enabled. It makes

@@ -10126,8 +10126,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "wasmtime",
- "wasmtime-wasi",
  "wat",
  "zen-core",
  "zen-memory",
@@ -10223,6 +10221,7 @@ dependencies = [
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -10281,11 +10280,13 @@ version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.23.0",
  "chrono",
  "diffy",
  "glob",
  "home",
  "htmd",
+ "libc",
  "notify",
  "notify-rust",
  "readabilityrs",
@@ -10297,6 +10298,7 @@ dependencies = [
  "scraper 0.27.0",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.19",
@@ -10308,6 +10310,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
+ "which",
  "zen-core",
 ]
 
