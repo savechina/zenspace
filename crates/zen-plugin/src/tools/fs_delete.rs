@@ -84,10 +84,20 @@ impl Tool for FsDeleteTool {
             .validate_path_for_write(&path)
             .map_err(KernelError::ToolFailed)?;
 
-        if let Some(root) = &self.workspace_root
-            && path == *root
-        {
-            return Ok(json!({ "error": "cannot delete workspace root" }));
+        if let Some(root) = &self.workspace_root {
+            // FR-026/CHK023: reject the raw root path AND any symlink alias
+            // resolving to the root. A naive `path == root` compare lets
+            // `fs.delete(root/self, clear_contents=true)` — where `self` is a
+            // symlink back to the root — bypass the guard and wipe the whole
+            // workspace through the alias (read_dir follows the link).
+            let is_root = path == *root
+                || std::fs::canonicalize(&path)
+                    .ok()
+                    .zip(std::fs::canonicalize(root).ok())
+                    .is_some_and(|(p, r)| p == r);
+            if is_root {
+                return Ok(json!({ "error": "cannot delete workspace root" }));
+            }
         }
 
         let meta = tokio::fs::metadata(&path)
@@ -201,6 +211,40 @@ mod tests {
         .unwrap();
         assert_eq!(res["error"], "cannot delete workspace root");
         assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn clear_contents_rejects_workspace_root() {
+        let dir = tempdir().unwrap();
+        let tool = FsDeleteTool::new(make_validator(dir.path()), Some(dir.path().to_path_buf()));
+        let res = block_on(tool.invoke(json!({
+            "path": dir.path().to_string_lossy(),
+            "clear_contents": true
+        })))
+        .unwrap();
+        assert_eq!(res["error"], "cannot delete workspace root");
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn clear_contents_rejects_symlink_alias_to_workspace_root() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+        let alias = dir.path().join("self");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+
+        let tool = FsDeleteTool::new(make_validator(dir.path()), Some(dir.path().to_path_buf()));
+        let res = block_on(tool.invoke(json!({
+            "path": alias.to_string_lossy(),
+            "clear_contents": true
+        })))
+        .unwrap();
+        assert_eq!(res["error"], "cannot delete workspace root");
+        assert!(
+            dir.path().join("keep.txt").exists(),
+            "workspace contents must survive the alias wipe"
+        );
     }
 
     #[test]

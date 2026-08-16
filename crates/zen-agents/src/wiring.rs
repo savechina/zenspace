@@ -1198,6 +1198,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seatbelt_via_wiring_blocks_shell_exec_network_binary() {
+        // CHK024 fail-path assertion: sandbox-exec/bubblewrap is absent in
+        // v0.0.6, so the seatbelt hook (not an OS sandbox) enforces fail-
+        // closed — a blocked network binary in `shell.exec` must be
+        // terminated pre-dispatch, never allowed to spawn unsandboxed.
+        let (hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
+            SandboxMode::WorkspaceWrite,
+            &[std::path::PathBuf::from("/ws")],
+        );
+        let seatbelt = &hooks[2];
+        let inv = rig_compose::normalizer::ToolInvocation {
+            name: "shell.exec".to_string(),
+            args: serde_json::json!({
+                "binary": "curl",
+                "args": ["http://169.254.169.254/latest/meta-data/"],
+                "cwd": "/ws",
+            }),
+        };
+        let action = seatbelt.before_invocation(&inv).await.unwrap();
+        assert!(
+            matches!(
+                action,
+                rig_compose::normalizer::ToolDispatchAction::Terminate { .. }
+            ),
+            "shell.exec network binary must be blocked pre-dispatch, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seatbelt_via_wiring_allows_benign_shell_exec_binary() {
+        let (hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
+            SandboxMode::WorkspaceWrite,
+            &[std::path::PathBuf::from("/ws")],
+        );
+        let seatbelt = &hooks[2];
+        let inv = rig_compose::normalizer::ToolInvocation {
+            name: "shell.exec".to_string(),
+            args: serde_json::json!({
+                "binary": "/usr/bin/git",
+                "args": ["status"],
+                "cwd": "/ws",
+            }),
+        };
+        let action = seatbelt.before_invocation(&inv).await.unwrap();
+        assert!(
+            matches!(
+                action,
+                rig_compose::normalizer::ToolDispatchAction::Continue
+            ),
+            "benign shell.exec binary must continue, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn seatbelt_via_wiring_allows_benign_daemon_status() {
         let (hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
             SandboxMode::WorkspaceWrite,

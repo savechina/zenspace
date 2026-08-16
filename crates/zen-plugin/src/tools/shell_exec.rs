@@ -15,6 +15,15 @@ pub struct ShellExecTool {
     workspace_root: PathBuf,
 }
 
+// CHK024 code-audit note (2026-08-16): v0.0.6 does NOT wrap execution with
+// sandbox-exec (macOS) / bubblewrap (Linux) — the FR-028 sandbox composition
+// is deferred. Fail-closed is enforced instead at the seatbelt hook layer:
+// `binary` is registered as a command arg (wiring.rs), so `check_command_arg`
+// terminates blocked network binaries (curl/wget) pre-dispatch, before any
+// spawn. The tool NEVER falls back to unsandboxed execution on missing
+// sandbox tooling — it simply never attempts one; spawn only happens for
+// binaries the seatbelt allowed. See spec.md FR-028 Clarification 2026-08-15.
+
 const NAME: &str = "shell.exec";
 const DESCRIPTION: &str =
     "Execute a binary with an argv array, optional stdin, env overrides, and a timeout";
