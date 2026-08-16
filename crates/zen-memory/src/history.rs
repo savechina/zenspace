@@ -20,6 +20,7 @@ struct HistoryEntry {
 ///
 /// Schema: `{"text":"...","ts":...,"session_id":"..."}` (Codex CLI compatible).
 /// Byte-capped: oldest entries trimmed when file exceeds max_bytes.
+#[derive(Debug, Clone)]
 pub struct HistoryStore {
     file_path: PathBuf,
     max_bytes: u64,

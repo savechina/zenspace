@@ -986,8 +986,30 @@ impl App {
             self.command_history.remove(0);
         }
         self.history_position = None;
-        if let Err(e) = self.history_store.append(cmd, self.session_id.as_deref()) {
-            tracing::warn!(error = %e, "failed to append command to history store");
+        self.persist_history(cmd);
+    }
+
+    /// Persist a submitted command to the history file OFF the event loop
+    /// (T055/T058: the submit path must not block on file IO — appending
+    /// re-reads the whole file for dedup, which is load-sensitive). Uses the
+    /// blocking pool when a tokio runtime is present, else writes inline
+    /// (headless tests without a runtime context).
+    fn persist_history(&self, cmd: &str) {
+        let store = self.history_store.clone();
+        let session_id = self.session_id.clone();
+        let cmd = cmd.to_string();
+        let append = move || {
+            if let Err(e) = store.append(&cmd, session_id.as_deref()) {
+                tracing::warn!(error = %e, "failed to append command to history store");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Dropping the JoinHandle detaches the blocking task — the
+                // append still runs, the event loop doesn't await it.
+                std::mem::drop(handle.spawn_blocking(append));
+            }
+            Err(_) => append(),
         }
     }
 
@@ -1238,20 +1260,13 @@ Use /thinking to show/hide thinking process."#;
                 Some(o) => o,
                 None => match super::prewarm::take_orchestrator() {
                     Some(o) => o,
-                    None => {
-                        match tokio::task::spawn_blocking(move || {
-                            Arc::new(build_orchestrator(config))
-                        })
-                        .await
-                        {
-                            Ok(o) => o,
-                            Err(e) => {
-                                let _ = done_tx
-                                    .send((Err(format!("orchestrator build failed: {e}")), None));
-                                return;
-                            }
+                    None => match super::prewarm::resolve(config).await {
+                        Some(o) => o,
+                        None => {
+                            let _ = done_tx.send((Err("orchestrator build failed".into()), None));
+                            return;
                         }
-                    }
+                    },
                 },
             };
 
