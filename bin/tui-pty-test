@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Layer-3 PTY end-to-end runner (test-design.md Phase C).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cargo build -p zen
+cargo test -p zen-cli --test tui_pty -- --ignored --test-threads=1

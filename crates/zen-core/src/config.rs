@@ -565,6 +565,25 @@ pub struct FinanceConfig {
 pub struct TuiConfig {
     /// Theme name: "zen", "classic", "catppuccin", "deep-ocean", "cyber-purple", "eink".
     pub theme: Option<String>,
+    /// Knowledge-base search behaviour for interactive chat context injection
+    /// (`[tui] knowledge_search`, T054). See [`KnowledgeSearchMode`].
+    pub knowledge_search: KnowledgeSearchMode,
+}
+
+/// Knowledge-base search mode for interactive TUI chat (`[tui] knowledge_search`).
+///
+/// - `fast` (default): cap the search tier at FTS5 — no embeddings, graph, or
+///   LLM synthesis — and apply a per-directory timeout, keeping
+///   Enter → LLM dispatch snappy (input-display-plan.md P0).
+/// - `full`: use the tier selected by `TierSelector` (previous behaviour).
+/// - `off`: skip knowledge-base search entirely (direct file lookup only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KnowledgeSearchMode {
+    #[default]
+    Fast,
+    Full,
+    Off,
 }
 
 /// Global command history config (history.jsonl).
@@ -1169,6 +1188,12 @@ fn merge_feeds(mut base: Vec<FeedConfig>, ov: Vec<FeedConfig>) -> Vec<FeedConfig
 fn merge_tui(base: TuiConfig, ov: TuiConfig) -> TuiConfig {
     TuiConfig {
         theme: str_merge(base.theme, ov.theme),
+        // Non-default override wins; otherwise keep the base layer's value.
+        knowledge_search: if ov.knowledge_search != KnowledgeSearchMode::default() {
+            ov.knowledge_search
+        } else {
+            base.knowledge_search
+        },
     }
 }
 
@@ -1713,5 +1738,29 @@ provider = "anthropic"
             plugin.resolved_base_path(),
             Some(PathBuf::from("/opt/zen/plugins"))
         );
+    }
+}
+
+#[cfg(test)]
+mod tui_config_tests {
+    use super::{KnowledgeSearchMode, ZenConfig};
+
+    #[test]
+    fn knowledge_search_defaults_to_fast() {
+        let cfg: ZenConfig = toml::from_str("").expect("empty config");
+        assert_eq!(cfg.tui.knowledge_search, KnowledgeSearchMode::Fast);
+    }
+
+    #[test]
+    fn knowledge_search_parses_all_modes() {
+        for (raw, expected) in [
+            ("fast", KnowledgeSearchMode::Fast),
+            ("full", KnowledgeSearchMode::Full),
+            ("off", KnowledgeSearchMode::Off),
+        ] {
+            let toml_str = format!("[tui]\nknowledge_search = \"{raw}\"");
+            let cfg: ZenConfig = toml::from_str(&toml_str).expect("parse mode");
+            assert_eq!(cfg.tui.knowledge_search, expected, "mode: {raw}");
+        }
     }
 }

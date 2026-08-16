@@ -52,4 +52,6 @@ unicode-width = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
 
 [dev-dependencies]
+portable-pty = "0.9.0"
 tempfile = { workspace = true }
+vt100 = "0.16.2"

@@ -295,7 +295,10 @@ pub fn render_slash_popup_inline(
     if !state.visible || state.filtered_indices.is_empty() {
         return;
     }
-    render_slash_popup_inner(frame, state, popup_area, theme, registry, INLINE_POPUP_ROWS);
+    // Row budget follows the actual popup area (2 border rows) so a layout
+    // that had to shrink the popup never renders rows outside its region.
+    let max_rows = (popup_area.height.saturating_sub(2) as usize).clamp(1, INLINE_POPUP_ROWS);
+    render_slash_popup_inner(frame, state, popup_area, theme, registry, max_rows);
 }
 
 fn render_slash_popup_inner(

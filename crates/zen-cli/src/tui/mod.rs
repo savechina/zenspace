@@ -8,6 +8,7 @@ mod inline_handler;
 mod inline_ui;
 pub mod markdown;
 pub mod model_picker;
+mod prewarm;
 mod render;
 pub mod scrollback_inserter;
 pub mod selection;

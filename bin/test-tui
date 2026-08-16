@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Automated TUI verification pipeline — docs/specs/002-agentic-tui/test-design.md
+#
+#   L1+L2  headless unit/session tests (TestBackend, always run)
+#   guard  ratatui `scrolling-regions` feature must stay disabled (T039)
+#   L3     PTY end-to-end (opt-in; Phase C harness when available)
+#   L4     tmux terminal smoke (needs tmux; ZEN_SKIP_TMUX=1 to skip)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "==> L1+L2: headless TUI tests (cargo test -p zen-cli tui::)"
+cargo test -p zen-cli --lib tui::
+
+echo "==> guard: ratatui 'scrolling-regions' feature must be absent (T039)"
+if cargo tree -p ratatui -e features 2>/dev/null | grep -q "scrolling-regions"; then
+  echo "ERROR: 'scrolling-regions' is ENABLED — insert_before would discard rows" >&2
+  echo "       see docs/specs/002-agentic-tui/codex-inline-design.md §2.3" >&2
+  exit 1
+fi
+echo "    ok: scrolling-regions absent"
+
+if [[ "${ZEN_SKIP_PTY:-0}" == "1" ]]; then
+  echo "==> L3: PTY e2e skipped (ZEN_SKIP_PTY=1)"
+elif [[ -x bin/tui-pty-test ]]; then
+  echo "==> L3: PTY e2e"
+  bin/tui-pty-test
+else
+  echo "==> L3: PTY harness not implemented yet (Phase C) — skipped"
+fi
+
+if [[ "${ZEN_SKIP_TMUX:-0}" == "1" ]]; then
+  echo "==> L4: tmux smoke skipped (ZEN_SKIP_TMUX=1)"
+elif command -v tmux >/dev/null 2>&1; then
+  echo "==> L4: tmux smoke"
+  bin/tui-smoke-tmux
+else
+  echo "==> L4: tmux not installed — skipped"
+fi
+
+echo "ALL TUI CHECKS PASSED"

@@ -441,28 +441,79 @@ impl ProviderInstance {
 pub struct DefaultRouter {
     config: zen_core::config::ZenConfig,
     mock: MockProvider,
-    providers: std::collections::HashMap<String, ProviderInstance>,
+    /// Lazily-built provider instances (T060).
+    ///
+    /// Key-requiring cloud providers are deliberately NOT constructed — and
+    /// their API keys NOT resolved — until the first actual call. Resolving
+    /// eagerly for every configured provider triggered the macOS Keychain
+    /// ACL prompt at every startup for providers never used
+    /// (`from_agentic` is called several times per session: App, prewarm,
+    /// orchestrator). Only keyless providers (ollama, mock) are built up
+    /// front; everything else is built + memoized on demand in
+    /// [`DefaultRouter::provider_instance`].
+    provider_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ProviderInstance>>>,
     current_variant: Option<String>,
 }
 
 impl DefaultRouter {
     /// Create from a full [`zen_core::config::AgenticConfig`].
     pub fn from_agentic(agentic: &zen_core::config::ZenConfig) -> Self {
-        let mut providers = std::collections::HashMap::new();
+        let mut provider_cache = std::collections::HashMap::new();
 
+        // T060: only keyless providers are built at construction. Building
+        // cloud providers here would resolve their API keys — env-first, but
+        // falling back to the macOS Keychain — once per configured provider
+        // on EVERY router construction (App, prewarm, orchestrator…),
+        // triggering the Keychain password prompt for providers never used.
         for (name, cfg) in &agentic.providers {
-            let instance = Self::create_provider_instance(name, cfg);
-            if let Some(p) = instance {
-                providers.insert(name.clone(), p);
+            let keyless = matches!(
+                cfg.provider_type.as_deref().unwrap_or_default(),
+                "ollama" | "mock"
+            );
+            if keyless && let Some(instance) = Self::create_provider_instance_without_key(cfg) {
+                provider_cache.insert(name.clone(), instance);
             }
         }
 
         Self {
             config: agentic.clone(),
             mock: MockProvider::default(),
-            providers,
+            provider_cache: std::sync::Arc::new(std::sync::Mutex::new(provider_cache)),
             current_variant: None,
         }
+    }
+
+    /// Build the instance for `name` on first use, resolving its API key only
+    /// now (lazy — T060). Memoized; a provider whose key cannot be resolved
+    /// is not cached so a later grant/keychain change is retried.
+    pub fn provider_instance(&self, name: &str) -> Option<ProviderInstance> {
+        {
+            let cache = self
+                .provider_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(instance) = cache.get(name) {
+                return Some(instance.clone());
+            }
+        }
+
+        let cfg = self.config.providers.get(name)?;
+        let instance = Self::create_provider_instance(name, cfg)?;
+        let mut cache = self
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(name.to_string(), instance.clone());
+        Some(instance)
+    }
+
+    /// Build a keyless provider instance (ollama / mock). Never resolves
+    /// secrets, so it is safe at construction time.
+    fn create_provider_instance_without_key(
+        cfg: &zen_core::config::ProviderConfig,
+    ) -> Option<ProviderInstance> {
+        Self::create_provider_instance_with_key("", cfg, None)
     }
 
     fn create_provider_instance(
@@ -599,7 +650,7 @@ impl DefaultRouter {
 
     /// Create from a legacy [`LlmConfig`] for backward compatibility.
     pub fn new(config: LlmConfig) -> Self {
-        let mut providers = std::collections::HashMap::new();
+        let mut providers = std::collections::HashMap::new(); // keyless/env-only
 
         if let Some(tc) = config.notion_extraction.as_ref()
             && tc.provider.as_deref() == Some("ollama")
@@ -668,7 +719,7 @@ impl DefaultRouter {
                 sandbox: zen_core::config::SandboxConfig::default(),
             },
             mock: MockProvider::default(),
-            providers,
+            provider_cache: std::sync::Arc::new(std::sync::Mutex::new(providers)),
             current_variant: None,
         }
     }
@@ -831,7 +882,7 @@ impl DefaultRouter {
     }
 
     fn is_local_llm_available(&self) -> bool {
-        if let Some(instance) = self.providers.get("ollama")
+        if let Some(instance) = self.provider_instance("ollama")
             && let ProviderInstance::Ollama(ollama) = instance
             && ollama.health_check()
         {
@@ -843,7 +894,7 @@ impl DefaultRouter {
 
     #[allow(dead_code)]
     pub fn health_check(&self) -> bool {
-        if let Some(instance) = self.providers.get("ollama")
+        if let Some(instance) = self.provider_instance("ollama")
             && let ProviderInstance::Ollama(ollama) = instance
         {
             return ollama.health_check();
@@ -966,7 +1017,7 @@ impl LlmRouter for DefaultRouter {
             .resolve_effective_options(&provider_name)
             .unwrap_or_default();
 
-        if let Some(instance) = self.providers.get(&provider_name) {
+        if let Some(instance) = self.provider_instance(&provider_name) {
             info!(
                 provider = provider_name,
                 model = instance.model_name(),
@@ -1017,7 +1068,7 @@ impl LlmRouter for DefaultRouter {
             return Ok(stream_resp);
         }
 
-        if let Some(instance) = self.providers.get(&provider_name) {
+        if let Some(instance) = self.provider_instance(&provider_name) {
             let prompt = prompt.to_string();
             let options = self
                 .resolve_effective_options(&provider_name)
@@ -1049,10 +1100,16 @@ impl LlmRouter for DefaultRouter {
     }
 
     fn list_providers(&self) -> Vec<(String, String)> {
+        // T060: listing must never resolve API keys (no Keychain prompt) —
+        // read names/models straight from config.
         let mut result = Vec::new();
 
-        for (name, instance) in &self.providers {
-            result.push((name.clone(), instance.model_name().to_string()));
+        for (name, cfg) in &self.config.providers {
+            let model = cfg
+                .default_model
+                .clone()
+                .unwrap_or_else(|| zen_core::constants::OPENAI_DEFAULT_MODEL.into());
+            result.push((name.clone(), model));
         }
 
         if result.is_empty()
@@ -1105,6 +1162,101 @@ pub fn is_local_llm_available(router: &dyn LlmRouter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── T060: lazy provider construction / deferred secret resolution ──────
+
+    fn test_router_config() -> zen_core::config::ZenConfig {
+        use std::collections::HashMap;
+        use zen_core::config::{ProviderConfig, ZenConfig};
+
+        let openai = ProviderConfig {
+            provider_type: Some("openai".into()),
+            default_model: Some("gpt-4o-mini".into()),
+            ..ProviderConfig::default()
+        };
+        let anthropic = ProviderConfig {
+            provider_type: Some("anthropic".into()),
+            default_model: Some("claude-3-5-sonnet".into()),
+            ..ProviderConfig::default()
+        };
+        let ollama = ProviderConfig {
+            provider_type: Some("ollama".into()),
+            default_model: Some("llama3.2".into()),
+            ..ProviderConfig::default()
+        };
+        let mut providers = HashMap::new();
+        providers.insert("openai".to_string(), openai);
+        providers.insert("anthropic".to_string(), anthropic);
+        providers.insert("ollama".to_string(), ollama);
+
+        ZenConfig {
+            default_provider: Some("openai".into()),
+            default_model: Some("gpt-4o-mini".into()),
+            providers,
+            ..ZenConfig::default()
+        }
+    }
+
+    fn cached_names(router: &DefaultRouter) -> Vec<String> {
+        let cache = router
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        cache.keys().cloned().collect()
+    }
+
+    /// T060: constructing the router must build ONLY keyless providers.
+    /// Building cloud providers eagerly resolved their API keys — env-first,
+    /// then macOS Keychain — once per provider on every startup, prompting
+    /// for providers the session never used.
+    #[test]
+    fn from_agentic_builds_only_keyless_providers() {
+        let router = DefaultRouter::from_agentic(&test_router_config());
+        let cached = cached_names(&router);
+        assert!(
+            cached.contains(&"ollama".to_string()),
+            "keyless ollama should be prebuilt: {cached:?}"
+        );
+        assert!(
+            !cached.contains(&"openai".to_string()) && !cached.contains(&"anthropic".to_string()),
+            "cloud providers must NOT be built (or key-resolved) at construction: {cached:?}"
+        );
+    }
+
+    /// T060: keyless providers resolve on demand and memoize; unresolved-key
+    /// providers are simply absent (same "not configured" error as before).
+    #[test]
+    fn provider_instance_is_lazy_and_memoized() {
+        let router = DefaultRouter::from_agentic(&test_router_config());
+        let first = router.provider_instance("ollama");
+        assert!(first.is_some(), "keyless provider resolves on demand");
+        let second = router.provider_instance("ollama");
+        assert!(second.is_some(), "memoized second lookup");
+        assert_eq!(first.unwrap().model_name(), second.unwrap().model_name());
+    }
+
+    /// T060: list_providers reads names/models from config — never resolves
+    /// secrets (no Keychain access from `zen model list` / provider listing).
+    #[test]
+    fn list_providers_never_resolves_keys() {
+        use crate::router::LlmRouter;
+        let router = DefaultRouter::from_agentic(&test_router_config());
+        let listed = router.list_providers();
+        let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"openai") && names.contains(&"anthropic"));
+        let openai_model = listed
+            .iter()
+            .find(|(n, _)| n == "openai")
+            .map(|(_, m)| m.clone())
+            .unwrap();
+        assert_eq!(openai_model, "gpt-4o-mini");
+        // Listing must not have side-effected any cloud instance into cache.
+        let cached = cached_names(&router);
+        assert!(
+            !cached.iter().any(|n| n == "openai" || n == "anthropic"),
+            "listing must stay key-free: {cached:?}"
+        );
+    }
 
     #[tokio::test]
     async fn mock_streaming_preserves_newlines_as_tokens() {

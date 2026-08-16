@@ -87,15 +87,30 @@ impl StreamCollector {
 
     /// Drain newly-committed lines that can be moved into terminal scrollback,
     /// and return the remaining pending tail that should stay in the inline
-    /// viewport.
-    pub fn drain_and_tail(
+    /// viewport, honoring the `/thinking` toggle (T063/G4): when
+    /// `show_thinking` is false, reasoning blocks are omitted from BOTH the
+    /// committed and pending regions (they are stripped from the final
+    /// response anyway) instead of flashing through the viewport.
+    /// `show_thinking` is false, reasoning blocks are omitted from BOTH the
+    /// committed and pending regions (they are stripped from the final
+    /// response anyway) instead of flashing through the viewport.
+    pub fn drain_and_tail_filtered(
         &mut self,
         reasoning_style: Style,
+        show_thinking: bool,
     ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-        self.split_render(reasoning_style)
+        self.split_render_opt(reasoning_style, show_thinking)
     }
 
     fn split_render(&mut self, reasoning_style: Style) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+        self.split_render_opt(reasoning_style, true)
+    }
+
+    fn split_render_opt(
+        &mut self,
+        reasoning_style: Style,
+        show_thinking: bool,
+    ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         if self.buffer.is_empty() {
             return (Vec::new(), Vec::new());
         }
@@ -106,7 +121,7 @@ impl StreamCollector {
         let mut committed: Vec<Line<'static>> = Vec::new();
         let mut pending: Vec<Line<'static>> = Vec::new();
 
-        if !reasoning.is_empty() {
+        if !reasoning.is_empty() && show_thinking {
             let header_text = if in_think { "Thinking..." } else { "Thought" };
             let header = Line::from(Span::styled(header_text, reasoning_style));
 
@@ -240,6 +255,43 @@ mod tests {
         assert_eq!(text, "Answer1Answer2");
         assert_eq!(reasoning, "FirstSecond");
         assert!(!in_think);
+    }
+
+    #[test]
+    fn filtered_mode_hides_reasoning() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>secret reasoning</think>Answer text");
+        let (committed, pending) = c.drain_and_tail_filtered(Style::default(), false);
+        let all: String = committed
+            .iter()
+            .chain(pending.iter())
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(all.contains("Answer text"), "text must render: {all:?}");
+        assert!(
+            !all.contains("secret reasoning"),
+            "reasoning must be hidden: {all:?}"
+        );
+        assert!(
+            !all.contains("Thinking"),
+            "reasoning header must be hidden: {all:?}"
+        );
+    }
+
+    #[test]
+    fn filtered_mode_shows_reasoning_when_enabled() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>visible reasoning</think>Answer");
+        let (committed, pending) = c.drain_and_tail_filtered(Style::default(), true);
+        let all: String = committed
+            .iter()
+            .chain(pending.iter())
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            all.contains("visible reasoning"),
+            "reasoning must render: {all:?}"
+        );
     }
 
     #[test]

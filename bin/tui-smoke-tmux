@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# L4 tmux smoke test (SC-009 / NFR-003 automated portion, T037).
+# Verifies inside a real multiplexer: banner renders, input box present,
+# slash popup opens WITHOUT crushing the input box (T059), exit leaves
+# scrollback intact (FR-015). Mouse-selection remains a manual checklist
+# item — capture-pane cannot verify it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+BIN="./target/debug/zen"
+[[ -x "$BIN" ]] || cargo build -p zen
+
+SESSION="zen-tui-smoke-$$"
+tmux new-session -d -s "$SESSION" -x 120 -y 30
+trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true' EXIT
+
+tmux send-keys -t "$SESSION" "$BIN" Enter
+sleep 4
+
+PANE="$(tmux capture-pane -t "$SESSION" -p)"
+grep -q "Zen REPL" <<<"$PANE" || { echo "FAIL: intro line missing"; echo "$PANE"; exit 1; }
+grep -q "Input (Enter=send" <<<"$PANE" || { echo "FAIL: input box missing"; echo "$PANE"; exit 1; }
+echo "    ok: banner + input box visible"
+
+tmux send-keys -t "$SESSION" "/"
+sleep 1
+PANE="$(tmux capture-pane -t "$SESSION" -p)"
+grep -q "Commands" <<<"$PANE" || { echo "FAIL: slash popup missing"; echo "$PANE"; exit 1; }
+grep -q "Input (Enter=send" <<<"$PANE" || { echo "FAIL: input box crushed by popup (T059 regression)"; echo "$PANE"; exit 1; }
+echo "    ok: slash popup open, input box intact"
+
+tmux send-keys -t "$SESSION" Escape
+sleep 0.3
+tmux send-keys -t "$SESSION" C-d
+sleep 1.5
+PANE="$(tmux capture-pane -t "$SESSION" -p)"
+grep -q "Zen REPL" <<<"$PANE" || { echo "FAIL: scrollback lost after exit (FR-015)"; echo "$PANE"; exit 1; }
+echo "    ok: exit leaves scrollback intact"
+echo "tmux smoke PASSED"

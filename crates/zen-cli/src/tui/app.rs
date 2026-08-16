@@ -65,11 +65,153 @@ pub enum PendingCallKind {
 }
 
 const MAX_HISTORY: usize = 100;
+
+/// Per-directory knowledge-search timeout for interactive chat context
+/// injection (T054, input-display-plan.md). On expiry the chat continues
+/// without knowledge context instead of blocking the event loop.
+const KNOWLEDGE_SEARCH_TIMEOUT_MS: u64 = 1500;
+
+/// Build the agent orchestrator (router + registry + wiring + memvid memory).
+///
+/// Extracted from `App::init_orchestrator` so background pre-warming can run
+/// it off the event-loop thread (T053).
+pub(crate) fn build_orchestrator(
+    config: &'static zen_core::config::ZenConfig,
+) -> AgentOrchestrator {
+    let router = DefaultRouter::from_agentic(config);
+    let orch = AgentOrchestrator::new(router);
+
+    match ZenPaths::detect() {
+        Ok(paths) => {
+            let memvid_dir = paths.memory();
+            if let Err(e) = std::fs::create_dir_all(&memvid_dir) {
+                tracing::warn!(path = ?memvid_dir, error = %e, "Failed to create memory directory");
+            }
+            let memvid_path = memvid_dir.join(MEMVID_STORE_FILE);
+            match orch.with_memory(memvid_path) {
+                Ok(o) => {
+                    tracing::info!("Memvid store wired successfully");
+                    o
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to initialize memvid store, continuing without memory");
+                    let router = DefaultRouter::from_agentic(config);
+                    AgentOrchestrator::new(router)
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to detect Zen paths, continuing without memory");
+            orch
+        }
+    }
+}
+
+/// Effective knowledge-search tier for interactive chat (T054).
+///
+/// In [`KnowledgeSearchMode::Fast`] the heavy tiers 3–5 (embeddings, graph,
+/// LLM synthesis) are capped to FTS5 (tier 2) so Enter → LLM dispatch never
+/// waits on model loads or synthesis calls.
+pub(crate) fn effective_search_tier(
+    query: &str,
+    mode: zen_core::config::KnowledgeSearchMode,
+) -> u8 {
+    use zen_core::config::KnowledgeSearchMode;
+    let tier = zen_vault::search::TierSelector::select_tier(query);
+    match mode {
+        KnowledgeSearchMode::Fast => tier.min(2),
+        KnowledgeSearchMode::Full | KnowledgeSearchMode::Off => tier,
+    }
+}
+
+fn format_search_results(results: Vec<zen_vault::search::SearchResult>) -> Vec<String> {
+    results
+        .into_iter()
+        .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
+        .collect()
+}
+
+/// Knowledge-context collection owning all its resources, so it can run off
+/// the event-loop thread (T055 async submit). Mode gating (T054) and the
+/// per-directory timeout apply exactly as in the legacy synchronous path.
+/// Must be called with a tokio runtime handle available (spawn_blocking).
+pub(crate) fn collect_knowledge_context(
+    router: &DefaultRouter,
+    config: &'static zen_core::config::ZenConfig,
+    query: &str,
+) -> Vec<String> {
+    use zen_core::config::KnowledgeSearchMode;
+    use zen_core::paths::ZenPaths;
+    use zen_vault::search::SearchService;
+
+    let paths = match ZenPaths::detect() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    // Direct file lookup is cheap and local — always run.
+    let mut results = App::direct_file_lookup_in_dirs(&paths, query);
+
+    let mode = config.tui.knowledge_search;
+    if mode == KnowledgeSearchMode::Off {
+        return format_search_results(results);
+    }
+
+    let service = SearchService::new(router.clone());
+    let tier = effective_search_tier(query, mode);
+
+    let owned_client = match super::prewarm::take_db_client() {
+        Some(c) => Some(c),
+        None => {
+            let db_path = paths.data().join("state.db");
+            tokio::runtime::Handle::current()
+                .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
+                .ok()
+        }
+    };
+    let client = match owned_client.as_ref() {
+        Some(c) => c,
+        None => return format_search_results(results),
+    };
+
+    for dir in [paths.inbox(), paths.wiki()] {
+        let search = service.search(query, &dir, client, Some(tier), None);
+        let outcome = tokio::runtime::Handle::current().block_on(tokio::time::timeout(
+            std::time::Duration::from_millis(KNOWLEDGE_SEARCH_TIMEOUT_MS),
+            search,
+        ));
+        match outcome {
+            Ok(Ok(r)) => results.extend(r),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, dir = %dir.display(), "knowledge search failed")
+            }
+            Err(_) => tracing::warn!(
+                dir = %dir.display(),
+                timeout_ms = KNOWLEDGE_SEARCH_TIMEOUT_MS,
+                "knowledge search timed out — continuing without context"
+            ),
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|r| seen.insert(r.file.clone()));
+    results.truncate(5);
+    let formatted = format_search_results(results);
+
+    tracing::info!(
+        query_len = query.len(),
+        tier,
+        results_count = formatted.len(),
+        "TUI collect_knowledge_context"
+    );
+
+    formatted
+}
 const MAX_QUEUE_SIZE: usize = 10;
 const TOAST_DURATION_SECS: u64 = 3;
 const PASTE_MODE_SECS: u64 = 2;
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputMode {
     #[default]
     Default,
@@ -362,6 +504,17 @@ pub struct App {
     /// the first user or agent message arrives so the large banner does not
     /// permanently consume the chat area.
     pub show_splash: bool,
+    /// Transient pre-LLM status shown in the inline footer (T056): set when
+    /// the async chat pipeline starts, cleared on the first token / done.
+    pub status_hint: Option<String>,
+    /// T062: user is reading scrollback (PageUp). While set, committed
+    /// blocks are DEFERRED instead of `insert_before`-ed, so the terminal
+    /// view does not jump while they read history; the live tail keeps
+    /// rendering the newest pending content.
+    pub reading_mode: bool,
+    /// T062: committed blocks held while `reading_mode` is active; flushed
+    /// in order on return-to-bottom.
+    pub deferred_scrollback: VecDeque<ScrollbackEntry>,
     /// Last rendered chat area rectangle, used to map mouse coordinates.
     pub chat_area: Option<ratatui::layout::Rect>,
     pub text_selection: Option<Selection>,
@@ -444,6 +597,9 @@ impl App {
             tool_call_count: 0,
             current_response_tokens: 0,
             show_splash: true,
+            status_hint: None,
+            reading_mode: false,
+            deferred_scrollback: VecDeque::new(),
             chat_area: None,
             text_selection: None,
             scrollback_queue: VecDeque::new(),
@@ -690,6 +846,16 @@ impl App {
         self.inline_mode
     }
 
+    /// T062: leave reading mode and move deferred blocks back into the
+    /// flush queue (order preserved). `inline_tick` performs the insert.
+    pub fn exit_reading_mode(&mut self) {
+        self.reading_mode = false;
+        if !self.deferred_scrollback.is_empty() {
+            self.scrollback_queue
+                .extend(self.deferred_scrollback.drain(..));
+        }
+    }
+
     pub fn enqueue_scrollback(&mut self, lines: Vec<Line<'static>>) {
         self.scrollback_queue
             .push_back(ScrollbackEntry { lines, wrap: true });
@@ -739,7 +905,7 @@ impl App {
         }
     }
 
-    fn render_user_lines_for_scrollback(&self, text: &str) -> Vec<Line<'static>> {
+    pub(crate) fn render_user_lines_for_scrollback(&self, text: &str) -> Vec<Line<'static>> {
         let theme = self.theme.as_ref();
         let bg = theme.user_bg();
         let prefix_style = theme.user_prefix();
@@ -776,35 +942,13 @@ impl App {
     }
 
     pub fn init_orchestrator(&mut self, config: &'static zen_core::config::ZenConfig) {
-        let router = DefaultRouter::from_agentic(config);
-        let orch = AgentOrchestrator::new(router);
-
-        let orch = match ZenPaths::detect() {
-            Ok(paths) => {
-                let memvid_dir = paths.memory();
-                if let Err(e) = std::fs::create_dir_all(&memvid_dir) {
-                    tracing::warn!(path = ?memvid_dir, error = %e, "Failed to create memory directory");
-                }
-                let memvid_path = memvid_dir.join(MEMVID_STORE_FILE);
-                match orch.with_memory(memvid_path) {
-                    Ok(o) => {
-                        tracing::info!("Memvid store wired successfully");
-                        o
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to initialize memvid store, continuing without memory");
-                        let router = DefaultRouter::from_agentic(config);
-                        AgentOrchestrator::new(router)
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to detect Zen paths, continuing without memory");
-                orch
-            }
+        // Prefer the background pre-warmed orchestrator (T053); fall back to
+        // synchronous construction so correctness never depends on the race.
+        let arc = match super::prewarm::take_orchestrator() {
+            Some(a) => a,
+            None => Arc::new(build_orchestrator(config)),
         };
-
-        self.orchestrator = Some(Arc::new(orch));
+        self.orchestrator = Some(arc);
         self.session = Some(SessionContext::new("default".into(), String::new()));
     }
 
@@ -935,13 +1079,17 @@ impl App {
                 self.message_queue.push_back(cmd.to_string());
             }
         } else {
+            // T055/T061: instant path for BOTH inline and full-screen —
+            // echo + pending call + streaming flag happen here (<1ms); the
+            // heavy pipeline (orchestrator acquire, knowledge search, LLM
+            // dispatch) runs in background tasks.
             if self.is_inline_mode() {
                 let user_lines = self.render_user_lines_for_scrollback(cmd);
                 self.enqueue_scrollback(user_lines);
             }
             self.ensure_session(cmd);
             self.current_query = cmd.to_string();
-            self.execute_chat(cmd);
+            self.start_async_chat(cmd);
         }
     }
 
@@ -1088,73 +1236,127 @@ Use /thinking to show/hide thinking process."#;
     }
 
     fn auto_search_knowledge(&mut self, query: &str) -> Vec<String> {
-        use zen_core::paths::ZenPaths;
-        use zen_vault::search::{SearchService, TierSelector};
-
-        let paths = match ZenPaths::detect() {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut results: Vec<zen_vault::search::SearchResult> = Vec::new();
-
-        results.extend(self.direct_file_lookup(&paths, query));
-
-        let service = SearchService::new(self.router.clone());
-        let tier = TierSelector::select_tier(query);
-
-        if self.db_client.is_none() {
-            let db_path = paths.data().join("state.db");
-            self.db_client = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
-            })
-            .ok();
-        }
-        let client = match self.db_client.as_ref() {
-            Some(c) => c,
-            None => {
-                let formatted: Vec<String> = results
-                    .into_iter()
-                    .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
-                    .collect();
-                return formatted;
-            }
-        };
-
-        for dir in [paths.inbox(), paths.wiki()] {
-            if let Ok(r) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(service.search(
-                    query,
-                    &dir,
-                    client,
-                    Some(tier),
-                    None,
-                ))
-            }) {
-                results.extend(r);
-            }
-        }
-        let mut seen = std::collections::HashSet::new();
-        results.retain(|r| seen.insert(r.file.clone()));
-        results.truncate(5);
-        let formatted: Vec<String> = results
-            .into_iter()
-            .map(|r| format!("[{}]\n{}", r.file.display(), r.content))
-            .collect();
-
-        tracing::info!(
-            query_len = query.len(),
-            tier,
-            results_count = formatted.len(),
-            "TUI auto_search_knowledge"
-        );
-
-        formatted
+        // Full-screen path: synchronous but bounded (T054) and pre-warmed
+        // (T053). Inline mode uses `start_async_chat` →
+        // `collect_knowledge_context` off the event loop instead (T055).
+        let router = self.router.clone();
+        collect_knowledge_context(&router, self.config, query)
     }
 
-    fn direct_file_lookup(
-        &self,
+    /// T055/T056: async chat dispatch for inline mode.
+    ///
+    /// The event loop only pays O(1) work: the pending call + streaming flag
+    /// are created here, then the heavy pipeline (orchestrator acquire →
+    /// knowledge search → LLM dispatch) runs in background tasks streaming
+    /// into the pending call's channels. `poll_llm_response` consumes the
+    /// result exactly as before — no consumer changes.
+    fn start_async_chat(&mut self, query: &str) {
+        if !self.is_inline_mode() {
+            // Full-screen user echo lives in the chat output area.
+            self.output.push(OutputCell::user(query));
+            self.invalidate_output_cache();
+        }
+        let (tokens_tx, tokens_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        self.pending_calls
+            .push(PendingCallKind::Streaming(PendingLlmCallStream {
+                tokens_rx,
+                done_rx,
+                query: query.to_string(),
+            }));
+        self.is_streaming = true;
+        if self.pending_calls.len() == 1 {
+            self.stream_collector.clear();
+        }
+        self.turn_started_at = Some(Instant::now());
+        self.tool_call_count = 0;
+        self.current_response_tokens = 0;
+        self.show_splash = false;
+        self.status_hint = Some("preparing context…".to_string());
+
+        if self.session.is_none() {
+            self.session = Some(SessionContext::new("default".into(), String::new()));
+        }
+
+        let config = self.config;
+        let router = self.router.clone();
+        let orchestrator = self.orchestrator.clone();
+        let session = self.session.clone();
+        let query_owned = query.to_string();
+
+        tokio::task::spawn(async move {
+            // 1. Orchestrator: live instance → pre-warm → background build.
+            let orch: Arc<AgentOrchestrator> = match orchestrator {
+                Some(o) => o,
+                None => match super::prewarm::take_orchestrator() {
+                    Some(o) => o,
+                    None => {
+                        match tokio::task::spawn_blocking(move || {
+                            Arc::new(build_orchestrator(config))
+                        })
+                        .await
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let _ = done_tx
+                                    .send((Err(format!("orchestrator build failed: {e}")), None));
+                                return;
+                            }
+                        }
+                    }
+                },
+            };
+
+            // 2. Knowledge context — bounded, owns its own DB handle.
+            let search_router = router.clone();
+            let search_query = query_owned.clone();
+            let context: Vec<String> = tokio::task::spawn_blocking(move || {
+                collect_knowledge_context(&search_router, config, &search_query)
+            })
+            .await
+            .unwrap_or_default();
+
+            // 3. Inject context into the session.
+            let mut session =
+                session.unwrap_or_else(|| SessionContext::new("default".into(), String::new()));
+            for (i, note_content) in context.iter().enumerate() {
+                session.knowledge.push(zen_core::types::RetrievedNote {
+                    path: format!("auto-search-{i}"),
+                    content: note_content.clone(),
+                    sensitivity: zen_core::types::Sensitivity::Public,
+                    relevance: 1.0 - (i as f64 * 0.1),
+                });
+            }
+
+            let session_id = session.session_id.to_string();
+            tracing::info!(
+                session_id,
+                query_len = query_owned.len(),
+                context_count = context.len(),
+                "TUI inline chat: dispatching (async pipeline)"
+            );
+
+            // 4. Streaming LLM call.
+            tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                let mut session = session;
+                let result = rt.block_on(async {
+                    orch.execute_stream(&mut session, &query_owned, |token| {
+                        if let Err(e) = tokens_tx.send(token.to_string()) {
+                            tracing::warn!(error = %e, "token channel closed during stream");
+                        }
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                });
+                if let Err(e) = done_tx.send((result, Some(session))) {
+                    tracing::warn!(error = %e, "done channel closed before result could be sent");
+                }
+            });
+        });
+    }
+
+    pub(crate) fn direct_file_lookup_in_dirs(
         paths: &zen_core::paths::ZenPaths,
         query: &str,
     ) -> Vec<zen_vault::search::SearchResult> {
@@ -1420,6 +1622,9 @@ Use /thinking to show/hide thinking process."#;
                 for token in &result.tokens {
                     self.stream_collector.push_delta(token);
                 }
+                if !result.tokens.is_empty() {
+                    self.status_hint = None; // T056: model started speaking
+                }
                 self.current_response_tokens = self.stream_collector.buffer().len() / 4;
 
                 if let Some(done_result) = result.done_result {
@@ -1452,8 +1657,9 @@ Use /thinking to show/hide thinking process."#;
                                     .as_ref()
                                     .text_muted()
                                     .add_modifier(ratatui::style::Modifier::ITALIC);
-                                let (committed, pending) =
-                                    self.stream_collector.drain_and_tail(reasoning_style);
+                                let (committed, pending) = self
+                                    .stream_collector
+                                    .drain_and_tail_filtered(reasoning_style, self.show_thinking);
                                 let mut remaining = committed;
                                 remaining.extend(pending);
                                 if !remaining.is_empty() {
@@ -1476,6 +1682,7 @@ Use /thinking to show/hide thinking process."#;
                                 self.invalidate_output_cache();
                             }
                             self.current_response_tokens = response.len() / 4;
+                            self.status_hint = None;
                             self.auto_scroll = true;
                             self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {
@@ -1490,6 +1697,7 @@ Use /thinking to show/hide thinking process."#;
                         (Err(e), _) => {
                             completed_indices.push(idx);
                             tracing::warn!(error = %e, "TUI chat: LLM response error");
+                            self.status_hint = None;
                             self.stream_collector.clear();
                             self.push_output(format!("[LLM] Error: {}", e), true);
                         }
@@ -1506,7 +1714,7 @@ Use /thinking to show/hide thinking process."#;
             self.is_streaming = false;
             while let Some(queued) = self.message_queue.pop_front() {
                 self.current_query = queued.clone();
-                self.execute_chat(&queued);
+                self.start_async_chat(&queued);
                 if !self.pending_calls.is_empty() {
                     break;
                 }
@@ -2332,6 +2540,9 @@ pub fn run_app(
     tokio::spawn(async move {
         scheduler.run().await;
     });
+    // T061: pre-warm orchestrator/DB in the background exactly like the
+    // inline path, so the first Enter does not pay the cold-start price here.
+    super::prewarm::spawn(config);
 
     let mut dirty = true;
     loop {
@@ -2397,4 +2608,42 @@ pub fn run_app(
     // appears on its own line.
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod search_tier_tests {
+    use super::effective_search_tier;
+    use zen_core::config::KnowledgeSearchMode;
+
+    #[test]
+    fn fast_mode_caps_heavy_tiers_to_fts() {
+        for q in ["similar: rust", "graph: rust", "summarize: rust"] {
+            assert_eq!(
+                effective_search_tier(q, KnowledgeSearchMode::Fast),
+                2,
+                "query: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_mode_keeps_light_tiers() {
+        assert_eq!(effective_search_tier("hello", KnowledgeSearchMode::Fast), 1);
+        assert_eq!(
+            effective_search_tier("hello world", KnowledgeSearchMode::Fast),
+            2
+        );
+    }
+
+    #[test]
+    fn full_mode_keeps_selected_tier() {
+        assert_eq!(
+            effective_search_tier("similar: rust", KnowledgeSearchMode::Full),
+            3
+        );
+        assert_eq!(
+            effective_search_tier("graph: rust", KnowledgeSearchMode::Full),
+            4
+        );
+    }
 }

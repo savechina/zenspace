@@ -178,7 +178,17 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         return InlineKeyAction::Continue;
     }
 
-    if key.code == KeyCode::PageUp {
+    // T062: keyboard reading mode. While active, scrollback inserts are
+    // deferred so the view does not jump mid-read (see inline_tick).
+    if key.code == KeyCode::PageUp && key.modifiers == KeyModifiers::NONE {
+        app.reading_mode = true;
+        return InlineKeyAction::Continue;
+    }
+    if (key.code == KeyCode::PageDown || key.code == KeyCode::End)
+        && key.modifiers == KeyModifiers::NONE
+        && app.reading_mode
+    {
+        app.exit_reading_mode();
         return InlineKeyAction::Continue;
     }
     if key.code == KeyCode::PageDown {

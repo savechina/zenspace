@@ -21,6 +21,14 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.input.exit_command_mode();
                 if !app.output.is_empty() {
                     app.enter_selection();
+                } else {
+                    // Nothing to select — `v` must stay typeable.
+                    app.input.input(Input {
+                        key: Key::Char('v'),
+                        ctrl: false,
+                        alt: false,
+                        shift: false,
+                    });
                 }
                 KeyAction::Continue
             }
@@ -54,6 +62,10 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             }
             _ => {
                 app.input.exit_command_mode();
+                // Exit-and-forward: do not swallow the key that left command
+                // mode — the user's first typed character must land in the
+                // input box.
+                forward_key_to_input(key, app);
                 KeyAction::Continue
             }
         };
@@ -126,21 +138,6 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             }
             _ => KeyAction::Continue,
         };
-    }
-
-    if !app.output.is_empty()
-        && key.code == KeyCode::Char('v')
-        && key.modifiers == KeyModifiers::NONE
-    {
-        let all_lines = app.all_lines().to_vec();
-        let last_line = all_lines.len().saturating_sub(1);
-        app.text_selection = Some(Selection::new(
-            TextPosition::new(last_line, 0),
-            TextPosition::new(last_line, 0),
-        ));
-        app.auto_scroll = true;
-        app.refresh_input_border();
-        return KeyAction::Continue;
     }
 
     let action = match (key.code, key.modifiers) {
@@ -387,6 +384,27 @@ pub fn handle_paste(pasted: &str, app: &mut super::app::App) {
     app.refresh_input_border();
 }
 
+/// Forward one crossterm key into the input textarea (used when leaving
+/// command mode on a keystroke so the character is not swallowed).
+fn forward_key_to_input(key: KeyEvent, app: &mut super::app::App) {
+    let mapped = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        _ => return, // pure control keys are not text
+    };
+    app.input.input(Input {
+        key: mapped,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    });
+}
+
 pub fn handle_mouse(mouse: MouseEvent, app: &mut super::app::App) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -593,5 +611,78 @@ fn ensure_visible(
             line_width.div_ceil(inner_width)
         };
         visual_row += wrapped;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Full-screen mode input regression tests (user report 2026-08-16:
+    //! typing `v` and other characters could not be entered normally).
+    use super::*;
+    use crate::tui::app::{App, InputMode};
+    use crate::tui::cell::OutputCell;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn test_app() -> App {
+        let config: &'static zen_core::config::ZenConfig = Box::leak(Box::default());
+        let mut app = App::new(config);
+        app.output.push(OutputCell::agent("previous answer", None));
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
+        handle_key(KeyEvent::new(code, modifiers), app)
+    }
+
+    /// Plain `v` in Default mode MUST type the letter — the old code hijacked
+    /// it into text selection whenever output existed, making `v` untypeable
+    /// in every message after the first response.
+    #[test]
+    fn default_mode_v_types_the_letter() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(app.input.lines().join(""), "v");
+        assert!(
+            app.text_selection.is_none(),
+            "typing must not hijack into selection"
+        );
+    }
+
+    /// Leaving command mode on a keystroke must forward that character into
+    /// the input (previously the first character after Ctrl+X was swallowed).
+    #[test]
+    fn command_mode_exit_forwards_the_key() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(app.input.effective_mode(), InputMode::Command);
+
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.input.effective_mode(), InputMode::Default);
+        assert_eq!(
+            app.input.lines().join(""),
+            "i",
+            "the key that left command mode must be inserted"
+        );
+    }
+
+    /// Command-mode `v` with no output must type `v` (nothing to select).
+    #[test]
+    fn command_mode_v_types_when_no_output() {
+        let mut app = test_app();
+        app.output.clear();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(app.input.effective_mode(), InputMode::Default);
+        assert_eq!(app.input.lines().join(""), "v");
+    }
+
+    /// Command-mode `v` with output still opens cell selection (the intended
+    /// keyboard path — kept reachable).
+    #[test]
+    fn command_mode_v_selects_when_output_exists() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(app.input.effective_mode(), InputMode::Selection);
     }
 }

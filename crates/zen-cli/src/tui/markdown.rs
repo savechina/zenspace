@@ -35,6 +35,57 @@ fn convert_text_to_owned_lines(text: ratatui::text::Text) -> Vec<Line<'static>> 
         .collect()
 }
 
+/// Render one top-level markdown block.
+///
+/// Code fences go through syntect/two-face highlighting (T028 / FR-012) so
+/// the inline streaming path matches the full-screen TUI; everything else
+/// stays on `tui_markdown`.
+fn render_block_dispatch(raw: &str) -> Vec<Line<'static>> {
+    if let Some(lines) = render_code_fence_block(raw) {
+        return lines;
+    }
+    render_block_via_tui_markdown(raw)
+}
+
+/// Parse a fenced code block: ```` ```lang ```` opener, content, optional
+/// closing fence (pending streaming blocks may still be open).
+fn parse_code_fence(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim_start();
+    let rest = trimmed.strip_prefix("```")?;
+    let mut lines = rest.lines();
+    let lang = lines.next()?.trim().to_string();
+    let mut content: Vec<&str> = Vec::new();
+    for line in lines {
+        if line.trim_start().starts_with("```") {
+            break;
+        }
+        content.push(line);
+    }
+    Some((lang, content.join("\n")))
+}
+
+/// Highlighted, framed code fence for the inline scrollback path. Mirrors
+/// `CodeCell` framing (`┌─ lang` / `└─`). Respects `NO_COLOR` (FR-011) by
+/// falling back to plain text.
+fn render_code_fence_block(raw: &str) -> Option<Vec<Line<'static>>> {
+    let (lang, code) = parse_code_fence(raw)?;
+
+    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_color = *NO_COLOR.get_or_init(|| std::env::var("NO_COLOR").is_ok());
+
+    let header_style = ratatui::style::Style::default()
+        .fg(ratatui::style::Color::DarkGray)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let mut lines = vec![Line::styled(format!("┌─ {}", lang), header_style)];
+    if no_color {
+        lines.extend(code.lines().map(|l| Line::raw(l.to_string())));
+    } else {
+        lines.extend(super::highlight::highlight_code(&code, &lang));
+    }
+    lines.push(Line::styled("└─", header_style));
+    Some(lines)
+}
+
 fn render_block_via_tui_markdown(raw: &str) -> Vec<Line<'static>> {
     let options = tui_markdown::Options::new(NoMarkerStyleSheet);
     let text = tui_markdown::from_str_with_options(raw, &options);
@@ -82,7 +133,7 @@ impl IncrementalMarkdownRenderer {
                 raw.clone()
             };
 
-            let lines = render_block_via_tui_markdown(&render_content);
+            let lines = render_block_dispatch(&render_content);
             result.extend(lines.iter().cloned());
             new_blocks.push(RenderedBlock { hash: h, lines });
         }
@@ -294,6 +345,67 @@ fn block_to_lines(block_display_text: &str) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_code_fence_extracts_lang_and_code() {
+        let (lang, code) = parse_code_fence("```rust\nfn main() {}\n```").expect("parse");
+        assert_eq!(lang, "rust");
+        assert_eq!(code, "fn main() {}");
+    }
+
+    #[test]
+    fn parse_code_fence_handles_open_pending_block() {
+        // Streaming: fence not yet closed — content runs to the end.
+        let (lang, code) = parse_code_fence("```python\nprint(1)\nprint(2)").expect("parse");
+        assert_eq!(lang, "python");
+        assert_eq!(code, "print(1)\nprint(2)");
+    }
+
+    #[test]
+    fn parse_code_fence_rejects_non_fence_block() {
+        assert!(parse_code_fence("just a paragraph").is_none());
+    }
+
+    /// T028 (FR-012): code fences in the inline markdown path must be
+    /// syntax-highlighted and framed like CodeCell.
+    #[test]
+    fn code_fence_rendered_framed_and_highlighted() {
+        let lines = render_markdown("```rust\nfn main() {}\n```");
+        let joined: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let text = joined.join("\n");
+        assert!(text.contains("┌─ rust"), "framing header missing: {text:?}");
+        assert!(
+            text.contains("fn main() {}"),
+            "code content missing: {text:?}"
+        );
+        assert!(text.contains("└─"), "framing footer missing: {text:?}");
+
+        // Syntect assigns explicit colors (unless NO_COLOR is set).
+        if std::env::var("NO_COLOR").is_err() {
+            let has_color = lines.iter().flat_map(|l| &l.spans).any(|s| {
+                matches!(
+                    s.style.fg,
+                    Some(ratatui::style::Color::Rgb(..))
+                        | Some(ratatui::style::Color::Indexed(..))
+                        | Some(ratatui::style::Color::Red)
+                        | Some(ratatui::style::Color::Green)
+                        | Some(ratatui::style::Color::Blue)
+                        | Some(ratatui::style::Color::Yellow)
+                        | Some(ratatui::style::Color::Cyan)
+                        | Some(ratatui::style::Color::Magenta)
+                )
+            });
+            assert!(has_color, "expected syntect-colored spans: {joined:?}");
+        }
+    }
 
     #[test]
     fn split_paragraphs_by_blank_lines() {
