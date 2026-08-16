@@ -22,15 +22,17 @@ jobs:
           - ubuntu-24.04-arm   # linux-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-      - name: Install ripgrep
-        uses: taiki-e/install-action@v2
-        with:
-          tool: ripgrep
       - name: Force bfd linker (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: echo "RUSTFLAGS=-D warnings -C link-arg=-fuse-ld=bfd" >> "$GITHUB_ENV"
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          cache-on-failure: true
+      # bin/lint = clippy + fmt --check — it compiles but never EXECUTES tests,
+      # so the ripgrep binary is not needed here (installed in the build job,
+      # where tier-1 search tests shell out to `rg`).
       - name: Run lint
         run: bin/lint
 
@@ -46,6 +48,9 @@ jobs:
         run: command -v tmux
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tui
+          cache-on-failure: true
       - name: TUI verification pipeline (L1 headless + L2 session + guard + L3 PTY + L4 tmux)
         env:
           TERM: xterm
@@ -71,6 +76,9 @@ jobs:
         run: echo "RUSTFLAGS=-D warnings -C link-arg=-fuse-ld=bfd" >> "$GITHUB_ENV"
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+          cache-on-failure: true
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
@@ -79,11 +87,12 @@ jobs:
         run: bin/build
       - name: Run tests
         run: bin/test
-      - name: Run lint
-        run: bin/lint
+      # No `Run lint` here — the parallel `lint` job runs the identical
+      # bin/lint on the same matrix; a second pass recompiles all deps via
+      # clippy-driver (incompatible with rustc artifacts) for zero benefit.
       - name: Upload artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
         with:
           name: zen-${{ matrix.os }}
-          path: target/release/zen
+          path: target/debug/zen
           if-no-files-found: error
