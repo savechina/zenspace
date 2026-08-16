@@ -232,6 +232,18 @@ async fn test_e2e_m0_m2_m4_consolidation_pipeline() {
     // SAFETY: single-threaded test — ZEN_HOME set once before any worker reads it
     unsafe { std::env::set_var("ZEN_HOME", &root) };
 
+    // Force keyword-only extraction: with no reachable LLM, the journaler's
+    // `extract_signals_via_llm` falls back to keyword extraction. The embedded
+    // default (`default_provider = "ollama"`) would otherwise trigger a real
+    // LLM call that hangs for minutes when Ollama is running/slow (or
+    // unreachable). `mock` is keyless and non-local, so `route()` returns
+    // `ProviderUnavailable` for Private sensitivity → keyword fallback.
+    fs::write(
+        root.join("config.toml"),
+        "default_provider = \"mock\"\n\n[providers.mock]\nprovider_type = \"mock\"\n",
+    )
+    .unwrap();
+
     // 2. Create directory structure for workers
     // SessionJournaler needs: sessions/, memories/journal/, vault/wiki/wisdom/facts/
     // MemoryCurator needs: memories/journal/, memories/MEMORY.md

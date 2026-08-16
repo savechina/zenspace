@@ -14,6 +14,7 @@ jobs:
   lint:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os:
           - macos-15-intel     # mac-x86
@@ -59,6 +60,7 @@ jobs:
   build:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os:
           - macos-15-intel     # mac-x86
@@ -83,9 +85,12 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - name: Build
-        run: bin/build
-      - name: Run tests
+      # No separate `bin/build` — `cargo nextest run` already produces
+      # `target/debug/zen` as a build prerequisite of the `crates/zen/tests/*`
+      # integration tests (common.rs uses `env!("CARGO_BIN_EXE_zen")`), and no
+      # crate declares `[features]`, so `--all-features` is a no-op. Paying a
+      # second dev-profile compile here only doubles build time.
+      - name: Build & test (nextest produces target/debug/zen)
         run: bin/test
       # No `Run lint` here — the parallel `lint` job runs the identical
       # bin/lint on the same matrix; a second pass recompiles all deps via

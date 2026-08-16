@@ -70,7 +70,16 @@ impl OllamaProvider {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let provider = OllamaProvider { base_url, model };
-            rt.block_on(provider.complete_async(&prompt, &options))
+            rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    provider.complete_async(&prompt, &options),
+                )
+                .await
+                .map_err(|_| LlmError::Call {
+                    reason: "Ollama completion timed out after 120s".into(),
+                })?
+            })
         })
         .join()
         .map_err(|e| LlmError::Call {
@@ -137,7 +146,10 @@ impl OllamaProvider {
     }
 
     pub fn health_check(&self) -> bool {
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
         match client.get(&url).send() {
             Ok(resp) => resp.status().is_success(),
