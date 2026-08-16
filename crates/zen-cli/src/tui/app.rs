@@ -66,6 +66,24 @@ pub enum PendingCallKind {
 
 const MAX_HISTORY: usize = 100;
 
+/// Deterministic markdown payload for the echo test seam (`ZEN_TEST_ECHO_LLM=1`,
+/// test-design.md §3 L3). Exercises reasoning (`<think>`), heading, paragraph
+/// (committed block), code fence (FR-012 highlight), list, link, and a trailing
+/// partial line (viewport tail).
+const ECHO_SCRIPT: &str = r##"<think>I should first understand the user's request.</think>
+# Echo Heading
+
+A paragraph with **bold** and *italic* inline text.
+
+```rust
+fn main() { println!("echo"); }
+```
+
+- bullet one
+- bullet two
+
+[link](https://example.com) and trailing"##;
+
 /// Per-directory knowledge-search timeout for interactive chat context
 /// injection (T054, input-display-plan.md). On expiry the chat continues
 /// without knowledge context instead of blocking the event loop.
@@ -1243,6 +1261,24 @@ Use /thinking to show/hide thinking process."#;
         self.current_response_tokens = 0;
         self.show_splash = false;
         self.status_hint = Some("preparing context…".to_string());
+
+        // ZEN_TEST_ECHO_LLM: test-only seam streaming a deterministic script
+        // through the real token channel (test-design.md §3 L3). Skips the
+        // orchestrator/LLM; production is unaffected (env var absent).
+        if std::env::var("ZEN_TEST_ECHO_LLM").is_ok() {
+            let script = ECHO_SCRIPT.to_string();
+            tokio::task::spawn(async move {
+                for chunk in script.split_inclusive('\n') {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    let _ = tokens_tx.send(chunk.to_string());
+                }
+                let _ = done_tx.send((
+                    Ok(script),
+                    Some(SessionContext::new("echo".into(), String::new())),
+                ));
+            });
+            return;
+        }
 
         if self.session.is_none() {
             self.session = Some(SessionContext::new("default".into(), String::new()));
@@ -2561,6 +2597,13 @@ pub fn run_app(
                     dirty = true;
                 }
                 crossterm::event::Event::Resize(_, _) => {
+                    // FR-014: keep ratatui's buffer synced to the live terminal
+                    // size. The inline path re-anchors its viewport on resize
+                    // (inline.rs); the alternate-screen path must at least
+                    // autoresize, or the stale buffer desyncs from the terminal
+                    // and later keystrokes render to the wrong place (the e9
+                    // "post-resize-input" flake).
+                    terminal.autoresize()?;
                     dirty = true;
                 }
                 _ => {}

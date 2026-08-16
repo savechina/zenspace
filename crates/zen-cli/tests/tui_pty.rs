@@ -370,3 +370,62 @@ fn e12_fullscreen_selection_mode_flow() {
     tui.send(b"\x04");
     tui.wait_exit();
 }
+
+/// E13 (streaming E2E, `ZEN_TEST_ECHO_LLM=1`): a plain message drives the real
+/// Enter → start_async_chat → token channel → scrollback pipeline via the
+/// deterministic echo script. Asserts committed markdown blocks (paragraph +
+/// code fence) land in native scrollback exactly once (duplicate-output
+/// regression), reasoning stays hidden by default, the turn separator renders
+/// on completion, and the app keeps accepting input afterwards.
+#[test]
+#[ignore]
+fn e13_echo_streaming_commits_blocks_without_duplication() {
+    let mut tui = Tui::spawn(&[("ZEN_TEST_ECHO_LLM", "1")]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+    tui.send(b"hello echo\r");
+
+    tui.wait_for("A paragraph with", "committed paragraph in scrollback");
+    tui.wait_for("fn main", "committed code fence in scrollback");
+    // Completion flushes the tail and emits the turn separator.
+    tui.wait_for("\u{2500}\u{2500}", "turn separator after completion");
+
+    let screen = tui.screen();
+    assert_eq!(
+        screen.matches("A paragraph with").count(),
+        1,
+        "paragraph must appear exactly once (duplicate-output regression):\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("fn main").count(),
+        1,
+        "code fence must appear exactly once:\n{screen}"
+    );
+    assert!(
+        !screen.contains("understand the user"),
+        "reasoning must stay hidden by default:\n{screen}"
+    );
+
+    // App must still be alive and accept a follow-up after the turn completes.
+    tui.send(b"still alive\r");
+    tui.wait_for("still alive", "follow-up accepted after streaming turn");
+    tui.send(b"\x04");
+    tui.wait_exit();
+}
+
+/// E14 (streaming E2E, `ZEN_TEST_ECHO_LLM=1`): `/thinking` toggles reasoning
+/// visibility. With thinking enabled before the turn, the echo script's
+/// `<think>` block renders into native scrollback.
+#[test]
+#[ignore]
+fn e14_echo_streaming_thinking_toggle_surfaces_reasoning() {
+    let mut tui = Tui::spawn(&[("ZEN_TEST_ECHO_LLM", "1")]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+    tui.send(b"/thinking\r");
+    std::thread::sleep(Duration::from_millis(300)); // let the toggle ack render
+    tui.send(b"hello echo\r");
+
+    tui.wait_for("understand the user", "reasoning visible in scrollback");
+    tui.wait_for("A paragraph with", "committed paragraph in scrollback");
+    tui.send(b"\x04");
+    tui.wait_exit();
+}

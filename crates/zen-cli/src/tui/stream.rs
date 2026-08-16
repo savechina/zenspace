@@ -9,6 +9,11 @@ pub struct StreamCollector {
     reasoning_active: bool,
     buffer_changed_since_render: bool,
     last_reasoning_split: Option<(String, String, bool)>,
+    // How much of the current text/reasoning split has already been fed to the
+    // incremental renderers. MdStream::append ACCUMULATES, so each render must
+    // feed only the newly-arrived suffix (see split_render_opt).
+    text_fed_len: usize,
+    reasoning_fed_len: usize,
 }
 
 impl StreamCollector {
@@ -20,6 +25,8 @@ impl StreamCollector {
             reasoning_active: false,
             buffer_changed_since_render: false,
             last_reasoning_split: None,
+            text_fed_len: 0,
+            reasoning_fed_len: 0,
         }
     }
 
@@ -118,6 +125,21 @@ impl StreamCollector {
         let (text, reasoning, in_think) = self.get_or_compute_split(&self.buffer.clone());
         self.reasoning_active = in_think;
 
+        // MdStream::append ACCUMULATES its input; feed only the suffix that
+        // arrived since the last render, or every already-committed block gets
+        // re-emitted (duplicate scrollback output). The split can transiently
+        // shrink while a `<think>`/`</think>` tag is mid-arrival, so clamp the
+        // slice instead of panicking on an out-of-range index.
+        let text_delta = text.get(self.text_fed_len..).unwrap_or("");
+        self.text_fed_len = text.len();
+        let reasoning_delta = if show_thinking {
+            let delta = reasoning.get(self.reasoning_fed_len..).unwrap_or("");
+            self.reasoning_fed_len = reasoning.len();
+            delta
+        } else {
+            ""
+        };
+
         let mut committed: Vec<Line<'static>> = Vec::new();
         let mut pending: Vec<Line<'static>> = Vec::new();
 
@@ -125,7 +147,7 @@ impl StreamCollector {
             let header_text = if in_think { "Thinking..." } else { "Thought" };
             let header = Line::from(Span::styled(header_text, reasoning_style));
 
-            let reasoning_update = self.reasoning_renderer.append(&reasoning);
+            let reasoning_update = self.reasoning_renderer.append(reasoning_delta);
 
             let reasoning_committed: Vec<Line<'static>> = reasoning_update
                 .committed
@@ -159,7 +181,7 @@ impl StreamCollector {
         }
 
         if !text.is_empty() {
-            let text_update = self.text_renderer.append(&text);
+            let text_update = self.text_renderer.append(text_delta);
             for block in &text_update.committed {
                 committed.extend(block.lines.iter().cloned());
             }
@@ -184,6 +206,8 @@ impl StreamCollector {
         self.reasoning_active = false;
         self.buffer_changed_since_render = false;
         self.last_reasoning_split = None;
+        self.text_fed_len = 0;
+        self.reasoning_fed_len = 0;
         let (text, reasoning, _) = Self::split_reasoning(&raw);
         let reasoning = if reasoning.is_empty() {
             None
@@ -200,6 +224,8 @@ impl StreamCollector {
         self.reasoning_active = false;
         self.buffer_changed_since_render = false;
         self.last_reasoning_split = None;
+        self.text_fed_len = 0;
+        self.reasoning_fed_len = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -374,5 +400,44 @@ mod tests {
         assert!(collector.buffer_changed());
         collector.render(Style::default());
         assert!(!collector.buffer_changed());
+    }
+
+    fn lines_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect()
+    }
+
+    #[test]
+    fn drain_does_not_reemit_committed_blocks() {
+        // Regression: split_render_opt used to feed the FULL accumulated text
+        // to MdStream::append on every tick. MdStream appends (never replaces),
+        // so a second drain with no new content doubled the pending tail (and
+        // re-committed any committed blocks), duplicating scrollback output.
+        let mut collector = StreamCollector::new();
+        collector.push_delta("Hello world");
+        let (c1, p1) = collector.drain_and_tail_filtered(Style::default(), true);
+        let first = lines_text(&c1) + &lines_text(&p1);
+        assert!(first.contains("Hello world"));
+
+        // No new content: the output must be identical (idempotent), not doubled.
+        let (c2, p2) = collector.drain_and_tail_filtered(Style::default(), true);
+        let second = lines_text(&c2) + &lines_text(&p2);
+        assert_eq!(
+            first, second,
+            "drain without new content must be idempotent"
+        );
+
+        // New content: prior text must appear exactly once, not re-emitted.
+        collector.push_delta(" Second");
+        let (c3, p3) = collector.drain_and_tail_filtered(Style::default(), true);
+        let third = lines_text(&c3) + &lines_text(&p3);
+        assert!(third.contains("Second"));
+        assert_eq!(
+            third.matches("Hello world").count(),
+            1,
+            "prior text re-emitted: {third:?}"
+        );
     }
 }
