@@ -34,7 +34,7 @@ test_data/
 *.mv2
 
 # Development specs (local only, not for release)
-docs/specs/
+docs/specs
 
 # Generated mdBook output
 docs/book/
