@@ -1983,7 +1983,7 @@ Use /thinking to show/hide thinking process."#;
 
     /// Auto-create a session on first chat message if none exists.
     /// Sets the session title from the first user message.
-    fn ensure_session(&mut self, first_message: &str) {
+    pub(crate) fn ensure_session(&mut self, first_message: &str) {
         if self.session_id.is_some() {
             return;
         }

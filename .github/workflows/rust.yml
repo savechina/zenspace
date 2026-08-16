@@ -34,13 +34,21 @@ jobs:
       - name: Run lint
         run: bin/lint
 
-tui:
+  tui:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Install tmux (L4 smoke dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+      - name: Verify tmux present (fail closed — L4 must not silently skip in CI)
+        run: command -v tmux
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
-      - name: TUI verification pipeline (L1 headless + L2 session + guard + L3 PTY)
+      - name: TUI verification pipeline (L1 headless + L2 session + guard + L3 PTY + L4 tmux)
+        env:
+          TERM: xterm
         run: bin/test-tui
 
   build:
