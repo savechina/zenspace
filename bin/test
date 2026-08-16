@@ -2,12 +2,8 @@
 set -euo pipefail
 set -x
 
+# Full workspace unit/integration suite (nextest). Headless tui:: L1/L2 tests
+# are covered here on every platform; the TUI runtime layers (L3 PTY, L4 tmux,
+# T039 guard) are owned by bin/test-tui — running them here would duplicate the
+# tui job. See docs/specs/002-agentic-tui/test-design.md.
 cargo nextest run --no-fail-fast "$@"
-
-# T072: L3 PTY end-to-end (opt-out with ZEN_SKIP_PTY=1). Complements the
-# headless L1/L2 suites above with real-escape-sequence verification.
-if [[ "${ZEN_SKIP_PTY:-0}" == "1" ]]; then
-  echo "bin/test: PTY layer skipped (ZEN_SKIP_PTY=1)"
-else
-  bin/tui-pty-test
-fi
