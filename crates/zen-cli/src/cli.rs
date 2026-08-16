@@ -194,7 +194,14 @@ pub async fn shell() -> Result<(), ZenError> {
             .map_err(|e| ZenError::Message(format!("Config error: {}", e)))?;
         // Inline is the default; the alternate-screen full TUI stays
         // selectable for scenarios that need mouse capture / selection mode.
-        let is_inline = std::env::var("ZEN_TUI_FULLSCREEN").is_err();
+        // Truthy parsing: only non-empty values other than 0/false enable it.
+        let fullscreen = std::env::var("ZEN_TUI_FULLSCREEN")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false);
+        let is_inline = !fullscreen;
         if is_inline {
             crate::tui::run_inline(config)
                 .map_err(|e| ZenError::Message(format!("TUI error: {}", e)))

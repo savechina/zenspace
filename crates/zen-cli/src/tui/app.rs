@@ -160,43 +160,36 @@ pub(crate) fn collect_knowledge_context(
     let service = SearchService::new(router.clone());
     let tier = effective_search_tier(query, mode);
 
-    let owned_client = match super::prewarm::take_db_client() {
-        Some(c) => Some(c),
-        None => {
-            let db_path = paths.data().join("state.db");
-            tokio::runtime::Handle::current()
-                .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
-                .ok()
-        }
-    };
-    let client = match owned_client.as_ref() {
-        Some(c) => c,
-        None => return format_search_results(results),
-    };
-
-    for dir in [paths.inbox(), paths.wiki()] {
-        let search = service.search(query, &dir, client, Some(tier), None);
-        let outcome = tokio::runtime::Handle::current().block_on(tokio::time::timeout(
-            std::time::Duration::from_millis(KNOWLEDGE_SEARCH_TIMEOUT_MS),
-            search,
-        ));
-        match outcome {
-            Ok(Ok(r)) => results.extend(r),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, dir = %dir.display(), "knowledge search failed")
+    let search_dirs = [paths.inbox(), paths.wiki()];
+    let outcome = super::prewarm::with_db_client(move |client| {
+        for dir in search_dirs {
+            let search = service.search(query, &dir, client, Some(tier), None);
+            let outcome = tokio::runtime::Handle::current().block_on(tokio::time::timeout(
+                std::time::Duration::from_millis(KNOWLEDGE_SEARCH_TIMEOUT_MS),
+                search,
+            ));
+            match outcome {
+                Ok(Ok(r)) => results.extend(r),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, dir = %dir.display(), "knowledge search failed")
+                }
+                Err(_) => tracing::warn!(
+                    dir = %dir.display(),
+                    timeout_ms = KNOWLEDGE_SEARCH_TIMEOUT_MS,
+                    "knowledge search timed out — continuing without context"
+                ),
             }
-            Err(_) => tracing::warn!(
-                dir = %dir.display(),
-                timeout_ms = KNOWLEDGE_SEARCH_TIMEOUT_MS,
-                "knowledge search timed out — continuing without context"
-            ),
         }
-    }
 
-    let mut seen = std::collections::HashSet::new();
-    results.retain(|r| seen.insert(r.file.clone()));
-    results.truncate(5);
-    let formatted = format_search_results(results);
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|r| seen.insert(r.file.clone()));
+        results.truncate(5);
+        format_search_results(results)
+    });
+
+    // DB unavailable: fall back to direct file lookup only (cheap, local).
+    let formatted = outcome
+        .unwrap_or_else(|| format_search_results(App::direct_file_lookup_in_dirs(&paths, query)));
 
     tracing::info!(
         query_len = query.len(),
@@ -1094,6 +1087,12 @@ impl App {
     }
 
     pub(crate) fn handle_slash_command(&mut self, cmd: &str) {
+        // A submitted command must close the slash popup — otherwise the
+        // popup stays visible (the composer was already cleared, so
+        // on_input_change never fires) and, in inline mode, masks the very
+        // picker the command opened (render order: slash → session → model).
+        self.slash_state.dismiss();
+
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
         let command_name = self
             .slash_registry
@@ -1190,57 +1189,6 @@ Example: '/h' = '/help', '/q' = '/exit', '/s <query>' = '/search <query>'
 Chat mode is default — type questions to get LLM responses.
 Use /thinking to show/hide thinking process."#;
         self.push_output(help.to_string(), false);
-    }
-
-    fn execute_chat(&mut self, query: &str) {
-        if self.orchestrator.is_none() {
-            self.init_orchestrator(self.config);
-        }
-
-        let specialist = self
-            .orchestrator
-            .as_ref()
-            .map(|o| o.route(query))
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let context = self.auto_search_knowledge(query);
-        if !context.is_empty() {
-            tracing::info!(
-                count = context.len(),
-                "TUI chat: knowledge context injected"
-            );
-            if !self.is_inline_mode() {
-                self.push_output(
-                    format!("[Knowledge] Found {} relevant notes", context.len()),
-                    false,
-                );
-            }
-        }
-
-        tracing::debug!(
-            specialist,
-            query_len = query.len(),
-            knowledge_count = context.len(),
-            "TUI chat: dispatching"
-        );
-
-        self.turn_started_at = Some(Instant::now());
-        self.tool_call_count = 0;
-        self.current_response_tokens = 0;
-        self.show_splash = false;
-        if !self.is_inline_mode() {
-            self.output.push(OutputCell::user(query));
-            self.invalidate_output_cache();
-        }
-        self.start_llm_call_via_orchestrator(query, &context);
-    }
-
-    fn auto_search_knowledge(&mut self, query: &str) -> Vec<String> {
-        // Full-screen path: synchronous but bounded (T054) and pre-warmed
-        // (T053). Inline mode uses `start_async_chat` →
-        // `collect_knowledge_context` off the event loop instead (T055).
-        let router = self.router.clone();
-        collect_knowledge_context(&router, self.config, query)
     }
 
     /// T055/T056: async chat dispatch for inline mode.

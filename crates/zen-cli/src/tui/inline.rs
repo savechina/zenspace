@@ -276,6 +276,13 @@ pub(crate) fn inline_tick<B: Backend>(
         state.dirty = true;
     }
 
+    // T070: toast lifecycle is tick-driven — keep redrawing while a toast is
+    // active/pending so it appears immediately and expires on time instead
+    // of waiting for an unrelated dirty tick.
+    if !app.toast_queue.is_empty() || app.current_toast.is_some() {
+        state.dirty = true;
+    }
+
     if state.dirty {
         terminal
             .draw(|frame| super::inline_ui::render(frame, app))
@@ -322,6 +329,9 @@ fn run_inline_session(
         }
     }
 
+    // Reading-mode exit flush: deferred blocks (T062) must reach scrollback
+    // before teardown, otherwise Ctrl+D while reading silently drops them.
+    app.exit_reading_mode();
     if !app.scrollback_queue.is_empty() {
         let _ = super::scrollback_inserter::insert_scrollback_queue(
             terminal,
@@ -765,6 +775,50 @@ mod tests {
             "deferred block must flush on PageDown: {flushed:?}"
         );
         assert!(app.deferred_scrollback.is_empty());
+    }
+
+    /// P1 regression (review-agent 2026-08-16): quitting while in reading
+    /// mode must flush deferred blocks, not drop them.
+    #[test]
+    fn s11_quit_in_reading_mode_flushes_deferred() {
+        let (mut app, tokens_tx, _done) = scripted_stream("read then quit");
+        let mut terminal = anchored_terminal(80, 24);
+        let mut state = InlineLoopState::new();
+
+        tokens_tx
+            .send("Deferred answer.".to_string())
+            .expect("send");
+        unthrottle(&mut state);
+        inline_tick(&mut app, &mut terminal, &mut state, None).expect("tick");
+
+        // Enter reading mode AFTER the block was already flushed? No — defer
+        // requires reading BEFORE the tick that commits. Re-do properly:
+        // (the first tick above flushed; start a second deferred block)
+        app.reading_mode = true;
+        tokens_tx
+            .send("\n\nSecond deferred body.\n\nTail".to_string())
+            .expect("send");
+        unthrottle(&mut state);
+        inline_tick(&mut app, &mut terminal, &mut state, None).expect("tick");
+        assert!(
+            !app.deferred_scrollback.is_empty(),
+            "second block must be deferred"
+        );
+
+        // Ctrl+D quit path runs the same exit flush as run_inline_session.
+        app.save_session_state();
+        app.running = false;
+        app.exit_reading_mode();
+        crate::tui::scrollback_inserter::insert_scrollback_queue(
+            &mut terminal,
+            &mut app.scrollback_queue,
+        )
+        .expect("final flush");
+        let flushed = flushed_rows(&mut terminal);
+        assert!(
+            flushed.iter().any(|r| r.contains("Second deferred body.")),
+            "deferred block must survive quit: {flushed:?}"
+        );
     }
 
     /// S7 (FR-008 precondition): consecutive turns both land in scrollback in

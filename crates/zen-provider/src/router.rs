@@ -1105,10 +1105,20 @@ impl LlmRouter for DefaultRouter {
         let mut result = Vec::new();
 
         for (name, cfg) in &self.config.providers {
-            let model = cfg
-                .default_model
-                .clone()
-                .unwrap_or_else(|| zen_core::constants::OPENAI_DEFAULT_MODEL.into());
+            let model = cfg.default_model.clone().unwrap_or_else(|| {
+                // T069: type-aware fallback — an ollama entry without an
+                // explicit model must not display a gpt-style default.
+                match cfg.provider_type.as_deref().unwrap_or_default() {
+                    "ollama" => zen_core::constants::OLLAMA_DEFAULT_MODEL,
+                    "anthropic" | "anthropic-compatible" => {
+                        zen_core::constants::ANTHROPIC_DEFAULT_MODEL
+                    }
+                    "gemini" => zen_core::constants::GEMINI_DEFAULT_MODEL,
+                    "mistral" => zen_core::constants::MISTRAL_DEFAULT_MODEL,
+                    _ => zen_core::constants::OPENAI_DEFAULT_MODEL,
+                }
+                .into()
+            });
             result.push((name.clone(), model));
         }
 
@@ -1237,6 +1247,55 @@ mod tests {
 
     /// T060: list_providers reads names/models from config — never resolves
     /// secrets (no Keychain access from `zen model list` / provider listing).
+    /// T069: fallback honors provider_type (ollama without default_model
+    /// lists the ollama default, not the OpenAI one).
+    #[test]
+    fn list_providers_fallback_is_type_aware() {
+        use crate::router::LlmRouter;
+        use std::collections::HashMap;
+        use zen_core::config::{ProviderConfig, ZenConfig};
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                provider_type: Some("ollama".into()),
+                default_model: None,
+                ..ProviderConfig::default()
+            },
+        );
+        providers.insert(
+            "custom".to_string(),
+            ProviderConfig {
+                provider_type: Some("openai-compatible".into()),
+                default_model: None,
+                ..ProviderConfig::default()
+            },
+        );
+        let cfg = ZenConfig {
+            providers,
+            ..ZenConfig::default()
+        };
+        let router = DefaultRouter::from_agentic(&cfg);
+        let listed = router.list_providers();
+        let ollama_model = listed
+            .iter()
+            .find(|(n, _)| n == "ollama")
+            .map(|(_, m)| m.clone())
+            .unwrap();
+        assert_eq!(
+            ollama_model,
+            zen_core::constants::OLLAMA_DEFAULT_MODEL,
+            "ollama fallback must be type-aware"
+        );
+        let custom_model = listed
+            .iter()
+            .find(|(n, _)| n == "custom")
+            .map(|(_, m)| m.clone())
+            .unwrap();
+        assert_eq!(custom_model, zen_core::constants::OPENAI_DEFAULT_MODEL);
+    }
+
     #[test]
     fn list_providers_never_resolves_keys() {
         use crate::router::LlmRouter;

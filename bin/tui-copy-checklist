@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# T065 — native-copy smoke checklist (manual; PTY/tmux cannot verify
+# mouse-selection or OS clipboard semantics). Run this in a REAL terminal.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+BIN="./target/debug/zen"
+[[ -x "$BIN" ]] || cargo build -p zen
+
+cat <<'EOS'
+──────────────────────────────────────────────────────────────
+ Zen TUI native-copy checklist (inline mode) — perform manually
+──────────────────────────────────────────────────────────────
+ 1. Run: ./target/debug/zen
+ 2. Send:  /help  → wait for output in scrollback
+ 3. Mouse-drag over the /help output text
+      EXPECT: terminal-native selection highlight appears
+ 4. Copy (Cmd+C / Ctrl+Shift+C) and paste anywhere
+      EXPECT: exact rendered text (no stray spaces after CJK)
+ 5. Scroll up with the terminal scrollbar / Shift+PageUp
+      EXPECT: banner + all prior output still present
+ 6. While scrolled UP, send another message (second terminal not
+    possible — return via PageDown) and verify the view did NOT
+    jump while you were reading (T062 reading mode)
+ 7. Press Ctrl+D
+      EXPECT: shell returns; scrollback retains everything (FR-015)
+ 8. CJK check: send  你好世界  and copy the rendered reply
+      EXPECT: no "你 好 世 界" spacing artifacts (T052)
+──────────────────────────────────────────────────────────────
+ Report results in docs/specs/002-agentic-tui/tasks.md (T065).
+EOS

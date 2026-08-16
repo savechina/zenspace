@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use zen_agents::orchestrator::AgentOrchestrator;
 
 static ORCHESTRATOR: OnceLock<Arc<AgentOrchestrator>> = OnceLock::new();
+/// Cached DB client for the lifetime of the process (review-agent P2 fix:
+/// opening a fresh `SqliteClient` per chat turn caused connection churn).
 static DB_CLIENT: OnceLock<Mutex<Option<zen_repo::SqliteClient>>> = OnceLock::new();
 
 /// Start background pre-warming. Cheap to call more than once (the stores
@@ -53,11 +55,21 @@ pub(crate) fn take_orchestrator() -> Option<Arc<AgentOrchestrator>> {
     ORCHESTRATOR.get().cloned()
 }
 
-/// Take the pre-warmed DB client (once), if ready.
-pub(crate) fn take_db_client() -> Option<zen_repo::SqliteClient> {
-    let slot = DB_CLIENT.get()?;
-    match slot.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(poisoned) => poisoned.into_inner().take(),
+/// Run `f` with the process-wide knowledge-DB client, opening it lazily on
+/// first use if prewarm has not already (must run in a tokio context, e.g.
+/// `spawn_blocking`). The client is cached for the process lifetime — no
+/// per-turn `SqliteClient::open_lazy` churn (review-agent P2 fix).
+pub(crate) fn with_db_client<R>(f: impl FnOnce(&zen_repo::SqliteClient) -> R) -> Option<R> {
+    let slot = DB_CLIENT.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        let db_path = zen_core::paths::ZenPaths::detect()
+            .ok()?
+            .data()
+            .join("state.db");
+        *guard = tokio::runtime::Handle::current()
+            .block_on(zen_repo::SqliteClient::open_lazy(&db_path))
+            .ok();
     }
+    guard.as_ref().map(f)
 }

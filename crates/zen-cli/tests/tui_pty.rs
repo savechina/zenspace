@@ -36,6 +36,10 @@ struct Tui {
 
 impl Tui {
     fn spawn(extra_env: &[(&str, &str)]) -> Self {
+        Self::spawn_with(extra_env, None)
+    }
+
+    fn spawn_with(extra_env: &[(&str, &str)], config_toml: Option<&str>) -> Self {
         let bin =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/zen");
         assert!(
@@ -59,6 +63,9 @@ impl Tui {
         // home is not writable at all.
         let home = tempfile::TempDir::new().expect("temp home");
         std::fs::create_dir_all(home.path().join(".zen")).expect("temp .zen");
+        if let Some(toml) = config_toml {
+            std::fs::write(home.path().join(".zen/config.toml"), toml).expect("temp config");
+        }
         cmd.env("HOME", home.path());
         cmd.cwd(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
         for (k, v) in extra_env {
@@ -153,7 +160,10 @@ impl Tui {
                 Some(status) => return status,
                 None => {
                     if start.elapsed() > TIMEOUT {
-                        panic!("zen did not exit within {TIMEOUT:?}");
+                        panic!(
+                            "zen did not exit within {TIMEOUT:?}; screen:\n{}",
+                            self.screen()
+                        );
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -248,6 +258,11 @@ fn e7_fullscreen_slash_popup_keeps_input() {
     // The composer still shows the typed slash.
     tui.wait_for("/", "composer visible under popup");
     tui.send(b"\x1b");
+    // Let crossterm flush the lone Esc BEFORE the next byte — with
+    // DISAMBIGUATE_ESCAPE_CODES, Esc+byte within the window parses as
+    // Alt+<byte> (that is how terminals encode Alt), which would swallow
+    // both keys.
+    std::thread::sleep(Duration::from_millis(400));
     tui.send(b"\x04");
     tui.wait_exit();
 }
@@ -266,6 +281,92 @@ fn e8_inline_survives_resize() {
     tui.resize(ROWS, COLS); // restore
     tui.send(b"still-alive");
     tui.wait_for("still-alive", "input accepted after resizes");
+    tui.send(b"\x04");
+    tui.wait_exit();
+}
+
+const PICKER_CONFIG: &str = r#"
+[providers.ollama]
+provider_type = "ollama"
+default_model = "qwen3-coder"
+
+[providers.openai]
+provider_type = "openai"
+default_model = "gpt-4o-mini"
+"#;
+
+/// E9 (T066, FR-014): alternate-screen mode survives live resize and keeps
+/// accepting input.
+#[test]
+#[ignore]
+fn e9_fullscreen_survives_resize() {
+    let mut tui = Tui::spawn(&[("ZEN_TUI_FULLSCREEN", "1")]);
+    tui.wait_for("Zen Agentic TUI", "fullscreen ready");
+    tui.resize(40, 36);
+    std::thread::sleep(Duration::from_millis(400));
+    tui.resize(24, 14);
+    std::thread::sleep(Duration::from_millis(400));
+    tui.resize(ROWS, COLS);
+    tui.send(b"post-resize-input");
+    tui.wait_for("post-resize-input", "input accepted after resizes");
+    tui.send(b"\x04");
+    tui.wait_exit();
+}
+
+/// E10 (T065): model picker opens from config providers, lists them, and
+/// dismisses on Esc. (Stage advance is config-dependent — a provider without
+/// a models catalog completes immediately — so it is not asserted here.)
+#[test]
+#[ignore]
+fn e10_inline_model_picker_flow() {
+    let mut tui = Tui::spawn_with(&[], Some(PICKER_CONFIG));
+    tui.wait_for("Input (Enter=send", "composer ready");
+    tui.send(b"/model\r");
+    tui.wait_for("Select Provider", "model picker provider stage");
+    tui.wait_for("ollama", "provider listed from config");
+    tui.send(b"\x1b");
+    std::thread::sleep(Duration::from_millis(400));
+    tui.send(b"\x04");
+    tui.wait_exit();
+}
+
+/// E11 (T065): session picker command opens the picker surface (isolated
+/// HOME → empty list is the deterministic expectation) and dismisses.
+#[test]
+#[ignore]
+fn e11_inline_session_picker_opens() {
+    let mut tui = Tui::spawn_with(&[], Some(PICKER_CONFIG));
+    tui.wait_for("Input (Enter=send", "composer ready");
+    // The picker renders nothing when the list is empty, so create one
+    // session first via `/new` (deterministic — no LLM round-trip; a plain
+    // message would leave the app streaming and queue the next command).
+    tui.send(b"/new\r");
+    std::thread::sleep(Duration::from_millis(600));
+    tui.send(b"/session\r");
+    tui.wait_for("Sessions", "session picker surface");
+    tui.send(b"\x1b");
+    std::thread::sleep(Duration::from_millis(400));
+    tui.send(b"\x04");
+    tui.wait_exit();
+}
+
+/// E12 (T065): full-screen selection mode — Ctrl+X enters command mode,
+/// `v` enters cell selection (border title changes), `y` yank path runs,
+/// Esc returns to input.
+#[test]
+#[ignore]
+fn e12_fullscreen_selection_mode_flow() {
+    let mut tui = Tui::spawn(&[("ZEN_TUI_FULLSCREEN", "1")]);
+    tui.wait_for("Zen Agentic TUI", "fullscreen ready");
+    tui.send(b"\x18"); // Ctrl+X → command mode
+    tui.wait_for("Command (v=select", "command mode border");
+    tui.send(b"v"); // output exists (splash) → selection mode
+    tui.wait_for("y yank", "selection mode border");
+    tui.send(b"y"); // yank selected cell (clipboard may be unavailable in CI;
+    // the mode must still be stable)
+    std::thread::sleep(Duration::from_millis(300));
+    tui.send(b"\x1b"); // exit selection
+    std::thread::sleep(Duration::from_millis(400));
     tui.send(b"\x04");
     tui.wait_exit();
 }
