@@ -27,9 +27,10 @@ use serde_json::Value;
 use tracing::debug;
 use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::paths::ZenPaths;
+#[cfg(not(test))]
+use zen_core::sandbox::apply_resource_limits;
 use zen_core::sandbox::{
     SandboxMode, SandboxValidator, SeatbeltHook, SeatbeltPolicy, ToolArgRegistry,
-    apply_resource_limits,
 };
 use zen_core::types::Sensitivity;
 use zen_memory::ZenMemvidStore;
@@ -253,6 +254,14 @@ impl ZenWiring {
         // descendants (shell.exec subprocesses, MCP stdio children, WASM-
         // forked processes) are resource-capped. Defense-in-depth — a
         // failure to set limits is logged but does not abort construction.
+        //
+        // Test builds skip this: on Linux, RLIMIT_NPROC also constrains
+        // pthread_create, and nextest runs hundreds of test processes in
+        // parallel under one UID — a NPROC=50 soft cap makes thread spawn
+        // fail with EAGAIN ("Resource temporarily unavailable") once the
+        // user's aggregate task count exceeds 50. This is process hardening
+        // for the production binary only, never for the test harness.
+        #[cfg(not(test))]
         match apply_resource_limits() {
             Ok(()) => debug!("resource limits applied: NPROC=50, NOFILE=256, CORE=0"),
             Err(e) => tracing::warn!("failed to apply resource limits: {}", e),
