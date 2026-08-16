@@ -307,6 +307,10 @@ fn e9_fullscreen_survives_resize() {
     tui.resize(24, 14);
     std::thread::sleep(Duration::from_millis(400));
     tui.resize(ROWS, COLS);
+    // Settle: fullscreen `autoresize()` processes the SIGWINCH on the next
+    // event-loop tick; without this wait the keystroke lands mid-resize on
+    // slow CI and never reaches the input widget (e9 "post-resize-input" flake).
+    std::thread::sleep(Duration::from_millis(400));
     tui.send(b"post-resize-input");
     tui.wait_for("post-resize-input", "input accepted after resizes");
     tui.send(b"\x04");
