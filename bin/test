@@ -2,6 +2,12 @@
 set -euo pipefail
 set -x
 
+# Limit build-time link parallelism (the OOM vector on ARM CI) —
+# cargo honors CARGO_BUILD_JOBS, NOT nextest's --build-jobs.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export NEXTEST_TEST_THREADS="${NEXTEST_TEST_THREADS:-2}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
+
 # Full workspace unit/integration suite (nextest). Headless tui:: L1/L2 tests
 # are covered here on every platform; the TUI runtime layers (L3 PTY, L4 tmux,
 # T039 guard) are owned by bin/test-tui — running them here would duplicate the

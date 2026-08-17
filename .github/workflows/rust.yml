@@ -91,6 +91,12 @@ jobs:
       # crate declares `[features]`, so `--all-features` is a no-op. Paying a
       # second dev-profile compile here only doubles build time.
       - name: Build & test (nextest produces target/debug/zen)
+        # ARM runner (2 cores / 8 GB) OOMs on 2 concurrent nextest threads
+        # — kernel SIGTERM manifests as exit 143. x86 (4 cores / 16 GB) is fine at 2.
+        env:
+          CARGO_BUILD_JOBS: "${{ matrix.os == 'ubuntu-24.04-arm' && '1' || '2' }}"
+          NEXTEST_TEST_THREADS: "${{ matrix.os == 'ubuntu-24.04-arm' && '1' || '2' }}"
+          RUST_TEST_THREADS: "${{ matrix.os == 'ubuntu-24.04-arm' && '1' || '2' }}"
         run: bin/test
       # No `Run lint` here — the parallel `lint` job runs the identical
       # bin/lint on the same matrix; a second pass recompiles all deps via
