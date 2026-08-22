@@ -115,19 +115,51 @@ fn convert_html_to_markdown(html: &str) -> String {
     htmd::convert(html).unwrap_or_else(|_| html.to_string())
 }
 
-async fn fetch_jina(client: &reqwest::Client, url: &str) -> Result<String, KernelError> {
-    let jina_url = format!("https://r.jina.ai/{}", url);
+async fn fetch_jina(
+    client: &reqwest::Client,
+    policy: &NetworkPolicy,
+    url: &str,
+    max_bytes: usize,
+) -> Result<String, KernelError> {
+    let jina_url = format!("https://r.jina.ai/{url}");
+    policy.validate_url(&jina_url).map_err(|reason| {
+        KernelError::ToolFailed(format!("Jina URL blocked by network policy: {reason}"))
+    })?;
     let resp = client
         .get(&jina_url)
         .header("X-Return-Format", "markdown")
         .header("Accept", "text/plain")
         .send()
         .await
-        .map_err(|e| KernelError::ToolFailed(format!("Jina fallback failed: {}", e)))?;
+        .map_err(|e| KernelError::ToolFailed(format!("Jina fallback failed: {e}")))?;
 
-    resp.text()
+    let (text, _truncated) = read_body_capped(resp, max_bytes).await?;
+    Ok(text)
+}
+
+/// Reads a response body in bounded chunks, stopping at `max_bytes` so a
+/// large or streaming response can't exhaust memory (memory-DoS guard).
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(String, bool), KernelError> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut truncated = false;
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| KernelError::ToolFailed(format!("Jina read failed: {}", e)))
+        .map_err(|e| KernelError::ToolFailed(format!("Failed to read response: {e}")))?
+    {
+        if bytes.len() + chunk.len() > max_bytes {
+            truncated = true;
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok((text, truncated))
 }
 
 #[async_trait]
@@ -148,9 +180,9 @@ impl Tool for WebFetchTool {
 
         // FR-036: network egress policy — block SSRF vectors (metadata
         // endpoints, private ranges) before any request leaves the process.
-        if let Err(reason) = self.network_policy.validate_url(url) {
-            return Ok(json!({ "error": reason }));
-        }
+        self.network_policy.validate_url(url).map_err(|reason| {
+            KernelError::ToolFailed(format!("URL blocked by network policy: {reason}"))
+        })?;
 
         let max_lines = args
             .get("max_lines")
@@ -182,10 +214,7 @@ impl Tool for WebFetchTool {
             .unwrap_or("")
             .to_string();
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("Failed to read response: {}", e)))?;
+        let (body, read_truncated) = read_body_capped(resp, max_bytes).await?;
 
         let title = extract_title(&body).unwrap_or_default();
 
@@ -205,7 +234,7 @@ impl Tool for WebFetchTool {
                 threshold = self.jina_fallback_threshold_chars,
                 "web.fetch content below readability threshold, falling back to Jina Reader"
             );
-            match fetch_jina(&self.client, url).await {
+            match fetch_jina(&self.client, &self.network_policy, url, max_bytes).await {
                 Ok(jina_content) => (jina_content, true),
                 Err(e) => {
                     tracing::warn!(url = url, error = %e, "Jina Reader fallback failed, using raw extract");
@@ -216,13 +245,8 @@ impl Tool for WebFetchTool {
             (markdown, false)
         };
 
-        let mut truncated = false;
+        let mut truncated = read_truncated;
         let mut content = final_content;
-        if content.len() > max_bytes {
-            truncated = true;
-            let end = content.floor_char_boundary(max_bytes);
-            content.truncate(end);
-        }
 
         let lines: Vec<&str> = content.lines().collect();
         if lines.len() > max_lines {
@@ -274,10 +298,12 @@ mod tests {
             .invoke(json!({
                 "url": "http://169.254.169.254/latest/meta-data/"
             }))
-            .await
-            .unwrap();
-        let err = res["error"].as_str().expect("expected error JSON");
-        assert!(err.contains("blocked by network policy"), "{err}");
+            .await;
+        let err = res.expect_err("policy violation must return Err, not Ok");
+        assert!(
+            err.to_string().contains("blocked by network policy"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -328,7 +329,6 @@ impl SeatbeltPolicy {
         profile.push_str("(allow file-read-data (literal \"/dev/urandom\"))\n");
 
         profile.push_str("(allow file-read-metadata)\n");
-        profile.push_str("(allow file-read-mode)\n");
 
         profile.push_str("(allow sysctl-read)\n");
 
@@ -466,6 +466,10 @@ impl SeatbeltPolicy {
     }
 }
 
+/// Seatbelt-based hook that validates tool invocations against a
+/// [`SeatbeltPolicy`]. Denies operations on metadata paths, enforces
+/// workspace-root containment for path args, and validates command args
+/// via the per-tool [`ToolArgRegistry`].
 pub struct SeatbeltHook {
     policy: Arc<SeatbeltPolicy>,
 }
@@ -1301,5 +1305,387 @@ mod tests {
                 .is_ok(),
             "non-existent read path must skip canonicalize and pass"
         );
+    }
+}
+
+/// OS sandbox profile derived from the active sandbox mode (D3, D6).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OsSandboxProfile {
+    /// Workspace roots the process may READ (all modes except full access).
+    pub readable_roots: Vec<PathBuf>,
+    /// Subset the process may WRITE (empty in `ReadOnly` mode).
+    pub writable_roots: Vec<PathBuf>,
+    /// OS-layer network access (`[sandbox] network_access`).
+    pub network: bool,
+    /// False only for `DangerFullAccess` — sandboxing is bypassed entirely.
+    pub sandboxed: bool,
+}
+
+impl OsSandboxProfile {
+    pub fn from_mode(
+        mode: SandboxMode,
+        workspace_roots: Vec<PathBuf>,
+        network_access: bool,
+    ) -> Self {
+        let (readable_roots, writable_roots, sandboxed) = match mode {
+            SandboxMode::ReadOnly => (workspace_roots, Vec::new(), true),
+            SandboxMode::WorkspaceWrite | SandboxMode::Ask => {
+                (workspace_roots.clone(), workspace_roots, true)
+            }
+            SandboxMode::DangerFullAccess => (Vec::new(), Vec::new(), false),
+        };
+        Self {
+            readable_roots,
+            writable_roots,
+            network: network_access,
+            sandboxed,
+        }
+    }
+}
+
+/// Error returned when the OS sandbox cannot be applied.
+#[derive(Debug, thiserror::Error)]
+pub enum OsSandboxError {
+    #[error("OS sandbox unavailable: {0}")]
+    SandboxUnavailable(String),
+}
+
+/// Substrings in child stderr (and signal/exit codes) that indicate a
+/// sandbox denial rather than a genuine program failure (D3/A1).
+const DENIAL_KEYWORDS: &[&str] = &[
+    "operation not permitted",
+    "permission denied",
+    "read-only file system",
+    "sandbox",
+    "landlock",
+    "seccomp",
+    "failed to write file",
+];
+
+/// Quick classifier: did the child exit because the sandbox denied it?
+///
+/// Matches the sandbox-exec/bwrap/seccomp failure signatures: exit codes
+/// 2/126/127 (cannot exec / command not permitted), 128+SIGSYS (seccomp
+/// kill), and stderr keywords.
+pub fn is_likely_sandbox_denied(exit_code: Option<i32>, stderr: &str) -> bool {
+    if let Some(code) = exit_code {
+        if matches!(code, 2 | 126 | 127) {
+            return true;
+        }
+        // SIGSYS (31) — seccomp/landlock violations terminate the process
+        // with a signal, reported as 128 + signum in shell exit status.
+        if code == 128 + 31 {
+            return true;
+        }
+    }
+    let lower = stderr.to_lowercase();
+    DENIAL_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
+/// Wrap `cmd` so that spawning it runs inside the OS sandbox described by
+/// `profile`, returning the wrapped command ready to `.spawn()`.
+///
+/// Fail-closed: macOS requires `/usr/bin/sandbox-exec`; if it is absent the
+/// function returns [`OsSandboxError::SandboxUnavailable`]. Linux requires
+/// `bubblewrap`; if absent the function returns [`OsSandboxError::SandboxUnavailable`].
+/// On unsupported platforms, returns `Ok(cmd)` unchanged.
+pub fn sandbox_spawn(
+    cmd: Command,
+    profile: &OsSandboxProfile,
+    allow_network: bool,
+) -> Result<Command, OsSandboxError> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = allow_network;
+        macos::wrap_sandbox_exec(cmd, profile)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::wrap_bubblewrap(cmd, profile, allow_network)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (profile, allow_network);
+        Ok(cmd)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+    fn escape_sbpl_path(path: &std::path::Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
+    /// Generate a codex-derived Seatbelt profile (D19).
+    ///
+    /// Allowance set: process-exec/fork, sysctl-read, POSIX sem/shm, PTY,
+    /// /dev devices, dyld/libSystem (read-only system paths), /tmp, Mach
+    /// bootstrap. Workspace roots are readable; writable roots additionally
+    /// writable. Network denied unless `profile.network`.
+    pub(super) fn sandbox_exec_profile(profile: &OsSandboxProfile) -> String {
+        let mut sb = String::new();
+        sb.push_str("(version 1)\n");
+        sb.push_str("(deny default)\n");
+
+        sb.push_str("(allow process-exec)\n");
+        sb.push_str("(allow process-fork)\n");
+        sb.push_str("(allow sysctl-read)\n");
+        sb.push_str("(allow ipc-posix-sem)\n");
+        sb.push_str("(allow ipc-posix-shm)\n");
+
+        sb.push_str("(allow mach-lookup)\n");
+        sb.push_str("(allow file-read-metadata)\n");
+
+        // Broad file-read: dynamic linker, dyld, system libs need to read
+        // from /usr/lib, /System, /bin, etc. Allow reads from root.
+        sb.push_str("(allow file-read* (subpath \"/\"))\n");
+
+        // Device nodes (read-only).
+        for dev in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"] {
+            sb.push_str(&format!("(allow file-read* (literal \"{dev}\"))\n"));
+        }
+
+        // Temp scratch (read + write).
+        sb.push_str("(allow file-write* (subpath \"/private/tmp\"))\n");
+
+        // Workspace roots: writable roots also get write permission.
+        for root in &profile.writable_roots {
+            let root = escape_sbpl_path(root);
+            sb.push_str(&format!("(allow file-write* (subpath \"{root}\"))\n"));
+        }
+
+        if profile.network {
+            sb.push_str("(allow network*)\n");
+        } else {
+            sb.push_str("(deny network*)\n");
+        }
+
+        sb
+    }
+
+    pub(super) fn wrap_sandbox_exec(
+        cmd: Command,
+        profile: &OsSandboxProfile,
+    ) -> Result<Command, OsSandboxError> {
+        if !std::path::Path::new(SANDBOX_EXEC).exists() {
+            return Err(OsSandboxError::SandboxUnavailable(
+                "sandbox-exec not found; refusing unsandboxed spawn".to_string(),
+            ));
+        }
+
+        let program = cmd.get_program().to_os_string();
+        let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
+        let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+        let cwd = cmd.get_current_dir().map(|p| p.to_path_buf());
+
+        let sbpl = sandbox_exec_profile(profile);
+
+        let mut wrapped = Command::new(SANDBOX_EXEC);
+        wrapped
+            .arg("-p")
+            .arg(sbpl)
+            .arg("--")
+            .arg(program)
+            .args(args);
+        for (k, v) in envs {
+            match v {
+                Some(v) => wrapped.env(k, v),
+                None => wrapped.env_remove(k),
+            };
+        }
+        if let Some(dir) = cwd {
+            wrapped.current_dir(dir);
+        }
+
+        Ok(wrapped)
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+
+    const BWRAP: &str = "bwrap";
+
+    pub(super) fn wrap_bubblewrap(
+        cmd: Command,
+        profile: &OsSandboxProfile,
+        allow_network: bool,
+    ) -> Result<Command, OsSandboxError> {
+        if which_bwrap().is_none() {
+            return Err(OsSandboxError::SandboxUnavailable(
+                "bubblewrap (bwrap) not found; install via: sudo apt install bubblewrap"
+                    .to_string(),
+            ));
+        }
+
+        let program = cmd.get_program().to_os_string();
+        let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
+        let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+        let cwd = cmd.get_current_dir().map(|p| p.to_path_buf());
+
+        let mut wrapped = Command::new(BWRAP);
+        wrapped
+            .arg("--ro-bind")
+            .arg("/")
+            .arg("/")
+            .arg("--dev")
+            .arg("/dev")
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--unshare-pid")
+            .args(["--die-with-parent", "--new-session"]);
+
+        if !allow_network {
+            wrapped.arg("--unshare-net");
+        }
+
+        for root in &profile.readable_roots {
+            let root_str = root.to_str().ok_or_else(|| {
+                OsSandboxError::SandboxUnavailable(format!(
+                    "workspace root {} is not valid UTF-8",
+                    root.display()
+                ))
+            })?;
+            if profile.writable_roots.contains(root) {
+                wrapped.args(["--bind", root_str, root_str]);
+            } else {
+                wrapped.args(["--ro-bind", root_str, root_str]);
+            }
+        }
+
+        wrapped.arg("--").arg(program).args(args);
+        for (k, v) in envs {
+            match v {
+                Some(v) => wrapped.env(k, v),
+                None => wrapped.env_remove(k),
+            };
+        }
+        if let Some(dir) = cwd {
+            wrapped.current_dir(dir);
+        }
+
+        Ok(wrapped)
+    }
+
+    fn which_bwrap() -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths).find_map(|dir| {
+                let full = dir.join(BWRAP);
+                if full.is_file() { Some(full) } else { None }
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod os_sandbox_tests {
+    use super::*;
+
+    fn roots() -> Vec<PathBuf> {
+        vec![PathBuf::from("/workspace")]
+    }
+
+    #[test]
+    fn read_only_mode_yields_no_writable_roots() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::ReadOnly, roots(), false);
+        assert_eq!(p.readable_roots, roots());
+        assert!(p.writable_roots.is_empty());
+        assert!(!p.network);
+        assert!(p.sandboxed);
+    }
+
+    #[test]
+    fn workspace_write_mode_yields_writable_roots() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::WorkspaceWrite, roots(), false);
+        assert_eq!(p.writable_roots, roots());
+        assert!(p.sandboxed);
+    }
+
+    #[test]
+    fn ask_mode_matches_workspace_write() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::Ask, roots(), false);
+        assert_eq!(p.writable_roots, roots());
+        assert!(p.sandboxed);
+    }
+
+    #[test]
+    fn full_access_mode_is_not_sandboxed() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::DangerFullAccess, roots(), false);
+        assert!(!p.sandboxed);
+        assert!(p.readable_roots.is_empty());
+        assert!(p.writable_roots.is_empty());
+    }
+
+    #[test]
+    fn network_flag_preserved() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::WorkspaceWrite, roots(), true);
+        assert!(p.network);
+    }
+
+    #[test]
+    fn sandbox_denial_exit_codes_detected() {
+        for code in [2, 126, 127, 128 + 31] {
+            assert!(
+                is_likely_sandbox_denied(Some(code), ""),
+                "exit {code} must be flagged as denial"
+            );
+        }
+        assert!(!is_likely_sandbox_denied(Some(0), ""));
+        assert!(!is_likely_sandbox_denied(Some(1), ""));
+    }
+
+    #[test]
+    fn sandbox_denial_stderr_keywords_detected() {
+        assert!(is_likely_sandbox_denied(None, "Operation not permitted"));
+        assert!(is_likely_sandbox_denied(None, "read-only file system"));
+        assert!(is_likely_sandbox_denied(None, "seccomp violation"));
+        assert!(!is_likely_sandbox_denied(None, "file not found"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sbpl_profile_contains_expected_rules() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::WorkspaceWrite, roots(), false);
+        let sbpl = macos::sandbox_exec_profile(&p);
+
+        assert!(sbpl.contains("(version 1)"));
+        assert!(sbpl.contains("(deny default)"));
+        assert!(sbpl.contains("(allow process-exec)"));
+        assert!(sbpl.contains("(allow sysctl-read)"));
+        assert!(sbpl.contains("(allow mach-lookup)"));
+        assert!(sbpl.contains("(deny network*)"));
+        assert!(sbpl.contains("(allow file-read* (subpath \"/\"))"));
+        assert!(sbpl.contains("(allow file-write* (subpath \"/workspace\"))"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sbpl_network_flag_flips_deny_to_allow() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::WorkspaceWrite, roots(), true);
+        let sbpl = macos::sandbox_exec_profile(&p);
+        assert!(sbpl.contains("(allow network*)"));
+        assert!(!sbpl.contains("(deny network*)"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sbpl_read_only_omits_write_rules() {
+        let p = OsSandboxProfile::from_mode(SandboxMode::ReadOnly, roots(), false);
+        let sbpl = macos::sandbox_exec_profile(&p);
+        assert!(sbpl.contains("(allow file-read* (subpath \"/\"))"));
+        assert!(!sbpl.contains("(allow file-write* (subpath \"/workspace\"))"));
     }
 }

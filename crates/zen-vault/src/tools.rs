@@ -1,3 +1,6 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use serde_json::Value;
 use thiserror::Error;
 
@@ -25,6 +28,49 @@ pub struct ToolSchema {
 pub trait ZenTool: Send + Sync {
     fn schema(&self) -> ToolSchema;
     fn invoke(&self, args: Value) -> impl std::future::Future<Output = ZenToolResult> + Send;
+}
+
+/// A workspace-resolved SQLite client shared by KB-backed agent tools.
+///
+/// The path is fixed at construction (resolved from `ZenPaths` by the
+/// wiring layer); the client itself is opened lazily on first use because
+/// `SqliteClient::open` is async while tool construction is sync, and
+/// opening runs the migration check — exactly once per shared holder
+/// instead of once per invocation.
+///
+/// Clones share the same underlying client.
+#[derive(Clone)]
+pub struct SharedSqliteClient {
+    db_path: PathBuf,
+    client: Arc<tokio::sync::OnceCell<Arc<zen_repo::SqliteClient>>>,
+}
+
+impl SharedSqliteClient {
+    pub fn new(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            client: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub async fn get(&self) -> Result<Arc<zen_repo::SqliteClient>, String> {
+        self.client
+            .get_or_try_init(|| async {
+                zen_repo::SqliteClient::open(&self.db_path)
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| {
+                        format!("failed to open state db at {}: {e}", self.db_path.display())
+                    })
+            })
+            .await
+            .map_err(|e: String| e)
+            .map(Arc::clone)
+    }
 }
 
 fn json_schema_object(props: serde_json::Map<String, Value>, required: Vec<&str>) -> Value {

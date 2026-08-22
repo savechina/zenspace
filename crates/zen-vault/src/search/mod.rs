@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 mod service;
 mod tier2;
@@ -11,9 +12,9 @@ pub mod tier_selector;
 
 pub use service::SearchService;
 pub use tier_selector::TierSelector;
-pub use tier2::Tier2Search;
+pub use tier2::{Tier2Search, Tier2SearchTool};
 pub use tier3::Tier3Search;
-pub use tier4::{GraphResult, Tier4Search};
+pub use tier4::{GraphResult, Tier4Search, Tier4SearchTool};
 pub use tier5::Tier5Search;
 
 /// Result of a search operation (shared across tiers).
@@ -24,6 +25,10 @@ pub struct SearchResult {
     pub content: String,
 }
 
+/// Timeout for ripgrep execution — prevents a hung search (e.g. over a
+/// network mount) from blocking the caller indefinitely.
+const RG_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Tier 1 search: exact keyword search via ripgrep.
 ///
 /// Target latency: <50ms (FR-007).
@@ -32,23 +37,40 @@ pub struct Tier1Search;
 impl Tier1Search {
     /// Search for an exact keyword match using ripgrep.
     ///
-    /// Returns matching lines across all files in `base_dir`.
-    pub fn search(query: &str, base_dir: &Path) -> Result<Vec<SearchResult>> {
+    /// Returns matching lines across all files in `base_dir`, capped at
+    /// `limit` results (`--max-count`) and bounded by [`RG_TIMEOUT`].
+    pub fn search(query: &str, base_dir: &Path, limit: usize) -> Result<Vec<SearchResult>> {
         // Verify ripgrep is installed
         which::which("rg").context("ripgrep not installed. Install with: brew install ripgrep")?;
 
-        let output = Command::new("rg")
-            .arg("--line-number")
+        let mut cmd = Command::new("rg");
+        cmd.arg("--line-number")
             .arg("--no-heading")
             .arg("--color=never")
             .arg("--fixed-strings")
+            .arg("--max-count")
+            .arg(limit.to_string())
             .arg(query)
             .arg(
                 base_dir
                     .to_str()
                     .context("base_dir contains invalid UTF-8")?,
-            )
-            .output()
+            );
+
+        let child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to spawn ripgrep")?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+
+        let output = rx
+            .recv_timeout(RG_TIMEOUT)
+            .context("ripgrep timed out")?
             .context("failed to execute ripgrep")?;
 
         if !output.status.success() && output.stdout.is_empty() {
@@ -101,7 +123,7 @@ mod tests {
         let file_path = tmp.path().join("test.txt");
         fs::write(&file_path, "hello world\nfoo bar\nhello again\n").unwrap();
 
-        let results = Tier1Search::search("hello", tmp.path()).unwrap();
+        let results = Tier1Search::search("hello", tmp.path(), 50).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].content.contains("hello world"));
         assert_eq!(results[0].line, 1);
@@ -120,7 +142,7 @@ mod tests {
         let file_path = tmp.path().join("test.txt");
         fs::write(&file_path, "nothing here\n").unwrap();
 
-        let results = Tier1Search::search("nonexistent", tmp.path()).unwrap();
+        let results = Tier1Search::search("nonexistent", tmp.path(), 50).unwrap();
         assert!(results.is_empty());
     }
 

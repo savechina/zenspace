@@ -304,6 +304,14 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                 ZenError::Service(format!("Failed to remove plugin directory: {}", e))
             })?;
 
+            // T097 (FR-047b): also drop the id from the disabled list in
+            // state.json so a reinstall doesn't come back disabled.
+            let mut state = PluginState::load(registry.plugin_dir());
+            state.enable(id);
+            state
+                .save(registry.plugin_dir())
+                .map_err(|e| ZenError::Service(format!("Failed to persist plugin state: {}", e)))?;
+
             println!(
                 "{} Plugin '{}' removed",
                 "✓".green().bold(),

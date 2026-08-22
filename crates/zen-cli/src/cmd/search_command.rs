@@ -19,7 +19,7 @@ pub enum SearchCommands {
         /// Tier filter (1-5), auto-selected if omitted
         #[arg(short, long)]
         tier: Option<u8>,
-        /// Max results (stub: not yet applied)
+        /// Max results per tier (default 20)
         #[arg(short, long)]
         limit: Option<usize>,
         /// Domain filter
@@ -82,7 +82,7 @@ pub async fn execute_command(cmd: &SearchCommands) -> Result<(), ZenError> {
                 .map_err(|e| ZenError::Message(format!("Database error: {}", e)))?;
 
             let results = service
-                .search(query, &base_dir, &client, *tier, domain.as_deref())
+                .search(query, &base_dir, &client, *tier, domain.as_deref(), *limit)
                 .await
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 

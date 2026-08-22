@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// Exponential backoff schedule (FR-013): one delay per attempt — 1s, 2s, 4s.
-const BACKOFF_SECS: [u64; MAX_RECONNECT_ATTEMPTS as usize] = [1, 2, 4];
+/// Single home for the schedule is `zen_core::retry::BACKOFF_SECS`.
+const BACKOFF_SECS: &[u64] = zen_core::retry::BACKOFF_SECS;
 
 type SpawnFuture = Pin<Box<dyn Future<Output = Result<Arc<dyn McpTransport>, String>> + Send>>;
 

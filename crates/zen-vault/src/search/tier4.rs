@@ -2,7 +2,10 @@ use anyhow::Result;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::tools::{ZenTool, ZenToolError, ZenToolResult, args_schema_entity, result_schema_array};
+use crate::tools::{
+    SharedSqliteClient, ZenTool, ZenToolError, ZenToolResult, args_schema_entity,
+    result_schema_array,
+};
 use zen_repo::{
     ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionsRepo, PageRankResult,
     ShortestPathResult, SqliteClient,
@@ -146,7 +149,27 @@ impl Tier4Search {
     }
 }
 
-impl ZenTool for Tier4Search {
+/// Agent-facing `tier4_search` tool bound to a workspace-resolved DB.
+///
+/// The DB path is injected at construction (via [`SharedSqliteClient`]);
+/// invocations never open a client themselves — the pre-D7 impl opened
+/// `./state.db` relative to the process CWD, which silently queried the
+/// wrong (or a nonexistent) database.
+pub struct Tier4SearchTool {
+    db: SharedSqliteClient,
+    inner: Tier4Search,
+}
+
+impl Tier4SearchTool {
+    pub fn new(db: SharedSqliteClient) -> Self {
+        Self {
+            db,
+            inner: Tier4Search,
+        }
+    }
+}
+
+impl ZenTool for Tier4SearchTool {
     fn schema(&self) -> crate::tools::ToolSchema {
         crate::tools::ToolSchema {
             name: "tier4_search".to_string(),
@@ -164,16 +187,11 @@ impl ZenTool for Tier4Search {
                 ZenToolError::InvalidArgs("missing required field: notion_name".to_string())
             })?;
         let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(3) as u32;
-        let db_path = args
-            .get("db_path")
-            .and_then(Value::as_str)
-            .unwrap_or("state.db");
 
-        let client = zen_repo::SqliteClient::open(std::path::Path::new(db_path))
-            .await
-            .map_err(|e| ZenToolError::ExecutionFailed(format!("failed to open state db: {e}")))?;
+        let client = self.db.get().await.map_err(ZenToolError::ExecutionFailed)?;
 
         let results = self
+            .inner
             .search(&client, notion_name, max_depth)
             .await
             .map_err(|e| ZenToolError::ExecutionFailed(e.to_string()))?;
@@ -283,9 +301,48 @@ mod tests {
 
     #[tokio::test]
     async fn test_tier4_tool_schema() {
-        let tier4 = Tier4Search;
-        let schema = tier4.schema();
+        let tool = Tier4SearchTool::new(SharedSqliteClient::new(std::path::PathBuf::from(
+            "unused.db",
+        )));
+        let schema = tool.schema();
         assert_eq!(schema.name, "tier4_search");
         assert!(schema.description.contains("BFS"));
+        assert!(
+            schema
+                .args_schema
+                .get("properties")
+                .and_then(|p| p.get("db_path"))
+                .is_none(),
+            "db_path must not be an invocable arg — it was the CWD bug vector"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier4_tool_uses_injected_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let client = SqliteClient::open(&db_path).await.unwrap();
+        let tier4 = Tier4Search;
+        tier4
+            .insert_entity(&client, "e1", "Alice", "person")
+            .await
+            .unwrap();
+        tier4
+            .insert_entity(&client, "e2", "Bob", "person")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        tier4
+            .insert_relationship(&client, "r1", "e1", "e2", "knows", 1.0, None, &now)
+            .await
+            .unwrap();
+
+        let tool = Tier4SearchTool::new(SharedSqliteClient::new(db_path));
+        let result = tool
+            .invoke(serde_json::json!({ "notion_name": "Alice", "max_depth": 2 }))
+            .await
+            .unwrap();
+        let notions = result["notions"].as_array().unwrap();
+        assert!(!notions.is_empty(), "got: {notions:?}");
     }
 }

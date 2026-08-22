@@ -17,6 +17,7 @@ pub mod plugin_command;
 pub mod provider_command;
 pub mod research_command;
 pub mod routine_command;
+pub mod sandbox_command;
 pub mod search_command;
 pub mod serve_command;
 pub mod session_command;

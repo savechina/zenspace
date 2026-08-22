@@ -3892,6 +3892,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf36173d4167ed999940f804952e6b08197cae5ad5d572eb4db150ce8ad5d58f"
 
 [[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6806,6 +6817,15 @@ dependencies = [
  "precomputed-hash",
  "selectors 0.38.0",
  "tendril 0.5.1",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -10290,6 +10310,7 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vt100",
+ "which",
  "zen-agents",
  "zen-auth",
  "zen-core",
@@ -10391,6 +10412,7 @@ dependencies = [
  "glob",
  "home",
  "htmd",
+ "landlock",
  "libc",
  "notify",
  "notify-rust",
@@ -10401,6 +10423,7 @@ dependencies = [
  "rig-mcp",
  "schemars",
  "scraper 0.27.0",
+ "seccompiler",
  "serde",
  "serde_json",
  "sha2 0.11.0",

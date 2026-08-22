@@ -9,6 +9,7 @@ pub mod network_policy;
 pub mod notion_graph;
 pub mod paths;
 pub mod process_hardening;
+pub mod retry;
 pub mod review;
 pub mod sandbox;
 pub mod sanitize;

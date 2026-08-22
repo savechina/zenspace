@@ -1,10 +1,10 @@
 <!--
 Sync Impact Report:
-- Version: 1.6.0 → 1.7.0-pending (MINOR - Agent Safety principle proposed)
+- Version: 1.7.0-pending → 1.8.0 (MINOR - Code Documentation & Scope Logic principle added)
 - Modified principles: None
-- Added principles: XIV. Agent Safety (PROPOSED 2026-08-11, pending ratification PR per Governance §"Amendments require")
+- Added principles: XV. Code Documentation & Scope Logic (2026-08-22)
 - Removed sections: None
-- Templates requiring updates: plan.md Constitution Check tables across feature specs (add XIV row)
+- Templates requiring updates: plan.md Constitution Check tables across feature specs (add XV row)
 - Deferred items: Principle XIV ratification requires a dedicated PR with review and explicit approval; spec 003-agentic-plugin FR-035..045 anticipate the principle and implement its intent ahead of ratification. Plan gate is conditional until the amendment lands.
 -->
 
@@ -288,4 +288,63 @@ All PRs MUST verify compliance with these principles. The AGENTS.md file serves 
 **Pending amendments**:
 - **v1.7.0 — Principle XIV: Agent Safety** (proposed 2026-08-11). Pending: dedicated PR with documented review. The principle text is in this file under §XIV but is informational until the PR merges. Spec 003-agentic-plugin FR-004, FR-018..020, FR-023..045 implement the principle's intent ahead of ratification. Once ratified, all agent-bearing feature specs MUST pass a Principle XIV compliance check in their plan.md Constitution Check table.
 
-**Version**: 1.7.0-pending | **Ratified**: 2026-02-24 | **Last Amended**: 2026-07-25 (v1.6.0 — Principle XIII Data Migration Compatibility) | **Pending Amendment**: 2026-08-11 (v1.7.0 — Principle XIV Agent Safety)
+### XV. Code Documentation & Scope Logic
+
+**All code MUST be documented with standardized, actionable descriptions that explain functionality, not just syntax. Code without documentation is incomplete code.**
+
+1. **Standardized Code Block Format** — Every code block in documentation (README, AGENTS.md, specs) MUST follow this structure:
+   ```markdown
+   ```<language>
+   # <PURPOSE>: One-line description of what this code does
+   # <USAGE>: When to use this code
+   # <EXPECTED>: What the user should see after running
+   # <ERRORS>: Common failure modes and fixes
+
+   <actual code>
+   ```
+   ```
+
+2. **Scope Logic Documentation** — All scope-defining code (feature flags, mode switches, conditional logic) MUST include:
+   - **Functionality**: What the code enables/disables
+   - **User impact**: How the scope change affects behavior
+   - **Default behavior**: What happens when not explicitly set
+   - **Interaction**: How this scope interacts with other modes/flags
+
+3. **Public API Documentation** — Every public function, struct, enum, and trait MUST have:
+   - **Description**: What it does (not what it is)
+   - **Parameters**: Each parameter's purpose and constraints
+   - **Returns**: What the return value represents
+   - **Errors**: When and why errors occur
+   - **Examples**: At least one usage example
+
+4. **CLI Command Documentation** — Every CLI command and subcommand MUST have:
+   - **Description**: One-line purpose
+   - **Usage**: Common invocation patterns
+   - **Examples**: Both command and expected output
+   - **Scope logic**: All flags with functionality, user impact, and defaults
+
+5. **AGENTS.md Synchronization** — The AGENTS.md file MUST be updated in the same PR that adds or modifies:
+   - New CLI commands or subcommands
+   - New feature flags or scope logic
+   - New code blocks in documentation
+   - Changes to existing functionality affecting user behavior
+
+**Enforcement requirements**:
+- All new CLI commands MUST have corresponding AGENTS.md documentation
+- Feature flags MUST be documented with functionality description and user impact
+- Code blocks in specs MUST pass a documentation review before merge
+- AGENTS.md changes MUST be reviewed for accuracy and completeness
+- Public APIs MUST have doc comments that explain purpose, not just syntax
+
+**Prohibited patterns**:
+- Code blocks without language identifiers
+- Code blocks without explanations of what they do
+- Feature flags without scope logic descriptions
+- CLI commands without AGENTS.md documentation
+- Scope logic without user impact descriptions
+- Public APIs without doc comments
+- Documentation that describes syntax instead of functionality
+
+Rationale: Undocumented code is technical debt. Standardized documentation reduces support burden, improves onboarding, prevents misuse, and makes the codebase self-documenting. AGENTS.md serves as the runtime development guide and MUST reflect the current state of the codebase.
+
+**Version**: 1.8.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-08-22 (v1.8.0 — Principle XV Code Documentation & Scope Logic) | **Pending Amendment**: 2026-08-11 (v1.7.0 — Principle XIV Agent Safety)

@@ -4,7 +4,28 @@ use tracing::debug;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+use clap::ValueEnum;
 use zen_core::errors::ZenError;
+use zen_core::sandbox::SandboxMode;
+
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxModeArg {
+    ReadOnly,
+    WorkspaceWrite,
+    Ask,
+    DangerFullAccess,
+}
+
+impl From<SandboxModeArg> for SandboxMode {
+    fn from(arg: SandboxModeArg) -> Self {
+        match arg {
+            SandboxModeArg::ReadOnly => SandboxMode::ReadOnly,
+            SandboxModeArg::WorkspaceWrite => SandboxMode::WorkspaceWrite,
+            SandboxModeArg::Ask => SandboxMode::Ask,
+            SandboxModeArg::DangerFullAccess => SandboxMode::DangerFullAccess,
+        }
+    }
+}
 
 use crate::cmd::agent_command::{self, AgentCommands};
 use crate::cmd::audit_command::{self, AuditCommands};
@@ -25,6 +46,7 @@ use crate::cmd::plugin_command::{self, PluginCommands};
 use crate::cmd::provider_command::{self, ProviderCommands};
 use crate::cmd::research_command::{self, ResearchCommands};
 use crate::cmd::routine_command::{self, RoutineCommands};
+use crate::cmd::sandbox_command::{self, SandboxArgs};
 use crate::cmd::search_command::{self, SearchCommands};
 use crate::cmd::serve_command::{self, ServeCommands};
 use crate::cmd::session_command::{self, SessionCommands};
@@ -43,6 +65,15 @@ struct Cli {
     verbose: clap_verbosity_flag::Verbosity<clap_verbosity_flag::InfoLevel>,
     #[command(subcommand)]
     command: Option<Commands>,
+
+    #[arg(long, hide = true)]
+    internal_sandbox_launcher: bool,
+
+    #[arg(long, value_enum, default_value_t = SandboxModeArg::WorkspaceWrite)]
+    sandbox: SandboxModeArg,
+
+    #[arg(long)]
+    ask_for_approval: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -179,6 +210,10 @@ enum Commands {
         #[command(subcommand)]
         operation: DispatchCommands,
     },
+    Sandbox {
+        #[command(flatten)]
+        args: SandboxArgs,
+    },
 }
 
 pub async fn shell() -> Result<(), ZenError> {
@@ -187,6 +222,15 @@ pub async fn shell() -> Result<(), ZenError> {
         .with_default_directive(cli.verbose.tracing_level_filter().into())
         .from_env()
         .unwrap();
+
+    if cli.internal_sandbox_launcher {
+        return zen_plugin::sandbox_launcher::run_sandbox_launcher().await;
+    }
+
+    if let Some(ref policy) = cli.ask_for_approval {
+        // SAFETY: set_var is called early in main before any threads are spawned.
+        unsafe { std::env::set_var("ZEN_ASK_FOR_APPROVAL", policy) };
+    }
 
     if cli.command.is_none() {
         init_tracing(filter, true)?;
@@ -312,5 +356,6 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Goal { ref operation } => goal_command::execute_command(operation),
         Commands::Skill { ref operation } => skill_command::execute_command(operation).await,
         Commands::Dispatch { ref operation } => dispatch_command::execute_command(operation).await,
+        Commands::Sandbox { ref args } => sandbox_command::execute_command(args),
     }
 }

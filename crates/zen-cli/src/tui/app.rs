@@ -99,7 +99,7 @@ pub(crate) fn build_orchestrator(
     let router = DefaultRouter::from_agentic(config);
     let orch = AgentOrchestrator::new(router);
 
-    match ZenPaths::detect() {
+    let orch = match ZenPaths::detect() {
         Ok(paths) => {
             let memvid_dir = paths.memory();
             if let Err(e) = std::fs::create_dir_all(&memvid_dir) {
@@ -122,7 +122,18 @@ pub(crate) fn build_orchestrator(
             tracing::warn!(error = %e, "Failed to detect Zen paths, continuing without memory");
             orch
         }
+    };
+
+    if let Ok(policy) = std::env::var("ZEN_ASK_FOR_APPROVAL")
+        && !policy.is_empty()
+    {
+        use zen_core::sandbox::SandboxMode;
+        let cb = super::approval_callback::create_approval_callback();
+        return orch
+            .with_sandbox_mode(SandboxMode::Ask)
+            .with_approval_callback(cb);
     }
+    orch
 }
 
 /// Effective knowledge-search tier for interactive chat (T054).
@@ -181,7 +192,7 @@ pub(crate) fn collect_knowledge_context(
     let search_dirs = [paths.inbox(), paths.wiki()];
     let outcome = super::prewarm::with_db_client(move |client| {
         for dir in search_dirs {
-            let search = service.search(query, &dir, client, Some(tier), None);
+            let search = service.search(query, &dir, client, Some(tier), None, None);
             let outcome = tokio::runtime::Handle::current().block_on(tokio::time::timeout(
                 std::time::Duration::from_millis(KNOWLEDGE_SEARCH_TIMEOUT_MS),
                 search,
@@ -1984,6 +1995,7 @@ Use /thinking to show/hide thinking process."#;
                     &base_dir,
                     client,
                     Some(tier),
+                    None,
                     None,
                 ),
             )

@@ -449,6 +449,10 @@ disclaimer_acknowledged = false
 # allow_network = false
 # allow_system = false
 
+# OS-level network access for sandboxed child processes (shell.exec, FR-028 D6).
+# Default false = the OS sandbox denies all network. Set true to opt out.
+# network_access = false
+
 [session]
 # Drain window for SIGINT/SIGTERM graceful shutdown (FR-041).
 drain_timeout_secs = 5

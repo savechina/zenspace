@@ -8,11 +8,14 @@ use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use zen_core::sandbox::SandboxValidator;
+use zen_core::sandbox::{OsSandboxProfile, is_likely_sandbox_denied, sandbox_spawn};
 
 #[derive(Clone)]
 pub struct ShellExecTool {
     workspace_root: PathBuf,
+    sandbox_validator: SandboxValidator,
+    sandbox_profile: OsSandboxProfile,
 }
 
 // CHK024 code-audit note (2026-08-16): v0.0.6 does NOT wrap execution with
@@ -51,7 +54,8 @@ static RESULT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "stdout": { "type": "string" },
             "stderr": { "type": "string" },
             "timed_out": { "type": "boolean" },
-            "duration_ms": { "type": "integer" }
+            "duration_ms": { "type": "integer" },
+            "sandbox_denied": { "type": "boolean" }
         }
     })
 });
@@ -66,8 +70,16 @@ const MAX_OUTPUT_CHARS: usize = 10_000;
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
 impl ShellExecTool {
-    pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+    pub fn new(
+        workspace_root: PathBuf,
+        sandbox_validator: SandboxValidator,
+        sandbox_profile: OsSandboxProfile,
+    ) -> Self {
+        Self {
+            workspace_root,
+            sandbox_validator,
+            sandbox_profile,
+        }
     }
 }
 
@@ -149,7 +161,12 @@ impl Tool for ShellExecTool {
 
         let resolved = resolve_binary(binary)?;
 
-        let mut cmd = Command::new(&resolved);
+        // FR-028: cwd must be a safe path (not env/protected/symlink-escape).
+        self.sandbox_validator
+            .validate_path_for_read(&cwd)
+            .map_err(|e| KernelError::InvalidArgument(format!("invalid cwd: {e}")))?;
+
+        let mut cmd = std::process::Command::new(&resolved);
         cmd.args(&argv)
             .current_dir(&cwd)
             .stdout(std::process::Stdio::piped())
@@ -176,6 +193,18 @@ impl Tool for ShellExecTool {
             &zen_core::env_scrub::EnvScrubConfig::default(),
         );
         cmd.env_clear().envs(&scrubbed);
+
+        // FR-028: wrap the spawn in the OS sandbox (sandbox-exec / bwrap),
+        // unless the profile is full access (DangerFullAccess).
+        let cmd = if self.sandbox_profile.sandboxed {
+            sandbox_spawn(cmd, &self.sandbox_profile, self.sandbox_profile.network)
+                .map_err(|e| KernelError::ToolFailed(e.to_string()))?
+        } else {
+            cmd
+        };
+
+        // Convert to tokio's async Command for spawn + timeout handling.
+        let mut cmd: tokio::process::Command = cmd.into();
 
         // New process group so the whole tree can be killed on timeout.
         #[cfg(unix)]
@@ -226,18 +255,30 @@ impl Tool for ShellExecTool {
                 let stdout = join_output(stdout_task).await;
                 let stderr = join_output(stderr_task).await;
                 let duration_ms = start.elapsed().as_millis() as u64;
-                tracing::debug!(
-                    tool = NAME,
-                    exit_code = status.code(),
-                    duration_ms,
-                    "exited"
-                );
+                let exit_code = status.code().unwrap_or(-1);
+                let stdout_str = truncate_output(&stdout);
+                let stderr_str = truncate_output(&stderr);
+                let sandbox_denied = is_likely_sandbox_denied(status.code(), &stderr_str);
+                let hint = if sandbox_denied {
+                    tracing::warn!(
+                        tool = NAME,
+                        binary,
+                        exit_code,
+                        "shell.exec denied by OS sandbox"
+                    );
+                    Some("sandbox denied this command. escalate: retry with --sandbox danger-full-access, or use ask-for-approval".to_string())
+                } else {
+                    None
+                };
+                tracing::debug!(tool = NAME, exit_code, duration_ms, "exited");
                 Ok(json!({
-                    "exit_code": status.code().unwrap_or(-1),
-                    "stdout": truncate_output(&stdout),
-                    "stderr": truncate_output(&stderr),
+                    "exit_code": exit_code,
+                    "stdout": stdout_str,
+                    "stderr": stderr_str,
                     "timed_out": false,
-                    "duration_ms": duration_ms
+                    "duration_ms": duration_ms,
+                    "sandbox_denied": sandbox_denied,
+                    "hint": hint
                 }))
             }
             Ok(Err(e)) => Err(KernelError::ToolFailed(format!(
@@ -261,7 +302,8 @@ impl Tool for ShellExecTool {
                     "stdout": truncate_output(&stdout),
                     "stderr": truncate_output(&stderr),
                     "timed_out": true,
-                    "duration_ms": timeout_ms
+                    "duration_ms": timeout_ms,
+                    "sandbox_denied": false
                 }))
             }
         }
@@ -273,7 +315,13 @@ mod tests {
     use super::*;
 
     fn tool() -> ShellExecTool {
-        ShellExecTool::new(PathBuf::from("/"))
+        use zen_core::sandbox::SandboxMode;
+        // DangerFullAccess bypasses the OS sandbox so the spawn/timeout/stdin
+        // tests exercise the bare process logic deterministically.
+        let validator =
+            zen_core::sandbox::SandboxValidator::new(SandboxMode::DangerFullAccess, vec![]);
+        let profile = OsSandboxProfile::from_mode(SandboxMode::DangerFullAccess, vec![], false);
+        ShellExecTool::new(PathBuf::from("/"), validator, profile)
     }
 
     #[tokio::test]
@@ -364,5 +412,29 @@ mod tests {
         unsafe {
             std::env::remove_var("ZEN_TEST_SCRUB_API_KEY");
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cwd_on_protected_path_rejected() {
+        use zen_core::sandbox::SandboxMode;
+        let dir = tempfile::tempdir().unwrap();
+        let protected = dir.path().join(".git");
+        std::fs::create_dir_all(&protected).unwrap();
+        let validator = zen_core::sandbox::SandboxValidator::new(
+            SandboxMode::WorkspaceWrite,
+            vec![dir.path().to_path_buf()],
+        );
+        let profile = OsSandboxProfile::from_mode(SandboxMode::WorkspaceWrite, vec![], false);
+        let t = ShellExecTool::new(dir.path().to_path_buf(), validator, profile);
+
+        let res = t
+            .invoke(json!({
+                "binary": "/bin/echo",
+                "args": ["hi"],
+                "cwd": protected.to_str().unwrap()
+            }))
+            .await;
+        assert!(res.is_err(), "cwd on a protected path must be rejected");
     }
 }

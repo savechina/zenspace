@@ -19,6 +19,10 @@ pub struct SearchService {
     tier5: Tier5Search,
 }
 
+/// Default result cap applied to each tier when the caller does not specify
+/// a limit (`zen search --limit`).
+const DEFAULT_SEARCH_LIMIT: usize = 20;
+
 impl SearchService {
     pub fn new(router: DefaultRouter) -> Self {
         Self {
@@ -33,6 +37,9 @@ impl SearchService {
     ///
     /// If `tier` is `Some`, uses that tier directly.
     /// If `tier` is `None`, uses [`TierSelector::select_tier`] to auto-select.
+    ///
+    /// `limit` caps the number of results returned by each tier, defaulting
+    /// to [`DEFAULT_SEARCH_LIMIT`].
     pub async fn search(
         &self,
         query: &str,
@@ -40,20 +47,23 @@ impl SearchService {
         client: &SqliteClient,
         tier: Option<u8>,
         domain_filter: Option<&str>,
+        limit: Option<usize>,
     ) -> Result<Vec<SearchResult>> {
         let selected = tier.unwrap_or_else(|| TierSelector::select_tier(query));
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
 
         info!(
             query_len = query.len(),
             tier = selected,
+            limit = limit,
             "SearchService: routing query"
         );
 
         let results = match selected {
-            1 => Tier1Search::search(query, base_dir),
+            1 => Tier1Search::search(query, base_dir, limit),
             2 => self
                 .tier2
-                .search_in_dir(client, query, base_dir, 20)
+                .search_in_dir(client, query, base_dir, limit)
                 .await
                 .map(|r| {
                     r.into_iter()
@@ -72,7 +82,7 @@ impl SearchService {
                             query.len()
                         )
                     })?;
-                self.tier3.search(client, &query_embedding, 10).await
+                self.tier3.search(client, &query_embedding, limit).await
             }
             4 => self
                 .tier4
@@ -82,7 +92,7 @@ impl SearchService {
             5 => {
                 let context = self
                     .tier2
-                    .search_in_dir(client, query, base_dir, 20)
+                    .search_in_dir(client, query, base_dir, limit)
                     .await
                     .map(|r| {
                         r.into_iter()
@@ -93,12 +103,20 @@ impl SearchService {
                             })
                             .collect::<Vec<_>>()
                     })?;
-                let synthesized = self.tier5.synthesize(query, &context)?;
-                Ok(vec![SearchResult {
-                    file: PathBuf::from("synthesis"),
-                    line: 0,
-                    content: synthesized,
-                }])
+                Ok(match self.tier5.synthesize(query, &context) {
+                    Ok(synthesized) => vec![SearchResult {
+                        file: PathBuf::from("synthesis"),
+                        line: 0,
+                        content: synthesized,
+                    }],
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Tier5 synthesis failed, returning raw context results"
+                        );
+                        context
+                    }
+                })
             }
             _ => anyhow::bail!("unknown tier: {selected}"),
         }?;
@@ -133,19 +151,27 @@ pub(crate) fn filter_by_domain(
     results: Vec<SearchResult>,
     domain: &str,
 ) -> Result<Vec<SearchResult>> {
+    use std::collections::HashMap;
+
     let domain_lower = domain.to_lowercase();
+    let mut domain_cache: HashMap<PathBuf, bool> = HashMap::new();
     let mut filtered = Vec::new();
     for r in results {
-        if !r.file.exists() {
+        // Graph/entity results use a synthetic `@notion` path; they carry no
+        // file frontmatter to filter on, so keep them.
+        if r.file.to_string_lossy().starts_with('@') {
+            filtered.push(r);
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(&r.file)
-            && let Ok(note) = crate::note::parse_frontmatter(&content)
-        {
-            let has_domain = note.domain.iter().any(|d| d.to_string() == domain_lower);
-            if has_domain {
-                filtered.push(r);
-            }
+        let has_domain = *domain_cache.entry(r.file.clone()).or_insert_with(|| {
+            std::fs::read_to_string(&r.file)
+                .ok()
+                .and_then(|content| crate::note::parse_frontmatter(&content).ok())
+                .map(|note| note.domain.iter().any(|d| d.to_string() == domain_lower))
+                .unwrap_or(false)
+        });
+        if has_domain {
+            filtered.push(r);
         }
     }
     Ok(filtered)

@@ -29,6 +29,7 @@ The system follows a binary/library split: `zen` (thin binary wrapper) delegates
 | **IX. UX Consistency** | Consistent output, conventional exit codes | JSON/human-readable dual output |
 | **X. Performance** | <500ms cold start, <50MB footprint | Async I/O for blocking ops |
 | **XI. Design-First & Reuse** | **MANDATORY**: Design before coding, reuse frameworks | **Prohibited**: Custom impl when library exists |
+| **XV. Code Documentation** | Code blocks + scope logic MUST be documented | AGENTS.md sync required |
 
 ### XI. Design-First & Reuse Priority (Critical for Agentic)
 
@@ -285,6 +286,92 @@ zenspace/
 - **Tests**: Integration only (no inline `#[cfg(test)]` in most crates). Custom ZenTest/ZenOutput harness.
 - **Lint**: `bin/lint` → `-D warnings` + `--allow dead_code`
 - **Command files**: Pattern `src/cmd/{name}_command.rs` with `pub fn execute_command(...)` dispatcher (note: correctly spelled now)
+
+## CODE DOCUMENTATION & SCOPE LOGIC (Principle XV)
+
+**Code without documentation is incomplete code.**
+
+### Standardized Code Block Format
+
+All code blocks in documentation MUST follow this structure:
+
+```markdown
+```<language>
+# <PURPOSE>: One-line description of what this code does
+# <USAGE>: When to use this code
+# <EXPECTED>: What the user should see after running
+# <ERRORS>: Common failure modes and fixes
+
+<actual code>
+```
+```
+
+Example:
+```bash
+# PURPOSE: Run zen sandbox test to verify sandboxing is working
+# USAGE: After installing bubblewrap/sandbox-exec, verify sandbox works
+# EXPECTED: ✅ Sandbox test passed — echo executed successfully
+# ERRORS: Sandbox binary not found → install bubblewrap or use --skip-check
+
+zen sandbox test
+
+# Expected output:
+# ✅ Sandbox test passed — echo executed successfully
+#   Output: zen-sandbox-test-12345
+```
+
+### Scope Logic Documentation
+
+All scope-defining code (feature flags, mode switches) MUST include:
+
+1. **Functionality**: What the code enables/disables
+2. **User impact**: How the scope change affects behavior
+3. **Default behavior**: What happens when not explicitly set
+4. **Interaction**: How this scope interacts with other modes/flags
+
+Example (from zen sandbox):
+```
+--sandbox <MODE>
+  Functionality: Override sandbox mode for this invocation
+  User impact: Controls what filesystem/network access the command has
+  Default: workspace-write (from ZEN_SANDBOX_MODE env var)
+  Values: read-only, workspace-write, ask, danger-full-access
+  Interaction: --sandbox overrides ZEN_SANDBOX_MODE env var
+```
+
+### Public API Documentation
+
+Every public function, struct, enum, and trait MUST have:
+- **Description**: What it does (not what it is)
+- **Parameters**: Each parameter's purpose and constraints
+- **Returns**: What the return value represents
+- **Errors**: When and why errors occur
+- **Examples**: At least one usage example
+
+### CLI Command Documentation
+
+Every CLI command and subcommand MUST have:
+- **Description**: One-line purpose
+- **Usage**: Common invocation patterns
+- **Examples**: Both command and expected output
+- **Scope logic**: All flags with functionality, user impact, and defaults
+
+### AGENTS.md Synchronization
+
+AGENTS.md MUST be updated in the same PR that adds or modifies:
+- New CLI commands or subcommands
+- New feature flags or scope logic
+- New code blocks in documentation
+- Changes to existing functionality affecting user behavior
+
+### Documentation Checklist
+
+When adding new CLI commands:
+- [ ] Add command to COMMANDS (CLI) table below
+- [ ] Add code block with language identifier
+- [ ] Add scope logic documentation for all flags
+- [ ] Update CONVENTIONS section if patterns change
+- [ ] Verify AGENTS.md matches actual implementation
 
 ## ANTI-PATTERNS (THIS PROJECT)
 

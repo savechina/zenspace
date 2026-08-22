@@ -2,6 +2,8 @@ pub mod hook_isolation;
 pub mod platform;
 pub mod plugin_wasm;
 pub mod registry;
+pub mod retry;
+pub mod sandbox_launcher;
 pub mod tools;
 pub mod wasm_sandbox;
 

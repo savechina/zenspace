@@ -81,10 +81,7 @@ impl Tier3Search {
             })
             .collect();
 
-        debug!(
-            "Tier3Search: found {} results for {DIM}-dim query (top_k={top_k})",
-            docs.len(),
-        );
+        debug!("Tier3Search: found {} results (top_k={top_k})", docs.len(),);
 
         Ok(docs)
     }
@@ -142,8 +139,6 @@ impl std::fmt::Debug for Tier3Search {
         f.debug_struct("Tier3Search").finish()
     }
 }
-
-const DIM: usize = 384;
 
 #[cfg(test)]
 mod tests {

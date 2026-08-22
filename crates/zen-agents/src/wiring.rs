@@ -281,8 +281,28 @@ impl ZenWiring {
         skills.register(Arc::new(zen_vault::ContradictionDetector::new()));
         skills.register(Arc::new(DistillationPipelineSkillAdapter));
 
-        tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier2Search)));
-        tools.register(Arc::new(ZenToolToolAdapter::new(zen_vault::Tier4Search)));
+        // D7 (2026-08-19 review): KB tools share one workspace-resolved
+        // SqliteClient. The old unit-struct ZenTool impls opened
+        // "./state.db" relative to the process CWD — production-broken.
+        // Fail-soft: without a detectable workspace the KB tools are
+        // skipped (warn) rather than registered against a wrong-path DB.
+        match zen_core::paths::ZenPaths::detect() {
+            Ok(paths) => {
+                let kb_db = zen_vault::SharedSqliteClient::new(paths.data().join("state.db"));
+                tools.register(Arc::new(ZenToolToolAdapter::new(
+                    zen_vault::Tier2SearchTool::new(kb_db.clone()),
+                )));
+                tools.register(Arc::new(ZenToolToolAdapter::new(
+                    zen_vault::Tier4SearchTool::new(kb_db),
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "workspace not detected ({}): tier2_search/tier4_search not registered",
+                    e
+                );
+            }
+        }
         tools.register(Arc::new(ZenToolToolAdapter::new(
             zen_vault::ComputeEmbeddings,
         )));
@@ -330,7 +350,7 @@ impl ZenWiring {
             sandbox_validator.clone(),
         )));
         tools.register(Arc::new(zen_plugin::tools::fs_glob::FsGlobTool::new(
-            sandbox_validator,
+            sandbox_validator.clone(),
         )));
 
         tools.register(Arc::new(zen_plugin::tools::web_fetch::WebFetchTool::new()));
@@ -339,6 +359,14 @@ impl ZenWiring {
 
         tools.register(Arc::new(zen_plugin::tools::shell_exec::ShellExecTool::new(
             workspace_roots.first().cloned().unwrap_or_default(),
+            sandbox_validator.clone(),
+            zen_core::sandbox::OsSandboxProfile::from_mode(
+                mode,
+                workspace_roots.clone(),
+                zen_core::config::load_config()
+                    .map(|c| c.sandbox.network_access)
+                    .unwrap_or(false),
+            ),
         )));
 
         let memvid_store = Self::try_open_memvid_store();

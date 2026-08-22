@@ -10,6 +10,7 @@ pub mod notion;
 pub mod search;
 pub mod tindy;
 pub mod tools;
+pub use tools::SharedSqliteClient;
 pub mod wiki;
 
 pub use distill::{
@@ -26,8 +27,8 @@ pub use notion::{
     Notion, NotionData, NotionGraphAdapter, NotionKind, NotionService, RelationKind, Relationship,
 };
 pub use search::{
-    GraphResult, SearchResult, SearchService, Tier1Search, Tier2Search, Tier3Search, Tier4Search,
-    Tier5Search, TierSelector,
+    GraphResult, SearchResult, SearchService, Tier1Search, Tier2Search, Tier2SearchTool,
+    Tier3Search, Tier4Search, Tier4SearchTool, Tier5Search, TierSelector,
 };
 pub use tindy::{
     ChangeDetector, ComputeEmbeddings, EmbeddingResult, GapType, KnowledgeGap, LearningLoop,

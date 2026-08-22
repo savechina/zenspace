@@ -132,7 +132,9 @@ async fn search_existing_content(
     }
 
     let service = SearchService::new(router);
-    let results = service.search(topic, wiki_dir, client, None, None).await;
+    let results = service
+        .search(topic, wiki_dir, client, None, None, None)
+        .await;
 
     match results {
         Ok(results) => {

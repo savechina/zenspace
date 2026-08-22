@@ -2,6 +2,7 @@
 //! [`Plugin`] whose activation registers every exported function as a tool
 //! namespaced `{plugin_id}.{func_name}` via [`PluginApi`](crate::PluginApi).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -15,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::PluginApi;
 use crate::registry::PluginEntry;
-use crate::wasm_sandbox::{ResourceLimits, WasmPermissions, WasmSandbox};
+use crate::wasm_sandbox::{ResourceLimits, WasmFsContext, WasmPermissions, WasmSandbox};
 use crate::{Plugin, PluginError};
 
 /// Map a manifest permission string to the resource string
@@ -102,6 +103,7 @@ impl Plugin for WasmPlugin {
                 Arc::clone(&self.sandbox),
                 Arc::clone(&self.wasm_bytes),
                 self.permissions.clone(),
+                Some(api.workspace_root().to_path_buf()),
             )));
         }
         Ok(())
@@ -150,6 +152,7 @@ pub struct WasmPluginTool {
     wasm_bytes: Arc<Vec<u8>>,
     module: OnceLock<Result<wasmtime::Module, String>>,
     permissions: Vec<String>,
+    workspace_root: Option<PathBuf>,
     #[cfg(test)]
     compile_count: Arc<AtomicUsize>,
 }
@@ -161,6 +164,7 @@ impl WasmPluginTool {
         sandbox: Arc<WasmSandbox>,
         wasm_bytes: Arc<Vec<u8>>,
         permissions: Vec<String>,
+        workspace_root: Option<PathBuf>,
     ) -> Self {
         Self {
             plugin_id,
@@ -169,6 +173,7 @@ impl WasmPluginTool {
             wasm_bytes,
             module: OnceLock::new(),
             permissions,
+            workspace_root,
             #[cfg(test)]
             compile_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -179,6 +184,40 @@ impl WasmPluginTool {
     pub(crate) fn compile_count(&self) -> usize {
         self.compile_count.load(Ordering::SeqCst)
     }
+}
+
+/// Enumerate files written under the plugin's scratch dir (relative paths,
+/// sorted). Copy-out to the real workspace stays host-mediated: the agent
+/// reads `scratch_outputs` and decides what (if anything) to move via
+/// fs.write. TODO: a `zen_copy_out` host function to let plugins request
+/// validated, audit-logged copies directly.
+fn list_scratch_files(scratch: &Path, max_depth: usize) -> Vec<String> {
+    fn walk(dir: &Path, scratch: &Path, depth_left: usize, out: &mut Vec<String>) {
+        if depth_left == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // symlink_metadata: never descend into symlinked dirs a plugin
+            // may have planted in its own scratch.
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                walk(&path, scratch, depth_left - 1, out);
+            } else if let Ok(rel) = path.strip_prefix(scratch) {
+                out.push(rel.display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(scratch, scratch, max_depth, &mut out);
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[async_trait]
@@ -229,6 +268,16 @@ impl Tool for WasmPluginTool {
             }
         }
 
+        // TODO-011: resolve manifest filesystem capabilities into preopen
+        // targets. Fail closed — an unresolvable capability rejects the
+        // invocation before compilation.
+        let fs_ctx = WasmFsContext::resolve(
+            &self.plugin_id,
+            &self.permissions,
+            self.workspace_root.as_deref(),
+        )
+        .map_err(|e| KernelError::ToolFailed(format!("WASM fs capability denied: {}", e)))?;
+
         // FR-051: compile once per tool instance. `get_or_init` runs the
         // closure exactly once even under concurrent first invocations; the
         // Result is cached because the bytes are immutable, so a compile
@@ -253,9 +302,15 @@ impl Tool for WasmPluginTool {
 
         let output = self
             .sandbox
-            .execute_module(module, &self.func_name, &inputs)
+            .execute_module_with_fs(module, &self.func_name, &inputs, &fs_ctx)
             .await
             .map_err(|e| KernelError::ToolFailed(format!("WASM execution failed: {}", e)))?;
+
+        let scratch_outputs = fs_ctx
+            .scratch_dir
+            .as_deref()
+            .map(|scratch| list_scratch_files(scratch, 8))
+            .unwrap_or_default();
 
         Ok(json!({
             "output": {
@@ -263,9 +318,14 @@ impl Tool for WasmPluginTool {
                 "stderr": output.stderr,
                 "exit_code": output.exit_code,
             },
+            "scratch_outputs": scratch_outputs,
             "metrics": {
                 "plugin": self.plugin_id,
                 "func_name": self.func_name,
+                "fs_capabilities": {
+                    "workspace_read": fs_ctx.workspace_root.is_some(),
+                    "scratch_write": fs_ctx.scratch_dir.is_some(),
+                },
                 "execution_time_ms": output.execution_time_ms,
                 "memory_used_bytes": output.memory_used_bytes,
             }
@@ -385,6 +445,7 @@ mod tests {
             Arc::new(WasmSandbox::new()),
             Arc::new(wat::parse_str(r#"(module (func (export "ping")))"#).unwrap()),
             vec![],
+            None,
         );
 
         let schema = tool.schema();
@@ -411,6 +472,7 @@ mod tests {
             sandbox,
             Arc::new(wat::parse_str(r#"(module (func (export "ping")))"#).unwrap()),
             vec!["network".to_string()],
+            None,
         );
 
         let err = tool.invoke(json!({})).await.unwrap_err().to_string();
@@ -426,6 +488,7 @@ mod tests {
             Arc::new(WasmSandbox::new()),
             Arc::new(wat::parse_str(r#"(module (func (export "ping")))"#).unwrap()),
             vec![],
+            None,
         );
 
         let first = tool.invoke(json!({ "inputs": [] })).await.unwrap();
@@ -449,6 +512,7 @@ mod tests {
             Arc::new(WasmSandbox::new()),
             Arc::new(wat::parse_str(r#"(module (func (export "ping")))"#).unwrap()),
             vec![],
+            None,
         ));
 
         let mut handles = Vec::new();
@@ -483,6 +547,7 @@ mod tests {
             Arc::new(WasmSandbox::new()), // deny-all policy
             Arc::new(wat::parse_str(r#"(module (func (export "ping")))"#).unwrap()),
             vec!["network".to_string()],
+            None,
         );
 
         for _ in 0..2 {
@@ -491,5 +556,57 @@ mod tests {
             assert!(err.contains("network"), "got: {err}");
         }
         assert_eq!(tool.compile_count(), 0, "denied invoke must not compile");
+    }
+
+    #[tokio::test]
+    async fn wasm_plugin_tool_fs_write_reports_scratch_outputs() {
+        use crate::wasm_sandbox::tests::write_file_wat;
+
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = WasmSandbox::new().with_policy(WasmPermissions {
+            allow_filesystem_write: true,
+            ..WasmPermissions::default()
+        });
+        let tool = WasmPluginTool::new(
+            "demo".to_string(),
+            "run".to_string(),
+            Arc::new(sandbox),
+            Arc::new(write_file_wat(3, "out.txt")),
+            vec!["filesystem_write".to_string()],
+            Some(root.path().to_path_buf()),
+        );
+
+        let result = tool.invoke(json!({ "inputs": [] })).await.unwrap();
+        let outputs = result["scratch_outputs"].as_array().unwrap();
+        assert!(outputs.iter().any(|v| v == "out.txt"), "got: {outputs:?}");
+        assert_eq!(result["metrics"]["fs_capabilities"]["scratch_write"], true);
+        let scratch = root
+            .path()
+            .join(".zen")
+            .join("data")
+            .join("plugin")
+            .join("demo")
+            .join("out.txt");
+        assert_eq!(std::fs::read_to_string(scratch).unwrap(), "hi\n");
+    }
+
+    #[tokio::test]
+    async fn wasm_plugin_tool_fs_capability_without_root_fails_closed() {
+        let sandbox = WasmSandbox::new().with_policy(WasmPermissions {
+            allow_filesystem_write: true,
+            ..WasmPermissions::default()
+        });
+        let tool = WasmPluginTool::new(
+            "demo".to_string(),
+            "run".to_string(),
+            Arc::new(sandbox),
+            Arc::new(wat::parse_str(r#"(module (func (export "run")))"#).unwrap()),
+            vec!["filesystem_write".to_string()],
+            None,
+        );
+
+        let err = tool.invoke(json!({})).await.unwrap_err().to_string();
+        assert!(err.contains("WASM fs capability denied"), "got: {err}");
+        assert!(err.contains("no workspace root"), "got: {err}");
     }
 }

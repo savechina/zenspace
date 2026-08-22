@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
+use tracing::warn;
 use zen_core::network_policy::NetworkPolicy;
+
+use crate::retry::retry_with_backoff;
 
 const NAME: &str = "web.search";
 const DESCRIPTION: &str =
@@ -39,6 +42,7 @@ static RESULT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 }
             },
             "count": { "type": "integer" },
+            "dropped_results": { "type": "integer" },
             "provider": { "type": "string" },
             "message": { "type": "string" }
         }
@@ -79,6 +83,34 @@ struct SearchResult {
     title: String,
     url: String,
     snippet: String,
+}
+
+/// Parsed provider response plus the number of malformed items dropped.
+#[derive(Debug, Default)]
+struct SearchOutcome {
+    results: Vec<SearchResult>,
+    dropped: usize,
+}
+
+/// Provider failure classified for retry/fallback decisions.
+#[derive(Debug)]
+enum ProviderError {
+    /// Transient (429/5xx/network): safe to retry, then fall back.
+    Retryable(String),
+    /// Permanent (auth/config/parse/policy): retrying won't help.
+    Fatal(String),
+}
+
+impl ProviderError {
+    fn retryable(&self) -> bool {
+        matches!(self, ProviderError::Retryable(_))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            ProviderError::Retryable(m) | ProviderError::Fatal(m) => m,
+        }
+    }
 }
 
 const DEFAULT_MAX_RESULTS: usize = 5;
@@ -143,18 +175,27 @@ fn extract_uddg(href: &str) -> Option<String> {
     Some(percent_decode(encoded))
 }
 
-async fn handle_rate_limit(resp: &mut reqwest::Response) -> Option<String> {
-    if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return None;
+async fn check_provider_status(resp: &reqwest::Response) -> Result<(), ProviderError> {
+    use reqwest::StatusCode;
+    match resp.status() {
+        s if s.is_success() => Ok(()),
+        StatusCode::TOO_MANY_REQUESTS => {
+            let retry_after = parse_retry_after(
+                resp.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            );
+            Err(ProviderError::Retryable(format!(
+                "search provider rate limit reached (429): retry after {retry_after}s"
+            )))
+        }
+        s if s.is_server_error() => Err(ProviderError::Retryable(format!(
+            "search provider server error ({s})"
+        ))),
+        s => Err(ProviderError::Fatal(format!(
+            "search provider returned {s}"
+        ))),
     }
-    let retry_after = parse_retry_after(
-        resp.headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok()),
-    );
-    Some(format!(
-        "search provider rate limit reached (429): retry after {retry_after}s"
-    ))
 }
 
 fn parse_retry_after(value: Option<&str>) -> u64 {
@@ -167,48 +208,54 @@ async fn search_brave(
     query: &str,
     max: usize,
     api_key: &str,
-) -> Result<Vec<SearchResult>, String> {
+) -> Result<SearchOutcome, ProviderError> {
     let url = format!(
         "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
         url_encode(query),
         max
     );
-    policy.validate_url(&url).map_err(|e| e.to_string())?;
-    let mut resp = client
+    policy
+        .validate_url(&url)
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
+    let resp = client
         .get(&url)
         .header("X-Subscription-Token", api_key)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ProviderError::Retryable(e.to_string()))?;
 
-    if let Some(rate_err) = handle_rate_limit(&mut resp).await {
-        return Err(rate_err);
-    }
+    check_provider_status(&resp).await?;
 
-    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let results = body
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
+    let mut outcome = SearchOutcome::default();
+    if let Some(arr) = body
         .get("web")
         .and_then(|w| w.get("results"))
         .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .take(max)
-                .filter_map(|item| {
-                    Some(SearchResult {
-                        title: item.get("title")?.as_str()?.to_string(),
-                        url: item.get("url")?.as_str()?.to_string(),
-                        snippet: item
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        for item in arr.iter().take(max) {
+            match (
+                item.get("title").and_then(|v| v.as_str()),
+                item.get("url").and_then(|v| v.as_str()),
+            ) {
+                (Some(title), Some(url)) => outcome.results.push(SearchResult {
+                    title: title.to_string(),
+                    url: url.to_string(),
+                    snippet: item
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                _ => outcome.dropped += 1,
+            }
+        }
+    }
 
-    Ok(results)
+    Ok(outcome)
 }
 
 async fn search_tavily(
@@ -217,7 +264,7 @@ async fn search_tavily(
     query: &str,
     max: usize,
     api_key: &str,
-) -> Result<Vec<SearchResult>, String> {
+) -> Result<SearchOutcome, ProviderError> {
     let body = json!({
         "query": query,
         "max_results": max,
@@ -225,43 +272,46 @@ async fn search_tavily(
     });
 
     let endpoint = "https://api.tavily.com/search";
-    policy.validate_url(endpoint).map_err(|e| e.to_string())?;
-    let mut resp = client
+    policy
+        .validate_url(endpoint)
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
+    let resp = client
         .post(endpoint)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&body)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ProviderError::Retryable(e.to_string()))?;
 
-    if let Some(rate_err) = handle_rate_limit(&mut resp).await {
-        return Err(rate_err);
+    check_provider_status(&resp).await?;
+
+    let resp_json: Value = resp
+        .json()
+        .await
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
+    let mut outcome = SearchOutcome::default();
+    if let Some(arr) = resp_json.get("results").and_then(|r| r.as_array()) {
+        for item in arr.iter().take(max) {
+            match (
+                item.get("title").and_then(|v| v.as_str()),
+                item.get("url").and_then(|v| v.as_str()),
+            ) {
+                (Some(title), Some(url)) => outcome.results.push(SearchResult {
+                    title: title.to_string(),
+                    url: url.to_string(),
+                    snippet: item
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                }),
+                _ => outcome.dropped += 1,
+            }
+        }
     }
 
-    let resp_json: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let results = resp_json
-        .get("results")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .take(max)
-                .filter_map(|item| {
-                    Some(SearchResult {
-                        title: item.get("title")?.as_str()?.to_string(),
-                        url: item.get("url")?.as_str()?.to_string(),
-                        snippet: item
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(results)
+    Ok(outcome)
 }
 
 async fn search_ddg(
@@ -269,22 +319,31 @@ async fn search_ddg(
     policy: &NetworkPolicy,
     query: &str,
     max: usize,
-) -> Result<Vec<SearchResult>, String> {
+) -> Result<SearchOutcome, ProviderError> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
-    policy.validate_url(&url).map_err(|e| e.to_string())?;
-    let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    policy
+        .validate_url(&url)
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| ProviderError::Retryable(e.to_string()))?;
 
-    if let Some(rate_err) = handle_rate_limit(&mut resp).await {
-        return Err(rate_err);
-    }
+    check_provider_status(&resp).await?;
 
-    let html = resp.text().await.map_err(|e| e.to_string())?;
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
     let document = scraper::Html::parse_document(&html);
-    let result_selector = scraper::Selector::parse(".result").map_err(|e| e.to_string())?;
+    let result_selector =
+        scraper::Selector::parse(".result").map_err(|e| ProviderError::Fatal(e.to_string()))?;
 
-    let title_selector = scraper::Selector::parse(".result__title a").map_err(|e| e.to_string())?;
-    let snippet_selector =
-        scraper::Selector::parse(".result__snippet").map_err(|e| e.to_string())?;
+    let title_selector = scraper::Selector::parse(".result__title a")
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
+    let snippet_selector = scraper::Selector::parse(".result__snippet")
+        .map_err(|e| ProviderError::Fatal(e.to_string()))?;
 
     let mut results = Vec::new();
     for result_el in document.select(&result_selector).take(max) {
@@ -320,7 +379,10 @@ async fn search_ddg(
         }
     }
 
-    Ok(results)
+    Ok(SearchOutcome {
+        results,
+        dropped: 0,
+    })
 }
 
 #[async_trait]
@@ -361,44 +423,72 @@ impl Tool for WebSearchTool {
             .filter(|k| !k.is_empty())
             .or_else(|| std::env::var("TAVILY_API_KEY").ok());
 
-        let (results, provider) = match override_provider {
+        let (outcome, provider) = match override_provider {
             "brave" => {
                 let key = brave_key.as_deref().ok_or_else(|| {
                     KernelError::ToolFailed("API key not configured for provider 'brave'".into())
                 })?;
-                let r = search_brave(&self.client, &self.network_policy, query, max, key)
-                    .await
-                    .map_err(KernelError::ToolFailed)?;
-                (r, "brave")
+                let o = retry_with_backoff(3, ProviderError::retryable, || {
+                    search_brave(&self.client, &self.network_policy, query, max, key)
+                })
+                .await
+                .map_err(|e| KernelError::ToolFailed(e.into_message()))?;
+                (o, "brave")
             }
             "tavily" => {
                 let key = tavily_key.as_deref().ok_or_else(|| {
                     KernelError::ToolFailed("API key not configured for provider 'tavily'".into())
                 })?;
-                let r = search_tavily(&self.client, &self.network_policy, query, max, key)
-                    .await
-                    .map_err(KernelError::ToolFailed)?;
-                (r, "tavily")
+                let o = retry_with_backoff(3, ProviderError::retryable, || {
+                    search_tavily(&self.client, &self.network_policy, query, max, key)
+                })
+                .await
+                .map_err(|e| KernelError::ToolFailed(e.into_message()))?;
+                (o, "tavily")
             }
             _ => {
-                if let Some(key) = &brave_key {
-                    let r = search_brave(&self.client, &self.network_policy, query, max, key)
-                        .await
-                        .map_err(KernelError::ToolFailed)?;
-                    (r, "brave")
-                } else if let Some(key) = &tavily_key {
-                    let r = search_tavily(&self.client, &self.network_policy, query, max, key)
-                        .await
-                        .map_err(KernelError::ToolFailed)?;
-                    (r, "tavily")
-                } else {
-                    let r = search_ddg(&self.client, &self.network_policy, query, max)
-                        .await
-                        .map_err(KernelError::ToolFailed)?;
-                    (r, "duckduckgo")
+                let brave_try = brave_key.as_deref().map(|key| {
+                    retry_with_backoff(3, ProviderError::retryable, || {
+                        search_brave(&self.client, &self.network_policy, query, max, key)
+                    })
+                });
+                let tavily_try = tavily_key.as_deref().map(|key| {
+                    retry_with_backoff(3, ProviderError::retryable, || {
+                        search_tavily(&self.client, &self.network_policy, query, max, key)
+                    })
+                });
+
+                let mut selected: Option<(&str, SearchOutcome)> = None;
+                if let Some(try_brave) = brave_try
+                    && let Ok(o) = try_brave.await
+                {
+                    selected = Some(("brave", o));
                 }
+                if selected.is_none()
+                    && let Some(try_tavily) = tavily_try
+                    && let Ok(o) = try_tavily.await
+                {
+                    selected = Some(("tavily", o));
+                }
+                if selected.is_none() {
+                    let o = retry_with_backoff(3, ProviderError::retryable, || {
+                        search_ddg(&self.client, &self.network_policy, query, max)
+                    })
+                    .await
+                    .map_err(|e| KernelError::ToolFailed(e.into_message()))?;
+                    selected = Some(("duckduckgo", o));
+                }
+
+                let (p, o) = selected.expect("fallback always selects a provider");
+                (o, p)
             }
         };
+
+        let results = outcome.results;
+        let dropped = outcome.dropped;
+        if dropped > 0 {
+            warn!(provider, dropped, "dropped malformed search results");
+        }
 
         let count = results.len();
         let results_json: Vec<Value> = results
@@ -418,6 +508,7 @@ impl Tool for WebSearchTool {
             "query": query,
             "results": results_json,
             "count": count,
+            "dropped_results": dropped,
             "provider": provider,
             "message": message
         }))

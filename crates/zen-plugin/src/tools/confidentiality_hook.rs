@@ -125,6 +125,13 @@ pub static TOOL_METADATA: &[ToolMetadata] = &[
         io: true,
         confidence: 0.7,
     },
+    ToolMetadata {
+        name: "shell.exec",
+        cloud: false,
+        mutating: true,
+        io: true,
+        confidence: 0.6,
+    },
 ];
 
 /// Look up the static metadata for a registered tool.

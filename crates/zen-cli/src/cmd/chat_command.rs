@@ -44,6 +44,19 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
             AgentOrchestrator::new(router.clone())
         }
     };
+    let orchestrator = if let Ok(policy) = std::env::var("ZEN_ASK_FOR_APPROVAL") {
+        if !policy.is_empty() {
+            use zen_core::sandbox::SandboxMode;
+            let cb = crate::tui::approval_callback::create_approval_callback();
+            orchestrator
+                .with_sandbox_mode(SandboxMode::Ask)
+                .with_approval_callback(cb)
+        } else {
+            orchestrator
+        }
+    } else {
+        orchestrator
+    };
     let mut session = SessionContext::new("default".to_string(), String::new());
 
     if let Some(name) = agent {
@@ -67,7 +80,7 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
 
         for dir in [paths.inbox(), paths.wiki()] {
             if let Ok(results) = service
-                .search(message, &dir, &client, Some(tier), None)
+                .search(message, &dir, &client, Some(tier), None, None)
                 .await
             {
                 for r in results {

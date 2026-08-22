@@ -15,6 +15,7 @@ use crate::tools::{
 pub struct EmbeddingResult {
     pub dimensions: usize,
     pub embedding: Vec<f32>,
+    pub degraded: bool,
 }
 
 pub struct ComputeEmbeddings;
@@ -72,7 +73,7 @@ pub fn pad_to_dim(v: &[f32], target: usize) -> Vec<f32> {
     out
 }
 
-fn compute_embedding_with_fallback(text: &str) -> Vec<f32> {
+fn compute_embedding_with_fallback(text: &str) -> (Vec<f32>, bool) {
     let router = get_embedding_router();
 
     if let Ok(embedding) = router.embed_sync(text) {
@@ -80,11 +81,11 @@ fn compute_embedding_with_fallback(text: &str) -> Vec<f32> {
             "ComputeEmbeddings: provider returns {}-dim",
             embedding.len()
         );
-        return pad_to_dim(&embedding, SYSTEM_EMBEDDING_DIM);
+        return (pad_to_dim(&embedding, SYSTEM_EMBEDDING_DIM), false);
     }
 
-    info!("ComputeEmbeddings: falling back to hash-based embedding");
-    hash_embedding(text)
+    warn!("ComputeEmbeddings: provider embedding failed, using hash fallback (degraded)");
+    (hash_embedding(text), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -96,14 +97,16 @@ pub fn compute_embeddings(text: &str) -> Result<EmbeddingResult> {
         return Ok(EmbeddingResult {
             dimensions: SYSTEM_EMBEDDING_DIM,
             embedding: vec![0.0; SYSTEM_EMBEDDING_DIM],
+            degraded: false,
         });
     }
 
-    let embedding = compute_embedding_with_fallback(text);
+    let (embedding, degraded) = compute_embedding_with_fallback(text);
 
     Ok(EmbeddingResult {
         dimensions: embedding.len(),
         embedding,
+        degraded,
     })
 }
 
@@ -136,7 +139,7 @@ fn aggregate_chunks(chunks: &[String]) -> Vec<f32> {
     let mut aggregated = vec![0.0f32; dim];
 
     for chunk in chunks {
-        let embedding = compute_embedding_with_fallback(chunk);
+        let (embedding, _degraded) = compute_embedding_with_fallback(chunk);
 
         let len = embedding.len().min(dim);
         for (i, v) in embedding.iter().enumerate().take(len) {
@@ -245,6 +248,7 @@ impl ZenTool for ComputeEmbeddings {
         Ok(json!({
             "dimensions": result.dimensions,
             "sample": sample,
+            "degraded": result.degraded,
         }))
     }
 }

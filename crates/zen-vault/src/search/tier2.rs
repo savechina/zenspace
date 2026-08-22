@@ -4,7 +4,8 @@ use std::path::Path;
 use tracing::debug;
 
 use crate::tools::{
-    ZenTool, ZenToolError, ZenToolResult, args_schema_string_limit, result_schema_array,
+    SharedSqliteClient, ZenTool, ZenToolError, ZenToolResult, args_schema_string_limit,
+    result_schema_array,
 };
 
 pub use zen_repo::{FtsResult, IndexNoteRequest, NotesRepo, SqliteClient};
@@ -81,7 +82,27 @@ impl Tier2Search {
     }
 }
 
-impl ZenTool for Tier2Search {
+/// Agent-facing `tier2_search` tool bound to a workspace-resolved DB.
+///
+/// The DB path is injected at construction (via [`SharedSqliteClient`]);
+/// invocations never open a client themselves — the pre-D7 impl opened
+/// `./state.db` relative to the process CWD, which silently queried the
+/// wrong (or a nonexistent) database.
+pub struct Tier2SearchTool {
+    db: SharedSqliteClient,
+    inner: Tier2Search,
+}
+
+impl Tier2SearchTool {
+    pub fn new(db: SharedSqliteClient) -> Self {
+        Self {
+            db,
+            inner: Tier2Search,
+        }
+    }
+}
+
+impl ZenTool for Tier2SearchTool {
     fn schema(&self) -> crate::tools::ToolSchema {
         crate::tools::ToolSchema {
             name: "tier2_search".to_string(),
@@ -96,17 +117,12 @@ impl ZenTool for Tier2Search {
         let query = args.get("query").and_then(Value::as_str).ok_or_else(|| {
             ZenToolError::InvalidArgs("missing required field: query".to_string())
         })?;
-        let db_path = args
-            .get("db_path")
-            .and_then(Value::as_str)
-            .unwrap_or("state.db");
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
 
-        let client = zen_repo::SqliteClient::open(std::path::Path::new(db_path))
-            .await
-            .map_err(|e| ZenToolError::ExecutionFailed(format!("failed to open state db: {e}")))?;
+        let client = self.db.get().await.map_err(ZenToolError::ExecutionFailed)?;
 
         let results = self
+            .inner
             .search(&client, query, limit)
             .await
             .map_err(|e| ZenToolError::ExecutionFailed(e.to_string()))?;
@@ -205,9 +221,115 @@ mod tests {
 
     #[test]
     fn test_tier2_tool_schema() {
-        let tier2 = Tier2Search;
-        let schema = tier2.schema();
+        let tool = Tier2SearchTool::new(SharedSqliteClient::new(std::path::PathBuf::from(
+            "unused.db",
+        )));
+        let schema = tool.schema();
         assert_eq!(schema.name, "tier2_search");
         assert!(schema.description.contains("BM25"));
+        assert!(
+            schema
+                .args_schema
+                .get("properties")
+                .and_then(|p| p.get("db_path"))
+                .is_none(),
+            "db_path must not be an invocable arg — it was the CWD bug vector"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier2_tool_uses_injected_db_not_cwd() {
+        // CRITICAL regression test (review D7): the pre-D7 impl opened
+        // "./state.db" relative to the process CWD. A decoy state.db in the
+        // CWD (crate root during tests) must NOT be consulted — only the
+        // injected workspace DB.
+        let dir = tempdir().unwrap();
+        let injected_db = dir.path().join("state.db");
+        let client = SqliteClient::open(&injected_db).await.unwrap();
+        let tier2 = Tier2Search;
+        tier2
+            .index_note(
+                &client,
+                "injected",
+                "injected",
+                "quantum entanglement note",
+                "test",
+                "notes/injected.md",
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let decoy = std::path::PathBuf::from("state.db");
+        let decoy_existed = decoy.exists();
+        if !decoy_existed {
+            let decoy_client = SqliteClient::open(&decoy).await.unwrap();
+            tier2
+                .index_note(
+                    &decoy_client,
+                    "decoy",
+                    "decoy",
+                    "decoy keyword entanglement",
+                    "test",
+                    "decoy.md",
+                    "test",
+                )
+                .await
+                .unwrap();
+        }
+
+        let tool = Tier2SearchTool::new(SharedSqliteClient::new(injected_db.clone()));
+        let result = tool
+            .invoke(json!({ "query": "entanglement", "limit": 10 }))
+            .await
+            .unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "must find the injected note");
+        assert!(
+            results
+                .iter()
+                .all(|r| r["path"].as_str().unwrap_or("").contains("injected.md")),
+            "results must come from the injected db, got: {results:?}"
+        );
+
+        if !decoy_existed {
+            let _ = std::fs::remove_file(&decoy);
+            let _ = std::fs::remove_file("state.db-shm");
+            let _ = std::fs::remove_file("state.db-wal");
+        }
+    }
+
+    #[tokio::test]
+    async fn tier2_tool_ignores_legacy_db_path_arg() {
+        let dir = tempdir().unwrap();
+        let injected_db = dir.path().join("state.db");
+        let client = SqliteClient::open(&injected_db).await.unwrap();
+        let tier2 = Tier2Search;
+        tier2
+            .index_note(
+                &client,
+                "note",
+                "note",
+                "unique-banana-stand",
+                "test",
+                "notes/banana.md",
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let tool = Tier2SearchTool::new(SharedSqliteClient::new(injected_db));
+        // A caller-supplied db_path must be ignored — it was the bug vector.
+        let result = tool
+            .invoke(json!({ "query": "banana", "db_path": "/nonexistent/wrong.db" }))
+            .await
+            .unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r["path"].as_str().unwrap_or("").contains("banana.md")),
+            "got: {results:?}"
+        );
     }
 }

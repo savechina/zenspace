@@ -69,6 +69,10 @@ pub struct SandboxConfig {
     /// WASM sandbox permission policy (`[sandbox.wasm]`).
     #[serde(default)]
     pub wasm: WasmSandboxConfig,
+    /// OS-layer network access for sandboxed child processes
+    /// (`[sandbox] network_access`, FR-028 D6). Default false = deny.
+    #[serde(default)]
+    pub network_access: bool,
 }
 
 /// Manual [`Deserialize`] for [`ZenConfig`] (FR-046): the `[agents]` table
@@ -1051,6 +1055,7 @@ fn merge_sandbox(base: SandboxConfig, ov: SandboxConfig) -> SandboxConfig {
             allow_network: base.wasm.allow_network || ov.wasm.allow_network,
             allow_system: base.wasm.allow_system || ov.wasm.allow_system,
         },
+        network_access: base.network_access || ov.network_access,
     }
 }
 

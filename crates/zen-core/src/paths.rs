@@ -228,7 +228,14 @@ impl ZenPaths {
         }
 
         let home = home::home_dir()?;
-        let mut current = env::current_dir().ok()?;
+        // When ZEN_HOME is set, start the walk-up from global_root's parent
+        // instead of current_dir().  This prevents the real repo's .zen/ from
+        // leaking into tests that set ZEN_HOME to an isolated temp directory.
+        let mut current = if env::var("ZEN_HOME").is_ok() {
+            global_root.parent()?.to_path_buf()
+        } else {
+            env::current_dir().ok()?
+        };
 
         loop {
             if current == home || &current == global_root {
@@ -266,5 +273,22 @@ mod tests {
         assert_eq!(paths.areas(), tmp.path().join("vault/areas"));
         assert_eq!(paths.resources_dir(), tmp.path().join("vault/resources"));
         assert_eq!(paths.archive(), tmp.path().join("vault/archive"));
+    }
+
+    #[test]
+    fn fr052_output_dir_prefers_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        assert_eq!(paths.output(), tmp.path().join("output"));
+    }
+
+    #[test]
+    fn fr052_output_dir_falls_back_to_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ZenPaths {
+            global_root: tmp.path().to_path_buf(),
+            workspace_root: None,
+        };
+        assert_eq!(paths.output(), tmp.path().join("output"));
     }
 }
