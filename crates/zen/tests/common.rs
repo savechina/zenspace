@@ -30,6 +30,13 @@ impl ZenTest {
             "ZEN_ROOT_DIR".into(),
             test.temp_dir.path().to_str().unwrap().into(),
         );
+        // user_root() in test mode reads ZEN_HOME directly; home::home_dir()
+        // on Linux uses getpwuid_r() which ignores the HOME env var, so we
+        // must set ZEN_HOME to ensure ZenPaths resolves to the temp directory.
+        test.env.insert(
+            "ZEN_HOME".into(),
+            test.temp_dir.path().to_str().unwrap().into(),
+        );
         // Set consistent arch/os for cross-platform testing
         test.env
             .insert("ZEN_TEST_PLATFORM".into(), "aarch64-apple-darwin".into()); // For mocking current_platform::CURRENT_PLATFORM

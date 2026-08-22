@@ -1566,15 +1566,24 @@ mod linux {
             }
         }
 
+        // Pass --chdir to bubblewrap before the -- separator so the sandboxed
+        // process starts in the correct working directory.
+        if let Some(ref dir) = cwd {
+            let dir_str = dir.to_str().ok_or_else(|| {
+                OsSandboxError::SandboxUnavailable(format!(
+                    "cwd {} is not valid UTF-8",
+                    dir.display()
+                ))
+            })?;
+            wrapped.args(["--chdir", dir_str]);
+        }
+
         wrapped.arg("--").arg(program).args(args);
         for (k, v) in envs {
             match v {
                 Some(v) => wrapped.env(k, v),
                 None => wrapped.env_remove(k),
             };
-        }
-        if let Some(dir) = cwd {
-            wrapped.current_dir(dir);
         }
 
         Ok(wrapped)
