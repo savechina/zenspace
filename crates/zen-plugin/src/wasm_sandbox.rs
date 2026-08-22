@@ -66,8 +66,8 @@ pub struct ExecutionOutput {
 /// - `allow_filesystem_read` → the workspace root is preopened READ-ONLY
 ///   at guest path `/workspace`.
 /// - `allow_filesystem_write` → a per-plugin scratch directory
-///   (`.zen/plugin-data/<plugin-id>/`) is preopened READ-WRITE at guest
-///   path `/scratch`. The workspace root itself is NEVER writable:
+///   (`.zen/data/plugin/<plugin-id>/`, FR-052) is preopened READ-WRITE at
+///   guest path `/scratch`. The workspace root itself is NEVER writable:
 ///   `state.db` and `.zen/` config stay structurally unwritable by plugins.
 #[derive(Debug, Clone, Default)]
 pub struct WasmPermissions {
@@ -91,7 +91,7 @@ pub struct WasmPermissions {
 /// ─────────────────────         ─────────────────────────────────────
 /// (none)                        — zero preopens (argv→stdout only)
 /// filesystem_read               /workspace → <root>       (READ-ONLY)
-/// filesystem_write              /scratch   → <root>/.zen/plugin-data/<id>/
+/// filesystem_write              /scratch   → <root>/.zen/data/plugin/<id>/
 /// filesystem_read + write       both of the above
 ///
 /// scratch is created host-side; copy-out to the real workspace is
@@ -102,7 +102,8 @@ pub struct WasmFsContext {
     /// Canonicalized workspace root for the read-only `/workspace` preopen.
     pub workspace_root: Option<PathBuf>,
     /// Canonicalized per-plugin scratch dir for the read-write `/scratch`
-    /// preopen. Always inside `<workspace_root>/.zen/plugin-data/<id>/`.
+    /// preopen. Always inside `<workspace_root>/.zen/data/plugin/<id>/`
+    /// (FR-052; pre-existing `.zen/plugin-data/` dirs are left untouched).
     pub scratch_dir: Option<PathBuf>,
 }
 

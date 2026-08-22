@@ -489,7 +489,18 @@ fn format_relative_time(mtime: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use zen_core::jsonl;
+
+    /// Serializes tests that mutate `ZEN_HOME`. Rust runs test threads in
+    /// parallel by default; without this lock, `test_logs_show_reads_entries`
+    /// and `test_logs_read_empty_dir` race on the process environment and the
+    /// empty-dir assertion reads the other test's fixture.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn setup_test_logs() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("zen-test-logs");
@@ -519,24 +530,28 @@ mod tests {
 
     #[test]
     fn test_logs_show_reads_entries() {
+        let _env = env_lock();
         let dir = setup_test_logs();
-        // SAFETY: test runs single-threaded, env is restored via drop
+        // SAFETY: env_lock() ensures no concurrent env access in this module;
+        // ZEN_HOME is removed explicitly at the end (no implicit restore).
         unsafe { std::env::set_var("ZEN_HOME", dir.to_str().unwrap()) };
         let agent_log = dir.join("logs").join("agent-session.jsonl");
         let entries = jsonl::read_jsonl_lines(&agent_log).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0]["agent"], "Sisyphus");
+        unsafe { std::env::remove_var("ZEN_HOME") };
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_logs_read_empty_dir() {
-        let dir = std::env::temp_dir().join("zen-test-logs-empty");
-        std::fs::create_dir_all(&dir).ok();
-        // SAFETY: test runs single-threaded, env is restored via drop
-        unsafe { std::env::set_var("ZEN_HOME", dir.to_str().unwrap()) };
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: env_lock() ensures no concurrent env access in this module;
+        // ZEN_HOME is removed explicitly at the end (no implicit restore).
+        unsafe { std::env::set_var("ZEN_HOME", dir.path().to_str().unwrap()) };
         let entries = read_all_log_entries().unwrap();
         assert!(entries.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
+        unsafe { std::env::remove_var("ZEN_HOME") };
     }
 }
