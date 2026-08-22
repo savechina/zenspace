@@ -642,6 +642,7 @@ mod tests {
 
     #[test]
     fn m2_indexes_journal_chunks() {
+        crate::memvid::reset_singletons();
         let tmp = TempDir::new().unwrap();
 
         // Create journal directory with one file
@@ -666,6 +667,7 @@ mod tests {
 
     #[test]
     fn m3_indexes_entity_files() {
+        crate::memvid::reset_singletons();
         let tmp = TempDir::new().unwrap();
 
         let entities_dir = tmp.path().join("wiki").join("notions");
@@ -690,6 +692,7 @@ mod tests {
 
     #[test]
     fn m4_indexes_wisdom_subdirs() {
+        crate::memvid::reset_singletons();
         let tmp = TempDir::new().unwrap();
 
         // Create all three wisdom subdirs with files
@@ -731,6 +734,7 @@ mod tests {
 
     #[test]
     fn index_all_collects_across_tiers() {
+        crate::memvid::reset_singletons();
         let tmp = TempDir::new().unwrap();
 
         // M2: one journal file

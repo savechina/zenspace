@@ -8,9 +8,10 @@ use tracing::{debug, info, warn};
 use zen_core::paths::ZenPaths;
 use zen_vault::{NotionData, NotionService, WikiCompiler, WikiPage};
 
-use super::super::{WorkerContext, WorkerReport, ZenWorker};
+#[cfg(test)]
+use zen_core::constants::WIKI_COMPILER_STATE_FILE;
 
-const STATE_FILE: &str = ".wiki_compiler_state.json";
+use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
 /// Persistent state for incremental wiki compilation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,8 +68,8 @@ impl WikiCompilerWorker {
         self
     }
 
-    fn state_path(global_root: &Path) -> PathBuf {
-        global_root.join("db").join(STATE_FILE)
+    fn state_path(paths: &ZenPaths) -> PathBuf {
+        paths.wiki_compiler_state()
     }
 
     async fn build_entity_data(
@@ -217,9 +218,8 @@ impl ZenWorker for WikiCompilerWorker {
     async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
         let start = std::time::Instant::now();
         let paths = ZenPaths::detect()?;
-        let global_root = paths.global_root();
 
-        let state_path = Self::state_path(global_root);
+        let state_path = Self::state_path(&paths);
         let state = CompilerState::load(&state_path);
         debug!(last_compile_time = %state.last_compile_time, "loaded compiler state");
 
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_state_roundtrip() {
         let dir = setup_state_dir();
-        let path = dir.path().join(STATE_FILE);
+        let path = dir.path().join(WIKI_COMPILER_STATE_FILE);
 
         let now = Utc::now();
         let state = CompilerState {
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn test_state_load_corrupted_file_returns_epoch() {
         let dir = setup_state_dir();
-        let path = dir.path().join(STATE_FILE);
+        let path = dir.path().join(WIKI_COMPILER_STATE_FILE);
         std::fs::write(&path, "not json").unwrap();
         let state = CompilerState::load(&path);
         assert_eq!(
@@ -488,15 +488,15 @@ mod tests {
 
     #[test]
     fn test_state_path_ends_with_state_file() {
-        let path = PathBuf::from("/tmp/.zen");
-        let state_path = WikiCompilerWorker::state_path(&path);
+        let paths = ZenPaths::for_testing(PathBuf::from("/tmp/.zen"));
+        let state_path = WikiCompilerWorker::state_path(&paths);
         assert!(
-            state_path.ends_with(STATE_FILE),
+            state_path.ends_with(WIKI_COMPILER_STATE_FILE),
             "state path should end with state file name"
         );
         assert!(
-            state_path.to_string_lossy().contains("/db/"),
-            "state path should be under db directory"
+            state_path.to_string_lossy().contains("/data/"),
+            "state path should be under data directory"
         );
     }
 }

@@ -111,6 +111,14 @@ impl AgentOrchestrator {
         Ok(self)
     }
 
+    pub fn with_memory_read_only(mut self, memory_path: PathBuf) -> Result<Self> {
+        let store = ZenMemvidStore::new_read_only(memory_path)?;
+        let inner = store.into_inner();
+        self.memvid_store = Some(inner);
+        debug!("AgentOrchestrator: read-only memory store (no PersistHook)");
+        Ok(self)
+    }
+
     /// Rebuild the wiring with the given sandbox mode.
     ///
     /// The mode drives the fs-tool path validators and the dispatch-time

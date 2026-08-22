@@ -64,8 +64,7 @@ impl SelfLearningSignals {
 
         let wiki_dir = zen_paths.wiki();
         let memories_dir = zen_paths.vault().join("memories");
-        let reinforcement_path: PathBuf =
-            zen_paths.global_root().join("memories/.reinforcement.json");
+        let reinforcement_path: PathBuf = zen_paths.memory().join(".reinforcement.json");
         let mut tracker = ReinforcementTracker::new(reinforcement_path);
 
         let corrections = load_corrections(&wiki_dir.join("wisdom/corrections"), &mut tracker);

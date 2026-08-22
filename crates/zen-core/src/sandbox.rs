@@ -68,6 +68,11 @@ pub fn is_env_file(path: &Path) -> bool {
     })
 }
 
+pub fn is_zen_path(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().to_string_lossy().as_ref() == ".zen")
+}
+
 pub fn is_metadata_path(path: &Path) -> bool {
     is_env_file(path)
         || path.components().any(|c| {
@@ -570,6 +575,11 @@ impl SandboxValidator {
             ));
         }
 
+        // Allow writing .zen/ paths — logs, sessions, vault are safe for agent operations.
+        if is_zen_path(&normalized) {
+            return Ok(());
+        }
+
         let path_str = normalized.to_string_lossy();
         for component in normalized.components() {
             let name = component.as_os_str().to_string_lossy();
@@ -618,6 +628,11 @@ impl SandboxValidator {
                 "read blocked: {} is an environment file",
                 path.display()
             ));
+        }
+
+        // Allow reading .zen/ paths — logs, sessions, vault are safe for agent operations.
+        if is_zen_path(&normalized) {
+            return Ok(());
         }
 
         for component in normalized.components() {

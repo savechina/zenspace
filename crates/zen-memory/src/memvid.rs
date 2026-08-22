@@ -3,7 +3,7 @@ use memvid_core::{MemoryCardBuilder, Ticket};
 use rig_memvid::memvid_core;
 use rig_memvid::{MemoryConfig, MemvidPersistHook, MemvidStore, WritePolicy};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use zen_core::notion_graph::NotionGraphProvider;
 
@@ -18,37 +18,132 @@ pub const TRIPLET_MIN_CONFIDENCE: f32 = 0.8;
 /// CapacityExceeded. We open the raw `Memvid` and raise the cap before wrapping.
 pub const MEMVID_CAPACITY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Global singleton for the memvid store (read-write, exclusive lock).
+///
+/// Ensures only ONE `Memvid` instance (and thus ONE tantivy `IndexReader`
+/// with its file watcher thread) exists per process for the writer path.
+/// Multiple independent `Memvid::open()` calls for the same `.mv2` file
+/// would each spawn a separate file watcher thread, causing the
+/// "Failed to open meta file" warning every 500ms.
+///
+/// The store is lazily initialized on first access and shared via `Arc`
+/// across all callers. Clones are cheap (shared `Arc<Mutex<Memvid>>`).
+static GLOBAL_MEMVID_STORE: OnceLock<Arc<Mutex<Option<MemvidStore>>>> = OnceLock::new();
+
+/// Global singleton for read-only memvid store (shared lock).
+///
+/// Secondary processes (CLI chat, search) open read-only to avoid
+/// conflicting with the primary writer. Multiple read-only handles
+/// can coexist via shared file locks.
+static GLOBAL_MEMVID_STORE_RO: OnceLock<Arc<Mutex<Option<MemvidStore>>>> = OnceLock::new();
+
+/// Get or initialize the global memvid store singleton (read-write).
+///
+/// Returns a clone of the shared `MemvidStore`. The underlying `Memvid`
+/// instance (and its tantivy file watcher) is created only once.
+/// Acquires an exclusive file lock — blocks until all readers release.
+fn get_or_init_memvid_store(memory_path: &std::path::Path) -> Result<MemvidStore> {
+    let global = GLOBAL_MEMVID_STORE.get_or_init(|| Arc::new(Mutex::new(None)));
+
+    let mut guard = global
+        .lock()
+        .map_err(|e| anyhow::anyhow!("memvid singleton lock poisoned: {e}"))?;
+
+    if let Some(ref store) = *guard {
+        return Ok(store.clone());
+    }
+
+    let mut memvid = if memory_path.exists() {
+        memvid_core::Memvid::open(memory_path)?
+    } else {
+        memvid_core::Memvid::create(memory_path)?
+    };
+
+    memvid.enable_lex()?;
+
+    let current = memvid.current_ticket();
+    if current.capacity_bytes < MEMVID_CAPACITY_BYTES {
+        let ticket =
+            Ticket::new("zen-memory", current.seq_no + 1).capacity_bytes(MEMVID_CAPACITY_BYTES);
+        #[allow(deprecated)]
+        memvid.apply_ticket(ticket)?;
+    }
+
+    let store = MemvidStore::from_memvid(memvid);
+    *guard = Some(store.clone());
+
+    tracing::debug!(path = %memory_path.display(), "memvid singleton initialized (read-write)");
+    Ok(store)
+}
+
+/// Get or initialize the global memvid store singleton (read-only).
+///
+/// Returns a clone of the shared `MemvidStore`. Uses `open_read_only()`
+/// which acquires a shared file lock — multiple readers can coexist.
+/// Falls back to read-write if the file doesn't exist yet (first-time init).
+fn get_or_init_memvid_store_ro(memory_path: &std::path::Path) -> Result<MemvidStore> {
+    let global = GLOBAL_MEMVID_STORE_RO.get_or_init(|| Arc::new(Mutex::new(None)));
+
+    let mut guard = global
+        .lock()
+        .map_err(|e| anyhow::anyhow!("memvid read-only singleton lock poisoned: {e}"))?;
+
+    if let Some(ref store) = *guard {
+        return Ok(store.clone());
+    }
+
+    // If file doesn't exist, create it with read-write (first-time init)
+    if !memory_path.exists() {
+        tracing::debug!(
+            path = %memory_path.display(),
+            "memvid read-only: file not found, creating with read-write"
+        );
+        return get_or_init_memvid_store(memory_path);
+    }
+
+    let memvid = memvid_core::Memvid::open_read_only(memory_path)?;
+    let store = MemvidStore::from_memvid(memvid);
+    *guard = Some(store.clone());
+
+    tracing::debug!(path = %memory_path.display(), "memvid singleton initialized (read-only)");
+    Ok(store)
+}
+
 pub struct ZenMemvidStore {
     store: MemvidStore,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
 }
 
+/// Reset global singletons for testing.
+///
+/// Each test creates unique temp directories, but the singleton caches
+/// stores by path. Without resetting, a test might get a stale cached
+/// store from a previous test whose temp directory was cleaned up.
+#[cfg(test)]
+pub fn reset_singletons() {
+    if let Some(global) = GLOBAL_MEMVID_STORE.get()
+        && let Ok(mut guard) = global.lock()
+    {
+        *guard = None;
+    }
+    if let Some(global) = GLOBAL_MEMVID_STORE_RO.get()
+        && let Ok(mut guard) = global.lock()
+    {
+        *guard = None;
+    }
+}
+
 impl ZenMemvidStore {
     pub fn new(memory_path: std::path::PathBuf) -> Result<Self> {
-        // Open or create the raw Memvid so we can apply a capacity ticket
-        // before wrapping. `MemvidStore::builder().open_or_create()` defaults
-        // to the Free-tier 50MB ticket, which made every write fail with
-        // CapacityExceeded once the store grew past that limit.
-        let mut memvid = if memory_path.exists() {
-            memvid_core::Memvid::open(&memory_path)?
-        } else {
-            memvid_core::Memvid::create(&memory_path)?
-        };
+        let store = get_or_init_memvid_store(&memory_path)?;
+        Ok(Self {
+            store,
+            notion_graph: None,
+        })
+    }
 
-        memvid.enable_lex()?;
-
-        // Raised only when needed (idempotent across opens): the ticket seq
-        // must strictly increase, so derive it from the current ticket.
-        let current = memvid.current_ticket();
-        if current.capacity_bytes < MEMVID_CAPACITY_BYTES {
-            let ticket =
-                Ticket::new("zen-memory", current.seq_no + 1).capacity_bytes(MEMVID_CAPACITY_BYTES);
-            #[allow(deprecated)]
-            memvid.apply_ticket(ticket)?;
-        }
-
-        let store = MemvidStore::from_memvid(memvid);
-
+    pub fn new_read_only(memory_path: std::path::PathBuf) -> Result<Self> {
+        let store = get_or_init_memvid_store_ro(&memory_path)?;
         Ok(Self {
             store,
             notion_graph: None,
@@ -641,6 +736,7 @@ mod tests {
 
     #[test]
     fn persist_structured_turn_creates_frame_and_card() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -662,6 +758,7 @@ mod tests {
 
     #[test]
     fn persist_structured_turn_enriched_options() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_enriched.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -690,6 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn retrieve_with_entity_context_enriches() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_enrich.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -735,6 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn retrieve_with_entity_context_graceful_degradation() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_grace.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -757,6 +856,7 @@ mod tests {
 
     #[test]
     fn put_entry_persists_and_retrievable() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_entry.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -797,6 +897,7 @@ mod tests {
 
     #[test]
     fn put_entry_with_knowledge_entity_type() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_entry_knowledge.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -819,6 +920,7 @@ mod tests {
             ContextItem, ContextOmissionReason, ContextSourceKind, OmittedContextItem,
         };
 
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_demotion.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -860,6 +962,7 @@ mod tests {
 
     #[test]
     fn memvid_store_new_raises_capacity_above_free_tier() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_capacity.mv2");
 
@@ -893,6 +996,7 @@ mod tests {
 
     #[test]
     fn memvid_storing_compactor_evicts_excess() {
+        reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_compact_evict.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();

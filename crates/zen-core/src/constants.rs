@@ -30,6 +30,7 @@ pub const CACHE_DIR: &str = "cache/";
 /// Root directory for cumulative memory artifacts (journal entries, logs).
 pub const MEMORY_DIR: &str = "memories/";
 pub const MEMVID_STORE_FILE: &str = "mem1.mv2";
+pub const WIKI_COMPILER_STATE_FILE: &str = ".wiki_compiler_state.json";
 /// Directory holding identity definition files (SOUL.md, MEMORY.md, AGENTS.md).
 ///
 /// **Design Note**: Intentionally co-located with `MEMORY_DIR` ("memories/").

@@ -92,7 +92,17 @@ const KNOWLEDGE_SEARCH_TIMEOUT_MS: u64 = 1500;
 /// Build the agent orchestrator (router + registry + wiring + memvid memory).
 ///
 /// Extracted from `App::init_orchestrator` so background pre-warming can run
-/// it off the event-loop thread (T053).
+/// Build the agent orchestrator with memory wired (read-only mode).
+///
+/// Uses `with_memory_read_only()` to enable multi-process access:
+/// - **Daemon (`zen serve start`)**: Opens with exclusive lock via `with_memory()`
+/// - **TUI (`zen`)**: Opens with shared lock via `with_memory_read_only()`
+/// - **CLI chat (`zen chat`)**: Opens with shared lock via `with_memory_read_only()`
+///
+/// This allows the TUI and CLI to coexist with the daemon without blocking.
+/// The daemon handles all writes; TUI/CLI are read-only consumers.
+///
+/// If memvid initialization fails, continues without memory (graceful degradation).
 pub(crate) fn build_orchestrator(
     config: &'static zen_core::config::ZenConfig,
 ) -> AgentOrchestrator {
@@ -106,9 +116,9 @@ pub(crate) fn build_orchestrator(
                 tracing::warn!(path = ?memvid_dir, error = %e, "Failed to create memory directory");
             }
             let memvid_path = memvid_dir.join(MEMVID_STORE_FILE);
-            match orch.with_memory(memvid_path) {
+            match orch.with_memory_read_only(memvid_path) {
                 Ok(o) => {
-                    tracing::info!("Memvid store wired successfully");
+                    tracing::info!("Memvid store wired successfully (read-only)");
                     o
                 }
                 Err(e) => {
@@ -1785,6 +1795,10 @@ Use /thinking to show/hide thinking process."#;
         }
     }
 
+    /// Switch the active LLM provider/model and re-wire memory store.
+    ///
+    /// Re-wires the memvid store in read-only mode after model switch,
+    /// maintaining multi-process compatibility with the daemon.
     pub fn set_model(&mut self, provider: &str, model: &str) {
         // Accept any provider that exists in config, is a known built-in, or is ollama/mock.
         // Custom providers (e.g. personal model gateways, third-party proxies) are configured
@@ -1860,7 +1874,7 @@ Use /thinking to show/hide thinking process."#;
                 let memvid_dir = paths.memory();
                 std::fs::create_dir_all(&memvid_dir).ok();
                 let memvid_path = memvid_dir.join(MEMVID_STORE_FILE);
-                match AgentOrchestrator::new(router).with_memory(memvid_path) {
+                match AgentOrchestrator::new(router).with_memory_read_only(memvid_path) {
                     Ok(o) => o,
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to re-wire memory store after model switch");

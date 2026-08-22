@@ -218,6 +218,20 @@ enum Commands {
 
 pub async fn shell() -> Result<(), ZenError> {
     let cli = Cli::parse();
+    // Suppress tantivy file-watcher polling noise (warns every ~500ms when
+    // a temp index directory lacks meta.json — harmless but noisy).
+    // tantivy uses the `log` crate, not `tracing`, so we must also set
+    // `log` via `env_logger`-style filter AND the `tracing` EnvFilter.
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    let suppress = "tantivy=off";
+    let rust_log = if rust_log.is_empty() {
+        suppress.to_string()
+    } else {
+        format!("{rust_log},{suppress}")
+    };
+    // SAFETY: set_var is called early in main before any threads are spawned.
+    unsafe { std::env::set_var("RUST_LOG", &rust_log) };
+
     let filter = EnvFilter::builder()
         .with_default_directive(cli.verbose.tracing_level_filter().into())
         .from_env()

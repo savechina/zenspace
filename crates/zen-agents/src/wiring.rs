@@ -25,6 +25,7 @@ use rig_compose::skill::{Skill, SkillOutcome};
 use rig_compose::tool::Tool;
 use serde_json::Value;
 use tracing::debug;
+use zen_core::constants::LOGS_DIR;
 use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::paths::ZenPaths;
 #[cfg(not(test))]
@@ -594,7 +595,7 @@ impl ZenWiring {
     fn audit_log_path(workspace_roots: &[std::path::PathBuf]) -> std::path::PathBuf {
         workspace_roots
             .first()
-            .map(|root| root.join("logs").join("audit.jsonl"))
+            .map(|root| root.join(LOGS_DIR).join("audit.jsonl"))
             .unwrap_or_else(|| std::path::PathBuf::from("logs/audit.jsonl"))
     }
 

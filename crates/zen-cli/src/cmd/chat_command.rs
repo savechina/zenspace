@@ -31,7 +31,7 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
             let mem_dir = paths.memory();
             std::fs::create_dir_all(&mem_dir).ok();
             let store_path = mem_dir.join(MEMVID_STORE_FILE);
-            match AgentOrchestrator::new(router.clone()).with_memory(store_path) {
+            match AgentOrchestrator::new(router.clone()).with_memory_read_only(store_path) {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to init memory store for CLI chat, continuing without memory");
