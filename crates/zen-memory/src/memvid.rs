@@ -18,6 +18,9 @@ pub const TRIPLET_MIN_CONFIDENCE: f32 = 0.8;
 /// CapacityExceeded. We open the raw `Memvid` and raise the cap before wrapping.
 pub const MEMVID_CAPACITY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Keyed single-entry singleton cache: (store path, shared store handle).
+type MemvidCache = Arc<Mutex<Option<(std::path::PathBuf, MemvidStore)>>>;
+
 /// Global singleton for the memvid store (read-write, exclusive lock).
 ///
 /// Ensures only ONE `Memvid` instance (and thus ONE tantivy `IndexReader`
@@ -26,16 +29,18 @@ pub const MEMVID_CAPACITY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// would each spawn a separate file watcher thread, causing the
 /// "Failed to open meta file" warning every 500ms.
 ///
-/// The store is lazily initialized on first access and shared via `Arc`
-/// across all callers. Clones are cheap (shared `Arc<Mutex<Memvid>>`).
-static GLOBAL_MEMVID_STORE: OnceLock<Arc<Mutex<Option<MemvidStore>>>> = OnceLock::new();
+/// The cache is keyed by path: a request for a different path replaces the
+/// cached entry (production uses one memory file per process). The store is
+/// lazily initialized on first access and shared via `Arc` across all
+/// callers. Clones are cheap (shared `Arc<Mutex<MemvidStore>>`).
+static GLOBAL_MEMVID_STORE: OnceLock<MemvidCache> = OnceLock::new();
 
 /// Global singleton for read-only memvid store (shared lock).
 ///
 /// Secondary processes (CLI chat, search) open read-only to avoid
 /// conflicting with the primary writer. Multiple read-only handles
 /// can coexist via shared file locks.
-static GLOBAL_MEMVID_STORE_RO: OnceLock<Arc<Mutex<Option<MemvidStore>>>> = OnceLock::new();
+static GLOBAL_MEMVID_STORE_RO: OnceLock<MemvidCache> = OnceLock::new();
 
 /// Get or initialize the global memvid store singleton (read-write).
 ///
@@ -49,7 +54,9 @@ fn get_or_init_memvid_store(memory_path: &std::path::Path) -> Result<MemvidStore
         .lock()
         .map_err(|e| anyhow::anyhow!("memvid singleton lock poisoned: {e}"))?;
 
-    if let Some(ref store) = *guard {
+    if let Some((cached_path, store)) = &*guard
+        && cached_path == memory_path
+    {
         return Ok(store.clone());
     }
 
@@ -70,7 +77,7 @@ fn get_or_init_memvid_store(memory_path: &std::path::Path) -> Result<MemvidStore
     }
 
     let store = MemvidStore::from_memvid(memvid);
-    *guard = Some(store.clone());
+    *guard = Some((memory_path.to_path_buf(), store.clone()));
 
     tracing::debug!(path = %memory_path.display(), "memvid singleton initialized (read-write)");
     Ok(store)
@@ -88,11 +95,33 @@ fn get_or_init_memvid_store_ro(memory_path: &std::path::Path) -> Result<MemvidSt
         .lock()
         .map_err(|e| anyhow::anyhow!("memvid read-only singleton lock poisoned: {e}"))?;
 
-    if let Some(ref store) = *guard {
+    if let Some((cached_path, store)) = &*guard
+        && cached_path == memory_path
+    {
         return Ok(store.clone());
     }
 
-    // If file doesn't exist, create it with read-write (first-time init)
+    // Same-process reuse: flock shared vs exclusive on separate file
+    // descriptors conflicts even within one process, so a read-only open
+    // here would retry ~10s and fail while this process holds the write
+    // lock (e.g. ZenWiring opened the store read-write first). Share the
+    // existing read-write store instead — same data, no second lock.
+    let rw_reusable = GLOBAL_MEMVID_STORE
+        .get()
+        .and_then(|g| g.lock().ok())
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|(p, s)| (p == memory_path).then(|| s.clone()))
+        });
+    if let Some(store) = rw_reusable {
+        *guard = Some((memory_path.to_path_buf(), store.clone()));
+        tracing::debug!(path = %memory_path.display(), "memvid read-only reusing same-process read-write store");
+        return Ok(store);
+    }
+
+    // If file doesn't exist, create it with read-write (first-time init).
+    // Note: this grants write capability to a "read-only" caller; acceptable
+    // because no other process can hold the file yet (it did not exist).
     if !memory_path.exists() {
         tracing::debug!(
             path = %memory_path.display(),
@@ -103,7 +132,7 @@ fn get_or_init_memvid_store_ro(memory_path: &std::path::Path) -> Result<MemvidSt
 
     let memvid = memvid_core::Memvid::open_read_only(memory_path)?;
     let store = MemvidStore::from_memvid(memvid);
-    *guard = Some(store.clone());
+    *guard = Some((memory_path.to_path_buf(), store.clone()));
 
     tracing::debug!(path = %memory_path.display(), "memvid singleton initialized (read-only)");
     Ok(store)
@@ -114,13 +143,21 @@ pub struct ZenMemvidStore {
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
 }
 
-/// Reset global singletons for testing.
+/// Serializes tests that touch the memvid global singletons.
 ///
-/// Each test creates unique temp directories, but the singleton caches
-/// stores by path. Without resetting, a test might get a stale cached
-/// store from a previous test whose temp directory was cleaned up.
+/// The singletons are process-global and Rust runs test threads in
+/// parallel; without this lock, one test's reset can interleave between
+/// another test's reset and its init, so the victim silently reuses the
+/// wrong store and reads a foreign (possibly deleted) tempdir.
 #[cfg(test)]
-pub fn reset_singletons() {
+pub(crate) static SINGLETON_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reset both memvid singletons without taking the test lock.
+///
+/// Only for use while already holding [`SINGLETON_TEST_LOCK`] (e.g. to force
+/// a genuine re-open from disk mid-test without releasing serialization).
+#[cfg(test)]
+pub(crate) fn reset_singletons_unchecked() {
     if let Some(global) = GLOBAL_MEMVID_STORE.get()
         && let Ok(mut guard) = global.lock()
     {
@@ -131,6 +168,21 @@ pub fn reset_singletons() {
     {
         *guard = None;
     }
+}
+
+/// Acquire [`SINGLETON_TEST_LOCK`] and reset both singletons.
+///
+/// The returned guard keeps the caller serialized; drop it to release.
+/// Async tests must not hold a std guard across `.await` (not `Send`):
+/// scope it around store construction and drop before awaiting — the
+/// constructed store is an owned clone and safe to use afterwards.
+#[cfg(test)]
+pub(crate) fn lock_and_reset_singletons() -> std::sync::MutexGuard<'static, ()> {
+    let guard = SINGLETON_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    reset_singletons_unchecked();
+    guard
 }
 
 impl ZenMemvidStore {
@@ -736,7 +788,7 @@ mod tests {
 
     #[test]
     fn persist_structured_turn_creates_frame_and_card() {
-        reset_singletons();
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -758,7 +810,7 @@ mod tests {
 
     #[test]
     fn persist_structured_turn_enriched_options() {
-        reset_singletons();
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_enriched.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -787,10 +839,12 @@ mod tests {
 
     #[tokio::test]
     async fn retrieve_with_entity_context_enriches() {
-        reset_singletons();
-        let dir = tempdir().unwrap();
-        let memory_path = dir.path().join("test_enrich.mv2");
-        let store = ZenMemvidStore::new(memory_path).unwrap();
+        let (_dir, store) = {
+            let _guard = lock_and_reset_singletons();
+            let dir = tempdir().unwrap();
+            let memory_path = dir.path().join("test_enrich.mv2");
+            (dir, ZenMemvidStore::new(memory_path).unwrap())
+        };
 
         store
             .persist_structured_turn("session-1", "user", "I love Rust programming")
@@ -833,10 +887,12 @@ mod tests {
 
     #[tokio::test]
     async fn retrieve_with_entity_context_graceful_degradation() {
-        reset_singletons();
-        let dir = tempdir().unwrap();
-        let memory_path = dir.path().join("test_grace.mv2");
-        let store = ZenMemvidStore::new(memory_path).unwrap();
+        let (_dir, store) = {
+            let _guard = lock_and_reset_singletons();
+            let dir = tempdir().unwrap();
+            let memory_path = dir.path().join("test_grace.mv2");
+            (dir, ZenMemvidStore::new(memory_path).unwrap())
+        };
 
         store
             .persist_structured_turn("session-2", "user", "Hello world")
@@ -856,7 +912,7 @@ mod tests {
 
     #[test]
     fn put_entry_persists_and_retrievable() {
-        reset_singletons();
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_entry.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -897,7 +953,7 @@ mod tests {
 
     #[test]
     fn put_entry_with_knowledge_entity_type() {
-        reset_singletons();
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_entry_knowledge.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -920,7 +976,7 @@ mod tests {
             ContextItem, ContextOmissionReason, ContextSourceKind, OmittedContextItem,
         };
 
-        reset_singletons();
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_demotion.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -947,6 +1003,7 @@ mod tests {
 
     #[test]
     fn memvid_storing_compactor_no_eviction_under_window() {
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_compact_no_evict.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -962,7 +1019,7 @@ mod tests {
 
     #[test]
     fn memvid_store_new_raises_capacity_above_free_tier() {
-        reset_singletons();
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_capacity.mv2");
 
@@ -985,6 +1042,9 @@ mod tests {
 
         // Reopening an existing store must re-raise capacity (idempotent),
         // deriving seq_no from the current ticket so apply_ticket succeeds.
+        // Evict the cache so this is a genuine reopen from disk, not the
+        // cached handle (the outer guard stays held).
+        reset_singletons_unchecked();
         let reopened = ZenMemvidStore::new(memory_path).unwrap();
         let stats = reopened.store().stats().unwrap();
         assert!(
@@ -996,7 +1056,7 @@ mod tests {
 
     #[test]
     fn memvid_storing_compactor_evicts_excess() {
-        reset_singletons();
+        let _guard = lock_and_reset_singletons();
         let dir = tempdir().unwrap();
         let memory_path = dir.path().join("test_compact_evict.mv2");
         let store = ZenMemvidStore::new(memory_path).unwrap();
@@ -1014,6 +1074,40 @@ mod tests {
         assert_eq!(turns[0].1, "Turn 3");
         assert_eq!(turns[1].0, "assistant");
         assert_eq!(turns[1].1, "Turn 4");
+    }
+
+    #[test]
+    fn different_paths_yield_distinct_stores() {
+        let _guard = lock_and_reset_singletons();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+
+        let a = ZenMemvidStore::new(dir_a.path().join("a.mv2")).unwrap();
+        a.store()
+            .put_text("frame from store A", memvid_core::PutOptions::default())
+            .unwrap();
+
+        let b = ZenMemvidStore::new(dir_b.path().join("b.mv2")).unwrap();
+        assert_eq!(a.store().frame_count().unwrap(), 1);
+        assert_eq!(b.store().frame_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn read_only_reuses_same_process_write_store() {
+        let _guard = lock_and_reset_singletons();
+        let dir = tempdir().unwrap();
+        let memory_path = dir.path().join("ro_reuse.mv2");
+
+        let rw = ZenMemvidStore::new(memory_path.clone()).unwrap();
+        rw.store()
+            .put_text("payload", memvid_core::PutOptions::default())
+            .unwrap();
+
+        // A read-only open in a process that already holds the read-write
+        // store must reuse it: taking a second (shared) flock would conflict
+        // with the process's own exclusive lock and block ~10s before failing.
+        let ro = ZenMemvidStore::new_read_only(memory_path).unwrap();
+        assert_eq!(ro.store().frame_count().unwrap(), 1);
     }
 
     #[test]
