@@ -570,8 +570,11 @@ Body
     #[tokio::test]
     async fn test_create_note_populates_file_path() {
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: Single-threaded test, no concurrent env access
-        unsafe { std::env::set_var("ZEN_ROOT_DIR", dir.path()) };
+        // SAFETY: Single-threaded test, no concurrent env access.
+        // ZEN_HOME is the env var ZenPaths::detect() actually reads (via
+        // user_root()); ZEN_ROOT_DIR is legacy and ignored. Without this,
+        // create_note() writes into the real ~/.zen/vault/inbox/.
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
 
         let service = NoteService::new();
         let note = service
@@ -580,7 +583,7 @@ Body
             .unwrap();
 
         // SAFETY: Single-threaded test, no concurrent env access
-        unsafe { std::env::remove_var("ZEN_ROOT_DIR") };
+        unsafe { std::env::remove_var("ZEN_HOME") };
 
         assert!(
             note.file_path.is_some(),
@@ -592,8 +595,11 @@ Body
     #[tokio::test]
     async fn test_create_note_returns_correct_source() {
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: Single-threaded test, no concurrent env access
-        unsafe { std::env::set_var("ZEN_ROOT_DIR", dir.path()) };
+        // SAFETY: Single-threaded test, no concurrent env access.
+        // ZEN_HOME is the env var ZenPaths::detect() actually reads (via
+        // user_root()); ZEN_ROOT_DIR is legacy and ignored. Without this,
+        // create_note() writes into the real ~/.zen/vault/inbox/.
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
 
         let service = NoteService::new();
         let note = service
@@ -606,7 +612,7 @@ Body
             .unwrap();
 
         // SAFETY: Single-threaded test, no concurrent env access
-        unsafe { std::env::remove_var("ZEN_ROOT_DIR") };
+        unsafe { std::env::remove_var("ZEN_HOME") };
 
         assert_eq!(note.source, "my-source");
         assert_eq!(note.tags, vec!["a", "b"]);
