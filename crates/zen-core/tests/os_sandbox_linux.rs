@@ -159,7 +159,7 @@ fn test_os_sandbox_linux_workspace_write_allowed() {
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", &format!("touch {}/sandbox_test_file", ws.display())]);
 
-    let wrapped = match zen_core::sandbox::sandbox_spawn(cmd, &profile, false) {
+    let mut wrapped = match zen_core::sandbox::sandbox_spawn(cmd, &profile, false) {
         Ok(w) => w,
         Err(_) => return, // bwrap not installed, skip
     };
@@ -183,7 +183,7 @@ fn test_os_sandbox_linux_etc_write_denied() {
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", "touch /etc/zen_sandbox_test_write 2>&1 || exit 0"]);
 
-    let wrapped = match zen_core::sandbox::sandbox_spawn(cmd, &profile, false) {
+    let mut wrapped = match zen_core::sandbox::sandbox_spawn(cmd, &profile, false) {
         Ok(w) => w,
         Err(_) => return, // bwrap not installed, skip
     };
@@ -222,7 +222,7 @@ fn test_os_sandbox_linux_network_blocked() {
         "curl -s -o /dev/null https://example.com 2>&1 || echo CURL_FAILED",
     ]);
 
-    let wrapped = match zen_core::sandbox::sandbox_spawn(cmd, &profile, false) {
+    let mut wrapped = match zen_core::sandbox::sandbox_spawn(cmd, &profile, false) {
         Ok(w) => w,
         Err(_) => return, // bwrap not installed, skip
     };

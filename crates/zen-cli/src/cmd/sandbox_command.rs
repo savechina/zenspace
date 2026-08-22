@@ -388,12 +388,12 @@ fn check_sandbox_binary() -> Result<PathBuf, String> {
             return Ok(PathBuf::from("landlock"));
         }
 
-        return Err("bubblewrap (bwrap) not found\n\
+        Err("bubblewrap (bwrap) not found\n\
              On Linux, install bubblewrap:\n\
               Debian/Ubuntu: sudo apt install bubblewrap\n\
               Fedora/RHEL:   sudo dnf install bubblewrap\n\
               Arch:          sudo pacman -S bubblewrap"
-            .to_string());
+            .to_string())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
