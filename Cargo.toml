@@ -166,7 +166,8 @@ fastembed = { version = "5.17", default-features = false, features = ["hf-hub-ru
 wasmtime = { version = "47", features = ["component-model"] }
 wasmtime-wasi = { version = "47", features = ["p1", "p2", "p3"] }
 
-# Linux 3-layer sandbox (FR-028): landlock (filesystem) + seccompiler (seccomp-bpf)
+# Linux 3-layer sandbox (FR-028): bubblewrap (namespaces) + landlock (filesystem) + seccompiler (seccomp-bpf)
+# bubblewrap-sys bundles bwrap but requires Meson build system; use system package instead
 landlock = "0.4.7"
 seccompiler = "0.5.0"
 

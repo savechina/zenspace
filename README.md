@@ -45,8 +45,12 @@ Local-first by default. macOS Keychain for secrets. Sensitive data never touches
 ## 🚀 Quick Start
 
 ```bash
-# Install (macOS)
+# Install (macOS or Linux via Homebrew)
 brew install savechina/tap/zenspace
+
+# Install (Linux via cargo)
+sudo apt install bubblewrap  # Required for sandbox isolation
+cargo install zen
 
 # Initialize
 zen workspace init
@@ -66,7 +70,7 @@ zen search run "Q3 planning"
 
 | Section | Description |
 |---------|-------------|
-| [Installation](https://savechina.github.io/zenspace/installation.html) | Homebrew, source, binary |
+| [Installation](https://savechina.github.io/zenspace/installation.html) | Homebrew, source, binary (macOS & Linux) |
 | [Quick Start](https://savechina.github.io/zenspace/quickstart.html) | 5-minute walkthrough |
 | [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 29 commands |
 | [Providers & Auth](https://savechina.github.io/zenspace/configuration/providers.html) | 9 protocol types, API keys |
