@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Multi-model provider connections using rig-core for zenspace"
 
 [dependencies]
+url.workspace = true
 zen-core = { path = "../zen-core" }
 zen-auth = { path = "../zen-auth" }
 tokio = { workspace = true }

@@ -11,15 +11,21 @@ use zen_gateway::{HttpConfig, read_pid, remove_pid, write_pid};
 
 #[derive(Subcommand)]
 pub enum ServeCommands {
-    /// Start the gateway server
+    /// Start the gateway server (UDS sole-owner daemon by default)
     Start {
         /// Run in foreground (blocks)
         #[arg(long)]
         foreground: bool,
-        /// Bind address (default: 127.0.0.1)
+        /// Legacy HTTP gateway instead of the UDS daemon
+        #[arg(long)]
+        http: bool,
+        /// Quiet mode used by client-side auto-spawn (`--daemonized`)
+        #[arg(long)]
+        daemonized: bool,
+        /// Bind address (default: 127.0.0.1, HTTP mode only)
         #[arg(long)]
         bind: Option<String>,
-        /// Port (default: 9876)
+        /// Port (default: 9876, HTTP mode only)
         #[arg(long)]
         port: Option<u16>,
         /// Start as MCP stdio server (for external MCP clients)
@@ -39,6 +45,10 @@ pub enum ServeCommands {
 }
 
 const PID_FILE_NAME: &str = "daemon.pid";
+
+fn uds_socket_path() -> std::path::PathBuf {
+    zen_gateway::transport::uds::default_socket_path()
+}
 
 fn pid_path() -> Result<std::path::PathBuf, ZenError> {
     let paths = ZenPaths::detect()?;
@@ -86,6 +96,8 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
     match operation {
         ServeCommands::Start {
             foreground,
+            http,
+            daemonized,
             bind,
             port,
             mcp,
@@ -93,16 +105,40 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             if *mcp {
                 return run_mcp_stdio().await;
             }
+            if *http {
+                let path = pid_path()?;
+                check_stale_pid(&path)?;
+                return if *foreground {
+                    run_foreground(&path, bind.as_deref(), *port)
+                } else {
+                    run_background(&path, bind.as_deref(), *port)
+                };
+            }
             let path = pid_path()?;
             check_stale_pid(&path)?;
-
-            if *foreground {
-                run_foreground(&path, bind.as_deref(), *port)
-            } else {
-                run_background(&path, bind.as_deref(), *port)
-            }
+            ensure_pid_dir(&path);
+            write_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
+            run_uds_foreground(*daemonized).await
         }
         ServeCommands::Stop => {
+            // Preferred path: graceful `shutdown` RPC over the UDS socket.
+            if let Ok(client) = zen_gateway::client::GatewayClient::connect(uds_socket_path()).await
+            {
+                let _ = client
+                    .handshake("cli-stop", "0.0", Default::default())
+                    .await;
+                if let Ok(result) = client.request("shutdown", serde_json::json!({})).await {
+                    remove_pid(&pid_path()?).ok();
+                    println!(
+                        "{} Gateway stopped via socket (drained: {}, cancelled: {})",
+                        "✅".green(),
+                        result["drained"],
+                        result["cancelled"]
+                    );
+                    return Ok(());
+                }
+            }
+
             let path = pid_path()?;
             if !path.exists() {
                 println!("Gateway not running (no PID file)");
@@ -151,6 +187,32 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             Ok(())
         }
         ServeCommands::Status => {
+            // Preferred path: live health/status over the UDS socket.
+            if let Ok(client) = zen_gateway::client::GatewayClient::connect(uds_socket_path()).await
+                && client
+                    .handshake("cli-status", "0.0", Default::default())
+                    .await
+                    .is_ok()
+                && let Ok(s) = client.request("health/status", serde_json::json!({})).await
+            {
+                let pid = pid_path().ok().and_then(|p| read_pid(&p).ok());
+                println!("{} Gateway running (UDS)", "✅".green());
+                if let Some(p) = pid {
+                    println!("  PID: {}", p);
+                }
+                println!("  Socket: {}", uds_socket_path().display());
+                println!(
+                    "  Version: {} (protocol {})",
+                    s["serverVersion"], s["protocolVersion"]
+                );
+                println!("  Clients: {}", s["clients"]);
+                println!("  Store:   {}", s["storeHealth"]);
+                println!("  Uptime:  {}ms", s["uptimeMs"]);
+                println!("  Turns:   {}", s["activeTurns"]);
+                print_process_stats(pid.unwrap_or(0));
+                return Ok(());
+            }
+
             let path = pid_path().ok();
             let config = HttpConfig::default();
             let health_url = format!("http://{}:{}/health", config.bind_addr, config.port);
@@ -243,6 +305,85 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
 
             Ok(())
         }
+    }
+}
+
+async fn run_uds_foreground(quiet: bool) -> Result<(), ZenError> {
+    use zen_gateway::{GatewayDaemonConfig, GatewayService};
+
+    let config = GatewayDaemonConfig::default();
+    let socket = config.socket_path.display().to_string();
+
+    let zen_config = zen_core::config::load_config()?;
+    let scheduler = zen_agents::scheduler::create_configured_scheduler(&zen_config.cron);
+    tokio::spawn(async move {
+        scheduler.run().await;
+    });
+    info!("Background scheduler started");
+
+    if !quiet {
+        println!("{} Gateway daemon started", "✅".green());
+        println!("  Socket: {}", socket);
+        println!("\nPress Ctrl+C to stop");
+    }
+
+    // Graceful drain (T035): the signal flips the external shutdown
+    // watch; serve_with_shutdown drains in-flight turns inside its
+    // window, cancels stragglers with audits, then returns so we exit 0.
+    // Startup failure must surface IMMEDIATELY (codex app-server-daemon
+    // pattern) — never idle until a signal arrives.
+    let pid_file = pid_path()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+    let signal_tx = shutdown_tx.clone();
+    let serve_task = tokio::spawn(async move {
+        let result = GatewayService::serve_with_shutdown(config, shutdown_tx, shutdown_rx).await;
+        let _ = done_tx.send(());
+        result
+    });
+    tokio::select! {
+        _ = &mut done_rx => {
+            remove_pid(&pid_file).ok();
+            match serve_task.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(ZenError::Service(format!(
+                    "gateway failed to start: {e} — fix the cause or run 'zen serve start' in foreground"
+                ))),
+                Err(e) => Err(ZenError::Service(format!("gateway task panicked: {e}"))),
+            }
+        }
+        _ = wait_for_stop_signal() => {
+            signal_tx.send_replace(true);
+            match serve_task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(ZenError::Service(format!("gateway drain failed: {e}"))),
+                Err(e) => return Err(ZenError::Service(format!("gateway task panicked: {e}"))),
+            }
+            remove_pid(&pid_file).ok();
+            if !quiet {
+                println!("\nGateway stopped");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Async twin of [`block_until_signal`]: resolves on SIGINT/SIGTERM so
+/// the surrounding `select!` can race it against early task completion.
+async fn wait_for_stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

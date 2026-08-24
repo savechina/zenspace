@@ -9,6 +9,7 @@ zen-vault = { path = "../zen-vault" }
 zen-agents = { path = "../zen-agents" }
 zen-provider = { path = "../zen-provider" }
 zen-memory = { path = "../zen-memory" }
+zen-repo = { path = "../zen-repo" }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
@@ -23,6 +24,8 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 uuid = { workspace = true }
+async-trait = { workspace = true }
+rig-memvid = { workspace = true }
 rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
 

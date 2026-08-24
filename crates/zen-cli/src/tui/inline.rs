@@ -306,9 +306,9 @@ fn run_inline_session(
         scheduler.run().await;
     });
 
-    // T053: pre-warm orchestrator + knowledge DB in the background so the
-    // first Enter does not pay the ~10s cold-start price on this thread.
-    super::prewarm::spawn(config);
+    // T053: pre-warm the gateway link in the background so the
+    // first Enter does not pay the cold-start price on this thread.
+    super::prewarm::spawn();
 
     super::scrollback_inserter::insert_scrollback_queue(terminal, &mut app.scrollback_queue)?;
 
@@ -685,9 +685,9 @@ mod tests {
             (elapsed, app, terminal)
         });
 
-        // Don't let the runtime drop join the background orchestrator build
-        // (`start_async_chat` spawn_blocking) — that wait is ~10s locally and
-        // ~27s under CI load. Abort the runtime instead; the asserts below
+        // Don't let the runtime drop join background turn work
+        // (the `start_async_chat` gateway producer) — a hosted turn can
+        // take seconds. Abort the runtime instead; the asserts below
         // only need the app state the tick produced.
         rt.shutdown_background();
 

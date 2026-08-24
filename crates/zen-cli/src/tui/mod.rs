@@ -1,5 +1,4 @@
 mod app;
-pub mod approval_callback;
 pub mod cell;
 mod clipboard;
 mod handler;

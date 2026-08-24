@@ -12,6 +12,52 @@ use zen_provider::LlmRouter;
 /// Max silence between streamed tokens before the unfold fails the stream.
 const STREAM_INACTIVITY_TIMEOUT_SECS: u64 = 120;
 
+/// Budget for the FIRST token only: local models (e.g. 30B+ on Ollama)
+/// spend minutes on cold model load + long-prompt prefill before any
+/// token exists — the inter-token budget must not govern that window.
+const STREAM_FIRST_TOKEN_TIMEOUT_SECS: u64 = 600;
+
+/// Env override keys (parsed once per process):
+/// `ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS`, `ZEN_STREAM_INACTIVITY_TIMEOUT_SECS`.
+fn env_budget(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The timeout applying to the next `token_rx.recv()` poll: the first
+/// token gets the long cold-start budget, every later token the short
+/// inactivity budget.
+fn stream_budget(
+    is_first_token: bool,
+    first_token_secs: u64,
+    inactivity_secs: u64,
+) -> std::time::Duration {
+    std::time::Duration::from_secs(if is_first_token {
+        first_token_secs
+    } else {
+        inactivity_secs
+    })
+}
+
+fn stream_budget_for_next(token_count: usize) -> std::time::Duration {
+    static BUDGETS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (first, inactivity) = *BUDGETS.get_or_init(|| {
+        (
+            env_budget(
+                "ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS",
+                STREAM_FIRST_TOKEN_TIMEOUT_SECS,
+            ),
+            env_budget(
+                "ZEN_STREAM_INACTIVITY_TIMEOUT_SECS",
+                STREAM_INACTIVITY_TIMEOUT_SECS,
+            ),
+        )
+    });
+    stream_budget(token_count == 0, first, inactivity)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ZenCompletionResponse {
     text: String,
@@ -152,11 +198,8 @@ impl CompletionModel for ZenCompletionModel {
         > = Box::pin(futures::stream::unfold(
             state,
             |(mut token_rx, mut done_rx, mut collected, mut token_count, provider_name)| async move {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(STREAM_INACTIVITY_TIMEOUT_SECS),
-                    token_rx.recv(),
-                )
-                .await
+                match tokio::time::timeout(stream_budget_for_next(token_count), token_rx.recv())
+                    .await
                 {
                     Ok(Some(token)) => {
                         collected.push_str(&token);
@@ -208,10 +251,15 @@ impl CompletionModel for ZenCompletionModel {
                             response_len = collected.len(),
                             "completion_model: LLM stream timed out waiting for tokens"
                         );
+                        let reason = if token_count == 0 {
+                            "streaming timed out before the first token \
+                             (cold model load or long prefill; tune \
+                             ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS)"
+                        } else {
+                            "streaming timed out: no tokens received"
+                        };
                         Some((
-                            Err(CompletionError::ProviderError(
-                                "streaming timed out: no tokens received".into(),
-                            )),
+                            Err(CompletionError::ProviderError(reason.into())),
                             (token_rx, done_rx, collected, token_count, provider_name),
                         ))
                     }
@@ -347,5 +395,29 @@ mod tests {
 
         let prompt = extract_last_user_prompt(&request);
         assert_eq!(prompt, "Hello");
+    }
+
+    #[test]
+    fn stream_budget_first_token_uses_cold_start_budget() {
+        assert_eq!(
+            stream_budget(true, 600, 120),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn stream_budget_subsequent_tokens_use_inactivity_budget() {
+        assert_eq!(
+            stream_budget(false, 600, 120),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn env_budget_falls_back_to_default_on_missing_or_malformed() {
+        // Not setting the env var (other tests may run in parallel and
+        // mutating the process env would race): only the fallback path
+        // is asserted here.
+        assert_eq!(env_budget("ZEN_TEST_DEFINITELY_UNSET_ENV_KEY", 42), 42);
     }
 }

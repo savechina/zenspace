@@ -22,18 +22,44 @@ impl OllamaProvider {
         Self { base_url, model }
     }
 
+    /// Builds the rig Ollama client. Loopback endpoints bypass
+    /// HTTP(S)_PROXY env vars: routing 127.0.0.1 through a system proxy
+    /// (Privoxy et al) yields 500s and breaks every local completion.
+    fn rig_client(&self) -> Result<ollama::Client, LlmError> {
+        let http = if is_loopback_url(&self.base_url) {
+            Some(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .map_err(|e| LlmError::Call {
+                        reason: format!("Failed to build Ollama http client: {}", e),
+                    })?,
+            )
+        } else {
+            None
+        };
+        match http {
+            Some(http) => ollama::Client::builder()
+                .api_key(Nothing)
+                .base_url(&self.base_url)
+                .http_client(http)
+                .build(),
+            None => ollama::Client::builder()
+                .api_key(Nothing)
+                .base_url(&self.base_url)
+                .build(),
+        }
+        .map_err(|e| LlmError::Call {
+            reason: format!("Failed to create Ollama client: {}", e),
+        })
+    }
+
     pub async fn complete_async(
         &self,
         prompt: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<String, LlmError> {
-        let client = ollama::Client::builder()
-            .api_key(Nothing)
-            .base_url(&self.base_url)
-            .build()
-            .map_err(|e| LlmError::Call {
-                reason: format!("Failed to create Ollama client: {}", e),
-            })?;
+        let client = self.rig_client()?;
 
         let model = client.completion_model(&self.model);
         let mut agent_builder = AgentBuilder::new(model);
@@ -93,13 +119,7 @@ impl OllamaProvider {
         token_tx: mpsc::UnboundedSender<String>,
         options: &zen_core::config::ModelOptions,
     ) -> Result<(), LlmError> {
-        let client = ollama::Client::builder()
-            .api_key(Nothing)
-            .base_url(&self.base_url)
-            .build()
-            .map_err(|e| LlmError::Call {
-                reason: format!("Failed to create Ollama client: {}", e),
-            })?;
+        let client = self.rig_client()?;
 
         let model = client.completion_model(&self.model);
 
@@ -146,10 +166,11 @@ impl OllamaProvider {
     }
 
     pub fn health_check(&self) -> bool {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
+        let mut b = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
+        if is_loopback_url(&self.base_url) {
+            b = b.no_proxy();
+        }
+        let client = b.build().unwrap_or_default();
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
         match client.get(&url).send() {
             Ok(resp) => resp.status().is_success(),
@@ -159,4 +180,15 @@ impl OllamaProvider {
             }
         }
     }
+}
+
+fn is_loopback_url(base_url: &str) -> bool {
+    let host = url::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    // `host_str` serializes IPv6 hosts with brackets — strip before matching.
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    // `0.0.0.0` (unspecified) also never leaves the machine.
+    host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0"
 }

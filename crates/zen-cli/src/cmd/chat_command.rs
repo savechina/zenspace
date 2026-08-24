@@ -1,14 +1,9 @@
 use clap::Parser;
 use colored::Colorize;
-use std::io::{self, Write};
 use tracing::debug;
 
-use zen_agents::AgentOrchestrator;
-use zen_core::config::load_config;
-use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::errors::ZenError;
-use zen_core::types::SessionContext;
-use zen_provider::DefaultRouter;
+use zen_gateway::client::SurfaceClient;
 
 #[derive(Parser)]
 pub struct ChatArgs {
@@ -19,108 +14,56 @@ pub struct ChatArgs {
     agent: Option<String>,
 }
 
+/// US3 gateway path (T022): the turn executes on the sole-owner daemon
+/// via `session/turn`; knowledge context arrives via `knowledge/search`.
+/// `ZEN_ASK_FOR_APPROVAL` has no client-side effect here — hosted turns
+/// run under the daemon-side approval policy until Q3 routing lands
+/// with US4 (T030). Journal persistence stays local (fire-and-forget).
 pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
     let ChatArgs { message, agent } = args;
     debug!("chat: {} (agent: {:?})", message, agent);
 
-    let config = load_config().map_err(|e| ZenError::Message(format!("Config error: {}", e)))?;
-
-    let router = DefaultRouter::from_agentic(config);
-    let orchestrator = match zen_core::paths::ZenPaths::detect() {
-        Ok(paths) => {
-            let mem_dir = paths.memory();
-            std::fs::create_dir_all(&mem_dir).ok();
-            let store_path = mem_dir.join(MEMVID_STORE_FILE);
-            match AgentOrchestrator::new(router.clone()).with_memory_read_only(store_path) {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to init memory store for CLI chat, continuing without memory");
-                    AgentOrchestrator::new(DefaultRouter::from_agentic(config))
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to detect Zen paths for CLI chat");
-            AgentOrchestrator::new(router.clone())
-        }
-    };
-    let orchestrator = if let Ok(policy) = std::env::var("ZEN_ASK_FOR_APPROVAL") {
-        if !policy.is_empty() {
-            use zen_core::sandbox::SandboxMode;
-            let cb = crate::tui::approval_callback::create_approval_callback();
-            orchestrator
-                .with_sandbox_mode(SandboxMode::Ask)
-                .with_approval_callback(cb)
-        } else {
-            orchestrator
-        }
-    } else {
-        orchestrator
-    };
-    let mut session = SessionContext::new("default".to_string(), String::new());
-
-    if let Some(name) = agent {
-        session.agent_name = name.clone();
+    if std::env::var("ZEN_ASK_FOR_APPROVAL").is_ok_and(|p| !p.is_empty()) {
+        tracing::info!(
+            "ZEN_ASK_FOR_APPROVAL set: hosted turns use the daemon-side approval policy \
+             (Q3 routing lands with US4)"
+        );
     }
 
-    if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
-        use zen_vault::search::{SearchService, TierSelector};
-        let service = SearchService::new(router.clone());
-        let tier = TierSelector::select_tier(message);
-        let mut seen = std::collections::HashSet::new();
+    let surface = SurfaceClient::open_default("zen-chat", env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|e| ZenError::Message(format!("gateway: {}", e)))?;
 
-        let db_path = paths.data().join("state.db");
-        let client = match zen_repo::SqliteClient::open(&db_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to create database client for chat search");
-                return Err(ZenError::Message(format!("Database error: {}", e)));
-            }
-        };
+    let session_id = surface
+        .ensure_session(None, agent.as_deref())
+        .await
+        .map_err(|e| ZenError::Message(format!("gateway: {}", e)))?;
 
-        for dir in [paths.inbox(), paths.wiki()] {
-            if let Ok(results) = service
-                .search(message, &dir, &client, Some(tier), None, None)
-                .await
-            {
-                for r in results {
-                    if seen.insert(r.file.clone()) {
-                        session.knowledge.push(zen_core::types::RetrievedNote {
-                            path: r.file.display().to_string(),
-                            content: r.content,
-                            sensitivity: zen_core::types::Sensitivity::Public,
-                            relevance: 1.0,
-                        });
-                    }
-                }
-            }
-        }
-
-        if !session.knowledge.is_empty() {
-            tracing::info!(
-                count = session.knowledge.len(),
-                "Knowledge context injected for CLI chat"
-            );
-        }
+    let knowledge = surface
+        .search_knowledge(message, None, 5)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "knowledge/search failed — continuing without context");
+            Vec::new()
+        });
+    if !knowledge.is_empty() {
+        tracing::info!(
+            count = knowledge.len(),
+            "Knowledge context injected for CLI chat (gateway)"
+        );
     }
 
-    let agent_label = session.agent_name.clone();
+    let agent_label = agent.clone().unwrap_or_else(|| "auto".to_string());
     println!("{} {}", "[Agent]".cyan().bold(), agent_label);
-    print!("\x1b[?25l");
-    io::stdout().flush().ok();
+    println!("{}", surface.link_state().banner().dimmed());
 
-    let result = orchestrator
-        .execute_stream(&mut session, message, |token| {
-            print!("{}", token);
-            io::stdout().flush().ok();
-        })
+    let result = surface
+        .turn_with_recovery(&session_id, message, knowledge)
         .await;
-
-    print!("\x1b[?25h");
-    println!();
 
     match result {
         Ok(response) => {
+            println!("{response}");
             println!(
                 "\n{} {} tokens",
                 "\u{2713}".green().bold(),
@@ -129,11 +72,10 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
 
             if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
                 let summary = format!(
-                    "Chat with {} agent — {} tokens.",
-                    session.agent_name,
+                    "Chat with {agent_label} agent — {} tokens.",
                     response.len() / 4
                 );
-                tracing::debug!(agent = %session.agent_name, "writing daily log entry for CLI chat");
+                tracing::debug!(agent = %agent_label, "writing daily log entry for CLI chat");
                 if let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary) {
                     tracing::warn!(error = %e, "failed to write daily journal entry for CLI chat");
                 }

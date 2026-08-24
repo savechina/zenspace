@@ -18,8 +18,13 @@ pub const TRIPLET_MIN_CONFIDENCE: f32 = 0.8;
 /// CapacityExceeded. We open the raw `Memvid` and raise the cap before wrapping.
 pub const MEMVID_CAPACITY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Keyed single-entry singleton cache: (store path, shared store handle).
-type MemvidCache = Arc<Mutex<Option<(std::path::PathBuf, MemvidStore)>>>;
+/// Path-keyed singleton cache: canonical store path -> shared handle.
+///
+/// Multiple distinct `.mv2` files may legitimately coexist in one process
+/// (e.g. a gateway serving a test/tmp store while `ZenWiring` opens the
+/// user's real store); a single-slot cache would silently evict one and
+/// deadlock the other behind its own file lock.
+type MemvidCache = Arc<Mutex<std::collections::HashMap<std::path::PathBuf, MemvidStore>>>;
 
 /// Global singleton for the memvid store (read-write, exclusive lock).
 ///
@@ -29,9 +34,9 @@ type MemvidCache = Arc<Mutex<Option<(std::path::PathBuf, MemvidStore)>>>;
 /// would each spawn a separate file watcher thread, causing the
 /// "Failed to open meta file" warning every 500ms.
 ///
-/// The cache is keyed by path: a request for a different path replaces the
-/// cached entry (production uses one memory file per process). The store is
-/// lazily initialized on first access and shared via `Arc` across all
+/// The cache is keyed by path so concurrently-used stores coexist; each
+/// path still maps to exactly ONE `Memvid` instance per process. The store
+/// is lazily initialized on first access and shared via `Arc` across all
 /// callers. Clones are cheap (shared `Arc<Mutex<MemvidStore>>`).
 static GLOBAL_MEMVID_STORE: OnceLock<MemvidCache> = OnceLock::new();
 
@@ -42,21 +47,40 @@ static GLOBAL_MEMVID_STORE: OnceLock<MemvidCache> = OnceLock::new();
 /// can coexist via shared file locks.
 static GLOBAL_MEMVID_STORE_RO: OnceLock<MemvidCache> = OnceLock::new();
 
+/// Drops the process-wide singleton caches (rw + read-only), releasing
+/// the underlying `Memvid` instances and their tantivy watcher threads.
+///
+/// PURPOSE: The singletons intentionally live for the whole process in
+/// daemons/CLIs; long-lived test binaries and graceful-drain paths
+/// (gateway T035) need an explicit release so background threads can
+/// exit and the process can terminate.
+pub fn clear_global_memvid_cache() {
+    if let Some(cache) = GLOBAL_MEMVID_STORE.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        guard.clear();
+    }
+    if let Some(cache) = GLOBAL_MEMVID_STORE_RO.get()
+        && let Ok(mut guard) = cache.lock()
+    {
+        guard.clear();
+    }
+}
+
 /// Get or initialize the global memvid store singleton (read-write).
 ///
 /// Returns a clone of the shared `MemvidStore`. The underlying `Memvid`
 /// instance (and its tantivy file watcher) is created only once.
 /// Acquires an exclusive file lock — blocks until all readers release.
 fn get_or_init_memvid_store(memory_path: &std::path::Path) -> Result<MemvidStore> {
-    let global = GLOBAL_MEMVID_STORE.get_or_init(|| Arc::new(Mutex::new(None)));
+    let global =
+        GLOBAL_MEMVID_STORE.get_or_init(|| Arc::new(Mutex::new(std::collections::HashMap::new())));
 
     let mut guard = global
         .lock()
         .map_err(|e| anyhow::anyhow!("memvid singleton lock poisoned: {e}"))?;
 
-    if let Some((cached_path, store)) = &*guard
-        && cached_path == memory_path
-    {
+    if let Some(store) = guard.get(memory_path) {
         return Ok(store.clone());
     }
 
@@ -77,7 +101,7 @@ fn get_or_init_memvid_store(memory_path: &std::path::Path) -> Result<MemvidStore
     }
 
     let store = MemvidStore::from_memvid(memvid);
-    *guard = Some((memory_path.to_path_buf(), store.clone()));
+    guard.insert(memory_path.to_path_buf(), store.clone());
 
     tracing::debug!(path = %memory_path.display(), "memvid singleton initialized (read-write)");
     Ok(store)
@@ -89,15 +113,14 @@ fn get_or_init_memvid_store(memory_path: &std::path::Path) -> Result<MemvidStore
 /// which acquires a shared file lock — multiple readers can coexist.
 /// Falls back to read-write if the file doesn't exist yet (first-time init).
 fn get_or_init_memvid_store_ro(memory_path: &std::path::Path) -> Result<MemvidStore> {
-    let global = GLOBAL_MEMVID_STORE_RO.get_or_init(|| Arc::new(Mutex::new(None)));
+    let global = GLOBAL_MEMVID_STORE_RO
+        .get_or_init(|| Arc::new(Mutex::new(std::collections::HashMap::new())));
 
     let mut guard = global
         .lock()
         .map_err(|e| anyhow::anyhow!("memvid read-only singleton lock poisoned: {e}"))?;
 
-    if let Some((cached_path, store)) = &*guard
-        && cached_path == memory_path
-    {
+    if let Some(store) = guard.get(memory_path) {
         return Ok(store.clone());
     }
 
@@ -109,12 +132,9 @@ fn get_or_init_memvid_store_ro(memory_path: &std::path::Path) -> Result<MemvidSt
     let rw_reusable = GLOBAL_MEMVID_STORE
         .get()
         .and_then(|g| g.lock().ok())
-        .and_then(|g| {
-            g.as_ref()
-                .and_then(|(p, s)| (p == memory_path).then(|| s.clone()))
-        });
+        .and_then(|g| g.get(memory_path).cloned());
     if let Some(store) = rw_reusable {
-        *guard = Some((memory_path.to_path_buf(), store.clone()));
+        guard.insert(memory_path.to_path_buf(), store.clone());
         tracing::debug!(path = %memory_path.display(), "memvid read-only reusing same-process read-write store");
         return Ok(store);
     }
@@ -132,7 +152,7 @@ fn get_or_init_memvid_store_ro(memory_path: &std::path::Path) -> Result<MemvidSt
 
     let memvid = memvid_core::Memvid::open_read_only(memory_path)?;
     let store = MemvidStore::from_memvid(memvid);
-    *guard = Some((memory_path.to_path_buf(), store.clone()));
+    guard.insert(memory_path.to_path_buf(), store.clone());
 
     tracing::debug!(path = %memory_path.display(), "memvid singleton initialized (read-only)");
     Ok(store)
@@ -161,12 +181,12 @@ pub(crate) fn reset_singletons_unchecked() {
     if let Some(global) = GLOBAL_MEMVID_STORE.get()
         && let Ok(mut guard) = global.lock()
     {
-        *guard = None;
+        guard.clear();
     }
     if let Some(global) = GLOBAL_MEMVID_STORE_RO.get()
         && let Ok(mut guard) = global.lock()
     {
-        *guard = None;
+        guard.clear();
     }
 }
 
