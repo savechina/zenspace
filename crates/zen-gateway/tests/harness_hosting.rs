@@ -21,7 +21,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use zen_core::types::SessionContext;
 use zen_gateway::protocol::{Capabilities, Frame};
@@ -39,25 +38,24 @@ struct ScriptedExec {
     delay_ms: u64,
 }
 
+#[async_trait::async_trait]
 impl TurnExecutor for ScriptedExec {
-    fn execute_stream<'a>(
-        &'a self,
-        _session: &'a mut SessionContext,
-        _prompt: &'a str,
-        mut on_token: Box<dyn FnMut(&str) + Send>,
-    ) -> BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async move {
-            if self.delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-            }
-            on_token("al");
-            on_token("pha ");
-            if self.delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-            }
-            on_token("beta");
-            Ok("alpha beta".to_string())
-        })
+    async fn execute_stream(
+        &self,
+        _session: &mut SessionContext,
+        _prompt: &str,
+        mut on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+    ) -> anyhow::Result<String> {
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+        on_token("al");
+        on_token("pha ");
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+        on_token("beta");
+        Ok("alpha beta".to_string())
     }
 }
 

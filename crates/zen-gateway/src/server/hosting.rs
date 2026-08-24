@@ -36,7 +36,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use zen_core::types::{RetrievedNote, SessionContext};
@@ -57,28 +56,28 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 /// One-method adapter around the agent stack so hosted execution is
 /// drivable by scripted fakes in tests (the daemon binds the real
 /// [`zen_agents::AgentOrchestrator`]).
+#[async_trait::async_trait]
 pub trait TurnExecutor: Send + Sync {
     /// Streams a hosted turn, invoking `on_token` per streamed fragment
     /// and returning the final response text.
-    fn execute_stream<'a>(
-        &'a self,
-        session: &'a mut SessionContext,
-        prompt: &'a str,
-        on_token: Box<dyn FnMut(&str) + Send>,
-    ) -> BoxFuture<'a, anyhow::Result<String>>;
+    async fn execute_stream(
+        &self,
+        session: &mut SessionContext,
+        prompt: &str,
+        on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+    ) -> anyhow::Result<String>;
 }
 
+#[async_trait::async_trait]
 impl TurnExecutor for zen_agents::AgentOrchestrator {
-    fn execute_stream<'a>(
-        &'a self,
-        session: &'a mut SessionContext,
-        prompt: &'a str,
-        mut on_token: Box<dyn FnMut(&str) + Send>,
-    ) -> BoxFuture<'a, anyhow::Result<String>> {
-        Box::pin(async move {
-            self.execute_stream(session, prompt, |tok: &str| on_token(tok))
-                .await
-        })
+    async fn execute_stream(
+        &self,
+        session: &mut SessionContext,
+        prompt: &str,
+        mut on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+    ) -> anyhow::Result<String> {
+        self.execute_stream(session, prompt, |tok| on_token(tok))
+            .await
     }
 }
 
@@ -931,24 +930,23 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl TurnExecutor for TestExec {
-        fn execute_stream<'a>(
-            &'a self,
-            _session: &'a mut SessionContext,
-            _prompt: &'a str,
-            mut on_token: Box<dyn FnMut(&str) + Send>,
-        ) -> BoxFuture<'a, anyhow::Result<String>> {
-            Box::pin(async move {
-                self.runs.fetch_add(1, Ordering::SeqCst);
-                let delay = *self.delay_ms.lock().unwrap();
-                if delay > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                }
-                on_token("hel");
-                on_token("lo ");
-                on_token("world");
-                Ok("hello world".to_string())
-            })
+        async fn execute_stream(
+            &self,
+            _session: &mut SessionContext,
+            _prompt: &str,
+            mut on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+        ) -> anyhow::Result<String> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let delay = *self.delay_ms.lock().unwrap();
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            on_token("hel");
+            on_token("lo ");
+            on_token("world");
+            Ok("hello world".to_string())
         }
     }
 

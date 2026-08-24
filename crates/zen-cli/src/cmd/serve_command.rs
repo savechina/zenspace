@@ -105,20 +105,18 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             if *mcp {
                 return run_mcp_stdio().await;
             }
-            if *http {
-                let path = pid_path()?;
-                check_stale_pid(&path)?;
-                return if *foreground {
-                    run_foreground(&path, bind.as_deref(), *port)
-                } else {
-                    run_background(&path, bind.as_deref(), *port)
-                };
-            }
             let path = pid_path()?;
             check_stale_pid(&path)?;
             ensure_pid_dir(&path);
+            // `--http` now enables the loopback HTTP carrier alongside the
+            // UDS daemon (T046: legacy HttpGateway retired); env opt-in
+            // also honored per FR-019 config layering.
+            let http_cfg = resolve_http_carrier(*http, bind.as_deref(), *port);
             write_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
-            run_uds_foreground(*daemonized).await
+            if *foreground {
+                return run_uds_foreground(*daemonized, http_cfg).await;
+            }
+            run_background(&path, http_cfg)
         }
         ServeCommands::Stop => {
             // Preferred path: graceful `shutdown` RPC over the UDS socket.
@@ -308,10 +306,47 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
     }
 }
 
-async fn run_uds_foreground(quiet: bool) -> Result<(), ZenError> {
+/// Resolves the loopback HTTP carrier config from the `--http` flag,
+/// `--bind`/`--port` args, and the `ZEN_GATEWAY_HTTP_*` env layer.
+/// Explicit flag wins; env enables when the flag is absent.
+fn resolve_http_carrier(
+    http_flag: bool,
+    bind: Option<&str>,
+    port: Option<u16>,
+) -> Option<zen_gateway::transport::http::HttpCarrierConfig> {
+    let defaults = HttpConfig::default();
+    let env_enabled = std::env::var("ZEN_GATEWAY_HTTP_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let enabled = http_flag || env_enabled;
+    if !enabled {
+        return None;
+    }
+    Some(zen_gateway::transport::http::HttpCarrierConfig {
+        bind_addr: bind
+            .map(str::to_string)
+            .or_else(|| std::env::var("ZEN_GATEWAY_HTTP_BIND_ADDR").ok())
+            .unwrap_or_else(|| defaults.bind_addr.clone()),
+        port: port
+            .or_else(|| {
+                std::env::var("ZEN_GATEWAY_HTTP_PORT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(defaults.port),
+    })
+}
+
+async fn run_uds_foreground(
+    quiet: bool,
+    http_cfg: Option<zen_gateway::transport::http::HttpCarrierConfig>,
+) -> Result<(), ZenError> {
     use zen_gateway::{GatewayDaemonConfig, GatewayService};
 
-    let config = GatewayDaemonConfig::default();
+    let config = GatewayDaemonConfig {
+        http: http_cfg,
+        ..GatewayDaemonConfig::default()
+    };
     let socket = config.socket_path.display().to_string();
 
     let zen_config = zen_core::config::load_config()?;
@@ -387,62 +422,22 @@ async fn wait_for_stop_signal() {
     }
 }
 
-fn run_foreground(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<(), ZenError> {
-    use zen_gateway::{Gateway, HttpGateway};
-
-    let mut config = HttpConfig::default();
-    if let Some(b) = bind {
-        config.bind_addr = b.to_string();
-    }
-    if let Some(p) = port {
-        config.port = p;
-    }
-
-    let port = config.port;
-    let bind_addr = config.bind_addr.clone();
-
-    let mut gw = HttpGateway::new(config);
-    gw.start(port)
-        .map_err(|e| ZenError::Service(e.to_string()))?;
-
-    write_pid(path).ok();
-
-    let zen_config = zen_core::config::load_config()?;
-    let scheduler = zen_agents::scheduler::create_configured_scheduler(&zen_config.cron);
-    tokio::spawn(async move {
-        scheduler.run().await;
-    });
-    info!("Background scheduler started");
-
-    println!("{} Gateway started", "✅".green());
-    println!("  Listening on http://{}:{}", bind_addr, port);
-    println!("  Health: http://{}:{}/health", bind_addr, port);
-    println!("  API:    http://{}:{}/api/v1/", bind_addr, port);
-    println!("  WS:     ws://{}:{}/api/v1/ws", bind_addr, port);
-    println!("\nPress Ctrl+C to stop");
-
-    block_until_signal();
-
-    if let Err(e) = gw.stop() {
-        tracing::warn!(error = %e, "failed to stop gateway cleanly");
-    }
-    remove_pid(path).ok();
-    println!("\nGateway stopped");
-    Ok(())
-}
-
-fn run_background(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<(), ZenError> {
+fn run_background(
+    path: &Path,
+    http_cfg: Option<zen_gateway::transport::http::HttpCarrierConfig>,
+) -> Result<(), ZenError> {
     let exe = std::env::current_exe().map_err(|e| ZenError::Service(e.to_string()))?;
 
     let mut cmd = Command::new(&exe);
     cmd.arg("serve").arg("start").arg("--foreground");
 
-    if let Some(b) = bind {
-        cmd.arg("--bind").arg(b);
+    if http_cfg.is_some() {
+        cmd.arg("--http");
     }
-    if let Some(p) = port {
-        cmd.arg("--port").arg(p.to_string());
-    }
+    cmd.env(
+        "ZEN_GATEWAY_HTTP_ENABLED",
+        if http_cfg.is_some() { "1" } else { "0" },
+    );
 
     cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -471,17 +466,15 @@ fn run_background(path: &Path, bind: Option<&str>, port: Option<u16>) -> Result<
         ensure_pid_dir(path);
         write_pid(path).map_err(|e| ZenError::Service(e.to_string()))?;
 
-        let config = HttpConfig::default();
-        let port = port.unwrap_or(config.port);
-        let bind_addr = bind.unwrap_or(&config.bind_addr);
-
         println!(
             "{} Gateway started (background, pid: {})",
             "✅".green(),
             child_pid
         );
-        println!("  Listening on http://{}:{}", bind_addr, port);
-        println!("  Health: http://{}:{}/health", bind_addr, port);
+        if let Some(cfg) = &http_cfg {
+            println!("  HTTP:     http://{}:{}/health", cfg.bind_addr, cfg.port);
+        }
+        println!("  Socket:   {}", uds_socket_path().display());
         println!("  PID file: {}", path.display());
         println!("  Run 'zen serve stop' to stop");
     } else {
@@ -534,39 +527,6 @@ fn print_process_stats(pid: u32) {
                 }
             }
         }
-    }
-}
-
-#[cfg(unix)]
-fn block_until_signal() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static STOP: AtomicBool = AtomicBool::new(false);
-
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            signal_handler as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            signal_handler as *const () as libc::sighandler_t,
-        );
-    }
-
-    while !STOP.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    extern "C" fn signal_handler(_sig: i32) {
-        STOP.store(true, Ordering::Relaxed);
-    }
-}
-
-#[cfg(not(unix))]
-fn block_until_signal() {
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
     }
 }
 

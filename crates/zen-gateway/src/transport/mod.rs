@@ -15,6 +15,7 @@
 //! ERRORS: Recv on a closed channel returns an error (peer gone); the L3
 //! client treats this as a disconnect event.
 
+pub mod http;
 pub mod in_process;
 pub mod uds;
 

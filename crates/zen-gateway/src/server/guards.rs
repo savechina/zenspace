@@ -11,7 +11,7 @@
 //! USAGE: `HostingDeps` carries an [`Arc<Guards>`]; the turn handler
 //! calls [`Guards::check_submit`] before creating a record and
 //! [`Guards::record_success`]/[`record_failure`] after execution. Every
-//! rejection returns -32020 `guardRejected{guard, reason}` and appends
+//! rejection returns -32020 `guard-rejected{guard, reason}` and appends
 //! an audit line when a sink is configured.
 //!
 //! EXPECTED: rejections are cheap synchronous checks; breaker recovery
@@ -161,7 +161,7 @@ pub fn audit_rejection(sink: Option<&std::path::PathBuf>, guard: &str, reason: &
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis().to_string())
                 .unwrap_or_else(|_| "0".to_string()),
-            "kind": "gateway.guardRejected",
+            "kind": "gateway.guard_rejected",
             "guard": guard,
             "reason": reason,
         })

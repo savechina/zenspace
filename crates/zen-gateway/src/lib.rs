@@ -40,18 +40,14 @@
 //! Closed catalog `-32000..-32099` per contract 01 — codes never change
 //! meaning; additions require a MINOR version bump.
 
-pub use gateway_error::GatewayError;
-pub use gateway_trait::{Gateway, GatewayStatus};
-
 mod daemon;
-mod gateway_error;
-mod gateway_trait;
+// Pre-004 batching experiment (analyze F7): no production callers since the
+// legacy HTTP stack retired; retained with its unit tests for future use.
+#[allow(dead_code)]
 mod inference_gateway;
-mod routes;
 pub mod subconscious;
 
 pub mod client;
-pub mod cron;
 pub mod mcp_server;
 pub mod protocol;
 pub mod qqbot;
@@ -59,12 +55,16 @@ pub mod server;
 pub mod transport;
 
 pub use daemon::{
-    GatewayDaemonConfig, GatewayService, HttpConfig, HttpGateway, read_pid, remove_pid, write_pid,
+    GatewayDaemonConfig, GatewayService, HttpConfig, read_pid, remove_pid, write_pid,
 };
-pub use inference_gateway::{
-    BatchedRequest, CompletionRequest, CompletionResponse, ContinuousBatcher, GatewayStats,
-    InferenceGateway, PromptTrieNode,
-};
-pub use mcp_server::{McpConfig, McpServer, McpServerError};
-pub use routes::{AgentInfo, ChatRequest, ChatResponse, GatewayState};
-pub use subconscious::{MicroAction, SubconsciousTick};
+pub use mcp_server::McpServer;
+
+/// Builds the Confidential-filtered MCP tool registry served on every
+/// carrier (FR-020: stdio and HTTP must expose identical tools).
+///
+/// # Errors
+/// Never fails — registry construction degrades internally; a build
+/// failure yields an empty (but valid) registry.
+pub fn mcp_registry_for_http() -> rig_compose::registry::ToolRegistry {
+    zen_agents::wiring::ZenWiring::new().build_mcp_registry()
+}
