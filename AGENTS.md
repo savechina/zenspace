@@ -286,6 +286,7 @@ zenspace/
 - **Tests**: Integration only (no inline `#[cfg(test)]` in most crates). Custom ZenTest/ZenOutput harness.
 - **Lint**: `bin/lint` → `-D warnings` + `--allow dead_code`
 - **Command files**: Pattern `src/cmd/{name}_command.rs` with `pub fn execute_command(...)` dispatcher (note: correctly spelled now)
+- **Async traits**: Object-safe async traits MUST use `#[async_trait::async_trait]` over manual `Pin<Box<dyn Future>>` plumbing (引入 async-trait 减少代码量). Caveat: when a parameter holds an elided lifetime inside a trait object (`Box<dyn FnMut(&str)>`), the macro hoists it into a concrete lifetime param that breaks HRTB demands — annotate it explicitly (`Box<dyn for<'s> FnMut(&'s str) + Send>`). Exemplar: zen-gateway `TurnExecutor`.
 
 ## CODE DOCUMENTATION & SCOPE LOGIC (Principle XV)
 
