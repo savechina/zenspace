@@ -40,9 +40,9 @@ impl zen_gateway::server::hosting::TurnExecutor for ScriptedExecutor {
         &self,
         _session: &mut zen_core::types::SessionContext,
         prompt: &str,
-        mut on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+        callback: &mut (dyn FnMut(String) + Send),
     ) -> anyhow::Result<String> {
-        on_token("echo:");
+        callback("echo:".to_string());
         Ok(format!("echo: {prompt}"))
     }
 }

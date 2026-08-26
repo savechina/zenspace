@@ -290,7 +290,7 @@ impl AgentExecutor {
             .session
             .conversation
             .iter()
-            .map(|turn| (turn.role.clone(), turn.content.clone()))
+            .map(|turn| (turn.role.to_string(), turn.content.clone()))
             .collect();
         builder = builder.memory_section(knowledge, history);
 
@@ -401,23 +401,23 @@ impl AgentExecutor {
 
     /// Execute a single agent request with streaming.
     ///
-    /// Calls `on_token` for each token chunk received from the streaming
+    /// Calls `callback` for each token chunk received from the streaming
     /// response and returns the complete accumulated response.
     ///
     /// **T296 Note**: Full streaming implementation requires rig-core
     /// `CompletionModel::stream()` + BudgetGuard (T295). Until those are
     /// available, this method falls back gracefully to the non-streaming
     /// execution path — the complete response is delivered as a single
-    /// token via `on_token`.
-    #[instrument(skip(self, context, agent, on_token))]
+    /// token via `callback`.
+    #[instrument(skip(self, context, agent, callback))]
     pub fn execute_with_retry_stream(
         &self,
         context: &AgentContext,
         agent: &crate::ZenAgent,
-        mut on_token: impl FnMut(&str),
+        mut callback: impl FnMut(&str),
     ) -> Result<AgentExecution> {
         let result = self.execute(context, agent)?;
-        on_token(&result.response);
+        callback(&result.response);
         Ok(result)
     }
 }

@@ -9,7 +9,7 @@
 // ============================================================================
 
 use std::path::Path;
-use zen_core::definition::{AgentDefinition, ToolPermission};
+use zen_core::definition::{AgentSpec, ToolPermission};
 use zen_core::sanitize::InputSanitizer;
 use zen_core::validate::*;
 
@@ -39,7 +39,7 @@ fn test_validate_command_accepts_valid() {
 
 #[test]
 fn test_agent_definition_valid_config() {
-    let def = AgentDefinition {
+    let def = AgentSpec {
         name: "test-agent".to_string(),
         prompt_template: "You are a test agent.".to_string(),
         tool_permissions: vec![ToolPermission::Read, ToolPermission::Search],

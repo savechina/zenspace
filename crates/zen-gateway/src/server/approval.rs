@@ -13,7 +13,7 @@
 //!
 //! USAGE: The daemon creates one broker, passes [`Self::callback`] to
 //! `AgentOrchestrator::with_approval_callback`, and hands clones to
-//! [`crate::server::hosting::HostingDeps`]; hosted turns
+//! [`crate::server::hosting::SessionHost`]; hosted turns
 //! [`Self::register`]/[`Self::deregister`] around execution. Each
 //! registration spawns an async worker performing the Q3 round-trip
 //! through the origin connection's [`ConnectionHandle`].

@@ -8,6 +8,7 @@ license.workspace = true
 description = "Zenspace CLI — productivity suite"
 
 [dependencies]
+sysinfo.workspace = true
 zen-service = { path = "../zen-service" }
 zen-gateway = { path = "../zen-gateway" }
 zen-core = { path = "../zen-core" }

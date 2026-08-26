@@ -13,7 +13,7 @@ use serde_json::json;
 use tracing::{debug, instrument, warn};
 use zen_core::notion_graph::NotionGraphProvider;
 use zen_core::paths::ZenPaths;
-use zen_core::types::SessionContext;
+use zen_core::types::{MessageRole, SessionContext};
 use zen_provider::DefaultRouter;
 
 use crate::completion_model::ZenCompletionModel;
@@ -854,8 +854,8 @@ impl ZenAgent {
             "ZenAgent::execute: LLM response received"
         );
 
-        session.add_turn("user", query);
-        session.add_turn("assistant", &response);
+        session.add_turn(MessageRole::User, query);
+        session.add_turn(MessageRole::Assistant, &response);
 
         Ok(response)
     }
@@ -938,7 +938,7 @@ impl ZenAgent {
         let history: Vec<(String, String)> = session
             .conversation
             .iter()
-            .map(|turn| (turn.role.clone(), turn.content.clone()))
+            .map(|turn| (turn.role.to_string(), turn.content.clone()))
             .collect();
 
         builder = builder.memory_section(knowledge, history);
@@ -1064,29 +1064,20 @@ impl ZenAgent {
             pack.omitted.len()
         );
 
-        if let Some(store) = &self.memvid_store {
-            if !pack.omitted.is_empty() {
-                let zen_store = zen_memory::memvid::ZenMemvidStore::from_store(store.clone());
-                let hook = zen_memory::memvid::MemvidDemotionHook::new(zen_store);
-                match hook.persist_evicted(&ctx.entity_id, &pack.omitted) {
-                    Ok(count) => {
-                        debug!(
-                            persisted = count,
-                            "Demoted context items persisted to memvid"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to persist demoted context items");
-                    }
+        if !pack.omitted.is_empty() {
+            // Persistence topology change (T050): demotion archives to the
+            // session .jsonl regardless of memvid availability.
+            let hook = zen_memory::memvid::MemvidDemotionHook::new();
+            match hook.persist_evicted(&ctx.entity_id, &pack.omitted) {
+                Ok(count) => {
+                    debug!(
+                        persisted = count,
+                        "Demoted context items archived to session file"
+                    );
                 }
-            }
-        } else if !pack.omitted.is_empty() {
-            for omitted in &pack.omitted {
-                tracing::debug!(
-                    source_id = %omitted.item.source_id,
-                    reason = ?omitted.reason,
-                    "Context item omitted from prompt"
-                );
+                Err(e) => {
+                    warn!(error = %e, "Failed to archive demoted context items");
+                }
             }
         }
 
@@ -1121,7 +1112,7 @@ impl ZenAgent {
                 window_size,
             );
             for turn in &session.conversation {
-                compactor.append(&turn.role, &turn.content);
+                compactor.append(turn.role.as_str(), &turn.content);
             }
             match compactor.compact() {
                 Ok((turns, persisted_count)) => {
@@ -1140,7 +1131,7 @@ impl ZenAgent {
                         .iter()
                         .rev()
                         .take(window_size)
-                        .map(|t| (t.role.clone(), t.content.clone()))
+                        .map(|t| (t.role.to_string(), t.content.clone()))
                         .collect::<Vec<_>>()
                         .into_iter()
                         .rev()
@@ -1153,7 +1144,7 @@ impl ZenAgent {
                 .iter()
                 .rev()
                 .take(window_size)
-                .map(|t| (t.role.clone(), t.content.clone()))
+                .map(|t| (t.role.to_string(), t.content.clone()))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -1220,18 +1211,18 @@ impl ZenAgent {
         }
     }
 
-    #[instrument(skip(self, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
+    #[instrument(skip(self, session, callback), fields(session_id = %session.session_id, query_len = query.len()))]
     pub async fn execute_stream(
         &self,
         query: &str,
         session: &mut SessionContext,
-        on_token: impl FnMut(&str),
+        callback: impl FnMut(&str),
     ) -> Result<String> {
         let response = self
-            .execute_stream_round(query, session, None, on_token)
+            .execute_stream_round(query, session, None, callback)
             .await?;
-        session.add_turn("user", query);
-        session.add_turn("assistant", &response);
+        session.add_turn(MessageRole::User, query);
+        session.add_turn(MessageRole::Assistant, &response);
         Ok(response)
     }
 
@@ -1241,13 +1232,13 @@ impl ZenAgent {
     /// the model can continue after a tool-dispatch round. Callers driving a
     /// multi-round tool loop own turn management themselves (see
     /// `AgentOrchestrator::execute_stream`).
-    #[instrument(skip(self, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
+    #[instrument(skip(self, session, callback), fields(session_id = %session.session_id, query_len = query.len()))]
     pub async fn execute_stream_round(
         &self,
         query: &str,
         session: &mut SessionContext,
         tool_results: Option<&str>,
-        on_token: impl FnMut(&str),
+        callback: impl FnMut(&str),
     ) -> Result<String> {
         let session_id = session.session_id.to_string();
         let conv_len = session.conversation.len();
@@ -1337,20 +1328,20 @@ impl ZenAgent {
         };
 
         let response = self
-            .call_llm_stream_with_assembly(query, &system_prompt, &user_message, session, on_token)
+            .call_llm_stream_with_assembly(query, &system_prompt, &user_message, session, callback)
             .await?;
 
         Ok(response)
     }
 
-    #[instrument(skip(self, system_prompt, user_message, session, on_token), fields(session_id = %session.session_id, query_len = query.len()))]
+    #[instrument(skip(self, system_prompt, user_message, session, callback), fields(session_id = %session.session_id, query_len = query.len()))]
     async fn call_llm_stream_with_assembly(
         &self,
         query: &str,
         system_prompt: &str,
         user_message: &str,
         session: &SessionContext,
-        mut on_token: impl FnMut(&str),
+        mut callback: impl FnMut(&str),
     ) -> Result<String> {
         use rig_core::OneOrMany;
         use rig_core::completion::{CompletionModel, CompletionRequest};
@@ -1368,7 +1359,7 @@ impl ZenAgent {
                 window_size,
             );
             for turn in &session.conversation {
-                compactor.append(&turn.role, &turn.content);
+                compactor.append(turn.role.as_str(), &turn.content);
             }
             match compactor.compact() {
                 Ok((turns, persisted_count)) => {
@@ -1387,7 +1378,7 @@ impl ZenAgent {
                         .iter()
                         .rev()
                         .take(window_size)
-                        .map(|t| (t.role.clone(), t.content.clone()))
+                        .map(|t| (t.role.to_string(), t.content.clone()))
                         .collect::<Vec<_>>()
                         .into_iter()
                         .rev()
@@ -1400,7 +1391,7 @@ impl ZenAgent {
                 .iter()
                 .rev()
                 .take(window_size)
-                .map(|t| (t.role.clone(), t.content.clone()))
+                .map(|t| (t.role.to_string(), t.content.clone()))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -1454,7 +1445,7 @@ impl ZenAgent {
                 Ok(StreamedAssistantContent::Text(text)) => {
                     let token = text.text.clone();
                     full_response.push_str(&token);
-                    on_token(&token);
+                    callback(&token);
                 }
                 Ok(StreamedAssistantContent::Final(_)) => break,
                 Ok(_) => {}

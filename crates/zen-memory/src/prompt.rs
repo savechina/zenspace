@@ -16,7 +16,7 @@ use std::path::Path;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use zen_core::AgentDefinition;
+use zen_core::AgentSpec;
 use zen_core::paths::ZenPaths;
 use zen_core::types::{Sensitivity, SessionContext};
 
@@ -102,7 +102,7 @@ pub struct PromptAssembly {
     pub coordinator_mode: bool,
 
     /// Priority 3: Agent definition (custom agent prompt)
-    pub agent_definition: Option<AgentDefinition>,
+    pub agent_definition: Option<AgentSpec>,
 
     /// Priority 4: Custom prompt (--system-prompt flag)
     pub custom_prompt: Option<String>,
@@ -376,7 +376,7 @@ impl PromptAssembly {
     }
 
     /// Build agent definition prompt (replacement chain).
-    fn build_agent_prompt(&self, def: &AgentDefinition) -> String {
+    fn build_agent_prompt(&self, def: &AgentSpec) -> String {
         let mut static_parts = Vec::new();
         let mut dynamic_parts = Vec::new();
 
@@ -746,7 +746,7 @@ Current sensitivity level: {}"#,
     }
 
     /// Build CLAUDE.md section (Section 18).
-    fn build_claude_md_section(&self, def: &AgentDefinition) -> String {
+    fn build_claude_md_section(&self, def: &AgentSpec) -> String {
         let mut parts = Vec::new();
 
         if !self.agents_content.is_empty() {
@@ -929,7 +929,7 @@ impl PromptAssemblyBuilder {
     }
 
     /// Priority 3: Set agent definition.
-    pub fn agent_definition(mut self, def: AgentDefinition) -> Self {
+    pub fn agent_definition(mut self, def: AgentSpec) -> Self {
         self.assembly.agent_definition = Some(def);
         self
     }
@@ -1102,7 +1102,7 @@ mod tests {
 
     #[test]
     fn assemble_with_agent_definition() {
-        let def = AgentDefinition::default_agent();
+        let def = AgentSpec::default_agent();
         let assembly = PromptAssembly::builder()
             .agent_definition(def)
             .sensitivity(Sensitivity::Public)
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn priority_agent_definition_replacement() {
-        let def = AgentDefinition {
+        let def = AgentSpec {
             name: "test".to_string(),
             prompt_template: "CUSTOM AGENT TEMPLATE".to_string(),
             tool_permissions: vec![],
@@ -1285,7 +1285,7 @@ mod tests {
     #[test]
     fn backward_compatibility_legacy_fields() {
         let mut assembly = PromptAssembly::new();
-        assembly.agent_definition = Some(AgentDefinition::default_agent());
+        assembly.agent_definition = Some(AgentSpec::default_agent());
         assembly.soul_content = "SOUL content".to_string();
         assembly.agents_content = "AGENTS content".to_string();
         assembly.memory_content = "MEMORY content".to_string();

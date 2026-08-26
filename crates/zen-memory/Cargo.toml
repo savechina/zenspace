@@ -20,3 +20,5 @@ rig-compose = { workspace = true }
 tempfile = { workspace = true }
 include_dir = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
+walkdir = { workspace = true }

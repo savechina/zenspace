@@ -1,11 +1,14 @@
 use anyhow::Result;
 use memvid_core::{MemoryCardBuilder, Ticket};
+use rig_memvid::MemvidStore;
 use rig_memvid::memvid_core;
-use rig_memvid::{MemoryConfig, MemvidPersistHook, MemvidStore, WritePolicy};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use zen_core::notion_graph::NotionGraphProvider;
+use zen_core::types::{ContextDemoted, DemotedContextItem, DemotionReason, SessionEvent};
+
+use crate::conversation::ConversationStore;
 
 /// Minimum confidence threshold for auto-extracted triplets (D9).
 /// Cards from `extract_triplets` below this threshold are filtered out on retrieval.
@@ -158,6 +161,7 @@ fn get_or_init_memvid_store_ro(memory_path: &std::path::Path) -> Result<MemvidSt
     Ok(store)
 }
 
+#[derive(Clone)]
 pub struct ZenMemvidStore {
     store: MemvidStore,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
@@ -376,6 +380,56 @@ impl ZenMemvidStore {
             }
         }
     }
+
+    /// Record a replay idempotency key against `session_id` (Phase 11 T048).
+    ///
+    /// Writes a tiny marker frame (`replay-key:<key>`, tag `replay-key`,
+    /// no triplet extraction) so [`ZenMemvidStore::contains_turn`] can answer
+    /// key-existence queries without scanning frames. Called by
+    /// [`crate::session_replayer::SessionReplayer`] AFTER the turn itself was
+    /// persisted — a failed marker write only risks a rare duplicate on a
+    /// later re-replay, never data loss (mv2 is a derived store).
+    ///
+    /// # Errors
+    /// Memvid write failure.
+    pub fn record_turn_key(&self, session_id: &str, replay_key: &str) -> Result<()> {
+        let opts = memvid_core::PutOptions::builder()
+            .uri(session_id)
+            .push_tag("replay-key")
+            .extract_triplets(false)
+            .build();
+        self.store
+            .put_text(&format!("replay-key:{replay_key}"), opts)?;
+        Ok(())
+    }
+
+    /// Query whether a replay idempotency key was already recorded for
+    /// `session_id` (Phase 11 T048).
+    ///
+    /// Implemented as a lexical search for the marker text scoped to the
+    /// session URI — the same uri+tag frame conventions as `turn`/`entry`
+    /// writes — rather than scanning all frames. Returns `false` when no
+    /// marker exists (the caller then persists the turn and records the key).
+    ///
+    /// # Errors
+    /// Memvid search failure (callers treat this as "not present" and log).
+    pub fn contains_turn(&self, session_id: &str, replay_key: &str) -> Result<bool> {
+        let request = memvid_core::SearchRequest {
+            query: format!("replay-key:{replay_key}"),
+            top_k: 1,
+            snippet_chars: 96,
+            uri: Some(session_id.to_string()),
+            scope: None,
+            cursor: None,
+            as_of_frame: None,
+            as_of_ts: None,
+            no_sketch: false,
+            acl_context: None,
+            acl_enforcement_mode: Default::default(),
+        };
+        let response = self.store.search(request)?;
+        Ok(response.total_hits > 0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -543,20 +597,25 @@ pub enum EntityType {
     Knowledge,
 }
 
-/// Persists context items evicted by [`rig_compose::context::ContextPack`]
-/// into the memvid store for later retrieval.
+/// Archives context items evicted by [`rig_compose::context::ContextPack`]
+/// into the session's canonical `.jsonl` archive.
 ///
 /// When `ContextPack::pack()` omits items due to budget or item-count
-/// overflow, this hook writes them to the backing `.mv2` archive so they
-/// remain queryable even after being evicted from the active context window.
-pub struct MemvidDemotionHook {
-    store: ZenMemvidStore,
+/// overflow, this hook appends a `context/demoted` [`SessionEvent`] to the
+/// session's `<sessions>/<id>.jsonl` file so they remain derivable from the
+/// canonical archive even after being evicted from the active context window.
+pub struct MemvidDemotionHook;
+
+impl Default for MemvidDemotionHook {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemvidDemotionHook {
-    /// Create a hook backed by the given store.
-    pub fn new(store: ZenMemvidStore) -> Self {
-        Self { store }
+    /// Create a hook.
+    pub fn new() -> Self {
+        Self
     }
 
     /// Persist context items evicted by `ContextPack::pack()`.
@@ -574,58 +633,40 @@ impl MemvidDemotionHook {
     ) -> Result<usize> {
         use rig_compose::context::ContextOmissionReason;
 
-        let mut persisted = 0usize;
-        for omitted_item in omitted {
-            let should_persist = matches!(
-                omitted_item.reason,
-                ContextOmissionReason::OverBudget | ContextOmissionReason::MaxItems
-            );
-            if !should_persist {
-                continue;
-            }
+        // Persistence topology change (T050): jsonl append replaces the mv2-only write so .mv2 is never the sole copy of user data.
+        let demoted: Vec<DemotedContextItem> = omitted
+            .iter()
+            .filter(|omitted_item| {
+                matches!(
+                    omitted_item.reason,
+                    ContextOmissionReason::OverBudget | ContextOmissionReason::MaxItems
+                )
+            })
+            .map(|omitted_item| DemotedContextItem {
+                source_id: omitted_item.item.source_id.clone(),
+                reason: match omitted_item.reason {
+                    ContextOmissionReason::OverBudget => DemotionReason::OverBudget,
+                    ContextOmissionReason::MaxItems => DemotionReason::MaxItems,
+                },
+                summary: omitted_item.item.text.clone(),
+            })
+            .collect();
 
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                "source".to_string(),
-                serde_json::Value::String("demoted".to_string()),
-            );
-            metadata.insert(
-                "original_source_id".to_string(),
-                serde_json::Value::String(omitted_item.item.source_id.clone()),
-            );
-            metadata.insert(
-                "omission_reason".to_string(),
-                serde_json::to_value(&omitted_item.reason).unwrap_or(serde_json::Value::Null),
-            );
-
-            let serialized = serde_json::to_vec(&metadata).unwrap_or_default();
-            let text = format!(
-                "[demoted:{}] {}",
-                omitted_item.item.source_id,
-                String::from_utf8_lossy(&serialized)
-            );
-
-            let opts = memvid_core::PutOptions::builder()
-                .uri(session_id)
-                .push_tag("demoted")
-                .build();
-
-            match self.store.store.put_text(&text, opts) {
-                Ok(_frame_id) => {
-                    persisted += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session_id,
-                        source_id = %omitted_item.item.source_id,
-                        error = %e,
-                        "Failed to persist demoted context item"
-                    );
-                }
-            }
+        if demoted.is_empty() {
+            return Ok(0);
         }
 
-        Ok(persisted)
+        let count = demoted.len();
+        let event = SessionEvent::ContextDemoted(ContextDemoted {
+            count,
+            timestamp: chrono::Utc::now(),
+            items: demoted,
+        });
+
+        let store = ConversationStore::open(session_id)?;
+        store.append_event(&event)?;
+
+        Ok(count)
     }
 }
 
@@ -696,19 +737,12 @@ impl MemvidStoringCompactor {
     }
 }
 
-pub fn create_persist_hook(
-    store: MemvidStore,
-    config: MemoryConfig,
-) -> MemvidPersistHook<rig_core::completion::CompletionRequest> {
-    MemvidPersistHook::new(store, config)
-}
-
-pub fn default_memory_config() -> MemoryConfig {
-    MemoryConfig::builder()
-        .policy(WritePolicy::Raw)
-        .commit_each_turn(true)
-        .build()
-}
+// T051 (2026-08-26): `create_persist_hook` / `default_memory_config` removed —
+// the rig-memvid MemvidPersistHook was instantiated but never attached to any
+// execution pipeline (AgentOrchestrator stored it without ever reading it; zen
+// calls completion models directly, bypassing rig-core's PromptHook mechanism).
+// ZenAgent::persist_turn is the sole active mv2 writer. Decision recorded in
+// AGENTS.md (dual-write audit, Phase 11 T051).
 
 pub struct ContextProjector {
     store: MemvidStore,
@@ -798,12 +832,6 @@ mod tests {
         fn is_available(&self) -> bool {
             true
         }
-    }
-
-    #[test]
-    fn default_memory_config_creation() {
-        let config = default_memory_config();
-        let _ = config;
     }
 
     #[test]
@@ -991,17 +1019,32 @@ mod tests {
     }
 
     #[test]
-    fn memvid_demotion_hook_persists_overbudget_items() {
+    fn persist_evicted_appends_context_demoted_to_session_jsonl() {
         use rig_compose::context::{
             ContextItem, ContextOmissionReason, ContextSourceKind, OmittedContextItem,
         };
+        use zen_core::types::{DemotionReason, Session, SessionEvent};
 
-        let _guard = lock_and_reset_singletons();
-        let dir = tempdir().unwrap();
-        let memory_path = dir.path().join("test_demotion.mv2");
-        let store = ZenMemvidStore::new(memory_path).unwrap();
-        let hook = MemvidDemotionHook::new(store);
+        // Isolated ZEN_HOME so ConversationStore::open resolves under a temp dir;
+        // set once per test process (atomic flag), mirroring zen-core's pattern.
+        static SESSION_HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let home = SESSION_HOME.get_or_init(|| {
+            let t = tempfile::TempDir::new().expect("failed to create temp dir");
+            // SAFETY: test environment setup, set once per process
+            unsafe {
+                std::env::set_var("ZEN_HOME", t.path());
+            }
+            t
+        });
 
+        let session = Session::new("test-agent", "/ws");
+        let session_path = session.save().unwrap();
+        assert!(
+            session_path.starts_with(home.path()),
+            "session must be under ZEN_HOME"
+        );
+
+        let hook = MemvidDemotionHook::new();
         let items = vec![
             OmittedContextItem {
                 item: ContextItem::new(ContextSourceKind::Memory, "frame-1", "demoted content A"),
@@ -1012,13 +1055,32 @@ mod tests {
                 reason: ContextOmissionReason::MaxItems,
             },
             OmittedContextItem {
-                item: ContextItem::new(ContextSourceKind::Memory, "frame-3", "should not persist"),
+                item: ContextItem::new(ContextSourceKind::Memory, "frame-3", "demoted content C"),
                 reason: ContextOmissionReason::OverBudget,
             },
         ];
 
-        let count = hook.persist_evicted("test-session", &items).unwrap();
+        let count = hook.persist_evicted(&session.id, &items).unwrap();
         assert_eq!(count, 3);
+
+        // The archive now contains exactly one parseable context/demoted line.
+        let content = std::fs::read_to_string(&session_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "meta + one demoted event");
+        assert!(lines[0].contains("\"session/meta\""));
+
+        let event: SessionEvent = serde_json::from_str(lines[1]).unwrap();
+        match event {
+            SessionEvent::ContextDemoted(payload) => {
+                assert_eq!(payload.count, 3);
+                assert_eq!(payload.items.len(), 3);
+                assert_eq!(payload.items[0].source_id, "frame-1");
+                assert_eq!(payload.items[0].reason, DemotionReason::OverBudget);
+                assert_eq!(payload.items[0].summary, "demoted content A");
+                assert_eq!(payload.items[1].reason, DemotionReason::MaxItems);
+            }
+            other => panic!("expected context_demoted line, got {:?}", other),
+        }
     }
 
     #[test]

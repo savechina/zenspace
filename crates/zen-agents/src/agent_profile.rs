@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use zen_core::AgentDefinition;
+use zen_core::AgentSpec;
 
 pub use zen_core::config::LlmPreference;
 
@@ -143,7 +143,7 @@ pub struct AgentProfile {
     pub llm_preferences: Vec<LlmPreference>,
     pub max_sensitivity: AgentClearance,
     pub cost_per_token: CostPerToken,
-    pub definition: Option<AgentDefinition>,
+    pub definition: Option<AgentSpec>,
 }
 
 impl AgentProfile {
@@ -176,7 +176,7 @@ pub struct AgentProfileBuilder {
     llm_preferences: Vec<LlmPreference>,
     max_sensitivity: AgentClearance,
     cost_per_token: CostPerToken,
-    definition: Option<AgentDefinition>,
+    definition: Option<AgentSpec>,
 }
 
 impl AgentProfileBuilder {
@@ -224,7 +224,7 @@ impl AgentProfileBuilder {
     }
 
     #[must_use]
-    pub fn definition(mut self, def: AgentDefinition) -> Self {
+    pub fn definition(mut self, def: AgentSpec) -> Self {
         self.definition = Some(def);
         self
     }

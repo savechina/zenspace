@@ -6,7 +6,7 @@ use chrono::Utc;
 use tracing::debug;
 
 use zen_core::paths::ZenPaths;
-use zen_core::types::{ChatTurnEvent, SessionEvent, session_created_at_from_id};
+use zen_core::types::{Message, MessageRole, SessionEvent, session_created_at_from_id};
 
 /// Conversation history manager — persists chat turns as typed events
 /// in the session's single `.jsonl` file (Codex-style).
@@ -15,7 +15,7 @@ use zen_core::types::{ChatTurnEvent, SessionEvent, session_created_at_from_id};
 /// `~/.zen/sessions/YYYY/MM/DD/<uuid>.jsonl`.
 /// Chat turns are appended as `{"type":"chat/turn","payload":{...}}` lines.
 ///
-/// The first line is a `session/meta` event written by `SessionRecord::save()`.
+/// The first line is a `session/meta` event written by `Session::save()`.
 /// This store only appends `chat/turn` events to the same file.
 pub struct ConversationStore {
     session_id: String,
@@ -79,15 +79,32 @@ impl ConversationStore {
     /// Append a chat turn to the session's `.jsonl` file.
     ///
     /// Writes a `chat/turn` event line. The file is created on first write;
-    /// the `session/meta` event (written by `SessionRecord::save()`) must
+    /// the `session/meta` event (written by `Session::save()`) must
     /// already exist as the first line.
     pub fn append(&self, role: &str, content: &str) -> Result<()> {
-        let event = SessionEvent::Turn(ChatTurnEvent {
-            role: role.to_string(),
+        let role_parsed = match role.parse::<MessageRole>() {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(role = role, "unknown role, falling back to assistant");
+                MessageRole::Assistant
+            }
+        };
+        let event = SessionEvent::Turn(Message {
+            role: role_parsed,
             content: content.to_string(),
-            timestamp: Utc::now(),
+            timestamp: Some(Utc::now()),
         });
-        let line = serde_json::to_string(&event).context("failed to serialize chat/turn event")?;
+        self.append_event(&event)
+    }
+
+    /// Append a serialized [`SessionEvent`] line to the session's `.jsonl` file.
+    ///
+    /// Shared append mechanism for every session event type: serializes the
+    /// event to one JSONL line, appends it, and fsyncs. `append()` builds a
+    /// `chat/turn` event and delegates here; other writers (e.g. the demotion
+    /// hook) reuse this method so the archive never has a second format.
+    pub fn append_event(&self, event: &SessionEvent) -> Result<()> {
+        let line = serde_json::to_string(event).context("failed to serialize session event")?;
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -99,7 +116,7 @@ impl ConversationStore {
         file.write_all(format!("{}\n", line).as_bytes())
             .with_context(|| {
                 format!(
-                    "failed to write chat/turn event: {}",
+                    "failed to write session event: {}",
                     self.file_path.display()
                 )
             })?;
@@ -109,9 +126,12 @@ impl ConversationStore {
 
         debug!(
             session_id = %self.session_id,
-            role,
-            content_len = content.len(),
-            "chat/turn appended to session file"
+            event_type = match event {
+                SessionEvent::Meta(_) => "session/meta",
+                SessionEvent::Turn(_) => "chat/turn",
+                SessionEvent::ContextDemoted(_) => "context/demoted",
+            },
+            "session event appended to session file"
         );
         Ok(())
     }
@@ -138,10 +158,13 @@ impl ConversationStore {
             if let Ok(event) = serde_json::from_str::<SessionEvent>(line) {
                 match event {
                     SessionEvent::Turn(turn) => {
-                        entries.push((turn.role, turn.content));
+                        entries.push((turn.role.to_string(), turn.content));
                     }
                     SessionEvent::Meta(_) => {
                         // skip metadata event
+                    }
+                    SessionEvent::ContextDemoted(_) => {
+                        // skip demotion archive events; not conversation turns
                     }
                 }
             }
@@ -217,15 +240,15 @@ impl ConversationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zen_core::types::SessionRecord;
+    use zen_core::types::Session;
 
     #[test]
     fn append_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
-        // First write the meta event (as SessionRecord::save() would)
-        let session = SessionRecord::new("test-agent", "/ws");
+        // First write the meta event (as Session::save() would)
+        let session = Session::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {
@@ -259,7 +282,7 @@ mod tests {
     fn load_empty_file_with_only_meta_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
-        let session = SessionRecord::new("test-agent", "/ws");
+        let session = Session::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {
@@ -277,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
-        let session = SessionRecord::new("test-agent", "/ws");
+        let session = Session::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {
@@ -300,7 +323,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.jsonl");
 
-        let session = SessionRecord::new("test-agent", "/ws");
+        let session = Session::new("test-agent", "/ws");
         SessionEvent::write_meta(&file_path, &session).unwrap();
 
         let store = ConversationStore {

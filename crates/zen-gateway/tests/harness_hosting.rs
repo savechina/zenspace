@@ -12,7 +12,7 @@
 //!
 //! USAGE: `cargo test -p zen-gateway --test harness_hosting`. Uses
 //! in-process transport pairs (contract-suite style) around the SAME
-//! `DispatchServer`/`HostingDeps` stack the UDS daemon installs.
+//! `DispatchServer`/`SessionHost` stack the UDS daemon installs.
 //!
 //! EXPECTED: all five tests pass deterministically — the scripted
 //! executor streams fixed fragments with configurable delays, so no
@@ -27,7 +27,7 @@ use zen_gateway::protocol::{Capabilities, Frame};
 use zen_gateway::server::approval::ApprovalBroker;
 use zen_gateway::server::dispatch::{ConnectionHandle, DispatchServer};
 use zen_gateway::server::hosting::{
-    HostingDeps, TurnExecutor, TurnState, cancel as hosting_cancel, resume as hosting_resume,
+    SessionHost, TurnExecutor, TurnState, cancel as hosting_cancel, resume as hosting_resume,
     start as hosting_start, turn as hosting_turn,
 };
 use zen_gateway::transport::{Transport, in_process};
@@ -44,25 +44,35 @@ impl TurnExecutor for ScriptedExec {
         &self,
         _session: &mut SessionContext,
         _prompt: &str,
-        mut on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+        callback: &mut (dyn FnMut(String) + Send),
     ) -> anyhow::Result<String> {
         if self.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
         }
-        on_token("al");
-        on_token("pha ");
+        callback("al".to_string());
+        callback("pha ".to_string());
         if self.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
         }
-        on_token("beta");
+        callback("beta".to_string());
         Ok("alpha beta".to_string())
     }
 }
 
-fn hosting_deps(delay_ms: u64, audit: Option<std::path::PathBuf>) -> Arc<HostingDeps> {
-    let mut deps = HostingDeps::new(Some(Arc::new(ScriptedExec { delay_ms })));
+fn hosting_deps(delay_ms: u64, audit: Option<std::path::PathBuf>) -> Arc<SessionHost> {
+    let mut deps = SessionHost::new(Some(Arc::new(ScriptedExec { delay_ms })));
     deps.audit_path = audit;
     Arc::new(deps)
+}
+
+/// Filters `audit.jsonl` lines down to parsed records with the given
+/// `kind` and `turnId` (T054 lifecycle assertions).
+fn audit_records(content: &str, kind: &str, turn_id: &str) -> Vec<Value> {
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|rec| rec["kind"] == json!(kind) && rec["turnId"] == json!(turn_id))
+        .collect()
 }
 
 /// Builds a dispatcher exposing the hosted-session methods over the
@@ -70,7 +80,7 @@ fn hosting_deps(delay_ms: u64, audit: Option<std::path::PathBuf>) -> Arc<Hosting
 /// wire (mirrors the daemon install set, including delta-class drops).
 #[allow(clippy::type_complexity)]
 async fn spawn_surface(
-    deps: Arc<HostingDeps>,
+    deps: Arc<SessionHost>,
 ) -> (
     in_process::InProcessTransport,
     tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -315,7 +325,107 @@ async fn cancel_mid_turn_unblocks_and_audits_cancelled() {
     }
     assert!(audited, "cancellation must be audited");
 
+    // T054: the cancelled terminal transition also emits the
+    // once-only lifecycle record with the cancelled outcome.
+    let mut lifecycle = Vec::new();
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&audit_path) {
+            lifecycle = audit_records(&content, "gateway.turn.completed", "tc");
+            if !lifecycle.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(lifecycle.len(), 1, "one lifecycle record per terminal turn");
+    assert_eq!(lifecycle[0]["outcome"], json!("cancelled"));
+
     assert_eq!(deps.turns.get("tc").unwrap().state(), TurnState::Cancelled);
+}
+
+/// T054: one `gateway.turn.started` per registration and exactly one
+/// `gateway.turn.completed` at terminal state; replaying the finished
+/// turnId (-32004) must add NEITHER record.
+#[tokio::test]
+async fn turn_lifecycle_audits_started_and_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let deps = hosting_deps(0, Some(audit_path.clone()));
+    {
+        let mut sessions = deps.sessions.lock().await;
+        let mut ctx = SessionContext::new("s1".to_string(), String::new());
+        ctx.agent_name = "metis".to_string();
+        sessions.insert("s1".to_string(), ctx);
+    }
+    let (client, _srv) = spawn_surface(Arc::clone(&deps)).await;
+    handshake(&client).await;
+
+    client
+        .send(Frame::request_with(
+            11,
+            "session/turn",
+            json!({"turnId": "tl", "sessionId": "s1", "prompt": "hi"}),
+        ))
+        .await
+        .unwrap();
+    loop {
+        let frame = client.recv().await.unwrap();
+        if matches!(frame, Frame::ServerResponse { .. }) {
+            break;
+        }
+    }
+
+    // Replay the completed turnId: resolves -32004 with the stored
+    // response and never re-registers (no extra lifecycle lines).
+    client
+        .send(Frame::request_with(
+            12,
+            "session/turn",
+            json!({"turnId": "tl", "sessionId": "s1", "prompt": "hi"}),
+        ))
+        .await
+        .unwrap();
+    loop {
+        let frame = client.recv().await.unwrap();
+        if let Frame::ServerResponse { id, error, .. } = frame {
+            assert_eq!(id, 12);
+            assert_eq!(error.expect("replay must fail").code, -32004);
+            break;
+        }
+    }
+
+    // Audit lines land asynchronously from the blocking append task.
+    let mut content = String::new();
+    for _ in 0..100 {
+        if let Ok(read) = std::fs::read_to_string(&audit_path)
+            && !audit_records(&read, "gateway.turn.completed", "tl").is_empty()
+        {
+            content = read;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let started = audit_records(&content, "gateway.turn.started", "tl");
+    let completed = audit_records(&content, "gateway.turn.completed", "tl");
+    assert_eq!(
+        started.len(),
+        1,
+        "started fires once per registration (replay adds none)\n{content}"
+    );
+    assert_eq!(
+        completed.len(),
+        1,
+        "completed fires exactly once at terminal state\n{content}"
+    );
+    assert_eq!(started[0]["sessionId"], json!("s1"));
+    assert_eq!(started[0]["agent"], json!("metis"));
+    assert!(
+        started[0]["ts"].as_str().is_some_and(|ts| !ts.is_empty()),
+        "epoch-millis ts mirrors existing audit records"
+    );
+    assert_eq!(completed[0]["sessionId"], json!("s1"));
+    assert_eq!(completed[0]["outcome"], json!("completed"));
 }
 
 #[tokio::test]

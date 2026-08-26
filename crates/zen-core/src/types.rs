@@ -90,31 +90,65 @@ impl fmt::Display for SessionStatus {
 /// A single event in a session's `.jsonl` file.
 ///
 /// Each session is a single `<uuid>.jsonl` file containing ordered events:
-///   - `session/meta` (first event) — replaces SessionRecord metadata JSON
+///   - `session/meta` (first event) — replaces Session metadata JSON
 ///   - `chat/turn` — conversation turns (replaces separate chat.jsonl)
+///   - `context/demoted` — context items evicted from the active window
+///     by `ContextPack` (archived per T050 so `.mv2` is never the sole copy)
 ///   - future: `tool/call`, `session/status`, etc.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum SessionEvent {
     #[serde(rename = "session/meta")]
-    Meta(SessionRecord),
+    Meta(Session),
     #[serde(rename = "chat/turn")]
-    Turn(ChatTurnEvent),
+    Turn(Message),
+    #[serde(rename = "context/demoted")]
+    ContextDemoted(ContextDemoted),
 }
 
-/// Payload for a `chat/turn` event.
+/// Payload of the `context/demoted` session event.
+///
+/// Records context items evicted from the active window by
+/// `rig_compose::context::ContextPack::pack()` into the session's canonical
+/// `.jsonl` archive, so demoted context stays derivable from the archive
+/// even when the `.mv2` store is missing or pruned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatTurnEvent {
-    pub role: String,
-    pub content: String,
-    /// Unix timestamp seconds (i64, Codex-compatible via chrono::serde::ts_seconds).
-    #[serde(with = "chrono::serde::ts_seconds")]
+pub struct ContextDemoted {
+    /// Number of demoted items recorded in this event.
+    pub count: usize,
+    /// Timestamp of the demotion archive write (RFC 3339).
     pub timestamp: DateTime<Utc>,
+    /// The evicted items, each with provenance and summary text.
+    pub items: Vec<DemotedContextItem>,
+}
+
+/// One context item evicted from the active window into the archive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemotedContextItem {
+    /// Stable id of the item in its source system.
+    pub source_id: String,
+    /// Why the packer did not select the item.
+    pub reason: DemotionReason,
+    /// Prompt-ready text of the evicted item (the context summary).
+    pub summary: String,
+}
+
+/// Reason a context item was not selected for a context pack.
+///
+/// Mirrors `rig_compose::context::ContextOmissionReason` with lowercase
+/// serde names for JSONL-compatible archive persistence (MessageRole-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DemotionReason {
+    /// The pack already reached its maximum item count.
+    MaxItems,
+    /// Adding the item would exceed the available character budget.
+    OverBudget,
 }
 
 impl SessionEvent {
     /// Read the first (meta) event from a `.jsonl` file.
-    pub fn read_meta(path: &std::path::Path) -> Result<SessionRecord> {
+    pub fn read_meta(path: &std::path::Path) -> Result<Session> {
         let line = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read session file: {}", path.display()))?
             .lines()
@@ -134,7 +168,7 @@ impl SessionEvent {
 
     /// Write a `session/meta` event as the first line of a `.jsonl` file.
     /// If the file already exists, the meta line is overwritten (line 1).
-    pub fn write_meta(path: &std::path::Path, notion: &SessionRecord) -> Result<()> {
+    pub fn write_meta(path: &std::path::Path, notion: &Session) -> Result<()> {
         let meta_line = serde_json::to_string(&SessionEvent::Meta(notion.clone()))
             .context("failed to serialize session/meta event")?;
 
@@ -163,24 +197,24 @@ impl SessionEvent {
     }
 }
 
-/// Read a SessionRecord from a file, detecting format by extension.
+/// Read a Session from a file, detecting format by extension.
 ///
 /// - `.jsonl` → parse first line as `session/meta` event
-/// - `.json` → legacy format, parse whole file as `SessionRecord`
-pub fn load_session_from_file(path: &std::path::Path) -> Result<SessionRecord> {
+/// - `.json` → legacy format, parse whole file as `Session`
+pub fn load_session_from_file(path: &std::path::Path) -> Result<Session> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("jsonl") => SessionEvent::read_meta(path),
         _ => {
             let json = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read session file: {}", path.display()))?;
-            serde_json::from_str::<SessionRecord>(&json)
+            serde_json::from_str::<Session>(&json)
                 .with_context(|| format!("failed to parse session file: {}", path.display()))
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// SessionRecord (FR-078, FR-081) — canonical definition
+// Session (FR-078, FR-081) — canonical definition
 // ---------------------------------------------------------------------------
 
 /// Session notion persisted as the first `session/meta` event in `<id>.jsonl`.
@@ -188,7 +222,7 @@ pub fn load_session_from_file(path: &std::path::Path) -> Result<SessionRecord> {
 /// Per data-model.md §3.9: JSONL file is primary storage (Tier 2 derived cache).
 /// SQLite table is derived from these files for fast queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionRecord {
+pub struct Session {
     /// Unique session identifier (UUID v7).
     pub id: String,
     /// Agent name from zen-agents registry.
@@ -211,7 +245,7 @@ pub struct SessionRecord {
     pub workspace: String,
 }
 
-impl SessionRecord {
+impl Session {
     /// Create a new session notion with the given agent name and workspace.
     pub fn new(agent_name: &str, workspace: &str) -> Self {
         let now = Utc::now();
@@ -297,7 +331,7 @@ impl SessionRecord {
         Ok(file_path)
     }
 
-    pub fn load(id: &str) -> Result<SessionRecord> {
+    pub fn load(id: &str) -> Result<Session> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
 
         // Fast path: SessionIndex → .jsonl
@@ -332,7 +366,7 @@ impl SessionRecord {
             .map(|p| {
                 let json = std::fs::read_to_string(&p)
                     .with_context(|| format!("failed to read session file: {}", p.display()))?;
-                serde_json::from_str::<SessionRecord>(&json)
+                serde_json::from_str::<Session>(&json)
                     .with_context(|| format!("failed to parse session file: {}", p.display()))
             })
             .transpose()
@@ -349,7 +383,7 @@ impl SessionRecord {
         if flat_path.exists() {
             let json = std::fs::read_to_string(&flat_path)
                 .with_context(|| format!("failed to read session file: {}", flat_path.display()))?;
-            let session: SessionRecord = serde_json::from_str(&json).with_context(|| {
+            let session: Session = serde_json::from_str(&json).with_context(|| {
                 format!("failed to parse session file: {}", flat_path.display())
             })?;
             return Ok(session);
@@ -399,10 +433,10 @@ impl SessionRecord {
         Ok(results)
     }
 
-    pub fn list() -> Result<Vec<SessionRecord>> {
+    pub fn list() -> Result<Vec<Session>> {
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
         let sessions_root = paths.sessions();
-        let mut sessions: Vec<SessionRecord> = Vec::new();
+        let mut sessions: Vec<Session> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
         if let Ok(index) = SessionIndex::open(&paths.data())
@@ -440,7 +474,7 @@ impl SessionRecord {
         sessions_root: &PathBuf,
         id: &str,
         db_dir: &PathBuf,
-    ) -> Option<SessionRecord> {
+    ) -> Option<Session> {
         let result = Self::scan_date_dirs(sessions_root, id, "jsonl")
             .ok()
             .and_then(|paths| paths.into_iter().next());
@@ -453,7 +487,7 @@ impl SessionRecord {
         let session = if found_path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             SessionEvent::read_meta(&found_path).ok()?
         } else {
-            serde_json::from_str::<SessionRecord>(&json).ok()?
+            serde_json::from_str::<Session>(&json).ok()?
         };
         let relative = found_path
             .strip_prefix(sessions_root)
@@ -470,7 +504,7 @@ impl SessionRecord {
 
     fn scan_filesystem_sessions(
         sessions_root: &PathBuf,
-        sessions: &mut Vec<SessionRecord>,
+        sessions: &mut Vec<Session>,
         seen_ids: &mut std::collections::HashSet<String>,
     ) -> Result<()> {
         Self::walk_sessions_dir(sessions_root, sessions, seen_ids)?;
@@ -479,7 +513,7 @@ impl SessionRecord {
 
     fn walk_sessions_dir(
         dir: &PathBuf,
-        sessions: &mut Vec<SessionRecord>,
+        sessions: &mut Vec<Session>,
         seen_ids: &mut std::collections::HashSet<String>,
     ) -> Result<()> {
         for entry in std::fs::read_dir(dir)
@@ -511,7 +545,7 @@ impl SessionRecord {
     }
 
     /// List only active sessions.
-    pub fn list_active() -> Result<Vec<SessionRecord>> {
+    pub fn list_active() -> Result<Vec<Session>> {
         Ok(Self::list()?
             .into_iter()
             .filter(|s| s.status == SessionStatus::Active)
@@ -552,7 +586,7 @@ impl SessionRecord {
 /// Parse the creation datetime from a UUID v7 session ID string.
 ///
 /// UUID v7 embeds a Unix millisecond timestamp in its first 48 bits.
-/// This extracts it without needing the `SessionRecord.created_at` field.
+/// This extracts it without needing the `Session.created_at` field.
 ///
 /// Returns `None` if the string is not a valid UUID v7.
 pub fn session_created_at_from_id(session_id: &str) -> Option<DateTime<Utc>> {
@@ -664,7 +698,7 @@ impl SemanticEntropy {
 }
 
 // ---------------------------------------------------------------------------
-// SessionContext, RetrievedNote, ConversationTurn (FR-076, FR-081)
+// SessionContext, RetrievedNote, Message (FR-076, FR-081)
 // ---------------------------------------------------------------------------
 
 /// Assembled session context for agent orchestration.
@@ -689,7 +723,7 @@ pub struct SessionContext {
     /// Computed sensitivity policy from retrieved notes
     pub sensitivity_policy: Sensitivity,
     /// Conversation history for this session
-    pub conversation: Vec<ConversationTurn>,
+    pub conversation: Vec<Message>,
     /// Token budget for this session
     pub max_tokens: usize,
 }
@@ -707,13 +741,100 @@ pub struct RetrievedNote {
     pub relevance: f64,
 }
 
+/// Typed role of a conversation turn's author.
+///
+/// Canonical lowercase names (`"system"`, `"user"`, `"assistant"`, `"tool"`)
+/// are produced by [`fmt::Display`] and consumed by [`std::str::FromStr`],
+/// matching the role strings historically stored in prompts and session
+/// files. Serde uses lowercase variant names for JSONL compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    /// System / instruction turn.
+    System,
+    /// Human-authored turn.
+    User,
+    /// Model-authored turn.
+    Assistant,
+    /// Tool-dispatch result turn (streaming tool-loop bookkeeping).
+    Tool,
+}
+
+impl MessageRole {
+    /// Canonical lowercase role name, identical to [`fmt::Display`] output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        }
+    }
+}
+
+impl fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when a string does not name a valid [`MessageRole`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidMessageRole(pub String);
+
+impl fmt::Display for InvalidMessageRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown message role: {} (expected system|user|assistant|tool)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidMessageRole {}
+
+impl std::str::FromStr for MessageRole {
+    type Err = InvalidMessageRole;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "system" => Ok(MessageRole::System),
+            "user" => Ok(MessageRole::User),
+            "assistant" => Ok(MessageRole::Assistant),
+            "tool" => Ok(MessageRole::Tool),
+            other => Err(InvalidMessageRole(other.to_string())),
+        }
+    }
+}
+
 /// A single turn in the conversation history.
+///
+/// The turn's speaker is the typed [`MessageRole`]; its [`fmt::Display`]
+/// impl yields the same lowercase role strings used in prompt assembly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationTurn {
-    /// Role: "user" or "assistant"
-    pub role: String,
+pub struct Message {
+    /// Role of the turn's author (see [`MessageRole`]).
+    pub role: MessageRole,
     /// Message content
     pub content: String,
+    /// Turn creation time; `None` for synthesized or historical turns.
+    ///
+    /// `#[serde(default)]` keeps JSON persisted before this field existed
+    /// deserializable (yields `None`).
+    #[serde(default)]
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
+impl Message {
+    /// Create a message with `timestamp` set to the current time.
+    pub fn new(role: MessageRole, content: &str) -> Self {
+        Self {
+            role,
+            content: content.to_string(),
+            timestamp: Some(Utc::now()),
+        }
+    }
 }
 
 impl SessionContext {
@@ -735,18 +856,15 @@ impl SessionContext {
     }
 
     /// Add a conversation turn.
-    pub fn add_turn(&mut self, role: &str, content: &str) {
+    pub fn add_turn(&mut self, role: MessageRole, content: &str) {
         tracing::info!(
             session_id = %self.session_id,
-            role = role,
+            role = %role,
             content_len = content.len(),
             conversation_turns_before = self.conversation.len(),
             "SessionContext::add_turn: adding conversation turn"
         );
-        self.conversation.push(ConversationTurn {
-            role: role.to_string(),
-            content: content.to_string(),
-        });
+        self.conversation.push(Message::new(role, content));
         tracing::info!(
             session_id = %self.session_id,
             conversation_turns_after = self.conversation.len(),
@@ -849,15 +967,15 @@ mod tests {
     #[test]
     fn test_session_context_add_turn() {
         let mut ctx = SessionContext::new("test".to_string(), "prompt".to_string());
-        ctx.add_turn("user", "hello");
-        ctx.add_turn("assistant", "hi");
+        ctx.add_turn(MessageRole::User, "hello");
+        ctx.add_turn(MessageRole::Assistant, "hi");
         assert_eq!(ctx.conversation.len(), 2);
     }
 
     #[test]
     fn test_session_context_build_prompt() {
         let mut ctx = SessionContext::new("test".to_string(), "system".to_string());
-        ctx.add_turn("user", "question");
+        ctx.add_turn(MessageRole::User, "question");
         let prompt = ctx.build_prompt("follow-up");
         assert!(prompt.contains("system"));
         assert!(prompt.contains("question"));
@@ -879,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_session_entity_new_has_correct_defaults() {
-        let session = SessionRecord::new("test-agent", "/workspace");
+        let session = Session::new("test-agent", "/workspace");
         assert_eq!(session.agent_name, "test-agent");
         assert_eq!(session.workspace, "/workspace");
         assert_eq!(session.sensitivity_policy, Sensitivity::Private);
@@ -889,9 +1007,9 @@ mod tests {
 
     #[test]
     fn test_session_entity_serialization_roundtrip() {
-        let session = SessionRecord::new("Sisyphus-Junior", "/tmp");
+        let session = Session::new("Sisyphus-Junior", "/tmp");
         let json = serde_json::to_string(&session).unwrap();
-        let loaded: SessionRecord = serde_json::from_str(&json).unwrap();
+        let loaded: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.agent_name, "Sisyphus-Junior");
         assert_eq!(loaded.workspace, "/tmp");
@@ -900,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_session_state_transitions() {
-        let mut session = SessionRecord::new("test", "/workspace");
+        let mut session = Session::new("test", "/workspace");
         assert_eq!(session.status, SessionStatus::Active);
 
         session.compact().unwrap();
@@ -937,7 +1055,7 @@ mod tests {
     #[test]
     fn test_session_save_to_date_path() {
         let root = session_test_dir();
-        let session = SessionRecord::new("agent-x", "/ws");
+        let session = Session::new("agent-x", "/ws");
         let path = session.save().unwrap();
 
         let year = session.created_at.format("%Y").to_string();
@@ -957,10 +1075,10 @@ mod tests {
     #[test]
     fn test_session_load_roundtrip() {
         session_test_dir();
-        let session = SessionRecord::new("agent-y", "/ws2");
+        let session = Session::new("agent-y", "/ws2");
         session.save().unwrap();
 
-        let loaded = SessionRecord::load(&session.id).unwrap();
+        let loaded = Session::load(&session.id).unwrap();
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.agent_name, "agent-y");
         assert_eq!(loaded.workspace, "/ws2");
@@ -972,7 +1090,7 @@ mod tests {
         let sessions_root = root.join("sessions");
 
         // Legacy flat .json file
-        let flat_session = SessionRecord::new("flat-agent", "/flat-ws");
+        let flat_session = Session::new("flat-agent", "/flat-ws");
         let flat_path = sessions_root.join(format!("{}.json", flat_session.id));
         std::fs::write(
             &flat_path,
@@ -981,10 +1099,10 @@ mod tests {
         .unwrap();
 
         // New .jsonl file via save()
-        let date_session = SessionRecord::new("date-agent", "/date-ws");
+        let date_session = Session::new("date-agent", "/date-ws");
         date_session.save().unwrap();
 
-        let all = SessionRecord::list().unwrap();
+        let all = Session::list().unwrap();
         let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
         assert!(
             ids.contains(&flat_session.id.as_str()),
@@ -1030,12 +1148,12 @@ mod tests {
         let root = session_test_dir();
         let sessions_root = root.join("sessions");
 
-        let mut session = SessionRecord::new("legacy-agent", "/legacy-ws");
+        let mut session = Session::new("legacy-agent", "/legacy-ws");
         session.title = Some("Legacy Session".to_string());
         let flat_path = sessions_root.join(format!("{}.json", session.id));
         std::fs::write(&flat_path, serde_json::to_string_pretty(&session).unwrap()).unwrap();
 
-        let loaded = SessionRecord::load(&session.id).unwrap();
+        let loaded = Session::load(&session.id).unwrap();
         assert_eq!(loaded.id, session.id);
         assert_eq!(loaded.agent_name, "legacy-agent");
         assert_eq!(loaded.title.as_deref(), Some("Legacy Session"));
@@ -1046,13 +1164,13 @@ mod tests {
         let root = session_test_dir();
         let db_dir = root.join("data");
 
-        let session = SessionRecord::new("repair-agent", "/repair-ws");
+        let session = Session::new("repair-agent", "/repair-ws");
         session.save().unwrap();
 
         let index = crate::session_index::SessionIndex::open(&db_dir).unwrap();
         index.reconcile(&session.id, "wrong/path.jsonl").unwrap();
 
-        let all = SessionRecord::list().unwrap();
+        let all = Session::list().unwrap();
         assert!(
             all.iter().any(|s| s.id == session.id),
             "repaired session should be in list"

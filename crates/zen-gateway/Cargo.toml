@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+libc.workspace = true
+sysinfo.workspace = true
 zen-core = { path = "../zen-core" }
 zen-vault = { path = "../zen-vault" }
 zen-agents = { path = "../zen-agents" }

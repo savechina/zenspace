@@ -1,9 +1,9 @@
 // Re-export SessionContext, RetrievedNote, ConversationTurn from zen-core::types (FR-081)
-pub use zen_core::types::{ConversationTurn, RetrievedNote, SessionContext};
+pub use zen_core::types::{Message, RetrievedNote, SessionContext};
 
 use anyhow::Result;
 
-use zen_core::types::{SessionRecord, SessionStatus};
+use zen_core::types::{Session, SessionStatus};
 
 /// Session lifecycle manager — creates, persists, resumes, and archives sessions.
 ///
@@ -17,9 +17,9 @@ impl SessionManager {
 
     /// Create a new session with the specified agent.
     ///
-    /// Returns the created SessionRecord, already persisted to disk.
-    pub fn create_session(&self, agent_name: &str, workspace: &str) -> Result<SessionRecord> {
-        let session = SessionRecord::new(agent_name, workspace);
+    /// Returns the created Session, already persisted to disk.
+    pub fn create_session(&self, agent_name: &str, workspace: &str) -> Result<Session> {
+        let session = Session::new(agent_name, workspace);
         session.save()?;
         tracing::info!(
             session_id = %session.id,
@@ -33,8 +33,8 @@ impl SessionManager {
     ///
     /// Loads the session from disk and reactivates it if compacted.
     /// Returns error if session is archived.
-    pub fn resume_session(&self, session_id: &str) -> Result<SessionRecord> {
-        let mut session = SessionRecord::load(session_id)?;
+    pub fn resume_session(&self, session_id: &str) -> Result<Session> {
+        let mut session = Session::load(session_id)?;
 
         match session.status {
             SessionStatus::Active => {
@@ -58,29 +58,29 @@ impl SessionManager {
 
     /// Archive a session (terminal state).
     pub fn archive_session(&self, session_id: &str) -> Result<()> {
-        let mut session = SessionRecord::load(session_id)?;
+        let mut session = Session::load(session_id)?;
         session.archive()
     }
 
     /// Get the current status of a session.
     pub fn get_status(&self, session_id: &str) -> Result<SessionStatus> {
-        let session = SessionRecord::load(session_id)?;
+        let session = Session::load(session_id)?;
         Ok(session.status)
     }
 
     /// List all sessions.
-    pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
-        SessionRecord::list()
+    pub fn list_sessions(&self) -> Result<Vec<Session>> {
+        Session::list()
     }
 
     /// List only active sessions.
-    pub fn list_active_sessions(&self) -> Result<Vec<SessionRecord>> {
-        SessionRecord::list_active()
+    pub fn list_active_sessions(&self) -> Result<Vec<Session>> {
+        Session::list_active()
     }
 
     /// Fork an existing session (deep copy messages).
-    pub fn fork_session(&self, source_id: &str, title: Option<String>) -> Result<SessionRecord> {
-        let source = SessionRecord::load(source_id)?;
+    pub fn fork_session(&self, source_id: &str, title: Option<String>) -> Result<Session> {
+        let source = Session::load(source_id)?;
         let forked = source.fork(title);
         forked.save()?;
 
@@ -95,7 +95,7 @@ impl SessionManager {
 
     /// Rename an existing session.
     pub fn rename_session(&self, session_id: &str, title: String) -> Result<()> {
-        let mut session = SessionRecord::load(session_id)?;
+        let mut session = Session::load(session_id)?;
         session.rename(title)
     }
 }

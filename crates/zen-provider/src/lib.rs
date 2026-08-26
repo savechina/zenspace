@@ -1,11 +1,9 @@
-pub mod chat;
 pub mod embedding;
 pub mod model_meta;
 pub mod providers;
 mod router;
 pub mod stream;
 
-pub use chat::{ChatMessage, ChatSession, MessageRole};
 pub use embedding::{
     DefaultEmbeddingRouter, EmbeddingError, EmbeddingProvider, EmbeddingRouter,
     OllamaEmbeddingProvider, OpenAiEmbeddingProvider,

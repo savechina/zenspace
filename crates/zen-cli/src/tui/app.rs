@@ -25,7 +25,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 use tui_textarea::TextArea;
 use zen_core::paths::ZenPaths;
-use zen_core::types::SessionContext;
+use zen_core::types::{MessageRole, SessionContext};
 
 use super::cell::{BannerCell, ErrorCell, MarkdownCell, OutputCell, PlainCell};
 use super::model_picker::ModelPickerState;
@@ -1821,7 +1821,7 @@ Use /thinking to show/hide thinking process."#;
 
     pub(crate) fn save_session_state(&mut self) {
         if let Some(ref id) = self.session_id
-            && let Ok(mut notion) = zen_core::types::SessionRecord::load(id)
+            && let Ok(mut notion) = zen_core::types::Session::load(id)
         {
             notion.updated_at = chrono::Utc::now();
             notion.status = zen_core::types::SessionStatus::Completed;
@@ -2005,12 +2005,15 @@ Use /thinking to show/hide thinking process."#;
                 {
                     let mut i = 0;
                     while i < entries.len() {
-                        if entries[i].0 == "user" {
+                        if entries[i].0.parse::<MessageRole>() == Ok(MessageRole::User) {
                             let user_content = entries[i].1.clone();
                             self.push_output(format!("You: {}", user_content), false);
-                            session_ctx.add_turn("user", &user_content);
+                            session_ctx.add_turn(MessageRole::User, &user_content);
 
-                            if i + 1 < entries.len() && entries[i + 1].0 == "assistant" {
+                            if i + 1 < entries.len()
+                                && entries[i + 1].0.parse::<MessageRole>()
+                                    == Ok(MessageRole::Assistant)
+                            {
                                 let raw_assistant = entries[i + 1].1.clone();
                                 let normalized = normalize_compact_markdown(&raw_assistant);
                                 self.output.push(OutputCell::Markdown(MarkdownCell::new(
@@ -2019,7 +2022,7 @@ Use /thinking to show/hide thinking process."#;
                                 self.invalidate_output_cache();
                                 self.chat_history
                                     .push((user_content.clone(), normalized.clone()));
-                                session_ctx.add_turn("assistant", &normalized);
+                                session_ctx.add_turn(MessageRole::Assistant, &normalized);
 
                                 i += 2;
                             } else {

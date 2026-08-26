@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::Subcommand;
+use colored::Colorize;
 use tracing::debug;
 
 use zen_core::errors::ZenError;
@@ -34,6 +35,9 @@ pub enum WikiCommands {
         #[arg(short, long)]
         check: Option<String>,
     },
+    /// Rebuild the gateway memory store (mv2) from md sources + session
+    /// archives (requires a running gateway daemon)
+    RebuildMemory,
     /// Run the consolidation pipeline (inbox → wiki)
     Distill {
         /// Target pathway (reserved, not yet used)
@@ -50,6 +54,44 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
         WikiCommands::List => {
             let paths = ZenPaths::detect()?;
             list_wiki_pages(&paths.wiki().join("notions"))
+        }
+        WikiCommands::RebuildMemory => {
+            // D3=A RPC model: the rebuild runs inside the sole-owner
+            // daemon; without it there is nothing to rebuild remotely.
+            let path = zen_gateway::transport::uds::default_socket_path();
+            let client = zen_gateway::client::GatewayClient::connect(&path)
+                .await
+                .map_err(|_| {
+                    ZenError::Message(format!(
+                        "gateway daemon not reachable at {} — run `zen serve start` first",
+                        path.display()
+                    ))
+                })?;
+            client
+                .handshake(
+                    "cli-wiki-rebuild",
+                    env!("CARGO_PKG_VERSION"),
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| ZenError::Message(format!("gateway handshake failed: {e}")))?;
+            println!("Rebuilding memory store (reindex + full session replay)...");
+            let result = client
+                .request("memory/rebuild", serde_json::json!({}))
+                .await
+                .map_err(|e| ZenError::Message(format!("memory/rebuild failed: {e}")))?;
+            println!(
+                "{} Rebuilt: {} files scanned, {} chunks indexed, {} index errors",
+                "✅".green(),
+                result["filesScanned"].as_u64().unwrap_or(0),
+                result["chunksIndexed"].as_u64().unwrap_or(0),
+                result["errors"].as_array().map(|a| a.len()).unwrap_or(0),
+            );
+            let replayed = result["replay"]["replayed"].as_u64().unwrap_or(0);
+            let skipped = result["replay"]["skipped"].as_u64().unwrap_or(0);
+            let last_offset = result["replay"]["lastOffset"].as_u64().unwrap_or(0);
+            println!("  replayed: {replayed}, skipped: {skipped}, lastOffset: {last_offset}");
+            Ok(())
         }
         WikiCommands::Show { name } => {
             let paths = ZenPaths::detect()?;

@@ -1,7 +1,7 @@
 //! Hosted agent turns (E3) — US4 core: turn state machine, event ring
 //! buffer, streaming fan-out, idempotent replay, cancel, and resume.
 //!
-//! PURPOSE: Owns the E3 [`TurnRecord`] lifecycle
+//! PURPOSE: Owns the E3 [`Turn`] lifecycle
 //! (Submitted→Running→Streaming→Completed|Cancelled, AwaitingApproval
 //! when an approval is pending) and the per-turn bounded event ring
 //! (design §5.3: 2048 frames | 60s) that powers `session/resume`
@@ -12,7 +12,7 @@
 //! against scripted executors instead of live providers.
 //!
 //! USAGE: The daemon installs `session/turn`, `session/cancel`, and
-//! `session/resume` handlers capturing a [`HostingDeps`]. The turn
+//! `session/resume` handlers capturing a [`SessionHost`]. The turn
 //! handler receives the originating connection's outbound queue sender
 //! for fan-out (SC-007 anchor); the registry itself is global so resume
 //! works across reconnects.
@@ -23,6 +23,10 @@
 //! `-32004` with the stored final result instead of re-executing;
 //! `session/cancel` drops the execution future mid-await, audits
 //! `outcome:"cancelled"`, and answers `{outcome:"cancelled"}`.
+//! Turn lifecycle is audited to `audit.jsonl`: `gateway.turn.started`
+//! fires once per registration and exactly-once `gateway.turn.completed`
+//! (`outcome` completed|cancelled) fires at the FIRST terminal
+//! transition (T054 observability).
 //!
 //! ERRORS: -32602 malformed params; -32003 unknown sessionId;
 //! -32004 replayed completed turn; -32603 execution failure /
@@ -56,15 +60,17 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 /// One-method adapter around the agent stack so hosted execution is
 /// drivable by scripted fakes in tests (the daemon binds the real
 /// [`zen_agents::AgentOrchestrator`]).
+///
+/// Owned-token payload (`String`) keeps the signature lifetime-free
+/// under `#[async_trait]` — no HRTB annotation, no boxing; call-site
+/// closures coerce to `&mut dyn FnMut` automatically.
 #[async_trait::async_trait]
 pub trait TurnExecutor: Send + Sync {
-    /// Streams a hosted turn, invoking `on_token` per streamed fragment
-    /// and returning the final response text.
     async fn execute_stream(
         &self,
         session: &mut SessionContext,
         prompt: &str,
-        on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+        callback: &mut (dyn FnMut(String) + Send),
     ) -> anyhow::Result<String>;
 }
 
@@ -74,9 +80,9 @@ impl TurnExecutor for zen_agents::AgentOrchestrator {
         &self,
         session: &mut SessionContext,
         prompt: &str,
-        mut on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+        callback: &mut (dyn FnMut(String) + Send),
     ) -> anyhow::Result<String> {
-        self.execute_stream(session, prompt, |tok| on_token(tok))
+        self.execute_stream(session, prompt, |tok| callback(tok.to_string()))
             .await
     }
 }
@@ -118,7 +124,7 @@ pub struct TurnEvent {
 
 /// E3 record for one hosted turn. Shared between the executing task,
 /// the cancel/resume handlers, and the approval broker.
-pub struct TurnRecord {
+pub struct Turn {
     pub turn_id: String,
     pub session_id: String,
     state: StdMutex<TurnState>,
@@ -137,9 +143,13 @@ pub struct TurnRecord {
     /// oldest-first idempotency reaper so recently-finished turns a
     /// client may still be retrying survive GC.
     terminal_at: StdMutex<Option<Instant>>,
+    /// Guards once-only `gateway.turn.completed` emission across
+    /// racing terminal paths (client cancel vs watchdog vs natural
+    /// completion) — double emission is impossible by construction.
+    terminal_audited: AtomicBool,
 }
 
-impl TurnRecord {
+impl Turn {
     fn new(turn_id: String, session_id: String) -> Self {
         let (done_tx, _) = watch::channel(false);
         Self {
@@ -154,6 +164,7 @@ impl TurnRecord {
             notify_cancel: Notify::new(),
             done_tx,
             terminal_at: StdMutex::new(None),
+            terminal_audited: AtomicBool::new(false),
         }
     }
 
@@ -200,6 +211,11 @@ impl TurnRecord {
     pub fn request_cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
         self.notify_cancel.notify_waiters();
+    }
+
+    /// Claims the terminal-audit slot: `true` exactly once per turn.
+    fn claim_terminal_audit(&self) -> bool {
+        !self.terminal_audited.swap(true, Ordering::SeqCst)
     }
 
     /// Appends an event to the ring (evicting capacity/window overflow)
@@ -277,7 +293,7 @@ fn event_params(turn_id: &str, seq: u64, kind: &str, payload: &Value) -> Value {
 /// (one running turn per session keeps `SessionContext` mutation safe).
 #[derive(Default)]
 pub struct TurnRegistry {
-    turns: StdMutex<HashMap<String, Arc<TurnRecord>>>,
+    turns: StdMutex<HashMap<String, Arc<Turn>>>,
     permits: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -286,7 +302,7 @@ impl TurnRegistry {
     /// concurrent duplicate with the same turnId registered first —
     /// plain `get`-then-`insert` would let two racing submissions both
     /// execute (HashMap::insert overwrites the loser's record).
-    fn insert_if_absent(&self, record: Arc<TurnRecord>) -> Option<Arc<TurnRecord>> {
+    fn insert_if_absent(&self, record: Arc<Turn>) -> Option<Arc<Turn>> {
         let mut turns = self.turns.lock().expect("registry lock");
         if let Some(existing) = turns.get(&record.turn_id) {
             return Some(Arc::clone(existing));
@@ -296,7 +312,7 @@ impl TurnRegistry {
     }
 
     /// Looks up a turn record by id (`None` when GC'd or unknown).
-    pub fn get(&self, turn_id: &str) -> Option<Arc<TurnRecord>> {
+    pub fn get(&self, turn_id: &str) -> Option<Arc<Turn>> {
         self.turns
             .lock()
             .expect("registry lock")
@@ -338,7 +354,7 @@ impl TurnRegistry {
     /// Requests cancellation on every non-terminal turn (drain path);
     /// each turn's finalize writes its own cancelled audit.
     pub async fn cancel_all_active(&self) {
-        let active: Vec<Arc<TurnRecord>> = self
+        let active: Vec<Arc<Turn>> = self
             .turns
             .lock()
             .expect("registry lock")
@@ -363,7 +379,7 @@ impl TurnRegistry {
 
 /// Dependency bundle for the hosted-session methods.
 #[derive(Clone)]
-pub struct HostingDeps {
+pub struct SessionHost {
     /// Daemon-built executor; `None` degrades turns to fast -32603.
     pub executor: Option<Arc<dyn TurnExecutor>>,
     /// Live sessions keyed by sessionId (shared with session/start).
@@ -379,7 +395,7 @@ pub struct HostingDeps {
     pub audit_path: Option<std::path::PathBuf>,
 }
 
-impl HostingDeps {
+impl SessionHost {
     /// Creates an empty bundle around an optional executor.
     pub fn new(executor: Option<Arc<dyn TurnExecutor>>) -> Self {
         Self {
@@ -488,7 +504,7 @@ pub(crate) fn parse_knowledge(params: &Value) -> Result<Option<Vec<RetrievedNote
 
 /// session/start — `{sessionId?, agent?}` → `{sessionId, agent}`.
 /// Mints UUIDv7 ids and registers the hosted [`SessionContext`].
-pub async fn start(deps: Arc<HostingDeps>, params: Value) -> Result<Value, RpcError> {
+pub async fn start(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcError> {
     let requested = params.get("sessionId").and_then(Value::as_str);
     let agent = params.get("agent").and_then(Value::as_str);
 
@@ -515,7 +531,7 @@ pub async fn start(deps: Arc<HostingDeps>, params: Value) -> Result<Value, RpcEr
 ///
 /// Cancelling a finished/unknown turn still reports success (cancel is
 /// advisory); only malformed params fail.
-pub async fn cancel(deps: Arc<HostingDeps>, params: Value) -> Result<Value, RpcError> {
+pub async fn cancel(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcError> {
     const METHOD: &str = "session/cancel";
     let turn_id = require_str(METHOD, &params, "turnId")?.to_string();
     if let Some(record) = deps.turns.get(&turn_id)
@@ -529,7 +545,7 @@ pub async fn cancel(deps: Arc<HostingDeps>, params: Value) -> Result<Value, RpcE
 /// session/resume — `{turnId, lastSeq}` → buffered frames after
 /// `lastSeq`, or a full snapshot when the window was exceeded (design
 /// §5.3). Unknown turns yield an empty snapshot so stale clients recover.
-pub async fn resume(deps: Arc<HostingDeps>, params: Value) -> Result<Value, RpcError> {
+pub async fn resume(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcError> {
     const METHOD: &str = "session/resume";
     let turn_id = require_str(METHOD, &params, "turnId")?.to_string();
     let last_seq = params.get("lastSeq").and_then(Value::as_u64).unwrap_or(0);
@@ -568,7 +584,7 @@ pub async fn resume(deps: Arc<HostingDeps>, params: Value) -> Result<Value, RpcE
 /// `connection` (when present) enables Q3 approval routing through the
 /// broker for the duration of the turn.
 pub async fn turn(
-    deps: Arc<HostingDeps>,
+    deps: Arc<SessionHost>,
     origin: Option<mpsc::Sender<OutboundFrame>>,
     params: Value,
 ) -> Result<Value, RpcError> {
@@ -580,7 +596,7 @@ pub async fn turn(
 /// approvals from this surface).
 #[tracing::instrument(skip_all, fields(turn_id, session_id))]
 pub async fn turn_with(
-    deps: Arc<HostingDeps>,
+    deps: Arc<SessionHost>,
     origin: Option<mpsc::Sender<OutboundFrame>>,
     connection: Option<crate::server::dispatch::ConnectionHandle>,
     params: Value,
@@ -635,7 +651,11 @@ pub async fn turn_with(
         return Err(rejection);
     }
 
-    {
+    // Agent label for the registration audit: the session map is the
+    // authority (session/start populated it); empty names fall back
+    // to the "auto" convention shared with session/start and
+    // agent/status frames.
+    let agent_label = {
         let mut sessions = deps.sessions.lock().await;
         if !sessions.contains_key(&session_id) {
             return Err(RpcError::session_not_found(&session_id));
@@ -647,7 +667,12 @@ pub async fn turn_with(
                 .knowledge
                 .extend(notes);
         }
-    }
+        sessions
+            .get(&session_id)
+            .map(|s| s.agent_name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "auto".to_string())
+    };
 
     let Some(executor) = deps.executor.as_ref() else {
         return Err(RpcError::internal(
@@ -655,7 +680,7 @@ pub async fn turn_with(
         ));
     };
 
-    let record = Arc::new(TurnRecord::new(turn_id.clone(), session_id.clone()));
+    let record = Arc::new(Turn::new(turn_id.clone(), session_id.clone()));
     *record.origin.lock().expect("origin lock") = origin;
     if let Some(existing) = deps.turns.insert_if_absent(Arc::clone(&record)) {
         // Registration race lost: mirror the winner (no double-exec).
@@ -674,6 +699,17 @@ pub async fn turn_with(
             )),
         };
     }
+
+    // Fresh registration won: replays, retries, and race losers
+    // return above without re-registering, so this fires exactly once
+    // per registered execution (T054).
+    deps.audit(json!({
+        "ts": chrono_now(),
+        "kind": "gateway.turn.started",
+        "turnId": record.turn_id,
+        "sessionId": record.session_id,
+        "agent": agent_label,
+    }));
 
     // Q3 approval route lives exactly as long as the turn; a deadline
     // miss (-32011) inside the broker cancels it (contracts/02).
@@ -717,17 +753,19 @@ pub async fn turn_with(
     let token_record = Arc::clone(&record);
     let token_pending = Arc::clone(&pending);
     let token_notify = flush_notify.clone();
-    let on_token = Box::new(move |tok: &str| {
+    let mut callback = move |tok: String| {
         if token_record.state() == TurnState::Running {
             token_record.set_state(TurnState::Streaming);
         }
-        token_pending.lock().expect("pending lock").push_str(tok);
+        token_pending.lock().expect("pending lock").push_str(&tok);
         token_notify.notify_one();
-    }) as Box<dyn FnMut(&str) + Send>;
+    };
 
     let watchdog = crate::server::guards::watchdog_timeout();
     let execution = async move {
-        let outcome = executor.execute_stream(&mut ctx, &prompt, on_token).await;
+        let outcome = executor
+            .execute_stream(&mut ctx, &prompt, &mut callback)
+            .await;
         (outcome, ctx)
     };
 
@@ -763,6 +801,7 @@ pub async fn turn_with(
             record.emit_structural("turn_completed", json!({ "response": response }));
             emit_agent_status(&record, "idle");
             release_done(&record);
+            audit_turn_completed(&deps, &record, "completed");
             Ok(
                 json!({ "turnId": turn_id, "response": record.final_response().unwrap_or_default() }),
             )
@@ -775,6 +814,7 @@ pub async fn turn_with(
             record.emit_structural("turn_error", json!({ "code": -32603, "message": message }));
             emit_agent_status(&record, "error");
             release_done(&record);
+            audit_turn_completed(&deps, &record, "completed");
             Err(RpcError::internal(&format!("agent execution failed: {e}")))
         }
         Ok(Err(reason)) => {
@@ -811,13 +851,34 @@ enum CancelReason {
     Watchdog,
 }
 
-async fn finalize_cancelled(deps: &Arc<HostingDeps>, record: &Arc<TurnRecord>) {
+/// Emits the once-only `gateway.turn.completed` audit line at the
+/// turn's FIRST terminal transition; the claim flag makes double
+/// emission impossible by construction even when cancel, watchdog,
+/// and natural completion race. Outcome follows the existing audit
+/// vocabulary ("completed"/"cancelled") — an execution error is still
+/// a terminal `Completed` per the TurnState design, its detail lives
+/// in the `turn_error` event. `TurnExecutor` reports no token usage,
+/// so the `tokens` field is omitted consistently rather than guessed.
+fn audit_turn_completed(deps: &Arc<SessionHost>, record: &Arc<Turn>, outcome: &'static str) {
+    if !record.claim_terminal_audit() {
+        return;
+    }
+    deps.audit(json!({
+        "ts": chrono_now(),
+        "kind": "gateway.turn.completed",
+        "turnId": record.turn_id,
+        "sessionId": record.session_id,
+        "outcome": outcome,
+    }));
+}
+
+async fn finalize_cancelled(deps: &Arc<SessionHost>, record: &Arc<Turn>) {
     finalize_cancelled_with_reason(deps, record, CancelReason::Client).await;
 }
 
 async fn finalize_cancelled_with_reason(
-    deps: &Arc<HostingDeps>,
-    record: &Arc<TurnRecord>,
+    deps: &Arc<SessionHost>,
+    record: &Arc<Turn>,
     reason: CancelReason,
 ) {
     record.set_state(TurnState::Cancelled);
@@ -831,6 +892,7 @@ async fn finalize_cancelled_with_reason(
     );
     emit_agent_status(record, "idle");
     release_done(record);
+    audit_turn_completed(deps, record, "cancelled");
     deps.audit(json!({
         "ts": chrono_now(),
         "kind": "gateway.cancelled",
@@ -841,12 +903,12 @@ async fn finalize_cancelled_with_reason(
     }));
 }
 
-fn release_done(record: &Arc<TurnRecord>) {
+fn release_done(record: &Arc<Turn>) {
     record.done_tx.send_replace(true);
 }
 
 /// Flushes accumulated token text as one merged delta frame.
-fn drain_pending(record: &Arc<TurnRecord>, pending: &Arc<StdMutex<String>>) {
+fn drain_pending(record: &Arc<Turn>, pending: &Arc<StdMutex<String>>) {
     let drained: String = std::mem::take(&mut *pending.lock().expect("pending lock"));
     if !drained.is_empty() {
         record.emit_delta(&drained);
@@ -858,7 +920,7 @@ fn flush_done_signal(flusher: &tokio::task::JoinHandle<()>) {
 }
 
 fn spawn_flusher(
-    record: Arc<TurnRecord>,
+    record: Arc<Turn>,
     pending: Arc<StdMutex<String>>,
     notify: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
@@ -884,7 +946,7 @@ fn spawn_flusher(
     })
 }
 
-fn emit_agent_status(record: &Arc<TurnRecord>, state: &str) {
+fn emit_agent_status(record: &Arc<Turn>, state: &str) {
     record.send_frame(
         OutboundFrame::structural(crate::protocol::Frame::notification(
             "agent/status",
@@ -907,9 +969,9 @@ mod tests {
     use super::*;
     use crate::transport::in_process;
 
-    async fn deps_with_executor() -> (Arc<HostingDeps>, Arc<TestExec>) {
+    async fn deps_with_executor() -> (Arc<SessionHost>, Arc<TestExec>) {
         let exec = Arc::new(TestExec::default());
-        let deps = HostingDeps::new(Some(exec.clone() as Arc<dyn TurnExecutor>));
+        let deps = SessionHost::new(Some(exec.clone() as Arc<dyn TurnExecutor>));
         deps.sessions
             .lock()
             .await
@@ -936,16 +998,16 @@ mod tests {
             &self,
             _session: &mut SessionContext,
             _prompt: &str,
-            mut on_token: Box<dyn for<'s> FnMut(&'s str) + Send>,
+            callback: &mut (dyn FnMut(String) + Send),
         ) -> anyhow::Result<String> {
             self.runs.fetch_add(1, Ordering::SeqCst);
             let delay = *self.delay_ms.lock().unwrap();
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            on_token("hel");
-            on_token("lo ");
-            on_token("world");
+            callback("hel".to_string());
+            callback("lo ".to_string());
+            callback("world".to_string());
             Ok("hello world".to_string())
         }
     }
@@ -1050,7 +1112,7 @@ mod tests {
             delay_ms: StdMutex::new(5_000),
             runs: std::sync::atomic::AtomicU32::new(0),
         });
-        let mut deps_builder = HostingDeps::new(Some(exec as Arc<dyn TurnExecutor>));
+        let mut deps_builder = SessionHost::new(Some(exec as Arc<dyn TurnExecutor>));
         deps_builder
             .sessions
             .lock()
@@ -1102,7 +1164,7 @@ mod tests {
             delay_ms: StdMutex::new(5_000),
             runs: std::sync::atomic::AtomicU32::new(0),
         });
-        let mut deps_builder = HostingDeps::new(Some(exec.clone() as Arc<dyn TurnExecutor>));
+        let mut deps_builder = SessionHost::new(Some(exec.clone() as Arc<dyn TurnExecutor>));
         deps_builder
             .sessions
             .lock()
@@ -1179,7 +1241,7 @@ mod tests {
 
     #[tokio::test]
     async fn ring_evicts_beyond_capacity_keeping_recent() {
-        let record = Arc::new(TurnRecord::new("t".into(), "s".into()));
+        let record = Arc::new(Turn::new("t".into(), "s".into()));
         for i in 0..(RING_CAPACITY + 50) {
             record.push_event("delta", json!({ "text": i }));
         }

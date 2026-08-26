@@ -92,7 +92,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
 | zen-auth | Keychain + SecretRef resolution | `crates/zen-auth/` |
 | zen-plugin | Agent tools, WASM sandbox (wasmtime), MCP client, plugin registry | `crates/zen-plugin/` |
-| zen-gateway | Sole-owner UDS daemon: JSON-RPC 2.0 method registry, hosted agent sessions (US4), guards/approvals, HTTP `/api/v1` + MCP stdio | `crates/zen-gateway/` |
+| zen-gateway | Sole-owner UDS daemon: JSON-RPC 2.0 method registry, hosted agent sessions (US4), guards/approvals, HTTP `/api/v1` + MCP stdio, QQBot channel (`channel/qqbot/`: WS gateway + HTTP bridge) | `crates/zen-gateway/` |
 
 ### Dependency Graph
 
@@ -204,13 +204,13 @@ zenspace/
 │   │   └── src/
 │   │       ├── providers/      # 7 protocol-specific providers (13 named configs)
 │   │       ├── router.rs       # DefaultRouter, LlmRouter trait, auth resolution
-│   │       ├── chat.rs         # ChatMessage, ChatSession, MessageRole
+│   │       ├── chat.rs         # MessageRole re-exported from zen-core
 │   │       ├── model_meta.rs   # ModelMetadata, ModelRouter, routing metrics
 │   │       └── stream.rs       # StreamResponse
 │   ├── zen-memory/             # Identity context (SOUL.md, MEMORY.md)
 │   ├── zen-auth/               # Keychain + SecretRef resolution
 │   ├── zen-plugin/             # WASM sandbox + MCP server
-│   └── zen-gateway/            # Sole-owner daemon: protocol/, transport/, client/, server/ (hosting+guards+approval), daemon.rs
+│   └── zen-gateway/            # Sole-owner daemon: protocol/, transport/, channel/ (qqbot carrier), client/, server/ (hosting+guards+approval), daemon.rs
 ├── config/                     # Embedded config.toml (provider definitions)
 ├── docs/specs/                 # Architecture specs (~400KB)
 ├── assets/                     # Static assets
@@ -276,6 +276,87 @@ zenspace/
 | Model metadata | `crates/zen-provider/src/model_meta.rs` | ModelRouter, metrics |
 | Auth resolution | `crates/zen-provider/src/router.rs` | resolve_api_key(), 4-tier resolution |
 
+## TYPE TAXONOMY (Structural Concept System)
+
+All data types across workspace crates follow a 7-layer hierarchy. Each layer has a
+single responsibility; types must not leak across layer boundaries except through
+explicit dependency injection.
+
+### Layer Overview
+
+```
+配置层 (Config)       ProviderConfig, AgentConfig, ModelEntry, ModelOptions,
+                      VariantConfig, FallbackStep, RetryPolicy
+
+核心层 (Core)         Sensitivity, MessageRole, Message, SessionStatus,
+                      Session, SessionContext, RetrievedNote
+
+Agent 层 (Agent)      AgentSpec, AgentProfile, Role, Capability,
+                      AgentClearance, ToolPermission, CostPerToken, LlmPreference
+
+执行层 (Execution)    Turn, TurnState, TurnEvent, TurnRegistry,
+                      SessionHost, TurnExecutor
+
+路由层 (Routing)      ModelMetadata, ModelRouter,
+                      ComplexityLevel, TaskType, Task, SemanticEntropy
+
+事件层 (Events)       SessionEvent (Session | Message)
+
+工具层 (Tools)        ToolSchema (external dependency, rig_compose)
+```
+
+### Key Design Relationships
+
+- **`AgentSpec ⊂ AgentProfile`**: `AgentProfile` is the canonical identity managed by
+  the registry; it embeds `AgentSpec` as `definition: Option<AgentSpec>`. `AgentSpec`
+  is the static definition (prompt, permissions, constraints); `AgentProfile` adds
+  role, capabilities, LLM preferences, and clearance. Both have a `name` field —
+  duplicates are tracked for cleanup (ADR-013).
+
+- **`Session`**: Domain model for session metadata persisted as the first
+  `session/meta` event in `<id>.jsonl`. Contains identity, lifecycle status,
+  and timestamps. Analogous to Codex's `Session`.
+
+- **`Message`**: Domain model for conversation turns inside `SessionContext`.
+  `{ role: MessageRole, content: String, timestamp: Option<DateTime<Utc>> }`.
+  Also used as `SessionEvent::Turn(Message)` payload for JSONL persistence.
+  `MessageRole` serializes as lowercase strings (`"user"`, `"assistant"`) via
+  `#[serde(rename_all = "lowercase")]` for backward-compatible JSONL format.
+
+- **TurnState lifecycle**: `Submitted → Running → Streaming → AwaitingApproval →
+  Completed | Cancelled`. Errors emit `"turn_error"` structural events but transition
+  to `Completed` (the turn terminates; the error is in the event payload, not the
+  state). Watchdog timeouts transition to `Cancelled`. `TurnState` intentionally lacks
+  a `Failed` variant — terminal states represent lifecycle completion, not outcome.
+
+### Triple-Enum Safety Taxonomy (2026-06-01 remediation)
+
+Three deliberately separate enums model orthogonal safety concerns. They were
+historically conflated under a single "SensitivityLevel" and were split to prevent
+accidental cross-domain mixing.
+
+| Enum            | Axis                | Domain                | Variants                      | Ord  | Crate          |
+| --------------- | ------------------- | --------------------- | ----------------------------- | ---- | -------------- |
+| `Sensitivity`     | Data classification | zen-core (universal)  | Public / Private / Confidential | Yes  | types.rs       |
+| `SafetyLevel`     | Action validation   | zen-core (validate)   | Safe / Warning / Protected     | No   | validate.rs    |
+| `AgentClearance`  | Agent permission    | zen-agents (agent)    | Low / Medium / High            | Yes  | agent_profile  |
+
+- **`Sensitivity`**: Classifies data (notes, sessions, tool invocations). Used for LLM
+  routing decisions (`enforce_sensitivity()`), tool gating (`ConfidentialityHook`),
+  and session policies. Ordered so `max()`/`max_of()` can compute ceilings.
+
+- **`SafetyLevel`**: Classifies *actions* (path modifications, command execution) by the
+  `RoleSeparationValidator`. Isolated to `zen-core/src/validate.rs` — never imported
+  by other crates.
+
+- **`AgentClearance`**: Determines which agents may handle which data levels. Compared
+  against `Sensitivity` at the orchestrator level by convention (no `From` impls
+  between the two). `AgentProfile::can_handle_sensitivity()` takes `AgentClearance`.
+
+No `From`/`Into` implementations exist between any pair. This is intentional — cross-
+domain bridging is explicit at the orchestration layer, never implicit via the type
+system.
+
 ## CONVENTIONS
 
 - **Workspace deps**: All shared deps in `[workspace.dependencies]`, inherit via `workspace = true`
@@ -286,7 +367,7 @@ zenspace/
 - **Tests**: Integration only (no inline `#[cfg(test)]` in most crates). Custom ZenTest/ZenOutput harness.
 - **Lint**: `bin/lint` → `-D warnings` + `--allow dead_code`
 - **Command files**: Pattern `src/cmd/{name}_command.rs` with `pub fn execute_command(...)` dispatcher (note: correctly spelled now)
-- **Async traits**: Object-safe async traits MUST use `#[async_trait::async_trait]` over manual `Pin<Box<dyn Future>>` plumbing (引入 async-trait 减少代码量). Caveat: when a parameter holds an elided lifetime inside a trait object (`Box<dyn FnMut(&str)>`), the macro hoists it into a concrete lifetime param that breaks HRTB demands — annotate it explicitly (`Box<dyn for<'s> FnMut(&'s str) + Send>`). Exemplar: zen-gateway `TurnExecutor`.
+- **Async traits**: Object-safe async traits MUST use `#[async_trait::async_trait]` over manual `Pin<Box<dyn Future>>` plumbing (引入 async-trait 减少代码量). Prefer owned-payload callbacks (`&mut dyn FnMut(String)`) so the macro has no lifetime to hoist; if borrowed tokens are unavoidable, annotate HRTB explicitly (`for<'s>`) at the trait site. Exemplar: zen-gateway `TurnExecutor`.
 
 ## CODE DOCUMENTATION & SCOPE LOGIC (Principle XV)
 
@@ -405,7 +486,7 @@ bin/release patch        # Bump version, tag, push
 | `zen wps` | Work process utilities | `wps_command.rs` |
 | `zen version` | Show version | `cli.rs` inline |
 | `zen session` | Session lifecycle | `session_command.rs` |
-| `zen serve` | Gateway daemon: start [--daemonized] [--http] / status / stop / mcp; `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
+| `zen serve` | Gateway daemon: start [--foreground] [--http] / status / stop / mcp; `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
 | `zen agent` | Agent registry | `agent_command.rs` |
 | `zen workspace` | `.zen/` structure | `workspace_command.rs` |
 | `zen config` | Config layers | `config_command.rs` |
@@ -419,7 +500,7 @@ bin/release patch        # Bump version, tag, push
 | `zen logs` | Structured log viewer | `logs_command.rs` |
 | `zen ingest` | Ingest files/feeds | `ingest_command.rs` |
 | `zen routine` | Routine management | `routine_command.rs` |
-| `zen wiki` | Wiki ops: list, show, reindex, lint, distill | `wiki_command.rs` |
+| `zen wiki` | Wiki ops: list, show, reindex, lint, distill, rebuild-memory | `wiki_command.rs` |
 | `zen brief` | Brief generation | `brief_command.rs` |
 | `zen model` | Model metadata + routing | `model_command.rs` |
 | `zen plugin` | Plugin management (install, enable, disable, rehash, tools list) | `plugin_command.rs` |
@@ -499,6 +580,38 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 - Extension loading: `sqlite_vec::sqlite3_vec_init` auto-registered via `sqlite3_auto_extension` at `SqliteClient::open()`
 - Unified data layer: `SqliteClient` (tokio-rusqlite writer + sqlx pool); 9 domain repositories hold `&SqliteClient`
 
+### async_trait (Object-Safe Async Traits)
+
+```rust
+// PURPOSE: Declare object-safe async traits without manual Pin<Box<dyn Future>> plumbing —
+//          the macro desugars `async fn` into a boxed-future signature implementors can match.
+// USAGE: Any trait meant for `Arc<dyn Trait>` / dyn dispatch across crates or test fakes.
+// EXPECTED: Implementors write plain `async fn`; dyn dispatch and spawned tasks work as-is.
+// ERRORS: Elided lifetimes inside trait-object params (`Box<dyn FnMut(&str)>`) get hoisted to a
+//         concrete lifetime param by the macro, breaking HRTB demands. Two escapes: (1) BEST —
+//         make the callback payload owned (`&mut dyn FnMut(String)`) so no lifetime exists to
+//         hoist; (2) if borrowed tokens are unavoidable, annotate explicitly (`for<'s>`) at the
+//         TRAIT site.
+
+// Owned-payload callback: `&mut (dyn FnMut(String) + Send)` keeps the
+// signature lifetime-free under the macro — no `for<'s>` HRTB, no boxing;
+// call-site closures coerce to `&mut dyn FnMut` automatically.
+#[async_trait::async_trait]
+pub trait TurnExecutor: Send + Sync {
+    async fn execute_stream(
+        &self,
+        session: &mut SessionContext,
+        prompt: &str,
+        callback: &mut (dyn FnMut(String) + Send),
+    ) -> anyhow::Result<String>;
+}
+```
+
+- Rule: prefer `#[async_trait]` over hand-written `Pin<Box<...>>` signatures (Constitution XI — reuse over novelty; cuts ~10 lines of boxing boilerplate per method)
+- Rule 2: owned-payload `callback: &mut (dyn FnMut(String) + Send)` is the canonical callback shape — borrowed payloads (`&str`) force HRTB annotations; newtype wrappers add boilerplate with no benefit. Static-dispatch layers (`impl FnMut(&str)`, e.g. zen-agents) may keep borrowed payloads; owned is mandatory only under `#[async_trait]` dyn signatures. Param name is `callback` everywhere (never `on_token`).
+- Caveat: the macro gives EVERY argument its own `'lifeN`; elided lifetimes inside trait-object parameters become concrete. Callbacks that must stay higher-ranked need explicit `for<'s>` at the trait definition (avoid by using owned payloads).
+- Exemplar: `crates/zen-gateway/src/server/hosting.rs` (`TurnExecutor`: orchestrator adapter + scripted test fakes)
+
 ### Agent Quality Pipeline
 
 ```
@@ -557,7 +670,18 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 
 - Project uses Rust edition 2024 (stable toolchain, MSRV 1.80+)
 - zen-repo uses the unified `SqliteClient` (tokio-rusqlite writer + sqlx pool) with 9 domain repositories
-- **Agentic gateway (004)**: sole-owner daemon owns the memvid store RW; chat/TUI route through it via `SurfaceClient` (`ZEN_SANDBOX_MODE=ask` enables Q3 approval routing to the originating surface). Protocol frozen by `docs/specs/004-agentic-gateway/contracts/`; error catalog -32000..-32099 is closed/additive-only. Guards: watchdog 900s (`ZEN_TURN_WATCHDOG_SECS`), circuit breaker 5→60s, doom-loop 20 turns/10min, stale-client GC 30s — rejections are `-32020 guard-rejected{guard,reason}` + audit line in `<logs>/audit.jsonl`. LLM streaming budgets (zen-agents `completion_model`): first-token 600s (`ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS`, covers cold local-model load+prefill), inter-token 120s (`ZEN_STREAM_INACTIVITY_TIMEOUT_SECS`); client turn ceiling 960s (`ZEN_TURN_TIMEOUT_SECS`) — invariant: turn ceiling > watchdog > first-token budget
+- **Agentic gateway (004)**: sole-owner daemon owns the memvid store RW; chat/TUI route through it via `SurfaceClient` (`ZEN_SANDBOX_MODE=ask` enables Q3 approval routing to the originating surface). Protocol frozen by `docs/specs/004-agentic-gateway/contracts/`; error catalog -32000..-32099 is closed/additive-only. Guards: watchdog 900s (`ZEN_TURN_WATCHDOG_SECS`), circuit breaker 5→60s, doom-loop 20 turns/10min, stale-client GC 30s — rejections are `-32020 guard-rejected{guard,reason}` + audit line in `<logs>/audit.jsonl`; turn lifecycle audit kinds `gateway.turn.started` (turnId/sessionId/agent, once per registration) and `gateway.turn.completed` (outcome completed|cancelled, exactly once at first terminal transition; `tokens` omitted until `TurnExecutor` reports usage) emitted from `server/hosting.rs` (T054). LLM streaming budgets (zen-agents `completion_model`): first-token 600s (`ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS`, covers cold local-model load+prefill), inter-token 120s (`ZEN_STREAM_INACTIVITY_TIMEOUT_SECS`); client turn ceiling 960s (`ZEN_TURN_TIMEOUT_SECS`) — invariant: turn ceiling > watchdog > first-token budget
+- **Session replay & memory rebuild (Phase 11)**: GC tick (30s) runs incremental jsonl→mv2 replay (`zen-memory::SessionReplayer`, blake3 turn-key idempotency; checkpoints in state.db `memvid_replay_offsets` via T049 migration 005); skipped-corrupt-line ratio >5%/tick logs ERROR. `health/status.replay` reports `{replayed, skipped, lastOffset}`. `memory/rebuild` RPC (since 1.1, additive MINOR bump — registry now 21 rows) = MemvidIndexer full reindex + checkpoint reset-to-0 + immediate full replay; CLI surface `zen wiki rebuild-memory` errors with "run `zen serve start` first" when daemon offline (D3=A RPC model)
+- **Dual-write decision (T051, 2026-08-26)**: rig-memvid `MemvidPersistHook` removed — it was instantiated in `AgentOrchestrator` but never attached to any execution pipeline (dead code; zen calls completion models directly, bypassing rig-core's PromptHook mechanism). `ZenAgent::persist_turn` is the sole active mv2 writer; `create_persist_hook`/`default_memory_config` deleted from zen-memory
+- **QQBot channel (004 Phase 13)**: `channel/qqbot/` bridges QQ official-bot events onto the gateway's own loopback HTTP surface — one daemon carries UDS + HTTP(`/api/v1`+MCP) + qqbot concurrently (channel test `qqbot_channel.rs`). Config scope logic:
+  ```
+  [channels.qqbot]           # config.toml only (no CLI/env surface of its own)
+    Functionality: enables the QQ official-bot WS gateway client + v2 REST sender
+    User impact: allowlisted QQ chats converse with persistent agent sessions; /new resets a chat's session, /status renders gateway health
+    Default: absent → channel off; present-but-incomplete credentials → disabled with WARN
+    Values: app_id, client_secret (required); allowed_users (deny-by-default; matches BOTH namespaces — group `author.member_openid` AND C2C `author.id` — so allowlist entries may mix group-member and C2C user openids); home_channel (unused yet)
+    Interaction: enabling qqbot implies the loopback HTTP carrier (bind 127.0.0.1:9876 default) since it bridges via POST /api/v1/chat; ZEN_QQBOT_APP_ID/ZEN_QQBOT_CLIENT_SECRET env layer applies per standard 5-layer config
+  ```
 - Schema migrations are forward-only additive (Principle XIII); `_sqlx_migrations` tracks applied versions; `sqlx::migrate!()` runs all pending on every `SqliteClient::open()`
 - `docs/specs/001-agentic-foundation/` has extensive architecture docs (~400KB)
 - Karpathy guidelines skill installed at `.opencode/skills/karpathy-guidelines/`

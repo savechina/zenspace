@@ -3,13 +3,13 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
-use zen_core::types::SessionRecord;
+use zen_core::types::Session;
 
 pub const MAX_SESSION_ROWS: usize = 10;
 
 pub struct SessionPickerState {
     pub visible: bool,
-    pub sessions: Vec<SessionRecord>,
+    pub sessions: Vec<Session>,
     pub selected: usize,
     pub scroll_offset: usize,
     pub archive_pending: Option<String>,
@@ -31,7 +31,7 @@ impl SessionPickerState {
     }
 
     pub fn load_sessions(&mut self) {
-        if let Ok(sessions) = SessionRecord::list() {
+        if let Ok(sessions) = Session::list() {
             self.sessions = sessions
                 .into_iter()
                 .filter(|s| s.status != zen_core::types::SessionStatus::Archived)
@@ -78,7 +78,7 @@ impl SessionPickerState {
         }
     }
 
-    pub fn selected_session(&self) -> Option<&SessionRecord> {
+    pub fn selected_session(&self) -> Option<&Session> {
         self.sessions.get(self.selected)
     }
 

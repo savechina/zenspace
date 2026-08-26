@@ -7,11 +7,10 @@ use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::{
     ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
-use rig_memvid::MemvidPersistHook;
 use tracing::{debug, info, instrument, warn};
 
-use zen_core::types::SessionContext;
-use zen_memory::{ZenMemvidStore, create_persist_hook, default_memory_config};
+use zen_core::types::{MessageRole, SessionContext};
+use zen_memory::ZenMemvidStore;
 use zen_provider::DefaultRouter;
 
 use crate::delegate_tools;
@@ -39,7 +38,6 @@ pub struct AgentOrchestrator {
     executor: crate::executor::AgentExecutor,
     token_budget: Arc<AtomicTokenBudget>,
     memvid_store: Option<rig_memvid::MemvidStore>,
-    persist_hook: Option<MemvidPersistHook<rig_core::completion::CompletionRequest>>,
     quality_pipeline: QualityPipeline,
     /// FR-046 `[agents] tools` overlay applied on top of the builtin
     /// per-agent grant map when building agents and delegates.
@@ -51,10 +49,6 @@ impl AgentOrchestrator {
         let registry = crate::registry::DefaultAgentRegistry::new();
         let wiring = ZenWiring::new();
         let memvid_store = wiring.memvid_store.clone();
-        let persist_hook = memvid_store.as_ref().map(|store| {
-            let config = zen_memory::default_memory_config();
-            zen_memory::create_persist_hook(store.clone(), config)
-        });
         if memvid_store.is_some() {
             debug!("AgentOrchestrator: auto-wired memvid store from ZenWiring");
         }
@@ -69,7 +63,6 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store,
-            persist_hook,
             quality_pipeline: QualityPipeline::new(),
             tool_overlay,
         }
@@ -79,10 +72,6 @@ impl AgentOrchestrator {
         let registry = crate::registry::DefaultAgentRegistry::new();
         let wiring = ZenWiring::new();
         let memvid_store = wiring.memvid_store.clone();
-        let persist_hook = memvid_store.as_ref().map(|store| {
-            let config = zen_memory::default_memory_config();
-            zen_memory::create_persist_hook(store.clone(), config)
-        });
         let tool_overlay = delegate_tools::load_tool_grant_overlay();
         let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
         let executor = crate::executor::AgentExecutor::new(router.clone());
@@ -94,7 +83,6 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store,
-            persist_hook,
             quality_pipeline: QualityPipeline::new(),
             tool_overlay,
         }
@@ -102,12 +90,8 @@ impl AgentOrchestrator {
 
     pub fn with_memory(mut self, memory_path: PathBuf) -> Result<Self> {
         let store = ZenMemvidStore::new(memory_path)?;
-        let inner = store.into_inner();
-        let config = default_memory_config();
-        let hook = create_persist_hook(inner.clone(), config);
-        self.memvid_store = Some(inner);
-        self.persist_hook = Some(hook);
-        debug!("AgentOrchestrator: PersistHook wired for auto-capture (FR-MEM-002 / D2)");
+        self.memvid_store = Some(store.into_inner());
+        debug!("AgentOrchestrator: memvid store wired (persist via ZenAgent::persist_turn)");
         Ok(self)
     }
 
@@ -459,8 +443,8 @@ impl AgentOrchestrator {
             Some(final_execution.metadata.duration_ms),
         );
 
-        session.add_turn("user", user_query);
-        session.add_turn("assistant", &final_execution.response);
+        session.add_turn(MessageRole::User, user_query);
+        session.add_turn(MessageRole::Assistant, &final_execution.response);
         zen_agent.persist_turn(
             &session.session_id.to_string(),
             user_query,
@@ -539,12 +523,12 @@ impl AgentOrchestrator {
     /// round 1 streams the model's answer; if it contains tool calls, we
     /// dispatch them through the sandbox hook pipeline, feed results back,
     /// and stream another round, up to `MAX_TOOL_ROUNDS`.
-    #[instrument(skip(self, session, on_token), fields(session_id = %session.session_id))]
+    #[instrument(skip(self, session, callback), fields(session_id = %session.session_id))]
     pub async fn execute_stream(
         &self,
         session: &mut SessionContext,
         user_query: &str,
-        mut on_token: impl FnMut(&str),
+        mut callback: impl FnMut(&str),
     ) -> Result<String> {
         let _start = Instant::now();
         let agent_name = self.classify_agent(user_query);
@@ -561,7 +545,7 @@ impl AgentOrchestrator {
         self.wiring.connect_mcp_servers().await;
 
         let mut response = zen_agent
-            .execute_stream_round(user_query, session, None, &mut on_token)
+            .execute_stream_round(user_query, session, None, &mut callback)
             .await?;
 
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -603,7 +587,7 @@ impl AgentOrchestrator {
                             user_query,
                             session,
                             Some(&results_json),
-                            &mut on_token,
+                            &mut callback,
                         )
                         .await?;
                 }
@@ -619,11 +603,14 @@ impl AgentOrchestrator {
             }
         }
 
-        session.add_turn("user", user_query);
+        session.add_turn(MessageRole::User, user_query);
         for (role, content) in &interaction_turns {
-            session.add_turn(role, content);
+            let parsed = role
+                .parse::<MessageRole>()
+                .expect("interaction_turns roles are hardcoded (assistant/tool)");
+            session.add_turn(parsed, content);
         }
-        session.add_turn("assistant", &response);
+        session.add_turn(MessageRole::Assistant, &response);
 
         let actual_tokens = (response.len() / 4 + user_query.len() / 4) as u64;
         let reservation = self

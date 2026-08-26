@@ -10,8 +10,13 @@
 //! per-request correlation ids, demultiplexes server frames, and offers
 //! an optional heartbeat that flags disconnection after two misses.
 //!
-//! USAGE: `GatewayClient::connect_or_spawn(&path, None).await?` then
-//! `.handshake("tui", caps).await?` and `.request(method, params).await`.
+//! USAGE: `GatewayClient::connect_or_spawn_with_probe(&path, None,
+//! "tui", version, caps).await?` — the surface dial path (T019 +
+//! T055): connect-or-spawn, handshake, and a serverVersion probe that
+//! restarts a protocol-incompatible daemon exactly once. Lower-level
+//! callers use `GatewayClient::connect_or_spawn(&path, None).await?`
+//! then `.handshake("tui", caps).await?` and
+//! `.request(method, params).await`.
 //! Server-initiated Q3 requests arrive on the notifications channel;
 //! answer them with [`GatewayClient::respond`].
 //!
@@ -30,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::protocol::{
     Capabilities, Frame, RpcErrorBody, SERVER_PROTOCOL_VERSION, initialize_params,
@@ -51,6 +56,19 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Delay between readiness probes.
 const READY_POLL: Duration = Duration::from_millis(25);
+/// Per-attempt cap on the initialize round-trip inside [`wait_for_ready`] (codex parity).
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Cap on the best-effort `shutdown` RPC inside the version-probe
+/// restart cycle (T055). The handler acknowledges immediately; the
+/// daemon exits asynchronously afterwards.
+const SHUTDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for the daemon to release its socket after an ACKNOWLEDGED
+/// `shutdown` RPC (T055). The drain path drops the listener before
+/// flushing, so release is normally sub-second; the bound only guards
+/// a stuck carrier.
+const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delay between socket-release probes (T055).
+const RELEASE_POLL: Duration = Duration::from_millis(50);
 
 /// Where `default_spawn` redirects daemon stderr; on readiness timeout
 /// its tail becomes the user-facing diagnosis (codex stderr-log pattern).
@@ -107,13 +125,95 @@ fn clean_stale_socket(path: &Path) {
     }
 }
 
+/// Extracts `serverInfo.version` from an `initialize` result
+/// (contracts/01 shape). `None` when absent, empty, or non-string —
+/// foreign/experimental daemons may omit it (T059b: degrade, never
+/// refuse).
+fn server_version_of(handshake_result: &serde_json::Value) -> Option<String> {
+    handshake_result
+        .pointer("/serverInfo/version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Parses the `MAJOR.MINOR` prefix of a crate semver
+/// (`MAJOR.MINOR.PATCH`, pre-release/build suffixes tolerated). The
+/// patch component is deliberately ignored — patch diffs are cosmetic
+/// per contracts/00 §version. Returns `None` for foreign or
+/// unparseable strings (T059b).
+fn parse_version_prefix(version: &str) -> Option<(u64, u64)> {
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Outcome of comparing the handshake's advertised server version
+/// against this build (T055). Mirrors the contract version semantics:
+/// the restart trigger is "the handshake would fail per equal-major &&
+/// client-minor ≤ server-minor" — never a cosmetic patch diff.
+enum ServerVersionCompat {
+    /// Same major and server not older at the minor level (patch diffs
+    /// ignored) — additive changes only, safe to use.
+    Compatible,
+    /// Major divergence, or a server older than this build beyond
+    /// patch level — the same refusal shape the protocol negotiation
+    /// applies. Carries the offending advertised version.
+    Incompatible(String),
+    /// Missing/empty/unparseable advertisement (foreign or experimental
+    /// daemon); never a hard refusal (T059b).
+    Unknown,
+}
+
+fn classify_server_version(server_version: Option<&str>) -> ServerVersionCompat {
+    let Some(advertised) = server_version.filter(|v| !v.is_empty()) else {
+        return ServerVersionCompat::Unknown;
+    };
+    match (
+        parse_version_prefix(env!("CARGO_PKG_VERSION")),
+        parse_version_prefix(advertised),
+    ) {
+        (Some(client), Some(server)) => {
+            if client.0 != server.0 || client.1 > server.1 {
+                ServerVersionCompat::Incompatible(advertised.to_string())
+            } else {
+                ServerVersionCompat::Compatible
+            }
+        }
+        _ => ServerVersionCompat::Unknown,
+    }
+}
+
+/// Polls until the socket stops admitting connections — the daemon
+/// exited and released its bind (file removed or listener dropped) —
+/// or `budget` elapses. Socket-probe authority, never PID trust
+/// (T055; `wait_exit`-style bounded poll).
+async fn wait_for_socket_release(path: &Path, budget: Duration) -> bool {
+    let end = tokio::time::Instant::now() + budget;
+    loop {
+        if UdsTransport::connect(path).await.is_err() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(RELEASE_POLL).await;
+    }
+}
+
 /// Default production spawner: relaunch this binary detached as
-/// `zen serve start --daemonized` with null stdio, stderr captured to
+/// `zen serve start` with null stdio, stderr captured to
 /// `<logs>/gateway-spawn.log`, and a new session.
 fn default_spawn() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    cmd.args(["serve", "start", "--daemonized"])
+    cmd.args(["serve", "start"])
+        // Implicitly-spawned daemons self-exit after 30 idle minutes
+        // (codex THREAD_UNLOADING_DELAY parity); explicit `zen serve
+        // start` never sets this and runs until `zen serve stop`.
+        .env("ZEN_GATEWAY_IDLE_EXIT_SECS", "1800")
         .stdout(Stdio::null())
         .stdin(Stdio::null());
     match spawn_log_path() {
@@ -134,30 +234,77 @@ fn default_spawn() -> anyhow::Result<()> {
     }
     #[cfg(unix)]
     {
-        // Detach from the caller's process group without pulling libc in.
+        // New SESSION (codex app-server-daemon pattern): the daemon must
+        // survive terminal hangup entirely — process_group(0) only leaves
+        // the foreground group, setsid() leaves the controlling terminal.
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     cmd.spawn()
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("spawn zen serve: {e}"))
 }
 
-/// Dials until the socket answers or `deadline` passes.
-async fn wait_for_ready(path: &Path, deadline: Duration) -> anyhow::Result<UdsTransport> {
+/// Dial-until-ready: socket liveness alone proves nothing (the listener
+/// can bind before the dispatcher answers), so readiness is confirmed
+/// with a real `initialize` round-trip on a THROWAWAY connection — the
+/// returned transport stays untouched so callers run their own
+/// initialize lifecycle on it (codex app-server-daemon pattern).
+async fn wait_for_ready(path: &Path, deadline: Duration) -> anyhow::Result<Arc<UdsTransport>> {
     let end = tokio::time::Instant::now() + deadline;
     loop {
-        match UdsTransport::connect(path).await {
-            Ok(t) => return Ok(t),
-            Err(_) if tokio::time::Instant::now() < end => {
-                tokio::time::sleep(READY_POLL).await;
-            }
-            Err(e) => anyhow::bail!(
-                "gateway not ready at {} within {deadline:?}: {e}{}",
+        if probe_ready(path).await.is_ok() {
+            // Probe passed; hand the caller a fresh, session-virgin transport.
+            return match UdsTransport::connect(path).await {
+                Ok(t) => Ok(Arc::new(t)),
+                Err(e) if tokio::time::Instant::now() < end => {
+                    debug!(error = %e, "post-probe connect failed; retrying");
+                    tokio::time::sleep(READY_POLL).await;
+                    continue;
+                }
+                Err(e) => anyhow::bail!(
+                    "gateway not ready at {} within {deadline:?}: {e}{}",
+                    path.display(),
+                    spawn_log_tail(2048)
+                ),
+            };
+        }
+        if tokio::time::Instant::now() >= end {
+            anyhow::bail!(
+                "gateway not ready at {} within {deadline:?}: initialize round-trip kept failing{}",
                 path.display(),
                 spawn_log_tail(2048)
-            ),
+            );
         }
+        tokio::time::sleep(READY_POLL).await;
+    }
+}
+
+/// One readiness attempt: connect, `initialize` round-trip under
+/// [`READY_PROBE_TIMEOUT`], drop everything. Connection-level failures
+/// and timeouts are retriable by the caller; they carry the error for
+/// the final timeout message.
+async fn probe_ready(path: &Path) -> anyhow::Result<()> {
+    let transport = UdsTransport::connect(path).await?;
+    let probe = GatewayClient::from_transport(Arc::new(transport), path);
+    let attempt = tokio::time::timeout(
+        READY_PROBE_TIMEOUT,
+        probe.handshake("zen-readiness", "0.0", Default::default()),
+    )
+    .await;
+    match attempt {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "initialize round-trip exceeded {READY_PROBE_TIMEOUT:?}"
+        )),
     }
 }
 
@@ -224,11 +371,11 @@ pub struct GatewayClient {
 /// removed — instead of leaking tasks behind a runtime that is about to
 /// exit. `None` link ownership means we ATTACHED to a server someone
 /// else owns and must leave it running.
-pub struct EmbeddedServer {
+pub struct EmbeddedGatewayGuard {
     shutdown: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
-impl Drop for EmbeddedServer {
+impl Drop for EmbeddedGatewayGuard {
     fn drop(&mut self) {
         let _ = self.shutdown.send_replace(true);
     }
@@ -250,14 +397,14 @@ impl GatewayClient {
     /// The embedded server binds the public socket first (atomic
     /// single-instance arbiter), so a racing sibling surface loses the
     /// bind, never touches the store lock, and attaches to us instead.
-    /// The returned [`EmbeddedServer`] must be held by the surface for
+    /// The returned [`EmbeddedGatewayGuard`] must be held by the surface for
     /// as long as it may act as the server; dropping it drains.
     ///
     /// # Errors
     /// Dial failure plus readiness timeout (with spawn-log tail).
     pub async fn connect_or_embed(
         socket_path: impl AsRef<Path>,
-    ) -> anyhow::Result<(Self, Option<EmbeddedServer>)> {
+    ) -> anyhow::Result<(Self, Option<EmbeddedGatewayGuard>)> {
         let path = socket_path.as_ref();
         if let Ok(client) = Self::connect(path).await {
             return Ok((client, None));
@@ -282,10 +429,10 @@ impl GatewayClient {
                 .await;
             });
         }
-        let transport = Arc::new(wait_for_ready(path, READY_TIMEOUT).await?);
+        let transport = wait_for_ready(path, READY_TIMEOUT).await?;
         Ok((
             Self::from_transport(transport, path),
-            Some(EmbeddedServer { shutdown }),
+            Some(EmbeddedGatewayGuard { shutdown }),
         ))
     }
 
@@ -310,8 +457,154 @@ impl GatewayClient {
             Some(spawn) => spawn()?,
             None => default_spawn()?,
         }
-        let transport = Arc::new(wait_for_ready(path, READY_TIMEOUT).await?);
+        let transport = wait_for_ready(path, READY_TIMEOUT).await?;
         Ok(Self::from_transport(transport, path))
+    }
+
+    /// T055 dial path: [`GatewayClient::connect_or_spawn`] plus the
+    /// initialize handshake and a version probe on the advertised
+    /// `serverInfo.version`. When the server is protocol-incompatible
+    /// with this build — per contract version semantics (equal major,
+    /// client minor ≤ server minor; patch diffs are cosmetic) — or the
+    /// handshake was refused with -32001, the client performs exactly
+    /// ONE restart cycle: best-effort `shutdown` RPC, bounded wait for
+    /// socket release, then one `connect_or_spawn` retry. A second
+    /// mismatch never loops: the error surfaces with the FR-004
+    /// recovery hint, and a version that is STILL unknown after the
+    /// retry is accepted (T059b — foreign/experimental daemons stay
+    /// usable). Concurrency-safe across surfaces: the atomic UDS bind
+    /// arbitrates the respawn, so racing siblings never double-spawn.
+    ///
+    /// # Errors
+    /// Dial/spawn/readiness failures as [`GatewayClient::connect_or_spawn`];
+    /// handshake failures propagate; a persistent version mismatch
+    /// fails with an FR-004 recovery message instead of silently
+    /// connecting to an incompatible daemon.
+    ///
+    /// ```no_run
+    /// # async fn demo() -> anyhow::Result<()> {
+    /// use zen_gateway::client::GatewayClient;
+    /// use zen_gateway::protocol::Capabilities;
+    /// let client = GatewayClient::connect_or_spawn_with_probe(
+    ///     "/tmp/zen-gateway.sock",
+    ///     None,
+    ///     "zen-chat",
+    ///     "0.0.8",
+    ///     Capabilities::default(),
+    /// )
+    /// .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect_or_spawn_with_probe(
+        socket_path: impl AsRef<Path>,
+        spawn_fn: Option<DaemonSpawnFn>,
+        client_name: &str,
+        client_version: &str,
+        capabilities: Capabilities,
+    ) -> anyhow::Result<Self> {
+        let path = socket_path.as_ref();
+        let mut restarted = false;
+        loop {
+            let client = GatewayClient::connect_or_spawn(path, spawn_fn.clone()).await?;
+            match client
+                .handshake(client_name, client_version, capabilities)
+                .await
+            {
+                Ok(result) => {
+                    let server_version = server_version_of(&result);
+                    match classify_server_version(server_version.as_deref()) {
+                        ServerVersionCompat::Compatible => return Ok(client),
+                        ServerVersionCompat::Unknown if restarted => {
+                            // T059b: never loop-restart against a daemon
+                            // that does not advertise a version.
+                            warn!(
+                                client = env!("CARGO_PKG_VERSION"),
+                                "serverVersion still unknown after one restart; accepting foreign/experimental gateway"
+                            );
+                            return Ok(client);
+                        }
+                        ServerVersionCompat::Unknown => {
+                            warn!(
+                                client = env!("CARGO_PKG_VERSION"),
+                                "serverVersion unknown/empty in handshake; attempting one daemon restart"
+                            );
+                        }
+                        ServerVersionCompat::Incompatible(version) => {
+                            if restarted {
+                                client.close().await;
+                                anyhow::bail!(
+                                    "gateway version mismatch persists after one restart \
+                                     (server {version} vs client {}): restart the gateway \
+                                     with a matching version (zen serve stop, then retry)",
+                                    env!("CARGO_PKG_VERSION")
+                                );
+                            }
+                            warn!(
+                                server = %version,
+                                client = env!("CARGO_PKG_VERSION"),
+                                "protocol-incompatible gateway detected; restarting it once"
+                            );
+                        }
+                    }
+                    Self::restart_daemon(&client, path).await;
+                    restarted = true;
+                }
+                Err(e) => {
+                    let version_refused = e
+                        .downcast_ref::<RpcErrorBody>()
+                        .is_some_and(|body| body.code == -32001);
+                    if version_refused && !restarted {
+                        warn!(
+                            error = %e,
+                            "handshake refused with -32001 version-mismatch; restarting gateway once"
+                        );
+                        Self::restart_daemon(&client, path).await;
+                        restarted = true;
+                        continue;
+                    }
+                    client.close().await;
+                    if version_refused {
+                        anyhow::bail!(
+                            "gateway handshake refused with -32001 version-mismatch: \
+                             restart the gateway with a matching version (zen serve stop, \
+                             then retry) — {e:#}"
+                        );
+                    }
+                    anyhow::bail!("gateway handshake failed: {e:#}");
+                }
+            }
+        }
+    }
+
+    /// One restart cycle of the version probe (T055): best-effort
+    /// `shutdown` RPC (local carriers only, contracts/00 §Handshake),
+    /// then a bounded socket-release wait — only when the shutdown was
+    /// ACKNOWLEDGED; a gate rejection (-32000 pre-handshake) or
+    /// transport death leaves nothing to wait for, and the retry dial
+    /// re-probes whatever still lives on the path.
+    async fn restart_daemon(client: &GatewayClient, path: &Path) {
+        match client
+            .request_timeout("shutdown", serde_json::json!({}), SHUTDOWN_RPC_TIMEOUT)
+            .await
+        {
+            Ok(_) => {
+                if !wait_for_socket_release(path, SHUTDOWN_RELEASE_TIMEOUT).await {
+                    warn!(
+                        socket = %path.display(),
+                        budget_secs = SHUTDOWN_RELEASE_TIMEOUT.as_secs(),
+                        "gateway socket did not release after shutdown; retrying dial anyway"
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(
+                    code = e.code,
+                    "shutdown RPC during version restart not accepted: {}", e.message
+                );
+            }
+        }
+        client.close().await;
     }
 
     fn from_transport(transport: Arc<UdsTransport>, socket_path: &Path) -> Self {
@@ -567,6 +860,7 @@ impl GatewayClient {
 mod tests {
     use super::*;
     use crate::server::stub_server;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn serve_one_connection(socket: &Path) {
         let listener = crate::transport::uds::bind_socket(socket).await.unwrap();
@@ -681,6 +975,366 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(!client.is_connected(), "silent peer must flag disconnect");
         hb.abort();
+        client.close().await;
+    }
+
+    /// T055 test fixture: scripted initialize behavior of the fake
+    /// daemon under test.
+    #[derive(Clone)]
+    enum InitializeScript {
+        /// Successful initialize result advertising this `serverInfo`.
+        Advertise(serde_json::Value),
+        /// Refuse initialize with -32001 (older protocol daemon) and
+        /// gate-reject `shutdown` with -32000 — the pre-handshake gate
+        /// behavior a real older daemon exhibits.
+        Refuse,
+    }
+
+    /// T055 test fixture: binds the socket, serves scripted
+    /// initialize/shutdown/health frames per connection, and on the
+    /// first `shutdown` releases the socket and exits — the release
+    /// the restart cycle polls for. The shutdown REPLY is sent only
+    /// after the teardown completes so the client's retry dial never
+    /// races a half-torn-down listener.
+    async fn scripted_version_daemon(
+        sock: &Path,
+        script: InitializeScript,
+        shutdown_seen: Arc<AtomicUsize>,
+    ) {
+        let listener = crate::transport::uds::bind_socket(sock)
+            .await
+            .expect("scripted daemon binds");
+        let released = Arc::new(tokio::sync::Notify::new());
+        let torn_down = Arc::new(tokio::sync::Notify::new());
+        loop {
+            let side = tokio::select! {
+                _ = released.notified() => break,
+                accepted = crate::transport::uds::accept_transport(&listener) => match accepted {
+                    Ok(side) => side,
+                    Err(_) => break,
+                },
+            };
+            let script = script.clone();
+            let seen = Arc::clone(&shutdown_seen);
+            let released = Arc::clone(&released);
+            let torn_down = Arc::clone(&torn_down);
+            tokio::spawn(async move {
+                loop {
+                    let Ok(frame) = side.recv().await else { break };
+                    let Frame::ClientRequest { id, method, .. } = frame else {
+                        continue; // `initialized` and other notifications
+                    };
+                    let reply = match method.as_str() {
+                        "initialize" => match &script {
+                            InitializeScript::Advertise(info) => Frame::response(
+                                id,
+                                serde_json::json!({
+                                    "protocolVersion": SERVER_PROTOCOL_VERSION,
+                                    "serverInfo": info,
+                                    "capabilities": {},
+                                }),
+                            ),
+                            InitializeScript::Refuse => Frame::error_response(
+                                id,
+                                crate::protocol::RpcError::version_mismatch(
+                                    "0.0.1-old",
+                                    SERVER_PROTOCOL_VERSION,
+                                    "scripted refusal",
+                                ),
+                            ),
+                        },
+                        "shutdown" => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            released.notify_one();
+                            torn_down.notified().await;
+                            match &script {
+                                InitializeScript::Advertise(_) => Frame::response(
+                                    id,
+                                    serde_json::json!({"drained": 0, "cancelled": 0}),
+                                ),
+                                InitializeScript::Refuse => Frame::error_response(
+                                    id,
+                                    crate::protocol::RpcError::not_initialized(),
+                                ),
+                            }
+                        }
+                        "health/status" => Frame::response(
+                            id,
+                            serde_json::json!({
+                                "serverVersion": "scripted",
+                                "storeHealth": "ok",
+                            }),
+                        ),
+                        other => Frame::error_response(
+                            id,
+                            crate::protocol::RpcError::internal(&format!(
+                                "scripted: no handler for {other}"
+                            )),
+                        ),
+                    };
+                    if side.send(reply).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(listener);
+        std::fs::remove_file(sock).ok();
+        torn_down.notify_one();
+    }
+
+    /// Waits until a daemon owns the socket (connect-probe style —
+    /// never PID trust).
+    async fn wait_socket_live(sock: &Path) {
+        for _ in 0..400 {
+            if std::os::unix::net::UnixStream::connect(sock).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("scripted daemon never bound {}", sock.display());
+    }
+
+    /// Injected spawner booting a healthy stub daemon (bind-loser
+    /// semantics preserved — races lose quietly); counts invocations.
+    fn stub_daemon_spawner(sock: &Path) -> (DaemonSpawnFn, Arc<AtomicUsize>) {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let sock = sock.to_path_buf();
+        let counted = {
+            let spawns = Arc::clone(&spawns);
+            move || {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                let sock = sock.clone();
+                tokio::spawn(async move {
+                    let Ok(listener) = crate::transport::uds::bind_socket(&sock).await else {
+                        return;
+                    };
+                    loop {
+                        if let Ok(server_side) =
+                            crate::transport::uds::accept_transport(&listener).await
+                            && let Ok(server) = stub_server(server_side)
+                        {
+                            let _ = server.run().await;
+                        }
+                    }
+                });
+                Ok(())
+            }
+        };
+        (Arc::new(counted), spawns)
+    }
+
+    /// Boots an incompatible scripted daemon on `sock`.
+    fn spawn_incompatible_daemon(sock: &Path, shutdown_seen: Arc<AtomicUsize>) {
+        let sock = sock.to_path_buf();
+        tokio::spawn(async move {
+            scripted_version_daemon(
+                &sock,
+                InitializeScript::Advertise(serde_json::json!({
+                    "name": "zen-gateway",
+                    "version": "999.0.0",
+                })),
+                shutdown_seen,
+            )
+            .await;
+        });
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_triggers_exactly_one_restart_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("vp1.sock");
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        spawn_incompatible_daemon(&sock, Arc::clone(&seen));
+        wait_socket_live(&sock).await;
+
+        let (spawn_fn, spawns) = stub_daemon_spawner(&sock);
+        let client = GatewayClient::connect_or_spawn_with_probe(
+            &sock,
+            Some(spawn_fn),
+            "probe-test",
+            "0.0",
+            Capabilities::default(),
+        )
+        .await
+        .expect("one restart cycle must recover a compatible daemon");
+
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "one shutdown RPC");
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "one respawn — never a loop"
+        );
+        let status = client
+            .request("health/status", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["storeHealth"], "ok", "recovered link is usable");
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_mismatch_fails_with_recovery_hint_without_loop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("vp2.sock");
+
+        let seen_a = Arc::new(AtomicUsize::new(0));
+        spawn_incompatible_daemon(&sock, Arc::clone(&seen_a));
+        wait_socket_live(&sock).await;
+
+        // The respawn lands on ANOTHER incompatible daemon (a racing
+        // surface's old binary won the bind arbitration).
+        let seen_b = Arc::new(AtomicUsize::new(0));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let b_sock = sock.clone();
+        let spawn_fn: DaemonSpawnFn = {
+            let spawns = Arc::clone(&spawns);
+            let seen_b = Arc::clone(&seen_b);
+            Arc::new(move || {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                let sock = b_sock.clone();
+                let seen = Arc::clone(&seen_b);
+                spawn_incompatible_daemon(&sock, seen);
+                Ok(())
+            })
+        };
+
+        let err = match GatewayClient::connect_or_spawn_with_probe(
+            &sock,
+            Some(spawn_fn),
+            "probe-test",
+            "0.0",
+            Capabilities::default(),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("second mismatch must fail visibly, never connect silently"),
+        };
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("version mismatch"), "got: {msg}");
+        assert!(
+            msg.contains("zen serve stop"),
+            "FR-004 recovery hint, got: {msg}"
+        );
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "exactly one restart cycle"
+        );
+        assert_eq!(seen_a.load(Ordering::SeqCst), 1, "daemon A shut down once");
+        assert_eq!(
+            seen_b.load(Ordering::SeqCst),
+            0,
+            "daemon B left running — no kill-and-loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_server_version_accepts_after_one_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("vp3.sock");
+
+        // Daemon A advertises an EMPTY serverVersion (T059b).
+        let seen_a = Arc::new(AtomicUsize::new(0));
+        {
+            let sock = sock.to_path_buf();
+            let seen = Arc::clone(&seen_a);
+            tokio::spawn(async move {
+                scripted_version_daemon(
+                    &sock,
+                    InitializeScript::Advertise(serde_json::json!({
+                        "name": "foreign",
+                        "version": "",
+                    })),
+                    seen,
+                )
+                .await;
+            });
+        }
+        wait_socket_live(&sock).await;
+
+        // The respawn lands on a daemon omitting serverInfo entirely.
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let b_sock = sock.clone();
+        let spawn_fn: DaemonSpawnFn = {
+            let spawns = Arc::clone(&spawns);
+            Arc::new(move || {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                let sock = b_sock.clone();
+                tokio::spawn(async move {
+                    scripted_version_daemon(
+                        &sock,
+                        InitializeScript::Advertise(serde_json::json!({})),
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                    .await;
+                });
+                Ok(())
+            })
+        };
+
+        let client = GatewayClient::connect_or_spawn_with_probe(
+            &sock,
+            Some(spawn_fn),
+            "probe-test",
+            "0.0",
+            Capabilities::default(),
+        )
+        .await
+        .expect("still-unknown version after one restart must be accepted");
+
+        assert_eq!(seen_a.load(Ordering::SeqCst), 1, "one restart attempted");
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        let status = client
+            .request("health/status", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["storeHealth"], "ok", "accepted link is usable");
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn refused_handshake_triggers_restart_and_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("vp4.sock");
+
+        // Daemon A refuses initialize with -32001 and gate-rejects
+        // shutdown with -32000, yet still releases the socket.
+        let seen = Arc::new(AtomicUsize::new(0));
+        {
+            let sock = sock.to_path_buf();
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                scripted_version_daemon(&sock, InitializeScript::Refuse, seen).await;
+            });
+        }
+        wait_socket_live(&sock).await;
+
+        let (spawn_fn, spawns) = stub_daemon_spawner(&sock);
+        let client = GatewayClient::connect_or_spawn_with_probe(
+            &sock,
+            Some(spawn_fn),
+            "probe-test",
+            "0.0",
+            Capabilities::default(),
+        )
+        .await
+        .expect("refused handshake must restart once and recover");
+
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "shutdown attempted despite gate rejection"
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        let status = client
+            .request("health/status", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["storeHealth"], "ok");
         client.close().await;
     }
 }

@@ -20,8 +20,9 @@ pub mod types;
 pub mod validate;
 
 pub use config::LlmPreference;
-pub use definition::{AgentDefinition, ToolPermission};
+pub use definition::{AgentSpec, ToolPermission};
 pub use notion_graph::{
     ImportanceScore, NotionGraphProvider, NotionSummary, SelfModelLayer, SimpleNotion,
 };
 pub use secrets::SecretRef;
+pub use types::MessageRole;

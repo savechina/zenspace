@@ -237,12 +237,33 @@ impl Drop for HttpDispatchSession {
     }
 }
 
+/// Maps catalog error codes to HTTP statuses. `-32004
+/// turn-already-completed` is deliberately `OK`: it is the idempotent-
+/// replay success shape — the caller already holds the final reply in
+/// `RpcErrorBody.data` (unpacked at the call site), so surfacing 500
+/// would turn a redelivery into a client-visible failure.
 fn rpc_error_to_status(code: i32) -> axum::http::StatusCode {
     match code {
+        -32004 => axum::http::StatusCode::OK,
         -32602 | -32600 | -32700 => axum::http::StatusCode::BAD_REQUEST,
         -32002 | -32000 => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// Unpacks an idempotent replay (`-32004`) into the original final
+/// reply carried in `data`; `None` for any other error shape. The
+/// canonical wire shape is `{"response": "..."}` (protocol/error.rs);
+/// a bare string is accepted defensively.
+fn replayed_reply(error: &RpcErrorBody) -> Option<String> {
+    if error.code != -32004 {
+        return None;
+    }
+    let data = error.data.as_ref()?;
+    data.get("response")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| data.as_str())
+        .map(str::to_string)
 }
 
 // ─────────────────────── Legacy REST shims (T041 parity) ───────────────────────
@@ -260,12 +281,23 @@ struct ChatRequest {
     #[allow(dead_code)]
     agent: Option<String>,
     session_id: Option<String>,
+    /// Caller-supplied idempotency key forwarded as the hosted
+    /// `turnId`; absent → server mints one. Carriers derive it
+    /// deterministically from platform message ids so redeliveries
+    /// replay instead of re-executing.
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 struct ChatResponse {
     reply: String,
     agent: Option<String>,
+    /// Hosted-session id for conversation continuity; `None` when the
+    /// turn failed before `session/start` completed. Additive field —
+    /// legacy clients ignore unknown JSON keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -288,6 +320,7 @@ async fn chat_handler(
             Json(ChatResponse {
                 reply: "Empty message".to_string(),
                 agent: None,
+                session_id: None,
             }),
         );
     }
@@ -299,6 +332,7 @@ async fn chat_handler(
                 Json(ChatResponse {
                     reply: format!("carrier error: {e}"),
                     agent: None,
+                    session_id: None,
                 }),
             );
         }
@@ -314,11 +348,15 @@ async fn chat_handler(
             .as_str()
             .unwrap_or_default()
             .to_string();
+        let turn_id = req
+            .turn_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         let turn = session
             .call(
                 "session/turn",
                 serde_json::json!({
-                    "turnId": uuid::Uuid::now_v7().to_string(),
+                    "turnId": turn_id,
                     "sessionId": session_id,
                     "prompt": req.message,
                 }),
@@ -328,28 +366,41 @@ async fn chat_handler(
             .is_null()
             .then(|| started["agent"].as_str().map(str::to_string))
             .flatten();
-        Ok::<_, RpcErrorBody>((turn, agent))
+        Ok::<_, RpcErrorBody>((session_id, turn, agent))
     };
     match tokio::time::timeout(HTTP_CALL_TIMEOUT, call).await {
-        Ok(Ok((turn, agent))) => (
+        Ok(Ok((session_id, turn, agent))) => (
             axum::http::StatusCode::OK,
             Json(ChatResponse {
                 reply: turn["response"].as_str().unwrap_or_default().to_string(),
                 agent,
+                session_id: Some(session_id),
             }),
         ),
-        Ok(Err(e)) => (
-            rpc_error_to_status(e.code),
-            Json(ChatResponse {
-                reply: format!("{} ({})", e.message, e.name),
-                agent: None,
-            }),
-        ),
+        Ok(Err(e)) => match replayed_reply(&e) {
+            Some(reply) => (
+                axum::http::StatusCode::OK,
+                Json(ChatResponse {
+                    reply,
+                    agent: None,
+                    session_id: None,
+                }),
+            ),
+            None => (
+                rpc_error_to_status(e.code),
+                Json(ChatResponse {
+                    reply: format!("{} ({})", e.message, e.name),
+                    agent: None,
+                    session_id: None,
+                }),
+            ),
+        },
         Err(_) => (
             axum::http::StatusCode::GATEWAY_TIMEOUT,
             Json(ChatResponse {
                 reply: "turn exceeded carrier timeout".to_string(),
                 agent: None,
+                session_id: None,
             }),
         ),
     }
@@ -471,7 +522,13 @@ async fn run_ws_bridge(socket: axum::extract::ws::WebSocket, service: Arc<crate:
                     "prompt": req.message,
                 });
                 if let Err(e) = session.call("session/turn", turn_params).await {
-                    let reply = serde_json::json!({"type": "error", "content": format!("Execution error: {} ({})", e.message, e.name)});
+                    let reply = match replayed_reply(&e) {
+                        Some(content) => serde_json::json!({"type": "done", "content": content}),
+                        None => serde_json::json!(
+                            {"type": "error",
+                             "content": format!("Execution error: {} ({})", e.message, e.name)}
+                        ),
+                    };
                     let _ = sink.send(axum::extract::ws::Message::Text(reply.to_string().into())).await;
                 }
             }

@@ -25,6 +25,7 @@ pub mod seed;
 pub mod self_model;
 pub mod sensitivity;
 pub mod session;
+pub mod session_replayer;
 pub mod virtue_log;
 
 pub use frontmatter::{extract_frontmatter, parse_field, parse_yaml_array};
@@ -46,7 +47,7 @@ pub use memory_service::IdentityContext;
 pub use memvid::TRIPLET_MIN_CONFIDENCE;
 pub use memvid::{
     ContextProjector, EntityType, MemoryEntry, MemvidDemotionHook, MemvidStoringCompactor,
-    ZenMemvidStore, create_persist_hook, default_memory_config,
+    ZenMemvidStore,
 };
 pub use memvid_index::{MemvidIndexReport, MemvidIndexer};
 pub use mental_model::MentalModelSignal;
@@ -61,6 +62,9 @@ pub use seed::{SEED_FILE_COUNT, copy_seeds_to, seed_file_paths};
 pub use self_model::{SelfModelItem, SelfModelLayer};
 pub use sensitivity::{compute_max_sensitivity, validate_provider_for_sensitivity};
 pub use session::SessionManager;
-pub use session::{ConversationTurn, RetrievedNote, SessionContext};
+pub use session::{Message, RetrievedNote, SessionContext};
+pub use session_replayer::{
+    InMemoryReplayCheckpoints, ReplayCheckpointStore, ReplayStats, SessionReplayer, turn_replay_key,
+};
 pub use virtue_log::{VirtueDomain, VirtueLog, VirtueStatus};
-pub use zen_core::types::{SessionRecord, SessionStatus};
+pub use zen_core::types::{Session, SessionStatus};

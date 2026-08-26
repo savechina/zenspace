@@ -13,7 +13,7 @@ use std::fmt;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use zen_core::types::{ConversationTurn, Sensitivity, SessionContext};
+use zen_core::types::{Message, Sensitivity, SessionContext};
 
 use crate::zen_agent::IdentityContext;
 
@@ -200,21 +200,21 @@ impl PromptTemplate {
 }
 
 // ---------------------------------------------------------------------------
-// ChatMessage — lightweight turn representation for prompt assembly
+// PromptMessage — lightweight turn representation for prompt assembly
 // ---------------------------------------------------------------------------
 
 /// Lightweight chat message used in prompt builder for conversation rendering.
 ///
-/// Wraps `ConversationTurn` from zen-core for display formatting.
+/// Wraps `Message` from zen-core for display formatting.
 #[derive(Debug, Clone)]
-pub struct ChatMessage {
+pub struct PromptMessage {
     /// Role identifier: "user", "assistant", or "system".
     pub role: String,
     /// Message text.
     pub content: String,
 }
 
-impl ChatMessage {
+impl PromptMessage {
     /// Create a new chat message.
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -234,9 +234,9 @@ impl ChatMessage {
     }
 }
 
-impl From<ConversationTurn> for ChatMessage {
-    fn from(turn: ConversationTurn) -> Self {
-        Self::new(turn.role, turn.content)
+impl From<Message> for PromptMessage {
+    fn from(turn: Message) -> Self {
+        Self::new(turn.role.to_string(), turn.content)
     }
 }
 
@@ -679,17 +679,19 @@ Reject and re-delegate if quality gates fail.";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zen_core::types::ConversationTurn;
+    use zen_core::types::{Message, MessageRole};
 
     fn make_test_session() -> SessionContext {
         let mut session = SessionContext::new("test-agent".into(), "You are a test agent.".into());
-        session.conversation.push(ConversationTurn {
-            role: "user".into(),
+        session.conversation.push(Message {
+            role: MessageRole::User,
             content: "Hello".into(),
+            timestamp: None,
         });
-        session.conversation.push(ConversationTurn {
-            role: "assistant".into(),
+        session.conversation.push(Message {
+            role: MessageRole::Assistant,
             content: "Hi there!".into(),
+            timestamp: None,
         });
         session
     }
@@ -897,11 +899,12 @@ mod tests {
 
     #[test]
     fn chat_message_from_conversation_turn() {
-        let turn = ConversationTurn {
-            role: "user".into(),
+        let turn = Message {
+            role: MessageRole::User,
             content: "test".into(),
+            timestamp: None,
         };
-        let msg: ChatMessage = turn.into();
+        let msg: PromptMessage = turn.into();
         assert_eq!(msg.role, "user");
         assert_eq!(msg.content, "test");
     }

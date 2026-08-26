@@ -27,6 +27,9 @@ version = "0.0.8"
 [workspace.dependencies]
 clap = { version = "4.5.39", features = ["derive", "env", "string"] }
 bigdecimal = { version = "0.4.8", features = ["serde", "serde_json"] }
+# Session-replay idempotency keys (Phase 11 T048) — matches the blake3
+# content-hash convention already used inside rig-memory-policy's dedup.
+blake3 = "1"
 dotenvy = "0.15.7"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "local-time", "tracing-log"] }

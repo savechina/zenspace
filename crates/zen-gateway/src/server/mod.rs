@@ -40,7 +40,7 @@ pub use dispatch::{
     APPROVAL_TIMEOUT, ApprovalOutcome, ConnectionHandle, DispatchServer, HandlerFn, stub_server,
 };
 pub use guards::{Guards, WATCHDOG_TIMEOUT};
-pub use hosting::{HostingDeps, TurnRegistry, TurnState};
+pub use hosting::{SessionHost, TurnRegistry, TurnState};
 
 use crate::protocol::Frame;
 use crate::transport::Transport;

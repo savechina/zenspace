@@ -47,7 +47,7 @@ pub type ApprovalPolicy = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + 
 
 /// One `session/event` notification, demultiplexed for UI consumption.
 #[derive(Debug, Clone)]
-pub struct SessionEvent {
+pub struct TurnNotification {
     pub turn_id: String,
     pub seq: u64,
     pub kind: String,
@@ -132,7 +132,7 @@ impl From<RpcErrorBody> for SurfaceError {
 /// reconnect-between-turns recovery.
 pub struct SurfaceClient {
     socket_path: PathBuf,
-    embedded: std::sync::RwLock<Option<crate::client::EmbeddedServer>>,
+    embedded: std::sync::RwLock<Option<crate::client::EmbeddedGatewayGuard>>,
     client_name: String,
     client_version: String,
     capabilities: Capabilities,
@@ -143,7 +143,11 @@ pub struct SurfaceClient {
     /// pump fail-safe denies any approval routed here for a turn this
     /// surface did not submit (SC-007: origin-only approvals).
     active_turns: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
-    events_tx: tokio::sync::broadcast::Sender<SessionEvent>,
+    events_tx: tokio::sync::broadcast::Sender<TurnNotification>,
+    /// Notification pump for the CURRENT link (T056). Every redial
+    /// aborts the prior pump before installing its replacement, so
+    /// reconnect cycles never leak blocked pump tasks.
+    pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl SurfaceClient {
@@ -186,6 +190,7 @@ impl SurfaceClient {
                 std::collections::HashSet::new(),
             )),
             events_tx,
+            pump: std::sync::Mutex::new(None),
         };
         surface.dial().await?;
         Ok(surface)
@@ -200,7 +205,7 @@ impl SurfaceClient {
     /// Subscribes to demultiplexed `session/event` notifications.
     /// Lagging subscribers drop oldest frames (broadcast semantics);
     /// the merged final text always arrives in `turn_completed`.
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<SessionEvent> {
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<TurnNotification> {
         self.events_tx.subscribe()
     }
 
@@ -214,30 +219,33 @@ impl SurfaceClient {
         *self.link.write().expect("link state lock poisoned") = state;
     }
 
-    /// Attach-or-embed + handshake; installs the fresh client, keeps the
-    /// embedded-server ownership (if this process became the server),
-    /// and flips the link to `Ok(serverVersion)`.
+    /// Attach-or-spawn + handshake; installs the fresh client and flips
+    /// the link to `Ok(serverVersion)`.
+    ///
+    /// Spawns a detached daemon (setsid) instead of embedding the server
+    /// in this process: a one-shot CLI that hosts the gateway dies when
+    /// the command exits, EOF-ing every surface attached to it
+    /// ("uds transport closed by peer"). A detached daemon outlives all
+    /// clients by design (codex app-server parity: exactly one server
+    /// process, surfaces come and go).
     async fn dial(&self) -> Result<GatewayClient, SurfaceError> {
         self.set_link(GatewayLinkState::Connecting);
-        let (client, embedded) = GatewayClient::connect_or_embed(&self.socket_path)
-            .await
-            .map_err(|e| {
-                self.set_link(GatewayLinkState::OfflineDegraded);
-                SurfaceError::Offline(e.to_string())
-            })?;
-        let result = client
-            .handshake(&self.client_name, &self.client_version, self.capabilities)
-            .await;
-        if let Err(e) = result {
-            client.close().await;
+        // T055: probe-enabled dial — handshake plus serverVersion check;
+        // an incompatible daemon is restarted once before this returns.
+        let client = GatewayClient::connect_or_spawn_with_probe(
+            &self.socket_path,
+            None,
+            &self.client_name,
+            &self.client_version,
+            self.capabilities,
+        )
+        .await
+        .map_err(|e| {
             self.set_link(GatewayLinkState::OfflineDegraded);
-            return Err(SurfaceError::Offline(format!("handshake failed: {e}")));
-        }
-        // Attach freely, including to embedded owners: a live owner serves
-        // our turns until it exits; graceful drain + next-turn redial
-        // recover that case (degraded banner UX). Refusing here would
-        // bounce every second surface off a plain `zen chat`/TUI session.
-        *self.embedded.write().expect("embedded lock poisoned") = embedded;
+            SurfaceError::Offline(e.to_string())
+        })?;
+        // Invariant: never take embedded ownership here — see dial() doc.
+        *self.embedded.write().expect("embedded lock poisoned") = None;
         let version = crate::protocol::SERVER_PROTOCOL_VERSION.to_string();
         self.set_link(GatewayLinkState::Ok(version));
         *self.inner.lock().await = Some(client.clone());
@@ -248,15 +256,24 @@ impl SurfaceClient {
     /// Background demux loop for one live link: answers Q3 approval
     /// requests through the installed policy (default deny) and fans
     /// `session/event` notifications out to subscribers. Exits when the
-    /// reader dies; a later redial spawns a fresh pump.
-    fn spawn_notification_pump(&self, client: GatewayClient) {
+    /// reader dies; a later redial ABORTS this pump before installing
+    /// its replacement (T056 — orphaned pumps block forever on their
+    /// still-open notification channel). Returns the new pump's
+    /// [`tokio::task::AbortHandle`] for liveness observation.
+    fn spawn_notification_pump(&self, client: GatewayClient) -> tokio::task::AbortHandle {
+        {
+            let mut slot = self.pump.lock().expect("pump slot poisoned");
+            if let Some(prior) = slot.take() {
+                prior.abort();
+            }
+        }
         let policy_slot = {
             let policy = self.approval_policy.read().expect("policy lock");
             policy.clone()
         };
         let active_turns = Arc::clone(&self.active_turns);
         let events_tx = self.events_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut client = client;
             loop {
                 let frame = match client.next_notification().await {
@@ -301,7 +318,7 @@ impl SurfaceClient {
                     crate::protocol::Frame::Notification { method, params, .. }
                         if method == "session/event" =>
                     {
-                        let event = SessionEvent {
+                        let event = TurnNotification {
                             turn_id: params["turnId"].as_str().unwrap_or_default().into(),
                             seq: params["seq"].as_u64().unwrap_or(0),
                             kind: params["kind"].as_str().unwrap_or_default().into(),
@@ -313,6 +330,9 @@ impl SurfaceClient {
                 }
             }
         });
+        let abort = handle.abort_handle();
+        *self.pump.lock().expect("pump slot poisoned") = Some(handle);
+        abort
     }
 
     /// Returns a live client, redialing when the cached one is dead
@@ -787,6 +807,7 @@ mod tests {
                 std::collections::HashSet::new(),
             )),
             events_tx: tokio::sync::broadcast::channel(16).0,
+            pump: std::sync::Mutex::new(None),
         };
         assert_eq!(
             surface.link_state(),
@@ -799,5 +820,70 @@ mod tests {
             .unwrap();
         assert_eq!(response, "again (knowledge=0)");
         assert!(matches!(surface.link_state(), GatewayLinkState::Ok(_)));
+    }
+
+    /// T056: repeated redials must not leak notification pumps. A pump
+    /// whose link was replaced stays blocked on its (still-open)
+    /// notification channel forever unless the replacement ABORTS it —
+    /// proven here by requiring the first pump to terminate (its link
+    /// stays alive, so termination can only come from the abort).
+    #[tokio::test]
+    async fn redial_aborts_prior_notification_pump() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("pump.sock");
+        // Concurrent accept loop (serve_canned serves connections
+        // sequentially; this test needs TWO links open at once).
+        let listener = uds::bind_socket(&sock).await.unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(side) = uds::accept_transport(&listener).await
+                    && let Ok(server) = stub_server(side)
+                {
+                    tokio::spawn(async move {
+                        let _ = server.run().await;
+                    });
+                }
+            }
+        });
+        let surface = open_test_surface(&sock).await;
+
+        async fn dial_test_link(sock: &Path, name: &str) -> GatewayClient {
+            let client = GatewayClient::connect(sock).await.unwrap();
+            client
+                .handshake(name, "0.0", Capabilities::default())
+                .await
+                .unwrap();
+            client
+        }
+        let first = dial_test_link(&sock, "pump-one").await;
+        let first_pump = surface.spawn_notification_pump(first);
+        assert!(
+            !first_pump.is_finished(),
+            "pump #1 must run while its link is alive"
+        );
+
+        // Redial (what ensure_link does after a dead link): the second
+        // pump replaces the first through the same path dial() uses.
+        let second = dial_test_link(&sock, "pump-two").await;
+        let second_pump = surface.spawn_notification_pump(second);
+        assert!(!second_pump.is_finished(), "pump #2 must run");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !first_pump.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first pump leaked: still running after replacement"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !surface
+                .pump
+                .lock()
+                .expect("pump slot poisoned")
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished),
+            "replacement pump must stay live for the next redial"
+        );
     }
 }

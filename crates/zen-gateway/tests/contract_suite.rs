@@ -424,7 +424,9 @@ fn registry_covers_contract_catalog() {
     for name in required {
         assert!(all.contains(name), "registry missing {name}");
     }
-    assert_eq!(all.len(), 20, "catalog freeze: exactly 20 rows");
+    // 21 rows since 1.1: additive `memory/rebuild` (Phase 11 T053/T057
+    // MINOR bump per contract 00 §version; contracts/02 Count line synced).
+    assert_eq!(all.len(), 21, "catalog freeze: exactly 21 rows");
 }
 
 #[test]

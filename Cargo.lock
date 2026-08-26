@@ -10298,6 +10298,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "syntect",
+ "sysinfo",
  "tempfile",
  "time",
  "tokio",
@@ -10360,12 +10361,14 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "libc",
  "reqwest 0.13.4",
  "rig-compose 0.5.0",
  "rig-mcp",
  "rig-memvid",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -10388,6 +10391,7 @@ version = "0.0.8"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "chrono",
  "include_dir",
  "rig-compose 0.5.0",
@@ -10400,6 +10404,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "walkdir",
  "zen-core",
 ]
 

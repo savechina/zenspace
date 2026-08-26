@@ -59,7 +59,7 @@ impl fmt::Display for ToolPermission {
 /// integration is a Phase 2 architectural task tracked in
 /// `docs/specs/001-agentic-foundation/spec.md` lines 1115-1126.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentDefinition {
+pub struct AgentSpec {
     /// Agent name (e.g., "coordinator", "junior", "oracle")
     /// NOTE: Duplicate of AgentProfile.name — consider removal in ADR-013 cleanup
     pub name: String,
@@ -99,7 +99,7 @@ pub struct AgentDefinition {
     pub custom_instructions: Vec<String>,
 }
 
-impl AgentDefinition {
+impl AgentSpec {
     /// Returns the built-in default agent definition for general-purpose use.
     pub fn default_agent() -> Self {
         Self {
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn default_agent_has_expected_fields() {
-        let agent = AgentDefinition::default_agent();
+        let agent = AgentSpec::default_agent();
         assert_eq!(agent.name, "default");
         assert!(!agent.context_injection.is_empty());
         assert!(agent.category_routing.is_none());
@@ -158,9 +158,9 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_roundtrip() {
-        let agent = AgentDefinition::default_agent();
+        let agent = AgentSpec::default_agent();
         let toml_str = toml::to_string(&agent).unwrap();
-        let deserialized: AgentDefinition = toml::from_str(&toml_str).unwrap();
+        let deserialized: AgentSpec = toml::from_str(&toml_str).unwrap();
         assert_eq!(deserialized.name, agent.name);
         assert_eq!(deserialized.prompt_template, agent.prompt_template);
         assert_eq!(deserialized.tool_permissions, agent.tool_permissions);

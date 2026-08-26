@@ -8,7 +8,7 @@
 //! per session → cool-down, 5→60s), [`DoomLoop`] (turn-rate cap per
 //! session window, 20/10min), and the StaleClientGC heartbeat helper.
 //!
-//! USAGE: `HostingDeps` carries an [`Arc<Guards>`]; the turn handler
+//! USAGE: `SessionHost` carries an [`Arc<Guards>`]; the turn handler
 //! calls [`Guards::check_submit`] before creating a record and
 //! [`Guards::record_success`]/[`record_failure`] after execution. Every
 //! rejection returns -32020 `guard-rejected{guard, reason}` and appends

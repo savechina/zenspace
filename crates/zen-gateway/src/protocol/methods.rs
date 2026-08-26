@@ -10,7 +10,9 @@
 //! USAGE: Query via [`MethodRegistry::lookup`] / [`MethodRegistry::supported_methods`].
 //! Quadrant classification is static by method (never inferred from channel).
 //!
-//! EXPECTED: 20 rows, exactly the entries enumerated by contracts/02
+//! EXPECTED: 21 rows (20 at v1.0 freeze + additive `memory/rebuild` since
+//! 1.1 — Phase 11 T053/T057 MINOR bump decision recorded here per
+//! contract 00 §version rules), exactly the entries enumerated by contracts/02
 //! (16 C→S request methods + 4 notifications, with `agent/status`
 //! present as BOTH a request and a notification). The contracts/02
 //! count-note's "21" is an off-by-one in its arithmetic; the enumerated
@@ -159,6 +161,15 @@ pub const METHODS: &[MethodMeta] = &[
         phase: Phase::Phase1,
         params: "—",
         result: "{frames, capacityBytes, generation}",
+    },
+    MethodMeta {
+        name: "memory/rebuild",
+        domain: "memory",
+        quadrant: Quadrant::ClientRequest,
+        since: "1.1",
+        phase: Phase::Phase3,
+        params: "—",
+        result: "{filesScanned, chunksIndexed, errors[], replay}",
     },
     // Knowledge
     MethodMeta {
@@ -316,9 +327,9 @@ mod tests {
 
     #[test]
     fn table_matches_contracts_count() {
-        // 20 rows per contracts/02 (see module docs for the count note).
-        assert_eq!(METHODS.len(), 20);
-        assert_eq!(MethodRegistry::supported_methods().len(), 20);
+        // 21 rows since 1.1 (additive MINOR bump): memory/rebuild (Phase 11 T053/T057).
+        assert_eq!(METHODS.len(), 21);
+        assert_eq!(MethodRegistry::supported_methods().len(), 21);
     }
 
     #[test]

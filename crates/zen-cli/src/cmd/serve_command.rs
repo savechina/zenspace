@@ -3,15 +3,23 @@ use colored::Colorize;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 use tracing::info;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
-use zen_gateway::{HttpConfig, read_pid, remove_pid, write_pid};
+use zen_gateway::{
+    HttpConfig, is_pid_alive, pid_record_alive, read_pid, read_pid_record, remove_pid, write_pid,
+    write_pid_for,
+};
 
 #[derive(Subcommand)]
 pub enum ServeCommands {
     /// Start the gateway server (UDS sole-owner daemon by default)
+    ///
+    /// Without flags this detaches immediately (codex app-server pattern:
+    /// the spawner owns reporting; the daemon process stays machine-quiet).
+    /// Startup output prints only when stdout is a terminal.
     Start {
         /// Run in foreground (blocks)
         #[arg(long)]
@@ -19,9 +27,6 @@ pub enum ServeCommands {
         /// Legacy HTTP gateway instead of the UDS daemon
         #[arg(long)]
         http: bool,
-        /// Quiet mode used by client-side auto-spawn (`--daemonized`)
-        #[arg(long)]
-        daemonized: bool,
         /// Bind address (default: 127.0.0.1, HTTP mode only)
         #[arg(long)]
         bind: Option<String>,
@@ -55,35 +60,49 @@ fn pid_path() -> Result<std::path::PathBuf, ZenError> {
     Ok(paths.global_root().join(PID_FILE_NAME))
 }
 
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+/// Polls until `pid` exits or the grace window elapses.
+///
+/// Returns `true` when the process is gone, `false` if it survived the
+/// full grace period (caller decides whether to escalate or fail).
+async fn wait_exit(pid: u32, grace: Duration) -> bool {
+    const POLL: Duration = Duration::from_millis(250);
+    let deadline = tokio::time::Instant::now() + grace;
+    while is_pid_alive(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL).await;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    true
 }
 
-fn check_stale_pid(path: &Path) -> Result<(), ZenError> {
-    if path.exists() {
-        let pid = read_pid(path).map_err(|e| ZenError::Service(e.to_string()))?;
-        if is_process_alive(pid) {
-            return Err(ZenError::Service(format!(
-                "Gateway already running (pid: {}). Run 'zen serve stop' first.",
-                pid
-            )));
+/// Best-effort cleanup of a stale or recycled-pid pid file.
+///
+/// Never rejects startup: the daemon's socket bind is the single-instance
+/// arbiter (codex parity — probe/socket first, pid file advisory only).
+fn clean_stale_pid(path: &Path) {
+    let Ok(record) = read_pid_record(path) else {
+        if path.exists() {
+            println!("{} Removed unreadable PID file", "🧹".yellow());
+            remove_pid(path).ok();
         }
-        println!(
-            "{} Cleaned up stale PID file (pid: {} was dead)",
-            "🧹".yellow(),
-            pid
-        );
-        remove_pid(path).ok();
+        return;
+    };
+    if pid_record_alive(record.pid, record.start.as_deref()) {
+        return;
     }
-    Ok(())
+    let recycled = is_pid_alive(record.pid);
+    println!(
+        "{} Cleaned up stale PID file (pid: {} {})",
+        "🧹".yellow(),
+        record.pid,
+        if recycled {
+            "was recycled by another process"
+        } else {
+            "is dead"
+        }
+    );
+    remove_pid(path).ok();
 }
 
 fn ensure_pid_dir(path: &Path) {
@@ -97,7 +116,6 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
         ServeCommands::Start {
             foreground,
             http,
-            daemonized,
             bind,
             port,
             mcp,
@@ -106,17 +124,29 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
                 return run_mcp_stdio().await;
             }
             let path = pid_path()?;
-            check_stale_pid(&path)?;
+            clean_stale_pid(&path);
             ensure_pid_dir(&path);
             // `--http` now enables the loopback HTTP carrier alongside the
             // UDS daemon (T046: legacy HttpGateway retired); env opt-in
             // also honored per FR-019 config layering.
             let http_cfg = resolve_http_carrier(*http, bind.as_deref(), *port);
+            // QQBot channel (Phase 13): config.toml-only (`[channels.qqbot]`);
+            // its presence implies the loopback HTTP carrier it bridges to.
+            let zen_config = zen_core::config::load_config()?;
+            let qqbot_cfg = resolve_qqbot_channel(zen_config);
+            let http_cfg = http_cfg.or_else(|| {
+                qqbot_cfg.as_ref().map(|_| HttpConfig::default()).map(|d| {
+                    zen_gateway::transport::http::HttpCarrierConfig {
+                        bind_addr: d.bind_addr,
+                        port: d.port,
+                    }
+                })
+            });
             write_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
             if *foreground {
-                return run_uds_foreground(*daemonized, http_cfg).await;
+                return run_uds_foreground(http_cfg, qqbot_cfg).await;
             }
-            run_background(&path, http_cfg)
+            run_background(&path, http_cfg).await
         }
         ServeCommands::Stop => {
             // Preferred path: graceful `shutdown` RPC over the UDS socket.
@@ -143,13 +173,25 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
                 return Ok(());
             }
 
-            let pid = read_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
+            let record = match read_pid_record(&path) {
+                Ok(r) => r,
+                Err(e) => return Err(ZenError::Service(e.to_string())),
+            };
 
-            if !is_process_alive(pid) {
-                println!("Gateway process not responding (pid: {})", pid);
+            if !pid_record_alive(record.pid, record.start.as_deref()) {
+                if is_pid_alive(record.pid) {
+                    println!(
+                        "PID file is stale (pid: {} was recycled by another process)",
+                        record.pid
+                    );
+                } else {
+                    println!("Gateway process not responding (pid: {})", record.pid);
+                }
                 remove_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
+                println!("Gateway not running");
                 return Ok(());
             }
+            let pid = record.pid;
 
             #[cfg(unix)]
             {
@@ -161,16 +203,19 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
                     println!("Failed to send signal to gateway (pid: {})", pid);
                 }
 
-                for i in 0..20 {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    if !is_process_alive(pid) {
-                        break;
-                    }
-                    if i == 10 {
-                        println!("Process not responding, force killing...");
-                        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        break;
+                // Escalation chain (codex app-server-daemon pattern): the
+                // daemon drains in-flight turns for ≤10s after SIGTERM, so
+                // grace slightly beyond that before a forced kill — and
+                // never report success over a wedged process.
+                const TERM_GRACE: Duration = Duration::from_secs(15);
+                const KILL_GRACE: Duration = Duration::from_secs(5);
+                if !wait_exit(pid, TERM_GRACE).await {
+                    println!("Process not responding, force killing...");
+                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    if !wait_exit(pid, KILL_GRACE).await {
+                        return Err(ZenError::Service(format!(
+                            "gateway pid {pid} survived SIGKILL"
+                        )));
                     }
                 }
             }
@@ -248,7 +293,7 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             } else if let Some(path) = path {
                 if path.exists()
                     && let Ok(pid) = read_pid(&path)
-                    && is_process_alive(pid)
+                    && is_pid_alive(pid)
                 {
                     println!(
                         "{} Gateway process alive (pid: {}) but HTTP not responding",
@@ -337,14 +382,59 @@ fn resolve_http_carrier(
     })
 }
 
+/// Resolves the QQBot channel from `[channels.qqbot]` (config.toml
+/// only, per Phase 13 decision — no CLI/env surface of its own).
+///
+/// Returns `None` when unset or when credentials are incomplete;
+/// endpoint URLs stay at official defaults (tests override via
+/// `GatewayDaemonConfig` directly).
+fn resolve_qqbot_channel(
+    zen_config: &zen_core::config::ZenConfig,
+) -> Option<zen_gateway::channel::qqbot::QqBotAdapterOptions> {
+    let q = zen_config.channels.qqbot.as_ref()?;
+    if q.app_id.is_empty() || q.client_secret.is_empty() {
+        tracing::warn!("channels.qqbot set but app_id/client_secret incomplete; channel disabled");
+        return None;
+    }
+    let bindings_db = ZenPaths::detect().ok().map(|p| p.data().join("state.db"))?;
+    Some(zen_gateway::channel::qqbot::QqBotAdapterOptions {
+        app_id: q.app_id.clone(),
+        client_secret: q.client_secret.clone(),
+        chat_base: String::new(),
+        ws_url: zen_gateway::channel::qqbot::DEFAULT_WS_URL.to_string(),
+        api_base: zen_gateway::channel::qqbot::DEFAULT_API_BASE.to_string(),
+        token_url: zen_gateway::channel::qqbot::DEFAULT_TOKEN_URL.to_string(),
+        allowed_users: q.allowed_users.clone(),
+        bindings_db,
+        // Daemon resolves the shared audit sink; CLI side stays None
+        // (overridden in serve_with_shutdown).
+        audit_path: None,
+    })
+}
+
 async fn run_uds_foreground(
-    quiet: bool,
     http_cfg: Option<zen_gateway::transport::http::HttpCarrierConfig>,
+    qqbot_cfg: Option<zen_gateway::channel::qqbot::QqBotAdapterOptions>,
 ) -> Result<(), ZenError> {
+    use std::io::IsTerminal;
     use zen_gateway::{GatewayDaemonConfig, GatewayService};
 
+    // Banner output only for humans at a terminal; spawned/redirected
+    // runs (auto-start, pipes) stay machine-quiet.
+    let interactive = std::io::stdout().is_terminal();
+
+    // Idle self-exit is an IMPLICIT-spawn-only affordance: chat-booted
+    // daemons clean themselves up; explicit `serve start` (no env set)
+    // runs until `zen serve stop`. Default mirrors codex's 30-min
+    // THREAD_UNLOADING_DELAY constant.
+    let idle_exit = std::env::var("ZEN_GATEWAY_IDLE_EXIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
     let config = GatewayDaemonConfig {
         http: http_cfg,
+        qqbot: qqbot_cfg,
+        idle_exit,
         ..GatewayDaemonConfig::default()
     };
     let socket = config.socket_path.display().to_string();
@@ -356,7 +446,7 @@ async fn run_uds_foreground(
     });
     info!("Background scheduler started");
 
-    if !quiet {
+    if interactive {
         println!("{} Gateway daemon started", "✅".green());
         println!("  Socket: {}", socket);
         println!("\nPress Ctrl+C to stop");
@@ -395,7 +485,7 @@ async fn run_uds_foreground(
                 Err(e) => return Err(ZenError::Service(format!("gateway task panicked: {e}"))),
             }
             remove_pid(&pid_file).ok();
-            if !quiet {
+            if interactive {
                 println!("\nGateway stopped");
             }
             Ok(())
@@ -422,7 +512,7 @@ async fn wait_for_stop_signal() {
     }
 }
 
-fn run_background(
+async fn run_background(
     path: &Path,
     http_cfg: Option<zen_gateway::transport::http::HttpCarrierConfig>,
 ) -> Result<(), ZenError> {
@@ -459,74 +549,69 @@ fn run_background(
         .map_err(|e| ZenError::Service(format!("Failed to spawn gateway daemon: {}", e)))?;
 
     let child_pid = child.id();
+    drop(child);
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    if is_process_alive(child_pid) {
-        ensure_pid_dir(path);
-        write_pid(path).map_err(|e| ZenError::Service(e.to_string()))?;
-
-        println!(
-            "{} Gateway started (background, pid: {})",
-            "✅".green(),
-            child_pid
-        );
-        if let Some(cfg) = &http_cfg {
-            println!("  HTTP:     http://{}:{}/health", cfg.bind_addr, cfg.port);
+    // Readiness probe instead of liveness guessing: the socket bind is
+    // the single-instance arbiter; a losing or crashed child never
+    // answers, so failure is reported honestly (codex parity — the
+    // probe is ground truth, pid files advisory).
+    const READY_POLL: Duration = Duration::from_millis(250);
+    const READY_BUDGET: Duration = Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + READY_BUDGET;
+    loop {
+        let ready = match zen_gateway::client::GatewayClient::connect(uds_socket_path()).await {
+            Ok(client) => client
+                .handshake("cli-start", "0.0", Default::default())
+                .await
+                .is_ok(),
+            Err(_) => false,
+        };
+        if ready {
+            ensure_pid_dir(path);
+            write_pid_for(path, child_pid).map_err(|e| ZenError::Service(e.to_string()))?;
+            println!(
+                "{} Gateway started (background, pid: {})",
+                "✅".green(),
+                child_pid
+            );
+            if let Some(cfg) = &http_cfg {
+                println!("  HTTP:     http://{}:{}/health", cfg.bind_addr, cfg.port);
+            }
+            println!("  Socket:   {}", uds_socket_path().display());
+            println!("  PID file: {}", path.display());
+            println!("  Run 'zen serve stop' to stop");
+            return Ok(());
         }
-        println!("  Socket:   {}", uds_socket_path().display());
-        println!("  PID file: {}", path.display());
-        println!("  Run 'zen serve stop' to stop");
-    } else {
-        return Err(ZenError::Service(
-            "Gateway daemon failed to start. Check logs for details.".to_string(),
-        ));
+        if !is_pid_alive(child_pid) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(READY_POLL).await;
     }
 
-    Ok(())
+    Err(ZenError::Service(
+        "Gateway daemon failed to become ready within 10s. Check ~/.zen/logs/gateway-spawn.log"
+            .to_string(),
+    ))
 }
 
 fn print_process_stats(pid: u32) {
+    use sysinfo::Pid;
     if pid == 0 {
         return;
     }
-    #[cfg(unix)]
-    {
-        use std::fs;
-        let stat_path = format!("/proc/{}/stat", pid);
-        if let Ok(content) = fs::read_to_string(&stat_path) {
-            let parts: Vec<&str> = content.split_whitespace().collect();
-            if parts.len() > 22 {
-                let utime: u64 = parts[13].parse().unwrap_or(0);
-                let stime: u64 = parts[14].parse().unwrap_or(0);
-                let starttime: u64 = parts[21].parse().unwrap_or(0);
-                let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-                let uptime_secs = fs::read_to_string("/proc/uptime")
-                    .ok()
-                    .and_then(|s| s.split_whitespace().next().map(|v| v.to_string()))
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0) as u64;
-                let process_start_secs = starttime / clk_tck;
-                let run_time = uptime_secs.saturating_sub(process_start_secs);
-
-                println!(
-                    "  CPU time: {}s user + {}s system",
-                    utime / clk_tck,
-                    stime / clk_tck
-                );
-                println!("  Run time: {}s", run_time);
-
-                let status_path = format!("/proc/{}/status", pid);
-                if let Ok(status) = fs::read_to_string(&status_path) {
-                    for line in status.lines() {
-                        if line.starts_with("VmRSS:") {
-                            println!("  Memory: {}", line.trim());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    let target = Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    if let Some(process) = system.process(target) {
+        println!("  CPU:     {:.1}%", process.cpu_usage());
+        println!("  Memory:  {} MB", process.memory() / 1024 / 1024);
+        println!(
+            "  Started: {} (up {}s)",
+            chrono::DateTime::from_timestamp(process.start_time() as i64, 0)
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            process.run_time()
+        );
     }
 }
 

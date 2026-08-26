@@ -5,7 +5,7 @@ use crate::agent_profile::{
 };
 
 use thiserror::Error;
-use zen_core::{AgentDefinition, ToolPermission};
+use zen_core::{AgentSpec, ToolPermission};
 
 /// Errors that can occur when interacting with the agent registry.
 #[derive(Debug, Error)]
@@ -168,7 +168,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::High,
             cost_per_token: moderate,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "sisyphus".to_string(),
                 prompt_template: "You are Sisyphus, the chief orchestrator of the Zen agent system. \
                     You are the single entry point for all agentic operations. Your responsibilities \
@@ -217,7 +217,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::Medium,
             cost_per_token: cheap,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "junior".to_string(),
                 prompt_template: "You are Junior, a focused executor in the Zen agent system. \
                     You receive well-defined tasks from orchestrators and specialists and execute \
@@ -264,7 +264,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::High,
             cost_per_token: moderate,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "hermes".to_string(),
                 prompt_template: "You are Hermes, the delivery validator and push officer in the Zen agent system. \
                     You validate completed work, manage delivery pipelines, and ensure quality gates before \
@@ -312,7 +312,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::Medium,
             cost_per_token: moderate,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "metis".to_string(),
                 prompt_template: "You are Metis, the tactical reviewer and gap analyst in the Zen agent system. \
                     You review plans and specifications for completeness, identify gaps, and ensure architectural \
@@ -352,7 +352,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::Medium,
             cost_per_token: cheap,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "momus".to_string(),
                 prompt_template: "You are Momus, the gate reviewer in the Zen agent system. \
                     You review completed implementation work against specifications and design documents. \
@@ -392,7 +392,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::High,
             cost_per_token: premium,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "oracle".to_string(),
                 prompt_template: "You are Oracle, the deep technical specialist in the Zen agent system. \
                     You provide expert analysis on complex technical questions, architectural decisions, \
@@ -433,7 +433,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::Medium,
             cost_per_token: moderate,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "prometheus".to_string(),
                 prompt_template: "You are Prometheus, the strategic planner in the Zen agent system. \
                     You design implementation plans, decompose complex features into executable tasks, \
@@ -474,7 +474,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::CloudOnly],
             max_sensitivity: AgentClearance::Low,
             cost_per_token: cheap,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "explore".to_string(),
                 prompt_template: "You are Explore, the research and exploration specialist in the Zen agent system. \
                     You gather information from external sources, explore documentation, analyze web content, \
@@ -515,7 +515,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::High,
             cost_per_token: cheap,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "librarian".to_string(),
                 prompt_template: "You are Librarian, the knowledge organization specialist in the Zen agent system. \
                     You organize, index, and maintain the workspace knowledge base. You manage notes, wiki pages, \
@@ -555,7 +555,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::Medium,
             cost_per_token: moderate,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "argus".to_string(),
                 prompt_template: "You are Argus, the multimodal visual specialist in the Zen agent system. \
                     You analyze images, diagrams, and visual content to extract structure, text, and design \
@@ -598,7 +598,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::High,
             cost_per_token: premium,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "hephaestus".to_string(),
                 prompt_template: "You are Hephaestus, the deep executor in the Zen agent system. \
                     You handle complex, end-to-end implementation tasks from planning to testing. \
@@ -644,7 +644,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::Medium,
             cost_per_token: cheap,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "atlas".to_string(),
                 prompt_template: "You are Atlas, the execution foreman in the Zen agent system. \
                     You handle batch operations, task decomposition for routine work, and automation. \
@@ -689,7 +689,7 @@ fn builtin_agents() -> Vec<AgentProfile> {
             llm_preferences: vec![LlmPreference::Any],
             max_sensitivity: AgentClearance::High,
             cost_per_token: premium,
-            definition: Some(AgentDefinition {
+            definition: Some(AgentSpec {
                 name: "zeus".to_string(),
                 prompt_template: "You are Zeus, the final value judge in the Zen agent system. \
                     You have veto and amnesty power over QualityPipeline decisions. You make the \
