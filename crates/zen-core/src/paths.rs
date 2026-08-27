@@ -77,7 +77,9 @@ impl ZenPaths {
     }
 
     pub fn vault(&self) -> PathBuf {
-        self.user_data(VAULT_DIR)
+        // Vault is always global — personal agentic knowledge follows the user,
+        // not the project. See design discussion 2026-08-27.
+        self.global_root.join(VAULT_DIR)
     }
 
     pub fn inbox(&self) -> PathBuf {
@@ -93,7 +95,7 @@ impl ZenPaths {
     }
 
     pub fn skills(&self) -> PathBuf {
-        self.user_data(SKILLS_DIR)
+        self.global_root.join(SKILLS_DIR)
     }
 
     pub fn db(&self) -> PathBuf {
@@ -122,7 +124,7 @@ impl ZenPaths {
     }
 
     pub fn finance(&self) -> PathBuf {
-        self.user_data(FINANCE_DIR)
+        self.global_root.join(FINANCE_DIR)
     }
 
     pub fn projects(&self) -> PathBuf {

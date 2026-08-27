@@ -19,6 +19,7 @@ release/
 *.swp
 *.swo
 .zen/
+.zentest/
 
 # Logs
 *.log

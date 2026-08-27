@@ -61,29 +61,12 @@ fn test_zen_workspace_init_creates_zen_dir() {
     let zen_dir = test.cwd.join(".zen");
     assert!(zen_dir.exists(), ".zen/ directory should be created");
     assert!(
-        zen_dir.join("knowledge").exists(),
-        "knowledge/ should be created"
-    );
-    assert!(
-        zen_dir.join("sessions").exists(),
-        "sessions/ should be created"
-    );
-    assert!(zen_dir.join("memory").exists(), "memory/ should be created");
-    assert!(
-        zen_dir.join("knowledge/inbox").exists(),
-        "knowledge/inbox/ should be created"
-    );
-    assert!(
-        zen_dir.join("knowledge/raw").exists(),
-        "knowledge/raw/ should be created"
-    );
-    assert!(
-        zen_dir.join("knowledge/wiki").exists(),
-        "knowledge/wiki/ should be created"
-    );
-    assert!(
         zen_dir.join("config.toml").exists(),
         "config.toml should be created"
+    );
+    assert!(
+        zen_dir.join("output").exists(),
+        "output/ should be created"
     );
 }
 

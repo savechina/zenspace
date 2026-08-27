@@ -1,0 +1,54 @@
+#!/bin/bash
+# PURPOSE: Drop-in replacement for bin/zen with full test isolation.
+#          Same as `zen` but all data goes to .zentest/ (project-local).
+#          ~/.zen is NEVER touched — production stays clean.
+#          Test data persists for debugging across runs.
+# USAGE:   bin/test-zen                          # opens TUI in isolated env
+#          bin/test-zen note create "test"       # runs command in isolated env
+#          bin/test-zen workspace init           # init in isolated env
+# EXPECTED: Identical behavior to bin/zen, all data in .zentest/
+# ERRORS:  Binary not built → `cargo build -p zen` first.
+#
+# Isolation:
+#   ZEN_HOME=.zentest      → ZenPaths.global_root = .zentest/ (not ~/.zen)
+#   HOME=/tmp/zen-tmp-XXX  → safety net: prevents any accidental ~/.zen fallback
+#
+# Data management:
+#   Default: data persists in .zentest/ for debugging
+#   ZEN_TEST_CLEAN=1: wipe .zentest/ before run (fresh state)
+#   rm -rf .zentest/: manual cleanup
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+ZEN_TEST_DIR=".zentest"
+
+if [[ ! -f target/debug/zen ]]; then
+  echo "==> Building zen binary..."
+  cargo build -p zen 2>&1
+fi
+
+# Clean mode: wipe test data before run
+if [[ "${ZEN_TEST_CLEAN:-0}" == "1" ]]; then
+  rm -rf "$ZEN_TEST_DIR"
+fi
+
+# Create .zentest if missing
+mkdir -p "$ZEN_TEST_DIR"
+
+# Safety net: HOME points to temp dir so ~/.zen is never reached
+TEST_HOME=$(mktemp -d "${TMPDIR:-/tmp}/zen-tmp-XXXXXX")
+cleanup() { rm -rf "$TEST_HOME"; }
+trap cleanup EXIT
+
+# Isolation
+export ZEN_HOME="$ZEN_TEST_DIR"
+export HOME="$TEST_HOME"
+
+# Prevent .env file from leaking production keys into tests
+unset ZEN_OPENAI_API_KEY 2>/dev/null || true
+unset ZEN_ANTHROPIC_API_KEY 2>/dev/null || true
+unset OPENAI_API_KEY 2>/dev/null || true
+unset ANTHROPIC_API_KEY 2>/dev/null || true
+
+# Run zen (no exec: trap needs the shell to fire cleanup on exit)
+./target/debug/zen "$@"

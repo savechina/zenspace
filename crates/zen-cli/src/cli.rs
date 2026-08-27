@@ -225,17 +225,16 @@ pub async fn shell() -> Result<(), ZenError> {
     let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
     let suppress = "tantivy=off";
     let rust_log = if rust_log.is_empty() {
-        suppress.to_string()
+        format!("info,{suppress}")
     } else {
         format!("{rust_log},{suppress}")
     };
     // SAFETY: set_var is called early in main before any threads are spawned.
     unsafe { std::env::set_var("RUST_LOG", &rust_log) };
 
-    let filter = EnvFilter::builder()
-        .with_default_directive(cli.verbose.tracing_level_filter().into())
-        .from_env()
-        .unwrap();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,tantivy=off")
+    });
 
     if cli.internal_sandbox_launcher {
         return zen_plugin::sandbox_launcher::run_sandbox_launcher().await;
@@ -267,7 +266,7 @@ pub async fn shell() -> Result<(), ZenError> {
             crate::tui::run(config).map_err(|e| ZenError::Message(format!("TUI error: {}", e)))
         }
     } else if let Some(cmd) = cli.command {
-        init_tracing(filter, false)?;
+        init_tracing(filter, true)?;
         dispatch_command(cmd).await
     } else {
         unreachable!("clap parse: command is neither None nor Some")

@@ -134,7 +134,7 @@ fn config_file_uses_global_when_no_workspace() {
 }
 
 #[test]
-fn vault_path_is_under_user_data() {
+fn vault_is_always_global() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "project");
     unsafe {
@@ -144,12 +144,12 @@ fn vault_path_is_under_user_data() {
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let kb = paths.vault();
     assert!(
-        kb.starts_with(&ws),
-        "vault should be under workspace: {kb:?}"
+        kb.starts_with(&home_path),
+        "vault should be under global_root: {kb:?}"
     );
     assert!(
         kb.ends_with("vault"),
-        "vault should end with 'knowledge': {kb:?}"
+        "vault should end with 'vault': {kb:?}"
     );
 
     unsafe {
@@ -158,27 +158,66 @@ fn vault_path_is_under_user_data() {
 }
 
 #[test]
-fn inbox_is_under_vault() {
-    let (_tmp, _home_path) = setup_zen_home();
+fn inbox_is_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "project");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let inbox = paths.inbox();
+    assert!(
+        inbox.starts_with(&home_path),
+        "inbox should be under global_root: {inbox:?}"
+    );
     assert!(inbox.ends_with("vault/inbox"), "inbox path: {inbox:?}");
+
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
-fn raw_is_under_vault() {
-    let (_tmp, _home_path) = setup_zen_home();
+fn raw_is_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "project");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let raw = paths.raw();
+    assert!(
+        raw.starts_with(&home_path),
+        "raw should be under global_root: {raw:?}"
+    );
     assert!(raw.ends_with("vault/raw"), "raw path: {raw:?}");
+
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
-fn wiki_is_under_vault() {
-    let (_tmp, _home_path) = setup_zen_home();
+fn wiki_is_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "project");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let wiki = paths.wiki();
+    assert!(
+        wiki.starts_with(&home_path),
+        "wiki should be under global_root: {wiki:?}"
+    );
     assert!(wiki.ends_with("vault/wiki"), "wiki path: {wiki:?}");
+
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
@@ -474,33 +513,105 @@ fn user_data_differs_by_workspace() {
 }
 
 #[test]
-fn knowledge_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.vault());
+fn vault_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    assert!(
+        paths.vault().starts_with(&home_path),
+        "vault should always be under global"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
-fn inbox_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.inbox());
+fn inbox_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    assert!(
+        paths.inbox().starts_with(&home_path),
+        "inbox should always be under global"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
-fn raw_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.raw());
+fn raw_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    assert!(
+        paths.raw().starts_with(&home_path),
+        "raw should always be under global"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
-fn wiki_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.wiki());
+fn wiki_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    assert!(
+        paths.wiki().starts_with(&home_path),
+        "wiki should always be under global"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
-fn skills_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.skills());
+fn skills_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    assert!(
+        paths.skills().starts_with(&home_path),
+        "skills should always be under global"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
-fn finance_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.finance());
+fn finance_always_global() {
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    assert!(
+        paths.finance().starts_with(&home_path),
+        "finance should always be under global"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 /// These methods should ALWAYS use global_root regardless of workspace:
