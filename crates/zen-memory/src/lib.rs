@@ -1,6 +1,7 @@
 pub mod anti_pattern;
 pub mod belief;
 pub mod commitment;
+pub mod compression;
 pub mod conversation;
 pub mod correction;
 pub mod decision;

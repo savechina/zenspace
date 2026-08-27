@@ -67,6 +67,29 @@ impl<'a> MemvidReplayOffsetRepo<'a> {
         Ok(())
     }
 
+    /// Translates a checkpoint key after cold-compression renamed the
+    /// archive (`old.jsonl` → `new.jsonl.zst`, task B4). No-op when the
+    /// old path has no row (never replayed).
+    ///
+    /// # Errors
+    /// SQLite write failure.
+    pub async fn rename_path(&self, old_session_path: &str, new_session_path: &str) -> Result<()> {
+        let (old, new) = (old_session_path.to_string(), new_session_path.to_string());
+        self.client
+            .writer()
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE memvid_replay_offsets SET session_path = ?2 \
+                     WHERE session_path = ?1",
+                    rusqlite::params![old, new],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)?;
+        Ok(())
+    }
+
     /// Upserts the applied replay offset for `session_path`.
     ///
     /// Inserts the checkpoint row on first write; an existing row's

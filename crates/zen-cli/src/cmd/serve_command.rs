@@ -479,7 +479,19 @@ async fn run_uds_foreground(
         }
         _ = wait_for_stop_signal() => {
             signal_tx.send_replace(true);
-            match serve_task.await {
+            // B1 two-tier stop: a SECOND signal during the drain window
+            // toggles the watch once more; serve_with_shutdown's drain
+            // wait treats any post-shutdown change as force-immediate
+            // cancellation (codex ShutdownSignal::Forceable precedent).
+            let escalate_tx = signal_tx.clone();
+            let escalator = tokio::spawn(async move {
+                wait_for_stop_signal().await;
+                info!("second stop signal received; escalating to immediate cancel");
+                escalate_tx.send_replace(false);
+            });
+            let served = serve_task.await;
+            escalator.abort();
+            match served {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(ZenError::Service(format!("gateway drain failed: {e}"))),
                 Err(e) => return Err(ZenError::Service(format!("gateway task panicked: {e}"))),

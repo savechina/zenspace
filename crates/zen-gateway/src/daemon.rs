@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::net::UnixStream;
 use tokio::sync::{RwLock, mpsc, watch};
-use zen_memory::{ReplayCheckpointStore, SessionReplayer, ZenMemvidStore};
+use zen_memory::{
+    ReplayCheckpointStore, SessionReplayer, ZenMemvidStore,
+    compression::{CompressionReport, compress_cold_sessions},
+};
 use zen_repo::MemvidReplayOffsetRepo;
 use zen_vault::search::SearchService;
 
@@ -292,6 +295,9 @@ pub struct GatewayService {
     /// Replay-tick busy flag: a previous tick still running skips this
     /// one instead of piling up blocking mv2 writes.
     replay_running: Arc<std::sync::atomic::AtomicBool>,
+    /// B4 cold-compression busy flag (separate from replay so a long
+    /// compression pass never suppresses the 30s replay cadence).
+    compress_running: Arc<std::sync::atomic::AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     _claim: SoleOwnerClaim,
 }
@@ -441,6 +447,7 @@ impl GatewayService {
             replay_db,
             replay_counters: Arc::new(ReplayCounters::default()),
             replay_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            compress_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_tx,
             _claim: claim,
         })
@@ -719,6 +726,67 @@ impl GatewayService {
     /// Skips when a previous tick is still running (busy flag), when the
     /// checkpoint db or memvid store is unavailable, or when ZenPaths
     /// cannot resolve the sessions root. Aggregates per-file stats into
+    /// B4 cold-archive compression step (runs in the GC tick after the
+    /// replay pass): compress `*.jsonl` archives older than 7 days to
+    /// `.jsonl.zst` (zstd level 3, ≤2 concurrent jobs) and translate the
+    /// replay checkpoint rows onto the renamed paths so the next replay
+    /// tick resumes against the compressed twin instead of full
+    /// re-replaying from byte 0.
+    ///
+    /// Skips when a previous pass is still running or state.db is
+    /// unavailable; per-file failures are logged and never abort the pass.
+    async fn run_compression_step(self: &std::sync::Arc<Self>) {
+        use std::sync::atomic::Ordering;
+
+        if self.compress_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _busy = ReplayTickGuard(self.compress_running.clone());
+
+        let Some(db) = self.replay_db.as_ref() else {
+            return;
+        };
+        let Some(sessions_root) = zen_core::paths::ZenPaths::detect()
+            .ok()
+            .map(|p| p.sessions())
+        else {
+            return;
+        };
+
+        let report: CompressionReport = compress_cold_sessions(&sessions_root).await;
+        for (old, new) in &report.renamed {
+            if let Err(e) = MemvidReplayOffsetRepo::new(db)
+                .rename_path(&old.to_string_lossy(), &new.to_string_lossy())
+                .await
+            {
+                tracing::warn!(
+                    old = %old.display(),
+                    new = %new.display(),
+                    error = %e,
+                    "checkpoint rename failed; next replay re-reads idempotently"
+                );
+            }
+        }
+        if report.compressed > 0 || !report.errors.is_empty() {
+            tracing::info!(
+                compressed = report.compressed,
+                bytesRead = report.bytes_read,
+                bytesWritten = report.bytes_written,
+                errors = report.errors.len(),
+                "cold-session compression pass done"
+            );
+            for err in &report.errors {
+                tracing::warn!(error = %err, "compression candidate failed");
+            }
+        }
+    }
+
+    /// Phase 11 T052: incremental jsonl→mv2 replay over the sessions
+    /// root, invoked from the GC tick (30s cadence).
+    ///
+    /// Skips when a previous tick is still running (busy flag), when the
+    /// checkpoint db or memvid store is unavailable, or when ZenPaths
+    /// cannot resolve the sessions root. Aggregates per-file stats into
     /// [`Self::replay_counters`] and enforces the 5% skipped-ratio
     /// silent-failure guard (ERROR log). Live `persist_turn` writes stay
     /// immediate — same-process store state serializes against replay.
@@ -967,6 +1035,7 @@ impl GatewayService {
                     drop(conns);
                     gc_service.hosting.turns.reap_terminal(64);
                     gc_service.run_replay_tick().await;
+                    gc_service.run_compression_step().await;
                 }
             })
         };
@@ -1108,15 +1177,29 @@ impl GatewayService {
         // Graceful drain (design §6): let in-flight turns finish inside
         // the window, then cancel stragglers — their finalize path writes
         // the `outcome:"cancelled"` audits — and give the audit tasks a
-        // short grace before the store drops.
+        // short grace before the store drops. B1 two-tier stop: a second
+        // SIGTERM/SIGINT during the window toggles the external watch
+        // again (`serve_command` escalator), which exits the wait early
+        // and cancels immediately — cancellation audits are still written.
         let drained = service.client_count().await;
-        let deadline = tokio::time::Instant::now() + config.drain_window;
-        while service.hosting.turns.active_count() > 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut external_drain = external_rx.clone();
+        let exit = wait_drain_or_force(
+            &|| service.hosting.turns.active_count(),
+            &mut external_drain,
+            config.drain_window,
+        )
+        .await;
+        match exit {
+            DrainExit::Clean => {}
+            DrainExit::WindowElapsed => {
+                tracing::info!("drain window elapsed; cancelling stragglers");
+            }
+            DrainExit::Forced => {
+                tracing::warn!("second stop signal received; forcing immediate cancellation");
+            }
         }
         let cancelled = service.hosting.turns.active_count();
         if cancelled > 0 {
-            tracing::info!(cancelled, "drain window elapsed; cancelling stragglers");
             service.hosting.turns.cancel_all_active().await;
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
@@ -1133,4 +1216,113 @@ fn knowledge_required(
     store_health: &'static str,
 ) -> Result<std::sync::Arc<KnowledgeState>, crate::protocol::RpcError> {
     state.ok_or_else(|| crate::protocol::RpcError::store_unavailable(store_health))
+}
+
+/// Outcome of the post-shutdown turn-drain wait (task B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainExit {
+    /// No active turns remained; nothing to cancel.
+    Clean,
+    /// Window elapsed with turns still active (caller cancels stragglers).
+    WindowElapsed,
+    /// Second stop signal forced early exit (caller cancels immediately).
+    Forced,
+}
+
+/// Waits for in-flight turns to finish within `window`, exiting early
+/// when a second stop signal arrives (B1 two-tier shutdown).
+///
+/// `external` is the daemon's external shutdown watch AFTER the graceful
+/// transition was already observed by the accept loop, so any further
+/// value change means the operator signalled again (`serve_command`
+/// toggles the watch on a second SIGTERM/SIGINT) and the wait must end
+/// now so the caller can cancel with cancellation audits.
+pub(crate) async fn wait_drain_or_force(
+    active: &(dyn Fn() -> usize + Send + Sync),
+    external: &mut watch::Receiver<bool>,
+    window: std::time::Duration,
+) -> DrainExit {
+    // Baseline the watch BEFORE arming: paths that shut down without an
+    // external signal (`shutdown` RPC, idle exit) leave this receiver
+    // with the startup value unseen — without this consume, changed()
+    // would fire immediately and force-cancel turns that should drain.
+    drop(external.borrow_and_update());
+    if active() == 0 {
+        return DrainExit::Clean;
+    }
+    let deadline = tokio::time::Instant::now() + window;
+    tokio::select! {
+        _ = tokio::time::sleep_until(deadline) => {
+            if active() > 0 { DrainExit::WindowElapsed } else { DrainExit::Clean }
+        }
+        changed = external.changed() => match changed {
+            // Second stop signal: force immediate cancellation.
+            Ok(()) if active() > 0 => DrainExit::Forced,
+            Ok(()) => DrainExit::Clean,
+            // All senders dropped: escalation became impossible, so fall
+            // back to riding out the plain drain window instead of
+            // treating the turn as drained.
+            Err(_) => {
+                tokio::time::sleep_until(deadline).await;
+                if active() > 0 { DrainExit::WindowElapsed } else { DrainExit::Clean }
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    fn counter(v: Arc<std::sync::atomic::AtomicUsize>) -> impl Fn() -> usize {
+        move || v.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn clean_exit_when_no_turns_active() {
+        let (_, mut rx) = watch::channel(false);
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exit =
+            wait_drain_or_force(&counter(n), &mut rx, std::time::Duration::from_secs(5)).await;
+        assert_eq!(exit, DrainExit::Clean);
+    }
+
+    #[tokio::test]
+    async fn second_signal_forces_immediate_exit_before_window() {
+        let (tx, mut rx) = watch::channel(true);
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let start = std::time::Instant::now();
+        let task = tokio::spawn(async move {
+            wait_drain_or_force(
+                &counter(Arc::clone(&n)),
+                &mut rx,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+        });
+        // Graceful already consumed by the accept loop; a second signal
+        // toggles the watch again → the drain wait must exit as Forced
+        // well inside the (30s) window instead of sleeping it out.
+        // Yield first so the spawned wait arms its watch baseline before
+        // the toggle lands (otherwise the baseline swallows it).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tx.send_replace(false);
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("forced wait must not outlive 2s")
+            .unwrap();
+        assert_eq!(exit, DrainExit::Forced);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn window_elapsed_when_turn_never_finishes_and_no_signal() {
+        // Named binding: a bare `_` would drop the sender and close the
+        // watch, turning this into the sender-dropped fallback case.
+        let (_tx, mut rx) = watch::channel(true);
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let exit =
+            wait_drain_or_force(&counter(n), &mut rx, std::time::Duration::from_millis(50)).await;
+        assert_eq!(exit, DrainExit::WindowElapsed);
+    }
 }

@@ -8,6 +8,11 @@
 //! store before persisting, so full re-replay (daemon restart mid-batch,
 //! checkpoint reset) can never double-write.
 //!
+//! B4 transparency: `*.jsonl.zst` cold archives are decoded on read via
+//! [`crate::compression::load_session_bytes`]; compressed files skip the
+//! trailing-newline repair (immutable by construction). Checkpoint keys
+//! follow the renamed path — the compressor's caller translates rows.
+//!
 //! USAGE: Constructed by the gateway replay tick (T052) with the sole-owner
 //! [`ZenMemvidStore`] and a checkpoint store backed by the daemon's state.db
 //! `memvid_replay_offsets` table (zen-repo `MemvidReplayOffsetRepo` adapted
@@ -170,9 +175,8 @@ impl SessionReplayer {
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            if !entry.file_type().is_file()
-                || entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl")
-            {
+            let ext = entry.path().extension().and_then(|e| e.to_str());
+            if !entry.file_type().is_file() || !matches!(ext, Some("jsonl") | Some("zst")) {
                 continue;
             }
             let path = entry.into_path();
@@ -225,17 +229,18 @@ impl SessionReplayer {
             }
         }
 
-        if let Err(e) = repair_trailing_newline(path) {
-            tracing::warn!(path = %path.display(), error = %e, "trailing-newline repair failed");
-        }
-
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
+        // B4: `.jsonl.zst` archives are immutable — decode instead of
+        // repair (appending to a compressed twin is meaningless).
+        let (bytes, compressed) = match crate::compression::load_session_bytes(path) {
+            Ok(pair) => pair,
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "session file unreadable");
+                tracing::warn!(path = %path.display(), error = %e, "session archive unreadable");
                 return stats;
             }
         };
+        if !compressed && let Err(e) = repair_trailing_newline(path) {
+            tracing::warn!(path = %path.display(), error = %e, "trailing-newline repair failed");
+        }
 
         let stored = match self.checkpoints.load_offset(&checkpoint_key).await {
             Ok(offset) => offset,
@@ -443,6 +448,62 @@ mod tests {
             turn_replay_key("s", "u", "c", None),
             turn_replay_key("s", "u", "c", ts())
         );
+    }
+
+    /// B4 transparency end-to-end: a `.jsonl.zst` cold archive replays
+    /// exactly like its plain twin — turns persist, second pass is all
+    /// duplicates (idempotency keys), no repair attempt on compressed
+    /// bytes.
+    #[tokio::test]
+    async fn replay_reads_compressed_archive_transparently() {
+        use crate::memvid::ZenMemvidStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory_path = dir.path().join("memory.mv2");
+        let store = ZenMemvidStore::new(memory_path).unwrap();
+
+        let event = SessionEvent::Turn(zen_core::types::Message {
+            role: zen_core::types::MessageRole::User,
+            content: "compressed turn".into(),
+            timestamp: ts(),
+        });
+        let line = serde_json::to_string(&event).unwrap();
+        // Archives are newline-terminated per event (complete-line
+        // semantics); compress the terminated form.
+        let framed = format!("{line}\n");
+        let encoded = zstd::stream::encode_all(framed.as_bytes(), 3).unwrap();
+        let archive = dir.path().join("sess.jsonl.zst");
+        std::fs::write(&archive, encoded).unwrap();
+
+        let replayer = SessionReplayer::new(
+            store.clone(),
+            std::sync::Arc::new(InMemoryReplayCheckpoints::default()),
+        );
+
+        let stats = replayer.replay_file(&archive).await;
+        assert_eq!(stats.replayed, 1, "turn from compressed archive persists");
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(
+            stats.last_offset,
+            line.len() as u64 + 1,
+            "offset over decoded bytes"
+        );
+
+        // Second pass WITH the saved checkpoint resumes at EOF: nothing
+        // to do (incremental semantics).
+        let again = replayer.replay_file(&archive).await;
+        assert_eq!(again.replayed, 0);
+        assert_eq!(again.duplicates, 0);
+
+        // Lost checkpoints (daemon state.db wiped) force a byte-0
+        // re-read: dedup keys must turn every line into a duplicate.
+        let cold = SessionReplayer::new(
+            store,
+            std::sync::Arc::new(InMemoryReplayCheckpoints::default()),
+        );
+        let third = cold.replay_file(&archive).await;
+        assert_eq!(third.replayed, 0);
+        assert_eq!(third.duplicates, 1, "idempotency keys prevent double-write");
     }
 
     #[tokio::test]

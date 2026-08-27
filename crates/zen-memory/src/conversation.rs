@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -20,6 +22,11 @@ use zen_core::types::{Message, MessageRole, SessionEvent, session_created_at_fro
 pub struct ConversationStore {
     session_id: String,
     file_path: PathBuf,
+    /// B3 write-pending recovery: serialized lines whose append failed
+    /// stay queued here and are flushed (in order) by the next successful
+    /// append, so a transient I/O failure can never silently drop an
+    /// archived event.
+    pending: Mutex<VecDeque<String>>,
 }
 
 impl ConversationStore {
@@ -43,6 +50,7 @@ impl ConversationStore {
         Ok(Self {
             session_id: session_id.to_string(),
             file_path,
+            pending: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -59,6 +67,7 @@ impl ConversationStore {
         Ok(Self {
             session_id: session_id.to_string(),
             file_path,
+            pending: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -73,6 +82,7 @@ impl ConversationStore {
         Ok(Self {
             session_id: session_id.to_string(),
             file_path,
+            pending: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -97,14 +107,28 @@ impl ConversationStore {
         self.append_event(&event)
     }
 
+    /// Number of serialized events retained by B3 write-pending recovery
+    /// (non-zero means earlier appends failed and are awaiting flush).
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Append a serialized [`SessionEvent`] line to the session's `.jsonl` file.
     ///
     /// Shared append mechanism for every session event type: serializes the
     /// event to one JSONL line, appends it, and fsyncs. `append()` builds a
     /// `chat/turn` event and delegates here; other writers (e.g. the demotion
     /// hook) reuse this method so the archive never has a second format.
+    ///
+    /// B3 write-pending recovery: the line is queued BEFORE any I/O; a
+    /// failed open/write/fsync leaves it (and any earlier backlog) in
+    /// `pending` and returns `Err`. The next append flushes the backlog
+    /// first — order preserved, payload never dropped on transient errors.
     pub fn append_event(&self, event: &SessionEvent) -> Result<()> {
         let line = serde_json::to_string(event).context("failed to serialize session event")?;
+
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.push_back(line);
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -113,13 +137,16 @@ impl ConversationStore {
             .with_context(|| {
                 format!("failed to open session file: {}", self.file_path.display())
             })?;
-        file.write_all(format!("{}\n", line).as_bytes())
-            .with_context(|| {
-                format!(
-                    "failed to write session event: {}",
-                    self.file_path.display()
-                )
-            })?;
+        while let Some(queued) = pending.front() {
+            file.write_all(format!("{queued}\n").as_bytes())
+                .with_context(|| {
+                    format!(
+                        "failed to write session event: {}",
+                        self.file_path.display()
+                    )
+                })?;
+            pending.pop_front();
+        }
         file.sync_all().with_context(|| {
             format!("failed to fsync session file: {}", self.file_path.display())
         })?;
@@ -242,6 +269,43 @@ mod tests {
     use super::*;
     use zen_core::types::Session;
 
+    /// B3 write-pending recovery: a failed append retains its payload;
+    /// the next successful append flushes the backlog FIRST so archive
+    /// order matches event order.
+    #[test]
+    fn failed_append_retains_payload_and_next_append_flushes_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("b3.jsonl");
+
+        let store = ConversationStore::with_file(file_path.clone(), "b3-session").unwrap();
+        let ev = |text: &str| {
+            SessionEvent::Turn(Message {
+                role: MessageRole::User,
+                content: text.to_string(),
+                timestamp: Some(chrono::Utc::now()),
+            })
+        };
+
+        // Break the parent directory so open() fails.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(store.append_event(&ev("lost-without-b3")).is_err());
+        assert_eq!(store.pending_count(), 1, "failed payload must be retained");
+
+        // Restore the directory: the next append flushes backlog first.
+        std::fs::create_dir_all(dir.path()).unwrap();
+        store.append_event(&ev("second")).unwrap();
+        assert_eq!(store.pending_count(), 0);
+
+        let contents = std::fs::read_to_string(&file_path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "backlog + new event");
+        assert!(
+            lines[0].contains("lost-without-b3"),
+            "retained payload must land BEFORE the newer event"
+        );
+        assert!(lines[1].contains("second"));
+    }
+
     #[test]
     fn append_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -254,6 +318,7 @@ mod tests {
         let store = ConversationStore {
             session_id: "test".to_string(),
             file_path: file_path.clone(),
+            pending: Mutex::new(VecDeque::new()),
         };
 
         store.append("user", "Hello").unwrap();
@@ -274,6 +339,7 @@ mod tests {
         let store = ConversationStore {
             session_id: "test".to_string(),
             file_path: dir.path().join("nonexistent.jsonl"),
+            pending: Mutex::new(VecDeque::new()),
         };
         assert!(store.load().unwrap().is_empty());
     }
@@ -288,6 +354,7 @@ mod tests {
         let store = ConversationStore {
             session_id: "test".to_string(),
             file_path,
+            pending: Mutex::new(VecDeque::new()),
         };
 
         // Only meta event, no chat turns
@@ -306,6 +373,7 @@ mod tests {
         let store = ConversationStore {
             session_id: "test".to_string(),
             file_path: file_path.clone(),
+            pending: Mutex::new(VecDeque::new()),
         };
 
         for i in 0..5 {
@@ -329,6 +397,7 @@ mod tests {
         let store = ConversationStore {
             session_id: "test".to_string(),
             file_path: file_path.clone(),
+            pending: Mutex::new(VecDeque::new()),
         };
 
         store.append("user", "Hello").unwrap();

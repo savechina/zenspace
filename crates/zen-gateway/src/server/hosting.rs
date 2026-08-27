@@ -1279,4 +1279,53 @@ mod tests {
         }
         assert!(saw_completed);
     }
+
+    /// Task B2 pinning test: `turn_completed` is a Structural-class frame,
+    /// so it must survive a saturated outbound queue (backpressure, not
+    /// drop). If lifecycle events get reclassified as deltas this fails
+    /// because enqueue drops deltas under pressure.
+    #[tokio::test]
+    async fn turn_completed_delivery_survives_saturated_outbound_queue() {
+        let (deps, _exec) = deps_with_executor().await;
+        let (queue_tx, mut queue_rx) = mpsc::channel::<OutboundFrame>(1);
+        // Saturate BEFORE the turn runs so every emission hits pressure.
+        queue_tx
+            .send(OutboundFrame::structural(
+                crate::protocol::Frame::notification("prefill", json!({})),
+            ))
+            .await
+            .unwrap();
+
+        turn(
+            Arc::clone(&deps),
+            Some(queue_tx),
+            turn_params("t-sat", "s1"),
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_prefill = false;
+        let mut saw_completed = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), queue_rx.recv()).await {
+                Ok(Some(of)) => {
+                    if let crate::protocol::Frame::Notification { method, params, .. } = &of.frame {
+                        if method == "prefill" {
+                            saw_prefill = true;
+                        } else if method == "session/event" && params["kind"] == "turn_completed" {
+                            saw_completed = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(
+            saw_prefill && saw_completed,
+            "turn_completed must arrive AFTER the pre-saturated frame (FIFO backpressure proves structural classification)"
+        );
+    }
 }
