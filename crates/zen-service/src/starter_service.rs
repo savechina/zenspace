@@ -86,6 +86,7 @@ pub fn workspace() {
         home.join("CodeRepo").join("workspace").join("bluekit"),
         home.join("Documents").join("Work"),
         home.join("Documents").join("Other"),
+        home.join("Documents").join("Life"),
         home.join("Documents").join("Personal"),
         home.join("Documents").join("Archive"),
         home.join("Software"),

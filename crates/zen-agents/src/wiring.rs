@@ -145,6 +145,7 @@ impl Skill for DistillationPipelineSkillAdapter {
         let pipeline = zen_vault::DistillationPipeline::new();
         let report = pipeline
             .run(&inbox_dir, &wiki_dir)
+            .await
             .map_err(|e| KernelError::SkillFailed(e.to_string()))?;
 
         ctx.evidence.push(

@@ -125,15 +125,12 @@ zen-provider → zen-core
 ### Data Flow
 
 ```
-zen note create → zen-vault (note service) → zen-repo (NotesRepo)
-zen search run  → zen-vault (SearchService) → tier routing → ripgrep/FTS5/vec0/graph/LLM
-zen ingest      → zen-vault (raw directory) → IngestResult → consolidation
-zen consolidate → zen-vault (ConsolidationPipeline) → zen-provider (entity extraction)
+zen wiki distill → zen-vault (DistillationPipeline) → notion extraction → wiki compile → archive
+zen loop run     → ZenScheduler (ZenLoopWorker) → ingest sweep → distill → graph verify → gaps
 zen session start → zen-agents (ZenCoordinator) → blackboard → executor
-zen similar find → zen-vault (tier3, vec0 embeddings) → zen-provider (embeddings)
-zen graph query → zen-vault (tier4, graph.db) → entity graph
-zen reindex run → zen-vault (Reindexer, checksums, embeddings)
-zen lint run    → zen-vault (Linter, orphan pages, broken wikilinks)
+zen wiki reindex → zen-vault (Reindexer, checksums, embeddings)
+zen wiki lint    → zen-vault (Linter, orphan pages, broken wikilinks)
+zen serve start  → zen-gateway daemon + ZenScheduler (cron workers: journal, dream, wisdom, subconscious)
 ```
 
 ## STRUCTURE
@@ -182,9 +179,9 @@ zenspace/
 │   │       ├── note.rs         # Note, NoteService, frontmatter parsing
 │   │       ├── wiki.rs         # WikiPage, WikiIndex, AtomicWikiWriter
 │   │       ├── search/         # 5-tier search (ripgrep → FTS5 → vec0 → graph → LLM)
-│   │       ├── consolidate/    # 4-stage pipeline (extract → compile → deduplicate → index)
-│   │       ├── entity.rs       # Entity, RelationType, EntityService
-│   │       ├── maintenance/    # Linter, Reindexer, LearningLoop
+│   │       ├── distill/        # DistillationPipeline (extract → compile → merge → archive; transaction/checkpoint/recovery)
+│   │       ├── notion/         # NotionService: DB-backed entity graph via NotionsRepo
+│   │       ├── tindy/          # Linter, LearningLoop, WikiCompiler skill, Reindexer, embeddings, checksums
 │   │       ├── ingest/         # FeedEntry, RssFetcher, ingest_local_file
 │   │       └── intent.rs       # Intent detection
 │   ├── zen-agents/             # Agent system (13 agents, 4 tiers)
@@ -199,6 +196,7 @@ zenspace/
 │   │       ├── execution.rs    # AgentExecution, ToolCall
 │   │       ├── review.rs       # QualityPipeline (Metis→Momus→Hermes→Zeus)
 │   │       ├── sandbox.rs      # WasmSandbox (wasmtime), ResourceLimits
+│   │       ├── scheduler/     # ZenScheduler: cron-driven ~30s tick, 13 background workers (session-journaler, dream, memory-curator, memvid-indexer, subconscious, notion-extractor, wiki-compiler, commitment-tracker, reflection, wisdom-synth, decision-tracker, express, evidence-gatherer)
 │   │       └── wiring.rs       # ZenWiring (DI wiring)
 │   ├── zen-provider/           # Multi-provider LLM routing
 │   │   └── src/
@@ -253,8 +251,9 @@ zenspace/
 | Task | Location | Notes |
 |------|----------|-------|
 | Add search tier | `crates/zen-vault/src/search/tierN.rs` | + register in search/service.rs |
-| Modify consolidation | `crates/zen-vault/src/consolidate/mod.rs` | 4-stage pipeline |
-| Add lint rule | `crates/zen-vault/src/maintenance/mod.rs` | Linter trait |
+| Modify distill pipeline | `crates/zen-vault/src/distill/pipeline.rs` | Stages: extract → normalize → compile → merge → archive; transaction/checkpoint/recovery |
+| Add lint rule | `crates/zen-vault/src/tindy/lint.rs` | Linter (page-level: orphans, broken wikilinks) |
+| Add scheduler worker | `crates/zen-agents/src/scheduler/workers/` | ZenWorker trait, cron schedule, register in scheduler/mod.rs |
 | Note format change | `crates/zen-vault/src/note.rs` | frontmatter, Domain, write_note |
 
 ### Agent System
@@ -475,7 +474,9 @@ cargo fmt --all          # Format
 bin/release patch        # Bump version, tag, push
 ```
 
-### Agentic Commands (29 commands)
+### Agentic Commands (21 commands)
+
+Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal memory/knowledge pipeline. Nine manual commands (`note`, `search`, `similar`, `notion`/`graph`, `research`, `ingest`, `routine`, `brief`, `dispatch`) were removed from the CLI surface — their capabilities live on internally via ZenScheduler workers and the distill loop; the command files remain on disk uncompiled, restorable when business scenarios require.
 
 | Command | Description | Dispatch File |
 |---------|-------------|---------------|
@@ -492,23 +493,15 @@ bin/release patch        # Bump version, tag, push
 | `zen config` | Config layers | `config_command.rs` |
 | `zen provider` | LLM provider mgmt | `provider_command.rs` |
 | `zen audit` | Audit log ops | `audit_command.rs` |
-| `zen note` | Create notes | `note_command.rs` |
-| `zen search` | KB search (5-tier) | `search_command.rs` |
-| `zen similar` | Vector similarity | `similar_command.rs` |
-| `zen notion` (alias: `graph`) | Entity graph query | `graph_command.rs` |
-| `zen research` | Research tasks | `research_command.rs` |
 | `zen logs` | Structured log viewer | `logs_command.rs` |
-| `zen ingest` | Ingest files/feeds | `ingest_command.rs` |
-| `zen routine` | Routine management | `routine_command.rs` |
 | `zen wiki` | Wiki ops: list, show, reindex, lint, distill, rebuild-memory | `wiki_command.rs` |
-| `zen brief` | Brief generation | `brief_command.rs` |
+| `zen loop` | Knowledge loop: run [--dry-run] [--json] / status / gaps / enable / disable (005) | `loop_command.rs` |
 | `zen model` | Model metadata + routing | `model_command.rs` |
 | `zen plugin` | Plugin management (install, enable, disable, rehash, tools list) | `plugin_command.rs` |
 | `zen auth` | Auth/keychain ops | `auth_command.rs` |
 | `zen habit` | Habit tracking | `habit_command.rs` |
 | `zen goal` | Goal management | `goal_command.rs` |
 | `zen skill` | Skill management | `skill_command.rs` |
-| `zen dispatch` | Task dispatch: run, status, list, cancel | `dispatch_command.rs` |
 
 ## AGENT TOOL INVENTORY (v0.0.6)
 
@@ -718,6 +711,10 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
   - Merged `zen reindex` + `zen lint` + `zen distill` into `zen wiki` (subcommands: reindex, lint, distill)
   - Removed stale `zen hello` + `zen consolidate` from command table (never in Commands enum)
   - Command count: 33 → 29 (4 top-level commands eliminated, Occam's Razor)
+- **CLI personal-agent scope trim (2026-08-28, 005-agentic-loop)**:
+  - Removed 9 manual commands from CLI surface: `note`, `search`, `similar`, `notion`/`graph`, `research`, `ingest`, `routine`, `brief`, `dispatch`
+  - Rationale: zen focuses on the personal memory/knowledge pipeline — these capabilities run internally via ZenScheduler workers + distill loop, not as manual commands; command files remain on disk uncompiled, restorable when business scenarios require
+  - Command count: 29 → 20 (9 removed; `zen loop` will make 21 when 005 lands)
 
 ## Skill routing
 

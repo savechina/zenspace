@@ -30,27 +30,18 @@ impl From<SandboxModeArg> for SandboxMode {
 use crate::cmd::agent_command::{self, AgentCommands};
 use crate::cmd::audit_command::{self, AuditCommands};
 use crate::cmd::auth_command::{self, AuthCommands};
-use crate::cmd::brief_command::{self, BriefCommands};
 use crate::cmd::chat_command::{self, ChatArgs};
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::config_command::{self, ConfigCommands};
-use crate::cmd::dispatch_command::{self, DispatchCommands};
 use crate::cmd::goal_command::{self, GoalCommands};
-use crate::cmd::graph_command::{self, GraphCommands};
 use crate::cmd::habit_command::{self, HabitCommands};
-use crate::cmd::ingest_command::{self, IngestCommands};
 use crate::cmd::logs_command::{self, LogCommands};
 use crate::cmd::model_command::{self, ModelCommands};
-use crate::cmd::note_command::{self, NoteCommands};
 use crate::cmd::plugin_command::{self, PluginCommands};
 use crate::cmd::provider_command::{self, ProviderCommands};
-use crate::cmd::research_command::{self, ResearchCommands};
-use crate::cmd::routine_command::{self, RoutineCommands};
 use crate::cmd::sandbox_command::{self, SandboxArgs};
-use crate::cmd::search_command::{self, SearchCommands};
 use crate::cmd::serve_command::{self, ServeCommands};
 use crate::cmd::session_command::{self, SessionCommands};
-use crate::cmd::similar_command::{self, SimilarCommands};
 use crate::cmd::skill_command::{self, SkillCommands};
 use crate::cmd::starter_command::{self, StarterCommands};
 use crate::cmd::wiki_command::{self, WikiCommands};
@@ -127,28 +118,6 @@ enum Commands {
         #[command(subcommand)]
         operation: AuditCommands,
     },
-    Note {
-        #[command(subcommand)]
-        operation: NoteCommands,
-    },
-    Search {
-        #[command(subcommand)]
-        operation: SearchCommands,
-    },
-    Similar {
-        #[command(subcommand)]
-        operation: SimilarCommands,
-    },
-    /// Notion knowledge graph operations (alias: graph)
-    #[command(visible_alias = "graph")]
-    Notion {
-        #[command(subcommand)]
-        operation: GraphCommands,
-    },
-    Research {
-        #[command(subcommand)]
-        operation: ResearchCommands,
-    },
     Logs {
         /// Number of lines to display (default: 50)
         #[arg(short = 'n', long, default_value = "50")]
@@ -166,21 +135,9 @@ enum Commands {
         #[command(subcommand)]
         operation: Option<LogCommands>,
     },
-    Ingest {
-        #[command(subcommand)]
-        operation: IngestCommands,
-    },
-    Routine {
-        #[command(subcommand)]
-        operation: RoutineCommands,
-    },
     Wiki {
         #[command(subcommand)]
         operation: WikiCommands,
-    },
-    Brief {
-        #[command(subcommand)]
-        operation: BriefCommands,
     },
     Model {
         #[command(subcommand)]
@@ -205,10 +162,6 @@ enum Commands {
     Skill {
         #[command(subcommand)]
         operation: SkillCommands,
-    },
-    Dispatch {
-        #[command(subcommand)]
-        operation: DispatchCommands,
     },
     Sandbox {
         #[command(flatten)]
@@ -343,11 +296,6 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Config { ref operation } => config_command::execute_command(operation),
         Commands::Provider { ref operation } => provider_command::execute_command(operation),
         Commands::Audit { ref operation } => audit_command::execute_command(operation),
-        Commands::Note { ref operation } => note_command::execute_command(operation).await,
-        Commands::Search { ref operation } => search_command::execute_command(operation).await,
-        Commands::Similar { ref operation } => similar_command::execute_command(operation),
-        Commands::Notion { ref operation } => graph_command::execute_command(operation),
-        Commands::Research { ref operation } => research_command::execute_command(operation).await,
         Commands::Logs {
             lines,
             level,
@@ -358,17 +306,13 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
             Some(cmd) => logs_command::execute_command(cmd),
             None => logs_command::execute_show(lines, level.as_deref(), follow, json),
         },
-        Commands::Ingest { ref operation } => ingest_command::execute_command(operation),
         Commands::Wiki { ref operation } => wiki_command::execute_command(operation).await,
-        Commands::Routine { ref operation } => routine_command::execute_command(operation).await,
-        Commands::Brief { ref operation } => brief_command::execute_command(operation),
         Commands::Model { ref operation } => model_command::execute_command(operation),
         Commands::Plugin { ref operation } => plugin_command::execute_command(operation),
         Commands::Auth { ref operation } => auth_command::execute_command(operation),
         Commands::Habit { ref operation } => habit_command::execute_command(operation),
         Commands::Goal { ref operation } => goal_command::execute_command(operation),
         Commands::Skill { ref operation } => skill_command::execute_command(operation).await,
-        Commands::Dispatch { ref operation } => dispatch_command::execute_command(operation).await,
         Commands::Sandbox { ref args } => sandbox_command::execute_command(args),
     }
 }

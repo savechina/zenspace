@@ -104,7 +104,23 @@ pub enum SchedulerError {
 /// Default tick interval for the scheduler loop (30 seconds).
 pub const DEFAULT_TICK_INTERVAL_SECONDS: u64 = 30;
 
-type RegisteredWorker = (String, Schedule, Arc<dyn ZenWorker>, bool);
+type RegisteredWorker = (
+    String,
+    Schedule,
+    Arc<dyn ZenWorker>,
+    bool,
+    // F5: per-worker in-flight flag — a slow worker never overlaps itself.
+    Arc<std::sync::atomic::AtomicBool>,
+);
+
+/// Clears a worker's in-flight flag on drop (F5) — panic-safe.
+struct InFlightGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Cron-driven scheduler that manages and executes background workers.
 ///
@@ -182,8 +198,16 @@ impl ZenScheduler {
             "scheduler: worker registered"
         );
 
-        self.workers
-            .insert(id, (expr.to_string(), schedule, Arc::new(worker), true));
+        self.workers.insert(
+            id,
+            (
+                expr.to_string(),
+                schedule,
+                Arc::new(worker),
+                true,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        );
         Ok(())
     }
 
@@ -209,10 +233,15 @@ impl ZenScheduler {
         let interval = self.tick_interval;
 
         // Collect workers to fire first to avoid borrow issues with spawn.
-        let mut to_fire: Vec<(String, Arc<dyn ZenWorker>, WorkerContext)> = Vec::new();
+        let mut to_fire: Vec<(String, Arc<dyn ZenWorker>, WorkerContext, Arc<std::sync::atomic::AtomicBool>)> = Vec::new();
 
-        for (id, (_expr, schedule, worker, enabled)) in &self.workers {
+        for (id, (_expr, schedule, worker, enabled, in_flight)) in &self.workers {
             if !enabled {
+                continue;
+            }
+            // F5: skip a worker that is still running from a previous tick.
+            if in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                debug!(worker = %id, "scheduler: skipping worker (still in flight)");
                 continue;
             }
             let should_fire = schedule.upcoming(Utc).next().is_some_and(|next| {
@@ -223,11 +252,11 @@ impl ZenScheduler {
 
             if should_fire {
                 debug!(worker = %id, "scheduler: firing worker");
-                to_fire.push((id.clone(), Arc::clone(worker), ctx.clone()));
+                to_fire.push((id.clone(), Arc::clone(worker), ctx.clone(), Arc::clone(in_flight)));
             }
         }
 
-        for (id, worker, ctx) in to_fire {
+        for (id, worker, ctx, in_flight) in to_fire {
             {
                 let costs = self.worker_costs.read().unwrap();
                 if let Some(&cost) = costs.get(&id)
@@ -245,6 +274,8 @@ impl ZenScheduler {
             let cost_cap = self.cost_cap_usd;
             let costs = Arc::clone(&self.worker_costs);
             tokio::spawn(async move {
+                // F5: always clear the in-flight flag, success or failure.
+                let _clear = InFlightGuard(&in_flight);
                 match worker.execute(&ctx).await {
                     Ok(report) => {
                         info!(
@@ -278,11 +309,22 @@ impl ZenScheduler {
     }
 
     /// Immediately trigger a named worker outside the scheduled loop.
+    ///
+    /// F5: returns a busy error (not WorkerNotFound) when the worker is
+    /// still executing a previous run.
     pub async fn trigger(&self, name: &str) -> Result<WorkerReport, SchedulerError> {
-        let (_, _, worker, _) = self
+        let (_, _, worker, _, in_flight) = self
             .workers
             .get(name)
             .ok_or_else(|| SchedulerError::WorkerNotFound(name.to_string()))?;
+
+        // F5: manual runs must not overlap cron runs of the same worker.
+        if in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Err(SchedulerError::WorkerNotFound(format!(
+                "{name} (busy: previous run still in flight)"
+            )));
+        }
+        let _clear = InFlightGuard(in_flight);
 
         let ctx = WorkerContext::new(Utc::now());
         info!(worker = %name, "scheduler: manual trigger");
@@ -296,7 +338,7 @@ impl ZenScheduler {
     pub fn list(&self) -> Vec<WorkerSummary> {
         self.workers
             .iter()
-            .map(|(id, (expr, _schedule, worker, enabled))| WorkerSummary {
+            .map(|(id, (expr, _schedule, worker, enabled, _in_flight))| WorkerSummary {
                 id: id.clone(),
                 schedule: expr.clone(),
                 description: worker.description().to_string(),
@@ -488,6 +530,19 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
 
     if let Err(e) = scheduler.register(EvidenceGatherer::new()) {
         warn!("scheduler: failed to register evidence-gatherer worker: {e}");
+    }
+
+    // ── Knowledge-processing loop (005-agentic-loop): interval + enabled
+    //    come from [agentic.loop]; disabled → manual-only (`zen wiki loop run`).
+    if let Ok(config) = zen_core::config::load_config() {
+        let loop_cfg = &config.agentic.loop_cfg;
+        let mut loop_worker = ZenLoopWorker::new().with_schedule(loop_cfg.interval_or_default());
+        if !loop_cfg.enabled_or_default() {
+            loop_worker = loop_worker.disabled();
+        }
+        if let Err(e) = scheduler.register(loop_worker) {
+            warn!("scheduler: failed to register zen-loop worker (non-critical): {e}");
+        }
     }
 
     scheduler

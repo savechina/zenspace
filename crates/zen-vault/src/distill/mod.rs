@@ -6,6 +6,7 @@ pub mod pipeline;
 pub mod recovery;
 pub mod source_ingest;
 pub mod transaction;
+pub mod types;
 pub mod wiki_compile;
 
 pub use chat_import::ChatImporter;
@@ -16,6 +17,12 @@ pub use pipeline::{DistillationPipeline, DistillationPipelineInput, Distillation
 pub use recovery::RecoveryManager;
 pub use source_ingest::SourceIngester;
 pub use transaction::TransactionScope;
+pub use types::{
+    Belief, Commitment, CommitmentLifecycle, CycleOutcome, Decision, GapKind, GapRecord,
+    GraphPlaceholder, HypothesisSlug, HypothesisStatus, JobState, LoopBudget, LoopCycleReport,
+    MemoryReward, PlaceholderStatus, ProcessingJob, SelfModelItem, SelfModelLayer, ToolCall,
+    TypedSignalKind, VerificationNode,
+};
 pub use wiki_compile::WikiCompiler;
 
 pub struct Distill;

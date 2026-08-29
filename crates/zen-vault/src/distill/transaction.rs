@@ -44,8 +44,15 @@ impl TransactionScope {
 
     /// Record a path that will be cleaned up on rollback.
     pub fn track_path(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
         let line = format!("{}\n", path.display());
-        fs::write(&self.tracking_file, &line)
+        // F2 fix: append (fs::write truncated — only the last tracked path survived).
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.tracking_file)
+            .with_context(|| format!("open txn file: {}", self.tracking_file.display()))?;
+        file.write_all(line.as_bytes())
             .with_context(|| format!("track path: {}", path.display()))?;
         Ok(())
     }
@@ -84,5 +91,69 @@ impl TransactionScope {
         fs::remove_file(&self.tracking_file).ok();
         info!(removed, "Transaction rollback: {}", self.name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_logs_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zen-txn-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// T006 F2: ≥3 tracked paths must ALL survive tracking and ALL be
+    /// removed on rollback (the old fs::write impl kept only the last one).
+    #[test]
+    fn multi_file_rollback_restores_every_tracked_path() {
+        let logs = temp_logs_dir();
+        let work = logs.join("work");
+        fs::create_dir_all(&work).unwrap();
+
+        let txn = TransactionScope::new("multi-rollback-test");
+        txn.begin().unwrap();
+
+        let mut tracked = Vec::new();
+        for i in 0..3 {
+            let path = work.join(format!("page-{i}.md"));
+            fs::write(&path, format!("content {i}")).unwrap();
+            txn.track_path(&path).unwrap();
+            tracked.push(path);
+        }
+
+        for path in &tracked {
+            assert!(path.exists(), "{path:?} must exist pre-rollback");
+        }
+
+        txn.rollback().unwrap();
+
+        for path in &tracked {
+            assert!(!path.exists(), "{path:?} must be removed by rollback");
+        }
+        fs::remove_dir_all(&logs).ok();
+    }
+
+    #[test]
+    fn commit_deletes_tracking_file_and_keeps_files() {
+        let logs = temp_logs_dir();
+        fs::create_dir_all(&logs).unwrap();
+        let work = logs.join("work");
+        fs::create_dir_all(&work).unwrap();
+
+        let txn = TransactionScope::new("commit-keeps-test");
+        txn.begin().unwrap();
+        let path = work.join("kept.md");
+        fs::write(&path, "kept").unwrap();
+        txn.track_path(&path).unwrap();
+
+        txn.commit().unwrap();
+        assert!(path.exists(), "commit must keep tracked files");
+        fs::remove_dir_all(&logs).ok();
     }
 }

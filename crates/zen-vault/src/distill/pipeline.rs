@@ -9,20 +9,28 @@ use rig_compose::skill::Skill;
 use rig_compose::workflow::Workflow;
 use tracing::info;
 
+use super::checkpoint::Checkpoint;
 use super::contradiction::ContradictionDetector;
+use super::checkpoint::CheckpointManager;
 use super::notion_extraction::NotionExtractor;
+use super::recovery::RecoveryManager;
+use super::transaction::TransactionScope;
 use super::wiki_compile::WikiCompiler;
+use crate::notion::service::NotionService;
 
 use crate::note::{Note, parse_frontmatter};
+use crate::tindy::checksum::ChangeDetector;
 use crate::wiki::WikiPage;
 
 #[derive(Debug, Clone)]
 pub struct DistillationReport {
     pub notes_processed: usize,
     pub entities_extracted: usize,
+    /// Notions durably upserted into the DB graph via NotionService (T003).
+    pub entities_persisted: usize,
     pub wiki_pages_created: usize,
     pub contradictions_found: usize,
-    /// Notes migrated from inbox to wiki domain directories after distillation.
+    /// Raw notes archived to `vault/archive/<yyyy-mm>/` (T005; was wiki-moves).
     pub migrated_files: Vec<(PathBuf, PathBuf)>,
 }
 
@@ -111,9 +119,86 @@ pub fn auto_link_wikilinks(content: &str, known_entities: &[String]) -> String {
     result
 }
 
-/// Returns (source, dest) pairs for successfully migrated files.
-fn migrate_inbox_to_wiki(notes: &[Note], wiki_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let mut migrated = Vec::new();
+/// T004: deterministic content normalization (FR-003) —
+/// CRLF → LF, trailing-whitespace strip, 2+ blank lines collapsed to 1,
+/// outer blank-line trim. Encoding is forced to UTF-8 at read time
+/// (`load_notes` uses `from_utf8_lossy`).
+pub fn normalize_content(content: &str) -> String {
+    let lf = content.replace("\r\n", "\n").replace('\r', "\n");
+    let no_trailing_ws: String = lf
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut collapsed: Vec<&str> = Vec::with_capacity(no_trailing_ws.len());
+    let mut blank_run = 0usize;
+    for line in no_trailing_ws.lines() {
+        if line.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        collapsed.push(line);
+    }
+    while collapsed.first().is_some_and(|l| l.is_empty()) {
+        collapsed.remove(0);
+    }
+    while collapsed.last().is_some_and(|l| l.is_empty()) {
+        collapsed.pop();
+    }
+    let mut out = collapsed.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Insert provenance key/value lines into a note's YAML frontmatter
+/// (before the closing `---`). Content without frontmatter gets one prepended.
+pub fn append_provenance(raw: &str, pairs: &[(&str, String)]) -> String {
+    let mut lines: Vec<String> = raw.lines().map(|l| l.to_string()).collect();
+    let has_frontmatter = lines.first().map(|l| l.trim() == "---").unwrap_or(false);
+    if has_frontmatter {
+        let close = lines
+            .iter()
+            .skip(1)
+            .position(|l| l.trim() == "---")
+            .map(|p| p + 1);
+        let insert_at = close.unwrap_or(lines.len());
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            lines.insert(insert_at + i, format!("{k}: \"{v}\""));
+        }
+    } else {
+        let mut fm: Vec<String> = vec!["---".into()];
+        for (k, v) in pairs {
+            fm.push(format!("{k}: \"{v}\""));
+        }
+        fm.push("---".into());
+        fm.extend(lines);
+        lines = fm;
+    }
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// T005: archive processed inbox notes to `vault/archive/<yyyy-mm>/` with
+/// provenance frontmatter (FR-006/007). Returns (source, dest) pairs.
+///
+/// Replaces the old wiki-tree move: raw notes leave the inbox but never
+/// enter the wiki domain dirs; the inbox is empty after a Completed cycle.
+fn archive_processed_notes(
+    notes: &[Note],
+    archive_dir: &Path,
+    cycle_id: &str,
+    track: &TransactionScope,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut archived = Vec::new();
 
     for note in notes {
         let source = match &note.file_path {
@@ -121,63 +206,85 @@ fn migrate_inbox_to_wiki(notes: &[Note], wiki_dir: &Path) -> Vec<(PathBuf, PathB
             _ => continue,
         };
 
-        let domain_dir = note
-            .domain
-            .first()
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "general".to_string());
-        let dest_dir = wiki_dir.join(&domain_dir);
-
-        if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+        let now = chrono::Utc::now();
+        let month_dir = archive_dir.join(now.format("%Y-%m").to_string());
+        if let Err(e) = std::fs::create_dir_all(&month_dir) {
             tracing::warn!(
                 source = %source.display(),
                 error = %e,
-                "Failed to create wiki domain directory, skipping migration"
+                "Failed to create archive month directory, leaving note in inbox"
             );
             continue;
         }
 
         let filename = source.file_name().unwrap_or_default();
-        let mut dest = dest_dir.join(filename);
-
+        let mut dest = month_dir.join(filename);
         if dest.exists() {
             let stem = source.file_stem().unwrap_or_default();
             let ext = source.extension().unwrap_or_default();
-            let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-            dest = dest_dir.join(format!(
+            dest = month_dir.join(format!(
                 "{}_{}.{}",
                 stem.to_string_lossy(),
-                ts,
+                now.format("%Y%m%d%H%M%S"),
                 ext.to_string_lossy()
             ));
         }
 
-        match std::fs::rename(&source, &dest) {
+        let raw = match std::fs::read(&source) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            Err(e) => {
+                tracing::warn!(source = %source.display(), error = %e, "Failed to read note for archive");
+                continue;
+            }
+        };
+        let checksum = ChangeDetector::compute_checksum(&raw);
+        let provenance = append_provenance(
+            &raw,
+            &[
+                ("source_path", source.to_string_lossy().to_string()),
+                ("archived_at", now.to_rfc3339()),
+                ("cycle_id", cycle_id.to_string()),
+                (
+                    "original_created_at",
+                    note.created_at.to_rfc3339(),
+                ),
+                ("checksum", checksum),
+                ("merged_into", String::new()),
+            ],
+        );
+
+        match std::fs::write(&dest, provenance)
+            .and_then(|_| std::fs::remove_file(&source))
+        {
             Ok(()) => {
+                if let Err(e) = track.track_path(&dest) {
+                    tracing::warn!(dest = %dest.display(), error = %e, "Failed to track archived file");
+                }
                 info!(
                     source = %source.display(),
                     dest = %dest.display(),
-                    "Migrated inbox note to wiki domain"
+                    "Archived processed inbox note"
                 );
-                migrated.push((source, dest));
+                archived.push((source, dest));
             }
             Err(e) => {
                 tracing::warn!(
                     source = %source.display(),
                     error = %e,
-                    "Failed to migrate inbox note, leaving in inbox"
+                    "Failed to archive inbox note, leaving in inbox"
                 );
             }
         }
     }
 
-    migrated
+    archived
 }
 
 pub struct DistillationPipeline {
     extractor: NotionExtractor,
     compiler: WikiCompiler,
     detector: ContradictionDetector,
+    notion_service: NotionService,
 }
 
 impl DistillationPipeline {
@@ -186,10 +293,91 @@ impl DistillationPipeline {
             extractor: NotionExtractor::new(),
             compiler: WikiCompiler::new(),
             detector: ContradictionDetector::new(),
+            notion_service: NotionService::new(),
         }
     }
 
-    pub fn run(&self, inbox_dir: &Path, wiki_dir: &Path) -> Result<DistillationReport> {
+    /// Production entry (sync callers `await` this): derives archive/logs
+    /// dirs from `ZenPaths` and opens the workspace DB lazily.
+    pub async fn run(&self, inbox_dir: &Path, wiki_dir: &Path) -> Result<DistillationReport> {
+        use zen_core::paths::ZenPaths;
+        let vault_root = wiki_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let archive_dir = vault_root.join("archive");
+        let logs_dir = ZenPaths::detect()
+            .map(|p| p.logs().to_path_buf())
+            .unwrap_or_else(|_| vault_root.join("logs"));
+        let db = zen_repo::SqliteClient::open_lazy(&logs_dir.join("state.db"))
+            .await
+            .ok();
+        self.run_scoped(inbox_dir, wiki_dir, &archive_dir, &logs_dir, db.as_ref())
+            .await
+    }
+
+    /// Isolated-dirs entry (worker + tests): all stage dirs injected, DB optional.
+    ///
+    /// Stage chain (worker contract stage 3):
+    /// T007 checkpoint gate → load → T004 normalize → extract →
+    /// T003 NotionService persist → auto-link → compile → contradictions →
+    /// T005 archive, with T006 TransactionScope around mutations.
+    pub async fn run_scoped(
+        &self,
+        inbox_dir: &Path,
+        wiki_dir: &Path,
+        archive_dir: &Path,
+        logs_dir: &Path,
+        db: Option<&zen_repo::SqliteClient>,
+    ) -> Result<DistillationReport> {
+        // T007: pre-cycle gate — recover-or-restart on a prior crashed cycle.
+        let recovery = RecoveryManager::new(logs_dir);
+        if let Some(cp) = recovery.check_incomplete()? {
+            info!(
+                status = %cp.status,
+                "Prior cycle checkpoint found — clearing for idempotent restart"
+            );
+            recovery.recover()?;
+        }
+        let cycle_id = uuid::Uuid::now_v7().to_string();
+        let checkpoints = CheckpointManager::new(logs_dir);
+        checkpoints.write_checkpoint(&Checkpoint {
+            status: "started".to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            notes_count: 0,
+        })?;
+
+        let txn = TransactionScope::new(&format!("distill-{cycle_id}"));
+        txn.begin()?;
+        let run = self.run_stages(inbox_dir, wiki_dir, archive_dir, db, &txn, &cycle_id);
+        match run.await {
+            Ok(report) => {
+                txn.commit()?;
+                checkpoints.write_checkpoint(&Checkpoint {
+                    status: "completed".to_string(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    notes_count: report.notes_processed,
+                })?;
+                Ok(report)
+            }
+            Err(e) => {
+                if let Err(rb) = txn.rollback() {
+                    tracing::warn!(error = %rb, "Transaction rollback itself failed");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn run_stages(
+        &self,
+        inbox_dir: &Path,
+        wiki_dir: &Path,
+        archive_dir: &Path,
+        db: Option<&zen_repo::SqliteClient>,
+        txn: &TransactionScope,
+        cycle_id: &str,
+    ) -> Result<DistillationReport> {
         let notes = self.load_notes(inbox_dir)?;
         let notes_processed = notes.len();
         info!(
@@ -201,9 +389,35 @@ impl DistillationPipeline {
         let entities_extracted = notions.len();
         info!(entities_extracted, "Notion extraction complete");
 
+        // T003: persist extracted notions into the DB graph (Principle XII).
+        let mut entities_persisted = 0usize;
+        if let Some(client) = db {
+            for notion in &notions {
+                match self.notion_service.upsert_entity(client, notion).await {
+                    Ok(()) => entities_persisted += 1,
+                    Err(e) => tracing::warn!(
+                        notion = %notion.name,
+                        error = %e,
+                        "Failed to persist notion, continuing"
+                    ),
+                }
+            }
+            info!(entities_persisted, "Notion persistence complete");
+        } else {
+            tracing::debug!("No DB client — skipping notion persistence (test mode)");
+        }
+
+        let normalized: Vec<Note> = notes
+            .iter()
+            .map(|note| {
+                let mut n = note.clone();
+                n.content = normalize_content(&note.content);
+                n
+            })
+            .collect();
+
         let entity_names: Vec<String> = notions.iter().map(|n| n.name.clone()).collect();
-        let linked_notes: Vec<Note> = notes
-            .clone()
+        let linked_notes: Vec<Note> = normalized
             .into_iter()
             .map(|mut note| {
                 note.content = auto_link_wikilinks(&note.content, &entity_names);
@@ -213,6 +427,11 @@ impl DistillationPipeline {
 
         let pages = self.compiler.compile(&linked_notes, wiki_dir)?;
         let wiki_pages_created = pages.len();
+        for page in &pages {
+            if let Some(path) = page_file_path(page) {
+                txn.track_path(&path)?;
+            }
+        }
         if wiki_pages_created > 0 {
             info!(wiki_pages_created, "Wiki pages compiled and written");
         }
@@ -227,18 +446,21 @@ impl DistillationPipeline {
             info!("No contradictions found");
         }
 
-        let migrated = migrate_inbox_to_wiki(&notes, wiki_dir);
+        let archived = archive_processed_notes(&notes, archive_dir, cycle_id, txn);
 
         Ok(DistillationReport {
             notes_processed,
             entities_extracted,
+            entities_persisted,
             wiki_pages_created,
             contradictions_found,
-            migrated_files: migrated,
+            migrated_files: archived,
         })
     }
 
     /// Load all .md notes from the inbox directory.
+    ///
+    /// Reads bytes and decodes lossily to UTF-8 (T004 encoding normalization).
     fn load_notes(&self, inbox_dir: &Path) -> Result<Vec<Note>> {
         let mut notes = Vec::new();
 
@@ -266,25 +488,28 @@ impl DistillationPipeline {
 
         for entry in entries {
             let path = entry.path();
-            match std::fs::read_to_string(&path) {
-                Ok(content) => match parse_frontmatter(&content) {
-                    Ok(mut note) => {
-                        note.file_path = Some(path.clone());
-                        notes.push(note);
-                    }
-                    Err(e) => {
-                        info!(
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to parse frontmatter, skipping note"
-                        );
-                    }
-                },
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
                 Err(e) => {
                     info!(
                         path = %path.display(),
                         error = %e,
                         "Failed to read note file, skipping"
+                    );
+                    continue;
+                }
+            };
+            let content = String::from_utf8_lossy(&bytes).to_string();
+            match parse_frontmatter(&content) {
+                Ok(mut note) => {
+                    note.file_path = Some(path.clone());
+                    notes.push(note);
+                }
+                Err(e) => {
+                    info!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to parse frontmatter, skipping note"
                     );
                 }
             }
@@ -292,6 +517,10 @@ impl DistillationPipeline {
 
         Ok(notes)
     }
+}
+
+fn page_file_path(page: &WikiPage) -> Option<PathBuf> {
+    Some(page.path.clone())
 }
 
 impl Default for DistillationPipeline {
@@ -328,6 +557,7 @@ impl Workflow for DistillationPipeline {
             return Ok(DistillationReport {
                 notes_processed: 0,
                 entities_extracted: 0,
+                entities_persisted: 0,
                 wiki_pages_created: 0,
                 contradictions_found: 0,
                 migrated_files: Vec::new(),
@@ -441,7 +671,18 @@ impl Workflow for DistillationPipeline {
         };
 
         let migrated = if !dry_run {
-            migrate_inbox_to_wiki(&notes, wiki_dir)
+            let archive_dir = wiki_dir
+                .parent()
+                .map(|p| p.join("archive"))
+                .unwrap_or_else(|| wiki_dir.join("archive"));
+            let txn = TransactionScope::new("workflow-archive");
+            txn.begin()
+                .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+            let cycle_id = uuid::Uuid::now_v7().to_string();
+            let archived = archive_processed_notes(&notes, &archive_dir, &cycle_id, &txn);
+            txn.commit()
+                .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
+            archived
         } else {
             Vec::new()
         };
@@ -449,6 +690,7 @@ impl Workflow for DistillationPipeline {
         Ok(DistillationReport {
             notes_processed,
             entities_extracted,
+            entities_persisted: 0,
             wiki_pages_created,
             contradictions_found,
             migrated_files: migrated,
@@ -501,39 +743,55 @@ updated_at: "2026-05-23T15:00:00+00:00"
         )
     }
 
-    #[test]
-    fn test_pipeline_empty_inbox() {
+    /// T007/T006-isolated runner: tmp inbox/wiki/archive/logs, no DB.
+    async fn run_isolated(
+        pipeline: &DistillationPipeline,
+        inbox: &Path,
+        wiki: &Path,
+    ) -> Result<DistillationReport> {
+        let root = wiki.parent().unwrap_or(wiki);
+        let archive = root.join("archive");
+        let logs = root.join("logs");
+        pipeline
+            .run_scoped(inbox, wiki, &archive, &logs, None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_empty_inbox() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         fs::create_dir(&inbox_dir).unwrap();
         let wiki_dir = tmp.path().join("wiki");
 
         let pipeline = DistillationPipeline::new();
-        let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
 
         assert_eq!(report.notes_processed, 0);
         assert_eq!(report.entities_extracted, 0);
+        assert_eq!(report.entities_persisted, 0);
         assert_eq!(report.wiki_pages_created, 0);
         assert_eq!(report.contradictions_found, 0);
     }
 
-    #[test]
-    fn test_pipeline_nonexistent_inbox() {
+    #[tokio::test]
+    async fn test_pipeline_nonexistent_inbox() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         let wiki_dir = tmp.path().join("wiki");
 
         let pipeline = DistillationPipeline::new();
-        let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
 
         assert_eq!(report.notes_processed, 0);
         assert_eq!(report.entities_extracted, 0);
+        assert_eq!(report.entities_persisted, 0);
         assert_eq!(report.wiki_pages_created, 0);
         assert_eq!(report.contradictions_found, 0);
     }
 
-    #[test]
-    fn test_pipeline_with_single_note() {
+    #[tokio::test]
+    async fn test_pipeline_with_single_note() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         fs::create_dir(&inbox_dir).unwrap();
@@ -546,7 +804,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("note1.md"), &note_content).unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
 
         assert_eq!(report.notes_processed, 1);
         assert!(
@@ -557,8 +815,8 @@ updated_at: "2026-05-23T15:00:00+00:00"
         assert_eq!(report.contradictions_found, 0);
     }
 
-    #[test]
-    fn test_pipeline_filters_non_md_files() {
+    #[tokio::test]
+    async fn test_pipeline_filters_non_md_files() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         fs::create_dir(&inbox_dir).unwrap();
@@ -570,13 +828,13 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("data.json"), "{}").unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
 
         assert_eq!(report.notes_processed, 1);
     }
 
-    #[test]
-    fn test_pipeline_with_multiple_notes() {
+    #[tokio::test]
+    async fn test_pipeline_with_multiple_notes() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         fs::create_dir(&inbox_dir).unwrap();
@@ -594,7 +852,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("02-python.md"), &note2).unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
 
         assert_eq!(report.notes_processed, 2);
         // Entities are deduplicated across notes
@@ -605,8 +863,8 @@ updated_at: "2026-05-23T15:00:00+00:00"
         );
     }
 
-    #[test]
-    fn test_pipeline_skips_malformed_notes() {
+    #[tokio::test]
+    async fn test_pipeline_skips_malformed_notes() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         fs::create_dir(&inbox_dir).unwrap();
@@ -620,13 +878,13 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("02-bad.md"), "---\nid: \"note-2\"\n\nbody").unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = pipeline.run(&inbox_dir, &wiki_dir).unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
 
         assert_eq!(report.notes_processed, 1, "Should skip the malformed note");
     }
 
-    #[test]
-    fn test_pipeline_creates_wiki_dir_if_missing() {
+    #[tokio::test]
+    async fn test_pipeline_creates_wiki_dir_if_missing() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         fs::create_dir(&inbox_dir).unwrap();
@@ -637,8 +895,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("note.md"), &note).unwrap();
 
         let pipeline = DistillationPipeline::new();
-        // WikiStructure::ensure_directories creates wiki_dir hierarchy
-        let result = pipeline.run(&inbox_dir, &wiki_dir);
+        let result = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await;
         assert!(result.is_ok());
     }
 
@@ -647,6 +904,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let report = DistillationReport {
             notes_processed: 5,
             entities_extracted: 3,
+            entities_persisted: 3,
             wiki_pages_created: 2,
             contradictions_found: 1,
             migrated_files: Vec::new(),
@@ -661,6 +919,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let report = DistillationReport {
             notes_processed: 1,
             entities_extracted: 0,
+            entities_persisted: 0,
             wiki_pages_created: 0,
             contradictions_found: 0,
             migrated_files: Vec::new(),
@@ -669,14 +928,14 @@ updated_at: "2026-05-23T15:00:00+00:00"
         assert_eq!(report.notes_processed, cloned.notes_processed);
     }
 
-    #[test]
-    fn test_pipeline_default() {
+    #[tokio::test]
+    async fn test_pipeline_default() {
         let pipeline = DistillationPipeline::default();
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
         let wiki_dir = tmp.path().join("wiki");
 
-        let result = pipeline.run(&inbox_dir, &wiki_dir);
+        let result = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await;
         assert!(result.is_ok());
     }
 
@@ -747,11 +1006,19 @@ updated_at: "2026-05-23T15:00:00+00:00"
         assert_eq!(result, "Use `Rust` for programming.");
     }
 
+    fn archive_test_txn(logs: &Path) -> TransactionScope {
+        let txn = TransactionScope::new("archive-test");
+        std::fs::create_dir_all(logs).unwrap();
+        txn.begin().unwrap();
+        txn
+    }
+
     #[test]
-    fn test_migrate_inbox_to_wiki_moves_by_domain() {
+    fn test_archive_processed_notes_writes_month_dir_and_provenance() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
-        let wiki_dir = tmp.path().join("wiki");
+        let archive_dir = tmp.path().join("archive");
+        let logs_dir = tmp.path().join("logs");
         fs::create_dir_all(&inbox_dir).unwrap();
 
         let content = create_test_note("note-1", "# Work note");
@@ -765,82 +1032,34 @@ updated_at: "2026-05-23T15:00:00+00:00"
             ..Note::default()
         }];
 
-        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
+        let txn = archive_test_txn(&logs_dir);
+        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-1", &txn);
 
-        assert_eq!(migrated.len(), 1);
-        let (src, dst) = &migrated[0];
+        assert_eq!(archived.len(), 1);
+        let (src, dst) = &archived[0];
         assert_eq!(src, &source);
-        assert!(dst.starts_with(wiki_dir.join("work")));
-        assert!(!source.exists(), "inbox file should be gone");
-        assert!(dst.exists(), "wiki file should exist");
-    }
-
-    #[test]
-    fn test_migrate_inbox_to_wiki_defaults_to_general() {
-        let tmp = tempdir().unwrap();
-        let inbox_dir = tmp.path().join("inbox");
-        let wiki_dir = tmp.path().join("wiki");
-        fs::create_dir_all(&inbox_dir).unwrap();
-
-        let content = create_test_note("note-2", "# Untagged note");
-        let source = inbox_dir.join("untagged.md");
-        fs::write(&source, &content).unwrap();
-
-        let notes = vec![Note {
-            id: "note-2".to_string(),
-            domain: Vec::new(),
-            file_path: Some(source.clone()),
-            ..Note::default()
-        }];
-
-        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
-
-        assert_eq!(migrated.len(), 1);
-        let (_, dst) = &migrated[0];
-        assert!(dst.starts_with(wiki_dir.join("general")));
-        assert!(dst.exists());
-    }
-
-    #[test]
-    fn test_migrate_inbox_to_wiki_avoids_overwrite() {
-        let tmp = tempdir().unwrap();
-        let inbox_dir = tmp.path().join("inbox");
-        let wiki_dir = tmp.path().join("wiki");
-        let work_dir = wiki_dir.join("work");
-        fs::create_dir_all(&inbox_dir).unwrap();
-        fs::create_dir_all(&work_dir).unwrap();
-
-        let content = create_test_note("note-3", "# Another work note");
-        let source = inbox_dir.join("duplicate.md");
-        fs::write(&source, &content).unwrap();
-
-        fs::write(work_dir.join("duplicate.md"), "existing").unwrap();
-
-        let notes = vec![Note {
-            id: "note-3".to_string(),
-            domain: vec![crate::note::Domain::Work],
-            file_path: Some(source.clone()),
-            ..Note::default()
-        }];
-
-        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
-
-        assert_eq!(migrated.len(), 1);
-        let (_, dst) = &migrated[0];
-        assert!(work_dir.join("duplicate.md").exists());
-        let dst_name = dst.file_name().unwrap().to_string_lossy();
         assert!(
-            dst_name.starts_with("duplicate_"),
-            "expected timestamp suffix: {dst_name}"
+            dst.starts_with(&archive_dir),
+            "dest must live under archive dir"
         );
-        assert!(dst.exists());
+        assert!(!source.exists(), "inbox file should be gone");
+        assert!(dst.exists(), "archived file should exist");
+
+        let archived_content = fs::read_to_string(dst).unwrap();
+        assert!(archived_content.contains("source_path:"));
+        assert!(archived_content.contains("archived_at:"));
+        assert!(archived_content.contains("cycle_id: \"cycle-1\""));
+        assert!(archived_content.contains("original_created_at:"));
+        assert!(archived_content.contains("checksum:"));
+        assert!(archived_content.contains("merged_into:"));
     }
 
     #[test]
-    fn test_migrate_inbox_to_wiki_inbox_empty_after() {
+    fn test_archive_processed_notes_inbox_empty_after() {
         let tmp = tempdir().unwrap();
         let inbox_dir = tmp.path().join("inbox");
-        let wiki_dir = tmp.path().join("wiki");
+        let archive_dir = tmp.path().join("archive");
+        let logs_dir = tmp.path().join("logs");
         fs::create_dir_all(&inbox_dir).unwrap();
 
         let c1 = create_test_note("n1", "# Note one");
@@ -865,9 +1084,10 @@ updated_at: "2026-05-23T15:00:00+00:00"
             },
         ];
 
-        let migrated = migrate_inbox_to_wiki(&notes, &wiki_dir);
+        let txn = archive_test_txn(&logs_dir);
+        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-2", &txn);
 
-        assert_eq!(migrated.len(), 2);
+        assert_eq!(archived.len(), 2);
         assert!(!s1.exists());
         assert!(!s2.exists());
 
@@ -877,7 +1097,76 @@ updated_at: "2026-05-23T15:00:00+00:00"
             .collect();
         assert!(
             inbox_entries.is_empty(),
-            "inbox should be empty after migration"
+            "inbox should be empty after archive"
         );
+    }
+
+    #[test]
+    fn test_archive_avoids_overwrite_with_timestamp() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        let archive_dir = tmp.path().join("archive");
+        let logs_dir = tmp.path().join("logs");
+        let month_dir = archive_dir.join(chrono::Utc::now().format("%Y-%m").to_string());
+        fs::create_dir_all(&inbox_dir).unwrap();
+        fs::create_dir_all(&month_dir).unwrap();
+
+        let content = create_test_note("note-3", "# Another work note");
+        let source = inbox_dir.join("duplicate.md");
+        fs::write(&source, &content).unwrap();
+        fs::write(month_dir.join("duplicate.md"), "existing").unwrap();
+
+        let notes = vec![Note {
+            id: "note-3".to_string(),
+            domain: vec![crate::note::Domain::Work],
+            file_path: Some(source.clone()),
+            ..Note::default()
+        }];
+
+        let txn = archive_test_txn(&logs_dir);
+        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-3", &txn);
+
+        assert_eq!(archived.len(), 1);
+        let (_, dst) = &archived[0];
+        assert!(month_dir.join("duplicate.md").exists());
+        let dst_name = dst.file_name().unwrap().to_string_lossy();
+        assert!(
+            dst_name.starts_with("duplicate_"),
+            "expected timestamp suffix: {dst_name}"
+        );
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn test_normalize_content_collapses_and_trims() {
+        let raw = "\r\n# Title   \r\n\r\n\r\n\r\nBody line.  \n\n\n\n";
+        let out = normalize_content(raw);
+        assert!(!out.contains('\r'), "CRLF must become LF");
+        assert!(!out.contains("   \n"), "trailing whitespace must be stripped");
+        assert!(out.starts_with("# Title"), "leading blanks trimmed");
+        assert!(out.ends_with("Body line.\n"), "trailing blanks trimmed");
+        assert!(!out.contains("\n\n\n"), "3+ blank lines collapsed to 2");
+    }
+
+    #[test]
+    fn test_normalize_content_keeps_single_blank_lines() {
+        let out = normalize_content("# T\n\nBody.\n");
+        assert_eq!(out, "# T\n\nBody.\n");
+    }
+
+    #[test]
+    fn test_append_provenance_into_existing_frontmatter() {
+        let raw = "---\nid: \"n1\"\n---\n\nbody";
+        let out = append_provenance(raw, &[("cycle_id", "c9".to_string())]);
+        assert!(out.starts_with("---\n"));
+        assert!(out.contains("id: \"n1\""));
+        assert!(out.contains("cycle_id: \"c9\""));
+        assert!(out.contains("---\n\nbody"));
+    }
+
+    #[test]
+    fn test_append_provenance_prepends_when_missing() {
+        let out = append_provenance("no frontmatter here", &[("cycle_id", "c9".into())]);
+        assert!(out.starts_with("---\ncycle_id: \"c9\"\n---\n"));
     }
 }

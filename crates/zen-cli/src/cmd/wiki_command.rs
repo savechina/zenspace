@@ -47,6 +47,11 @@ pub enum WikiCommands {
         #[arg(short, long)]
         date: Option<String>,
     },
+    /// Knowledge-processing loop (run/status/gaps/enable/disable)
+    Loop {
+        #[command(subcommand)]
+        command: crate::cmd::loop_command::LoopCommands,
+    },
 }
 
 pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
@@ -192,6 +197,7 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             let pipeline = zen_vault::distill::DistillationPipeline::new();
             let report = pipeline
                 .run(&inbox_dir, &wiki_dir)
+                .await
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 
             println!(
@@ -206,6 +212,9 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             println!("  Contradictions found:   {}", report.contradictions_found);
 
             Ok(())
+        }
+        WikiCommands::Loop { command } => {
+            crate::cmd::loop_command::execute_command(command).await
         }
     }
 }

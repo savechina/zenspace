@@ -61,6 +61,8 @@ pub struct ZenConfig {
     pub mcp_servers: Vec<McpServerConfig>,
     /// Sandbox hardening (`[sandbox.*]`).
     pub sandbox: SandboxConfig,
+    /// Agentic module sections (`[agentic.*]`, 005-agentic-loop).
+    pub agentic: AgenticConfig,
 }
 
 /// Sandbox hardening config — `[sandbox.*]` sections (T091).
@@ -105,6 +107,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             web_search: WebSearchConfig,
             mcp_servers: Vec<McpServerConfig>,
             sandbox: SandboxConfig,
+            agentic: AgenticConfig,
         }
 
         let shadow = ZenConfigShadow::deserialize(deserializer)?;
@@ -126,6 +129,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             web_search: shadow.web_search,
             mcp_servers: shadow.mcp_servers,
             sandbox: shadow.sandbox,
+            agentic: shadow.agentic,
         })
     }
 }
@@ -398,6 +402,103 @@ pub struct CronConfig {
     /// If a worker's cumulative cost exceeds this cap, it skips execution
     /// until the next monthly reset. Default: 10.0 (sane for personal use).
     pub llm_cost_cap_usd: Option<f64>,
+}
+
+/// Agentic module sections — `[agentic.*]` (005-agentic-loop).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AgenticConfig {
+    /// Knowledge-processing loop — TOML `[agentic.loop]`.
+    /// (`loop` is a Rust keyword, hence the `loop_cfg` field name.)
+    #[serde(rename = "loop")]
+    pub loop_cfg: LoopConfig,
+}
+
+/// Knowledge-processing loop configuration (005-agentic-loop, T001).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates `ZenLoopWorker` cron registration and merge/distill tuning.
+/// - User impact: `enabled = false` makes the loop manual-only (`zen wiki loop run` still works).
+/// - Default: enabled=true, 5-min cron, merge threshold 0.62, pure-duplicate 0.98,
+///   max_attempts 3, min_free_bytes 100 MiB, host_sources empty (FR-033 off).
+/// - Interaction: `ZEN_LOOP_*` env vars override any config layer (5th layer).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct LoopConfig {
+    /// Worker fires on cron when true; absent → enabled (contract cli.md).
+    pub enabled: Option<bool>,
+    /// 6-field cron expression. Default `"0 */5 * * * *"`.
+    pub interval: Option<String>,
+    /// Trigram-Jaccard similarity threshold for wiki merge clustering (FR-016).
+    pub merge_threshold: Option<f64>,
+    /// Similarity at/above which two pages short-circuit as pure duplicates. Default 0.98.
+    pub merge_pure_duplicate: Option<f64>,
+    /// Provider model reference for LLM-assisted merges (mem0 ADD/UPDATE discipline).
+    pub merge_llm_model: Option<String>,
+    /// Per-note retry attempts before quarantine (FR-010). Default 3.
+    pub max_attempts: Option<u32>,
+    /// Pre-cycle free-space guard in bytes; below → cycle Aborted (FR-005 guard).
+    pub min_free_bytes: Option<u64>,
+    /// Host directories governed by FR-033 (default empty = feature off).
+    pub host_sources: Vec<HostSourceConfig>,
+}
+
+impl LoopConfig {
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn interval_or_default(&self) -> &str {
+        self.interval.as_deref().unwrap_or("0 */5 * * * *")
+    }
+
+    pub fn merge_threshold_or_default(&self) -> f64 {
+        self.merge_threshold.unwrap_or(0.62)
+    }
+
+    pub fn merge_pure_duplicate_or_default(&self) -> f64 {
+        self.merge_pure_duplicate.unwrap_or(0.98)
+    }
+
+    pub fn max_attempts_or_default(&self) -> u32 {
+        self.max_attempts.unwrap_or(3)
+    }
+
+    pub fn min_free_bytes_or_default(&self) -> u64 {
+        self.min_free_bytes.unwrap_or(100 * 1024 * 1024)
+    }
+}
+
+/// One governed host directory (FR-033, T043).
+///
+/// TOML layout (inside `[agentic.loop]`):
+/// ```toml
+/// [[agentic.loop.host_sources]]
+/// host_path   = "~/Documents/Work"
+/// para_target = "areas"          # projects|areas|resources|archive
+/// m_tier      = "M3"             # M3|M4|M5
+/// worker_type = "doc"            # code|doc
+/// raw_policy  = "copy"           # index-only|copy
+/// sensitivity = "Private"        # Private|Internal
+/// allow_cloud = false            # cloud LLM extraction opt-in
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct HostSourceConfig {
+    /// Absolute or `~`-expanded host directory path.
+    pub host_path: String,
+    /// PARA bucket the source classifies into.
+    pub para_target: Option<String>,
+    /// DESIGN memory tier this source feeds (M3/M4/M5).
+    pub m_tier: Option<String>,
+    /// `code` (deterministic, index-only) or `doc` (LLM semantic, copy).
+    pub worker_type: Option<String>,
+    /// `index-only` (code track) or `copy` (doc track → `vault/raw/{host_hash}/`).
+    pub raw_policy: Option<String>,
+    /// `Private` (default for Personal/Work) or `Internal`.
+    pub sensitivity: Option<String>,
+    /// Cloud LLM extraction opt-in; false (default) forces local models for Private.
+    pub allow_cloud: Option<bool>,
 }
 
 /// Plugin system config.
@@ -1041,7 +1142,31 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         web_search: merge_web_search(base.web_search, override_cfg.web_search),
         mcp_servers: merge_mcp_servers(base.mcp_servers, override_cfg.mcp_servers),
         sandbox: merge_sandbox(base.sandbox, override_cfg.sandbox),
+        agentic: merge_agentic(base.agentic, override_cfg.agentic),
     })
+}
+
+fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
+    AgenticConfig {
+        loop_cfg: merge_loop(base.loop_cfg, ov.loop_cfg),
+    }
+}
+
+fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
+    LoopConfig {
+        enabled: ov.enabled.or(base.enabled),
+        interval: str_merge(base.interval, ov.interval),
+        merge_threshold: ov.merge_threshold.or(base.merge_threshold),
+        merge_pure_duplicate: ov.merge_pure_duplicate.or(base.merge_pure_duplicate),
+        merge_llm_model: str_merge(base.merge_llm_model, ov.merge_llm_model),
+        max_attempts: ov.max_attempts.or(base.max_attempts),
+        min_free_bytes: ov.min_free_bytes.or(base.min_free_bytes),
+        host_sources: if ov.host_sources.is_empty() {
+            base.host_sources
+        } else {
+            ov.host_sources
+        },
+    }
 }
 
 /// Grants accumulate across config layers: any layer enabling a WASM
@@ -1294,7 +1419,30 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_channels_env(&mut config.channels);
     apply_history_env(&mut config.history);
     apply_embeddings_env(&mut config.embeddings);
+    apply_loop_env(&mut config.agentic.loop_cfg);
     config
+}
+
+fn apply_loop_env(cfg: &mut LoopConfig) {
+    if let Some(v) = env_bool("ZEN_LOOP_ENABLED") {
+        cfg.enabled = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_LOOP_INTERVAL") {
+        cfg.interval = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_LOOP_MERGE_THRESHOLD") {
+        if let Ok(f) = v.parse() {
+            cfg.merge_threshold = Some(f);
+        }
+    }
+    if let Some(v) = env_u32("ZEN_LOOP_MAX_ATTEMPTS") {
+        cfg.max_attempts = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_LOOP_MIN_FREE_BYTES") {
+        if let Ok(n) = v.parse() {
+            cfg.min_free_bytes = Some(n);
+        }
+    }
 }
 
 fn apply_agent_env(agents: &mut HashMap<String, AgentConfig>) {

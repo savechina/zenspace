@@ -2227,11 +2227,20 @@ Use /thinking to show/hide thinking process."#;
         use zen_core::paths::ZenPaths;
         use zen_vault::distill::DistillationPipeline;
         if let Ok(paths) = ZenPaths::detect() {
-            match DistillationPipeline::new().run(&paths.inbox(), &paths.wiki()) {
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    DistillationPipeline::new().run(&paths.inbox(), &paths.wiki()),
+                )
+            });
+            match result {
                 Ok(report) => {
                     self.push_output("Distillation complete:".into(), false);
                     self.push_output(
                         format!("  Notes processed: {}", report.notes_processed),
+                        false,
+                    );
+                    self.push_output(
+                        format!("  Archived: {}", report.migrated_files.len()),
                         false,
                     );
                 }

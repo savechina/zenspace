@@ -3,10 +3,12 @@ mod common;
 use common::ZenTest;
 
 // ============================================================================
-// CLI Smoke Tests — all 29 zen commands
-//
+// CLI Smoke Tests — zen commands (personal-agent scope: 20 commands, 005)
 // Each test runs `zen <command>` as a subprocess and verifies exit code 0.
 // These supplement the existing integration_test.rs with additional coverage.
+// Nine manual commands (note/search/similar/notion-graph/research/ingest/
+// routine/dispatch/brief) were removed from CLI surface and live on as
+// internal pipeline capabilities (ZenScheduler workers + distill loop).
 // ============================================================================
 
 // ---------------------------------------------------------------------------
@@ -176,29 +178,8 @@ fn test_zen_provider_route_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// Note / Knowledge Commands (3 tests)
+// Note / Knowledge Commands (1 test — remaining wiki subcommand)
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_zen_note_help_shows_subcommands() {
-    let test = ZenTest::new();
-    let output = test.zen(&["note", "--help"]);
-    assert!(output.success(), "note --help should succeed");
-    let stdout = output.stdout().to_lowercase();
-    assert!(stdout.contains("create"), "note help should list create");
-}
-
-#[test]
-fn test_zen_search_help_shows_subcommands() {
-    let test = ZenTest::new();
-    let output = test.zen(&["search", "--help"]);
-    assert!(output.success(), "search --help should succeed");
-    let stdout = output.stdout().to_lowercase();
-    assert!(
-        stdout.contains("run") || stdout.contains("query"),
-        "search help should list subcommands"
-    );
-}
 
 #[test]
 fn test_zen_wiki_lint_help_shows_subcommands() {
@@ -265,20 +246,6 @@ fn test_zen_plugin_help_shows_subcommands() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_zen_similar_help_succeeds() {
-    let test = ZenTest::new();
-    let output = test.zen(&["similar", "--help"]);
-    assert!(output.success(), "similar --help should succeed");
-}
-
-#[test]
-fn test_zen_graph_help_succeeds() {
-    let test = ZenTest::new();
-    let output = test.zen(&["graph", "--help"]);
-    assert!(output.success(), "graph --help should succeed");
-}
-
-#[test]
 fn test_zen_wiki_reindex_help_succeeds() {
     let test = ZenTest::new();
     let output = test.zen(&["wiki", "reindex", "--help"]);
@@ -286,45 +253,10 @@ fn test_zen_wiki_reindex_help_succeeds() {
 }
 
 #[test]
-fn test_zen_research_help_succeeds() {
-    let test = ZenTest::new();
-    let output = test.zen(&["research", "--help"]);
-    assert!(output.success(), "research --help should succeed");
-}
-
-#[test]
 fn test_zen_wiki_distill_help_succeeds() {
     let test = ZenTest::new();
     let output = test.zen(&["wiki", "distill", "--help"]);
     assert!(output.success(), "wiki distill --help should succeed");
-}
-
-#[test]
-fn test_zen_ingest_help_succeeds() {
-    let test = ZenTest::new();
-    let output = test.zen(&["ingest", "--help"]);
-    assert!(output.success(), "ingest --help should succeed");
-}
-
-#[test]
-fn test_zen_routine_help_succeeds() {
-    let test = ZenTest::new();
-    let output = test.zen(&["routine", "--help"]);
-    assert!(output.success(), "routine --help should succeed");
-}
-
-#[test]
-fn test_zen_dispatch_help_succeeds() {
-    let test = ZenTest::new();
-    let output = test.zen(&["dispatch", "--help"]);
-    assert!(output.success(), "dispatch --help should succeed");
-}
-
-#[test]
-fn test_zen_brief_help_succeeds() {
-    let test = ZenTest::new();
-    let output = test.zen(&["brief", "--help"]);
-    assert!(output.success(), "brief --help should succeed");
 }
 
 #[test]
