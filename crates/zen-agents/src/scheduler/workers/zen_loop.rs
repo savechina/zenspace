@@ -4,7 +4,7 @@
 //! reusing the exact service code paths behind the manual `zen wiki` subcommands:
 //! pre-cycle guards → ingest sweep → distill → verify → reindex → report+audit.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
@@ -33,12 +33,36 @@ pub fn gaps_path(logs_dir: &Path) -> PathBuf {
     logs_dir.join("loop-gaps.jsonl")
 }
 
+/// Persisted retry counters (`<logs>/loop-attempts.json`) — survives the
+/// per-run worker instances of manual `zen wiki loop run` invocations.
+pub fn attempts_path(logs_dir: &Path) -> PathBuf {
+    logs_dir.join("loop-attempts.json")
+}
+
+fn load_attempts(logs_dir: &Path) -> HashMap<String, u8> {
+    std::fs::read_to_string(attempts_path(logs_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_attempts(logs_dir: &Path, attempts: &HashMap<String, u8>) {
+    if let Ok(json) = serde_json::to_string_pretty(attempts) {
+        std::fs::write(attempts_path(logs_dir), json).ok();
+    }
+}
+
 /// The cron-driven knowledge-processing loop (worker contract, Phase 1).
 pub struct ZenLoopWorker {
     scheduled: Option<&'static str>,
     /// Inbox file names seen in the previous cycle — stale = seen ≥2 cycles
     /// and still present (IngestNeverConsolidated).
     prev_inbox: Mutex<Option<HashSet<String>>>,
+    /// Inbox files still present after a cycle → attempt count (T017).
+    attempts: Mutex<HashMap<String, u8>>,
+    /// T018: pre-cycle checksums; a file whose checksum changes mid-cycle
+    /// (user edit during processing) is skipped and re-queued next cycle.
+    pre_checksums: Mutex<HashMap<String, String>>,
     cycles: AtomicU32,
     /// `zen wiki loop run --dry-run`: read paths only, no mutations.
     dry_run: bool,
@@ -51,6 +75,8 @@ impl ZenLoopWorker {
         Self {
             scheduled: None,
             prev_inbox: Mutex::new(None),
+            attempts: Mutex::new(HashMap::new()),
+            pre_checksums: Mutex::new(HashMap::new()),
             cycles: AtomicU32::new(0),
             dry_run: false,
             cron_enabled: true,
@@ -178,6 +204,23 @@ impl ZenWorker for ZenLoopWorker {
         let mut gaps: Vec<GapRecord> = Vec::new();
         self.ingest_sweep(&paths, &mut gaps, &cycle_id).await;
 
+        // T018: snapshot pre-cycle checksums for the concurrent-modification
+        // gate — a file edited mid-cycle is left for the next cycle.
+        let inbox_before = inbox_listing(&paths.inbox());
+        {
+            let mut pre = self.pre_checksums.lock().await;
+            pre.clear();
+            for name in &inbox_before {
+                let path = paths.inbox().join(name);
+                if let Ok(bytes) = std::fs::read(&path) {
+                    let checksum = zen_vault::ChangeDetector::compute_checksum(
+                        &String::from_utf8_lossy(&bytes),
+                    );
+                    pre.insert(name.clone(), checksum);
+                }
+            }
+        }
+
         // ── Stage 3: distill (same code path as `zen wiki distill`) ───────
         if self.dry_run {
             info!("loop: dry-run — skipping distill/reindex mutations");
@@ -223,9 +266,76 @@ impl ZenWorker for ZenLoopWorker {
             }
         }
 
-        // ── Stage 4: verify (stub — T016 wires GraphIntegrityVerifier) ────
-        // Structural gap detection lands with US2; page lint stays in
-        // `zen wiki lint` until then.
+        // ── Stage 4: verify (T016) — GraphIntegrityVerifier + page lint ───
+        if let Some(db) = db.as_ref() {
+            let verifier =
+                zen_vault::GraphIntegrityVerifier::new(db, &cycle_id);
+            let inventory = zen_vault::wiki_page_inventory(&paths.wiki());
+            match verifier.verify(&inventory).await {
+                Ok(mut graph_gaps) => gaps.append(&mut graph_gaps),
+                Err(e) => warn!(error = %e, "loop: graph verify failed (cycle continues)"),
+            }
+        }
+        match zen_vault::Linter::new().run(&paths.wiki()) {
+            Ok(lint) => {
+                report.lint_orphan_pages = lint.orphan_pages.len();
+                report.lint_broken_wikilinks = lint.broken_wikilinks.len();
+            }
+            Err(e) => warn!(error = %e, "loop: page lint failed (cycle continues)"),
+        }
+
+        // T017: inbox-empty guarantee — leftover notes retry next cycle,
+        // quarantined after max_attempts (FR-006/FR-010).
+        {
+            let max_attempts = loop_cfg.max_attempts_or_default();
+            let mut attempts = self.attempts.lock().await;
+            *attempts = load_attempts(&logs_dir);
+            let leftover = inbox_listing(&paths.inbox());
+            let mut quarantined = 0usize;
+            for name in leftover {
+                let pre = self.pre_checksums.lock().await;
+                let edited_mid_cycle = pre
+                    .get(&name)
+                    .map(|before| {
+                        std::fs::read(paths.inbox().join(&name))
+                            .map(|b| {
+                                zen_vault::ChangeDetector::compute_checksum(
+                                    &String::from_utf8_lossy(&b),
+                                ) != *before
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                drop(pre);
+                if edited_mid_cycle {
+                    info!(file = %name, "loop: file changed mid-cycle — re-queued next cycle (T018)");
+                    attempts.remove(&name);
+                    continue;
+                }
+                let count = attempts.entry(name.clone()).or_insert(0);
+                *count += 1;
+                if u32::from(*count) >= max_attempts {
+                    let quarantine_dir = paths.archive().join("quarantine");
+                    std::fs::create_dir_all(&quarantine_dir).ok();
+                    let from = paths.inbox().join(&name);
+                    let to = quarantine_dir.join(&name);
+                    if std::fs::rename(&from, &to).is_ok() {
+                        quarantined += 1;
+                        gaps.push(
+                            GapRecord::new(
+                                GapKind::QuarantinedNote,
+                                &cycle_id,
+                                format!("note failed {max_attempts} cycles — quarantined"),
+                            )
+                            .with_path(&to),
+                        );
+                        attempts.remove(&name);
+                    }
+                }
+            }
+            save_attempts(&logs_dir, &attempts);
+            report.quarantined_count = quarantined;
+        }
 
         // ── Stage 5: reindex (checksum-gated, same path as `zen wiki reindex`) ──
         // without_embeddings: the 5-min hot chain stays offline-safe; vec0

@@ -45,6 +45,9 @@ pub struct LoopCycleReport {
     pub archived_count: usize,
     pub quarantined_count: usize,
     pub pending_count: usize,
+    /// Page-lint results run in-cycle (T016, FR-005/SC-003).
+    pub lint_orphan_pages: usize,
+    pub lint_broken_wikilinks: usize,
     pub gaps: Vec<GapRecord>,
     pub last_error: Option<String>,
 }

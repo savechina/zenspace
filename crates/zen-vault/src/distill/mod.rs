@@ -1,6 +1,7 @@
 pub mod chat_import;
 pub mod checkpoint;
 pub mod contradiction;
+pub mod merge;
 pub mod notion_extraction;
 pub mod pipeline;
 pub mod recovery;
@@ -13,6 +14,7 @@ pub use chat_import::ChatImporter;
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
 pub use notion_extraction::NotionExtractor;
+pub use merge::{MergeStrategy, WikiMergePlan, build_merge_plans, trigram_jaccard};
 pub use pipeline::{DistillationPipeline, DistillationPipelineInput, DistillationReport};
 pub use recovery::RecoveryManager;
 pub use source_ingest::SourceIngester;

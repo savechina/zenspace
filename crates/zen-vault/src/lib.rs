@@ -1,6 +1,7 @@
 pub mod brief;
 pub mod dispatch;
 pub mod distill;
+pub mod graph_verify;
 pub mod goal;
 pub mod habit;
 pub mod ingest;
@@ -13,6 +14,7 @@ pub mod tools;
 pub use tools::SharedSqliteClient;
 pub mod wiki;
 
+pub use graph_verify::{GraphIntegrityVerifier, wiki_page_inventory};
 pub use distill::{
     ChatImporter, Checkpoint, CheckpointManager, Contradiction, ContradictionDetector,
     DistillationPipeline, DistillationPipelineInput, DistillationReport, NotionExtractor,

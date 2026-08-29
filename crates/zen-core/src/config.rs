@@ -453,7 +453,7 @@ impl LoopConfig {
     }
 
     pub fn merge_threshold_or_default(&self) -> f64 {
-        self.merge_threshold.unwrap_or(0.62)
+        self.merge_threshold.unwrap_or(0.82)
     }
 
     pub fn merge_pure_duplicate_or_default(&self) -> f64 {

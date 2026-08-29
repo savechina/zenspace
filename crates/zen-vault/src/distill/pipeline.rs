@@ -29,6 +29,8 @@ pub struct DistillationReport {
     /// Notions durably upserted into the DB graph via NotionService (T003).
     pub entities_persisted: usize,
     pub wiki_pages_created: usize,
+    /// Wiki merge plans executed (T015, FR-016).
+    pub merged_count: usize,
     pub contradictions_found: usize,
     /// Raw notes archived to `vault/archive/<yyyy-mm>/` (T005; was wiki-moves).
     pub migrated_files: Vec<(PathBuf, PathBuf)>,
@@ -436,6 +438,9 @@ impl DistillationPipeline {
             info!(wiki_pages_created, "Wiki pages compiled and written");
         }
 
+        // T015: merge execution — cluster + fold duplicates (FR-016).
+        let merged_count = self.execute_merge_plans(wiki_dir, archive_dir, txn, cycle_id)?;
+
         let contradictions = self.detector.detect(&notes)?;
         let contradictions_found = contradictions.len();
         if contradictions_found > 0 {
@@ -452,10 +457,182 @@ impl DistillationPipeline {
             notes_processed,
             entities_extracted,
             entities_persisted,
+            merged_count,
             wiki_pages_created,
             contradictions_found,
             migrated_files: archived,
         })
+    }
+
+    /// T015 (FR-016): cluster compiled wiki pages and execute merge plans.
+    ///
+    /// PureDuplicate (≥0.98): target keeps its content; Merge: target absorbs
+    /// non-overlapping source content. Both: sources archived with
+    /// `merged_into`, target gains `merged_from`/`supersede_of`/`merged_at`
+    /// frontmatter, and other pages' `[[source]]` wikilinks are rewritten to
+    /// `[[target]]` (OVP2 bi-temporal pattern, data-model §5). Merge never
+    /// deletes — originals live in the archive.
+    fn execute_merge_plans(
+        &self,
+        wiki_dir: &Path,
+        archive_dir: &Path,
+        txn: &TransactionScope,
+        cycle_id: &str,
+    ) -> Result<usize> {
+        use super::merge::{MergeStrategy, build_merge_plans};
+
+        let inventory = crate::graph_verify::wiki_page_inventory(wiki_dir);
+        if inventory.len() < 2 {
+            return Ok(0);
+        }
+
+        let (threshold, pure_dup) = match zen_core::config::load_config() {
+            Ok(cfg) => (
+                cfg.agentic.loop_cfg.merge_threshold_or_default(),
+                cfg.agentic.loop_cfg.merge_pure_duplicate_or_default(),
+            ),
+            Err(_) => (0.82, 0.98),
+        };
+
+        let pages: Vec<crate::wiki::WikiPage> = inventory
+            .iter()
+            .filter_map(|(name, rel)| {
+                let raw = std::fs::read_to_string(wiki_dir.join(rel)).ok()?;
+                Some(crate::wiki::WikiPage {
+                    title: name.clone(),
+                    path: wiki_dir.join(rel),
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    tags: vec![],
+                    wikilinks: crate::wiki::WikiPage::extract_wikilinks(&raw),
+                    para: None,
+                    okf_type: None,
+                    content: raw,
+                })
+            })
+            .collect();
+
+        let (plans, alias_gaps) = build_merge_plans(&pages, threshold, pure_dup, cycle_id);
+        if !alias_gaps.is_empty() {
+            for gap in &alias_gaps {
+                info!(kind = ?gap.kind, "merge: alias collision detected");
+            }
+        }
+
+        let mut merged = 0usize;
+        let now = chrono::Utc::now();
+        for plan in plans {
+            if plan.strategy == MergeStrategy::Skip {
+                continue;
+            }
+            let target_path = plan.target_page.clone();
+            let target_stem = target_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let mut target_content =
+                std::fs::read_to_string(&target_path).unwrap_or_default();
+
+            let mut absorbed = Vec::new();
+            for source in &plan.source_pages {
+                if source == &target_path || !source.exists() {
+                    continue;
+                }
+                let source_stem = source
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let source_content = std::fs::read_to_string(source).unwrap_or_default();
+
+                // Mechanical content absorption: append source body to target
+                // when it carries unique lines (deterministic; LLM assist is
+                // merge_llm_model, applied by the worker when configured).
+                if plan.strategy == MergeStrategy::Merge {
+                    let unique: Vec<&str> = source_content
+                        .lines()
+                        .filter(|line| {
+                            !line.trim().is_empty()
+                                && !target_content.contains(line.trim())
+                        })
+                        .collect();
+                    if !unique.is_empty() {
+                        target_content.push_str(&format!(
+                            "\n\n## From [[{source_stem}]]\n\n{}\n",
+                            unique.join("\n")
+                        ));
+                    }
+                }
+
+                // Archive the source (never delete — data-model §5) with
+                // merged_into provenance.
+                let month_dir = archive_dir.join(now.format("%Y-%m").to_string());
+                std::fs::create_dir_all(&month_dir).ok();
+                let file_name = source
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("{}.md", source_stem));
+                let archived = month_dir.join(file_name);
+                let provenance = append_provenance(
+                    &source_content,
+                    &[
+                        ("source_path", source.to_string_lossy().to_string()),
+                        ("archived_at", now.to_rfc3339()),
+                        ("cycle_id", cycle_id.to_string()),
+                        ("merged_into", target_stem.clone()),
+                    ],
+                );
+                if std::fs::write(&archived, provenance).is_ok()
+                    && std::fs::remove_file(source).is_ok()
+                {
+                    txn.track_path(&archived)?;
+                    txn.track_path(source)?;
+                    absorbed.push(source_stem);
+                }
+            }
+
+            if absorbed.is_empty() {
+                continue;
+            }
+
+            // Rewrite wikilinks in remaining wiki pages: [[absorbed]] → [[target]].
+            for page in &pages {
+                if !page.path.exists() || &page.path == &target_path {
+                    continue;
+                }
+                let content = match std::fs::read_to_string(&page.path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut rewritten = content.clone();
+                for stem in &absorbed {
+                    rewritten = rewritten.replace(&format!("[[{stem}]]"), &format!("[[{target_stem}]]"));
+                }
+                if rewritten != content {
+                    std::fs::write(&page.path, &rewritten).ok();
+                    txn.track_path(&page.path)?;
+                }
+            }
+
+            // Target provenance (mem0 ADD/UPDATE discipline).
+            let list: Vec<String> = absorbed.iter().map(|s| format!("\"{s}\"")).collect();
+            target_content = append_provenance(
+                &target_content,
+                &[
+                    ("merged_from", format!("[{}]", list.join(", "))),
+                    ("supersede_of", format!("[{}]", list.join(", "))),
+                    ("merged_at", now.to_rfc3339()),
+                    ("cycle_id", cycle_id.to_string()),
+                ],
+            );
+            std::fs::write(&target_path, &target_content)?;
+            txn.track_path(&target_path)?;
+            merged += 1;
+        }
+
+        if merged > 0 {
+            info!(merged, "merge: plans executed");
+        }
+        Ok(merged)
     }
 
     /// Load all .md notes from the inbox directory.
@@ -558,6 +735,7 @@ impl Workflow for DistillationPipeline {
                 notes_processed: 0,
                 entities_extracted: 0,
                 entities_persisted: 0,
+                merged_count: 0,
                 wiki_pages_created: 0,
                 contradictions_found: 0,
                 migrated_files: Vec::new(),
@@ -691,6 +869,7 @@ impl Workflow for DistillationPipeline {
             notes_processed,
             entities_extracted,
             entities_persisted: 0,
+            merged_count: 0,
             wiki_pages_created,
             contradictions_found,
             migrated_files: migrated,
@@ -905,6 +1084,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
             notes_processed: 5,
             entities_extracted: 3,
             entities_persisted: 3,
+            merged_count: 1,
             wiki_pages_created: 2,
             contradictions_found: 1,
             migrated_files: Vec::new(),
@@ -920,6 +1100,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
             notes_processed: 1,
             entities_extracted: 0,
             entities_persisted: 0,
+            merged_count: 0,
             wiki_pages_created: 0,
             contradictions_found: 0,
             migrated_files: Vec::new(),
