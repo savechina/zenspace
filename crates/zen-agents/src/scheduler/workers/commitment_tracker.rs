@@ -308,12 +308,20 @@ fn extract_commitments_from_journal(path: &Path) -> Result<Vec<CommitmentItem>> 
         if in_commitments && let Some(item) = trimmed.strip_prefix("- ") {
             let text = item.trim().to_string();
             if !text.is_empty() && !text.starts_with("_(no ") {
-                let created_at = date_str
+                let created_at = match date_str
                     .as_ref()
                     .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
                     .and_then(|d| d.and_hms_opt(0, 0, 0))
                     .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
-                    .unwrap_or_else(Utc::now);
+                {
+                    Some(dt) => dt,
+                    None => {
+                        if let Some(d) = date_str.as_ref() {
+                            warn!(date = %d, "commitment_tracker: unparsable date, created_at defaults to now");
+                        }
+                        Utc::now()
+                    }
+                };
                 items.push(CommitmentItem {
                     text,
                     session_id: session_id.clone(),
