@@ -83,7 +83,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | Crate | Role | Path |
 |-------|------|------|
 | zen | Binary entry (13-line wrapper) | `crates/zen/` |
-| zen-cli | CLI library (21 commands, TUI, dispatch) | `crates/zen-cli/` |
+| zen-cli | CLI library (20 commands, TUI, dispatch) | `crates/zen-cli/` |
 | zen-core | Config layers, error taxonomy, path scoping, constants (13 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
 | zen-repo | Unified data layer: SqliteClient + 9 domain repositories (FTS5, vec0, graph) | `crates/zen-repo/` |
@@ -106,6 +106,7 @@ zen (binary)            -- 13-line main.rs -- loads .env, config, calls zen_cli:
       ├── zen-agents    → zen-memory → zen-core
       │                 └── zen-provider
       │                 └── zen-vault
+      │                 └── zen-repo (scheduler workers open state.db directly — pre-existing dep)
       ├── zen-core      (13 public modules: audit, config, constants, definition,
       │                 errors, paths, platform, review, sandbox, sanitize,
       │                 secrets, types, validate)
@@ -119,7 +120,7 @@ zen-provider → zen-core
 ### Binary/Library Split
 
 - **Binary**: `crates/zen/src/main.rs` (13 lines) -- loads `.env`, calls `zen_core::config::load_config()`, then `zen_cli::shell().await`
-- **Library**: `crates/zen-cli/` -- exports `shell()` via `lib.rs`, contains clap Parser, TUI runner, 21 subcommand dispatchers
+- **Library**: `crates/zen-cli/` -- exports `shell()` via `lib.rs`, contains clap Parser, TUI runner, 20 subcommand dispatchers
 - **TUI**: Runs on main thread (ratatui/crossterm) when `cli.command.is_none()`
 
 ### Data Flow
@@ -140,10 +141,10 @@ zen serve start  → zen-gateway daemon + ZenScheduler (cron workers: journal, d
 zenspace/
 ├── crates/                     # 12 workspace crates (binary/library split)
 │   ├── zen/                    # Binary entry (13-line wrapper)
-│   ├── zen-cli/                # CLI library: 21 commands, TUI, clap derive
+│   ├── zen-cli/                # CLI library: 20 commands, TUI, clap derive
 │   │   ├── src/
 │   │   │   ├── lib.rs          # pub use cli::shell
-│   │   │   ├── cli.rs          # clap Parser/Subcommand (21 variants), shell() dispatcher
+│   │   │   ├── cli.rs          # clap Parser/Subcommand (20 variants), shell() dispatcher
 │   │   │   ├── tui/            # ratatui TUI interface
 │   │   │   ├── session.rs      # Session helpers
 │   │   │   ├── sandbox.rs      # Sandbox helpers
@@ -479,7 +480,7 @@ cargo fmt --all          # Format
 bin/release patch        # Bump version, tag, push
 ```
 
-### Agentic Commands (21 commands)
+### Agentic Commands (20 commands)
 
 Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal memory/knowledge pipeline. Nine manual commands (`note`, `search`, `similar`, `notion`/`graph`, `research`, `ingest`, `routine`, `brief`, `dispatch`) were removed from the CLI surface — their capabilities live on internally via ZenScheduler workers and the distill loop; the command files remain on disk uncompiled, restorable when business scenarios require.
 
@@ -500,7 +501,6 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen audit` | Audit log ops | `audit_command.rs` |
 | `zen logs` | Structured log viewer | `logs_command.rs` |
 | `zen wiki` | Wiki ops: list, show, reindex, lint, distill, rebuild-memory, loop (run/status/gaps/enable/disable) | `wiki_command.rs` |
-| `zen loop` | Knowledge loop: run [--dry-run] [--json] / status / gaps / enable / disable (005) | `loop_command.rs` |
 | `zen model` | Model metadata + routing | `model_command.rs` |
 | `zen plugin` | Plugin management (install, enable, disable, rehash, tools list) | `plugin_command.rs` |
 | `zen auth` | Auth/keychain ops | `auth_command.rs` |
@@ -719,7 +719,7 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 - **CLI personal-agent scope trim (2026-08-28, 005-agentic-loop)**:
   - Removed 9 manual commands from CLI surface: `note`, `search`, `similar`, `notion`/`graph`, `research`, `ingest`, `routine`, `brief`, `dispatch`
   - Rationale: zen focuses on the personal memory/knowledge pipeline — these capabilities run internally via ZenScheduler workers + distill loop, not as manual commands; command files remain on disk uncompiled, restorable when business scenarios require
-  - Command count: 29 → 20 (9 removed; `zen loop` will make 21 when 005 lands)
+  - Command count: 29 → 20 (9 removed; 005's loop landed nested as `zen wiki loop` — no new top-level command)
 
 ## Skill routing
 

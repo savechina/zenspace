@@ -42,7 +42,6 @@ pub enum LoopCommands {
         /// - User impact: no files are moved, created, or archived; the
         ///   report shows what *would* happen.
         /// - Default: false (full mutations).
-        /// - Interaction: --dry-run overrides ZEN_LOOP_DRY_RUN env var.
         #[arg(long)]
         dry_run: bool,
 

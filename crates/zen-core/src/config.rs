@@ -419,7 +419,7 @@ pub struct AgenticConfig {
 /// Scope logic (Constitution XV):
 /// - Functionality: gates `ZenLoopWorker` cron registration and merge/distill tuning.
 /// - User impact: `enabled = false` makes the loop manual-only (`zen wiki loop run` still works).
-/// - Default: enabled=true, 5-min cron, merge threshold 0.62, pure-duplicate 0.98,
+/// - Default: enabled=true, 5-min cron, merge threshold 0.82, pure-duplicate 0.98,
 ///   max_attempts 3, min_free_bytes 100 MiB, host_sources empty (FR-033 off).
 /// - Interaction: `ZEN_LOOP_*` env vars override any config layer (5th layer).
 #[derive(Debug, Clone, Deserialize, Default)]
