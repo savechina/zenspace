@@ -258,6 +258,47 @@ fn loop_cycle_skips_commit_for_unrelated_workspace_repo() {
     );
 }
 
+/// T031 — FR-030 Stage 3a: a raw code source under vault/raw/ is routed
+/// through the graph Router & Join within the cycle; the persisted report
+/// must count it routed with at least one notion extracted (isolated
+/// ZEN_HOME temp dir).
+#[test]
+fn loop_routes_raw_sources_into_graph() {
+    let test = ZenTest::new();
+
+    let init = test.zen(&["workspace", "init"]);
+    assert!(init.success(), "workspace init failed: {}", init.stderr());
+
+    let raw_dir = test.cwd.join("vault").join("raw");
+    fs::create_dir_all(&raw_dir).expect("create vault/raw dir");
+    fs::write(raw_dir.join("handler.rs"), "pub fn main() {}\n").expect("seed raw source");
+
+    let run = test.zen(&["wiki", "loop", "run"]);
+    assert!(
+        run.success(),
+        "loop run failed:\nSTDOUT: {}\nSTDERR: {}",
+        run.stdout(),
+        run.stderr()
+    );
+
+    let logs = test.cwd.join(".zen").join("logs");
+    let report_path = if logs.exists() {
+        logs.join("loop-last-report.json")
+    } else {
+        test.cwd.join("logs").join("loop-last-report.json")
+    };
+    let raw = fs::read_to_string(&report_path).expect("loop-last-report.json persisted");
+    let report: serde_json::Value = serde_json::from_str(&raw).expect("parse cycle report");
+    assert!(
+        report["raw_sources_routed"].as_u64().unwrap_or(0) >= 1,
+        "raw_sources_routed must be >= 1, got: {report}"
+    );
+    assert!(
+        report["raw_notions_joined"].as_u64().unwrap_or(0) >= 1,
+        "raw_notions_joined must be >= 1, got: {report}"
+    );
+}
+
 fn find_files_recursively(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {

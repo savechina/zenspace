@@ -533,7 +533,8 @@ impl ZenWorker for ZenLoopWorker {
                 None
             }
         };
-        let pipeline = DistillationPipeline::new();
+        let pipeline =
+            DistillationPipeline::new().with_cas_commit(loop_cfg.cas_commit_or_default());
         // T033 (FR-032): per-cycle LoopBudget — constructs from config defaults
         // since LoopConfig doesn't expose max_steps/max_tokens fields yet.
         let mut budget = LoopBudget::default();
@@ -556,6 +557,11 @@ impl ZenWorker for ZenLoopWorker {
                 report.merged_count = outcome.report.merged_count;
                 report.archived_count = outcome.report.migrated_files.len();
                 report.pending_count = outcome.pending_count;
+                // T032/T033 (FR-031/FR-032): pipeline outcome bookkeeping —
+                // placeholder downgrades + CAS drift detection counters.
+                report.placeholder_downgrades = outcome.placeholder_downgrades;
+                report.cas_rolled_back = outcome.cas_rolled_back;
+                report.cas_drifted = outcome.cas_drifted;
                 gaps.extend(outcome.gaps);
             }
             Err(e) => {
@@ -564,6 +570,67 @@ impl ZenWorker for ZenLoopWorker {
                 report.gaps = gaps;
                 persist_report_and_audit(&paths, &logs_dir, &report).await?;
                 return Ok(worker_report(&report, started));
+            }
+        }
+
+        // ── Stage 3a: Raw source graph routing (T031, FR-030) ─────────────
+        // Code/paper sources under vault/raw/ bypass the md-note distill
+        // pipeline and route straight into the entity graph. DailyNote and
+        // Unknown tracks are skipped — md/txt already flow through distill,
+        // so routing them here would double-process. Warn-and-continue per
+        // file; a missing DB skips the whole stage.
+        if loop_cfg.raw_graph_routing_or_default() {
+            match db.as_ref() {
+                Some(db) => {
+                    let raw_dir = paths.vault().join("raw");
+                    let router =
+                        zen_vault::graph_router::GraphRouter::new(zen_vault::NotionService::new());
+                    let mut routed = 0usize;
+                    let mut joined = 0usize;
+                    if let Ok(entries) = std::fs::read_dir(&raw_dir) {
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let path = entry.path();
+                            if !path.is_file() {
+                                continue;
+                            }
+                            let content = match std::fs::read(&path) {
+                                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                                Err(e) => {
+                                    warn!(error = %e, path = %path.display(), "loop: raw source read failed");
+                                    continue;
+                                }
+                            };
+                            let track = zen_vault::graph_router::classify_source(&path, &content);
+                            if !matches!(
+                                track,
+                                zen_vault::graph_router::SourceTrack::Code
+                                    | zen_vault::graph_router::SourceTrack::Paper
+                            ) {
+                                continue;
+                            }
+                            match router
+                                .route_and_join(db, &path, &content, None, &report.cycle_id)
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    routed += 1;
+                                    joined += outcome.notions_extracted;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, path = %path.display(), "loop: raw source graph routing failed (continues)");
+                                }
+                            }
+                        }
+                    }
+                    if routed > 0 {
+                        info!(routed, joined, "loop: raw sources routed into graph");
+                    }
+                    report.raw_sources_routed = routed;
+                    report.raw_notions_joined = joined;
+                }
+                None => {
+                    warn!("loop: DB unavailable — skipping raw-source graph routing");
+                }
             }
         }
 
@@ -670,6 +737,31 @@ impl ZenWorker for ZenLoopWorker {
                     warn!(error = %e, slug = %slug.slug, "loop: hypothesis save failed");
                 }
             }
+            report.hypotheses_generated = slugs.len();
+
+            // FR-031a: declare this cycle's slugs as placeholder page slots
+            // (placeholders.json) so concurrent writers downgrade creates to
+            // updates. Persistence is best-effort; a corrupt registry starts
+            // fresh rather than blocking the cycle.
+            if !slugs.is_empty() {
+                let registry_path = paths.logs().join("placeholders.json");
+                let mut registry = match zen_vault::graph_verify::PlaceholderRegistry::load(
+                    &registry_path,
+                ) {
+                    Ok(registry) => registry,
+                    Err(e) => {
+                        warn!(error = %e, "loop: placeholder registry unreadable — starting fresh");
+                        zen_vault::graph_verify::PlaceholderRegistry::new()
+                    }
+                };
+                for slug in &slugs {
+                    registry.declare(&slug.slug, "zen-loop");
+                }
+                if let Err(e) = registry.save(&registry_path) {
+                    warn!(error = %e, path = %registry_path.display(), "loop: placeholder registry save failed (non-fatal)");
+                }
+            }
+
             if !slugs.is_empty() {
                 info!(
                     generated = slugs.len(),
@@ -682,6 +774,57 @@ impl ZenWorker for ZenLoopWorker {
                         .count(),
                     "loop: hypotheses generated from gaps"
                 );
+            }
+        }
+
+        // ── Stage 5c: Hypothesis refinement & reverify (T029, FR-028) ─────
+        // Refinement queue: every hypothesis slug on disk becomes external
+        // fetch prompts + precise user questions, persisted to logs/ so the
+        // operator (or a future host surface) can answer them between
+        // cycles. Then stale hypotheses (older than the configured window)
+        // transition via reverify. Both are best-effort.
+        if loop_cfg.hypothesis_refinement_or_default() {
+            let hypotheses_dir = paths.vault().join("wiki/wisdom/hypotheses");
+            let slugs = match zen_vault::distill::load_all(&hypotheses_dir) {
+                Ok(slugs) => slugs,
+                Err(e) => {
+                    warn!(error = %e, "loop: hypothesis load for refinement failed");
+                    Vec::new()
+                }
+            };
+            let (fetch_prompts, user_questions) =
+                zen_vault::distill::build_refinement_queue(&slugs);
+            report.refinement_fetch_prompts = fetch_prompts.len();
+            report.refinement_user_questions = user_questions.len();
+
+            let queue = serde_json::json!({
+                "cycle_id": report.cycle_id,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "fetch_prompts": fetch_prompts,
+                "user_questions": user_questions,
+            });
+            let queue_path = paths.logs().join("refinement-queue.json");
+            match serde_json::to_string_pretty(&queue)
+                .context("serializing refinement queue")
+                .and_then(|json| {
+                    std::fs::write(&queue_path, json)
+                        .with_context(|| format!("write {}", queue_path.display()))
+                }) {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!(error = %e, "loop: refinement queue persist failed (non-fatal)")
+                }
+            }
+
+            let wiki_dir = paths.vault().join("wiki");
+            match zen_vault::distill::reverify(
+                &hypotheses_dir,
+                &wiki_dir,
+                chrono::Utc::now(),
+                chrono::Duration::days(loop_cfg.reverify_older_than_days_or_default() as i64),
+            ) {
+                Ok(reverified) => report.hypotheses_reverified = reverified,
+                Err(e) => warn!(error = %e, "loop: hypothesis reverify failed (non-fatal)"),
             }
         }
 
