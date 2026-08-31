@@ -404,12 +404,21 @@ impl DistillationPipeline {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         let archive_dir = vault_root.join("archive");
-        let logs_dir = ZenPaths::detect()
+        let zen_paths = ZenPaths::detect();
+        let logs_dir = zen_paths
+            .as_ref()
             .map(|p| p.logs().to_path_buf())
             .unwrap_or_else(|_| vault_root.join("logs"));
-        let db = zen_repo::SqliteClient::open_lazy(&logs_dir.join("state.db"))
-            .await
-            .ok();
+        // Canonical DB — always <data>/state.db, the same file
+        // ZenLoopWorker, reindex, and FTS open. Opening a different path
+        // here would fork the entity graph by entry point (the worker's
+        // "same code path as `zen wiki distill`" contract, T008).
+        let db = match &zen_paths {
+            Ok(p) => zen_repo::SqliteClient::open_lazy(&p.data().join("state.db"))
+                .await
+                .ok(),
+            Err(_) => None,
+        };
         let outcome = self
             .run_scoped(
                 inbox_dir,
@@ -792,11 +801,14 @@ impl DistillationPipeline {
     /// T030 (FR-029): ORAV per-source verification loop.
     ///
     /// Observe → Reason → Act → Verify for a single source note:
-    /// - **Observe**: note content + extracted entity names + existing wiki entities
+    /// - **Observe**: note content + extracted entity names
     /// - **Reason**: diff (which entities/pages are new vs already present)
     /// - **Act**: normal pipeline already compiled this source; verify the output
-    /// - **Verify**: validate every wikilink/slug via `validate_slug`, run
-    ///   `ContradictionDetector` on proposed content vs existing pages
+    /// - **Verify**: validate every wikilink/slug via `validate_slug`;
+    ///   contradiction detection currently compares claims WITHIN the note
+    ///   only — cross-page comparison against the pre-cycle wiki snapshot
+    ///   is not wired yet (`_wiki_inventory` is the Phase-8 hook), so the
+    ///   contradiction leg only catches self-contradictory notes today.
     ///
     /// On Verify failure: retry IN-PLACE up to 2 times (drop the offending
     /// slug/claim, re-link, re-compile for that source). After 2 retries,
@@ -973,8 +985,8 @@ impl DistillationPipeline {
                 let source_content = std::fs::read_to_string(source).unwrap_or_default();
 
                 // Mechanical content absorption: append source body to target
-                // when it carries unique lines (deterministic; LLM assist is
-                // merge_llm_model, applied by the worker when configured).
+                // when it carries unique lines (deterministic; LLM assist via
+                // `merge_llm_model` is not yet wired — tracked by T046).
                 if plan.strategy == MergeStrategy::Merge {
                     let unique: Vec<&str> = source_content
                         .lines()

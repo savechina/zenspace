@@ -561,7 +561,6 @@ impl ZenWorker for ZenLoopWorker {
             Err(e) => {
                 report.outcome = Some(CycleOutcome::Failed);
                 report.last_error = Some(format!("distill stage: {e:#}"));
-                gaps.append(&mut report.gaps);
                 report.gaps = gaps;
                 persist_report_and_audit(&paths, &logs_dir, &report).await?;
                 return Ok(worker_report(&report, started));
@@ -665,7 +664,7 @@ impl ZenWorker for ZenLoopWorker {
         // repeated cycles converge instead of duplicating.
         {
             let hypotheses_dir = paths.vault().join("wiki/wisdom/hypotheses");
-            let slugs = zen_vault::distill::generate_from_gaps(&gaps, ctx.now);
+            let slugs = zen_vault::distill::generate_from_gaps(&gaps);
             for slug in &slugs {
                 if let Err(e) = zen_vault::distill::save(slug, &hypotheses_dir) {
                     warn!(error = %e, slug = %slug.slug, "loop: hypothesis save failed");
@@ -769,6 +768,22 @@ fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
         return;
     }
 
+    // Containment: only commit when zen-managed trees actually live inside
+    // this work tree. When they live elsewhere (e.g. workspace_root resolved
+    // to an unrelated source repo), `git add` would sweep that repo's own
+    // dirty state into a "loop:" commit — observed in the wild (T041).
+    let managed: Vec<PathBuf> = [paths.vault(), paths.logs(), paths.memory()]
+        .into_iter()
+        .filter(|p| p.starts_with(workspace_root))
+        .collect();
+    if managed.is_empty() {
+        debug!(
+            workspace = %workspace_root.display(),
+            "loop: vault/logs/memory outside work tree — skipping git commit"
+        );
+        return;
+    }
+
     let message = format!(
         "loop: {} notes={} pages={} merged={} quarantined={}",
         report.cycle_id,
@@ -778,11 +793,12 @@ fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
         report.quarantined_count
     );
 
-    let add = std::process::Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .args(["add", "-A"])
-        .output();
+    let mut add_cmd = std::process::Command::new("git");
+    add_cmd.arg("-C").arg(workspace_root).arg("add").arg("--");
+    for managed_path in &managed {
+        add_cmd.arg(managed_path);
+    }
+    let add = add_cmd.output();
     match add {
         Ok(out) if out.status.success() => {}
         Ok(out) => {

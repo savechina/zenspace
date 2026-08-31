@@ -364,11 +364,11 @@ fn extract_subject_from_hypothesis(h: &HypothesisSlug) -> String {
 /// let gaps = vec![
 ///     GapRecord::new(GapKind::OrphanEntity, "c1", "orphan: Foo").with_entity("Foo"),
 /// ];
-/// let hypotheses = generate_from_gaps(&gaps, Utc::now());
+/// let hypotheses = generate_from_gaps(&gaps);
 /// assert_eq!(hypotheses.len(), 1);
 /// assert_eq!(hypotheses[0].status, crate::distill::types::HypothesisStatus::Exploring);
 /// ```
-pub fn generate_from_gaps(gaps: &[GapRecord], _now: DateTime<Utc>) -> Vec<HypothesisSlug> {
+pub fn generate_from_gaps(gaps: &[GapRecord]) -> Vec<HypothesisSlug> {
     let mut seen_slugs = HashSet::new();
     let mut out = Vec::new();
 
@@ -1031,8 +1031,7 @@ mod tests {
         let gap1 = GapRecord::new(GapKind::OrphanEntity, "c1", "orphan: Foo").with_entity("Foo");
         let gap2 =
             GapRecord::new(GapKind::OrphanEntity, "c2", "orphan: Foo again").with_entity("Foo");
-        let now = Utc::now();
-        let hypotheses = generate_from_gaps(&[gap1, gap2], now);
+        let hypotheses = generate_from_gaps(&[gap1, gap2]);
         // Same entity → same slug → deduped to 1
         assert_eq!(hypotheses.len(), 1);
     }
@@ -1044,7 +1043,7 @@ mod tests {
             GapRecord::new(GapKind::LlmFailure, "c1", "llm failed"),
             GapRecord::new(GapKind::OrphanEntity, "c1", "orphan").with_entity("Bar"),
         ];
-        let hypotheses = generate_from_gaps(&gaps, Utc::now());
+        let hypotheses = generate_from_gaps(&gaps);
         assert_eq!(hypotheses.len(), 1);
         assert_eq!(hypotheses[0].gap_kind, GapKind::OrphanEntity);
     }
@@ -1055,7 +1054,7 @@ mod tests {
             .with_path("decisions/q3.md")
             .with_entity("Q3 Plan");
         let expected_from = gap.id.clone();
-        let hypotheses = generate_from_gaps(&[gap], Utc::now());
+        let hypotheses = generate_from_gaps(&[gap]);
         assert_eq!(hypotheses.len(), 1);
         assert!(hypotheses[0].exploration_prompt.is_some());
         assert_eq!(hypotheses[0].evidence_refs, vec!["decisions/q3.md"]);
