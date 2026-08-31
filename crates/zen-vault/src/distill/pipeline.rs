@@ -17,9 +17,11 @@ use super::notion_extraction::NotionExtractor;
 use super::recovery::RecoveryManager;
 use super::stages::LlmDistillStage;
 use super::transaction::TransactionScope;
+use super::transaction::VersionSnapshot;
 use super::types::{GapKind, GapRecord, LoopBudget, VerificationNode};
 use super::wiki_compile::WikiCompiler;
 use crate::graph_router::validate_slug;
+use crate::graph_verify::PlaceholderRegistry;
 use crate::notion::service::NotionService;
 
 use crate::note::{Note, parse_frontmatter};
@@ -59,6 +61,15 @@ pub struct ScopedRunOutcome {
     pub pending_count: usize,
     /// Gaps emitted during this cycle (ORAV failures, budget deferrals).
     pub gaps: Vec<GapRecord>,
+    /// Page creates downgraded to updates via PlaceholderRegistry (T032, FR-031).
+    pub placeholder_downgrades: usize,
+    /// True when CAS drift rolled back the cycle's tracked writes (T033, FR-032).
+    pub cas_rolled_back: bool,
+    /// Paths that drifted outside the cycle's VersionSnapshot (T033, FR-032).
+    pub cas_drifted: Vec<String>,
+    /// Inbox sources archived this cycle whose removal was deferred to the
+    /// CAS commit point (FR-032). Empty when CAS was inactive.
+    pub deferred_sources: Vec<PathBuf>,
 }
 
 /// Scan content for known entity names and wrap them in `[[wikilinks]]`
@@ -279,13 +290,16 @@ pub fn append_provenance(raw: &str, pairs: &[(&str, String)]) -> String {
 /// T005: archive processed inbox notes to `vault/archive/<yyyy-mm>/` with
 /// provenance frontmatter (FR-006/007). Returns (source, dest) pairs.
 ///
-/// Replaces the old wiki-tree move: raw notes leave the inbox but never
-/// enter the wiki domain dirs; the inbox is empty after a Completed cycle.
+/// With `defer_source_removal` (FR-032 CAS) the inbox source is left in place
+/// as rollback insurance; `run_scoped` removes it after a clean conditional
+/// commit. Replaces the old wiki-tree move: raw notes leave the inbox but
+/// never enter the wiki domain dirs; the inbox is empty after a Completed cycle.
 fn archive_processed_notes(
     notes: &[Note],
     archive_dir: &Path,
     cycle_id: &str,
     track: &TransactionScope,
+    defer_source_removal: bool,
 ) -> Vec<(PathBuf, PathBuf)> {
     let mut archived = Vec::new();
 
@@ -339,7 +353,12 @@ fn archive_processed_notes(
             ],
         );
 
-        match std::fs::write(&dest, provenance).and_then(|_| std::fs::remove_file(&source)) {
+        let write_result = if defer_source_removal {
+            std::fs::write(&dest, provenance)
+        } else {
+            std::fs::write(&dest, provenance).and_then(|_| std::fs::remove_file(&source))
+        };
+        match write_result {
             Ok(()) => {
                 if let Err(e) = track.track_path(&dest) {
                     tracing::warn!(dest = %dest.display(), error = %e, "Failed to track archived file");
@@ -374,6 +393,10 @@ pub struct DistillationPipeline {
     notion_service: NotionService,
     /// Optional LLM model for FR-003 enrichment. `None` → heuristic only.
     llm_model: Option<String>,
+    /// FR-032 OCC/CAS gate: snapshot the wiki dir before stages and commit
+    /// via `commit_conditional`, rolling back tracked writes on drift.
+    /// `false` restores plain `txn.commit()` (source removal not deferred).
+    cas_commit: bool,
 }
 
 impl DistillationPipeline {
@@ -385,6 +408,7 @@ impl DistillationPipeline {
             detector: ContradictionDetector::new(),
             notion_service: NotionService::new(),
             llm_model: None,
+            cas_commit: true,
         }
     }
 
@@ -392,6 +416,16 @@ impl DistillationPipeline {
     /// the LLM path; `None` (default) disables it.
     pub fn with_llm_model(mut self, model: String) -> Self {
         self.llm_model = Some(model);
+        self
+    }
+
+    /// Enable/disable FR-032 OCC/CAS conditional commits. `true` (default)
+    /// snapshots the wiki dir each `run_scoped` cycle and rolls back every
+    /// tracked write on drift; `false` keeps today's plain-commit behavior.
+    /// The manual `run()` path overrides this from
+    /// `LoopConfig::cas_commit_or_default()`.
+    pub fn with_cas_commit(mut self, cas_commit: bool) -> Self {
+        self.cas_commit = cas_commit;
         self
     }
 
@@ -419,14 +453,21 @@ impl DistillationPipeline {
                 .ok(),
             Err(_) => None,
         };
+        // FR-032: the manual path resolves its CAS gate from config (same knob
+        // the worker exposes), defaulting to enabled when config is unreadable.
+        let cas_commit = match zen_core::config::load_config() {
+            Ok(cfg) => cfg.agentic.loop_cfg.cas_commit_or_default(),
+            Err(_) => true,
+        };
         let outcome = self
-            .run_scoped(
+            .run_scoped_inner(
                 inbox_dir,
                 wiki_dir,
                 &archive_dir,
                 &logs_dir,
                 db.as_ref(),
                 None,
+                cas_commit,
             )
             .await?;
         Ok(outcome.report)
@@ -438,6 +479,10 @@ impl DistillationPipeline {
     /// T007 checkpoint gate → load → T004 normalize → extract →
     /// T003 NotionService persist → auto-link → compile → contradictions →
     /// T005 archive, with T006 TransactionScope around mutations.
+    ///
+    /// The CAS gate follows the pipeline's `cas_commit` field (`true` by
+    /// default, [`Self::with_cas_commit`]); the manual [`Self::run`] path
+    /// resolves it from `LoopConfig::cas_commit_or_default()` instead.
     pub async fn run_scoped(
         &self,
         inbox_dir: &Path,
@@ -446,6 +491,30 @@ impl DistillationPipeline {
         logs_dir: &Path,
         db: Option<&zen_repo::SqliteClient>,
         budget: Option<&mut LoopBudget>,
+    ) -> Result<ScopedRunOutcome> {
+        self.run_scoped_inner(
+            inbox_dir,
+            wiki_dir,
+            archive_dir,
+            logs_dir,
+            db,
+            budget,
+            self.cas_commit,
+        )
+        .await
+    }
+
+    /// `run_scoped` body with the CAS gate injected by the caller.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scoped_inner(
+        &self,
+        inbox_dir: &Path,
+        wiki_dir: &Path,
+        archive_dir: &Path,
+        logs_dir: &Path,
+        db: Option<&zen_repo::SqliteClient>,
+        budget: Option<&mut LoopBudget>,
+        cas_commit: bool,
     ) -> Result<ScopedRunOutcome> {
         // T007: pre-cycle gate — recover-or-restart on a prior crashed cycle.
         let recovery = RecoveryManager::new(logs_dir);
@@ -466,6 +535,49 @@ impl DistillationPipeline {
 
         let txn = TransactionScope::new(&format!("distill-{cycle_id}"));
         txn.begin()?;
+
+        // FR-031b: consult the placeholder registry so page creates whose
+        // slugs were reserved during Agent planning are recorded this cycle.
+        // Missing file → empty registry; corrupt file → fresh (non-fatal).
+        let placeholders_path = logs_dir.join("placeholders.json");
+        let mut registry = match PlaceholderRegistry::load(&placeholders_path) {
+            Ok(reg) => reg,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to load placeholder registry — continuing with a fresh one"
+                );
+                PlaceholderRegistry::new()
+            }
+        };
+        let mut registry_dirty = false;
+
+        // FR-032 (T033): capture the wiki working set BEFORE any stage runs so
+        // the cycle can commit conditionally. Empty inventory (or a missing
+        // wiki dir) → no snapshot → CAS skipped for this cycle.
+        let snapshot = if cas_commit && wiki_dir.is_dir() {
+            let wiki_paths: Vec<PathBuf> = crate::graph_verify::wiki_page_inventory(wiki_dir)
+                .into_iter()
+                .map(|(_, rel)| wiki_dir.join(rel))
+                .collect();
+            if wiki_paths.is_empty() {
+                None
+            } else {
+                match VersionSnapshot::capture(&wiki_paths) {
+                    Ok(snap) => Some(snap),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to capture wiki version snapshot — CAS skipped this cycle"
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         let run = self.run_stages(
             inbox_dir,
             wiki_dir,
@@ -474,15 +586,80 @@ impl DistillationPipeline {
             &txn,
             &cycle_id,
             budget,
+            snapshot.is_some(),
+            &mut registry,
+            &mut registry_dirty,
         );
         match run.await {
-            Ok(outcome) => {
-                txn.commit()?;
-                checkpoints.write_checkpoint(&Checkpoint {
-                    status: "completed".to_string(),
-                    started_at: chrono::Utc::now().to_rfc3339(),
-                    notes_count: outcome.report.notes_processed,
-                })?;
+            Ok(mut outcome) => {
+                // FR-032 (T033): self-write-aware OCC. The snapshot covers
+                // pre-existing wiki pages; this cycle's own rewrites (merges,
+                // link rewrites, regenerated index/log) are txn-tracked and
+                // expected — only drift on paths we did NOT write counts as
+                // external interference and forces a rollback.
+                let committed = if let Some(snapshot) = &snapshot {
+                    let tracked: std::collections::HashSet<PathBuf> =
+                        txn.tracked_paths().into_iter().collect();
+                    match snapshot.verify() {
+                        Ok(drift) => {
+                            let external: Vec<PathBuf> =
+                                drift.into_iter().filter(|p| !tracked.contains(p)).collect();
+                            if external.is_empty() {
+                                // Clean cycle — reap the inbox sources whose
+                                // removal was deferred past the drift window.
+                                for src in &outcome.deferred_sources {
+                                    if let Err(e) = std::fs::remove_file(src) {
+                                        warn!(
+                                            source = %src.display(),
+                                            error = %e,
+                                            "Failed to remove deferred inbox source"
+                                        );
+                                    }
+                                }
+                                txn.commit()?;
+                                true
+                            } else {
+                                // Rollback deletes the tracked outputs (wiki
+                                // pages + archive dests); inbox sources are
+                                // intact because removal was deferred — zero
+                                // data loss, the next cycle reprocesses them.
+                                warn!(
+                                    drifted = ?external,
+                                    "CAS drift detected — cycle rolled back, checkpoint skipped"
+                                );
+                                if let Err(rb) = txn.rollback() {
+                                    tracing::warn!(
+                                        error = %rb,
+                                        "Transaction rollback itself failed"
+                                    );
+                                }
+                                outcome.cas_rolled_back = true;
+                                outcome.cas_drifted =
+                                    external.iter().map(|p| p.display().to_string()).collect();
+                                false
+                            }
+                        }
+                        Err(e) => {
+                            if let Err(rb) = txn.rollback() {
+                                tracing::warn!(error = %rb, "Transaction rollback itself failed");
+                            }
+                            return Err(e.context("CAS snapshot verification failed"));
+                        }
+                    }
+                } else {
+                    txn.commit()?;
+                    true
+                };
+                if committed {
+                    checkpoints.write_checkpoint(&Checkpoint {
+                        status: "completed".to_string(),
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        notes_count: outcome.report.notes_processed,
+                    })?;
+                }
+                if registry_dirty && let Err(e) = registry.save(&placeholders_path) {
+                    warn!(error = %e, "Failed to save placeholder registry");
+                }
                 Ok(outcome)
             }
             Err(e) => {
@@ -504,6 +681,9 @@ impl DistillationPipeline {
         txn: &TransactionScope,
         cycle_id: &str,
         mut budget: Option<&mut LoopBudget>,
+        defer_source_removal: bool,
+        registry: &mut PlaceholderRegistry,
+        registry_dirty: &mut bool,
     ) -> Result<ScopedRunOutcome> {
         let mut notes = self.load_notes(inbox_dir)?;
         // FR-012: configurable skip by extension from LoopConfig
@@ -664,11 +844,42 @@ impl DistillationPipeline {
             })
             .collect();
 
+        // FR-031b: pages already on disk before compile are updates; only NEW
+        // page paths consult the placeholder registry for create-downgrades.
+        let pre_compile_pages: HashSet<PathBuf> =
+            crate::graph_verify::wiki_page_inventory(wiki_dir)
+                .into_iter()
+                .map(|(_, rel)| wiki_dir.join(rel))
+                .collect();
+
         let pages = self.compiler.compile(&linked_notes, wiki_dir)?;
+        // The compiler also regenerates `log.md` and (when pages exist)
+        // `index.md` — track them so CAS self-write filtering sees them and
+        // rollback can clean them up like any other cycle output.
+        txn.track_path(&wiki_dir.join("log.md")).ok();
+        txn.track_path(&wiki_dir.join("index.md")).ok();
         let wiki_pages_created = pages.len();
+        let mut placeholder_downgrades = 0usize;
         for page in &pages {
-            if let Some(path) = page_file_path(page) {
-                txn.track_path(&path)?;
+            // Track the FULL path — rollback (incl. CAS drift rollback) can
+            // only clean up files it can resolve; page.path is wiki-relative.
+            let full_path = wiki_dir.join(&page.path);
+            txn.track_path(&full_path)?;
+            // FR-031b: slug = page file stem (slugify convention). A slug
+            // reserved in the registry downgrades this create to an update —
+            // the page is still written (single-writer create-as-update) and
+            // the slot advances to Merged.
+            let slug = full_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !pre_compile_pages.contains(&full_path) && registry.downgrade_to_update(&slug) {
+                placeholder_downgrades += 1;
+                info!(slug = %slug, "FR-031b: placeholder create downgraded to update");
+            }
+            if registry.lookup(&slug).is_some() {
+                registry.merge(&slug);
+                *registry_dirty = true;
             }
         }
         if wiki_pages_created > 0 {
@@ -762,7 +973,20 @@ impl DistillationPipeline {
                     .unwrap_or(true)
             })
             .collect();
-        let archived = archive_processed_notes(&notes_to_archive, archive_dir, cycle_id, txn);
+        let archived = archive_processed_notes(
+            &notes_to_archive,
+            archive_dir,
+            cycle_id,
+            txn,
+            defer_source_removal,
+        );
+        // FR-032: under CAS the inbox sources stay in place as rollback
+        // insurance; run_scoped removes them only after a clean commit.
+        let deferred_sources = if defer_source_removal {
+            archived.iter().map(|(src, _)| src.clone()).collect()
+        } else {
+            Vec::new()
+        };
 
         // Collect ORAV gap records for the worker's gap persistence layer.
         let mut gaps: Vec<GapRecord> = Vec::new();
@@ -795,6 +1019,10 @@ impl DistillationPipeline {
             verifications,
             pending_count: pending_notes.len(),
             gaps,
+            placeholder_downgrades,
+            cas_rolled_back: false,
+            cas_drifted: Vec::new(),
+            deferred_sources,
         })
     }
 
@@ -1136,10 +1364,6 @@ impl DistillationPipeline {
     }
 }
 
-fn page_file_path(page: &WikiPage) -> Option<PathBuf> {
-    Some(page.path.clone())
-}
-
 impl Default for DistillationPipeline {
     fn default() -> Self {
         Self::new()
@@ -1297,7 +1521,7 @@ impl Workflow for DistillationPipeline {
             txn.begin()
                 .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
             let cycle_id = uuid::Uuid::now_v7().to_string();
-            let archived = archive_processed_notes(&notes, &archive_dir, &cycle_id, &txn);
+            let archived = archive_processed_notes(&notes, &archive_dir, &cycle_id, &txn, false);
             txn.commit()
                 .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
             archived
@@ -1352,6 +1576,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::distill::types::PlaceholderStatus;
 
     fn create_test_note(id: &str, content: &str) -> String {
         format!(
@@ -1374,13 +1599,22 @@ updated_at: "2026-05-23T15:00:00+00:00"
         inbox: &Path,
         wiki: &Path,
     ) -> Result<DistillationReport> {
+        Ok(run_isolated_outcome(pipeline, inbox, wiki).await?.report)
+    }
+
+    /// Like `run_isolated` but returns the full [`ScopedRunOutcome`] so tests
+    /// can assert CAS/placeholder fields.
+    async fn run_isolated_outcome(
+        pipeline: &DistillationPipeline,
+        inbox: &Path,
+        wiki: &Path,
+    ) -> Result<ScopedRunOutcome> {
         let root = wiki.parent().unwrap_or(wiki);
         let archive = root.join("archive");
         let logs = root.join("logs");
-        let outcome = pipeline
+        pipeline
             .run_scoped(inbox, wiki, &archive, &logs, None, None)
-            .await?;
-        Ok(outcome.report)
+            .await
     }
 
     #[tokio::test]
@@ -1673,7 +1907,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         }];
 
         let txn = archive_test_txn(&logs_dir);
-        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-1", &txn);
+        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-1", &txn, false);
 
         assert_eq!(archived.len(), 1);
         let (src, dst) = &archived[0];
@@ -1725,7 +1959,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         ];
 
         let txn = archive_test_txn(&logs_dir);
-        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-2", &txn);
+        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-2", &txn, false);
 
         assert_eq!(archived.len(), 2);
         assert!(!s1.exists());
@@ -1764,7 +1998,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         }];
 
         let txn = archive_test_txn(&logs_dir);
-        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-3", &txn);
+        let archived = archive_processed_notes(&notes, &archive_dir, "cycle-3", &txn, false);
 
         assert_eq!(archived.len(), 1);
         let (_, dst) = &archived[0];
@@ -1811,5 +2045,182 @@ updated_at: "2026-05-23T15:00:00+00:00"
     fn test_append_provenance_prepends_when_missing() {
         let out = append_provenance("no frontmatter here", &[("cycle_id", "c9".into())]);
         assert!(out.starts_with("---\ncycle_id: \"c9\"\n---\n"));
+    }
+
+    // ── FR-032 CAS commit + FR-031b placeholder consult ────────────────
+
+    const RUST_NOTE: &str = "# Rust Project\n\nI love using Rust and Tokio for async programming.";
+
+    /// FR-032 happy path: with CAS on (default) the inbox source removal is
+    /// deferred past `commit_conditional` — a clean commit reaps it and the
+    /// archive dest + compiled wiki page survive.
+    #[tokio::test]
+    async fn test_cas_clean_commit_removes_deferred_source() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir(&wiki_dir).unwrap();
+        // Non-empty wiki inventory so the VersionSnapshot is captured.
+        fs::write(wiki_dir.join("seed.md"), "# Seed\n\nAnchor page for CAS.").unwrap();
+
+        let source = inbox_dir.join("note1.md");
+        fs::write(&source, create_test_note("note-1", RUST_NOTE)).unwrap();
+
+        let pipeline = DistillationPipeline::new();
+        let outcome = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+
+        assert!(!outcome.cas_rolled_back);
+        assert!(outcome.cas_drifted.is_empty());
+        assert_eq!(outcome.report.notes_processed, 1);
+
+        // Deferral did not break the flow: source removed only AFTER commit.
+        assert!(!source.exists(), "inbox source must be removed post-commit");
+        let dest = &outcome.report.migrated_files[0].1;
+        assert!(dest.exists(), "archive dest must exist");
+        assert!(
+            wiki_dir.join("notions/technology/rust-project.md").exists(),
+            "compiled page must survive the conditional commit"
+        );
+    }
+
+    /// FR-032 regression guard: CAS off restores today's behavior — source is
+    /// removed during the archive stage, no deferral, no rollback.
+    #[tokio::test]
+    async fn test_cas_off_removes_source_during_archive_stage() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir(&wiki_dir).unwrap();
+        fs::write(wiki_dir.join("seed.md"), "# Seed").unwrap();
+
+        let source = inbox_dir.join("note1.md");
+        fs::write(&source, create_test_note("note-1", RUST_NOTE)).unwrap();
+
+        let pipeline = DistillationPipeline::new().with_cas_commit(false);
+        let outcome = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+
+        assert!(!outcome.cas_rolled_back);
+        assert!(outcome.deferred_sources.is_empty());
+        assert!(!source.exists(), "CAS off: source removed in-stage");
+        assert!(outcome.report.migrated_files[0].1.exists());
+    }
+
+    /// FR-031b: a slug reserved in placeholders.json downgrades the page
+    /// create to an update (page still written), and the saved registry
+    /// shows the slot advanced to Merged.
+    #[tokio::test]
+    async fn test_placeholder_downgrade_recorded_and_merged() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+
+        fs::write(
+            inbox_dir.join("note1.md"),
+            create_test_note("note-1", RUST_NOTE),
+        )
+        .unwrap();
+
+        // Pre-declare the slug this note compiles to ("rust-project": title
+        // "Rust Project" → slugify → notions/technology/rust-project.md).
+        let logs_dir = tmp.path().join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let placeholders_path = logs_dir.join("placeholders.json");
+        let mut reg = PlaceholderRegistry::new();
+        reg.declare("rust-project", "agent-a");
+        reg.save(&placeholders_path).unwrap();
+
+        let pipeline = DistillationPipeline::new();
+        let outcome = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.placeholder_downgrades >= 1,
+            "reserved slug create must be recorded as a downgrade"
+        );
+        assert!(
+            wiki_dir.join("notions/technology/rust-project.md").exists(),
+            "page still created (create-as-update semantics)"
+        );
+
+        let reloaded = PlaceholderRegistry::load(&placeholders_path).unwrap();
+        assert_eq!(
+            reloaded.lookup("rust-project").unwrap().status,
+            PlaceholderStatus::Merged,
+            "saved registry must show the slot merged"
+        );
+    }
+
+    /// FR-032 self-write awareness: the compiler regenerates `index.md` and
+    /// `log.md` every cycle, so from cycle 2 on those churn files sit inside
+    /// the snapshot scope. Txn-tracked self-writes must NOT count as drift —
+    /// otherwise every writing cycle rolls back (livelock).
+    #[tokio::test]
+    async fn test_cas_self_writes_do_not_roll_back() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir(&wiki_dir).unwrap();
+        fs::write(wiki_dir.join("seed.md"), "# Seed").unwrap();
+        fs::write(wiki_dir.join("index.md"), "# Index\n\n- stale entry\n").unwrap();
+        fs::write(wiki_dir.join("log.md"), "# Log\n\nold-cycle entry\n").unwrap();
+
+        let source = inbox_dir.join("note1.md");
+        fs::write(&source, create_test_note("note-1", RUST_NOTE)).unwrap();
+
+        let pipeline = DistillationPipeline::new();
+        let outcome = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+
+        assert!(
+            !outcome.cas_rolled_back,
+            "self-writes (index/log regeneration) must not trigger CAS rollback"
+        );
+        assert!(outcome.cas_drifted.is_empty());
+        assert!(!source.exists(), "clean commit reaps the deferred source");
+    }
+
+    /// FR-032 drift: an external edit inside the snapshot window forces
+    /// `commit_conditional` to roll back every tracked output while the
+    /// drifted (non-tracked) wiki file stays intact.
+    #[test]
+    fn test_cas_drift_rolls_back_tracked_outputs() {
+        let tmp = tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        let wiki_page = wiki.join("rust.md");
+        fs::write(&wiki_page, "# Rust\n\noriginal").unwrap();
+
+        let txn = TransactionScope::new("cas-drift-pipeline-test");
+        txn.begin().unwrap();
+        // Tracked cycle output (archive dest analogue).
+        let tracked_output = tmp.path().join("archive").join("dest.md");
+        fs::create_dir_all(tracked_output.parent().unwrap()).unwrap();
+        fs::write(&tracked_output, "compiled").unwrap();
+        txn.track_path(&tracked_output).unwrap();
+
+        let snapshot = VersionSnapshot::capture(std::slice::from_ref(&wiki_page)).unwrap();
+        // External modification between capture and commit → drift.
+        fs::write(&wiki_page, "# Rust\n\nexternal edit").unwrap();
+
+        match txn.commit_conditional(&snapshot).unwrap() {
+            crate::distill::transaction::CasCommitOutcome::RolledBack { drifted } => {
+                assert_eq!(drifted, vec![wiki_page.clone()]);
+            }
+            crate::distill::transaction::CasCommitOutcome::Committed => {
+                panic!("external edit must force rollback")
+            }
+        }
+        assert!(!tracked_output.exists(), "rollback deletes tracked outputs");
+        assert!(wiki_page.exists(), "drifted wiki file stays intact");
     }
 }

@@ -248,6 +248,23 @@ impl TransactionScope {
         Ok(())
     }
 
+    /// Paths recorded so far in this transaction, parsed from the tracking
+    /// file (empty before `begin` and after commit/rollback). Callers use
+    /// this to distinguish self-writes from external drift when gating a
+    /// commit on a [`VersionSnapshot`].
+    pub fn tracked_paths(&self) -> Vec<PathBuf> {
+        fs::read_to_string(&self.tracking_file)
+            .map(|content| {
+                content
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Commit the transaction by deleting the tracking file.
     pub fn commit(&self) -> Result<()> {
         if self.tracking_file.exists() {
