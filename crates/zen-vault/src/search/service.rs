@@ -90,7 +90,7 @@ impl SearchService {
                 .await
                 .map(|graphs| graphs.into_iter().map(graph_to_search).collect()),
             5 => {
-                let context = self
+                let mut context = self
                     .tier2
                     .search_in_dir(client, query, base_dir, limit)
                     .await
@@ -103,6 +103,22 @@ impl SearchService {
                             })
                             .collect::<Vec<_>>()
                     })?;
+                // FR-031 Sub-graph Synthesis RAG: prepend the N-hop entity
+                // neighborhood so synthesis reasons over the local graph
+                // structure, not just Top-K text hits. No matching entity →
+                // empty subgraph → no injection.
+                if let Ok(subgraph) = Tier4Search::subgraph_synthesis(client, query, 2).await
+                    && subgraph.nodes.len() > 1
+                {
+                    context.insert(
+                        0,
+                        SearchResult {
+                            file: PathBuf::from(format!("@subgraph:{}", subgraph.center)),
+                            line: 0,
+                            content: subgraph.render(),
+                        },
+                    );
+                }
                 Ok(match self.tier5.synthesize(query, &context) {
                     Ok(synthesized) => vec![SearchResult {
                         file: PathBuf::from("synthesis"),
