@@ -720,6 +720,12 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
   - Removed 9 manual commands from CLI surface: `note`, `search`, `similar`, `notion`/`graph`, `research`, `ingest`, `routine`, `brief`, `dispatch`
   - Rationale: zen focuses on the personal memory/knowledge pipeline — these capabilities run internally via ZenScheduler workers + distill loop, not as manual commands; command files remain on disk uncompiled, restorable when business scenarios require
   - Command count: 29 → 20 (9 removed; 005's loop landed nested as `zen wiki loop` — no new top-level command)
+- **Phase 8 wiring (2026-09-01, 005-agentic-loop)** — deferred library surfaces went live, no CLI-surface change:
+  - FR-028: ZenLoopWorker Stage 5c — refinement queue persisted to `logs/refinement-queue.json`, hypothesis re-verify on `reverify_older_than_days` (default 7)
+  - FR-030: Stage 3a — `vault/raw/` Code/Paper sources routed through `GraphRouter::route_and_join` each cycle (`raw_graph_routing`, default on); host-source `worker_type` awaits FR-033 (T043/T044)
+  - FR-031: Stage 5b declares hypothesis slugs into `logs/placeholders.json`; distill compile downgrades reserved creates to updates (report field `placeholder_downgrades`) and merges slots; tier-5 synthesis prepends a 2-hop `SubgraphContext` render (`@subgraph:` result)
+  - FR-032: self-write-aware OCC in `run_scoped` (`cas_commit`, default on) — pre-cycle `VersionSnapshot`, inbox-source removal deferred past the drift window, commit gated on EXTERNAL drift only (drift minus txn-tracked self-writes; raw `commit_conditional` counts self-writes as drift and would livelock every writing cycle — it stays the library primitive for scopes without self-writes); rolled-back cycles report `cas_rolled_back`/`cas_drifted` and skip the checkpoint; `log.md`/`index.md` churn is txn-tracked
+  - New `[agentic.loop]` config keys (all default-on/7, 5-layer inherited): `hypothesis_refinement`, `reverify_older_than_days`, `raw_graph_routing`, `cas_commit`
 
 ## Skill routing
 
