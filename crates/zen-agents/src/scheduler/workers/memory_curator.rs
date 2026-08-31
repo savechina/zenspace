@@ -89,10 +89,16 @@ impl ZenWorker for MemoryCurator {
 
             match extract_signals_from_journal(&path) {
                 Ok(signals) => {
+                    // Marker only when BOTH extraction passes succeed — a
+                    // failed typed extraction must retry next cycle, not be
+                    // skipped forever.
                     match extract_typed_signals_from_journal(&path) {
-                        Ok(typed) => typed_all.extend(typed),
+                        Ok(typed) => {
+                            typed_all.extend(typed);
+                            to_mark.push(path.clone());
+                        }
                         Err(e) => {
-                            warn!(path = %path.display(), error = %e, "failed to extract typed signals from journal entry");
+                            warn!(path = %path.display(), error = %e, "typed signal extraction failed; journal stays unmarked for retry");
                         }
                     }
                     debug!(
@@ -105,7 +111,6 @@ impl ZenWorker for MemoryCurator {
                     all_signals.facts.extend(signals.facts);
                     all_signals.reflections.extend(signals.reflections);
                     all_signals.commitments.extend(signals.commitments);
-                    to_mark.push(path);
                 }
                 Err(e) => {
                     warn!(path = %path.display(), error = %e, "failed to extract signals from journal entry");

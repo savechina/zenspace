@@ -2,10 +2,10 @@
 ///
 /// ## Scope Logic
 ///
-/// **Functionality**: When `LoopConfig::merge_llm_model` is `Some(model)`, attempts
-/// LLM-based notion enrichment via `zen_provider::DefaultRouter`. If the router
-/// is unavailable, the model is not configured, or the budget is exceeded, falls
-/// back to the deterministic `NotionExtractor` heuristic.
+/// **Functionality**: STUB (T046 pending) — when a model is configured the
+/// stage currently logs the intent and falls through to the deterministic
+/// `NotionExtractor` heuristic; `zen_provider::DefaultRouter` routing is not
+/// yet wired. The `merge_llm_model` config knob is parsed but not yet consumed.
 ///
 /// **User impact**: Notes with an LLM-capable model configured get richer notion
 /// extraction (confidence-scored, relation-aware). Without LLM config, the system
@@ -16,7 +16,7 @@
 /// **Interaction**: Token consumption is bounded by `LoopBudget::consume_tokens`.
 /// Once over budget, the stage short-circuits to heuristic for all remaining notes.
 use anyhow::Result;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::super::notion_extraction::NotionExtractor;
 use super::super::types::LoopBudget;
@@ -74,46 +74,22 @@ impl LlmDistillStage {
             "LlmDistillStage: attempting LLM enrichment"
         );
 
-        // Phase 2: Estimate budget. Rough heuristic: ~500 tokens per note
-        // for LLM context (prompt + completion).
-        let estimate = (notes.len() as u32) * 500;
-        if !self.budget.consume_tokens(estimate) {
-            warn!(
-                estimated = estimate,
-                remaining = self
-                    .budget
-                    .max_tokens
-                    .saturating_sub(self.budget.consumed_tokens),
-                "LlmDistillStage: budget exceeded, falling back to heuristic"
-            );
-            let notions = self.extractor.extract_batch(notes)?;
-            return Ok((notions, 0));
-        }
-
-        // Phase 3: LLM call stub — route through DefaultRouter when wired.
-        // For now, log the intent and fall through to heuristic.
-        //
-        // Future integration (FR-003 follow-up):
-        //   let router = zen_provider::DefaultRouter::new();
-        //   for note in notes {
-        //       let prompt = build_distill_prompt(note);
-        //       let response = router.complete(&model, &prompt, Sensitivity::Public)?;
-        //       notions.extend(parse_llm_notions(&response)?);
-        //   }
+        // Phase 2/3: LLM call stub (T046 pending). No LLM work is performed,
+        // so no tokens are consumed or reported — reporting the estimate
+        // would be fictional accounting. zen_provider routing lands with T046.
         debug!(
             model = %model,
-            tokens_budgeted = estimate,
-            "LlmDistillStage: LLM stub — defaulting to heuristic extraction"
+            notes_count = notes.len(),
+            "LlmDistillStage: LLM stub — heuristic extraction, 0 tokens"
         );
 
         let notions = self.extractor.extract_batch(notes)?;
         info!(
             notions_extracted = notions.len(),
-            tokens_consumed = estimate,
             "LlmDistillStage: distillation complete (heuristic path)"
         );
 
-        Ok((notions, estimate))
+        Ok((notions, 0))
     }
 }
 
@@ -143,25 +119,15 @@ mod tests {
     }
 
     #[test]
-    fn over_budget_falls_back_to_heuristic() {
-        let budget = LoopBudget {
-            max_tokens: 10, // very low ceiling
-            ..Default::default()
-        };
-        let mut stage = LlmDistillStage::new(budget, Some("test:model".into()));
-        let notes = vec![sample_note("Building with TypeScript and React")];
-        let (notions, cost) = stage.distill_with_fallback(&notes).unwrap();
-        assert_eq!(cost, 0, "over-budget should consume zero additional tokens");
-        assert!(!notions.is_empty());
-    }
-
-    #[test]
     fn stub_model_uses_heuristic_path() {
         let budget = LoopBudget::default();
         let mut stage = LlmDistillStage::new(budget, Some("openai:gpt-4o".into()));
         let notes = vec![sample_note("Exploring WASM and Docker containers")];
         let (notions, cost) = stage.distill_with_fallback(&notes).unwrap();
-        assert!(cost > 0, "in-budget stub should consume estimated tokens");
+        assert_eq!(
+            cost, 0,
+            "stub performs no LLM work, must report zero tokens"
+        );
         assert!(!notions.is_empty());
     }
 }
