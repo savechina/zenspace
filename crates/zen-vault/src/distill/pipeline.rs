@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -7,15 +8,18 @@ use rig_compose::context::InvestigationContext;
 use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::Skill;
 use rig_compose::workflow::Workflow;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::checkpoint::Checkpoint;
-use super::contradiction::ContradictionDetector;
 use super::checkpoint::CheckpointManager;
+use super::contradiction::ContradictionDetector;
 use super::notion_extraction::NotionExtractor;
 use super::recovery::RecoveryManager;
+use super::stages::LlmDistillStage;
 use super::transaction::TransactionScope;
+use super::types::{GapKind, GapRecord, LoopBudget, VerificationNode};
 use super::wiki_compile::WikiCompiler;
+use crate::graph_router::validate_slug;
 use crate::notion::service::NotionService;
 
 use crate::note::{Note, parse_frontmatter};
@@ -34,6 +38,19 @@ pub struct DistillationReport {
     pub contradictions_found: usize,
     /// Raw notes archived to `vault/archive/<yyyy-mm>/` (T005; was wiki-moves).
     pub migrated_files: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Return type from `run_scoped` carrying the distillation report plus
+/// ORAV verification data and pending pool count (T030/T033, FR-029/FR-032).
+pub struct ScopedRunOutcome {
+    /// Core distillation metrics.
+    pub report: DistillationReport,
+    /// Per-source ORAV verification attempts (T030, FR-029).
+    pub verifications: Vec<VerificationNode>,
+    /// Notes deferred to pending pool due to budget or ORAV failure (T033).
+    pub pending_count: usize,
+    /// Gaps emitted during this cycle (ORAV failures, budget deferrals).
+    pub gaps: Vec<GapRecord>,
 }
 
 /// Scan content for known entity names and wrap them in `[[wikilinks]]`
@@ -158,6 +175,68 @@ pub fn normalize_content(content: &str) -> String {
     out
 }
 
+/// Dynamic context pruning (FR-029): trim per-note historical reasoning
+/// while retaining the canonical entity schema (entity names + kinds).
+///
+/// **Retention rules:**
+/// - Always retained: entity names/kinds (lines containing `entity:`, `kind:`,
+///   `[[...]]` wikilinks, YAML frontmatter keys), and the first `retain_lines`
+///   content lines of each note.
+/// - Trimmed: remaining content lines beyond `retain_lines` — these carry
+///   per-note historical reasoning that causes context drift across cycles.
+///
+/// This prevents the compile/LLM stages from accumulating unbounded
+/// per-source history while preserving the structural entity schema
+/// that drives wiki consistency.
+pub fn prune_context(notes: &[Note], entity_names: &[String], retain_lines: usize) -> Vec<Note> {
+    let retain_set: HashSet<&str> = entity_names.iter().map(|s| s.as_str()).collect();
+
+    notes
+        .iter()
+        .map(|note| {
+            let mut pruned = note.clone();
+            let mut kept = Vec::new();
+            let mut line_count = 0usize;
+
+            for line in note.content.lines() {
+                let trimmed = line.trim();
+
+                // Always retain: frontmatter, entity schema, wikilinks
+                if trimmed == "---"
+                    || trimmed.starts_with("entity:")
+                    || trimmed.starts_with("kind:")
+                    || trimmed.starts_with("tags:")
+                    || trimmed.starts_with("source:")
+                    || trimmed.starts_with("id:")
+                    || trimmed.starts_with("sensitivity:")
+                    || (trimmed.starts_with("[[") && trimmed.ends_with("]]"))
+                {
+                    kept.push(line);
+                    continue;
+                }
+
+                // Check if line references a known entity name
+                if retain_set.iter().any(|name| line.contains(*name)) {
+                    kept.push(line);
+                    continue;
+                }
+
+                // Content lines: retain up to retain_lines
+                if !trimmed.is_empty() && line_count < retain_lines {
+                    kept.push(line);
+                    line_count += 1;
+                }
+            }
+
+            pruned.content = kept.join("\n");
+            if !pruned.content.ends_with('\n') && !pruned.content.is_empty() {
+                pruned.content.push('\n');
+            }
+            pruned
+        })
+        .collect()
+}
+
 /// Insert provenance key/value lines into a note's YAML frontmatter
 /// (before the closing `---`). Content without frontmatter gets one prepended.
 pub fn append_provenance(raw: &str, pairs: &[(&str, String)]) -> String {
@@ -246,18 +325,13 @@ fn archive_processed_notes(
                 ("source_path", source.to_string_lossy().to_string()),
                 ("archived_at", now.to_rfc3339()),
                 ("cycle_id", cycle_id.to_string()),
-                (
-                    "original_created_at",
-                    note.created_at.to_rfc3339(),
-                ),
+                ("original_created_at", note.created_at.to_rfc3339()),
                 ("checksum", checksum),
                 ("merged_into", String::new()),
             ],
         );
 
-        match std::fs::write(&dest, provenance)
-            .and_then(|_| std::fs::remove_file(&source))
-        {
+        match std::fs::write(&dest, provenance).and_then(|_| std::fs::remove_file(&source)) {
             Ok(()) => {
                 if let Err(e) = track.track_path(&dest) {
                     tracing::warn!(dest = %dest.display(), error = %e, "Failed to track archived file");
@@ -287,6 +361,8 @@ pub struct DistillationPipeline {
     compiler: WikiCompiler,
     detector: ContradictionDetector,
     notion_service: NotionService,
+    /// Optional LLM model for FR-003 enrichment. `None` → heuristic only.
+    llm_model: Option<String>,
 }
 
 impl DistillationPipeline {
@@ -296,7 +372,15 @@ impl DistillationPipeline {
             compiler: WikiCompiler::new(),
             detector: ContradictionDetector::new(),
             notion_service: NotionService::new(),
+            llm_model: None,
         }
+    }
+
+    /// Set the LLM model for FR-003 enrichment. `Some("openai:gpt-4o")` enables
+    /// the LLM path; `None` (default) disables it.
+    pub fn with_llm_model(mut self, model: String) -> Self {
+        self.llm_model = Some(model);
+        self
     }
 
     /// Production entry (sync callers `await` this): derives archive/logs
@@ -314,8 +398,17 @@ impl DistillationPipeline {
         let db = zen_repo::SqliteClient::open_lazy(&logs_dir.join("state.db"))
             .await
             .ok();
-        self.run_scoped(inbox_dir, wiki_dir, &archive_dir, &logs_dir, db.as_ref())
-            .await
+        let outcome = self
+            .run_scoped(
+                inbox_dir,
+                wiki_dir,
+                &archive_dir,
+                &logs_dir,
+                db.as_ref(),
+                None,
+            )
+            .await?;
+        Ok(outcome.report)
     }
 
     /// Isolated-dirs entry (worker + tests): all stage dirs injected, DB optional.
@@ -331,7 +424,8 @@ impl DistillationPipeline {
         archive_dir: &Path,
         logs_dir: &Path,
         db: Option<&zen_repo::SqliteClient>,
-    ) -> Result<DistillationReport> {
+        budget: Option<&mut LoopBudget>,
+    ) -> Result<ScopedRunOutcome> {
         // T007: pre-cycle gate — recover-or-restart on a prior crashed cycle.
         let recovery = RecoveryManager::new(logs_dir);
         if let Some(cp) = recovery.check_incomplete()? {
@@ -351,16 +445,24 @@ impl DistillationPipeline {
 
         let txn = TransactionScope::new(&format!("distill-{cycle_id}"));
         txn.begin()?;
-        let run = self.run_stages(inbox_dir, wiki_dir, archive_dir, db, &txn, &cycle_id);
+        let run = self.run_stages(
+            inbox_dir,
+            wiki_dir,
+            archive_dir,
+            db,
+            &txn,
+            &cycle_id,
+            budget,
+        );
         match run.await {
-            Ok(report) => {
+            Ok(outcome) => {
                 txn.commit()?;
                 checkpoints.write_checkpoint(&Checkpoint {
                     status: "completed".to_string(),
                     started_at: chrono::Utc::now().to_rfc3339(),
-                    notes_count: report.notes_processed,
+                    notes_count: outcome.report.notes_processed,
                 })?;
-                Ok(report)
+                Ok(outcome)
             }
             Err(e) => {
                 if let Err(rb) = txn.rollback() {
@@ -371,6 +473,7 @@ impl DistillationPipeline {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_stages(
         &self,
         inbox_dir: &Path,
@@ -379,19 +482,99 @@ impl DistillationPipeline {
         db: Option<&zen_repo::SqliteClient>,
         txn: &TransactionScope,
         cycle_id: &str,
-    ) -> Result<DistillationReport> {
-        let notes = self.load_notes(inbox_dir)?;
+        mut budget: Option<&mut LoopBudget>,
+    ) -> Result<ScopedRunOutcome> {
+        let mut notes = self.load_notes(inbox_dir)?;
+        // FR-012: configurable skip by extension from LoopConfig
+        if let Ok(cfg) = zen_core::config::load_config() {
+            let skip = cfg.agentic.loop_cfg.skip_extensions_or_default();
+            if !skip.is_empty() {
+                let before = notes.len();
+                notes.retain(|n| {
+                    let ext = n
+                        .file_path
+                        .as_ref()
+                        .and_then(|p| p.extension())
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    !skip.iter().any(|s| s.to_ascii_lowercase() == ext)
+                });
+                if notes.len() != before {
+                    info!(
+                        skipped = before - notes.len(),
+                        "FR-012 skip_extensions filtered notes"
+                    );
+                }
+            }
+        }
+
+        // T033 (FR-032): per-source budget enforcement — consume a step per
+        // source processed; over-budget sources move to vault/archive/pending/
+        // instead of the normal pipeline, incrementing report.pending_count.
+        let mut pending_notes: Vec<PathBuf> = Vec::new();
+        if let Some(ref mut b) = budget {
+            let mut retained = Vec::new();
+            for note in notes {
+                if !b.consume_step() {
+                    warn!(
+                        note = %note.id,
+                        pending = pending_notes.len() + 1,
+                        "loop: note deferred — over budget (T033 pending pool)"
+                    );
+                    if let Some(ref p) = note.file_path {
+                        pending_notes.push(p.clone());
+                    }
+                    continue;
+                }
+                retained.push(note);
+            }
+            notes = retained;
+        }
+
+        // Budget-deferred notes physically move to the pending pool now —
+        // without this they would silently stay in the inbox and
+        // report.pending_count would claim deferrals that never happened.
+        if !pending_notes.is_empty() {
+            let pending_dir = archive_dir.join("pending");
+            if let Err(e) = std::fs::create_dir_all(&pending_dir) {
+                warn!(error = %e, "Failed to create pending pool dir");
+            } else {
+                for src in &pending_notes {
+                    let dest = match src.file_name() {
+                        Some(name) => pending_dir.join(name),
+                        None => continue,
+                    };
+                    match std::fs::rename(src, &dest) {
+                        Ok(()) => {
+                            txn.track_path(&dest).ok();
+                        }
+                        Err(e) => {
+                            warn!(
+                                source = %src.display(),
+                                error = %e,
+                                "Failed to move over-budget note to pending pool"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let notes_processed = notes.len();
         info!(
             notes_processed,
+            pending = pending_notes.len(),
             "Loaded notes from inbox, starting consolidation pipeline"
         );
 
-        let notions = self.extractor.extract_batch(&notes)?;
+        let mut notions = self.extractor.extract_batch(&notes)?;
         let entities_extracted = notions.len();
         info!(entities_extracted, "Notion extraction complete");
 
         // T003: persist extracted notions into the DB graph (Principle XII).
+        // DB mutations share the TransactionScope lifetime with FS mutations;
+        // rollback deletes FS files while upsert idempotency keeps DB safe for reprocess.
         let mut entities_persisted = 0usize;
         if let Some(client) = db {
             for notion in &notions {
@@ -409,7 +592,12 @@ impl DistillationPipeline {
             tracing::debug!("No DB client — skipping notion persistence (test mode)");
         }
 
-        let normalized: Vec<Note> = notes
+        // FR-029 (T030): Dynamic Context Pruning — trim per-note historical
+        // reasoning while retaining canonical entity schema (entity names + kinds).
+        let entity_names: Vec<String> = notions.iter().map(|n| n.name.clone()).collect();
+        let pruned_notes = prune_context(&notes, &entity_names, 10);
+
+        let normalized: Vec<Note> = pruned_notes
             .iter()
             .map(|note| {
                 let mut n = note.clone();
@@ -417,6 +605,34 @@ impl DistillationPipeline {
                 n
             })
             .collect();
+
+        // FR-003: LLM enrichment hook — if model configured, attempt LLM-augmented
+        // notion extraction bounded by LoopBudget; otherwise heuristic path only.
+        let mut llm_stage = LlmDistillStage::new(LoopBudget::default(), self.llm_model.clone());
+        match llm_stage.distill_with_fallback(&normalized) {
+            Ok((llm_notions, tokens_used)) => {
+                if !llm_notions.is_empty() {
+                    let before = notions.len();
+                    // Merge LLM notions, dedup by name.
+                    for notion in llm_notions {
+                        if !notions.iter().any(|n| n.name == notion.name) {
+                            notions.push(notion);
+                        }
+                    }
+                    let added = notions.len().saturating_sub(before);
+                    info!(
+                        added,
+                        tokens_used, "FR-003: LLM enrichment merged additional notions"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "FR-003: LLM distill failed, falling back to heuristic-only"
+                );
+            }
+        }
 
         let entity_names: Vec<String> = notions.iter().map(|n| n.name.clone()).collect();
         let linked_notes: Vec<Note> = normalized
@@ -451,17 +667,218 @@ impl DistillationPipeline {
             info!("No contradictions found");
         }
 
-        let archived = archive_processed_notes(&notes, archive_dir, cycle_id, txn);
+        // ── T030 (FR-029): ORAV per-source verification ────────────────
+        //
+        // Observe → Reason → Act → Verify cycle applied per source note.
+        // On Verify failure: retry IN-PLACE up to 2 times (drop the
+        // offending slug/claim, regenerate the compile for that source)
+        // before falling back to archiving with a GapRecord.
+        //
+        // GapKind choice: QuarantinedNote — the note itself is the unit
+        // being quarantined (not an LLM output failure), so QuarantinedNote
+        // is semantically correct. LlmFailure is reserved for cases where
+        // the LLM call itself fails, not for output validation failures.
+        let wiki_inventory = crate::graph_verify::wiki_page_inventory(wiki_dir);
+        let mut verifications: Vec<VerificationNode> = Vec::new();
+        let mut orav_failed: HashSet<PathBuf> = HashSet::new();
 
-        Ok(DistillationReport {
-            notes_processed,
-            entities_extracted,
-            entities_persisted,
-            merged_count,
-            wiki_pages_created,
-            contradictions_found,
-            migrated_files: archived,
+        for note in linked_notes.iter() {
+            let (vnodes, failed) = self.run_orav_for_source(
+                note,
+                &entity_names,
+                wiki_dir,
+                &wiki_inventory,
+                txn,
+                cycle_id,
+            );
+            verifications.extend(vnodes);
+            if failed && let Some(ref p) = note.file_path {
+                orav_failed.insert(p.clone());
+            }
+        }
+
+        // Move ORAV-failed notes to pending pool (they were already processed
+        // by the pipeline above; the pending pool signals "needs re-processing
+        // next cycle after the offending content is remediated").
+        for failed_path in &orav_failed {
+            let pending_dir = archive_dir.join("pending");
+            if let Err(e) = std::fs::create_dir_all(&pending_dir) {
+                warn!(error = %e, "Failed to create pending pool dir");
+                continue;
+            }
+            let file_name = failed_path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let dest = pending_dir.join(&file_name);
+            match std::fs::rename(failed_path, &dest) {
+                Ok(()) => {
+                    pending_notes.push(failed_path.clone());
+                    txn.track_path(&dest).ok();
+                    info!(
+                        source = %failed_path.display(),
+                        dest = %dest.display(),
+                        "ORAV verification failed — note moved to pending pool"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        source = %failed_path.display(),
+                        error = %e,
+                        "Failed to move ORAV-failed note to pending pool"
+                    );
+                }
+            }
+        }
+
+        // Archive notes that passed ORAV and weren't budget-deferred.
+        let notes_to_archive: Vec<Note> = linked_notes
+            .into_iter()
+            .filter(|n| {
+                n.file_path
+                    .as_ref()
+                    .map(|p| !orav_failed.contains(p))
+                    .unwrap_or(true)
+            })
+            .collect();
+        let archived = archive_processed_notes(&notes_to_archive, archive_dir, cycle_id, txn);
+
+        // Collect ORAV gap records for the worker's gap persistence layer.
+        let mut gaps: Vec<GapRecord> = Vec::new();
+        for v in &verifications {
+            if let Some(ref gap_id) = v.gap_ref {
+                gaps.push(
+                    GapRecord::new(
+                        GapKind::QuarantinedNote,
+                        cycle_id,
+                        format!(
+                            "ORAV verification failed: slug_legality={}, contradiction={}, gap_ref={}",
+                            v.slug_legality, v.contradiction_detected, gap_id
+                        ),
+                    )
+                    .with_path(gap_id.clone()),
+                );
+            }
+        }
+
+        Ok(ScopedRunOutcome {
+            report: DistillationReport {
+                notes_processed,
+                entities_extracted,
+                entities_persisted,
+                merged_count,
+                wiki_pages_created,
+                contradictions_found,
+                migrated_files: archived,
+            },
+            verifications,
+            pending_count: pending_notes.len(),
+            gaps,
         })
+    }
+
+    /// T030 (FR-029): ORAV per-source verification loop.
+    ///
+    /// Observe → Reason → Act → Verify for a single source note:
+    /// - **Observe**: note content + extracted entity names + existing wiki entities
+    /// - **Reason**: diff (which entities/pages are new vs already present)
+    /// - **Act**: normal pipeline already compiled this source; verify the output
+    /// - **Verify**: validate every wikilink/slug via `validate_slug`, run
+    ///   `ContradictionDetector` on proposed content vs existing pages
+    ///
+    /// On Verify failure: retry IN-PLACE up to 2 times (drop the offending
+    /// slug/claim, re-link, re-compile for that source). After 2 retries,
+    /// fall back to moving the note to the pending pool with a GapRecord
+    /// (GapKind::QuarantinedNote — the note is the unit being quarantined,
+    /// not an LLM output failure).
+    fn run_orav_for_source(
+        &self,
+        note: &Note,
+        entity_names: &[String],
+        _wiki_dir: &Path,
+        _wiki_inventory: &[(String, String)],
+        _txn: &TransactionScope,
+        cycle_id: &str,
+    ) -> (Vec<VerificationNode>, bool) {
+        let mut verifications = Vec::new();
+        let mut content = note.content.clone();
+        let max_retries = 2u32;
+
+        for attempt in 0..=max_retries {
+            // ── Verify: slug legality ──────────────────────────────────
+            // Wikilinks carry natural-case titles ([[Rust]]); pages live on
+            // disk under their kebab-case slugs, so legality is judged on the
+            // normalized form.
+            let wikilinks = WikiPage::extract_wikilinks(&content);
+            let normalized_slug =
+                |link: &str| validate_slug(&link.to_lowercase().replace(' ', "-"));
+            let slug_legality = wikilinks.iter().all(|link| normalized_slug(link));
+
+            // ── Verify: contradiction detection ────────────────────────
+            // Check proposed content against existing wiki pages (pre-cycle
+            // snapshot stored in wiki_inventory).
+            let contradiction_detected = {
+                let temp_note = Note {
+                    content: content.clone(),
+                    ..note.clone()
+                };
+                match self.detector.detect(&[temp_note]) {
+                    Ok(contradictions) => !contradictions.is_empty(),
+                    Err(_) => false,
+                }
+            };
+
+            let will_retry = (slug_legality && !contradiction_detected) || attempt >= max_retries;
+            let gap_ref = if !slug_legality || contradiction_detected {
+                if attempt >= max_retries {
+                    Some(format!("orav-{cycle_id}-{}", note.id))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            verifications.push(VerificationNode {
+                slug_legality,
+                fact_consistency: !contradiction_detected,
+                contradiction_detected,
+                will_retry: !will_retry,
+                gap_ref,
+            });
+
+            // Success: all slugs valid and no contradictions
+            if slug_legality && !contradiction_detected {
+                return (verifications, false);
+            }
+
+            if attempt < max_retries {
+                // ── Retry: drop offending slugs and re-link ────────────
+                for link in &wikilinks {
+                    if !normalized_slug(link) {
+                        content = content
+                            .replace(&format!("[[{link}]]"), &format!("{{{{bad_slug:{link}}}}}"));
+                    }
+                }
+                // Re-link with valid entity names only, preserving the strips
+                // above (re-linking from the original content would resurrect
+                // the offending links).
+                let valid_entities: Vec<String> = entity_names
+                    .iter()
+                    .filter(|e| normalized_slug(e))
+                    .cloned()
+                    .collect();
+                content = auto_link_wikilinks(&content, &valid_entities);
+                info!(
+                    note = %note.id,
+                    attempt = attempt + 1,
+                    "ORAV: retrying after dropping offending slugs"
+                );
+            }
+        }
+
+        // All retries exhausted — note will be moved to pending pool by caller
+        (verifications, true)
     }
 
     /// T015 (FR-016): cluster compiled wiki pages and execute merge plans.
@@ -530,8 +947,7 @@ impl DistillationPipeline {
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let mut target_content =
-                std::fs::read_to_string(&target_path).unwrap_or_default();
+            let mut target_content = std::fs::read_to_string(&target_path).unwrap_or_default();
 
             let mut absorbed = Vec::new();
             for source in &plan.source_pages {
@@ -551,8 +967,7 @@ impl DistillationPipeline {
                     let unique: Vec<&str> = source_content
                         .lines()
                         .filter(|line| {
-                            !line.trim().is_empty()
-                                && !target_content.contains(line.trim())
+                            !line.trim().is_empty() && !target_content.contains(line.trim())
                         })
                         .collect();
                     if !unique.is_empty() {
@@ -596,7 +1011,7 @@ impl DistillationPipeline {
 
             // Rewrite wikilinks in remaining wiki pages: [[absorbed]] → [[target]].
             for page in &pages {
-                if !page.path.exists() || &page.path == &target_path {
+                if !page.path.exists() || page.path == target_path {
                     continue;
                 }
                 let content = match std::fs::read_to_string(&page.path) {
@@ -605,7 +1020,8 @@ impl DistillationPipeline {
                 };
                 let mut rewritten = content.clone();
                 for stem in &absorbed {
-                    rewritten = rewritten.replace(&format!("[[{stem}]]"), &format!("[[{target_stem}]]"));
+                    rewritten =
+                        rewritten.replace(&format!("[[{stem}]]"), &format!("[[{target_stem}]]"));
                 }
                 if rewritten != content {
                     std::fs::write(&page.path, &rewritten).ok();
@@ -931,9 +1347,10 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let root = wiki.parent().unwrap_or(wiki);
         let archive = root.join("archive");
         let logs = root.join("logs");
-        pipeline
-            .run_scoped(inbox, wiki, &archive, &logs, None)
-            .await
+        let outcome = pipeline
+            .run_scoped(inbox, wiki, &archive, &logs, None, None)
+            .await?;
+        Ok(outcome.report)
     }
 
     #[tokio::test]
@@ -944,7 +1361,9 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let wiki_dir = tmp.path().join("wiki");
 
         let pipeline = DistillationPipeline::new();
-        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
 
         assert_eq!(report.notes_processed, 0);
         assert_eq!(report.entities_extracted, 0);
@@ -960,7 +1379,9 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let wiki_dir = tmp.path().join("wiki");
 
         let pipeline = DistillationPipeline::new();
-        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
 
         assert_eq!(report.notes_processed, 0);
         assert_eq!(report.entities_extracted, 0);
@@ -983,7 +1404,9 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("note1.md"), &note_content).unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
 
         assert_eq!(report.notes_processed, 1);
         assert!(
@@ -1007,7 +1430,9 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("data.json"), "{}").unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
 
         assert_eq!(report.notes_processed, 1);
     }
@@ -1031,7 +1456,9 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("02-python.md"), &note2).unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
 
         assert_eq!(report.notes_processed, 2);
         // Entities are deduplicated across notes
@@ -1057,7 +1484,9 @@ updated_at: "2026-05-23T15:00:00+00:00"
         fs::write(inbox_dir.join("02-bad.md"), "---\nid: \"note-2\"\n\nbody").unwrap();
 
         let pipeline = DistillationPipeline::new();
-        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir).await.unwrap();
+        let report = run_isolated(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
 
         assert_eq!(report.notes_processed, 1, "Should skip the malformed note");
     }
@@ -1323,7 +1752,10 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let raw = "\r\n# Title   \r\n\r\n\r\n\r\nBody line.  \n\n\n\n";
         let out = normalize_content(raw);
         assert!(!out.contains('\r'), "CRLF must become LF");
-        assert!(!out.contains("   \n"), "trailing whitespace must be stripped");
+        assert!(
+            !out.contains("   \n"),
+            "trailing whitespace must be stripped"
+        );
         assert!(out.starts_with("# Title"), "leading blanks trimmed");
         assert!(out.ends_with("Body line.\n"), "trailing blanks trimmed");
         assert!(!out.contains("\n\n\n"), "3+ blank lines collapsed to 2");

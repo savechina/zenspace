@@ -1,3 +1,5 @@
+use sha2::{Digest, Sha256};
+
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{FtsResult, IndexNoteRequest};
 
@@ -37,14 +39,16 @@ impl<'a> NotesRepo<'a> {
         let tags = req.tags.to_string();
         let file_path = req.file_path.to_string();
         let source = req.source.to_string();
+        let hash = Sha256::digest(content.as_bytes());
+        let content_hash: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
 
         self.client
             .writer()
             .call(move |conn| {
                 conn.execute(
                     "INSERT OR REPLACE INTO notes_meta (id, file_path, source, domain, project, created_at, updated_at, content_hash) \
-                     VALUES (?1, ?2, ?3, '', '', datetime('now'), datetime('now'), '')",
-                    rusqlite::params![id, file_path, source],
+                     VALUES (?1, ?2, ?3, '', '', datetime('now'), datetime('now'), ?4)",
+                    rusqlite::params![id, file_path, source, content_hash],
                 )?;
                 conn.execute(
                     "INSERT OR REPLACE INTO notes_fts (rowid, id, title, content, tags) \

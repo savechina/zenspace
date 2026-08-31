@@ -521,10 +521,27 @@ pub fn load_identity_files(zen_paths: &ZenPaths) -> IdentityContext {
         })
         .ok();
 
+    // FR-023/T025: self-model lives under memories/self-model/ (not identity/);
+    // absent directory yields None.
+    let self_model_dir = zen_paths.memory().join("self-model");
+    let self_model = if self_model_dir.is_dir() {
+        match zen_memory::self_model::SelfModelItem::load_all(&self_model_dir) {
+            Ok(items) if !items.is_empty() => Some(items),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(path = ?self_model_dir, error = %e, "self-model directory unreadable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     IdentityContext {
         soul,
         memory,
         agents,
+        self_model,
     }
 }
 

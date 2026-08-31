@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashSet};
+
 use anyhow::Result;
 use serde_json::Value;
 use tracing::debug;
@@ -10,6 +12,87 @@ use zen_repo::{
     ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionsRepo, PageRankResult,
     ShortestPathResult, SqliteClient,
 };
+
+/// A node in an extracted N-hop subgraph (FR-031 Sub-graph Synthesis RAG).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubgraphNode {
+    /// Canonical entity name.
+    pub name: String,
+    /// BFS depth from the center entity (0 = center).
+    pub depth: u32,
+}
+
+/// A directed edge between two discovered subgraph nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubgraphEdge {
+    /// Source entity name.
+    pub source: String,
+    /// Target entity name.
+    pub target: String,
+    /// Relationship type as stored in the graph (e.g. `knows`, `RelatedTo`).
+    pub relation: String,
+}
+
+/// N-hop subgraph centered on an entity, built for LLM prompt injection —
+/// FR-031 Sub-graph Synthesis RAG: instead of Top-K vector retrieval, the
+/// whole neighborhood is handed to the Agent for cross-document synthesis.
+///
+/// Tier-5/service wiring lands in a later wave; this type plus
+/// [`Tier4Search::subgraph_synthesis`] and [`Tier4Search::synthesize_context`]
+/// are the delivery surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubgraphContext {
+    /// Center entity name the subgraph was extracted around.
+    pub center: String,
+    /// Discovered nodes (center included at depth 0 when found), sorted by
+    /// `(depth, name)`.
+    pub nodes: Vec<SubgraphNode>,
+    /// Deduplicated exact edges whose both endpoints are in `nodes`, sorted
+    /// by `(source, relation, target)`.
+    pub edges: Vec<SubgraphEdge>,
+}
+
+impl SubgraphContext {
+    /// Render a compact markdown-ish context block: a header line, nodes
+    /// grouped by ascending BFS depth (name-sorted within a depth), then
+    /// deterministically ordered edges. Suitable for direct injection into
+    /// an LLM synthesis prompt.
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "## Subgraph: {} ({} nodes, {} edges)\n",
+            self.center,
+            self.nodes.len(),
+            self.edges.len()
+        );
+
+        let mut by_depth: BTreeMap<u32, Vec<&str>> = BTreeMap::new();
+        for node in &self.nodes {
+            by_depth
+                .entry(node.depth)
+                .or_default()
+                .push(node.name.as_str());
+        }
+        for (depth, names) in by_depth {
+            out.push_str(&format!("\n### Depth {depth}\n"));
+            for name in names {
+                out.push_str(&format!("- {name}\n"));
+            }
+        }
+
+        out.push_str("\n### Edges\n");
+        let mut lines: Vec<String> = self
+            .edges
+            .iter()
+            .map(|e| format!("- {} -> {} ({})\n", e.source, e.target, e.relation))
+            .collect();
+        lines.sort();
+        lines.dedup();
+        for line in lines {
+            out.push_str(&line);
+        }
+        out
+    }
+}
 
 pub struct GraphResult {
     pub notion: String,
@@ -146,6 +229,111 @@ impl Tier4Search {
             .connected_components()
             .await
             .map_err(Into::into)
+    }
+
+    /// Build the N-hop subgraph centered on `center` (FR-031 Sub-graph
+    /// Synthesis RAG).
+    ///
+    /// Nodes come from [`NotionsRepo::bfs_search`] (deduplicated by name at
+    /// minimum depth); exact edges come from
+    /// [`NotionsRepo::load_relationships_all`] per discovered node, keeping
+    /// only edges whose both endpoints are in the node set. Unknown or
+    /// isolated centers yield an empty (but well-formed) context.
+    ///
+    /// Cost note: one entity-lookup plus one bidirectional edge query per
+    /// discovered node — bounded by the subgraph size, which `hops` caps.
+    pub async fn subgraph_synthesis(
+        client: &SqliteClient,
+        center: &str,
+        hops: u32,
+    ) -> Result<SubgraphContext> {
+        if center.trim().is_empty() {
+            return Ok(SubgraphContext {
+                center: center.to_string(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
+
+        let repo = NotionsRepo::new(client);
+        let bfs = repo.bfs_search(center, hops).await?;
+
+        let mut nodes: Vec<SubgraphNode> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if !bfs.is_empty() {
+            nodes.push(SubgraphNode {
+                name: center.to_string(),
+                depth: 0,
+            });
+            seen.insert(center.to_string());
+        }
+        for row in &bfs {
+            if seen.insert(row.notion.clone()) {
+                nodes.push(SubgraphNode {
+                    name: row.notion.clone(),
+                    depth: row.depth,
+                });
+            }
+        }
+
+        let mut edges: Vec<SubgraphEdge> = Vec::new();
+        let mut edge_keys: HashSet<(String, String, String)> = HashSet::new();
+        for node in &nodes {
+            let Some(entity) = repo.find_entity_by_name(&node.name).await? else {
+                continue;
+            };
+            for rel in repo.load_relationships_all(&entity.id).await? {
+                let (Some(source), Some(target)) = (
+                    repo.notion_name(&rel.source_notion_id).await?,
+                    repo.notion_name(&rel.target_notion_id).await?,
+                ) else {
+                    continue;
+                };
+                if !seen.contains(&source) || !seen.contains(&target) {
+                    continue;
+                }
+                if edge_keys.insert((source.clone(), target.clone(), rel.relation_type.clone())) {
+                    edges.push(SubgraphEdge {
+                        source,
+                        target,
+                        relation: rel.relation_type,
+                    });
+                }
+            }
+        }
+
+        nodes.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.name.cmp(&b.name)));
+        edges.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then_with(|| a.relation.cmp(&b.relation))
+                .then_with(|| a.target.cmp(&b.target))
+        });
+
+        debug!(
+            "subgraph_synthesis: center `{}` hops={hops} → {} nodes / {} edges",
+            center,
+            nodes.len(),
+            edges.len()
+        );
+        Ok(SubgraphContext {
+            center: center.to_string(),
+            nodes,
+            edges,
+        })
+    }
+
+    /// Thin wrapper over [`Self::subgraph_synthesis`]: build the N-hop
+    /// subgraph and return [`SubgraphContext::render`] output ready for LLM
+    /// prompt injection. Tier-5/service wiring lands in a later wave.
+    pub async fn synthesize_context(
+        client: &SqliteClient,
+        center: &str,
+        hops: u32,
+    ) -> Result<String> {
+        Ok(Self::subgraph_synthesis(client, center, hops)
+            .await?
+            .render())
     }
 }
 
@@ -344,5 +532,158 @@ mod tests {
             .unwrap();
         let notions = result["notions"].as_array().unwrap();
         assert!(!notions.is_empty(), "got: {notions:?}");
+    }
+
+    #[test]
+    fn subgraph_render_groups_nodes_by_depth_and_sorts_edges() {
+        let ctx = SubgraphContext {
+            center: "Alice".to_string(),
+            nodes: vec![
+                SubgraphNode {
+                    name: "Bob".to_string(),
+                    depth: 1,
+                },
+                SubgraphNode {
+                    name: "Alice".to_string(),
+                    depth: 0,
+                },
+                SubgraphNode {
+                    name: "Zed".to_string(),
+                    depth: 2,
+                },
+                SubgraphNode {
+                    name: "Carol".to_string(),
+                    depth: 1,
+                },
+            ],
+            edges: vec![
+                SubgraphEdge {
+                    source: "Bob".to_string(),
+                    target: "Zed".to_string(),
+                    relation: "knows".to_string(),
+                },
+                SubgraphEdge {
+                    source: "Alice".to_string(),
+                    target: "Bob".to_string(),
+                    relation: "knows".to_string(),
+                },
+            ],
+        };
+
+        let rendered = ctx.render();
+        assert!(rendered.starts_with("## Subgraph: Alice (4 nodes, 2 edges)\n"));
+        // Depth sections in ascending order.
+        let d0 = rendered.find("### Depth 0").unwrap();
+        let d1 = rendered.find("### Depth 1").unwrap();
+        let d2 = rendered.find("### Depth 2").unwrap();
+        assert!(d0 < d1 && d1 < d2);
+        // Within depth 1, names sorted: Bob before Carol.
+        let bob = rendered.find("- Bob\n").unwrap();
+        let carol = rendered.find("- Carol\n").unwrap();
+        assert!(d1 < bob && bob < carol);
+        // Edges present and sorted by source.
+        let edge_a = rendered.find("- Alice -> Bob (knows)\n").unwrap();
+        let edge_b = rendered.find("- Bob -> Zed (knows)\n").unwrap();
+        let edges_header = rendered.find("### Edges\n").unwrap();
+        assert!(edges_header < edge_a && edge_a < edge_b);
+    }
+
+    #[test]
+    fn subgraph_render_empty_is_well_formed() {
+        let ctx = SubgraphContext {
+            center: "Nobody".to_string(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        let rendered = ctx.render();
+        assert!(rendered.starts_with("## Subgraph: Nobody (0 nodes, 0 edges)\n"));
+        assert!(!rendered.contains("### Depth"));
+        assert!(rendered.contains("### Edges\n"));
+    }
+
+    #[tokio::test]
+    async fn subgraph_synthesis_builds_nodes_and_exact_edges() {
+        let (_dir, client) = setup_test_db().await;
+        let tier4 = Tier4Search;
+        tier4
+            .insert_entity(&client, "e1", "Alice", "person")
+            .await
+            .unwrap();
+        tier4
+            .insert_entity(&client, "e2", "Bob", "person")
+            .await
+            .unwrap();
+        tier4
+            .insert_entity(&client, "e3", "Charly", "person")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        tier4
+            .insert_relationship(&client, "r1", "e1", "e2", "knows", 1.0, None, &now)
+            .await
+            .unwrap();
+        tier4
+            .insert_relationship(&client, "r2", "e2", "e3", "knows", 1.0, None, &now)
+            .await
+            .unwrap();
+
+        // 2-hop: all three nodes, both directed edges with exact endpoints.
+        let ctx = Tier4Search::subgraph_synthesis(&client, "Alice", 2)
+            .await
+            .unwrap();
+        assert_eq!(ctx.center, "Alice");
+        let names: Vec<&str> = ctx.nodes.iter().map(|n| n.name.as_str()).collect();
+        for expected in ["Alice", "Bob", "Charly"] {
+            assert!(names.contains(&expected), "missing {expected} in {names:?}");
+        }
+        assert_eq!(ctx.edges.len(), 2);
+        assert!(
+            ctx.edges
+                .iter()
+                .any(|e| e.source == "Alice" && e.target == "Bob" && e.relation == "knows")
+        );
+        assert!(
+            ctx.edges
+                .iter()
+                .any(|e| e.source == "Bob" && e.target == "Charly" && e.relation == "knows")
+        );
+
+        // 1-hop: depth-2 node and its edge are excluded.
+        let ctx1 = Tier4Search::subgraph_synthesis(&client, "Alice", 1)
+            .await
+            .unwrap();
+        assert!(!ctx1.nodes.iter().any(|n| n.name == "Charly"));
+        assert!(ctx1.edges.iter().all(|e| e.target != "Charly"));
+
+        // Unknown center → empty but well-formed context.
+        let ctx0 = Tier4Search::subgraph_synthesis(&client, "Ghost", 2)
+            .await
+            .unwrap();
+        assert!(ctx0.nodes.is_empty() && ctx0.edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn synthesize_context_returns_rendered_block() {
+        let (_dir, client) = setup_test_db().await;
+        let tier4 = Tier4Search;
+        tier4
+            .insert_entity(&client, "e1", "Alice", "person")
+            .await
+            .unwrap();
+        tier4
+            .insert_entity(&client, "e2", "Bob", "person")
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        tier4
+            .insert_relationship(&client, "r1", "e1", "e2", "knows", 1.0, None, &now)
+            .await
+            .unwrap();
+
+        let text = Tier4Search::synthesize_context(&client, "Alice", 2)
+            .await
+            .unwrap();
+        assert!(text.starts_with("## Subgraph: Alice"));
+        assert!(text.contains("- Alice -> Bob (knows)"));
     }
 }

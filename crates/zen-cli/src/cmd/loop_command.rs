@@ -95,10 +95,7 @@ async fn run_cycle(dry_run: bool, json: bool) -> Result<(), ZenError> {
         println!("Loop cycle report ({}):", cycle.cycle_id);
         println!(
             "  Outcome:            {}",
-            cycle
-                .outcome
-                .map(|o| o.as_str())
-                .unwrap_or("unknown")
+            cycle.outcome.map(|o| o.as_str()).unwrap_or("unknown")
         );
         println!("  Notes processed:    {}", cycle.notes_processed);
         println!("  Entities persisted: {}", cycle.entities_persisted);
@@ -107,15 +104,16 @@ async fn run_cycle(dry_run: bool, json: bool) -> Result<(), ZenError> {
         println!("  Gaps:               {}", cycle.gaps.len());
         println!("  Worker duration:    {}ms", report.duration_ms);
     } else {
-        println!("Cycle executed ({}ms) — no report persisted", report.duration_ms);
+        println!(
+            "Cycle executed ({}ms) — no report persisted",
+            report.duration_ms
+        );
     }
 
     match read_last_report(&paths) {
-        Ok(Some(c)) if c.outcome == Some(CycleOutcome::Failed) => {
-            Err(ZenError::Message(
-                c.last_error.unwrap_or_else(|| "cycle failed".into()),
-            ))
-        }
+        Ok(Some(c)) if c.outcome == Some(CycleOutcome::Failed) => Err(ZenError::Message(
+            c.last_error.unwrap_or_else(|| "cycle failed".into()),
+        )),
         _ => Ok(()),
     }
 }
@@ -148,7 +146,11 @@ fn show_status(json: bool) -> Result<(), ZenError> {
     println!("  Schedule: {}", loop_cfg.interval_or_default());
     match cycle {
         Some(c) => {
-            println!("  Last cycle: {} ({})", c.cycle_id, c.started_at.map(|t| t.to_rfc3339()).unwrap_or_default());
+            println!(
+                "  Last cycle: {} ({})",
+                c.cycle_id,
+                c.started_at.map(|t| t.to_rfc3339()).unwrap_or_default()
+            );
             println!(
                 "  Outcome: {} · notes {} · pages {} · archived {} · gaps {}",
                 c.outcome.map(|o| o.as_str()).unwrap_or("unknown"),
@@ -170,8 +172,7 @@ fn show_status(json: bool) -> Result<(), ZenError> {
 fn show_gaps(kind: Option<&str>, json: bool) -> Result<(), ZenError> {
     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
     let gaps_file = gaps_path_from(&paths.logs());
-    let mut records = read_jsonl_lines(&gaps_file)
-        .map_err(|e| ZenError::Message(e.to_string()))?;
+    let mut records = read_jsonl_lines(&gaps_file).map_err(|e| ZenError::Message(e.to_string()))?;
     records.reverse(); // most recent first
 
     if let Some(filter) = kind {
@@ -199,7 +200,14 @@ fn show_gaps(kind: Option<&str>, json: bool) -> Result<(), ZenError> {
         let k = r.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
         let detail = r.get("detail").and_then(|d| d.as_str()).unwrap_or("");
         let path = r.get("subject_path").and_then(|p| p.as_str()).unwrap_or("");
-        println!("[{k}] {detail}{}", if path.is_empty() { String::new() } else { format!(" ({path})") });
+        println!(
+            "[{k}] {detail}{}",
+            if path.is_empty() {
+                String::new()
+            } else {
+                format!(" ({path})")
+            }
+        );
     }
     Ok(())
 }

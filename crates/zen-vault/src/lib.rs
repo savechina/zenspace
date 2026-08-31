@@ -1,8 +1,9 @@
 pub mod brief;
 pub mod dispatch;
 pub mod distill;
-pub mod graph_verify;
 pub mod goal;
+pub mod graph_router;
+pub mod graph_verify;
 pub mod habit;
 pub mod ingest;
 pub mod intent;
@@ -14,12 +15,13 @@ pub mod tools;
 pub use tools::SharedSqliteClient;
 pub mod wiki;
 
-pub use graph_verify::{GraphIntegrityVerifier, wiki_page_inventory};
 pub use distill::{
     ChatImporter, Checkpoint, CheckpointManager, Contradiction, ContradictionDetector,
     DistillationPipeline, DistillationPipelineInput, DistillationReport, NotionExtractor,
-    RecoveryManager, SourceIngester, TransactionScope, WikiCompiler,
+    RecoveryManager, ScopedRunOutcome, SourceIngester, TransactionScope, WikiCompiler,
+    prune_context,
 };
+pub use graph_verify::{GraphIntegrityVerifier, wiki_page_inventory};
 pub use ingest::{
     FeedEntry, IngestResult, RssFetcher, extract_readable_content, fetch_feed, ingest_local_file,
     ingest_url,

@@ -64,10 +64,7 @@ fn test_zen_workspace_init_creates_zen_dir() {
         zen_dir.join("config.toml").exists(),
         "config.toml should be created"
     );
-    assert!(
-        zen_dir.join("output").exists(),
-        "output/ should be created"
-    );
+    assert!(zen_dir.join("output").exists(), "output/ should be created");
 }
 
 #[test]

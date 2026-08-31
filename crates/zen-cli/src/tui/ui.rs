@@ -1,4 +1,5 @@
 use super::app::{App, InputMode};
+use super::loop_panel::render_loop_panel;
 use super::model_picker::render_model_picker;
 use super::selection::highlight_line;
 use super::session_picker::render_session_picker;
@@ -303,6 +304,9 @@ pub fn render(frame: &mut Frame, app: &mut App, active_toast: Option<&str>) {
         app.theme.as_ref(),
     );
     render_model_picker(frame, &app.model_picker, app.theme.as_ref());
+    if app.loop_panel.visible {
+        render_loop_panel(frame, &app.loop_panel, frame.area());
+    }
     render_toast_banner(frame, active_toast, app.theme.as_ref());
 }
 

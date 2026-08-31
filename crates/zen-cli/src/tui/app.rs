@@ -395,6 +395,7 @@ pub struct App {
     pub inline_mode: bool,
     output_cache: Option<OutputCache>,
     theme_generation: u64,
+    pub loop_panel: crate::tui::loop_panel::LoopPanelState,
 }
 
 impl App {
@@ -473,6 +474,7 @@ impl App {
             inline_mode: false,
             output_cache: None,
             theme_generation: 0,
+            loop_panel: crate::tui::loop_panel::LoopPanelState::default(),
         };
         app.load_command_history();
         app
@@ -2228,9 +2230,8 @@ Use /thinking to show/hide thinking process."#;
         use zen_vault::distill::DistillationPipeline;
         if let Ok(paths) = ZenPaths::detect() {
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    DistillationPipeline::new().run(&paths.inbox(), &paths.wiki()),
-                )
+                tokio::runtime::Handle::current()
+                    .block_on(DistillationPipeline::new().run(&paths.inbox(), &paths.wiki()))
             });
             match result {
                 Ok(report) => {

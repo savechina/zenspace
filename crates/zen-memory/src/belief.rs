@@ -76,7 +76,7 @@ pub struct EvidenceEntry {
 pub enum SourceType {
     /// Direct self-observation (weight: 1.0).
     SelfObservation,
-    /// Trusted peer or mentor (weight: 0.7).
+    /// Trusted peer or mentor (weight: 0.5, per FR-025 "others=0.5").
     TrustedPeer,
     /// Authoritative book or paper (weight: 0.8).
     AuthorityBook,
@@ -89,7 +89,7 @@ impl SourceType {
     pub fn default_weight(&self) -> f64 {
         match self {
             SourceType::SelfObservation => 1.0,
-            SourceType::TrustedPeer => 0.7,
+            SourceType::TrustedPeer => 0.5,
             SourceType::AuthorityBook => 0.8,
             SourceType::AnonymousInternet => 0.2,
         }
@@ -232,6 +232,14 @@ impl Belief {
 
     /// Apply time-based decay if belief hasn't been retrieved in 90+ days.
     /// weight *= 0.95. Returns true if decay was applied.
+    ///
+    /// Decay model (FR-025) has two independent mechanisms:
+    /// - **Evidence weight decay** (this method): unretrieved ≥ 90 days → `weight × 0.95`.
+    /// - **Posterior confidence half-life**
+    ///   ([`Belief::apply_confidence_half_life`]): `posterior × 0.5^(days_since_last_updated / 30)`
+    ///   — beliefs not refreshed by new evidence drift back toward uncertainty.
+    ///
+    /// [`apply_decay_all`] applies both; fine-grained callers may invoke each separately.
     pub fn apply_decay(&mut self, now: DateTime<Utc>) -> bool {
         if let Some(last) = self.last_retrieved {
             let days_unretrieved = (now - last).num_days();
@@ -241,6 +249,43 @@ impl Belief {
             }
         }
         false
+    }
+
+    /// Apply the 30-day posterior confidence half-life (FR-025).
+    ///
+    /// Multiplies `posterior` by `0.5^(elapsed_days / half_life_days)`, where
+    /// `elapsed_days` is measured from `last_updated` to `now`. Stale beliefs —
+    /// those not refreshed by new evidence — drift back toward uncertainty
+    /// without any contradicting evidence. The result is clamped at the 0.01
+    /// floor to preserve the documented posterior range (0.01–0.99);
+    /// `last_updated` is NOT modified (decay is not evidence).
+    ///
+    /// # Parameters
+    /// - `now`: current wall-clock time; elapsed time is `now - last_updated`
+    ///   (fractional days, so sub-day precision is preserved).
+    /// - `half_life_days`: days after which the posterior halves (spec: 30.0).
+    ///
+    /// # Returns
+    /// `true` if the posterior changed (elapsed > 0 and not already at the floor).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut b = Belief::new("id".into(), "prop".into(), "auth".into());
+    /// b.last_updated = Utc::now() - chrono::Duration::days(30);
+    /// assert!(b.apply_confidence_half_life(Utc::now(), 30.0)); // posterior halved
+    /// ```
+    pub fn apply_confidence_half_life(&mut self, now: DateTime<Utc>, half_life_days: f64) -> bool {
+        let elapsed_days = (now - self.last_updated).num_seconds() as f64 / 86_400.0;
+        if elapsed_days <= 0.0 {
+            return false;
+        }
+        let factor = 0.5_f64.powf(elapsed_days / half_life_days);
+        let new_posterior = (self.posterior * factor).max(0.01);
+        if (new_posterior - self.posterior).abs() < 1e-12 {
+            return false;
+        }
+        self.posterior = new_posterior;
+        true
     }
 
     /// Should this belief be promoted to wiki/wisdom/?
@@ -425,11 +470,21 @@ impl Belief {
 
 // ─── Aggregation helpers ───────────────────────────────────────────────
 
-/// Apply decay to all beliefs and return count of decayed beliefs.
+/// Apply both decay mechanisms (FR-025) to all beliefs and return the count
+/// of beliefs changed by either:
+///
+/// - 90-day evidence-weight decay (`weight × 0.95`, [`Belief::apply_decay`])
+/// - 30-day posterior confidence half-life
+///   ([`Belief::apply_confidence_half_life`])
+///
+/// Existing callers (wisdom synthesis, loop wiring) get both decays through
+/// this single entry point.
 pub fn apply_decay_all(beliefs: &mut [Belief], now: DateTime<Utc>) -> usize {
     let mut count = 0;
     for b in beliefs.iter_mut() {
-        if b.apply_decay(now) {
+        let weight_decayed = b.apply_decay(now);
+        let half_life_decayed = b.apply_confidence_half_life(now, 30.0);
+        if weight_decayed || half_life_decayed {
             count += 1;
         }
     }
@@ -494,7 +549,7 @@ mod tests {
     fn test_self_observation_has_highest_weight() {
         assert_eq!(SourceType::SelfObservation.default_weight(), 1.0);
         assert_eq!(SourceType::AuthorityBook.default_weight(), 0.8);
-        assert_eq!(SourceType::TrustedPeer.default_weight(), 0.7);
+        assert_eq!(SourceType::TrustedPeer.default_weight(), 0.5);
         assert_eq!(SourceType::AnonymousInternet.default_weight(), 0.2);
     }
 
@@ -589,6 +644,78 @@ mod tests {
         let decayed = b.apply_decay(now);
         assert!(!decayed, "expected no decay within 90 days");
         assert_eq!(b.weight, initial_weight);
+    }
+
+    #[test]
+    fn test_confidence_half_life_30_days_halves_posterior() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::SelfObservation, None);
+        b.last_updated = Utc::now() - Duration::days(30);
+        let before = b.posterior;
+
+        let now = b.last_updated + Duration::days(30);
+        let changed = b.apply_confidence_half_life(now, 30.0);
+
+        assert!(changed, "expected half-life decay to apply after 30 days");
+        assert!(
+            (b.posterior - before * 0.5).abs() < 0.001,
+            "expected posterior ~{}, got {}",
+            before * 0.5,
+            b.posterior
+        );
+    }
+
+    #[test]
+    fn test_confidence_half_life_zero_days_unchanged() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::SelfObservation, None);
+        let before = b.posterior;
+        let now = b.last_updated; // zero elapsed time
+
+        let changed = b.apply_confidence_half_life(now, 30.0);
+
+        assert!(!changed, "expected no change with zero elapsed days");
+        assert_eq!(b.posterior, before);
+    }
+
+    #[test]
+    fn test_confidence_half_life_clamps_at_floor() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.posterior = 0.02;
+        b.last_updated = Utc::now() - Duration::days(365);
+        let now = b.last_updated + Duration::days(365);
+
+        let changed = b.apply_confidence_half_life(now, 30.0);
+
+        assert!(changed);
+        assert!(
+            (b.posterior - 0.01).abs() < 1e-9,
+            "expected floor 0.01, got {}",
+            b.posterior
+        );
+    }
+
+    #[test]
+    fn test_apply_decay_all_applies_both_mechanisms() {
+        // Half-life only: never retrieved (no weight decay) but stale evidence.
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::SelfObservation, None);
+        let now = Utc::now();
+        b.last_updated = now - Duration::days(40);
+        let before = b.posterior;
+        let initial_weight = b.weight;
+
+        let count = apply_decay_all(std::slice::from_mut(&mut b), now);
+
+        assert_eq!(count, 1, "expected the belief counted as decayed");
+        assert!(
+            b.posterior < before,
+            "expected half-life applied to posterior"
+        );
+        assert_eq!(
+            b.weight, initial_weight,
+            "weight decay must not fire (never retrieved)"
+        );
     }
 
     #[test]

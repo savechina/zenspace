@@ -213,9 +213,7 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
 
             Ok(())
         }
-        WikiCommands::Loop { command } => {
-            crate::cmd::loop_command::execute_command(command).await
-        }
+        WikiCommands::Loop { command } => crate::cmd::loop_command::execute_command(command).await,
     }
 }
 

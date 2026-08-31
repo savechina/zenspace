@@ -1,11 +1,14 @@
 pub mod chat_import;
 pub mod checkpoint;
 pub mod contradiction;
+pub mod convert;
+pub mod hypothesis;
 pub mod merge;
 pub mod notion_extraction;
 pub mod pipeline;
 pub mod recovery;
 pub mod source_ingest;
+pub mod stages;
 pub mod transaction;
 pub mod types;
 pub mod wiki_compile;
@@ -13,11 +16,19 @@ pub mod wiki_compile;
 pub use chat_import::ChatImporter;
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
-pub use notion_extraction::NotionExtractor;
+pub use hypothesis::{
+    build_exploration_prompt, build_refinement_queue, confidence_for, gap_type, generate_from_gaps,
+    load_all, reverify, save, slug_for,
+};
 pub use merge::{MergeStrategy, WikiMergePlan, build_merge_plans, trigram_jaccard};
-pub use pipeline::{DistillationPipeline, DistillationPipelineInput, DistillationReport};
+pub use notion_extraction::NotionExtractor;
+pub use pipeline::{
+    DistillationPipeline, DistillationPipelineInput, DistillationReport, ScopedRunOutcome,
+    prune_context,
+};
 pub use recovery::RecoveryManager;
 pub use source_ingest::SourceIngester;
+pub use stages::LlmDistillStage;
 pub use transaction::TransactionScope;
 pub use types::{
     Belief, Commitment, CommitmentLifecycle, CycleOutcome, Decision, GapKind, GapRecord,

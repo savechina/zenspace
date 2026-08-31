@@ -1,8 +1,9 @@
 //! ZenLoopWorker — the knowledge-processing loop worker (005-agentic-loop).
 //!
-//! Executes the 6-stage cycle from `docs/specs/005-agentic-loop/contracts/worker.md`,
+//! Executes the cycle from `docs/specs/005-agentic-loop/contracts/worker.md`,
 //! reusing the exact service code paths behind the manual `zen wiki` subcommands:
-//! pre-cycle guards → ingest sweep → distill → verify → reindex → report+audit.
+//! pre-cycle guards → ingest sweep → distill → wisdom hooks (post-distill,
+//! T024-T027) → verify → reindex → report+audit → git history (T033).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,13 +12,13 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::jsonl::append_jsonl_line;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
-    CycleOutcome, GapKind, GapRecord, LoopCycleReport, SourceIngester,
+    CycleOutcome, GapKind, GapRecord, LoopBudget, LoopCycleReport, SourceIngester,
 };
 use zen_vault::{DistillationPipeline, Reindexer};
 
@@ -129,6 +130,229 @@ impl ZenLoopWorker {
         }
         *prev = Some(current);
     }
+
+    /// Stage 3b (T024-T027): wisdom composition, post-distill —
+    /// typed-signal routing, SelfModel humility gate, Decision CRIT check +
+    /// quarantine, belief decay + demotion scan.
+    /// Each hook is best-effort: a failure warns and the cycle continues.
+    async fn run_wisdom_hooks(
+        &self,
+        paths: &ZenPaths,
+        ctx: &WorkerContext,
+        gaps: &mut Vec<GapRecord>,
+        report: &mut LoopCycleReport,
+    ) {
+        // T024: typed-signal routing via the existing MemoryCurator worker
+        // (journal → wiki/wisdom + memories/commitments). Runs first so the
+        // T026 decision gate sees freshly routed decision pages.
+        match super::MemoryCurator::new().execute(ctx).await {
+            Ok(curator_report) => {
+                info!(
+                    signals = curator_report.fact_count,
+                    "loop: curator routing complete"
+                )
+            }
+            Err(e) => warn!(error = %e, "loop: curator routing failed (cycle continues)"),
+        }
+
+        // T025: SelfModel self-cognition gate (FR-023) — fires only when
+        // humility < 0.5 AND confidence > 0.8. Items live under
+        // memories/self-model/ (not identity/).
+        let self_model_dir = paths.memory().join("self-model");
+        match zen_memory::self_model::SelfModelItem::load_all(&self_model_dir) {
+            Ok(items) => {
+                for item in items {
+                    if let Some(humility) = item.humility_score
+                        && humility < 0.5
+                        && item.confidence > 0.8
+                    {
+                        gaps.push(
+                            GapRecord::new(
+                                GapKind::SelfCognitionBlocked,
+                                &report.cycle_id,
+                                format!(
+                                    "self-model `{}` humility {humility:.2} < 0.5 with confidence {:.2} > 0.8 — self-cognition block",
+                                    item.name, item.confidence
+                                ),
+                            )
+                            .with_entity(item.name.clone()),
+                        );
+                    }
+                }
+            }
+            Err(e) => debug!(error = %e, "loop: no self-model items to evaluate"),
+        }
+
+        // T026: Decision quality gate (FR-024) — real markdown-parsed
+        // decisions checked against 7 principles + 10 anti-patterns; CRIT
+        // quarantines the page.
+        self.run_decision_quality_gate(paths, gaps, report);
+
+        // T027: belief lifecycle (FR-025) — 90-day decay first, then the
+        // posterior < 0.2 demotion scan (preserve, never delete).
+        let beliefs_dir = paths.vault().join("wiki").join("wisdom").join("beliefs");
+        if beliefs_dir.is_dir() {
+            match zen_memory::belief::Belief::load_all(&beliefs_dir) {
+                Ok(mut beliefs) => {
+                    let decayed = zen_memory::belief::apply_decay_all(&mut beliefs, ctx.now);
+                    if decayed > 0 {
+                        info!(decayed, "loop: applied belief decay");
+                        for belief in &beliefs {
+                            if let Err(e) = belief.save(&beliefs_dir) {
+                                warn!(belief = %belief.id, error = %e, "loop: failed to save decayed belief");
+                            }
+                        }
+                    }
+                    let demote_dir = paths.memory().join("demoted-beliefs");
+                    for belief in &beliefs {
+                        if belief.posterior < 0.2 {
+                            let slug = format!("{}.md", belief.id);
+                            let from = beliefs_dir.join(&slug);
+                            if from.exists() {
+                                std::fs::create_dir_all(&demote_dir).ok();
+                                if std::fs::rename(&from, demote_dir.join(&slug)).is_ok() {
+                                    info!(belief = %belief.id, "loop: belief demoted to M2");
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "loop: belief lifecycle scan failed (cycle continues)")
+                }
+            }
+        }
+
+        // T028/T033 (FR-026/FR-032): commitment gap scan — discovers overdue
+        // commitments and feeds them into the cycle's gap vec for persistence
+        // to loop-gaps.jsonl and surfacing via `zen wiki loop gaps`.
+        let commitment_gaps = super::commitment_tracker::scan_commitment_gaps(paths, ctx.now);
+        if !commitment_gaps.is_empty() {
+            info!(
+                count = commitment_gaps.len(),
+                "loop: commitment gap scan found overdue commitments"
+            );
+            gaps.extend(commitment_gaps);
+        }
+    }
+
+    /// T026 (FR-024): scan `wiki/wisdom/decisions/*.md`, parse each via the
+    /// real zen-memory Decision markdown parser, and run BOTH the 10
+    /// anti-pattern checks (`check_all`) and the 7-principles check
+    /// (`check_decision_principles`). CRIT violations block promotion and
+    /// move the page to `vault/archive/quarantine/` (mirroring the T017
+    /// note-quarantine mechanism) with a `DecisionBlocked` gap; non-CRIT
+    /// principle violations are trace warnings only. Falls back to journal
+    /// `kind: decision` blocks when the decisions directory is empty — those
+    /// emit gaps without quarantine (no page exists yet). Idempotent: pages
+    /// already under quarantine are not re-checked.
+    fn run_decision_quality_gate(
+        &self,
+        paths: &ZenPaths,
+        gaps: &mut Vec<GapRecord>,
+        report: &mut LoopCycleReport,
+    ) {
+        use zen_memory::decision_check::check_all;
+        use zen_memory::quality_gate::check_decision_principles;
+
+        let decisions_dir = paths.vault().join("wiki").join("wisdom").join("decisions");
+        let quarantine_dir = paths.archive().join("quarantine");
+
+        if decisions_dir.is_dir()
+            && let Ok(decisions) = zen_memory::decision::Decision::load_all(&decisions_dir)
+        {
+            for decision in decisions {
+                let anti_report = check_all(&decision);
+                let principles = check_decision_principles(&decision);
+                if !principles.all_passed && !anti_report.has_crit {
+                    warn!(
+                        decision = %decision.id,
+                        "loop: decision fails {}/7 principles (non-CRIT, promotion review advised)",
+                        principles.failed_count
+                    );
+                }
+                if !anti_report.has_crit {
+                    continue;
+                }
+                let from = decisions_dir.join(format!("{}.md", decision.id));
+                let Some(file_name) = from.file_name().map(|n| n.to_os_string()) else {
+                    continue;
+                };
+                if !from.exists() || quarantine_dir.join(&file_name).exists() {
+                    continue;
+                }
+                std::fs::create_dir_all(&quarantine_dir).ok();
+                let to = quarantine_dir.join(&file_name);
+                if std::fs::rename(&from, &to).is_ok() {
+                    let crit_patterns: Vec<&str> = anti_report
+                        .violations
+                        .iter()
+                        .filter(|v| v.severity == zen_memory::decision::Severity::Crit)
+                        .map(|v| v.pattern_id.as_str())
+                        .collect();
+                    warn!(
+                        decision = %decision.id,
+                        crit = ?crit_patterns,
+                        "loop: decision quarantined (CRIT anti-pattern)"
+                    );
+                    gaps.push(
+                        GapRecord::new(
+                            GapKind::DecisionBlocked,
+                            &report.cycle_id,
+                            format!(
+                                "decision `{}` CRIT anti-patterns [{}] — quarantined",
+                                decision.id,
+                                crit_patterns.join(", ")
+                            ),
+                        )
+                        .with_path(&to),
+                    );
+                }
+            }
+            return;
+        }
+
+        // Fallback: journal `kind: decision` blocks when no decision pages
+        // exist (payload format matches the MemoryCurator routing contract).
+        let journal_dir = paths.memory().join("journal");
+        let Ok(entries) = std::fs::read_dir(&journal_dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !content.to_lowercase().contains("kind: decision") {
+                continue;
+            }
+            for raw in journal_decision_payloads(&content) {
+                let text = raw.split("|||").next().unwrap_or_default().trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let id = zen_memory::decision::Decision::slugify_title(text);
+                let decision = zen_memory::decision::Decision::new(
+                    id.clone(),
+                    text.to_string(),
+                    "journal".to_string(),
+                );
+                if check_all(&decision).has_crit {
+                    gaps.push(
+                        GapRecord::new(
+                            GapKind::DecisionBlocked,
+                            &report.cycle_id,
+                            format!("journal decision `{id}` has CRIT anti-pattern violations"),
+                        )
+                        .with_path(&path),
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl Default for ZenLoopWorker {
@@ -239,6 +463,9 @@ impl ZenWorker for ZenLoopWorker {
             }
         };
         let pipeline = DistillationPipeline::new();
+        // T033 (FR-032): per-cycle LoopBudget — constructs from config defaults
+        // since LoopConfig doesn't expose max_steps/max_tokens fields yet.
+        let mut budget = LoopBudget::default();
         let distill = pipeline
             .run_scoped(
                 &paths.inbox(),
@@ -246,30 +473,39 @@ impl ZenWorker for ZenLoopWorker {
                 &paths.archive(),
                 &logs_dir,
                 db.as_ref(),
+                Some(&mut budget),
             )
             .await;
 
         match distill {
-            Ok(dr) => {
-                report.notes_processed = dr.notes_processed;
-                report.entities_persisted = dr.entities_persisted;
-                report.pages_created = dr.wiki_pages_created;
-                report.archived_count = dr.migrated_files.len();
+            Ok(outcome) => {
+                report.notes_processed = outcome.report.notes_processed;
+                report.entities_persisted = outcome.report.entities_persisted;
+                report.pages_created = outcome.report.wiki_pages_created;
+                report.archived_count = outcome.report.migrated_files.len();
+                report.pending_count = outcome.pending_count;
+                gaps.extend(outcome.gaps);
             }
             Err(e) => {
                 report.outcome = Some(CycleOutcome::Failed);
                 report.last_error = Some(format!("distill stage: {e:#}"));
-                gaps.extend(report.gaps.drain(..));
+                gaps.append(&mut report.gaps);
                 report.gaps = gaps;
                 persist_report_and_audit(&paths, &logs_dir, &report).await?;
                 return Ok(worker_report(&report, started));
             }
         }
 
+        // ── Stage 3b: wisdom hooks (T024-T027, post-distill) ──────────────
+        // Typed-signal routing runs immediately after distill (FR-021) so
+        // routed wisdom surfaces are verified by the Stage 4 graph checks
+        // and reindexed in Stage 5 within the same cycle.
+        self.run_wisdom_hooks(&paths, ctx, &mut gaps, &mut report)
+            .await;
+
         // ── Stage 4: verify (T016) — GraphIntegrityVerifier + page lint ───
         if let Some(db) = db.as_ref() {
-            let verifier =
-                zen_vault::GraphIntegrityVerifier::new(db, &cycle_id);
+            let verifier = zen_vault::GraphIntegrityVerifier::new(db, &cycle_id);
             let inventory = zen_vault::wiki_page_inventory(&paths.wiki());
             match verifier.verify(&inventory).await {
                 Ok(mut graph_gaps) => gaps.append(&mut graph_gaps),
@@ -284,7 +520,7 @@ impl ZenWorker for ZenLoopWorker {
             Err(e) => warn!(error = %e, "loop: page lint failed (cycle continues)"),
         }
 
-        // T017: inbox-empty guarantee — leftover notes retry next cycle,
+        // T017: inbox-empty guarantee — leftover notes retry next cycles,
         // quarantined after max_attempts (FR-006/FR-010).
         {
             let max_attempts = loop_cfg.max_attempts_or_default();
@@ -349,11 +585,43 @@ impl ZenWorker for ZenLoopWorker {
             }
         }
 
+        // ── Stage 5b: Discovery Loop hypotheses (T029, FR-028) ─────────────
+        // Jeff Dean Discovery Loop: this cycle's accumulated gaps (distill,
+        // wisdom hooks, commitment tracker, graph verify) incubate into
+        // HypothesisSlug records at wiki/wisdom/hypotheses/. Idempotent
+        // per slug (save merges evidence and keeps the higher status), so
+        // repeated cycles converge instead of duplicating.
+        {
+            let hypotheses_dir = paths.vault().join("wiki/wisdom/hypotheses");
+            let slugs = zen_vault::distill::generate_from_gaps(&gaps, ctx.now);
+            for slug in &slugs {
+                if let Err(e) = zen_vault::distill::save(slug, &hypotheses_dir) {
+                    warn!(error = %e, slug = %slug.slug, "loop: hypothesis save failed");
+                }
+            }
+            if !slugs.is_empty() {
+                info!(
+                    generated = slugs.len(),
+                    exploring = slugs
+                        .iter()
+                        .filter(|s| matches!(
+                            s.status,
+                            zen_vault::distill::HypothesisStatus::Exploring
+                        ))
+                        .count(),
+                    "loop: hypotheses generated from gaps"
+                );
+            }
+        }
+
         // ── Stage 6: report + audit ───────────────────────────────────────
         let _ = self.cycles.fetch_add(1, Ordering::Relaxed);
         report.outcome = Some(CycleOutcome::Completed);
         report.gaps = gaps;
         persist_report_and_audit(&paths, &logs_dir, &report).await?;
+
+        // T033 (FR-032): local-first git history for the cycle's mutations.
+        commit_cycle_to_git(&paths, &report);
 
         Ok(worker_report(&report, started))
     }
@@ -366,6 +634,122 @@ fn worker_report(report: &LoopCycleReport, started: Instant) -> WorkerReport {
         fact_count: report.notes_processed,
         duration_ms: started.elapsed().as_millis() as u64,
         llm_cost_usd: 0.0,
+    }
+}
+
+/// Extract decision payload lines (`- text|||context|||ev`) that follow a
+/// `kind: decision` tag in a journal entry (T026 journal fallback).
+fn journal_decision_payloads(content: &str) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let mut in_decision_block = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("kind:") {
+            in_decision_block = lower.strip_prefix("kind:").is_some_and(|v| {
+                v.trim().trim_matches('"').eq_ignore_ascii_case("decision")
+                    || v.trim().trim_matches('"').eq_ignore_ascii_case("decisions")
+            });
+            continue;
+        }
+        if trimmed.starts_with("## ") {
+            in_decision_block = false;
+            continue;
+        }
+        if in_decision_block
+            && let Some(item) = trimmed.strip_prefix("- ")
+            && !item.trim().is_empty()
+            && !item.trim().starts_with("_(no ")
+        {
+            payloads.push(item.trim().to_string());
+        }
+    }
+    payloads
+}
+
+/// T033 (FR-032): commit the cycle's mutations to the workspace git repo.
+///
+/// Scope logic:
+/// - Functionality: appends a local-first history commit per cycle
+/// - User impact: `git log` in the workspace shows loop mutations
+/// - Default: skipped when no workspace root is detected or the workspace
+///   is not inside a git work tree (never initializes a repo)
+/// - Interaction: dry-run cycles return before this point; failures are
+///   logged (`nothing to commit` at debug, real errors at warn) and never
+///   fail the cycle
+fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
+    let Some(workspace_root) = paths.workspace_root() else {
+        debug!("loop: no workspace root — skipping git commit");
+        return;
+    };
+
+    let inside = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    let inside_work_tree = matches!(
+        inside,
+        Ok(out) if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+    );
+    if !inside_work_tree {
+        debug!(workspace = %workspace_root.display(), "loop: workspace not a git work tree — skipping git commit");
+        return;
+    }
+
+    let message = format!(
+        "loop: {} notes={} pages={} merged={} quarantined={}",
+        report.cycle_id,
+        report.notes_processed,
+        report.pages_created,
+        report.merged_count,
+        report.quarantined_count
+    );
+
+    let add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["add", "-A"])
+        .output();
+    match add {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            warn!(
+                workspace = %workspace_root.display(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "loop: git add failed (cycle continues)"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "loop: git add failed to spawn (cycle continues)");
+            return;
+        }
+    }
+
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["commit", "-m", &message])
+        .output();
+    match commit {
+        Ok(out) if out.status.success() => {
+            info!(workspace = %workspace_root.display(), "loop: git history committed");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if stderr.contains("nothing to commit") || stderr.contains("no changes added to commit")
+            {
+                debug!("loop: git commit skipped — nothing to commit");
+            } else {
+                warn!(
+                    workspace = %workspace_root.display(),
+                    stderr = %stderr.trim(),
+                    "loop: git commit failed (cycle continues)"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "loop: git commit failed to spawn (cycle continues)"),
     }
 }
 
@@ -431,5 +815,20 @@ mod tests {
     fn inbox_listing_empty_on_missing_dir() {
         let set = inbox_listing(Path::new("/nonexistent-zen-inbox"));
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn journal_decision_payloads_extracts_kind_blocks() {
+        let content = "---\nsession_id: s1\nkind: decision\n---\n\n- Use SQLite|||offline|||cheap\n\n## Facts\n\n- a fact\n\nkind: decisions\n\n- Ship dark mode|||demand\n- _(no decisions extracted)_\n";
+        let payloads = journal_decision_payloads(content);
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads[0].starts_with("Use SQLite"));
+        assert!(payloads[1].starts_with("Ship dark mode"));
+    }
+
+    #[test]
+    fn journal_decision_payloads_empty_without_tag() {
+        let content = "---\nsession_id: s1\n---\n\n## Facts\n\n- plain fact\n";
+        assert!(journal_decision_payloads(content).is_empty());
     }
 }

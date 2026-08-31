@@ -10215,6 +10215,7 @@ name = "zen"
 version = "0.0.8"
 dependencies = [
  "dotenvy",
+ "serde_json",
  "tempfile",
  "tokio",
  "zen-cli",
@@ -10486,6 +10487,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlite-vec",
  "sqlx",
  "tempfile",
@@ -10551,6 +10553,7 @@ dependencies = [
  "walkdir",
  "which",
  "zen-core",
+ "zen-memory",
  "zen-provider",
  "zen-repo",
 ]

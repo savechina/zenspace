@@ -233,7 +233,13 @@ impl ZenScheduler {
         let interval = self.tick_interval;
 
         // Collect workers to fire first to avoid borrow issues with spawn.
-        let mut to_fire: Vec<(String, Arc<dyn ZenWorker>, WorkerContext, Arc<std::sync::atomic::AtomicBool>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut to_fire: Vec<(
+            String,
+            Arc<dyn ZenWorker>,
+            WorkerContext,
+            Arc<std::sync::atomic::AtomicBool>,
+        )> = Vec::new();
 
         for (id, (_expr, schedule, worker, enabled, in_flight)) in &self.workers {
             if !enabled {
@@ -252,7 +258,12 @@ impl ZenScheduler {
 
             if should_fire {
                 debug!(worker = %id, "scheduler: firing worker");
-                to_fire.push((id.clone(), Arc::clone(worker), ctx.clone(), Arc::clone(in_flight)));
+                to_fire.push((
+                    id.clone(),
+                    Arc::clone(worker),
+                    ctx.clone(),
+                    Arc::clone(in_flight),
+                ));
             }
         }
 
@@ -338,12 +349,14 @@ impl ZenScheduler {
     pub fn list(&self) -> Vec<WorkerSummary> {
         self.workers
             .iter()
-            .map(|(id, (expr, _schedule, worker, enabled, _in_flight))| WorkerSummary {
-                id: id.clone(),
-                schedule: expr.clone(),
-                description: worker.description().to_string(),
-                enabled: *enabled,
-            })
+            .map(
+                |(id, (expr, _schedule, worker, enabled, _in_flight))| WorkerSummary {
+                    id: id.clone(),
+                    schedule: expr.clone(),
+                    description: worker.description().to_string(),
+                    enabled: *enabled,
+                },
+            )
             .collect()
     }
 

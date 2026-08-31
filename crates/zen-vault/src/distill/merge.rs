@@ -125,11 +125,7 @@ pub fn build_merge_plans(
             continue;
         }
 
-        let best = cluster
-            .scores
-            .values()
-            .copied()
-            .fold(0.0_f64, f64::max);
+        let best = cluster.scores.values().copied().fold(0.0_f64, f64::max);
         let (strategy, llm_merged) = if best >= pure_duplicate {
             (MergeStrategy::PureDuplicate, false)
         } else {
@@ -159,15 +155,11 @@ pub fn build_merge_plans(
                 })
                 .collect();
             if titles.len() < cluster.pages.len() {
-                gaps.push(
-                    super::types::GapRecord::new(
-                        GapKind::DuplicateEntityAlias,
-                        cycle_id,
-                        format!(
-                            "pure-duplicate cluster with alias-colliding titles: {titles:?}"
-                        ),
-                    ),
-                );
+                gaps.push(super::types::GapRecord::new(
+                    GapKind::DuplicateEntityAlias,
+                    cycle_id,
+                    format!("pure-duplicate cluster with alias-colliding titles: {titles:?}"),
+                ));
             }
         }
 
@@ -221,7 +213,10 @@ mod tests {
         let pages = vec![
             page("wiki/a.md", base),
             page("wiki/b.md", &format!("{base}\n")),
-            page("wiki/c.md", "# Totally Different\n\nThe mercado opens at dawn with fresh olives and bread."),
+            page(
+                "wiki/c.md",
+                "# Totally Different\n\nThe mercado opens at dawn with fresh olives and bread.",
+            ),
         ];
         let (plans, gaps) = build_merge_plans(&pages, 0.82, 0.98, "cycle-t");
         assert_eq!(plans.len(), 1, "one pure-duplicate cluster");
@@ -246,7 +241,10 @@ mod tests {
     fn dissimilar_pages_produce_no_plans() {
         let pages = vec![
             page("wiki/a.md", "# Rust\n\nSystems programming language."),
-            page("wiki/b.md", "# Cooking\n\nSoups require patience and good stock."),
+            page(
+                "wiki/b.md",
+                "# Cooking\n\nSoups require patience and good stock.",
+            ),
         ];
         let (plans, _) = build_merge_plans(&pages, 0.82, 0.98, "cycle-t");
         assert!(plans.is_empty());

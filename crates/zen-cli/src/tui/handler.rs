@@ -15,6 +15,18 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         return handle_text_selection_key(key, app);
     }
 
+    if app.loop_panel.visible
+        && matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Esc, KeyModifiers::NONE)
+                | (KeyCode::Char('l'), KeyModifiers::NONE)
+                | (KeyCode::Char('L'), KeyModifiers::NONE)
+        )
+    {
+        app.loop_panel.visible = false;
+        return KeyAction::Continue;
+    }
+
     if app.input.effective_mode() == InputMode::Command {
         return match (key.code, key.modifiers) {
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
@@ -108,6 +120,20 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
     }
 
     let input_before = app.input.lines().join("\n");
+
+    if matches!(
+        (key.code, key.modifiers),
+        (KeyCode::Char('l'), KeyModifiers::NONE) | (KeyCode::Char('L'), KeyModifiers::NONE)
+    ) && !app.model_picker.visible
+        && !app.session_picker.visible
+        && !app.slash_state.visible
+    {
+        app.loop_panel.toggle();
+        if app.loop_panel.visible && app.loop_panel.last_report.is_none() {
+            app.show_toast("Loop panel — no cycle yet (L to close)");
+        }
+        return KeyAction::Continue;
+    }
 
     if app.model_picker.visible {
         return match key.code {

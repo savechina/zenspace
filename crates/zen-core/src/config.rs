@@ -439,6 +439,9 @@ pub struct LoopConfig {
     pub max_attempts: Option<u32>,
     /// Pre-cycle free-space guard in bytes; below → cycle Aborted (FR-005 guard).
     pub min_free_bytes: Option<u64>,
+    /// Skip file extensions for ingest (FR-012). Default empty = no skip.
+    /// Example: `skip_extensions = ["tmp", "log", "bak"]`
+    pub skip_extensions: Option<Vec<String>>,
     /// Host directories governed by FR-033 (default empty = feature off).
     pub host_sources: Vec<HostSourceConfig>,
 }
@@ -466,6 +469,17 @@ impl LoopConfig {
 
     pub fn min_free_bytes_or_default(&self) -> u64 {
         self.min_free_bytes.unwrap_or(100 * 1024 * 1024)
+    }
+
+    pub fn skip_extensions_or_default(&self) -> Vec<String> {
+        self.skip_extensions.clone().unwrap_or_default()
+    }
+
+    pub fn is_extension_skipped(&self, ext: &str) -> bool {
+        let lower = ext.to_ascii_lowercase();
+        self.skip_extensions_or_default()
+            .iter()
+            .any(|e| e.to_ascii_lowercase() == lower)
     }
 }
 
@@ -1161,6 +1175,7 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
         merge_llm_model: str_merge(base.merge_llm_model, ov.merge_llm_model),
         max_attempts: ov.max_attempts.or(base.max_attempts),
         min_free_bytes: ov.min_free_bytes.or(base.min_free_bytes),
+        skip_extensions: ov.skip_extensions.or(base.skip_extensions),
         host_sources: if ov.host_sources.is_empty() {
             base.host_sources
         } else {
@@ -1430,17 +1445,27 @@ fn apply_loop_env(cfg: &mut LoopConfig) {
     if let Some(v) = env_str("ZEN_LOOP_INTERVAL") {
         cfg.interval = Some(v);
     }
-    if let Some(v) = env_str("ZEN_LOOP_MERGE_THRESHOLD") {
-        if let Ok(f) = v.parse() {
-            cfg.merge_threshold = Some(f);
-        }
+    if let Some(v) = env_str("ZEN_LOOP_MERGE_THRESHOLD")
+        && let Ok(f) = v.parse()
+    {
+        cfg.merge_threshold = Some(f);
     }
     if let Some(v) = env_u32("ZEN_LOOP_MAX_ATTEMPTS") {
         cfg.max_attempts = Some(v);
     }
-    if let Some(v) = env_str("ZEN_LOOP_MIN_FREE_BYTES") {
-        if let Ok(n) = v.parse() {
-            cfg.min_free_bytes = Some(n);
+    if let Some(v) = env_str("ZEN_LOOP_MIN_FREE_BYTES")
+        && let Ok(n) = v.parse()
+    {
+        cfg.min_free_bytes = Some(n);
+    }
+    if let Some(v) = env_str("ZEN_LOOP_SKIP_EXTENSIONS") {
+        let list = v
+            .split(',')
+            .map(|s| s.trim().trim_start_matches('.').to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if !list.is_empty() {
+            cfg.skip_extensions = Some(list);
         }
     }
 }

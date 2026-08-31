@@ -5,8 +5,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
+use zen_core::jsonl::append_jsonl_line;
 use zen_core::paths::ZenPaths;
 use zen_memory::commitment::Commitment;
+use zen_vault::distill::{GapKind, GapRecord};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
@@ -72,7 +74,7 @@ impl ZenWorker for CommitmentTracker {
         self.scheduled.unwrap_or("0 0 8 * * *")
     }
 
-    async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
+    async fn execute(&self, ctx: &WorkerContext) -> Result<WorkerReport> {
         let start = std::time::Instant::now();
         let paths = ZenPaths::detect()?;
 
@@ -198,6 +200,24 @@ impl ZenWorker for CommitmentTracker {
                 );
                 anti_talk_warnings += 1;
             }
+        }
+
+        let gap_records = scan_commitment_gaps(&paths, ctx.now);
+        if !gap_records.is_empty() {
+            let gaps_file = paths.logs().join("loop-gaps.jsonl");
+            for gap in &gap_records {
+                if let Err(e) = append_jsonl_line(&gaps_file, gap) {
+                    warn!(
+                        path = %gaps_file.display(),
+                        error = %e,
+                        "failed to append commitment gap record"
+                    );
+                }
+            }
+            info!(
+                count = gap_records.len(),
+                "commitment gap records emitted to loop-gaps.jsonl"
+            );
         }
 
         if due_count > 0 {
@@ -441,10 +461,181 @@ fn compute_all_anti_talk(commitments: &[Commitment], journal_dir: &Path) -> Vec<
     indicators
 }
 
+/// Scan persisted commitments for loop-gap conditions (FR-026).
+///
+/// Loads commitments from `memories/commitments/*.md` and emits:
+/// - [`GapKind::CommitmentOverdue`] for every active commitment whose
+///   `review_at` has passed (`Commitment::is_overdue`) — detail = slug + review_at.
+/// - [`GapKind::AntiTalkSuspect`] for every commitment whose
+///   mention-to-achievement ratio exceeds 5.0 (DESIGN §9.5 空谈警报) —
+///   detail = ratio + mention/milestone counts.
+///
+/// # Parameters
+/// - `paths`: workspace paths — commitments are read from
+///   `paths.vault()/memories/commitments/`, mentions counted in
+///   `paths.journal_entries()`.
+/// - `now`: detection timestamp; also scopes the generated `cycle_id`
+///   (`commitment-tracker-{timestamp}`) for audit lineage.
+///
+/// # Returns
+/// One `GapRecord` per detected condition (possibly empty).
+///
+/// # Errors
+/// None — load/IO failures degrade to `warn!` logs and skipped entries so a
+/// broken commitments file never fails the calling cycle.
+///
+/// # Example
+/// ```ignore
+/// let gaps = scan_commitment_gaps(&ZenPaths::detect()?, Utc::now());
+/// assert!(gaps.iter().all(|g| g.cycle_id.starts_with("commitment-tracker-")));
+/// ```
+pub fn scan_commitment_gaps(paths: &ZenPaths, now: DateTime<Utc>) -> Vec<GapRecord> {
+    let cycle_id = format!("commitment-tracker-{}", now.format("%Y%m%dT%H%M%SZ"));
+
+    let commitments_dir = paths.vault().join("memories/commitments");
+    let commitments = match Commitment::load_all(&commitments_dir) {
+        Ok(cs) => cs,
+        Err(e) => {
+            warn!(
+                dir = %commitments_dir.display(),
+                error = %e,
+                "failed to load commitments for gap scan, skipping"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut gaps = Vec::new();
+    for c in &commitments {
+        if c.is_overdue() {
+            let review_at = c
+                .review_at
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "none".to_string());
+            gaps.push(
+                GapRecord::new(
+                    GapKind::CommitmentOverdue,
+                    &cycle_id,
+                    format!(
+                        "commitment '{}' overdue for review (review_at={})",
+                        c.slug(),
+                        review_at
+                    ),
+                )
+                .with_path(format!("memories/commitments/{}.md", c.slug())),
+            );
+        }
+    }
+
+    let journal_dir = paths.journal_entries();
+    for at in compute_all_anti_talk(&commitments, &journal_dir) {
+        if at.ratio > 5.0 {
+            gaps.push(
+                GapRecord::new(
+                    GapKind::AntiTalkSuspect,
+                    &cycle_id,
+                    format!(
+                        "anti-talk suspect '{}' ratio={:.1} (mentions={}, milestones={})",
+                        at.commitment_slug, at.ratio, at.mention_count, at.milestone_count
+                    ),
+                )
+                .with_path(format!("memories/commitments/{}.md", at.commitment_slug)),
+            );
+        }
+    }
+
+    gaps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_scan_commitment_gaps_emits_overdue_and_anti_talk() {
+        let tmp = tempdir().unwrap();
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        let commitments_dir = paths.vault().join("memories/commitments");
+        let journal_dir = paths.journal_entries();
+        fs::create_dir_all(&commitments_dir).unwrap();
+        fs::create_dir_all(&journal_dir).unwrap();
+
+        // Overdue + anti-talk: past review_at, 10 mentions, 0 milestones.
+        let mut c1 = Commitment::new("ship feature X");
+        c1.review_at = Some((Utc::now() - chrono::Duration::days(3)).date_naive());
+        c1.save(&commitments_dir).unwrap();
+        let mentions = "talk about ship feature X again\n".repeat(10);
+        fs::write(journal_dir.join("2026-08-29.md"), &mentions).unwrap();
+
+        // Healthy: future review_at, no mentions.
+        let mut c2 = Commitment::new("balanced work");
+        c2.review_at = Some((Utc::now() + chrono::Duration::days(3)).date_naive());
+        c2.save(&commitments_dir).unwrap();
+
+        let now = Utc::now();
+        let gaps = scan_commitment_gaps(&paths, now);
+
+        assert_eq!(gaps.len(), 2, "expected overdue + anti-talk gaps");
+        assert!(
+            gaps.iter()
+                .all(|g| g.cycle_id.starts_with("commitment-tracker-"))
+        );
+
+        let overdue = gaps
+            .iter()
+            .find(|g| g.kind == GapKind::CommitmentOverdue)
+            .expect("expected CommitmentOverdue gap");
+        assert!(
+            overdue.detail.contains("ship-feature-x"),
+            "detail: {}",
+            overdue.detail
+        );
+        assert!(overdue.detail.contains("review_at="));
+        assert_eq!(
+            overdue.subject_path.as_deref(),
+            Some("memories/commitments/ship-feature-x.md")
+        );
+
+        let anti_talk = gaps
+            .iter()
+            .find(|g| g.kind == GapKind::AntiTalkSuspect)
+            .expect("expected AntiTalkSuspect gap");
+        assert!(
+            anti_talk.detail.contains("ratio=10.0"),
+            "detail: {}",
+            anti_talk.detail
+        );
+        assert!(anti_talk.detail.contains("mentions=10"));
+        assert!(anti_talk.detail.contains("milestones=0"));
+    }
+
+    #[test]
+    fn test_scan_commitment_gaps_healthy_commitments_no_gaps() {
+        let tmp = tempdir().unwrap();
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        let commitments_dir = paths.vault().join("memories/commitments");
+        fs::create_dir_all(&commitments_dir).unwrap();
+
+        let mut c = Commitment::new("on track work");
+        c.review_at = Some((Utc::now() + chrono::Duration::days(7)).date_naive());
+        c.add_milestone("m1", None);
+        c.complete_milestone(0).unwrap();
+        c.save(&commitments_dir).unwrap();
+
+        let gaps = scan_commitment_gaps(&paths, Utc::now());
+        assert!(gaps.is_empty(), "expected no gaps, got {:?}", gaps);
+    }
+
+    #[test]
+    fn test_scan_commitment_gaps_missing_dir_returns_empty() {
+        let tmp = tempdir().unwrap();
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+
+        let gaps = scan_commitment_gaps(&paths, Utc::now());
+
+        assert!(gaps.is_empty());
+    }
 
     #[test]
     fn test_extract_commitments_from_journal() {

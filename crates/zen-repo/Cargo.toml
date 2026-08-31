@@ -17,6 +17,7 @@ rusqlite = { workspace = true }
 tokio-rusqlite = { workspace = true }
 libc = { workspace = true }
 sqlite-vec = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

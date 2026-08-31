@@ -33,36 +33,56 @@ impl CycleOutcome {
 /// compatibility alias for the manual `zen wiki distill` code path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoopCycleReport {
+    /// Unique cycle identifier (uuid v7, `cycle-{id}`).
     pub cycle_id: String,
+    /// Wall-clock start (Utc::now at `zen_loop` tick); None before first tick.
     pub started_at: Option<DateTime<Utc>>,
+    /// Wall-clock end; None while Running.
     pub finished_at: Option<DateTime<Utc>>,
+    /// Terminal outcome — Completed / Failed / Aborted; None while in-flight.
     pub outcome: Option<CycleOutcome>,
+    /// When true, pipeline runs read-only (FR-018); no DB/FS mutations.
     pub dry_run: bool,
+    /// Inbox notes loaded before filtering (FR-001).
     pub notes_processed: usize,
+    /// Entities durably upserted via NotionService (FR-003/T003).
     pub entities_persisted: usize,
+    /// New wiki pages compiled via WikiCompiler (FR-004).
     pub pages_created: usize,
+    /// Wiki pages merged via `execute_merge_plans` (FR-016/T015).
     pub merged_count: usize,
+    /// Raw notes archived to `vault/archive/<yyyy-mm>/` (FR-006/T005).
     pub archived_count: usize,
+    /// Notes moved to `vault/quarantine/` after max retries (FR-010).
     pub quarantined_count: usize,
+    /// Notes deferred due to LoopBudget over-limit (FR-032).
     pub pending_count: usize,
     /// Page-lint results run in-cycle (T016, FR-005/SC-003).
     pub lint_orphan_pages: usize,
+    /// Broken `[[wikilink]]` targets counted by Linter; 0 = clean (FR-005).
     pub lint_broken_wikilinks: usize,
+    /// Detected gaps for next discovery cycle (FR-014, data-model §3).
     pub gaps: Vec<GapRecord>,
+    /// Last cycle-level error message, if any; None on success.
     pub last_error: Option<String>,
 }
 
 /// One detected knowledge-processing gap (data-model §3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapRecord {
+    /// Gap UUID v7 — stable id for HypothesisSlug trace (FR-028).
     pub id: String,
+    /// Gap taxonomy variant (FR-014, additive-only).
     pub kind: GapKind,
     /// Vault-relative path of the offending page/note, if any.
     pub subject_path: Option<String>,
     /// Entity name the gap is about, if any.
     pub subject_entity: Option<String>,
+    /// Human-readable gap description (e.g., "orphan: Foo").
     pub detail: String,
+    /// Detection wall-clock time (Utc::now).
     pub detected_at: DateTime<Utc>,
+    /// Originating cycle_id for audit lineage.
     pub cycle_id: String,
 }
 
@@ -168,16 +188,26 @@ pub enum JobState {
 /// dedup survives a crash and is never in-memory-only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingJob {
+    /// Note id (notes_meta.note_id) — durable identity for dedup (FR-011 F3).
     pub note_id: String,
+    /// Vault-relative inbox path of the note file.
     pub source_path: PathBuf,
+    /// SHA-256 content_hash for crash-safe dedup; never in-memory-only.
     pub checksum: String,
+    /// Current FSM state (Queued→Processing→Completed/Failed→Quarantined).
     pub state: JobState,
+    /// Retry attempts consumed; max via LoopConfig.max_attempts (default 3).
     pub attempts: u8,
+    /// Last failure message, if any.
     pub last_error: Option<String>,
 }
 
 impl ProcessingJob {
-    pub fn new(note_id: impl Into<String>, source_path: PathBuf, checksum: impl Into<String>) -> Self {
+    pub fn new(
+        note_id: impl Into<String>,
+        source_path: PathBuf,
+        checksum: impl Into<String>,
+    ) -> Self {
         Self {
             note_id: note_id.into(),
             source_path,
@@ -208,20 +238,30 @@ pub enum TypedSignalKind {
 /// Bayesian belief record (FR-025, M2→M4 lifecycle).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Belief {
+    /// Proposition text (e.g., "Rust is fast").
     pub proposition: String,
+    /// Prior probability 0.0–1.0 before evidence (default 0.5 if missing).
     pub prior: f64,
+    /// Posterior after Bayesian update 0.0–1.0.
     pub posterior: f64,
+    /// Number of supporting evidence items.
     pub evidence_count: u32,
+    /// Last Bayesian update timestamp.
     pub last_updated: DateTime<Utc>,
 }
 
 /// Prospective commitment (FR-026, M5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commitment {
+    /// Commitment description — what is promised.
     pub what: String,
+    /// Target deadline; None = no hard deadline (open-ended).
     pub by_when: Option<DateTime<Utc>>,
+    /// Daily review trigger time; past due → CommitmentOverdue gap (FR-026).
     pub review_at: Option<DateTime<Utc>>,
+    /// Current lifecycle state (Drafted→Validated→Executing…).
     pub lifecycle: CommitmentLifecycle,
+    /// Consecutive on-track days; AntiTalk detection when streak+mention ratio fails.
     pub discipline_streak: u32,
 }
 
@@ -238,22 +278,31 @@ pub enum CommitmentLifecycle {
     Pivoted,
 }
 
-/// Decision 5-layer record (FR-024).
+/// Decision 5-layer record (FR-024) — goal→facts→logic→execution→feedback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
+    /// Layer-1: decision objective (what to achieve).
     pub goal: String,
+    /// Layer-2: supporting facts (evidence).
     pub facts: Vec<String>,
+    /// Layer-3: reasoning chain (why this choice).
     pub logic: String,
+    /// Layer-4: action items to execute.
     pub execution: Vec<String>,
+    /// Layer-5: retrospective; None until closed.
     pub feedback: Option<String>,
 }
 
 /// 8-layer SelfModel introspective node (FR-023).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfModelItem {
+    /// Introspection layer taxonomy (Knowledge→Limit, 8 variants).
     pub layer: SelfModelLayer,
+    /// Human-readable self-assessment label.
     pub label: String,
+    /// 0.0–1.0 humility metric; <0.5 with high confidence triggers SelfCognitionBlocked gap.
     pub humility_score: Option<f64>,
+    /// Alternative options considered; None = not counted.
     pub optionality_count: Option<u32>,
 }
 
@@ -274,13 +323,21 @@ pub enum SelfModelLayer {
 /// Discovery Loop hypothesis (FR-028, filesystem JSON persistence).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HypothesisSlug {
+    /// Filesystem-safe slug (kebab-case, unique).
     pub slug: String,
+    /// Hypothesis statement text.
     pub hypothesis: String,
+    /// Source gap taxonomy that spawned this hypothesis.
     pub gap_kind: GapKind,
+    /// 0.0–1.0 confidence; <0.6 filtered (SC-012).
     pub confidence: f64,
+    /// Lifecycle: Hypothesis→Exploring→Validated/Rejected.
     pub status: HypothesisStatus,
+    /// LLM exploration prompt, if generated.
     pub exploration_prompt: Option<String>,
+    /// Vault-relative evidence file paths.
     pub evidence_refs: Vec<String>,
+    /// Originating gap/cycle reference (gap_id or cycle_id).
     pub created_from: String,
 }
 
@@ -297,8 +354,11 @@ pub enum HypothesisStatus {
 /// Pre-declared target page reserved during Agent planning (FR-031).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphPlaceholder {
+    /// Target page slug (must match wiki page naming convention).
     pub slug: String,
+    /// Lifecycle: Placeholder→Claimed→Merged.
     pub status: PlaceholderStatus,
+    /// Agent id claiming this placeholder; None if unclaimed.
     pub claimed_by: Option<String>,
 }
 
@@ -314,9 +374,13 @@ pub enum PlaceholderStatus {
 /// Per-ingest token & step budget (FR-032, OCC/CAS enforcement).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopBudget {
+    /// Step ceiling per cycle; default 5 (T032).
     pub max_steps: u32,
+    /// Token ceiling per cycle; default 8000 (T032).
     pub max_tokens: u32,
+    /// Steps consumed this cycle; >max_steps → pending pool.
     pub consumed_steps: u32,
+    /// Tokens consumed this cycle; >max_tokens → pending pool.
     pub consumed_tokens: u32,
 }
 
@@ -359,10 +423,15 @@ impl LoopBudget {
 /// ORAV per-source verification node (FR-029, transient).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationNode {
+    /// Slug naming convention passed (no illegal chars).
     pub slug_legality: bool,
+    /// Facts cross-referenced against sources OK.
     pub fact_consistency: bool,
+    /// Contradiction detected in this verification round.
     pub contradiction_detected: bool,
+    /// Verification will be retried next cycle.
     pub will_retry: bool,
+    /// Associated gap id, if any.
     pub gap_ref: Option<String>,
 }
 
@@ -370,9 +439,13 @@ pub struct VerificationNode {
 /// persisted at `memories/.reward/{card_id}.json`, additive & non-destructive.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryReward {
+    /// Total retrieval count for this memory card.
     pub access_count: u64,
+    /// References by downstream memories (citation graph).
     pub downstream_citations: u64,
+    /// Corrections applied to this memory.
     pub correction_count: u64,
+    /// Last RLVR reward update timestamp.
     pub last_reward_at: Option<DateTime<Utc>>,
 }
 
@@ -380,10 +453,15 @@ pub struct MemoryReward {
 /// appended to `sessions/{session_id}/tool_calls.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Tool name identifier (e.g., "fs.read").
     pub tool: String,
+    /// Call succeeded without error.
     pub success: bool,
+    /// Round-trip latency in milliseconds.
     pub latency_ms: u64,
+    /// ErrorCategory classification if failed (AgenticError category).
     pub error_category: Option<String>,
+    /// Call timestamp (Utc::now at completion).
     pub recorded_at: DateTime<Utc>,
 }
 
@@ -442,5 +520,42 @@ mod tests {
         let job = ProcessingJob::new("n1", PathBuf::from("inbox/a.md"), "hash");
         assert_eq!(job.state, JobState::Queued);
         assert_eq!(job.attempts, 0);
+    }
+
+    #[test]
+    fn loop_budget_token_exhaustion_pending_pool() {
+        let mut b = LoopBudget::default();
+        assert!(b.consume_tokens(4_000));
+        assert!(!b.over_budget());
+        assert!(b.consume_tokens(3_999));
+        assert!(!b.over_budget());
+        assert!(b.consume_tokens(1));
+        assert!(b.over_budget());
+        assert_eq!(b.consumed_tokens, 8_000);
+        assert!(!b.consume_tokens(1));
+    }
+
+    #[test]
+    fn loop_budget_skip_extensions_config_is_default() {
+        let mut b = LoopBudget {
+            max_steps: 1,
+            max_tokens: 100,
+            consumed_steps: 0,
+            consumed_tokens: 0,
+        };
+        assert!(b.consume_step());
+        assert!(b.over_budget());
+        assert!(!b.consume_step());
+    }
+
+    #[test]
+    fn content_hash_sha256_is_64_hex() {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(b"hello world");
+        assert_eq!(hash.len(), 32);
+        let hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(hex, "");
     }
 }

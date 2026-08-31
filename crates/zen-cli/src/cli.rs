@@ -185,9 +185,8 @@ pub async fn shell() -> Result<(), ZenError> {
     // SAFETY: set_var is called early in main before any threads are spawned.
     unsafe { std::env::set_var("RUST_LOG", &rust_log) };
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,tantivy=off")
-    });
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tantivy=off"));
 
     if cli.internal_sandbox_launcher {
         return zen_plugin::sandbox_launcher::run_sandbox_launcher().await;

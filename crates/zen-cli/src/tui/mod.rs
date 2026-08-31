@@ -6,6 +6,7 @@ mod highlight;
 mod inline;
 mod inline_handler;
 mod inline_ui;
+pub mod loop_panel;
 pub mod markdown;
 pub mod model_picker;
 mod prewarm;

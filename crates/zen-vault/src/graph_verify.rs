@@ -1,17 +1,24 @@
-//! Graph structural-integrity verification (005-agentic-loop, T014, FR-015).
+//! Graph structural-integrity verification (005-agentic-loop, T014, FR-015)
+//! and placeholder-based graph ingest registry (T032, FR-031).
 //!
 //! Three mechanical checks after each processing cycle (data-model §6):
 //! 1. every wiki concept page has a DB entity → [`GapKind::WikiPageWithoutEntities`]
 //! 2. no orphan entities (no page, no relationships) → [`GapKind::OrphanEntity`]
 //! 3. all relationships resolve to existing entities, canonical names via the
 //!    existing `notion_aliases` table (I1) → [`GapKind::UnresolvedRelationship`]
+//!
+//! The [`PlaceholderRegistry`] implements FR-031 concurrency control: target
+//! page slugs declared during Agent planning as `GraphPlaceholder` slots, with
+//! concurrent ingest tasks downgraded to updates when the slot is owned by
+//! another agent — avoiding LLM task stalls from lock contention.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
-use crate::distill::types::{GapKind, GapRecord};
+use crate::distill::types::{GapKind, GapRecord, GraphPlaceholder, PlaceholderStatus};
 
 /// Wiki concept page → DB entity consistency verifier.
 ///
@@ -33,10 +40,7 @@ impl<'a> GraphIntegrityVerifier<'a> {
     /// Run all three checks. `pages` = (concept name, vault-relative path)
     /// for every wiki page; relationship resolution canonicalizes through
     /// `notion_aliases` with `LEFT JOIN`-style fallback to identity (F1).
-    pub async fn verify(
-        &self,
-        pages: &[(String, String)],
-    ) -> Result<Vec<GapRecord>> {
+    pub async fn verify(&self, pages: &[(String, String)]) -> Result<Vec<GapRecord>> {
         let mut gaps = Vec::new();
 
         let entities = self.repo.load_all_entities().await?;
@@ -165,6 +169,152 @@ pub fn wiki_page_inventory(wiki_dir: &Path) -> Vec<(String, String)> {
     out
 }
 
+// ── Placeholder-based graph ingest (FR-031, T032a) ─────────────────────
+
+/// Outcome of a concurrent claim against a declared placeholder slot (FR-031).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimDecision {
+    /// The caller owns the slot and may create the target page.
+    Created,
+    /// The slot is owned by another agent (or already merged into the wiki)
+    /// — the caller must downgrade its create into an update to avoid LLM
+    /// task stalls from lock contention.
+    DowngradeToUpdate,
+}
+
+/// Placeholder-based graph ingest registry (FR-031, T032a).
+///
+/// During Agent planning, target page names are declared as placeholder
+/// slugs ([`GraphPlaceholder`]). Concurrent ingest tasks claiming an
+/// already-owned slug receive [`ClaimDecision::DowngradeToUpdate`] and become
+/// updates instead of competing creates.
+///
+/// Persistence: [`save`](Self::save)/[`load`](Self::load) a JSON file (the
+/// caller picks the path, typically `<logs>/placeholders.json`) so the
+/// registry survives process restarts within a cycle window.
+///
+/// # Examples
+///
+/// ```
+/// use zen_vault::graph_verify::{ClaimDecision, PlaceholderRegistry};
+///
+/// let mut reg = PlaceholderRegistry::new();
+/// reg.declare("rust-async", "agent-a");
+/// assert_eq!(reg.claim("rust-async", "agent-b"), ClaimDecision::DowngradeToUpdate);
+/// assert_eq!(reg.claim("rust-async", "agent-a"), ClaimDecision::Created);
+/// ```
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PlaceholderRegistry {
+    slots: HashMap<String, GraphPlaceholder>,
+}
+
+impl PlaceholderRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declare a target page slug during planning. Idempotent: the earliest
+    /// declaration wins and a re-declare by any agent is a no-op, so the
+    /// slot keeps its original owner.
+    pub fn declare(&mut self, slug: &str, claimed_by: &str) {
+        self.slots
+            .entry(slug.to_string())
+            .or_insert_with(|| GraphPlaceholder {
+                slug: slug.to_string(),
+                status: PlaceholderStatus::Placeholder,
+                claimed_by: Some(claimed_by.to_string()),
+            });
+    }
+
+    /// Claim a slug for an ingest task.
+    ///
+    /// Returns [`ClaimDecision::Created`] when the slot is free or already
+    /// owned by `claimed_by` (ownership is taken/refreshed, status advances
+    /// to `Claimed`). Returns [`ClaimDecision::DowngradeToUpdate`] when the
+    /// slot is `Placeholder`/`Claimed` by a different owner, or `Merged`
+    /// (any owner — the page already exists, so creates become updates).
+    pub fn claim(&mut self, slug: &str, claimed_by: &str) -> ClaimDecision {
+        let free = match self.slots.get(slug) {
+            None => true,
+            Some(slot) => {
+                slot.status != PlaceholderStatus::Merged
+                    && slot
+                        .claimed_by
+                        .as_deref()
+                        .is_none_or(|owner| owner == claimed_by)
+            }
+        };
+        if free {
+            self.slots.insert(
+                slug.to_string(),
+                GraphPlaceholder {
+                    slug: slug.to_string(),
+                    status: PlaceholderStatus::Claimed,
+                    claimed_by: Some(claimed_by.to_string()),
+                },
+            );
+            ClaimDecision::Created
+        } else {
+            ClaimDecision::DowngradeToUpdate
+        }
+    }
+
+    /// Mark a slot as merged into the main wiki graph. Merging an unknown
+    /// slug records a `Merged` slot so post-hoc lookups still resolve.
+    pub fn merge(&mut self, slug: &str) {
+        match self.slots.get_mut(slug) {
+            Some(slot) => slot.status = PlaceholderStatus::Merged,
+            None => {
+                self.slots.insert(
+                    slug.to_string(),
+                    GraphPlaceholder {
+                        slug: slug.to_string(),
+                        status: PlaceholderStatus::Merged,
+                        claimed_by: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Look up the placeholder record for `slug`, if declared.
+    pub fn lookup(&self, slug: &str) -> Option<&GraphPlaceholder> {
+        self.slots.get(slug)
+    }
+
+    /// Owner-less pre-flight check for task planners: true when `slug` is
+    /// reserved in any state (Placeholder, Claimed, or Merged), meaning a
+    /// create targeting it must downgrade to an update. Agents that already
+    /// hold the slot use [`Self::claim`] instead.
+    pub fn downgrade_to_update(&self, slug: &str) -> bool {
+        self.slots.contains_key(slug)
+    }
+
+    /// Persist the registry as pretty JSON at `path`. Parent directories are
+    /// the caller's responsibility (typically the logs dir).
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let json =
+            serde_json::to_string_pretty(self).context("serializing placeholder registry")?;
+        std::fs::write(path, json)
+            .with_context(|| format!("writing placeholder registry {}", path.display()))
+    }
+
+    /// Load a registry from `path`. A missing file yields an empty registry
+    /// (first run within a cycle window); a corrupt file is an error so
+    /// concurrency state is never silently discarded.
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(json) => serde_json::from_str(&json)
+                .with_context(|| format!("parsing placeholder registry {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => {
+                Err(e).with_context(|| format!("reading placeholder registry {}", path.display()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +335,112 @@ mod tests {
         assert_eq!(inv.len(), 2, "non-md excluded");
         let (_, rel) = &inv[0];
         assert!(!rel.starts_with('/'), "vault-relative");
+    }
+
+    #[test]
+    fn placeholder_declare_claim_conflict_downgrades() {
+        let mut reg = PlaceholderRegistry::new();
+        reg.declare("rust-async", "agent-a");
+        assert_eq!(
+            reg.lookup("rust-async").unwrap().status,
+            PlaceholderStatus::Placeholder
+        );
+
+        // Concurrent task by another agent downgrades instead of competing.
+        assert_eq!(
+            reg.claim("rust-async", "agent-b"),
+            ClaimDecision::DowngradeToUpdate
+        );
+        assert_eq!(
+            reg.lookup("rust-async").unwrap().claimed_by.as_deref(),
+            Some("agent-a")
+        );
+
+        // Owner re-claim advances the slot to Claimed.
+        assert_eq!(reg.claim("rust-async", "agent-a"), ClaimDecision::Created);
+        assert_eq!(
+            reg.lookup("rust-async").unwrap().status,
+            PlaceholderStatus::Claimed
+        );
+
+        // Re-declare after claiming is a no-op (earliest declaration wins).
+        reg.declare("rust-async", "agent-z");
+        assert_eq!(
+            reg.lookup("rust-async").unwrap().claimed_by.as_deref(),
+            Some("agent-a")
+        );
+
+        // Undeclared slug → fresh create.
+        assert_eq!(reg.claim("fresh-page", "agent-b"), ClaimDecision::Created);
+        assert!(reg.downgrade_to_update("fresh-page"));
+        assert!(!reg.downgrade_to_update("never-declared"));
+    }
+
+    #[test]
+    fn placeholder_merge_state() {
+        let mut reg = PlaceholderRegistry::new();
+        reg.declare("tokio-runtime", "agent-a");
+        reg.merge("tokio-runtime");
+        assert_eq!(
+            reg.lookup("tokio-runtime").unwrap().status,
+            PlaceholderStatus::Merged
+        );
+
+        // Merged slot: every later claim downgrades (the page exists).
+        assert_eq!(
+            reg.claim("tokio-runtime", "agent-a"),
+            ClaimDecision::DowngradeToUpdate
+        );
+        assert_eq!(
+            reg.claim("tokio-runtime", "agent-c"),
+            ClaimDecision::DowngradeToUpdate
+        );
+
+        // Merging an unknown slug records a Merged slot for later lookups.
+        reg.merge("late-page");
+        assert_eq!(
+            reg.lookup("late-page").unwrap().status,
+            PlaceholderStatus::Merged
+        );
+    }
+
+    #[test]
+    fn placeholder_save_load_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("placeholders.json");
+
+        let mut reg = PlaceholderRegistry::new();
+        reg.declare("rust-async", "agent-a");
+        reg.claim("rust-async", "agent-a");
+        reg.declare("stale-note", "agent-b");
+        reg.merge("merged-page");
+        reg.save(&path).unwrap();
+
+        let loaded = PlaceholderRegistry::load(&path).unwrap();
+        assert_eq!(
+            loaded.lookup("rust-async").unwrap().status,
+            PlaceholderStatus::Claimed
+        );
+        assert_eq!(
+            loaded.lookup("rust-async").unwrap().claimed_by.as_deref(),
+            Some("agent-a")
+        );
+        assert_eq!(
+            loaded.lookup("stale-note").unwrap().claimed_by.as_deref(),
+            Some("agent-b")
+        );
+        assert_eq!(
+            loaded.lookup("merged-page").unwrap().status,
+            PlaceholderStatus::Merged
+        );
+
+        // Missing file → empty registry (first run in a cycle window).
+        let fresh = PlaceholderRegistry::load(&tmp.path().join("absent.json")).unwrap();
+        assert!(fresh.lookup("rust-async").is_none());
+
+        // Corrupt file → hard error (concurrency state never silently dropped).
+        let corrupt = tmp.path().join("corrupt.json");
+        std::fs::write(&corrupt, "{ not json").unwrap();
+        assert!(PlaceholderRegistry::load(&corrupt).is_err());
     }
 }

@@ -14,6 +14,9 @@ pub struct IdentityContext {
     pub soul: Option<String>,
     pub memory: Option<String>,
     pub agents: Option<String>,
+    /// 8-layer self-model items from `memories/self-model/{slug}.md`
+    /// (FR-023, T025). `None` when the directory is absent or unreadable.
+    pub self_model: Option<Vec<crate::self_model::SelfModelItem>>,
 }
 
 impl IdentityContext {
@@ -41,6 +44,48 @@ impl IdentityContext {
         if other.agents.is_some() {
             self.agents = other.agents;
         }
+        if other.self_model.is_some() {
+            self.self_model = other.self_model;
+        }
+    }
+
+    /// Short rendered summary of the self-model items, one line per item:
+    /// layer, label, humility score, optionality count (FR-023).
+    ///
+    /// # Returns
+    ///
+    /// - `Some(String)` when self-model items are loaded and non-empty.
+    /// - `None` when no self-model was loaded (directory absent or empty) —
+    ///   callers treat this as "no self-model exposure" and skip the section.
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// - [knowledge] GTD 5 Steps — humility: n/a, optionality: n/a
+    /// - [self_concept] Calibrates fast — humility: 0.42, optionality: 3
+    /// ```
+    #[must_use]
+    pub fn self_model_summary(&self) -> Option<String> {
+        let items = self.self_model.as_ref()?;
+        if items.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for item in items {
+            let humility = item
+                .humility_score
+                .map(|h| format!("{h:.2}"))
+                .unwrap_or_else(|| "n/a".to_string());
+            let optionality = item
+                .optionality_count
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            out.push_str(&format!(
+                "- [{}] {} — humility: {humility}, optionality: {optionality}\n",
+                item.layer, item.name
+            ));
+        }
+        Some(out)
     }
 
     /// SOUL.md content as `&str` (empty string when absent).
@@ -255,6 +300,66 @@ mod tests {
         };
         a.merge(b);
         assert_eq!(a.soul, Some("new".into()));
+    }
+
+    #[test]
+    fn test_self_model_summary_none_when_absent() {
+        let ctx = IdentityContext::default();
+        assert!(ctx.self_model_summary().is_none());
+    }
+
+    #[test]
+    fn test_self_model_summary_none_when_empty() {
+        let ctx = IdentityContext {
+            self_model: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(ctx.self_model_summary().is_none());
+    }
+
+    #[test]
+    fn test_self_model_summary_renders_layer_label_humility_optionality() {
+        use crate::self_model::SelfModelItem;
+        use zen_core::notion_graph::SelfModelLayer;
+
+        let mut item = SelfModelItem::new(
+            "sc-1".into(),
+            SelfModelLayer::SelfConcept,
+            "Calibrates fast".into(),
+            "meta".into(),
+        );
+        item.humility_score = Some(0.42);
+        item.optionality_count = Some(3);
+
+        let ctx = IdentityContext {
+            self_model: Some(vec![item]),
+            ..Default::default()
+        };
+        let summary = ctx.self_model_summary().unwrap();
+        assert!(summary.contains("[self_concept] Calibrates fast"));
+        assert!(summary.contains("humility: 0.42"));
+        assert!(summary.contains("optionality: 3"));
+    }
+
+    #[test]
+    fn test_identity_context_merge_takes_self_model() {
+        use crate::self_model::{SelfModelItem, SelfModelLayer};
+
+        let mut a = IdentityContext::default();
+        let b = IdentityContext {
+            self_model: Some(vec![SelfModelItem::new(
+                "k1".into(),
+                SelfModelLayer::Knowledge,
+                "K1".into(),
+                "d".into(),
+            )]),
+            ..Default::default()
+        };
+        a.merge(b);
+        assert!(a.self_model.is_some());
+        assert_eq!(a.self_model.as_ref().unwrap().len(), 1);
+        // self_model does not count toward file_count (it is not a file tier)
+        assert_eq!(a.file_count(), 0);
     }
 
     #[test]

@@ -20,11 +20,24 @@ const TWIN: &str = "# Rust Handbook\n\nRust and Tokio power the zen workspace fo
 fn merge_folds_pure_duplicates_into_one_page() {
     let test = ZenTest::new();
     assert!(test.zen(&["workspace", "init"]).success());
-    seed_note(&test, "rust-a.md", &format!("---\nid: \"rust-a\"\n---\n\n{BASE}\n"));
-    seed_note(&test, "rust-b.md", &format!("---\nid: \"rust-b\"\n---\n\n{TWIN}\n"));
+    seed_note(
+        &test,
+        "rust-a.md",
+        &format!("---\nid: \"rust-a\"\n---\n\n{BASE}\n"),
+    );
+    seed_note(
+        &test,
+        "rust-b.md",
+        &format!("---\nid: \"rust-b\"\n---\n\n{TWIN}\n"),
+    );
 
     let run = test.zen(&["wiki", "loop", "run"]);
-    assert!(run.success(), "run failed: {} {}", run.stdout(), run.stderr());
+    assert!(
+        run.success(),
+        "run failed: {} {}",
+        run.stdout(),
+        run.stderr()
+    );
 
     let archive = test.cwd.join("vault").join("archive");
     let archived: Vec<String> = find_md(&archive)
