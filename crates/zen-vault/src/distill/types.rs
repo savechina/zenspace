@@ -124,7 +124,8 @@ pub enum GapKind {
     UnresolvedRelationship,
     /// Malformed note moved to quarantine.
     QuarantinedNote,
-    /// Note failed N retries, quarantined.
+    /// Reserved for LLM distillation failures (not yet emitted; LLM stage
+    /// lands with T046).
     LlmFailure,
     /// Normalized alias collision per DESIGN §7.3 (FR-022).
     DuplicateEntityAlias,
