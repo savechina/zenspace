@@ -32,6 +32,7 @@ impl CycleOutcome {
 /// Supersedes [`super::DistillationReport`], which remains as a thin
 /// compatibility alias for the manual `zen wiki distill` code path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoopCycleReport {
     /// Unique cycle identifier (uuid v7, `cycle-{id}`).
     pub cycle_id: String,
@@ -63,6 +64,25 @@ pub struct LoopCycleReport {
     pub lint_broken_wikilinks: usize,
     /// Detected gaps for next discovery cycle (FR-014, data-model §3).
     pub gaps: Vec<GapRecord>,
+    /// Hypotheses generated from gaps this cycle (FR-028, Stage 5b).
+    pub hypotheses_generated: usize,
+    /// External-fetch prompts queued by the refinement queue (FR-028, Stage 5c).
+    pub refinement_fetch_prompts: usize,
+    /// Precise user questions queued by the refinement queue (FR-028, Stage 5c).
+    pub refinement_user_questions: usize,
+    /// Hypotheses transitioned by periodic re-verify (FR-028, Stage 5c).
+    pub hypotheses_reverified: usize,
+    /// Raw sources routed through the graph Router & Join (FR-030, Stage 3a).
+    pub raw_sources_routed: usize,
+    /// Notions joined into the graph from raw sources (FR-030, Stage 3a).
+    pub raw_notions_joined: usize,
+    /// Page creates downgraded to updates via PlaceholderRegistry (FR-031).
+    pub placeholder_downgrades: usize,
+    /// True when the cycle's wiki writes were rolled back by CAS drift
+    /// detection (FR-032).
+    pub cas_rolled_back: bool,
+    /// Paths that drifted outside the cycle's VersionSnapshot (FR-032).
+    pub cas_drifted: Vec<String>,
     /// Last cycle-level error message, if any; None on success.
     pub last_error: Option<String>,
 }

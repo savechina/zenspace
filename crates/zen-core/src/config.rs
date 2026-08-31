@@ -420,7 +420,9 @@ pub struct AgenticConfig {
 /// - Functionality: gates `ZenLoopWorker` cron registration and merge/distill tuning.
 /// - User impact: `enabled = false` makes the loop manual-only (`zen wiki loop run` still works).
 /// - Default: enabled=true, 5-min cron, merge threshold 0.82, pure-duplicate 0.98,
-///   max_attempts 3, min_free_bytes 100 MiB, host_sources empty (FR-033 off).
+///   max_attempts 3, min_free_bytes 100 MiB, host_sources empty (FR-033 off),
+///   hypothesis_refinement true, reverify_older_than_days 7,
+///   raw_graph_routing true, cas_commit true.
 /// - Interaction: `ZEN_LOOP_*` env vars override any config layer (5th layer).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -444,6 +446,19 @@ pub struct LoopConfig {
     pub skip_extensions: Option<Vec<String>>,
     /// Host directories governed by FR-033 (default empty = feature off).
     pub host_sources: Vec<HostSourceConfig>,
+    /// Run FR-028 hypothesis refinement (queue build + periodic reverify)
+    /// in the cycle's Stage 5c. Default true.
+    pub hypothesis_refinement: Option<bool>,
+    /// Re-verify hypotheses older than this many days (FR-028 Compounding
+    /// Synthesis). Default 7.
+    pub reverify_older_than_days: Option<u64>,
+    /// Route `raw/` non-note sources through the FR-030 GraphRouter each
+    /// cycle (Code/Paper tracks join entities without wiki compile).
+    /// Default true.
+    pub raw_graph_routing: Option<bool>,
+    /// Commit distill wiki writes via FR-032 OCC/CAS (VersionSnapshot +
+    /// commit_conditional) instead of unconditional commit. Default true.
+    pub cas_commit: Option<bool>,
 }
 
 impl LoopConfig {
@@ -473,6 +488,22 @@ impl LoopConfig {
 
     pub fn skip_extensions_or_default(&self) -> Vec<String> {
         self.skip_extensions.clone().unwrap_or_default()
+    }
+
+    pub fn hypothesis_refinement_or_default(&self) -> bool {
+        self.hypothesis_refinement.unwrap_or(true)
+    }
+
+    pub fn reverify_older_than_days_or_default(&self) -> u64 {
+        self.reverify_older_than_days.unwrap_or(7)
+    }
+
+    pub fn raw_graph_routing_or_default(&self) -> bool {
+        self.raw_graph_routing.unwrap_or(true)
+    }
+
+    pub fn cas_commit_or_default(&self) -> bool {
+        self.cas_commit.unwrap_or(true)
     }
 
     pub fn is_extension_skipped(&self, ext: &str) -> bool {
@@ -1181,6 +1212,12 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
         } else {
             ov.host_sources
         },
+        hypothesis_refinement: ov.hypothesis_refinement.or(base.hypothesis_refinement),
+        reverify_older_than_days: ov
+            .reverify_older_than_days
+            .or(base.reverify_older_than_days),
+        raw_graph_routing: ov.raw_graph_routing.or(base.raw_graph_routing),
+        cas_commit: ov.cas_commit.or(base.cas_commit),
     }
 }
 
