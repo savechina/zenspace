@@ -26,15 +26,23 @@ use crate::note::{Note, parse_frontmatter};
 use crate::tindy::checksum::ChangeDetector;
 use crate::wiki::WikiPage;
 
+/// Summary of a single distillation pipeline run.
+///
+/// Produced by [`DistillationPipeline::run`] and [`DistillationPipeline::run_scoped`]
+/// to report per-cycle metrics to the worker and scheduler.
 #[derive(Debug, Clone)]
 pub struct DistillationReport {
+    /// Inbox `.md` files loaded and processed this cycle.
     pub notes_processed: usize,
+    /// Entities extracted from notes via NotionExtractor.
     pub entities_extracted: usize,
     /// Notions durably upserted into the DB graph via NotionService (T003).
     pub entities_persisted: usize,
+    /// New wiki pages compiled by WikiCompiler this cycle.
     pub wiki_pages_created: usize,
     /// Wiki merge plans executed (T015, FR-016).
     pub merged_count: usize,
+    /// Contradictions detected between note content and existing wiki pages.
     pub contradictions_found: usize,
     /// Raw notes archived to `vault/archive/<yyyy-mm>/` (T005; was wiki-moves).
     pub migrated_files: Vec<(PathBuf, PathBuf)>,
@@ -356,6 +364,9 @@ fn archive_processed_notes(
     archived
 }
 
+/// Orchestrates the full distillation pipeline: budget gate, normalize,
+/// notion extraction, wiki compilation, contradiction detection, merge,
+/// ORAV self-correction, and archival.
 pub struct DistillationPipeline {
     extractor: NotionExtractor,
     compiler: WikiCompiler,
@@ -366,6 +377,7 @@ pub struct DistillationPipeline {
 }
 
 impl DistillationPipeline {
+    /// Create a new pipeline with default (heuristic-only) configuration.
     pub fn new() -> Self {
         Self {
             extractor: NotionExtractor::new(),
@@ -1293,14 +1305,19 @@ impl Workflow for DistillationPipeline {
     }
 }
 
+/// Input bundle for the rig-compose [`Workflow`] implementation.
 #[derive(Debug, Clone)]
 pub struct DistillationPipelineInput {
+    /// Directory containing inbox `.md` notes to process.
     pub inbox_dir: PathBuf,
+    /// Target directory for compiled wiki pages.
     pub wiki_dir: PathBuf,
+    /// When `true`, pipeline runs read-only — no FS/DB mutations.
     pub dry_run: bool,
 }
 
 impl DistillationPipelineInput {
+    /// Create an input with `dry_run: false`.
     pub fn new(inbox_dir: PathBuf, wiki_dir: PathBuf) -> Self {
         Self {
             inbox_dir,
@@ -1309,6 +1326,7 @@ impl DistillationPipelineInput {
         }
     }
 
+    /// Enable dry-run mode: pipeline executes without writing to disk.
     pub fn with_dry_run(mut self) -> Self {
         self.dry_run = true;
         self

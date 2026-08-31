@@ -13,7 +13,7 @@ pub mod traits;
 pub mod types;
 
 pub use beliefs_repo::BeliefsRepo;
-pub use client::{SqliteClient, SqliteError};
+pub use client::{SqliteClient, SqliteError, probe_latest_version};
 pub use dispatch_repo::{DispatchRepo, DispatchTaskRow};
 pub use embeddings_repo::EmbeddingsRepo;
 pub use goals_repo::GoalsRepo;

@@ -20,7 +20,9 @@ pub use hypothesis::{
     build_exploration_prompt, build_refinement_queue, confidence_for, gap_type, generate_from_gaps,
     load_all, reverify, save, slug_for,
 };
-pub use merge::{MergeStrategy, WikiMergePlan, build_merge_plans, trigram_jaccard};
+pub use merge::{
+    MergeStrategy, WikiMergePlan, build_merge_plans, normalize_notion_name, trigram_jaccard,
+};
 pub use notion_extraction::NotionExtractor;
 pub use pipeline::{
     DistillationPipeline, DistillationPipelineInput, DistillationReport, ScopedRunOutcome,

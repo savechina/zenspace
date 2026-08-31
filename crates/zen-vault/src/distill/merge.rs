@@ -13,6 +13,19 @@ use serde::{Deserialize, Serialize};
 use super::types::GapKind;
 use crate::wiki::WikiPage;
 
+/// Normalize a notion (page/entity) name to a canonical lowercase form for
+/// clustering and alias resolution.
+///
+/// Strips Obsidian-style punctuation suffixes (`.js`, `.rs`, `.py`, `.ts`,
+/// `.go`, `.java`, `.rb`, `-lang`, ` lang`, ` language`) and lowercases,
+/// so `rust`, `Rust`, `rust-lang`, `rust.js` all resolve to `rust`.
+///
+/// Delegates to [`zen_repo::normalize_alias`] which implements the canonical
+/// suffix-stripping logic shared across the workspace (Principle XI: reuse).
+pub fn normalize_notion_name(name: &str) -> String {
+    zen_repo::normalize_alias(name)
+}
+
 /// What a merge plan will do with its cluster (data-model §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,13 +41,17 @@ pub enum MergeStrategy {
 /// Execution plan for one cluster of similar pages (data-model §5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WikiMergePlan {
+    /// Unique plan identifier (uuid v7).
     pub cluster_id: String,
     /// Pages folded into the target (includes it; ≥2 for an actionable plan).
     pub source_pages: Vec<PathBuf>,
+    /// Pairwise trigram-Jaccard similarity scores within the cluster.
     pub similarity_scores: HashMap<(PathBuf, PathBuf), f64>,
+    /// Strategy chosen based on similarity thresholds.
     pub strategy: MergeStrategy,
     /// The surviving page (largest content wins; ties → first path).
     pub target_page: PathBuf,
+    /// Whether the merge was LLM-assisted (currently always `false`).
     pub llm_merged: bool,
 }
 
@@ -75,13 +92,19 @@ struct Cluster {
     scores: HashMap<(PathBuf, PathBuf), f64>,
 }
 
-/// Cluster wiki pages by pairwise trigram-Jaccard similarity (greedy,
-/// seed-ordered — deterministic for identical inputs).
+/// Cluster wiki pages by name-normalization grouping and pairwise
+/// trigram-Jaccard similarity (greedy, seed-ordered — deterministic for
+/// identical inputs).
+///
+/// Phase 1: pages whose titles normalize to the same string via
+/// [`normalize_notion_name`] are forced into one cluster regardless of
+/// content similarity (so `rust`, `Rust`, `rust-lang`, `rust.js` coalesce).
+/// Phase 2: remaining singletons are clustered by content trigram-Jaccard.
 ///
 /// `threshold` = cluster entry (default 0.82), `pure_duplicate` = short-circuit
 /// (default 0.98). Returns actionable [`WikiMergePlan`]s plus
-/// `DuplicateEntityAlias` gaps for pure-duplicate title collisions detected
-/// during clustering.
+/// `DuplicateEntityAlias` gaps for alias collisions detected during
+/// clustering.
 pub fn build_merge_plans(
     pages: &[WikiPage],
     threshold: f64,
@@ -97,6 +120,46 @@ pub fn build_merge_plans(
     let mut plans = Vec::new();
     let mut gaps = Vec::new();
 
+    // Phase 1: pre-group by normalized title — pages with the same canonical
+    // name (e.g. "rust" from "rust", "rust-lang", "rust.js") are forced into
+    // one cluster.
+    let mut title_groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (path, _)) in items.iter().enumerate() {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let norm = normalize_notion_name(&stem);
+        title_groups.entry(norm).or_default().push(i);
+    }
+
+    for indices in title_groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let mut cluster = Cluster {
+            pages: Vec::new(),
+            scores: HashMap::new(),
+        };
+        for &idx in indices {
+            cluster.pages.push(items[idx].clone());
+            used[idx] = true;
+        }
+        // Compute pairwise similarity within the forced cluster.
+        for a in 0..cluster.pages.len() {
+            for b in (a + 1)..cluster.pages.len() {
+                let sim = trigram_jaccard(&cluster.pages[a].1, &cluster.pages[b].1);
+                cluster.scores.insert(
+                    (cluster.pages[a].0.clone(), cluster.pages[b].0.clone()),
+                    sim,
+                );
+            }
+        }
+        emit_cluster_plan(&cluster, pure_duplicate, cycle_id, &mut plans, &mut gaps);
+    }
+
+    // Phase 2: content-based trigram-Jaccard clustering for remaining
+    // singletons not captured by title normalization.
     for i in 0..items.len() {
         if used[i] {
             continue;
@@ -124,56 +187,65 @@ pub fn build_merge_plans(
         if cluster.pages.len() < 2 {
             continue;
         }
-
-        let best = cluster.scores.values().copied().fold(0.0_f64, f64::max);
-        let (strategy, llm_merged) = if best >= pure_duplicate {
-            (MergeStrategy::PureDuplicate, false)
-        } else {
-            (MergeStrategy::Merge, false)
-        };
-
-        // Target = page with the most content (stable: first on tie).
-        let target = cluster
-            .pages
-            .iter()
-            .enumerate()
-            .max_by_key(|(idx, (_, content))| (content.len(), std::cmp::Reverse(*idx)))
-            .map(|(_, (path, _))| path.clone())
-            .expect("cluster has ≥2 pages");
-
-        // Pure duplicates with identical normalized titles = alias collision.
-        if strategy == MergeStrategy::PureDuplicate {
-            let titles: HashSet<String> = cluster
-                .pages
-                .iter()
-                .map(|(p, _)| {
-                    zen_repo::normalize_alias(
-                        &p.file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect();
-            if titles.len() < cluster.pages.len() {
-                gaps.push(super::types::GapRecord::new(
-                    GapKind::DuplicateEntityAlias,
-                    cycle_id,
-                    format!("pure-duplicate cluster with alias-colliding titles: {titles:?}"),
-                ));
-            }
-        }
-
-        plans.push(WikiMergePlan {
-            cluster_id: uuid::Uuid::now_v7().to_string(),
-            source_pages: cluster.pages.into_iter().map(|(p, _)| p).collect(),
-            similarity_scores: cluster.scores,
-            strategy,
-            target_page: target,
-            llm_merged,
-        });
+        emit_cluster_plan(&cluster, pure_duplicate, cycle_id, &mut plans, &mut gaps);
     }
 
     (plans, gaps)
+}
+
+/// Emit a [`WikiMergePlan`] (and any alias-collision gap) for a completed
+/// cluster. Shared by both the title-normalization and trigram phases.
+fn emit_cluster_plan(
+    cluster: &Cluster,
+    pure_duplicate: f64,
+    cycle_id: &str,
+    plans: &mut Vec<WikiMergePlan>,
+    gaps: &mut Vec<super::types::GapRecord>,
+) {
+    let best = cluster.scores.values().copied().fold(0.0_f64, f64::max);
+    let (strategy, llm_merged) = if best >= pure_duplicate {
+        (MergeStrategy::PureDuplicate, false)
+    } else {
+        (MergeStrategy::Merge, false)
+    };
+
+    let target = cluster
+        .pages
+        .iter()
+        .enumerate()
+        .max_by_key(|(idx, (_, content))| (content.len(), std::cmp::Reverse(*idx)))
+        .map(|(_, (path, _))| path.clone())
+        .expect("cluster has ≥2 pages");
+
+    // Detect alias collisions: multiple pages with the same normalized title
+    // in the same cluster.
+    let titles: HashSet<String> = cluster
+        .pages
+        .iter()
+        .map(|(p, _)| {
+            normalize_notion_name(
+                &p.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    if titles.len() < cluster.pages.len() {
+        gaps.push(super::types::GapRecord::new(
+            GapKind::DuplicateEntityAlias,
+            cycle_id,
+            format!("cluster with alias-colliding titles: {titles:?}"),
+        ));
+    }
+
+    plans.push(WikiMergePlan {
+        cluster_id: uuid::Uuid::now_v7().to_string(),
+        source_pages: cluster.pages.iter().map(|(p, _)| p.clone()).collect(),
+        similarity_scores: cluster.scores.clone(),
+        strategy,
+        target_page: target,
+        llm_merged,
+    });
 }
 
 #[cfg(test)]
@@ -261,5 +333,34 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].kind, GapKind::DuplicateEntityAlias);
+    }
+
+    #[test]
+    fn normalized_titles_coalesce_rust_variants() {
+        let content_a = "# Rust\n\nSystems programming language with ownership and borrowing.";
+        let content_b = "# Rust Lang\n\nThe Rust programming language, also known as rust-lang.";
+        let content_c = "# Rust.js\n\nA JavaScript binding for Rust.";
+        let pages = vec![
+            page("wiki/rust.md", content_a),
+            page("wiki/rust-lang.md", content_b),
+            page("wiki/rust.js.md", content_c),
+        ];
+        let (plans, _gaps) = build_merge_plans(&pages, 0.82, 0.98, "cycle-t");
+        assert_eq!(
+            plans.len(),
+            1,
+            "all three rust variants coalesce into one cluster"
+        );
+        assert_eq!(plans[0].source_pages.len(), 3);
+    }
+
+    #[test]
+    fn normalize_notion_name_strips_suffixes() {
+        assert_eq!(normalize_notion_name("Rust"), "rust");
+        assert_eq!(normalize_notion_name("rust-lang"), "rust");
+        assert_eq!(normalize_notion_name("rust.js"), "rust");
+        assert_eq!(normalize_notion_name("TypeScript.ts"), "typescript");
+        assert_eq!(normalize_notion_name("Go-lang"), "go");
+        assert_eq!(normalize_notion_name("C Language"), "c");
     }
 }

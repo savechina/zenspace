@@ -24,18 +24,48 @@ use zen_vault::{DistillationPipeline, Reindexer};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
-/// Where the last cycle report is persisted (`<logs>/loop-last-report.json`).
+/// Return the path to the last cycle report file.
+///
+/// # Parameters
+/// - `logs_dir` — the workspace `<logs>/` directory (from `ZenPaths::logs()`).
+///
+/// # Returns
+/// Absolute path `<logs_dir>/loop-last-report.json`.
+///
+/// # Errors
+/// This is a pure path-join; it never fails. The file may not exist.
 pub fn last_report_path(logs_dir: &Path) -> PathBuf {
     logs_dir.join("loop-last-report.json")
 }
 
-/// Where gap records accumulate (`<logs>/loop-gaps.jsonl`).
+/// Return the path to the gap records JSONL file.
+///
+/// # Parameters
+/// - `logs_dir` — the workspace `<logs>/` directory.
+///
+/// # Returns
+/// Absolute path `<logs_dir>/loop-gaps.jsonl`. Each line is a `GapRecord`.
+///
+/// # Errors
+/// Pure path-join; never fails. The file may not exist.
 pub fn gaps_path(logs_dir: &Path) -> PathBuf {
     logs_dir.join("loop-gaps.jsonl")
 }
 
-/// Persisted retry counters (`<logs>/loop-attempts.json`) — survives the
-/// per-run worker instances of manual `zen wiki loop run` invocations.
+/// Return the path to the persistent retry-attempts JSON file.
+///
+/// Survives per-run worker instances of manual `zen wiki loop run`
+/// invocations, so stale-inbox quarantine counters persist across cycles.
+///
+/// # Parameters
+/// - `logs_dir` — the workspace `<logs>/` directory.
+///
+/// # Returns
+/// Absolute path `<logs_dir>/loop-attempts.json`. Maps inbox filenames to
+/// their consecutive-failure count.
+///
+/// # Errors
+/// Pure path-join; never fails. The file may not exist.
 pub fn attempts_path(logs_dir: &Path) -> PathBuf {
     logs_dir.join("loop-attempts.json")
 }
@@ -53,7 +83,12 @@ fn save_attempts(logs_dir: &Path, attempts: &HashMap<String, u8>) {
     }
 }
 
-/// The cron-driven knowledge-processing loop (worker contract, Phase 1).
+/// The cron-driven knowledge-processing loop worker.
+///
+/// Executes the full cycle: pre-cycle guards, ingest sweep, distill,
+/// wisdom hooks (T024-T027), graph verify, reindex, report + audit,
+/// and optional git commit (T033). Registered in `ZenScheduler` and
+/// fires on a configurable cron interval (default `0 */5 * * * *`).
 pub struct ZenLoopWorker {
     scheduled: Option<&'static str>,
     /// Inbox file names seen in the previous cycle — stale = seen ≥2 cycles
@@ -72,6 +107,11 @@ pub struct ZenLoopWorker {
 }
 
 impl ZenLoopWorker {
+    /// Create a new worker with default settings.
+    ///
+    /// # Returns
+    /// A `ZenLoopWorker` with default cron schedule (`0 */5 * * * *`),
+    /// dry-run disabled, and cron enabled.
     pub fn new() -> Self {
         Self {
             scheduled: None,
@@ -84,19 +124,44 @@ impl ZenLoopWorker {
         }
     }
 
-    /// Override the cron schedule (from `[agentic.loop] interval`).
+    /// Override the cron schedule expression.
+    ///
+    /// # Parameters
+    /// - `expr` — a cron expression (e.g. `"0 */10 * * * *"`).
+    ///
+    /// # Returns
+    /// The modified worker (builder pattern).
+    ///
+    /// # Errors
+    /// None at construction time; invalid cron expressions are caught at
+    /// scheduler registration.
     pub fn with_schedule(mut self, expr: &str) -> Self {
         self.scheduled = Some(Box::leak(expr.to_string().into_boxed_str()));
         self
     }
 
-    /// Dry-run mode: skip distill/reindex mutations, report only.
+    /// Enable or disable dry-run mode.
+    ///
+    /// When dry-run is active, the worker computes the cycle but skips all
+    /// distill and reindex mutations — report-only.
+    ///
+    /// # Parameters
+    /// - `dry_run` — `true` to skip mutations, `false` for normal execution.
+    ///
+    /// # Returns
+    /// The modified worker (builder pattern).
     pub fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
         self
     }
 
-    /// Cron-disabled state (registered but never fires; manual `run` unaffected).
+    /// Disable cron registration (worker is registered but never fires).
+    ///
+    /// Manual invocations via `zen wiki loop run` are unaffected — `run`
+    /// constructs its own worker and calls `trigger()` directly.
+    ///
+    /// # Returns
+    /// The modified worker (builder pattern).
     pub fn disabled(mut self) -> Self {
         self.cron_enabled = false;
         self
@@ -355,6 +420,7 @@ impl ZenLoopWorker {
     }
 }
 
+/// Convenience: `ZenLoopWorker::default()` returns `ZenLoopWorker::new()`.
 impl Default for ZenLoopWorker {
     fn default() -> Self {
         Self::new()
@@ -373,6 +439,11 @@ fn inbox_listing(inbox: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// `ZenWorker` implementation — the main cycle entry point.
+///
+/// `execute()` runs the full 6-stage pipeline: pre-cycle guards, ingest
+/// sweep, distill, wisdom hooks, graph verify + reindex, report + audit.
+/// Returns a `WorkerReport` with cycle metadata.
 #[async_trait::async_trait]
 impl ZenWorker for ZenLoopWorker {
     fn id(&self) -> &'static str {
@@ -482,6 +553,7 @@ impl ZenWorker for ZenLoopWorker {
                 report.notes_processed = outcome.report.notes_processed;
                 report.entities_persisted = outcome.report.entities_persisted;
                 report.pages_created = outcome.report.wiki_pages_created;
+                report.merged_count = outcome.report.merged_count;
                 report.archived_count = outcome.report.migrated_files.len();
                 report.pending_count = outcome.pending_count;
                 gaps.extend(outcome.gaps);

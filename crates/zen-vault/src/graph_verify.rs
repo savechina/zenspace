@@ -1,11 +1,13 @@
 //! Graph structural-integrity verification (005-agentic-loop, T014, FR-015)
 //! and placeholder-based graph ingest registry (T032, FR-031).
 //!
-//! Three mechanical checks after each processing cycle (data-model §6):
+//! Four mechanical checks after each processing cycle (data-model §6):
 //! 1. every wiki concept page has a DB entity → [`GapKind::WikiPageWithoutEntities`]
 //! 2. no orphan entities (no page, no relationships) → [`GapKind::OrphanEntity`]
 //! 3. all relationships resolve to existing entities, canonical names via the
 //!    existing `notion_aliases` table (I1) → [`GapKind::UnresolvedRelationship`]
+//! 4. no two distinct canonical entities resolve to the same normalized alias
+//!    (left-joins `notion_aliases` via `normalize_alias`) → [`GapKind::DuplicateEntityAlias`]
 //!
 //! The [`PlaceholderRegistry`] implements FR-031 concurrency control: target
 //! page slugs declared during Agent planning as `GraphPlaceholder` slots, with
@@ -30,6 +32,7 @@ pub struct GraphIntegrityVerifier<'a> {
 }
 
 impl<'a> GraphIntegrityVerifier<'a> {
+    /// Create a verifier backed by the given DB client.
     pub fn new(client: &'a zen_repo::SqliteClient, cycle_id: &str) -> Self {
         Self {
             repo: zen_repo::NotionsRepo::new(client),
@@ -116,6 +119,54 @@ impl<'a> GraphIntegrityVerifier<'a> {
                     );
                 }
             }
+        }
+
+        // ── Check 4: alias collision — two distinct canonical entities ──
+        // sharing the same normalized name or alias (T039, FR-022).
+        // Left-joins `notion_aliases` via `normalize_alias` on both entity
+        // names and each entity's stored aliases.
+        let mut normalized_map: HashMap<String, Vec<String>> = HashMap::new();
+        for entity in &entities {
+            let norm = zen_repo::normalize_alias(&entity.name);
+            normalized_map
+                .entry(norm)
+                .or_default()
+                .push(entity.id.clone());
+        }
+        // Also check aliases: an alias of entity A that normalizes to
+        // entity B's name means both resolve to the same normalized form.
+        for entity in &entities {
+            if let Ok(aliases) = self.repo.load_aliases_for_entity(&entity.id).await {
+                for alias in aliases {
+                    let norm = zen_repo::normalize_alias(&alias);
+                    let entry = normalized_map.entry(norm).or_default();
+                    if !entry.contains(&entity.id) {
+                        entry.push(entity.id.clone());
+                    }
+                }
+            }
+        }
+        for (norm, entity_ids_in_group) in &normalized_map {
+            if entity_ids_in_group.len() < 2 {
+                continue;
+            }
+            let names: Vec<String> = entity_ids_in_group
+                .iter()
+                .filter_map(|id| {
+                    entities
+                        .iter()
+                        .find(|e| &e.id == id)
+                        .map(|e| e.name.clone())
+                })
+                .collect();
+            gaps.push(
+                GapRecord::new(
+                    GapKind::DuplicateEntityAlias,
+                    &self.cycle_id,
+                    format!("alias collision: entities {names:?} all normalize to `{norm}`"),
+                )
+                .with_entity(names.first().cloned().unwrap_or_default()),
+            );
         }
 
         Ok(gaps)
@@ -442,5 +493,65 @@ mod tests {
         let corrupt = tmp.path().join("corrupt.json");
         std::fs::write(&corrupt, "{ not json").unwrap();
         assert!(PlaceholderRegistry::load(&corrupt).is_err());
+    }
+
+    #[tokio::test]
+    async fn alias_collision_emits_duplicate_entity_alias_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        let client = zen_repo::SqliteClient::open(&db).await.unwrap();
+        let repo = zen_repo::NotionsRepo::new(&client);
+
+        repo.insert_entity("e1", "Rust", "Concept", "2026-01-01")
+            .await
+            .unwrap();
+        repo.insert_entity("e2", "rust-lang", "Concept", "2026-01-01")
+            .await
+            .unwrap();
+
+        let verifier = GraphIntegrityVerifier::new(&client, "cycle-collision-test");
+        let gaps = verifier.verify(&[]).await.unwrap();
+
+        let collision_gaps: Vec<_> = gaps
+            .iter()
+            .filter(|g| g.kind == GapKind::DuplicateEntityAlias)
+            .collect();
+        assert_eq!(
+            collision_gaps.len(),
+            1,
+            "expected exactly one DuplicateEntityAlias gap, got {}",
+            collision_gaps.len()
+        );
+        assert!(
+            collision_gaps[0].detail.contains("Rust"),
+            "gap detail should mention the colliding entity names"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_collision_when_names_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        let client = zen_repo::SqliteClient::open(&db).await.unwrap();
+        let repo = zen_repo::NotionsRepo::new(&client);
+
+        repo.insert_entity("e1", "Rust", "Concept", "2026-01-01")
+            .await
+            .unwrap();
+        repo.insert_entity("e2", "Python", "Concept", "2026-01-01")
+            .await
+            .unwrap();
+
+        let verifier = GraphIntegrityVerifier::new(&client, "cycle-no-collision");
+        let gaps = verifier.verify(&[]).await.unwrap();
+
+        let collision_gaps: Vec<_> = gaps
+            .iter()
+            .filter(|g| g.kind == GapKind::DuplicateEntityAlias)
+            .collect();
+        assert!(
+            collision_gaps.is_empty(),
+            "no collision expected for distinct names"
+        );
     }
 }

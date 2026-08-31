@@ -17,38 +17,146 @@ use zen_core::jsonl::read_jsonl_lines;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{CycleOutcome, LoopCycleReport};
 
+/// Subcommands for `zen wiki loop` — manual trigger and observability
+/// surface for the ZenLoopWorker knowledge-processing loop.
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: manual trigger + observability surface for ZenLoopWorker.
+/// - User impact: `run` executes one full cycle regardless of enabled state;
+///   enable/disable only gates the cron registration (next tick).
+/// - Default: enabled=true from config; run is always allowed.
+/// - Interaction: same worker code path as the scheduler tick (contracts/cli.md).
 #[derive(Subcommand)]
 pub enum LoopCommands {
-    /// Execute one full processing cycle immediately
+    /// Execute one full processing cycle immediately.
+    ///
+    /// Runs the same code path as the cron tick: ingest sweep, distill,
+    /// wisdom hooks, graph verify, reindex, report + audit. The cycle
+    /// executes even when the loop is disabled via `disable`.
     Run {
-        /// Compute the cycle but perform no mutations (report only)
+        /// Compute the cycle but perform no mutations (report only).
+        ///
+        /// Scope logic:
+        /// - Functionality: read-only cycle — distill and reindex stages
+        ///   are skipped; ingest sweep and gap detection still run.
+        /// - User impact: no files are moved, created, or archived; the
+        ///   report shows what *would* happen.
+        /// - Default: false (full mutations).
+        /// - Interaction: --dry-run overrides ZEN_LOOP_DRY_RUN env var.
         #[arg(long)]
         dry_run: bool,
-        /// Machine-readable LoopCycleReport
+
+        /// Machine-readable LoopCycleReport.
+        ///
+        /// Scope logic:
+        /// - Functionality: outputs the full `LoopCycleReport` as JSON
+        ///   instead of the human-readable summary.
+        /// - User impact: suitable for scripting, piping, or dashboard
+        ///   ingestion; fields include cycle_id, outcome, notes_processed,
+        ///   entities_persisted, pages_created, archived_count, gaps.
+        /// - Default: false (human-readable output).
+        /// - Interaction: --json can be combined with --dry-run.
         #[arg(long)]
         json: bool,
     },
-    /// Show loop state: last cycle report, schedule, open gap counts
+
+    /// Show loop state: last cycle report, schedule, open gap counts.
+    ///
+    /// Scope logic:
+    /// - Functionality: reads `loop-last-report.json` and counts gaps
+    ///   by kind from `loop-gaps.jsonl`; does not trigger a cycle.
+    /// - User impact: shows enabled state, cron schedule, last cycle
+    ///   outcome, and open gap counts per kind.
+    /// - Default: human-readable table output.
+    /// - Interaction: --json outputs a single JSON object with
+    ///   `last_cycle`, `schedule`, `enabled`, and `open_gaps` fields.
     Status {
-        /// Machine-readable status object
+        /// Machine-readable status object.
+        ///
+        /// Scope logic:
+        /// - Functionality: outputs a JSON object with last_cycle
+        ///   (LoopCycleReport or null), schedule (cron string), enabled
+        ///   (bool), and open_gaps (map of kind to count).
+        /// - User impact: suitable for scripting or monitoring dashboards.
+        /// - Default: false (human-readable output).
         #[arg(long)]
         json: bool,
     },
-    /// List detected gap records (most recent first)
+
+    /// List detected gap records (most recent first).
+    ///
+    /// Scope logic:
+    /// - Functionality: reads `loop-gaps.jsonl` and displays records in
+    ///   reverse-chronological order; optional kind filter narrows results.
+    /// - User impact: shows gap kind, detail, and subject path for each
+    ///   record; useful for diagnosing stale inbox files, quarantined
+    ///   notes, decision blocks, or belief lifecycle events.
+    /// - Default: all gap kinds, human-readable format.
     Gaps {
-        /// Filter by gap kind (e.g. orphan_entity)
+        /// Filter by gap kind (e.g. orphan_entity).
+        ///
+        /// Scope logic:
+        /// - Functionality: retains only records whose `kind` field
+        ///   matches the given value (exact string match).
+        /// - User impact: narrows output to a specific concern, e.g.
+        ///   `--kind decision_blocked` shows only quarantined decisions.
+        /// - Default: no filter (all kinds shown).
+        /// - Values: decision_blocked, commitment_overdue,
+        ///   self_cognition_blocked, anti_talk_suspect, quarantined_note,
+        ///   wiki_page_without_entities, orphan_entity,
+        ///   duplicate_entity_alias.
         #[arg(long)]
         kind: Option<String>,
-        /// Machine-readable GapRecord array
+
+        /// Machine-readable GapRecord array.
+        ///
+        /// Scope logic:
+        /// - Functionality: outputs the filtered gap records as a JSON
+        ///   array instead of the human-readable `[kind] detail (path)`
+        ///   format.
+        /// - User impact: suitable for scripting or piping to jq.
+        /// - Default: false (human-readable output).
         #[arg(long)]
         json: bool,
     },
-    /// Enable the loop worker (fires on the configured cron)
+
+    /// Enable the loop worker (fires on the configured cron).
+    ///
+    /// Scope logic:
+    /// - Functionality: writes `enabled = true` under `[agentic.loop]`
+    ///   in the workspace config file via text-level upsert.
+    /// - User impact: the scheduler registers the worker on the next
+    ///   tick; manual `run` is unaffected (always works).
+    /// - Default: enabled from config.
+    /// - Interaction: takes effect next tick, not immediately; `run`
+    ///   works regardless of this setting.
     Enable,
-    /// Disable the loop worker (manual `run` still works)
+
+    /// Disable the loop worker (manual `run` still works).
+    ///
+    /// Scope logic:
+    /// - Functionality: writes `enabled = false` under `[agentic.loop]`
+    ///   in the workspace config file via text-level upsert.
+    /// - User impact: the scheduler deregisters the worker on the next
+    ///   tick; manual `run` is unaffected (always works).
+    /// - Default: enabled from config.
+    /// - Interaction: takes effect next tick, not immediately; `run`
+    ///   works regardless of this setting.
     Disable,
 }
 
+/// Dispatch a `LoopCommands` variant to the appropriate handler.
+///
+/// # Parameters
+/// - `operation` — the parsed CLI subcommand (run, status, gaps, enable, disable).
+///
+/// # Returns
+/// `Ok(())` on success; `Err(ZenError)` on cycle failure or I/O errors.
+///
+/// # Errors
+/// `run` propagates cycle failures from `LoopCycleReport::last_error`.
+/// `status` and `gaps` fail on path detection or file read errors.
+/// `enable`/`disable` fail on config file write errors.
 pub async fn execute_command(operation: &LoopCommands) -> Result<(), ZenError> {
     match operation {
         LoopCommands::Run { dry_run, json } => run_cycle(*dry_run, *json).await,

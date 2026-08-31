@@ -83,11 +83,11 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | Crate | Role | Path |
 |-------|------|------|
 | zen | Binary entry (13-line wrapper) | `crates/zen/` |
-| zen-cli | CLI library (29 commands, TUI, dispatch) | `crates/zen-cli/` |
+| zen-cli | CLI library (21 commands, TUI, dispatch) | `crates/zen-cli/` |
 | zen-core | Config layers, error taxonomy, path scoping, constants (13 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
 | zen-repo | Unified data layer: SqliteClient + 9 domain repositories (FTS5, vec0, graph) | `crates/zen-repo/` |
-| zen-vault | 10+ services: note, wiki, 5-tier search, consolidation, lint | `crates/zen-vault/` |
+| zen-vault | 10+ services: note, wiki, search, distill, tindy, notion, ingest, graph_verify, intent | `crates/zen-vault/` |
 | zen-agents | 13 agents, 4-tier registry, blackboard, QualityPipeline | `crates/zen-agents/` |
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
 | zen-auth | Keychain + SecretRef resolution | `crates/zen-auth/` |
@@ -119,14 +119,15 @@ zen-provider → zen-core
 ### Binary/Library Split
 
 - **Binary**: `crates/zen/src/main.rs` (13 lines) -- loads `.env`, calls `zen_core::config::load_config()`, then `zen_cli::shell().await`
-- **Library**: `crates/zen-cli/` -- exports `shell()` via `lib.rs`, contains clap Parser, TUI runner, 29 subcommand dispatchers
+- **Library**: `crates/zen-cli/` -- exports `shell()` via `lib.rs`, contains clap Parser, TUI runner, 21 subcommand dispatchers
 - **TUI**: Runs on main thread (ratatui/crossterm) when `cli.command.is_none()`
 
 ### Data Flow
 
 ```
 zen wiki distill → zen-vault (DistillationPipeline) → notion extraction → wiki compile → archive
-zen loop run     → ZenScheduler (ZenLoopWorker) → ingest sweep → distill → graph verify → gaps
+zen wiki loop run → ZenLoopWorker → budget gate → distill (normalize/txn/checkpoint) → ORAV self-correction → graph verify → hypothesis incubation → wisdom hooks → report/gaps/git
+zen wiki rebuild-memory → RPC to zen-gateway daemon → MemvidIndexer full reindex → replay from jsonl
 zen session start → zen-agents (ZenCoordinator) → blackboard → executor
 zen wiki reindex → zen-vault (Reindexer, checksums, embeddings)
 zen wiki lint    → zen-vault (Linter, orphan pages, broken wikilinks)
@@ -139,14 +140,14 @@ zen serve start  → zen-gateway daemon + ZenScheduler (cron workers: journal, d
 zenspace/
 ├── crates/                     # 12 workspace crates (binary/library split)
 │   ├── zen/                    # Binary entry (13-line wrapper)
-│   ├── zen-cli/                # CLI library: 29 commands, TUI, clap derive
+│   ├── zen-cli/                # CLI library: 21 commands, TUI, clap derive
 │   │   ├── src/
 │   │   │   ├── lib.rs          # pub use cli::shell
-│   │   │   ├── cli.rs          # clap Parser/Subcommand (29 variants), shell() dispatcher
+│   │   │   ├── cli.rs          # clap Parser/Subcommand (21 variants), shell() dispatcher
 │   │   │   ├── tui/            # ratatui TUI interface
 │   │   │   ├── session.rs      # Session helpers
 │   │   │   ├── sandbox.rs      # Sandbox helpers
-│   │   │   └── cmd/            # 28 *_command.rs dispatchers + mod.rs
+│   │   │   └── cmd/            # 34 *_command.rs dispatchers + mod.rs
 │   │   └── tests/              # Integration tests (ZenTest harness)
 │   ├── zen-core/               # Core infrastructure (13 public modules)
 │   │   └── src/
@@ -178,11 +179,15 @@ zenspace/
 │   │   └── src/
 │   │       ├── note.rs         # Note, NoteService, frontmatter parsing
 │   │       ├── wiki.rs         # WikiPage, WikiIndex, AtomicWikiWriter
+│   │       ├── wiki/           # AtomicWikiWriter implementation
 │   │       ├── search/         # 5-tier search (ripgrep → FTS5 → vec0 → graph → LLM)
 │   │       ├── distill/        # DistillationPipeline (extract → compile → merge → archive; transaction/checkpoint/recovery)
 │   │       ├── notion/         # NotionService: DB-backed entity graph via NotionsRepo
 │   │       ├── tindy/          # Linter, LearningLoop, WikiCompiler skill, Reindexer, embeddings, checksums
 │   │       ├── ingest/         # FeedEntry, RssFetcher, ingest_local_file
+│   │       ├── graph_router.rs # Graph query router
+│   │       ├── graph_verify.rs # Graph integrity verification
+│   │       ├── notion.rs       # NotionService entry point
 │   │       └── intent.rs       # Intent detection
 │   ├── zen-agents/             # Agent system (13 agents, 4 tiers)
 │   │   └── src/
@@ -196,7 +201,7 @@ zenspace/
 │   │       ├── execution.rs    # AgentExecution, ToolCall
 │   │       ├── review.rs       # QualityPipeline (Metis→Momus→Hermes→Zeus)
 │   │       ├── sandbox.rs      # WasmSandbox (wasmtime), ResourceLimits
-│   │       ├── scheduler/     # ZenScheduler: cron-driven ~30s tick, 13 background workers (session-journaler, dream, memory-curator, memvid-indexer, subconscious, notion-extractor, wiki-compiler, commitment-tracker, reflection, wisdom-synth, decision-tracker, express, evidence-gatherer)
+│   │       ├── scheduler/     # ZenScheduler: cron-driven ~30s tick, 14 background workers (session-journaler, dream, memory-curator, memvid-indexer, subconscious, notion-extractor, wiki-compiler, commitment-tracker, reflection, wisdom-synth, decision-tracker, express, evidence-gatherer, zen-loop)
 │   │       └── wiring.rs       # ZenWiring (DI wiring)
 │   ├── zen-provider/           # Multi-provider LLM routing
 │   │   └── src/
@@ -494,7 +499,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen provider` | LLM provider mgmt | `provider_command.rs` |
 | `zen audit` | Audit log ops | `audit_command.rs` |
 | `zen logs` | Structured log viewer | `logs_command.rs` |
-| `zen wiki` | Wiki ops: list, show, reindex, lint, distill, rebuild-memory | `wiki_command.rs` |
+| `zen wiki` | Wiki ops: list, show, reindex, lint, distill, rebuild-memory, loop (run/status/gaps/enable/disable) | `wiki_command.rs` |
 | `zen loop` | Knowledge loop: run [--dry-run] [--json] / status / gaps / enable / disable (005) | `loop_command.rs` |
 | `zen model` | Model metadata + routing | `model_command.rs` |
 | `zen plugin` | Plugin management (install, enable, disable, rehash, tools list) | `plugin_command.rs` |
@@ -552,7 +557,7 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 ### clap Derive API (CLI)
 
 - `Parser` derive on `Cli` struct with `#[command(author, version, about)]`
-- `Subcommand` derive on `Commands` enum (29 variants)
+- `Subcommand` derive on `Commands` enum (21 variants)
 - Subcommand structs in `cmd/` modules with `Subcommand` derive (e.g., `SessionCommands`, `NoteCommands`)
 - `clap_verbosity_flag::Verbosity<InfoLevel>` for global `--verbose`
 - `Option<Commands>`: `None` triggers TUI, `Some` triggers dispatch
