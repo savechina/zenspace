@@ -37,6 +37,7 @@ impl QqBotAuth {
             client_secret,
             token_url,
             http: reqwest::Client::builder()
+                .no_proxy()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()

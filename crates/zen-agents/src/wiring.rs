@@ -263,10 +263,24 @@ impl ZenWiring {
         // fail with EAGAIN ("Resource temporarily unavailable") once the
         // user's aggregate task count exceeds 50. This is process hardening
         // for the production binary only, never for the test harness.
-        #[cfg(not(test))]
-        match apply_resource_limits() {
-            Ok(()) => debug!("resource limits applied: NPROC=50, NOFILE=256, CORE=0"),
-            Err(e) => tracing::warn!("failed to apply resource limits: {}", e),
+        //
+        // NOTE: `#[cfg(test)]` only fires when *this* crate is the test
+        // target. Downstream crates (zen-gateway) that depend on zen-agents
+        // are compiled without `cfg(test)`, so the limit would still apply
+        // during their integration tests and wedge the daemon. Check the
+        // runtime env as well — the gateway harness sets `ZEN_SKIP_RLIMIT=1`
+        // before spawning its daemon.
+        let skip_rlimit = std::env::var("ZEN_SKIP_RLIMIT").is_ok()
+            || std::env::var("NEXTTEST").is_ok()
+            || std::env::var("NEXTEST_PROFILE").is_ok();
+        if skip_rlimit {
+            debug!("skipping resource limits (test harness)");
+        } else {
+            #[cfg(not(test))]
+            match apply_resource_limits() {
+                Ok(()) => debug!("resource limits applied: NPROC=50, NOFILE=256, CORE=0"),
+                Err(e) => tracing::warn!("failed to apply resource limits: {}", e),
+            }
         }
 
         // T091: `[sandbox.wasm]` permission policy (deny-all by default).

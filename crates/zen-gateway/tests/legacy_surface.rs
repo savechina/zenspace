@@ -87,6 +87,7 @@ async fn legacy_http_surface_parity_and_mcp_filtering() {
     });
 
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();

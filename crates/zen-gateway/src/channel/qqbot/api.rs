@@ -31,6 +31,7 @@ impl QqBotApi {
             auth,
             api_base,
             http: reqwest::Client::builder()
+                .no_proxy()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(API_TIMEOUT)
                 .build()

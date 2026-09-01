@@ -207,8 +207,12 @@ struct ChatOutcome {
 impl GatewayBridge {
     fn new(chat_base: String) -> Result<Self> {
         Ok(Self {
-            chat_http: reqwest::Client::new(),
+            chat_http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             health_http: reqwest::Client::builder()
+                .no_proxy()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(10))
                 .build()?,

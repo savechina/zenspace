@@ -365,6 +365,10 @@ fn restore_process_soft_limits() {
 }
 
 async fn spawn_stack(executor: Arc<dyn TurnExecutor>, drain: Duration) -> Stack {
+    // Prevent the production RLIMIT_NPROC=50 cap from wedging the test
+    // daemon on Linux — see wiring.rs note. Must be set before the
+    // daemon's `ZenWiring` (or any `apply_resource_limits` caller) runs.
+    unsafe { std::env::set_var("ZEN_SKIP_RLIMIT", "1") };
     let boot_guard = bootstrap_lock().lock().await;
     restore_process_soft_limits();
     let tmp = tempfile::tempdir().unwrap();
@@ -436,7 +440,10 @@ async fn spawn_stack(executor: Arc<dyn TurnExecutor>, drain: Duration) -> Stack 
         tmp,
         mock,
         http_base: format!("http://127.0.0.1:{http_port}"),
-        http_client: reqwest::Client::new(),
+        http_client: reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
         socket_path,
         drain_tx: shutdown_tx,
         done_rx,
@@ -448,7 +455,10 @@ async fn spawn_stack(executor: Arc<dyn TurnExecutor>, drain: Duration) -> Stack 
 /// channel's startup probe cannot lose a scheduling race. Called while
 /// still holding [`BOOTSTRAP`].
 async fn await_carrier(http_base: &str) {
-    let probe = reqwest::Client::new();
+    let probe = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     for i in 0..100 {
         match probe.get(format!("{http_base}/health")).send().await {
             Ok(resp) if resp.status().is_success() => return,
