@@ -95,6 +95,11 @@ pub fn create_default_registry() -> SlashCommandRegistry {
         "Toggle thinking display".to_string(),
     );
     registry.register(
+        "tools".to_string(),
+        vec![],
+        "Toggle tool intermediate expansion".to_string(),
+    );
+    registry.register(
         "model".to_string(),
         vec![],
         "Switch provider/model".to_string(),

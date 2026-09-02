@@ -460,3 +460,14 @@ drain_timeout_secs = 5
 [tools.fs_watcher]
 # Per-session watcher cap (FR-045).
 max_watchers = 8
+
+# =============================================================================
+# Agentic tool loop — per-turn tool dispatch cap (005-agentic-loop, T050)
+# =============================================================================
+#
+# Caps how many tool dispatch rounds the orchestrator may run per user turn
+# (replaces the former const MAX_TOOL_ROUNDS = 4). Values are clamped to
+# 1..=16 at load. Env override: ZEN_TOOL_MAX_ROUNDS (5th config layer).
+#
+[agentic.tool_loop]
+max_rounds = 8

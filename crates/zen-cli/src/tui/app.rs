@@ -1021,6 +1021,21 @@ impl App {
                     false,
                 );
             }
+            "tools" => {
+                // T057: collapse/expand 🔧/✅ tool intermediate blocks.
+                self.stream_collector.toggle_tools_expanded();
+                self.push_output(
+                    format!(
+                        "Tool intermediates {}",
+                        if self.stream_collector.tools_expanded() {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        }
+                    ),
+                    false,
+                );
+            }
             "export" => self.execute_export(),
             "note" => self.execute_note(parts.get(1).copied()),
             "search" => self.execute_search(parts.get(1).copied().unwrap_or("")),
@@ -1423,6 +1438,22 @@ Use /thinking to show/hide thinking process."#;
                                 response_len = response.len(),
                                 "TUI chat: LLM response complete"
                             );
+                            // T057: flush tool-intermediate blocks the
+                            // drain watermark missed (fullscreen never
+                            // drains; keeps them above the separator).
+                            let tool_lines = self.stream_collector.take_tool_lines();
+                            if !tool_lines.is_empty() {
+                                if self.is_inline_mode() {
+                                    self.enqueue_scrollback(tool_lines);
+                                } else {
+                                    for line in tool_lines {
+                                        let text: String =
+                                            line.spans.iter().map(|s| s.content.as_ref()).collect();
+                                        self.output.push(OutputCell::Plain(PlainCell::new(text)));
+                                    }
+                                    self.invalidate_output_cache();
+                                }
+                            }
                             let elapsed = self.turn_started_at.map(|t| t.elapsed());
                             let label = match (elapsed, self.tool_call_count) {
                                 (Some(e), 0) => Some(format!("{:.1}s", e.as_secs_f64())),

@@ -1,6 +1,7 @@
 use crate::tui::markdown::StreamingMarkdown;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use zen_gateway::server::hosting::{ToolIntermediate, split_tool_intermediates};
 
 pub struct StreamCollector {
     buffer: String,
@@ -14,6 +15,13 @@ pub struct StreamCollector {
     // feed only the newly-arrived suffix (see split_render_opt).
     text_fed_len: usize,
     reasoning_fed_len: usize,
+    // T057: tool intermediates parsed out of the 🔧/✅ callback stream.
+    // `rendered_tools` is the drain watermark (how many blocks have already
+    // been emitted into committed scrollback); `tools_expanded` is the user
+    // preference toggled via /tools.
+    tool_blocks: Vec<ToolIntermediate>,
+    rendered_tools: usize,
+    tools_expanded: bool,
 }
 
 impl StreamCollector {
@@ -27,12 +35,103 @@ impl StreamCollector {
             last_reasoning_split: None,
             text_fed_len: 0,
             reasoning_fed_len: 0,
+            tool_blocks: Vec::new(),
+            rendered_tools: 0,
+            tools_expanded: false,
         }
     }
 
     pub fn push_delta(&mut self, delta: &str) {
-        self.buffer.push_str(delta);
-        self.buffer_changed_since_render = true;
+        let (text, tool_events) = split_tool_intermediates(delta);
+        if !tool_events.is_empty() {
+            self.tool_blocks.extend(tool_events);
+            self.buffer_changed_since_render = true;
+        }
+        if !text.is_empty() {
+            self.buffer.push_str(&text);
+            self.buffer_changed_since_render = true;
+        }
+    }
+
+    /// Toggles expanded rendering of tool-intermediate blocks (`/tools`).
+    /// Affects blocks not yet drained into scrollback; already-flushed
+    /// entries keep the form they had (same lifecycle as the delta
+    /// pipeline's committed region).
+    pub fn toggle_tools_expanded(&mut self) {
+        self.tools_expanded = !self.tools_expanded;
+    }
+
+    pub fn tools_expanded(&self) -> bool {
+        self.tools_expanded
+    }
+
+    /// Drains rendered lines for blocks the watermark has not emitted
+    /// yet (completion flush; fullscreen never drains) and forgets them.
+    pub fn take_tool_lines(&mut self) -> Vec<Line<'static>> {
+        let expanded = self.tools_expanded;
+        let start = self.rendered_tools.min(self.tool_blocks.len());
+        let lines: Vec<Line<'static>> = self.tool_blocks[start..]
+            .iter()
+            .flat_map(|block| Self::tool_block_lines(block, expanded))
+            .collect();
+        self.rendered_tools = self.tool_blocks.len();
+        lines
+    }
+
+    /// Renders one tool block: collapsed → single `🔧/✅ <tool>: …`
+    /// line; expanded → metrics (`count/provider`) + ≤100-char preview.
+    fn tool_block_lines(block: &ToolIntermediate, expanded: bool) -> Vec<Line<'static>> {
+        match block {
+            ToolIntermediate::Started { tool, args } => {
+                let mut lines = vec![Line::from(Span::raw(format!("🔧 {tool}: …")))];
+                if expanded {
+                    let detail = args
+                        .get("raw")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| args.to_string());
+                    if !detail.is_empty() {
+                        lines.push(Line::from(Span::raw(format!("  {detail}"))));
+                    }
+                }
+                lines
+            }
+            ToolIntermediate::Completed {
+                tool,
+                count,
+                duration_ms,
+                provider,
+                error,
+                preview,
+            } => {
+                let head = match error {
+                    Some(e) => format!("✅ {tool}: failed: {e}"),
+                    None => format!("✅ {tool}: …"),
+                };
+                let mut lines = vec![Line::from(Span::raw(head))];
+                if expanded {
+                    let mut metrics: Vec<String> = Vec::new();
+                    if let Some(c) = count {
+                        metrics.push(format!("{c} hits"));
+                    }
+                    if let Some(ms) = duration_ms {
+                        metrics.push(format!("{ms}ms"));
+                    }
+                    if let Some(p) = provider {
+                        metrics.push(format!("provider {p}"));
+                    }
+                    if !metrics.is_empty() {
+                        lines.push(Line::from(Span::raw(format!("  {}", metrics.join(" · ")))));
+                    }
+                    if let Some(pv) = preview
+                        && !pv.is_empty()
+                    {
+                        lines.push(Line::from(Span::raw(format!("  {pv}"))));
+                    }
+                }
+                lines
+            }
+        }
     }
 
     pub(crate) fn buffer(&self) -> &str {
@@ -106,19 +205,23 @@ impl StreamCollector {
         reasoning_style: Style,
         show_thinking: bool,
     ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-        self.split_render_opt(reasoning_style, show_thinking)
+        self.split_render_opt(reasoning_style, show_thinking, true)
     }
 
     fn split_render(&mut self, reasoning_style: Style) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-        self.split_render_opt(reasoning_style, true)
+        self.split_render_opt(reasoning_style, true, false)
     }
 
+    /// `drain=true` (inline scrollback pipeline) emits each tool block
+    /// exactly once past the watermark; `drain=false` (fullscreen
+    /// snapshot) re-renders every block so the live view stays stable.
     fn split_render_opt(
         &mut self,
         reasoning_style: Style,
         show_thinking: bool,
+        drain: bool,
     ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-        if self.buffer.is_empty() {
+        if self.buffer.is_empty() && self.tool_blocks.is_empty() {
             return (Vec::new(), Vec::new());
         }
 
@@ -180,6 +283,23 @@ impl StreamCollector {
             }
         }
 
+        // T057: tool blocks render before the text tail (they arrive
+        // between LLM rounds, so this preserves arrival order for the
+        // common case).
+        if drain {
+            let expanded = self.tools_expanded;
+            let start = self.rendered_tools.min(self.tool_blocks.len());
+            for block in &self.tool_blocks[start..] {
+                committed.extend(Self::tool_block_lines(block, expanded));
+            }
+            self.rendered_tools = self.tool_blocks.len();
+        } else {
+            let expanded = self.tools_expanded;
+            for block in &self.tool_blocks {
+                committed.extend(Self::tool_block_lines(block, expanded));
+            }
+        }
+
         if !text.is_empty() {
             let text_update = self.text_renderer.append(text_delta);
             for block in &text_update.committed {
@@ -208,6 +328,8 @@ impl StreamCollector {
         self.last_reasoning_split = None;
         self.text_fed_len = 0;
         self.reasoning_fed_len = 0;
+        self.tool_blocks.clear();
+        self.rendered_tools = 0;
         let (text, reasoning, _) = Self::split_reasoning(&raw);
         let reasoning = if reasoning.is_empty() {
             None
@@ -226,6 +348,8 @@ impl StreamCollector {
         self.last_reasoning_split = None;
         self.text_fed_len = 0;
         self.reasoning_fed_len = 0;
+        self.tool_blocks.clear();
+        self.rendered_tools = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -439,5 +563,86 @@ mod tests {
             1,
             "prior text re-emitted: {third:?}"
         );
+    }
+
+    /// T057: 🔧/✅ lines become collapsible blocks, not buffer text —
+    /// collapsed renders one-liners only; the raw text never reaches
+    /// `finalize_and_drain`.
+    #[test]
+    fn tool_lines_route_to_collapsible_blocks() {
+        let mut c = StreamCollector::new();
+        c.push_delta("🔧 web.search — searching…\n");
+        c.push_delta("answer text ");
+        c.push_delta(
+            "✅ web.search done 5 hits 1234ms provider=brave\nfirst result preview text\n",
+        );
+        c.push_delta("continues");
+
+        assert_eq!(c.buffer(), "answer text continues");
+
+        let (committed, pending) = c.drain_and_tail_filtered(Style::default(), true);
+        let all = lines_text(&committed) + &lines_text(&pending);
+        assert!(all.contains("🔧 web.search: …"), "{all:?}");
+        assert!(all.contains("✅ web.search: …"), "{all:?}");
+        assert!(
+            !all.contains("first result preview text") && !all.contains("1234ms"),
+            "collapsed block must hide preview/metrics: {all:?}"
+        );
+        assert!(all.contains("answer text continues"), "{all:?}");
+
+        let (raw, _) = c.finalize_and_drain();
+        assert_eq!(raw, "answer text continues");
+        assert!(!raw.contains('🔧') && !raw.contains('✅'));
+    }
+
+    /// T057: expanded mode surfaces metrics + ≤100-char preview.
+    #[test]
+    fn expanded_block_shows_metrics_and_preview() {
+        let mut c = StreamCollector::new();
+        c.toggle_tools_expanded();
+        assert!(c.tools_expanded());
+        c.push_delta(
+            "✅ web.search done 5 hits 1234ms provider=brave\nfirst result preview text\n",
+        );
+        let (committed, pending) = c.drain_and_tail_filtered(Style::default(), true);
+        let all = lines_text(&committed) + &lines_text(&pending);
+        assert!(all.contains("5 hits · 1234ms · provider brave"), "{all:?}");
+        assert!(all.contains("first result preview text"), "{all:?}");
+    }
+
+    /// T057: drain emits each tool block exactly once (same idempotency
+    /// contract as text blocks).
+    #[test]
+    fn tool_blocks_drain_exactly_once() {
+        let mut c = StreamCollector::new();
+        c.push_delta("🔧 web.search — searching…\n");
+        let (c1, _) = c.drain_and_tail_filtered(Style::default(), true);
+        assert!(lines_text(&c1).contains("🔧 web.search: …"));
+        let (c2, _) = c.drain_and_tail_filtered(Style::default(), true);
+        assert!(
+            !lines_text(&c2).contains('🔧'),
+            "block re-emitted on second drain: {c2:?}"
+        );
+    }
+
+    /// T057: take_tool_lines flushes blocks the watermark missed
+    /// (fullscreen completion path) and forgets them.
+    #[test]
+    fn take_tool_lines_flushes_remaining_blocks() {
+        let mut c = StreamCollector::new();
+        c.push_delta("✅ web.search done 2 hits 90ms provider=ddg\npreview line\n");
+        let lines = c.take_tool_lines();
+        let text = lines_text(&lines);
+        assert!(text.contains("✅ web.search: …"), "{text:?}");
+        assert!(c.take_tool_lines().is_empty(), "must not re-flush");
+    }
+
+    /// T057: mixed token — text around a 🔧 line survives intact in
+    /// the buffer with newlines preserved.
+    #[test]
+    fn mixed_token_text_flows_around_tool_line() {
+        let mut c = StreamCollector::new();
+        c.push_delta("text before\n🔧 web.search x\nmiddle");
+        assert_eq!(c.buffer(), "text before\nmiddle");
     }
 }

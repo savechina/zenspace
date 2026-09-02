@@ -19,10 +19,14 @@
 //!
 //! EXPECTED: deltas coalesce to ≤1 frame per [`FLUSH_INTERVAL`]
 //! (design §5.2); structural events (`tool_*`, `turn_completed`,
-//! `turn_error`) are never dropped; a replayed `turnId` resolves
-//! `-32004` with the stored final result instead of re-executing;
-//! `session/cancel` drops the execution future mid-await, audits
-//! `outcome:"cancelled"`, and answers `{outcome:"cancelled"}`.
+//! `turn_error`) are never dropped; tool intermediates stream as
+//! `tool_started`/`tool_completed` structural frames (T056, 005
+//! `contracts/streaming.md`) parsed from the orchestrator's 🔧/✅
+//! callback lines so they survive ring replay; a replayed `turnId`
+//! resolves `-32004` with the stored final result instead of
+//! re-executing; `session/cancel` drops the execution future
+//! mid-await, audits `outcome:"cancelled"`, and answers
+//! `{outcome:"cancelled"}`.
 //! Turn lifecycle is audited to `audit.jsonl`: `gateway.turn.started`
 //! fires once per registration and exactly-once `gateway.turn.completed`
 //! (`outcome` completed|cancelled) fires at the FIRST terminal
@@ -265,6 +269,26 @@ impl Turn {
         );
     }
 
+    /// Emits a tool-lifecycle structural frame (T056, 005
+    /// `contracts/streaming.md`).
+    ///
+    /// Functionality: `tool_started`/`tool_completed` intermediates ride
+    /// the same never-dropped path as `turn_completed` — ring buffer
+    /// (2048 frames / 60s, replayable via `session/resume`) plus
+    /// `OutboundFrame::structural` delivery to the originating surface.
+    /// User impact: HTTP/WS clients observe every tool round even under
+    /// outbound backpressure, and resume replays them in seq order.
+    /// Default: `tool` is merged into `payload`; the caller decides
+    /// which optional fields (`args`/`duration_ms`/`count`/`provider`/
+    /// `error`/`preview`) are present, matching the contract's
+    /// omit-when-absent shape.
+    fn emit_tool_event(&self, kind: &'static str, tool: &str, mut payload: Value) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("tool".to_string(), Value::String(tool.to_string()));
+        }
+        self.emit_structural(kind, payload);
+    }
+
     fn send_frame(&self, frame: OutboundFrame, kind: &'static str) {
         let queue = self.origin.lock().expect("origin lock").clone();
         if let Some(queue) = queue {
@@ -285,6 +309,203 @@ fn event_params(turn_id: &str, seq: u64, kind: &str, payload: &Value) -> Value {
         obj.insert(k.clone(), v.clone());
     }
     params
+}
+
+// ───────────────────── tool intermediates (T056, D17) ─────────────────────
+
+/// Callback marker opening a tool-start intermediate line.
+pub const TOOL_STARTED_MARKER: &str = "🔧";
+/// Callback marker opening a tool-completion intermediate line.
+pub const TOOL_COMPLETED_MARKER: &str = "✅";
+/// Preview cap for `tool_completed` payloads (contracts/streaming.md).
+pub const TOOL_PREVIEW_MAX_CHARS: usize = 100;
+
+/// One parsed tool intermediate (research D17 grammar, 005
+/// `contracts/streaming.md` "Tool intermediate shapes").
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolIntermediate {
+    /// `🔧 <tool>[ args…]` — dispatch is starting.
+    Started {
+        tool: String,
+        /// Best-effort: JSON object when the orchestrator emits one,
+        /// `{"raw": "<free text>"}` otherwise.
+        args: Value,
+    },
+    /// `✅ <tool> done [N hits] [M ms] [provider=P]` — dispatch
+    /// finished (or failed, via `✅ <tool> failed[/error…]: <message>`).
+    Completed {
+        tool: String,
+        count: Option<u64>,
+        duration_ms: Option<u64>,
+        provider: Option<String>,
+        error: Option<String>,
+        /// ≤ [`TOOL_PREVIEW_MAX_CHARS`] chars of the result preview.
+        preview: Option<String>,
+    },
+}
+
+/// True when a callback line opens with a tool-intermediate marker.
+pub fn is_tool_intermediate(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with(TOOL_STARTED_MARKER) || trimmed.starts_with(TOOL_COMPLETED_MARKER)
+}
+
+/// Splits one orchestrator callback token into plain text (feeds the
+/// delta pipeline unchanged) and tool intermediates (T056 structural
+/// frames).
+///
+/// PURPOSE: The orchestrator interleaves 🔧/✅ lifecycle lines with
+/// streamed LLM text on the single `TurnExecutor` callback (research
+/// D17 — no trait break). This is the shared classifier for both
+/// consumers: the gateway (structural frames; tool lines suppressed
+/// from deltas) and the TUI `StreamCollector` (collapsible blocks).
+///
+/// GRAMMAR (per line):
+///   `🔧 <tool>[ args…]`                          → [`ToolIntermediate::Started`]
+///   `✅ <tool> done [N hits] [M ms] [provider=P]` → Completed
+///   `✅ <tool> failed[/error…]: <message>`        → Completed { error }
+/// The first non-marker line after a `✅` header is its preview
+/// (single line, capped at [`TOOL_PREVIEW_MAX_CHARS`] chars per the
+/// contract's `"preview": "…100 chars…"` shape); every other line
+/// passes through as text. Unrecognized metrics degrade to `tool` +
+/// `preview` only.
+pub fn split_tool_intermediates(token: &str) -> (String, Vec<ToolIntermediate>) {
+    let mut text = String::new();
+    let mut events: Vec<ToolIntermediate> = Vec::new();
+    let mut collecting_preview = false;
+    for line in token.split('\n') {
+        if is_tool_intermediate(line) {
+            collecting_preview = line.trim_start().starts_with(TOOL_COMPLETED_MARKER);
+            if let Some(event) = parse_tool_header(line.trim_start()) {
+                events.push(event);
+            }
+            continue;
+        }
+        if collecting_preview && !line.trim().is_empty() && !events.is_empty() {
+            let wants_preview = matches!(
+                events.last(),
+                Some(ToolIntermediate::Completed { preview: None, .. })
+            );
+            if wants_preview {
+                append_preview(events.last_mut().expect("checked non-empty"), line);
+                continue;
+            }
+        }
+        collecting_preview = false;
+        if line.is_empty() && text.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(line);
+    }
+    (text, events)
+}
+
+fn parse_tool_header(line: &str) -> Option<ToolIntermediate> {
+    let completed = line.starts_with(TOOL_COMPLETED_MARKER);
+    let rest = line
+        .strip_prefix(TOOL_COMPLETED_MARKER)
+        .or_else(|| line.strip_prefix(TOOL_STARTED_MARKER))?
+        .trim();
+    let (tool, detail) = match rest.split_once(char::is_whitespace) {
+        Some((tool, detail)) => (tool, detail.trim()),
+        None => (rest, ""),
+    };
+    if tool.is_empty() {
+        return None;
+    }
+    if !completed {
+        let args = match serde_json::from_str::<Value>(detail) {
+            Ok(args @ Value::Object(_)) => args,
+            _ if detail.is_empty() => json!({}),
+            _ => json!({ "raw": detail }),
+        };
+        return Some(ToolIntermediate::Started {
+            tool: tool.to_string(),
+            args,
+        });
+    }
+    let (count, duration_ms, provider) = scan_metrics(detail);
+    Some(ToolIntermediate::Completed {
+        tool: tool.to_string(),
+        count,
+        duration_ms,
+        provider,
+        error: extract_error(detail),
+        preview: None,
+    })
+}
+
+/// Extracts `N hits`, `Mms`, and `provider=P` metrics; absent fields
+/// stay `None` (contract omit-when-absent shape).
+fn scan_metrics(detail: &str) -> (Option<u64>, Option<u64>, Option<String>) {
+    let mut count = None;
+    let mut duration_ms = None;
+    let mut provider = None;
+    let tokens: Vec<&str> = detail.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        if let Some(p) = tok.strip_prefix("provider=") {
+            provider = Some(p.trim_matches('"').to_string());
+        } else if let Some(n) = tok.strip_suffix("ms").and_then(|n| n.parse::<u64>().ok()) {
+            if duration_ms.is_none() {
+                duration_ms = Some(n);
+            }
+        } else if let Ok(n) = tok.parse::<u64>()
+            && count.is_none()
+            && tokens
+                .get(i + 1)
+                .is_some_and(|next| next.starts_with("hit"))
+        {
+            count = Some(n);
+        }
+    }
+    (count, duration_ms, provider)
+}
+
+/// Recognizes `failed[: ] <message>` / `error[:=] <message>` in the
+/// header detail; ASCII keywords are located case-insensitively with a
+/// char-boundary guard so multibyte content cannot slice mid-codepoint.
+fn extract_error(detail: &str) -> Option<String> {
+    for keyword in ["failed", "error"] {
+        if let Some(at) = find_ignore_case(detail, keyword) {
+            let rest = detail[at + keyword.len()..]
+                .trim_start()
+                .trim_start_matches([':', '='])
+                .trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_ignore_case(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > h.len() {
+        return None;
+    }
+    (0..=h.len() - n.len())
+        .find(|&i| hay.is_char_boundary(i) && h[i..i + n.len()].eq_ignore_ascii_case(n))
+}
+
+fn append_preview(event: &mut ToolIntermediate, line: &str) {
+    let ToolIntermediate::Completed { preview, .. } = event else {
+        return;
+    };
+    if preview.is_some() {
+        return;
+    }
+    *preview = Some(truncate_chars(line, TOOL_PREVIEW_MAX_CHARS));
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((at, _)) => s[..at].to_string(),
+        None => s.to_string(),
+    }
 }
 
 // ──────────────────────────── registry + deps ───────────────────────────
@@ -754,10 +975,54 @@ pub async fn turn_with(
     let token_pending = Arc::clone(&pending);
     let token_notify = flush_notify.clone();
     let mut callback = move |tok: String| {
+        // T056 (research D17): the orchestrator interleaves 🔧/✅ tool
+        // lifecycle lines with LLM text on this single callback. Tool
+        // lines bypass the coalescing delta buffer and go out as
+        // structural frames — dropping a `tool_completed` would tear
+        // the event stream like a dropped `turn_completed`, and
+        // replaying them as deltas would double-render on clients
+        // that understand the structured kinds.
+        let (text, tool_events) = split_tool_intermediates(&tok);
+        for event in &tool_events {
+            match event {
+                ToolIntermediate::Started { tool, args } => {
+                    token_record.emit_tool_event("tool_started", tool, json!({ "args": args }));
+                }
+                ToolIntermediate::Completed {
+                    tool,
+                    count,
+                    duration_ms,
+                    provider,
+                    error,
+                    preview,
+                } => {
+                    let mut payload = serde_json::Map::new();
+                    if let Some(c) = count {
+                        payload.insert("count".to_string(), json!(c));
+                    }
+                    if let Some(ms) = duration_ms {
+                        payload.insert("duration_ms".to_string(), json!(ms));
+                    }
+                    if let Some(p) = provider {
+                        payload.insert("provider".to_string(), json!(p));
+                    }
+                    if let Some(e) = error {
+                        payload.insert("error".to_string(), json!(e));
+                    }
+                    if let Some(pv) = preview {
+                        payload.insert("preview".to_string(), json!(pv));
+                    }
+                    token_record.emit_tool_event("tool_completed", tool, Value::Object(payload));
+                }
+            }
+        }
+        if text.is_empty() {
+            return;
+        }
         if token_record.state() == TurnState::Running {
             token_record.set_state(TurnState::Streaming);
         }
-        token_pending.lock().expect("pending lock").push_str(&tok);
+        token_pending.lock().expect("pending lock").push_str(&text);
         token_notify.notify_one();
     };
 
@@ -1327,5 +1592,208 @@ mod tests {
             saw_prefill && saw_completed,
             "turn_completed must arrive AFTER the pre-saturated frame (FIFO backpressure proves structural classification)"
         );
+    }
+
+    /// Scripted executor emitting 🔧/✅ tool intermediates between token
+    /// streams (T056 contract harness, contracts/streaming.md).
+    struct ToolExec;
+
+    #[async_trait::async_trait]
+    impl TurnExecutor for ToolExec {
+        async fn execute_stream(
+            &self,
+            _session: &mut SessionContext,
+            _prompt: &str,
+            callback: &mut (dyn FnMut(String) + Send),
+        ) -> anyhow::Result<String> {
+            callback("🔧 web.search — searching…\n".to_string());
+            callback("partial ".to_string());
+            callback(
+                "✅ web.search done 5 hits 1234ms provider=brave\nfirst result preview text\n"
+                    .to_string(),
+            );
+            callback("final answer".to_string());
+            Ok("final answer".to_string())
+        }
+    }
+
+    async fn deps_with_tool_executor() -> Arc<SessionHost> {
+        let deps = SessionHost::new(Some(Arc::new(ToolExec) as Arc<dyn TurnExecutor>));
+        deps.sessions
+            .lock()
+            .await
+            .insert("s1".into(), SessionContext::new("s1".into(), String::new()));
+        Arc::new(deps)
+    }
+
+    /// Contract (005 streaming.md): `tool_started` precedes the first
+    /// `delta`, `tool_completed` precedes `turn_completed`, tool lines
+    /// never leak into delta payloads, and completion fields survive
+    /// into the replayable ring.
+    #[tokio::test]
+    async fn tool_intermediates_order_and_payloads() {
+        let deps = deps_with_tool_executor().await;
+        turn(Arc::clone(&deps), None, turn_params("t-tool", "s1"))
+            .await
+            .unwrap();
+        let record = deps.turns.get("t-tool").unwrap();
+        let events = record.events_after(0);
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind).collect();
+        let started = kinds.iter().position(|k| *k == "tool_started").unwrap();
+        let first_delta = kinds.iter().position(|k| *k == "delta").unwrap();
+        let completed = kinds.iter().position(|k| *k == "tool_completed").unwrap();
+        let done = kinds.iter().position(|k| *k == "turn_completed").unwrap();
+        assert!(started < first_delta, "kinds: {kinds:?}");
+        assert!(completed < done, "kinds: {kinds:?}");
+
+        assert_eq!(events[started].payload["tool"], "web.search");
+        assert_eq!(events[started].payload["args"]["raw"], "— searching…");
+        assert_eq!(events[completed].payload["tool"], "web.search");
+        assert_eq!(events[completed].payload["count"], 5);
+        assert_eq!(events[completed].payload["duration_ms"], 1234);
+        assert_eq!(events[completed].payload["provider"], "brave");
+        assert_eq!(
+            events[completed].payload["preview"],
+            "first result preview text"
+        );
+
+        for event in &events {
+            if event.kind == "delta" {
+                let text = event.payload["text"].as_str().unwrap_or("");
+                assert!(!text.contains('🔧') && !text.contains('✅'), "{text:?}");
+            }
+        }
+    }
+
+    /// Wire check: tool structural frames reach the originating surface
+    /// in emission order relative to deltas and the terminal frame.
+    #[tokio::test]
+    async fn tool_frames_reach_origin_in_emission_order() {
+        let deps = deps_with_tool_executor().await;
+        let (queue_tx, mut queue_rx) = mpsc::channel::<OutboundFrame>(64);
+        turn(
+            Arc::clone(&deps),
+            Some(queue_tx),
+            turn_params("t-wire", "s1"),
+        )
+        .await
+        .unwrap();
+
+        let mut kinds: Vec<String> = Vec::new();
+        while let Some(of) = queue_rx.recv().await {
+            if let crate::protocol::Frame::Notification { method, params, .. } = &of.frame {
+                if method != "session/event" {
+                    continue;
+                }
+                kinds.push(params["kind"].as_str().unwrap_or("?").to_string());
+                if params["kind"] == "turn_completed" {
+                    break;
+                }
+            }
+        }
+        let started = kinds.iter().position(|k| k == "tool_started").unwrap();
+        let first_delta = kinds.iter().position(|k| k == "delta").unwrap();
+        let completed = kinds.iter().position(|k| k == "tool_completed").unwrap();
+        let done = kinds.iter().position(|k| k == "turn_completed").unwrap();
+        assert!(
+            started < first_delta && completed < done,
+            "kinds: {kinds:?}"
+        );
+    }
+
+    /// Error intermediate: `✅ <tool> failed: …` maps to
+    /// `tool_completed {error}` with metrics omitted.
+    #[tokio::test]
+    async fn tool_error_intermediate_carries_error_field() {
+        struct ToolErrExec;
+        #[async_trait::async_trait]
+        impl TurnExecutor for ToolErrExec {
+            async fn execute_stream(
+                &self,
+                _session: &mut SessionContext,
+                _prompt: &str,
+                callback: &mut (dyn FnMut(String) + Send),
+            ) -> anyhow::Result<String> {
+                callback("✅ web.search failed: rate limit 429\n".to_string());
+                Ok("no results".to_string())
+            }
+        }
+        let deps = SessionHost::new(Some(Arc::new(ToolErrExec) as Arc<dyn TurnExecutor>));
+        deps.sessions
+            .lock()
+            .await
+            .insert("s1".into(), SessionContext::new("s1".into(), String::new()));
+        let deps = Arc::new(deps);
+        turn(Arc::clone(&deps), None, turn_params("t-err", "s1"))
+            .await
+            .unwrap();
+
+        let events = deps.turns.get("t-err").unwrap().events_after(0);
+        let done = events
+            .iter()
+            .find(|e| e.kind == "tool_completed")
+            .expect("tool_completed in ring");
+        assert_eq!(done.payload["tool"], "web.search");
+        assert_eq!(done.payload["error"], "rate limit 429");
+        assert!(done.payload.get("count").is_none());
+        assert!(done.payload.get("duration_ms").is_none());
+        assert!(done.payload.get("provider").is_none());
+    }
+
+    #[test]
+    fn parse_tool_header_started_with_json_args() {
+        let parsed =
+            split_tool_intermediates("🔧 web.search {\"query\":\"rust\",\"max_results\":5}")
+                .1
+                .remove(0);
+        match parsed {
+            ToolIntermediate::Started { tool, args } => {
+                assert_eq!(tool, "web.search");
+                assert_eq!(args["query"], "rust");
+                assert_eq!(args["max_results"], 5);
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_keeps_surrounding_text_and_extracts_preview() {
+        let (text, events) = split_tool_intermediates(
+            "before\n✅ web.search done 2 hits 90ms provider=ddg\npreview line\nafter",
+        );
+        assert_eq!(text, "before\nafter");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ToolIntermediate::Completed {
+                tool,
+                count,
+                duration_ms,
+                provider,
+                error,
+                preview,
+            } => {
+                assert_eq!(tool, "web.search");
+                assert_eq!(*count, Some(2));
+                assert_eq!(*duration_ms, Some(90));
+                assert_eq!(provider.as_deref(), Some("ddg"));
+                assert!(error.is_none());
+                assert_eq!(preview.as_deref(), Some("preview line"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_is_capped_at_100_chars() {
+        let long = "x".repeat(250);
+        let (_, events) =
+            split_tool_intermediates(&format!("✅ web.search done 1 hits 1ms\n{long}\n"));
+        match &events[0] {
+            ToolIntermediate::Completed { preview, .. } => {
+                let preview = preview.as_deref().unwrap();
+                assert_eq!(preview.chars().count(), TOOL_PREVIEW_MAX_CHARS);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 }

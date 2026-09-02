@@ -4,9 +4,12 @@ use std::time::Instant;
 
 use anyhow::Result;
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
+// Aliased: crate::execution::ToolCall (dispatch record) already owns the
+// short name; this is rig-core's native provider tool call.
 use rig_compose::normalizer::{
     ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
+use rig_core::completion::message::ToolCall as NativeToolCall;
 use tracing::{debug, info, instrument, warn};
 
 use zen_core::types::{MessageRole, SessionContext};
@@ -19,11 +22,18 @@ use crate::execution::{AgentExecution, ExecutionMetadata, ToolCall};
 use crate::registry::AgentRegistry;
 use crate::review::QualityPipeline;
 use crate::wiring::ZenWiring;
-use crate::zen_agent::ZenAgent;
+use crate::zen_agent::{ZenAgent, append_native_tool_calls_fenced};
 use zen_core::paths::ZenPaths;
 
-/// Maximum tool dispatch rounds per user query before giving the final answer.
-const MAX_TOOL_ROUNDS: usize = 4;
+/// Fallback tool-loop cap when config cannot be loaded (matches the
+/// `[agentic.tool_loop] max_rounds` contract default, 005-agentic-loop T050).
+const DEFAULT_MAX_TOOL_ROUNDS: usize = 8;
+
+/// Clamp bounds mirroring `zen_core::config::ToolLoopConfig` (1..=16).
+const TOOL_ROUNDS_CLAMP: (usize, usize) = (1, 16);
+
+/// T055: visible-intermediate preview width (chars of serialized tool output).
+const TOOL_PREVIEW_CHARS: usize = 100;
 
 /// Orchestrator manages agent lifecycle, registry, and execution flow.
 ///
@@ -42,6 +52,27 @@ pub struct AgentOrchestrator {
     /// FR-046 `[agents] tools` overlay applied on top of the builtin
     /// per-agent grant map when building agents and delegates.
     tool_overlay: Vec<String>,
+    /// T054: config-driven tool-loop cap (`[agentic.tool_loop] max_rounds`,
+    /// default 8, clamped 1..=16) replacing the former `MAX_TOOL_ROUNDS = 4`.
+    max_tool_rounds: usize,
+}
+
+/// Resolve the tool-loop cap from the 5-layer merged config (T054).
+///
+/// Config load failure is non-fatal here: the orchestrator falls back to the
+/// contract default (8) so chat keeps working with a misconfigured workspace.
+fn resolve_max_tool_rounds() -> usize {
+    match zen_core::config::load_config() {
+        Ok(config) => config.agentic.tool_loop.max_rounds_or_default() as usize,
+        Err(e) => {
+            warn!(error = %e, "config load failed; tool loop falls back to default rounds");
+            DEFAULT_MAX_TOOL_ROUNDS
+        }
+    }
+}
+
+fn clamp_tool_rounds(rounds: usize) -> usize {
+    rounds.clamp(TOOL_ROUNDS_CLAMP.0, TOOL_ROUNDS_CLAMP.1)
 }
 
 impl AgentOrchestrator {
@@ -56,6 +87,7 @@ impl AgentOrchestrator {
         let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(100_000));
+        let max_tool_rounds = resolve_max_tool_rounds();
         Self {
             registry,
             wiring,
@@ -65,6 +97,7 @@ impl AgentOrchestrator {
             memvid_store,
             quality_pipeline: QualityPipeline::new(),
             tool_overlay,
+            max_tool_rounds,
         }
     }
 
@@ -76,6 +109,7 @@ impl AgentOrchestrator {
         let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
         let executor = crate::executor::AgentExecutor::new(router.clone());
         let token_budget = Arc::new(AtomicTokenBudget::new(capacity));
+        let max_tool_rounds = resolve_max_tool_rounds();
         Self {
             registry,
             wiring,
@@ -85,7 +119,22 @@ impl AgentOrchestrator {
             memvid_store,
             quality_pipeline: QualityPipeline::new(),
             tool_overlay,
+            max_tool_rounds,
         }
+    }
+
+    /// Override the tool-loop cap programmatically (clamped 1..=16).
+    ///
+    /// Precedence over `load_config()`: intended for tests and embedding
+    /// callers that manage their own configuration surface.
+    pub fn with_tool_loop_config(mut self, max_rounds: usize) -> Self {
+        self.max_tool_rounds = clamp_tool_rounds(max_rounds);
+        self
+    }
+
+    /// Effective tool-dispatch rounds per user turn (T054).
+    pub fn max_tool_rounds(&self) -> usize {
+        self.max_tool_rounds
     }
 
     pub fn with_memory(mut self, memory_path: PathBuf) -> Result<Self> {
@@ -341,10 +390,10 @@ impl AgentOrchestrator {
 
         // Agentic tool loop: while the model requests tools, dispatch them
         // through the sandbox hook pipeline and feed results back, up to
-        // MAX_TOOL_ROUNDS iterations.
+        // `max_tool_rounds` iterations ([agentic.tool_loop], T054).
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut round = 0;
-        while round < MAX_TOOL_ROUNDS {
+        while round < self.max_tool_rounds {
             let invocations = Self::parse_tool_invocations(&execution.response);
             if invocations.is_empty() {
                 break;
@@ -507,6 +556,58 @@ impl AgentOrchestrator {
         entries.join("\n---\n")
     }
 
+    /// Merge fenced-JSON invocations parsed from model text with native
+    /// provider tool calls captured from the stream (T053).
+    ///
+    /// Fenced-JSON stays first (existing dispatch order); native calls are
+    /// appended after normalizer validation. A native call identical to an
+    /// already-parsed fenced one (same tool + args) is deduped so providers
+    /// echoing their own calls as text do not dispatch twice.
+    fn merge_invocations(response: &str, native: &[NativeToolCall]) -> Vec<ToolInvocation> {
+        let mut invocations = Self::parse_tool_invocations(response);
+        for call in native {
+            let Ok(invocation) =
+                ToolInvocation::new(call.function.name.clone(), call.function.arguments.clone())
+            else {
+                warn!(
+                    tool = %call.function.name,
+                    "native tool call rejected by normalizer, skipped"
+                );
+                continue;
+            };
+            if invocations.iter().any(|existing| {
+                existing.name == invocation.name && existing.args == invocation.args
+            }) {
+                debug!(tool = %invocation.name, "native tool call duplicates fenced-JSON, deduped");
+                continue;
+            }
+            invocations.push(invocation);
+        }
+        invocations
+    }
+
+    /// Render one tool result as a visible intermediate line (T055).
+    ///
+    /// Scope logic: `count` is shown as "N hits" only when the tool output
+    /// exposes it (web.search does); other tools fall back to duration-only.
+    /// The preview is the first 100 chars of the serialized output.
+    fn tool_done_line(result: &ToolInvocationResult, duration_ms: u128) -> String {
+        let head = match result.output.get("count").and_then(|c| c.as_u64()) {
+            Some(count) => format!(
+                "✅ {} done {count} hits {duration_ms}ms",
+                result.invocation.name
+            ),
+            None => format!("✅ {} done {duration_ms}ms", result.invocation.name),
+        };
+        let full = serde_json::to_string(&result.output).unwrap_or_default();
+        let preview: String = full.chars().take(TOOL_PREVIEW_CHARS).collect();
+        if full.chars().count() > TOOL_PREVIEW_CHARS {
+            format!("{head}\n{preview}…\n")
+        } else {
+            format!("{head}\n{preview}\n")
+        }
+    }
+
     /// Execute with backward compatibility — returns String for existing callers.
     pub async fn execute_string(
         &self,
@@ -519,10 +620,18 @@ impl AgentOrchestrator {
 
     /// Stream tokens to a callback while building the response.
     ///
-    /// Drives a fenced-JSON tool loop identical in shape to `execute()`:
-    /// round 1 streams the model's answer; if it contains tool calls, we
-    /// dispatch them through the sandbox hook pipeline, feed results back,
-    /// and stream another round, up to `MAX_TOOL_ROUNDS`.
+    /// Drives a tool loop identical in shape to `execute()`: round 1 streams
+    /// the model's answer; if it contains tool calls — fenced-JSON blocks in
+    /// the text OR native provider `ToolCall`s captured from the stream —
+    /// both are merged into one invocation set, dispatched through the
+    /// sandbox hook pipeline, results fed back, and another round streamed,
+    /// up to `max_tool_rounds` (T054).
+    ///
+    /// T055 (contract streaming.md, callback path): each dispatch is bracketed
+    /// by visible intermediates on the same callback — `🔧 <tool> …` before
+    /// dispatch and `✅ <tool> done …` (or the error) after — always emitted
+    /// before the next `execute_stream_round`, so TUI users see tool progress
+    /// instead of a silent gap. No protocol change for the TUI path.
     #[instrument(skip(self, session, callback), fields(session_id = %session.session_id))]
     pub async fn execute_stream(
         &self,
@@ -544,20 +653,24 @@ impl AgentOrchestrator {
 
         self.wiring.connect_mcp_servers().await;
 
-        let mut response = zen_agent
+        let (mut response, mut native_calls) = zen_agent
             .execute_stream_round(user_query, session, None, &mut callback)
             .await?;
 
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut interaction_turns: Vec<(&str, String)> = Vec::new();
         let mut round = 0;
-        while round < MAX_TOOL_ROUNDS {
-            let invocations = Self::parse_tool_invocations(&response);
+        while round < self.max_tool_rounds {
+            let invocations = Self::merge_invocations(&response, &native_calls);
             if invocations.is_empty() {
                 break;
             }
             round += 1;
 
+            for invocation in &invocations {
+                callback(&format!("🔧 {} …\n", invocation.name.as_str()));
+            }
+            let dispatch_started = Instant::now();
             let hooks = self.wiring.dispatch_hooks();
             match dispatch_tool_invocations_with_hooks(
                 zen_agent.generic.tools(),
@@ -567,12 +680,14 @@ impl AgentOrchestrator {
             .await
             {
                 Ok(results) => {
+                    let duration_ms = dispatch_started.elapsed().as_millis();
                     for result in &results {
                         tool_calls.push(ToolCall {
                             tool_name: result.invocation.name.to_string(),
                             arguments: result.invocation.args.to_string(),
                             result: result.output.to_string(),
                         });
+                        callback(&Self::tool_done_line(result, duration_ms));
                     }
                     let results_json = Self::results_to_prompt(&results);
                     info!(
@@ -580,9 +695,11 @@ impl AgentOrchestrator {
                         tool_count = results.len(),
                         "streaming tool dispatch succeeded, re-streaming"
                     );
-                    interaction_turns.push(("assistant", response.clone()));
+                    let assistant_text =
+                        append_native_tool_calls_fenced(response.clone(), &native_calls);
+                    interaction_turns.push(("assistant", assistant_text));
                     interaction_turns.push(("tool", results_json.clone()));
-                    response = zen_agent
+                    let (next_response, next_native_calls) = zen_agent
                         .execute_stream_round(
                             user_query,
                             session,
@@ -590,6 +707,8 @@ impl AgentOrchestrator {
                             &mut callback,
                         )
                         .await?;
+                    response = next_response;
+                    native_calls = next_native_calls;
                 }
                 Err(e) => {
                     warn!(error = %e, round, "streaming tool dispatch terminated by sandbox hook");
@@ -598,6 +717,7 @@ impl AgentOrchestrator {
                         arguments: String::new(),
                         result: format!("blocked by sandbox: {e}"),
                     });
+                    callback(&format!("❌ tool dispatch blocked: {e}\n"));
                     break;
                 }
             }
@@ -782,5 +902,143 @@ mod tests {
         let wiring = ZenWiring::new();
         let hooks = wiring.dispatch_hooks();
         assert_eq!(hooks.len(), 5);
+    }
+
+    #[test]
+    fn test_with_tool_loop_config_clamps() {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        assert_eq!(
+            AgentOrchestrator::new(router.clone())
+                .with_tool_loop_config(5)
+                .max_tool_rounds(),
+            5
+        );
+        assert_eq!(
+            AgentOrchestrator::new(router.clone())
+                .with_tool_loop_config(0)
+                .max_tool_rounds(),
+            1
+        );
+        assert_eq!(
+            AgentOrchestrator::new(router)
+                .with_tool_loop_config(999)
+                .max_tool_rounds(),
+            16
+        );
+    }
+
+    #[test]
+    fn test_tool_done_line_shows_count_hits_when_exposed() {
+        let invocation = ToolInvocation::new("web.search", serde_json::json!({"query": "x"}))
+            .expect("invocation");
+        let result = ToolInvocationResult {
+            invocation,
+            output: serde_json::json!({"count": 5, "results": ["a", "b"]}),
+        };
+        let line = AgentOrchestrator::tool_done_line(&result, 123);
+        assert!(
+            line.starts_with("✅ web.search done 5 hits 123ms\n"),
+            "got: {line}"
+        );
+        assert!(line.contains("\"results\""), "preview missing: {line}");
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_tool_done_line_duration_only_without_count() {
+        let invocation =
+            ToolInvocation::new("fs.read", serde_json::json!({"path": "/tmp/x"})).unwrap();
+        let result = ToolInvocationResult {
+            invocation,
+            output: serde_json::json!({"content": "hello"}),
+        };
+        let line = AgentOrchestrator::tool_done_line(&result, 42);
+        assert!(line.starts_with("✅ fs.read done 42ms\n"), "got: {line}");
+        assert!(!line.contains("hits"), "got: {line}");
+    }
+
+    fn native_call(name: &str, args: serde_json::Value) -> NativeToolCall {
+        NativeToolCall::new(
+            "native-id".to_string(),
+            rig_core::completion::message::ToolFunction::new(name.to_string(), args),
+        )
+    }
+
+    #[test]
+    fn merge_invocations_unifies_fenced_and_native() {
+        let response = "```json\n{\"tool\": \"fs.read\", \"args\": {\"path\": \"/tmp/x\"}}\n```";
+        let native = vec![native_call(
+            "web.search",
+            serde_json::json!({"query": "rust"}),
+        )];
+
+        let merged = AgentOrchestrator::merge_invocations(response, &native);
+        let names: Vec<&str> = merged.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["fs.read", "web.search"],
+            "native call was swallowed"
+        );
+        assert_eq!(merged[1].args["query"], "rust");
+    }
+
+    #[test]
+    fn merge_invocations_dedups_native_duplicate_of_fenced() {
+        let response = "```json\n{\"tool\": \"web.search\", \"args\": {\"query\": \"rust\"}}\n```";
+        let native = vec![native_call(
+            "web.search",
+            serde_json::json!({"query": "rust"}),
+        )];
+
+        let merged = AgentOrchestrator::merge_invocations(response, &native);
+        assert_eq!(merged.len(), 1, "identical call dispatched twice");
+    }
+
+    #[test]
+    fn merge_invocations_rejects_invalid_native_name() {
+        let native = vec![native_call("", serde_json::json!({}))];
+        let merged = AgentOrchestrator::merge_invocations("plain answer", &native);
+        assert!(merged.is_empty(), "invalid native call must not dispatch");
+    }
+
+    #[test]
+    fn merge_invocations_native_only_round_still_dispatches() {
+        let native = vec![native_call(
+            "web.search",
+            serde_json::json!({"query": "zenspace"}),
+        )];
+
+        let merged = AgentOrchestrator::merge_invocations("no fenced blocks here", &native);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name.as_str(), "web.search");
+    }
+
+    #[test]
+    fn test_tool_done_line_truncates_preview_to_100_chars() {
+        let invocation =
+            ToolInvocation::new("fs.read", serde_json::json!({"path": "/tmp/x"})).unwrap();
+        let long = "x".repeat(500);
+        let result = ToolInvocationResult {
+            invocation,
+            output: serde_json::json!({ "content": long }),
+        };
+        let line = AgentOrchestrator::tool_done_line(&result, 7);
+        let preview_line = line.lines().nth(1).expect("preview line");
+        assert_eq!(preview_line.chars().count(), TOOL_PREVIEW_CHARS + 1);
+        assert!(preview_line.ends_with('…'));
+    }
+
+    #[test]
+    fn test_tool_done_line_multibyte_preview_is_char_safe() {
+        let invocation =
+            ToolInvocation::new("fs.read", serde_json::json!({"path": "/tmp/x"})).unwrap();
+        let result = ToolInvocationResult {
+            invocation,
+            output: serde_json::json!({ "content": "🔧".repeat(200) }),
+        };
+        let line = AgentOrchestrator::tool_done_line(&result, 1);
+        let preview_line = line.lines().nth(1).expect("preview line");
+        assert_eq!(preview_line.chars().count(), TOOL_PREVIEW_CHARS + 1);
+        assert!(preview_line.ends_with('…'));
     }
 }

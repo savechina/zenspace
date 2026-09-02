@@ -14,12 +14,15 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use zen_core::config::load_config;
+use zen_core::config::{HostSourceContext, LoopConfig, load_config};
 use zen_core::jsonl::append_jsonl_line;
 use zen_core::paths::ZenPaths;
+use zen_core::types::Sensitivity;
+use zen_provider::{DefaultRouter, LlmRouter, Provider, TaskRequirements};
 use zen_vault::distill::{
     CycleOutcome, GapKind, GapRecord, LoopBudget, LoopCycleReport, SourceIngester,
 };
+use zen_vault::graph_router::{DocExtractor, is_routable_extension};
 use zen_vault::{DistillationPipeline, Reindexer};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
@@ -194,6 +197,136 @@ impl ZenLoopWorker {
             }
         }
         *prev = Some(current);
+    }
+
+    /// Stage 2 (FR-033, T043-T045): host-source governance sweep.
+    ///
+    /// Scope logic (Constitution XV):
+    /// - Functionality: stages new `md`/`txt` files from each configured
+    ///   `host_sources` entry into `vault/inbox/_incoming/{host_hash}/`,
+    ///   preserves doc-track originals under `vault/raw/{host_hash}/`
+    ///   (stamped frontmatter), promotes staging into the inbox, and emits
+    ///   the `loop.host.ingested` audit event with sensitivity-routed
+    ///   model tier.
+    /// - User impact: configured host dirs feed the knowledge pipeline each
+    ///   cycle; code-track repos are indexed in place (never copied);
+    ///   Private sources route to local models unless `allow_cloud = true`.
+    /// - Default: `host_sources` empty → feature off, no FS or audit writes.
+    /// - Interaction: runs BEFORE `ingest_sweep` so promoted files enter the
+    ///   same inbox stale-detection (prev_inbox) flow as raw copies; routing
+    ///   (Stage 3a) additionally honors the `raw_graph_routing` master switch.
+    async fn sweep_host_sources(
+        &self,
+        paths: &ZenPaths,
+        loop_cfg: &LoopConfig,
+        host_contexts: &[HostSourceContext],
+        config: &zen_core::config::ZenConfig,
+        cycle_id: &str,
+    ) {
+        if host_contexts.is_empty() {
+            return;
+        }
+        let inbox = paths.inbox();
+        let doc_extractor = DocExtractor::new();
+        let mut staged_by_hash: HashMap<String, Vec<String>> = HashMap::new();
+
+        for ctx in host_contexts {
+            if !ctx.host_path.is_dir() {
+                warn!(
+                    source = %ctx.host_path.display(),
+                    "loop: host_source path missing — skipped"
+                );
+                continue;
+            }
+            let staged = stage_host_dir(ctx, loop_cfg, &inbox);
+            if !staged.is_empty() {
+                info!(
+                    source = %ctx.host_path.display(),
+                    staged = staged.len(),
+                    "loop: host source swept into _incoming staging"
+                );
+            }
+            // T044 doc track: preserve originals read-only under
+            // raw/{host_hash}/ with provenance frontmatter stamps.
+            if ctx.preserves_raw() {
+                for name in &staged {
+                    let host_file = ctx.host_path.join(name);
+                    match std::fs::read_to_string(&host_file) {
+                        Ok(content) => {
+                            if let Err(e) = doc_extractor.ensure_raw_copy(
+                                &paths.raw(),
+                                ctx,
+                                &host_file,
+                                &content,
+                            ) {
+                                warn!(
+                                    error = %e,
+                                    file = %host_file.display(),
+                                    "loop: host raw preservation failed (continues)"
+                                );
+                            }
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            file = %host_file.display(),
+                            "loop: host file unreadable — raw copy skipped"
+                        ),
+                    }
+                }
+            }
+            staged_by_hash.insert(ctx.host_hash.clone(), staged);
+        }
+
+        let promoted_by_hash = SourceIngester::new()
+            .promote_incoming(&inbox)
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "loop: host staging promotion failed");
+                HashMap::new()
+            });
+
+        // T045 (FR-033/F6): per-source audit with sensitivity-routed tier.
+        // Cloud extraction requires allow_cloud=true; otherwise routing runs
+        // through the router's existing enforce_sensitivity local-only gate.
+        let mut router: Option<DefaultRouter> = None;
+        for ctx in host_contexts {
+            let staged = staged_by_hash
+                .get(&ctx.host_hash)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let promoted = promoted_by_hash.get(&ctx.host_hash).copied().unwrap_or(0);
+            if staged == 0 && promoted == 0 {
+                continue;
+            }
+            let model_tier = {
+                let router = router.get_or_insert_with(|| DefaultRouter::from_agentic(config));
+                resolve_model_tier(router, ctx)
+            };
+            info!(
+                source = %ctx.host_path.display(),
+                sensitivity = %ctx.sensitivity,
+                model_tier,
+                staged,
+                promoted,
+                "loop: host source ingested"
+            );
+            let audit = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "kind": "loop.host.ingested",
+                "cycle_id": cycle_id,
+                "source": ctx.host_path.to_string_lossy(),
+                "sensitivity": ctx.sensitivity.to_string(),
+                "model_tier": model_tier,
+                "worker_type": ctx.worker_type.map(|k| k.as_str()),
+                "raw_policy": ctx.raw_policy.as_str(),
+                "allow_cloud": ctx.allow_cloud,
+                "staged": staged,
+                "promoted": promoted,
+            });
+            let audit_path = paths.logs().join("audit.jsonl");
+            if let Err(e) = append_jsonl_line(&audit_path, &audit) {
+                warn!(error = %e, "loop: host audit append failed");
+            }
+        }
     }
 
     /// Stage 3b (T024-T027): wisdom composition, post-distill —
@@ -439,6 +572,90 @@ fn inbox_listing(inbox: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Stage new host files into `_incoming/{host_hash}/` (T043).
+///
+/// A file is staged only when neither the pending slot nor the promoted
+/// ledger (`promoted/{name}`) holds it — the staging tree is the sweep's
+/// persistent seen-set, so each host file enters the pipeline exactly once.
+/// Only top-level `md`/`txt` files are swept; config `skip_extensions`
+/// applies.
+fn stage_host_dir(ctx: &HostSourceContext, loop_cfg: &LoopConfig, inbox: &Path) -> Vec<String> {
+    let staging = inbox.join("_incoming").join(&ctx.host_hash);
+    let promoted_dir = staging.join("promoted");
+    let mut staged = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&ctx.host_path) else {
+        return staged;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !(ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("txt")) {
+            continue;
+        }
+        if loop_cfg.is_extension_skipped(ext) {
+            continue;
+        }
+        if staging.join(name).exists() || promoted_dir.join(name).exists() {
+            continue;
+        }
+        std::fs::create_dir_all(&staging).ok();
+        match std::fs::copy(&path, staging.join(name)) {
+            Ok(_) => staged.push(name.to_string()),
+            Err(e) => warn!(
+                error = %e,
+                file = %path.display(),
+                "loop: host staging copy failed (continues)"
+            ),
+        }
+    }
+    staged
+}
+
+/// T045 (FR-033/F6): resolve the effective model tier for a host source via
+/// the existing router sensitivity enforcement.
+///
+/// - `allow_cloud = false` (default): routing requests `Sensitivity::Private`
+///   so `enforce_sensitivity` forces a local provider — cloud is unreachable
+///   regardless of the source's own classification.
+/// - `allow_cloud = true`: explicit per-source opt-in overrides the local-only
+///   guard; the routed provider decides the tier.
+///
+/// # Returns
+/// `"local"`, `"cloud"`, or `"local-unavailable"` (enforcement could not
+/// find a reachable local provider — recorded honestly in the audit event;
+/// extraction continues heuristically offline).
+fn resolve_model_tier(router: &DefaultRouter, host: &HostSourceContext) -> &'static str {
+    let route_sensitivity = if host.allow_cloud {
+        Sensitivity::Public
+    } else {
+        Sensitivity::Private
+    };
+    let requirements = TaskRequirements {
+        max_tokens: None,
+        sensitivity: route_sensitivity,
+        preferred_model: None,
+        budget_limit: None,
+    };
+    match router.route(&requirements) {
+        Ok(Provider::Ollama) => "local",
+        Ok(_) if host.allow_cloud => "cloud",
+        Ok(_) => "local",
+        Err(_) => {
+            warn!(
+                source = %host.host_path.display(),
+                "loop: local LLM unavailable for Private host extraction — tier recorded as local-unavailable"
+            );
+            "local-unavailable"
+        }
+    }
+}
+
 /// `ZenWorker` implementation — the main cycle entry point.
 ///
 /// `execute()` runs the full 6-stage pipeline: pre-cycle guards, ingest
@@ -476,6 +693,28 @@ impl ZenWorker for ZenLoopWorker {
         let logs_dir = paths.logs().to_path_buf();
         std::fs::create_dir_all(&logs_dir).ok();
 
+        // FR-033 (T043): resolve governed host sources once per cycle.
+        // Invalid entries are warn-and-skipped (fail-closed validation in
+        // HostSourceConfig::resolve), never silently reinterpreted.
+        let workspace_id = paths
+            .workspace_root()
+            .map(|p| p.to_string_lossy().into_owned());
+        let host_contexts: Vec<HostSourceContext> = loop_cfg
+            .host_sources
+            .iter()
+            .filter_map(|source| match source.resolve(workspace_id.as_deref()) {
+                Ok(ctx) => Some(ctx),
+                Err(reason) => {
+                    warn!(
+                        source = %source.host_path,
+                        %reason,
+                        "loop: invalid host_source — skipped"
+                    );
+                    None
+                }
+            })
+            .collect();
+
         let mut report = LoopCycleReport {
             cycle_id: cycle_id.clone(),
             started_at: Some(ctx.now),
@@ -495,7 +734,11 @@ impl ZenWorker for ZenLoopWorker {
             return Ok(worker_report(&report, started));
         }
 
-        // ── Stage 2: ingest sweep (+ stale detection) ─────────────────────
+        // ── Stage 2: host-source governance sweep, then ingest sweep ─────
+        // Host promotion runs FIRST so promoted files enter the exact same
+        // inbox listing + stale-detection (prev_inbox) flow as raw copies.
+        self.sweep_host_sources(&paths, loop_cfg, &host_contexts, config, &cycle_id)
+            .await;
         let mut gaps: Vec<GapRecord> = Vec::new();
         self.ingest_sweep(&paths, &mut gaps, &cycle_id).await;
 
@@ -609,7 +852,7 @@ impl ZenWorker for ZenLoopWorker {
                                 continue;
                             }
                             match router
-                                .route_and_join(db, &path, &content, None, &report.cycle_id)
+                                .route_and_join(db, &path, &content, None, None, &report.cycle_id)
                                 .await
                             {
                                 Ok(outcome) => {
@@ -624,6 +867,61 @@ impl ZenWorker for ZenLoopWorker {
                     }
                     if routed > 0 {
                         info!(routed, joined, "loop: raw sources routed into graph");
+                    }
+
+                    // FR-033 host-source routing (T044/T045): governed sources
+                    // route WITH their HostSourceContext — code track reads the
+                    // host dir in place (index-only + provenance pages), doc
+                    // track routes the preserved raw/{host_hash}/ copies (or
+                    // the host dir itself for index-only docs).
+                    for ctx in &host_contexts {
+                        let routing_root = if ctx.preserves_raw() {
+                            raw_dir.join(&ctx.host_hash)
+                        } else {
+                            ctx.host_path.clone()
+                        };
+                        if !routing_root.is_dir() {
+                            continue;
+                        }
+                        let Ok(entries) = std::fs::read_dir(&routing_root) else {
+                            continue;
+                        };
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let path = entry.path();
+                            if !path.is_file() || !is_routable_extension(&path) {
+                                continue;
+                            }
+                            let content = match std::fs::read(&path) {
+                                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                                Err(e) => {
+                                    warn!(error = %e, path = %path.display(), "loop: host source read failed");
+                                    continue;
+                                }
+                            };
+                            match router
+                                .route_and_join(
+                                    db,
+                                    &path,
+                                    &content,
+                                    Some(ctx),
+                                    Some(&paths.vault()),
+                                    &report.cycle_id,
+                                )
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    routed += 1;
+                                    joined += outcome.notions_extracted;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, path = %path.display(), "loop: host source graph routing failed (continues)");
+                                }
+                            }
+                        }
+                    }
+
+                    if routed > 0 {
+                        info!(routed, joined, "loop: sources routed into graph");
                     }
                     report.raw_sources_routed = routed;
                     report.raw_notions_joined = joined;

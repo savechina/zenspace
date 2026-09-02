@@ -6,8 +6,9 @@ use futures::stream::StreamExt;
 use rig_compose::ContextPackConfig;
 use rig_compose::agent::{Agent, GenericAgent};
 use rig_compose::context::{Evidence, InvestigationContext, Signal};
-use rig_core::completion::{CompletionModel, ToolDefinition};
-use rig_core::streaming::StreamedAssistantContent;
+use rig_core::completion::message::{ToolCall, ToolFunction};
+use rig_core::completion::{AssistantContent, CompletionModel, ToolDefinition};
+use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
 use tracing::{debug, instrument, warn};
@@ -862,9 +863,11 @@ impl ZenAgent {
             )
         };
 
-        let response = self
+        let (response, native_tool_calls) = self
             .call_llm_with_assembly(query, &system_prompt, &user_message, session)
             .await?;
+
+        let response = append_native_tool_calls_fenced(response, &native_tool_calls);
 
         tracing::info!(
             response_len = response.len(),
@@ -1110,7 +1113,7 @@ impl ZenAgent {
         system_prompt: &str,
         user_message: &str,
         session: &SessionContext,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<ToolCall>)> {
         use rig_core::OneOrMany;
         use rig_core::completion::CompletionRequest;
         use rig_core::message::Message;
@@ -1212,10 +1215,19 @@ impl ZenAgent {
                     Some(response.usage.output_tokens),
                     Some(duration_ms),
                 );
-                match response.choice.first() {
-                    rig_core::completion::AssistantContent::Text(t) => Ok(t.text.clone()),
-                    other => Ok(format!("{other:?}")),
+                // T052: native provider tool calls must not fall into the
+                // former debug-string swallow path — return them alongside
+                // the text so callers can dispatch or re-serialize them.
+                let mut full_response = String::new();
+                let mut native_tool_calls: Vec<ToolCall> = Vec::new();
+                for content in response.choice {
+                    match content {
+                        AssistantContent::Text(t) => full_response.push_str(&t.text),
+                        AssistantContent::ToolCall(call) => native_tool_calls.push(call),
+                        other => debug!(content = ?other, "non-text assistant content ignored"),
+                    }
                 }
+                Ok((full_response, native_tool_calls))
             }
             Err(e) => {
                 crate::observability::emit_prompt_failed(
@@ -1235,9 +1247,12 @@ impl ZenAgent {
         session: &mut SessionContext,
         callback: impl FnMut(&str),
     ) -> Result<String> {
-        let response = self
+        let (response, native_tool_calls) = self
             .execute_stream_round(query, session, None, callback)
             .await?;
+        // This wrapper keeps the String contract for legacy callers; native
+        // calls are re-serialized as fenced-JSON instead of being dropped.
+        let response = append_native_tool_calls_fenced(response, &native_tool_calls);
         session.add_turn(MessageRole::User, query);
         session.add_turn(MessageRole::Assistant, &response);
         Ok(response)
@@ -1245,9 +1260,11 @@ impl ZenAgent {
 
     /// One streaming LLM round without session-turn bookkeeping.
     ///
-    /// `tool_results`, when non-empty, is injected into the user message so
-    /// the model can continue after a tool-dispatch round. Callers driving a
-    /// multi-round tool loop own turn management themselves (see
+    /// Returns the streamed text plus any native provider `ToolCall`s
+    /// captured from the stream (`ToolCall` / accumulated `ToolCallDelta`
+    /// events). `tool_results`, when non-empty, is injected into the user
+    /// message so the model can continue after a tool-dispatch round. Callers
+    /// driving a multi-round tool loop own turn management themselves (see
     /// `AgentOrchestrator::execute_stream`).
     #[instrument(skip(self, session, callback), fields(session_id = %session.session_id, query_len = query.len()))]
     pub async fn execute_stream_round(
@@ -1256,7 +1273,7 @@ impl ZenAgent {
         session: &mut SessionContext,
         tool_results: Option<&str>,
         callback: impl FnMut(&str),
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<ToolCall>)> {
         let session_id = session.session_id.to_string();
         let conv_len = session.conversation.len();
         tracing::info!(
@@ -1344,11 +1361,11 @@ impl ZenAgent {
             ),
         };
 
-        let response = self
+        let (response, native_tool_calls) = self
             .call_llm_stream_with_assembly(query, &system_prompt, &user_message, session, callback)
             .await?;
 
-        Ok(response)
+        Ok((response, native_tool_calls))
     }
 
     #[instrument(skip(self, system_prompt, user_message, session, callback), fields(session_id = %session.session_id, query_len = query.len()))]
@@ -1359,7 +1376,7 @@ impl ZenAgent {
         user_message: &str,
         session: &SessionContext,
         mut callback: impl FnMut(&str),
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<ToolCall>)> {
         use rig_core::OneOrMany;
         use rig_core::completion::{CompletionModel, CompletionRequest};
         use rig_core::message::Message;
@@ -1455,31 +1472,179 @@ impl ZenAgent {
         };
 
         let mut stream = self.completion_model.stream(request).await?;
-        let mut full_response = String::new();
+        let mut accumulator = StreamToolCallAccumulator::default();
 
         while let Some(item) = stream.next().await {
             match item {
                 Ok(StreamedAssistantContent::Text(text)) => {
-                    let token = text.text.clone();
-                    full_response.push_str(&token);
-                    callback(&token);
+                    accumulator.fold_text(&text.text);
+                    callback(&text.text);
                 }
                 Ok(StreamedAssistantContent::Final(_)) => break,
-                Ok(_) => {}
+                Ok(content) => accumulator.fold(content),
                 Err(e) => {
                     return Err(anyhow::anyhow!("streaming error: {}", e));
                 }
             }
         }
 
+        let (full_response, native_tool_calls) = accumulator.finish();
+
         crate::observability::emit_prompt_completed(model_name, &conversation_id, None, None, None);
 
         tracing::info!(
             response_len = full_response.len(),
+            native_tool_calls = native_tool_calls.len(),
             "call_llm_stream_with_assembly: response complete"
         );
 
-        Ok(full_response)
+        Ok((full_response, native_tool_calls))
+    }
+}
+
+/// A native tool call still being assembled from stream deltas (T051).
+#[derive(Debug, Default, Clone)]
+struct PendingToolCall {
+    internal_call_id: String,
+    id: String,
+    name: Option<String>,
+    args: String,
+}
+
+/// Stream-arrival-order slot: provider-complete call or delta accumulation.
+#[derive(Debug)]
+enum ToolCallSlot {
+    Complete(ToolCall),
+    Pending(PendingToolCall),
+}
+
+/// Folds streamed assistant content into `(text, Vec<ToolCall>)`.
+///
+/// `ToolCallDelta` fragments (`Name` / `Delta`) merge per `internal_call_id`;
+/// a later complete `ToolCall` with the same `internal_call_id` replaces the
+/// pending accumulation in place (providers may emit both). Everything else
+/// except text is ignored.
+#[derive(Debug, Default)]
+struct StreamToolCallAccumulator {
+    text: String,
+    slots: Vec<ToolCallSlot>,
+}
+
+impl StreamToolCallAccumulator {
+    fn fold_text(&mut self, token: &str) {
+        self.text.push_str(token);
+    }
+
+    fn fold<R: Clone>(&mut self, item: StreamedAssistantContent<R>) {
+        match item {
+            StreamedAssistantContent::Text(t) => self.text.push_str(&t.text),
+            StreamedAssistantContent::ToolCallDelta {
+                id,
+                internal_call_id,
+                content,
+            } => {
+                let pending = self.pending_slot(&internal_call_id, &id);
+                match content {
+                    ToolCallDeltaContent::Name(name) => pending.name = Some(name),
+                    ToolCallDeltaContent::Delta(fragment) => pending.args.push_str(&fragment),
+                }
+            }
+            StreamedAssistantContent::ToolCall {
+                tool_call,
+                internal_call_id,
+            } => self.complete_slot(&internal_call_id, tool_call),
+            _ => {}
+        }
+    }
+
+    fn pending_slot(&mut self, internal_call_id: &str, id: &str) -> &mut PendingToolCall {
+        // Position computed before any &mut borrow: the early-return-borrow
+        // shape trips NLL Problem Case #3 (conditional borrow + later push).
+        let existing = self.slots.iter().position(
+            |s| matches!(s, ToolCallSlot::Pending(p) if p.internal_call_id == internal_call_id),
+        );
+        if existing.is_none() {
+            self.slots.push(ToolCallSlot::Pending(PendingToolCall {
+                internal_call_id: internal_call_id.to_string(),
+                id: id.to_string(),
+                name: None,
+                args: String::new(),
+            }));
+        }
+        let pos = existing.unwrap_or(self.slots.len() - 1);
+        match &mut self.slots[pos] {
+            ToolCallSlot::Pending(p) => p,
+            ToolCallSlot::Complete(_) => {
+                unreachable!("pending_slot only resolves Pending slots")
+            }
+        }
+    }
+
+    fn complete_slot(&mut self, internal_call_id: &str, tool_call: ToolCall) {
+        if let Some(pos) = self.slots.iter().position(
+            |s| matches!(s, ToolCallSlot::Pending(p) if p.internal_call_id == internal_call_id),
+        ) {
+            self.slots[pos] = ToolCallSlot::Complete(tool_call);
+        } else {
+            self.slots.push(ToolCallSlot::Complete(tool_call));
+        }
+    }
+
+    fn finish(self) -> (String, Vec<ToolCall>) {
+        let mut calls = Vec::with_capacity(self.slots.len());
+        for slot in self.slots {
+            match slot {
+                ToolCallSlot::Complete(call) => calls.push(call),
+                ToolCallSlot::Pending(p) => {
+                    let Some(name) = p.name.filter(|n| !n.trim().is_empty()) else {
+                        debug!(
+                            internal_call_id = %p.internal_call_id,
+                            "dropping tool-call deltas that never carried a tool name"
+                        );
+                        continue;
+                    };
+                    // Delta fragments carry raw JSON text; parse leniently and
+                    // keep the raw string as payload so arguments are never lost.
+                    let arguments = serde_json::from_str::<serde_json::Value>(&p.args)
+                        .unwrap_or_else(|_| serde_json::Value::String(p.args.clone()));
+                    calls.push(ToolCall::new(p.id, ToolFunction::new(name, arguments)));
+                }
+            }
+        }
+        (self.text, calls)
+    }
+}
+
+/// Serialize native provider `ToolCall`s into the fenced-JSON dialect
+/// understood by `AgentOrchestrator::parse_tool_invocations`.
+pub(crate) fn serialize_tool_calls_fenced(calls: &[ToolCall]) -> String {
+    if calls.is_empty() {
+        return String::new();
+    }
+    let items: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|call| {
+            json!({
+                "tool": call.function.name,
+                "args": call.function.arguments,
+            })
+        })
+        .collect();
+    let payload = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+    format!("```json\n{payload}\n```")
+}
+
+/// Append the fenced-JSON rendering of native tool calls to model text so
+/// string-only consumers never lose them.
+pub(crate) fn append_native_tool_calls_fenced(text: String, calls: &[ToolCall]) -> String {
+    let fenced = serialize_tool_calls_fenced(calls);
+    if fenced.is_empty() {
+        return text;
+    }
+    if text.trim().is_empty() {
+        fenced
+    } else {
+        format!("{text}\n{fenced}")
     }
 }
 
@@ -1751,5 +1916,183 @@ mod chain_tests {
         assert_eq!(truncated, "abcd\n\n[truncated]");
         assert!(truncated.starts_with("abcd"));
         assert!(truncated.ends_with("[truncated]"));
+    }
+}
+
+#[cfg(test)]
+mod native_tool_call_tests {
+    use super::*;
+    use rig_core::streaming::ToolCallDeltaContent;
+
+    fn text_item(s: &str) -> StreamedAssistantContent<()> {
+        StreamedAssistantContent::Text(rig_core::message::Text::new(s.to_string()))
+    }
+
+    fn delta_item(
+        internal_id: &str,
+        content: ToolCallDeltaContent,
+    ) -> StreamedAssistantContent<()> {
+        StreamedAssistantContent::ToolCallDelta {
+            id: format!("{internal_id}-provider"),
+            internal_call_id: internal_id.to_string(),
+            content,
+        }
+    }
+
+    fn complete_call(
+        internal_id: &str,
+        name: &str,
+        args: serde_json::Value,
+    ) -> StreamedAssistantContent<()> {
+        StreamedAssistantContent::ToolCall {
+            tool_call: ToolCall::new(
+                format!("{internal_id}-provider"),
+                ToolFunction::new(name.to_string(), args),
+            ),
+            internal_call_id: internal_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn accumulator_captures_complete_tool_call_not_swallowed() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.fold(text_item("searching…"));
+        acc.fold(complete_call(
+            "c1",
+            "web.search",
+            json!({"query": "rust async"}),
+        ));
+
+        let (text, calls) = acc.finish();
+        assert_eq!(text, "searching…");
+        assert_eq!(calls.len(), 1, "native ToolCall was swallowed");
+        assert_eq!(calls[0].function.name, "web.search");
+        assert_eq!(calls[0].function.arguments["query"], "rust async");
+    }
+
+    #[test]
+    fn accumulator_merges_deltas_into_complete_tool_call() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.fold(delta_item(
+            "c1",
+            ToolCallDeltaContent::Name("web.search".to_string()),
+        ));
+        acc.fold(delta_item(
+            "c1",
+            ToolCallDeltaContent::Delta("{\"query\": \"ze".to_string()),
+        ));
+        acc.fold(delta_item(
+            "c1",
+            ToolCallDeltaContent::Delta("nspace\"}".to_string()),
+        ));
+
+        let (text, calls) = acc.finish();
+        assert!(text.is_empty());
+        assert_eq!(
+            calls.len(),
+            1,
+            "streamed deltas did not assemble a ToolCall"
+        );
+        assert_eq!(calls[0].function.name, "web.search");
+        assert_eq!(calls[0].function.arguments["query"], "zenspace");
+    }
+
+    #[test]
+    fn accumulator_complete_call_replaces_pending_deltas_in_place() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.fold(delta_item(
+            "c1",
+            ToolCallDeltaContent::Name("web.search".to_string()),
+        ));
+        acc.fold(delta_item(
+            "c1",
+            ToolCallDeltaContent::Delta("{\"query\"".to_string()),
+        ));
+        acc.fold(complete_call("c1", "web.search", json!({"query": "final"})));
+
+        let (_, calls) = acc.finish();
+        assert_eq!(calls.len(), 1, "deltas + complete call duplicated");
+        assert_eq!(calls[0].function.arguments["query"], "final");
+    }
+
+    #[test]
+    fn accumulator_preserves_arrival_order_across_slots() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.fold(complete_call("c1", "fs.read", json!({})));
+        acc.fold(delta_item(
+            "c2",
+            ToolCallDeltaContent::Name("web.fetch".to_string()),
+        ));
+        acc.fold(complete_call("c3", "fs.list", json!({})));
+
+        let (_, calls) = acc.finish();
+        let names: Vec<&str> = calls.iter().map(|c| c.function.name.as_str()).collect();
+        assert_eq!(names, ["fs.read", "web.fetch", "fs.list"]);
+    }
+
+    #[test]
+    fn accumulator_drops_nameless_deltas_and_keeps_raw_args_string() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.fold(delta_item(
+            "c1",
+            ToolCallDeltaContent::Delta("not json".to_string()),
+        ));
+        acc.fold(delta_item(
+            "c2",
+            ToolCallDeltaContent::Name("web.search".to_string()),
+        ));
+        acc.fold(delta_item(
+            "c2",
+            ToolCallDeltaContent::Delta("malformed".to_string()),
+        ));
+
+        let (_, calls) = acc.finish();
+        assert_eq!(
+            calls.len(),
+            1,
+            "nameless deltas must not materialize a call"
+        );
+        assert_eq!(calls[0].function.name, "web.search");
+        assert_eq!(
+            calls[0].function.arguments,
+            json!("malformed"),
+            "unparseable args fall back to raw string, never lost"
+        );
+    }
+
+    #[test]
+    fn fenced_serialization_matches_parse_dialect() {
+        let call = ToolCall::new(
+            "id1".to_string(),
+            ToolFunction::new("web.search".to_string(), json!({"query": "rust"})),
+        );
+        let fenced = serialize_tool_calls_fenced(std::slice::from_ref(&call));
+
+        assert!(fenced.starts_with("```json"));
+        assert!(fenced.ends_with("```"));
+        let value: serde_json::Value = serde_json::from_str(
+            fenced
+                .trim_start_matches("```json\n")
+                .trim_end_matches("```"),
+        )
+        .expect("fenced payload must be valid JSON");
+        assert_eq!(value[0]["tool"], "web.search");
+        assert_eq!(value[0]["args"]["query"], "rust");
+    }
+
+    #[test]
+    fn append_fenced_preserves_text_and_appends_block() {
+        let call = ToolCall::new(
+            "id1".to_string(),
+            ToolFunction::new("web.search".to_string(), json!({})),
+        );
+        let out = append_native_tool_calls_fenced("answer text".to_string(), &[call]);
+        assert!(out.starts_with("answer text\n```json"));
+        assert!(out.ends_with("```"));
+
+        assert_eq!(
+            append_native_tool_calls_fenced("text".to_string(), &[]),
+            "text"
+        );
     }
 }

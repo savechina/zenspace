@@ -412,6 +412,8 @@ pub struct AgenticConfig {
     /// (`loop` is a Rust keyword, hence the `loop_cfg` field name.)
     #[serde(rename = "loop")]
     pub loop_cfg: LoopConfig,
+    /// Per-turn tool dispatch loop — TOML `[agentic.tool_loop]` (T050).
+    pub tool_loop: ToolLoopConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -514,6 +516,42 @@ impl LoopConfig {
     }
 }
 
+/// Clamp bounds for `[agentic.tool_loop] max_rounds` (contract tool-loop.json).
+const TOOL_MAX_ROUNDS_MIN: u8 = 1;
+const TOOL_MAX_ROUNDS_MAX: u8 = 16;
+const TOOL_MAX_ROUNDS_DEFAULT: u8 = 8;
+
+/// Per-turn tool dispatch loop configuration (005-agentic-loop, T050) —
+/// TOML `[agentic.tool_loop]`.
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: caps the orchestrator's tool dispatch rounds per user turn
+///   (`orchestrator::execute_stream`/`execute`); replaces the former const
+///   `MAX_TOOL_ROUNDS = 4`. Token budget and turn watchdog remain in force.
+/// - User impact: higher values let the agent chain more tool calls per turn
+///   (multi-step web.search + fs.* sequences); lower values cut per-turn
+///   latency and cost at the price of truncated tool chains.
+/// - Default: `max_rounds = 8`, clamped to `1..=16` at load — both TOML and
+///   env-sourced values are bounded.
+/// - Interaction: env `ZEN_TOOL_MAX_ROUNDS` (5th layer) overrides any config
+///   file layer; the clamp applies after the 5-layer merge.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ToolLoopConfig {
+    /// Max tool dispatch rounds per user turn (absent → 8, clamped 1..=16).
+    pub max_rounds: Option<u8>,
+}
+
+impl ToolLoopConfig {
+    /// Effective per-turn tool dispatch round cap: config value clamped to
+    /// `1..=16`, or the default 8 when absent.
+    pub fn max_rounds_or_default(&self) -> u8 {
+        self.max_rounds
+            .unwrap_or(TOOL_MAX_ROUNDS_DEFAULT)
+            .clamp(TOOL_MAX_ROUNDS_MIN, TOOL_MAX_ROUNDS_MAX)
+    }
+}
+
 /// One governed host directory (FR-033, T043).
 ///
 /// TOML layout (inside `[agentic.loop]`):
@@ -544,6 +582,230 @@ pub struct HostSourceConfig {
     pub sensitivity: Option<String>,
     /// Cloud LLM extraction opt-in; false (default) forces local models for Private.
     pub allow_cloud: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Host governance resolution (FR-033, T043)
+// ---------------------------------------------------------------------------
+
+/// Normalized worker kind for a host source (FR-033 `worker_type: code|doc`).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: forces the Router lane — `Code` = deterministic slug
+///   extraction, index-only provenance, no vault copy; `Doc` = agentic
+///   semantic extraction with raw preservation copy.
+/// - User impact: absent `worker_type` → `None` → the GraphRouter classifies
+///   per-file by content heuristics (existing `resolve_track` behavior).
+/// - Default: `None` (auto-classify).
+/// - Interaction: invalid TOML values are rejected by
+///   [`HostSourceConfig::resolve`] — the loop worker warns and skips the
+///   whole source (never silently reinterprets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostWorkerKind {
+    /// Deterministic track (no LLM, index-only).
+    Code,
+    /// Agentic semantic track (raw copy + limited products).
+    Doc,
+}
+
+impl HostWorkerKind {
+    /// Parse a TOML `worker_type` value; `None` on anything but `code`/`doc`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "code" => Some(Self::Code),
+            "doc" => Some(Self::Doc),
+            _ => None,
+        }
+    }
+
+    /// Canonical string form (used in frontmatter tags and audit events).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Doc => "doc",
+        }
+    }
+}
+
+/// Raw-preservation policy for a host source (FR-033 `raw_policy`).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: decides whether host files are copied into
+///   `vault/raw/{host_hash}/` (read-only preservation with provenance
+///   frontmatter) or only indexed in place.
+/// - User impact: `index-only` keeps GB-scale repos out of the vault;
+///   `copy` preserves document originals for full-text search/reindex.
+/// - Default: `index-only` when `worker_type = code`, `copy` otherwise
+///   (including auto-classified sources).
+/// - Interaction: the code track NEVER copies regardless of this policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRawPolicy {
+    /// Provenance pages only; no file copies (code track default).
+    IndexOnly,
+    /// Copy originals to `vault/raw/{host_hash}/` (doc track default).
+    Copy,
+}
+
+impl HostRawPolicy {
+    /// Parse a TOML `raw_policy` value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "index-only" => Some(Self::IndexOnly),
+            "copy" => Some(Self::Copy),
+            _ => None,
+        }
+    }
+
+    /// Canonical string form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IndexOnly => "index-only",
+            Self::Copy => "copy",
+        }
+    }
+}
+
+/// Fully-resolved host source: validated config + `~` expansion + stable
+/// staging hash. Built once per cycle by the loop worker via
+/// [`HostSourceConfig::resolve`]; invalid sources never produce a context.
+#[derive(Debug, Clone)]
+pub struct HostSourceContext {
+    /// `~`/`$HOME`-expanded host directory.
+    pub host_path: PathBuf,
+    /// First 8 hex chars of SHA-256 over the expanded host path — stable
+    /// key for `_incoming/{host_hash}/` staging and `raw/{host_hash}/` copies.
+    pub host_hash: String,
+    /// `None` = auto-classify per file in the GraphRouter.
+    pub worker_type: Option<HostWorkerKind>,
+    /// Resolved preservation policy (defaults by worker kind).
+    pub raw_policy: HostRawPolicy,
+    /// Data classification feeding sensitivity routing (default Private).
+    pub sensitivity: crate::types::Sensitivity,
+    /// Cloud LLM extraction opt-in (default false → local-only routing).
+    pub allow_cloud: bool,
+    /// PARA bucket for code-track provenance pages; None = no page.
+    pub para_target: Option<String>,
+    /// DESIGN memory tier tag (M3/M4/M5), stamped into frontmatter/metadata.
+    pub m_tier: Option<String>,
+    /// Workspace identity stamped into frontmatter for cross-workspace filtering.
+    pub workspace_id: Option<String>,
+}
+
+impl HostSourceContext {
+    /// True when files from this source are preserved under
+    /// `vault/raw/{host_hash}/` (doc track with copy policy).
+    pub fn preserves_raw(&self) -> bool {
+        self.raw_policy == HostRawPolicy::Copy && self.worker_type != Some(HostWorkerKind::Code)
+    }
+}
+
+/// Expand `~` and `$HOME` in a configured host path.
+///
+/// # Parameters
+/// - `raw` — the literal `host_path` string from config.
+///
+/// # Returns
+/// Expanded absolute path (best-effort: an empty `$HOME` leaves the literal).
+pub fn expand_home_path(raw: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if raw == "~" {
+        return PathBuf::from(home);
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return PathBuf::from(format!("{home}/{rest}"));
+    }
+    PathBuf::from(raw.replace("$HOME", &home))
+}
+
+/// Stable staging key for a host directory: first 8 hex chars of
+/// SHA-256 over the expanded path string. Collisions across the 12-entry
+/// planning reference are practically impossible; the full path always
+/// travels alongside in provenance frontmatter.
+///
+/// # Parameters
+/// - `host_path` — the expanded host directory.
+///
+/// # Returns
+/// 8 lowercase hex characters.
+pub fn host_dir_hash(host_path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(host_path.to_string_lossy().as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+use std::path::Path;
+
+impl HostSourceConfig {
+    /// Validate and resolve this source into a [`HostSourceContext`].
+    ///
+    /// # Parameters
+    /// - `workspace_id` — workspace identity for frontmatter stamping
+    ///   (usually `ZenPaths::workspace_root()` as a string).
+    ///
+    /// # Returns
+    /// The resolved context with `~` expansion and staging hash applied.
+    ///
+    /// # Errors
+    /// `Err(reason)` when any field is invalid — the caller (loop worker)
+    /// logs a warning and skips the source (fail-closed per FR-033):
+    /// empty `host_path`, `worker_type` ∉ {code, doc}, `raw_policy` ∉
+    /// {index-only, copy}, `sensitivity` ∉ {Private, Internal, Public},
+    /// or `para_target` ∉ {projects, areas, resources, archive}.
+    pub fn resolve(&self, workspace_id: Option<&str>) -> Result<HostSourceContext, String> {
+        if self.host_path.trim().is_empty() {
+            return Err("host_path is empty".to_string());
+        }
+        let worker_type = match self.worker_type.as_deref() {
+            None => None,
+            Some(v) => Some(
+                HostWorkerKind::parse(v)
+                    .ok_or_else(|| format!("invalid worker_type `{v}` (expected code|doc)"))?,
+            ),
+        };
+        let raw_policy = match self.raw_policy.as_deref() {
+            None => match worker_type {
+                Some(HostWorkerKind::Code) => HostRawPolicy::IndexOnly,
+                _ => HostRawPolicy::Copy,
+            },
+            Some(v) => HostRawPolicy::parse(v)
+                .ok_or_else(|| format!("invalid raw_policy `{v}` (expected index-only|copy)"))?,
+        };
+        let sensitivity = match self.sensitivity.as_deref() {
+            None => crate::types::Sensitivity::Private,
+            Some(v) => match v {
+                "Private" => crate::types::Sensitivity::Private,
+                // FR-033 "Internal" (company-internal) maps onto the
+                // Sensitivity taxonomy's local-only Private tier — both are
+                // withheld from cloud routing by `enforce_sensitivity`.
+                "Internal" => crate::types::Sensitivity::Private,
+                "Public" => crate::types::Sensitivity::Public,
+                other => {
+                    return Err(format!(
+                        "invalid sensitivity `{other}` (expected Private|Internal|Public)"
+                    ));
+                }
+            },
+        };
+        if let Some(target) = self.para_target.as_deref()
+            && !matches!(target, "projects" | "areas" | "resources" | "archive")
+        {
+            return Err(format!(
+                "invalid para_target `{target}` (expected projects|areas|resources|archive)"
+            ));
+        }
+        let host_path = expand_home_path(&self.host_path);
+        Ok(HostSourceContext {
+            host_hash: host_dir_hash(&host_path),
+            host_path,
+            worker_type,
+            raw_policy,
+            sensitivity,
+            allow_cloud: self.allow_cloud.unwrap_or(false),
+            para_target: self.para_target.clone(),
+            m_tier: self.m_tier.clone(),
+            workspace_id: workspace_id.map(|s| s.to_string()),
+        })
+    }
 }
 
 /// Plugin system config.
@@ -1194,6 +1456,13 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
 fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
     AgenticConfig {
         loop_cfg: merge_loop(base.loop_cfg, ov.loop_cfg),
+        tool_loop: merge_tool_loop(base.tool_loop, ov.tool_loop),
+    }
+}
+
+fn merge_tool_loop(base: ToolLoopConfig, ov: ToolLoopConfig) -> ToolLoopConfig {
+    ToolLoopConfig {
+        max_rounds: ov.max_rounds.or(base.max_rounds),
     }
 }
 
@@ -1472,7 +1741,16 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_history_env(&mut config.history);
     apply_embeddings_env(&mut config.embeddings);
     apply_loop_env(&mut config.agentic.loop_cfg);
+    apply_tool_loop_env(&mut config.agentic.tool_loop);
     config
+}
+
+fn apply_tool_loop_env(cfg: &mut ToolLoopConfig) {
+    if let Some(v) = env_str("ZEN_TOOL_MAX_ROUNDS")
+        && let Ok(n) = v.parse::<u8>()
+    {
+        cfg.max_rounds = Some(n.clamp(TOOL_MAX_ROUNDS_MIN, TOOL_MAX_ROUNDS_MAX));
+    }
 }
 
 fn apply_loop_env(cfg: &mut LoopConfig) {
@@ -1933,6 +2211,70 @@ provider = "anthropic"
     }
 
     #[test]
+    fn tool_loop_absent_section_defaults_to_max_rounds_8() {
+        let config: ZenConfig = toml::from_str("").unwrap();
+        assert_eq!(config.agentic.tool_loop.max_rounds, None);
+        assert_eq!(config.agentic.tool_loop.max_rounds_or_default(), 8);
+    }
+
+    #[test]
+    fn tool_loop_parses_present_section() {
+        let config: ZenConfig = toml::from_str("[agentic.tool_loop]\nmax_rounds = 12\n").unwrap();
+        assert_eq!(config.agentic.tool_loop.max_rounds, Some(12));
+        assert_eq!(config.agentic.tool_loop.max_rounds_or_default(), 12);
+    }
+
+    #[test]
+    fn tool_loop_max_rounds_clamped_to_1_16() {
+        for (raw, expected) in [(0, 1), (1, 1), (16, 16), (99, 16), (200, 16)] {
+            let toml_str = format!("[agentic.tool_loop]\nmax_rounds = {raw}\n");
+            let config: ZenConfig = toml::from_str(&toml_str).unwrap();
+            assert_eq!(
+                config.agentic.tool_loop.max_rounds_or_default(),
+                expected,
+                "raw: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_tool_loop_override_layer_wins_absent_keeps_base() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let merged = merge_configs(
+            parse("[agentic.tool_loop]\nmax_rounds = 4\n"),
+            parse("[agentic.tool_loop]\nmax_rounds = 12\n"),
+        )
+        .unwrap();
+        assert_eq!(merged.agentic.tool_loop.max_rounds_or_default(), 12);
+
+        let merged_absent =
+            merge_configs(parse("[agentic.tool_loop]\nmax_rounds = 4\n"), parse("")).unwrap();
+        assert_eq!(merged_absent.agentic.tool_loop.max_rounds_or_default(), 4);
+    }
+
+    #[test]
+    fn tool_loop_env_override_respected_and_clamped() {
+        // SAFETY: test-only env mutation; ZEN_TOOL_MAX_ROUNDS is read by no
+        // sibling test in this binary and is removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_TOOL_MAX_ROUNDS", "3") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.tool_loop.max_rounds_or_default(), 3);
+
+        unsafe { std::env::set_var("ZEN_TOOL_MAX_ROUNDS", "99") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.tool_loop.max_rounds_or_default(), 16);
+
+        unsafe { std::env::remove_var("ZEN_TOOL_MAX_ROUNDS") };
+    }
+
+    #[test]
+    fn embedded_config_ships_tool_loop_default_8() {
+        let config = load_embedded_config().unwrap();
+        assert_eq!(config.agentic.tool_loop.max_rounds, Some(8));
+        assert_eq!(config.agentic.tool_loop.max_rounds_or_default(), 8);
+    }
+
+    #[test]
     fn resolved_base_path_expands_tilde() {
         let plugin = PluginConfig {
             base_path: Some("~/.zen/plugins".into()),
@@ -1977,5 +2319,95 @@ mod tui_config_tests {
             let cfg: ZenConfig = toml::from_str(&toml_str).expect("parse mode");
             assert_eq!(cfg.tui.knowledge_search, expected, "mode: {raw}");
         }
+    }
+}
+
+#[cfg(test)]
+mod host_source_tests {
+    use super::*;
+
+    fn source(raw: &str) -> HostSourceConfig {
+        toml::from_str(raw).expect("parse host source")
+    }
+
+    #[test]
+    fn resolve_defaults_are_private_local_doc() {
+        let hs = source("host_path = \"~/Documents/Work\"");
+        let ctx = hs.resolve(Some("ws")).unwrap();
+        assert_eq!(ctx.worker_type, None);
+        assert_eq!(ctx.raw_policy, HostRawPolicy::Copy);
+        assert_eq!(ctx.sensitivity, crate::types::Sensitivity::Private);
+        assert!(!ctx.allow_cloud);
+        assert!(ctx.preserves_raw());
+        assert!(ctx.host_path.to_string_lossy().ends_with("Documents/Work"));
+        assert_eq!(ctx.workspace_id.as_deref(), Some("ws"));
+    }
+
+    #[test]
+    fn resolve_code_source_defaults_index_only() {
+        let hs = source("host_path = \"~/CodeRepo/ownspace\"\nworker_type = \"code\"");
+        let ctx = hs.resolve(None).unwrap();
+        assert_eq!(ctx.raw_policy, HostRawPolicy::IndexOnly);
+        assert!(!ctx.preserves_raw());
+    }
+
+    #[test]
+    fn resolve_rejects_invalid_fields() {
+        assert!(source("host_path = \"\"").resolve(None).is_err());
+        assert!(
+            source("host_path = \"/tmp\"\nworker_type = \"bogus\"")
+                .resolve(None)
+                .is_err()
+        );
+        assert!(
+            source("host_path = \"/tmp\"\nraw_policy = \"mirror\"")
+                .resolve(None)
+                .is_err()
+        );
+        assert!(
+            source("host_path = \"/tmp\"\nsensitivity = \"Secret\"")
+                .resolve(None)
+                .is_err()
+        );
+        assert!(
+            source("host_path = \"/tmp\"\npara_target = \"stuff\"")
+                .resolve(None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_internal_sensitivity_and_allow_cloud() {
+        let hs =
+            source("host_path = \"/tmp/docs\"\nsensitivity = \"Internal\"\nallow_cloud = true");
+        let ctx = hs.resolve(None).unwrap();
+        // "Internal" maps onto the taxonomy's local-only Private tier.
+        assert_eq!(ctx.sensitivity, crate::types::Sensitivity::Private);
+        assert!(ctx.allow_cloud);
+    }
+
+    #[test]
+    fn host_dir_hash_is_stable_eight_hex() {
+        let a = host_dir_hash(&PathBuf::from("/home/u/Documents/Work"));
+        let b = host_dir_hash(&PathBuf::from("/home/u/Documents/Work"));
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 8);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, host_dir_hash(&PathBuf::from("/home/u/Documents/Other")));
+    }
+
+    #[test]
+    fn expand_home_path_forms() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(
+            expand_home_path("~/Docs"),
+            PathBuf::from(format!("{home}/Docs"))
+        );
+        assert_eq!(expand_home_path("~"), PathBuf::from(home.clone()));
+        assert_eq!(
+            expand_home_path("$HOME/Work"),
+            PathBuf::from(format!("{home}/Work"))
+        );
+        assert_eq!(expand_home_path("/abs/path"), PathBuf::from("/abs/path"));
     }
 }
