@@ -77,6 +77,12 @@ impl Tool for FsWriteTool {
             .validate_path_for_write(&path)
             .map_err(KernelError::ToolFailed)?;
 
+        // Vault-relative writes via ZenPaths::vault() use atomic tmp+rename (OCC/CAS primitive)
+        // to keep crash-safety and VersionSnapshot consistency (data-model §12, research D20).
+        // Non-vault writes under workspace root use direct tokio::fs::write (already validated).
+        let is_vault =
+            zen_core::sandbox::is_zen_path(&path) || path.to_string_lossy().contains("vault/");
+
         if create_dirs && let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -86,9 +92,30 @@ impl Tool for FsWriteTool {
         let bytes = content.as_bytes();
         let bytes_written = bytes.len();
 
-        tokio::fs::write(&path, bytes)
+        if is_vault {
+            let p = path.clone();
+            let c = content.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let tmp = p.with_extension(format!(
+                    "{}.tmp",
+                    p.extension()
+                        .map_or("tmp".to_string(), |e| e.to_string_lossy().to_string())
+                ));
+                std::fs::write(&tmp, &c)?;
+                std::fs::rename(&tmp, &p)?;
+                Ok::<(), std::io::Error>(())
+            })
             .await
+            .map_err(|e| KernelError::ToolFailed(format!("vault write join failed: {}", e)))?
             .map_err(|e| KernelError::ToolFailed(format!("Failed to write {}: {}", path_str, e)))?;
+        } else {
+            tokio::fs::write(&path, bytes).await.map_err(|e| {
+                KernelError::ToolFailed(format!("Failed to write {}: {}", path_str, e))
+            })?;
+        }
 
         Ok(json!({
             "path": path_str,

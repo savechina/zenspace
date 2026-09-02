@@ -592,7 +592,10 @@ impl SandboxValidator {
         }
 
         if self.workspace_roots.is_empty() {
-            return Err("no workspace roots configured, writes denied".to_string());
+            return Err(
+                "no workspace roots configured — run zen workspace init or use vault/... (vault is global ~/.zen/vault/ per ZenPaths invariant)"
+                    .to_string(),
+            );
         }
 
         let allowed = self
@@ -601,7 +604,7 @@ impl SandboxValidator {
             .any(|root| is_within_root(path, root));
         if !allowed {
             return Err(format!(
-                "write denied: {} is not under any workspace root",
+                "write denied: {} is not under any workspace root — use vault/... (e.g. vault/resources/<slug>.md) or run zen workspace init",
                 path_str
             ));
         }
