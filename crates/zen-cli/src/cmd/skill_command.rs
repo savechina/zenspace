@@ -2,13 +2,19 @@ use clap::Subcommand;
 use colored::Colorize;
 use zen_agents::skill_history::{SkillExecutionRecord, SkillHistory};
 use zen_agents::skill_loader::SkillLoader;
+use zen_agents::skill_precipitation::SkillPrecipitator;
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 
 #[derive(Subcommand)]
 pub enum SkillCommands {
     /// List all available skills
-    List,
+    List {
+        /// Machine-readable output for cross-agent consumption (FR-039
+        /// shared brain: Codex/Hermes read the same SKILL.md plane)
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a skill by name
     Run {
         /// Skill name
@@ -30,17 +36,42 @@ pub enum SkillCommands {
         /// Skill name
         name: String,
     },
+    /// Detect skill drafts from execution history and stage them for
+    /// confirmation (FR-037 skill precipitation; same code path as the
+    /// DreamWorker's precipitation step)
+    Precipitate,
+    /// Confirm a pending skill draft — promotes it to
+    /// `~/.zen/skills/<name>/SKILL.md` (Hybrid C first-occurrence gate)
+    Confirm {
+        /// Pending skill draft name
+        name: String,
+    },
 }
 
 pub async fn execute_command(cmd: &SkillCommands) -> Result<(), ZenError> {
     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
 
     match cmd {
-        SkillCommands::List => {
+        SkillCommands::List { json } => {
             let loader = SkillLoader::new(&paths);
             let skills = loader
                 .list_skills()
                 .map_err(|e| ZenError::Message(e.to_string()))?;
+
+            if *json {
+                let mut defs = Vec::new();
+                for name in &skills {
+                    if let Ok(def) = loader.load_skill(name) {
+                        defs.push(def);
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&defs)
+                        .map_err(|e| ZenError::Message(e.to_string()))?
+                );
+                return Ok(());
+            }
 
             if skills.is_empty() {
                 println!("No skills found in {}", paths.skills().display());
@@ -192,5 +223,76 @@ pub async fn execute_command(cmd: &SkillCommands) -> Result<(), ZenError> {
 
             Ok(())
         }
+
+        SkillCommands::Precipitate => {
+            let history = SkillHistory::new(&paths);
+            let precipitator = SkillPrecipitator::new(paths.skills(), paths.logs());
+            let names = precipitator
+                .list_history_names()
+                .map_err(|e| ZenError::Message(e.to_string()))?;
+            if names.is_empty() {
+                println!("No skill execution history found.");
+                return Ok(());
+            }
+
+            let preferences = load_preferences(&paths);
+            let drafts = precipitator
+                .detect(&history, &names, &preferences)
+                .map_err(|e| ZenError::Message(e.to_string()))?;
+            if drafts.is_empty() {
+                println!("No skill drafts detected (need ≥2 similar successes or corrections).");
+                return Ok(());
+            }
+
+            precipitator
+                .stage(&drafts)
+                .map_err(|e| ZenError::Message(e.to_string()))?;
+            println!(
+                "{} draft(s) staged, awaiting `zen skill confirm <name>`:",
+                drafts.len()
+            );
+            for draft in &drafts {
+                println!("  {} — {}", draft.name.bold(), draft.description);
+            }
+            Ok(())
+        }
+
+        SkillCommands::Confirm { name } => {
+            let precipitator = SkillPrecipitator::new(paths.skills(), paths.logs());
+            let path = precipitator
+                .confirm(name)
+                .map_err(|e| ZenError::Message(e.to_string()))?;
+            println!(
+                "{} {}",
+                "Skill confirmed:".green().bold(),
+                path.display().to_string().cyan()
+            );
+            Ok(())
+        }
     }
+}
+
+/// Load M4 preference triples from `vault/wiki/wisdom/preferences/*.md`
+/// (same minimal frontmatter contract as the DreamWorker precipitation step;
+/// read failures are non-fatal — drafts simply seed without triggers).
+fn load_preferences(paths: &ZenPaths) -> Vec<zen_memory::Preference> {
+    let dir = paths.wiki().join("wisdom").join("preferences");
+    let mut preferences = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return preferences,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(p) = zen_memory::Preference::parse_page(&content) {
+            preferences.push(p);
+        }
+    }
+    preferences
 }

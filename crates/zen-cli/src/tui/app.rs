@@ -83,6 +83,7 @@ fn main() { println!("echo"); }
 const MAX_QUEUE_SIZE: usize = 10;
 const TOAST_DURATION_SECS: u64 = 3;
 const PASTE_MODE_SECS: u64 = 2;
+const INPUT_HINT: &str = "Input (Enter=send, Shift+Enter=newline, Ctrl+D=exit)";
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputMode {
@@ -122,7 +123,7 @@ impl InputCell {
                 vertical_left: ">",
                 ..border::PLAIN
             })
-            .title(" Input (Enter=send, Ctrl+D=exit) ")
+            .title(format!(" {} ", INPUT_HINT))
     }
 
     pub fn effective_mode(&self) -> InputMode {
@@ -393,6 +394,9 @@ pub struct App {
     /// drain, read non-consuming by the viewport. Prevents duplicate-drain race.
     pub viewport_tail: Vec<Line<'static>>,
     pub inline_mode: bool,
+    /// Last memory-nudge poll (FR-040 TUI surface): file IO throttled to
+    /// [`NUDGE_POLL_SECS`]; `None` means never polled (first loop polls).
+    last_nudge_poll: Option<Instant>,
     output_cache: Option<OutputCache>,
     theme_generation: u64,
     pub loop_panel: crate::tui::loop_panel::LoopPanelState,
@@ -406,7 +410,7 @@ impl App {
                 vertical_left: ">",
                 ..border::PLAIN
             })
-            .title(" Input (Enter=send, Ctrl+D=exit) ")
+            .title(format!(" {} ", INPUT_HINT))
     }
 
     pub(crate) fn create_input_textarea(text: impl Into<String>) -> InputCell {
@@ -475,6 +479,7 @@ impl App {
             output_cache: None,
             theme_generation: 0,
             loop_panel: crate::tui::loop_panel::LoopPanelState::default(),
+            last_nudge_poll: None,
         };
         app.load_command_history();
         app
@@ -563,6 +568,64 @@ impl App {
         self.toast_queue.push_back(msg.into());
     }
 
+    /// Surface pending memory nudges as toasts (FR-040 TUI surface).
+    ///
+    /// Reads `logs/memory-nudges.jsonl`, toasts entries newer than the
+    /// `logs/.last-nudge-shown` marker (cap 3 per poll), and advances the
+    /// marker. File IO runs at most every [`NUDGE_POLL_SECS`]; all failures
+    /// are silent no-ops (a missed toast is never an error).
+    pub fn poll_memory_nudges(&mut self) {
+        let Ok(paths) = zen_core::paths::ZenPaths::detect() else {
+            return;
+        };
+        self.poll_memory_nudges_in(paths.logs().as_path());
+    }
+
+    /// Testable core of [`Self::poll_memory_nudges`]: all state lives under
+    /// `logs_dir`, so tests pass a tempdir instead of mutating `ZEN_HOME`
+    /// (which [`zen_core::paths::user_root`] caches process-wide outside
+    /// `cfg(test)` builds — env mutation is order-dependent and flaky).
+    pub(crate) fn poll_memory_nudges_in(&mut self, logs_dir: &std::path::Path) {
+        const NUDGE_POLL_SECS: u64 = 60;
+        const MAX_TOASTS_PER_POLL: usize = 3;
+        let now = Instant::now();
+        if let Some(last) = self.last_nudge_poll
+            && now.duration_since(last).as_secs() < NUDGE_POLL_SECS
+        {
+            return;
+        }
+        self.last_nudge_poll = Some(now);
+        let Ok(content) = std::fs::read_to_string(logs_dir.join("memory-nudges.jsonl")) else {
+            return;
+        };
+        let marker_path = logs_dir.join(".last-nudge-shown");
+        let seen = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        let all: Vec<&str> = content.lines().collect();
+        let seen_idx = if seen.trim().is_empty() {
+            None
+        } else {
+            all.iter().rposition(|l| l.trim() == seen.trim())
+        };
+        let fresh: Vec<&str> = all
+            .into_iter()
+            .skip(seen_idx.map(|i| i + 1).unwrap_or(0))
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        for line in fresh.iter().take(MAX_TOASTS_PER_POLL) {
+            let msg = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                .unwrap_or_else(|| (*line).to_string());
+            self.show_toast(msg);
+        }
+        if let Some(last) = fresh.last() {
+            let _ = std::fs::write(&marker_path, last);
+        }
+    }
+
     pub fn get_active_toast(&mut self) -> Option<String> {
         if self.current_toast.is_none()
             && let Some(msg) = self.toast_queue.pop_front()
@@ -599,10 +662,7 @@ impl App {
             String::from(" Select: ↑↓/jk nav · y yank · Esc exit ")
         };
         let (border_char, title) = match mode {
-            InputMode::Default => (
-                ">",
-                String::from(" Input (Enter=send, Ctrl+D=exit, Ctrl+X=cmd) "),
-            ),
+            InputMode::Default => (">", format!(" {} ", INPUT_HINT)),
             InputMode::Paste => ("|", String::from(" Paste ")),
             InputMode::History => ("←", String::from(" History (↑↓ browse, Enter=load) ")),
             InputMode::Selection => ("▐", cell_info),
@@ -2342,6 +2402,7 @@ pub fn run_app(
         }
 
         app.refresh_input_border();
+        app.poll_memory_nudges();
         let active_toast = app.get_active_toast();
         if dirty {
             terminal

@@ -86,6 +86,26 @@ impl InformationQualityGate {
             && (self.cross_verified || self.sampling_bias.is_none())
     }
 
+    /// Evidence grade per `docs/specs/005-agentic-loop/contracts/memory-grade.json`:
+    /// `Unverified | Corroborated | Actionable`.
+    ///
+    /// - `Actionable`: passes [`Self::can_promote_to_m3`] (credible, clear, verified).
+    /// - `Corroborated`: credible and well-formed but missing the verification leg
+    ///   (`cross_verified == false` with a sampling bias present).
+    /// - `Unverified`: fails even the basic clarity/credibility bar.
+    pub fn grade(&self) -> MemoryGrade {
+        if self.can_promote_to_m3() {
+            MemoryGrade::Actionable
+        } else if self.source_credibility > 0.5
+            && self.definition_clarity
+            && !self.frivolous_expression
+        {
+            MemoryGrade::Corroborated
+        } else {
+            MemoryGrade::Unverified
+        }
+    }
+
     pub fn fail_reasons(&self) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         if self.source_credibility <= 0.5 {
@@ -102,6 +122,57 @@ impl InformationQualityGate {
         }
         reasons
     }
+}
+
+/// Evidence grade for a signal, per `contracts/memory-grade.json` output.
+///
+/// Serialization is externally-tagged PascalCase (`"Unverified"`, `"Corroborated"`,
+/// `"Actionable"`), matching the contract strings and the existing [`Bias`] enum style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MemoryGrade {
+    Unverified,
+    Corroborated,
+    Actionable,
+}
+
+/// Minimum whitespace-separated tokens for a journal signal to count as
+/// "definition_clarity" — shorter fragments are treated as vague.
+pub const MIN_SIGNAL_TOKENS: usize = 5;
+
+/// Grade a raw journal signal string (SessionJournaler M2 pre-filter +
+/// ZenDream M2→M3 promotion gate — single shared heuristic, T073).
+///
+/// Gate inputs are derived from what is knowable for a bare signal line:
+/// - `source_credibility`: LLM extraction passed the
+///   [`EXTRACTION_GUARDRAILS`] self-check (0.7); keyword-only pattern match
+///   is weaker evidence (0.6). Both sit above the 0.5 promotion floor so the
+///   gate discriminates on *content quality*, not extraction path.
+/// - `definition_clarity`: at least [`MIN_SIGNAL_TOKENS`] tokens (specific
+///   enough to be durable after 6 months).
+/// - `frivolous_expression`: the 轻佻表达 guardrail — an unquantified claim
+///   (`tokens < MIN_SIGNAL_TOKENS` with no digit).
+/// - `sampling_bias`: `None` — journal signals are first-party self-report by
+///   construction; bias screening happens at extraction time via
+///   [`EXTRACTION_GUARDRAILS`] (迷信数据/迎合解读), not post-hoc.
+/// - `cross_verified`: true only for LLM extraction (guardrail
+///   cross-examination counts as within-cycle verification).
+///
+/// Returns `(grade, gate)` so callers can surface `fail_reasons` in logs.
+pub fn grade_session_signal(
+    text: &str,
+    llm_extracted: bool,
+) -> (MemoryGrade, InformationQualityGate) {
+    let tokens = text.split_whitespace().count();
+    let has_quantification = text.chars().any(|c| c.is_ascii_digit());
+    let gate = InformationQualityGate {
+        source_credibility: if llm_extracted { 0.7 } else { 0.6 },
+        definition_clarity: tokens >= MIN_SIGNAL_TOKENS,
+        sampling_bias: None,
+        cross_verified: llm_extracted,
+        fact_opinion_separated: llm_extracted,
+        frivolous_expression: tokens < MIN_SIGNAL_TOKENS && !has_quantification,
+    };
+    (gate.grade(), gate)
 }
 
 // §9.3 — Decision Promotion Gate
@@ -320,6 +391,134 @@ mod tests {
         assert!(json.contains("GeographicBias"));
         let deserialized: Bias = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, Bias::GeographicBias);
+    }
+
+    // ── T074: full grade matrix (Unverified | Corroborated | Actionable) ──
+
+    fn gate(
+        credibility: f64,
+        clarity: bool,
+        bias: Option<Bias>,
+        cross: bool,
+        frivolous: bool,
+    ) -> InformationQualityGate {
+        InformationQualityGate {
+            source_credibility: credibility,
+            definition_clarity: clarity,
+            sampling_bias: bias,
+            cross_verified: cross,
+            fact_opinion_separated: true,
+            frivolous_expression: frivolous,
+        }
+    }
+
+    #[test]
+    fn grade_matrix_actionable_when_promotable() {
+        let cases = [
+            gate(0.8, true, None, true, false),
+            gate(0.8, true, None, false, false),
+            gate(0.8, true, Some(Bias::SelectionBias), true, false),
+            gate(1.0, true, None, true, false),
+        ];
+        for g in &cases {
+            assert_eq!(g.grade(), MemoryGrade::Actionable, "gate: {g:?}");
+            assert!(g.can_promote_to_m3());
+            assert!(g.fail_reasons().is_empty());
+        }
+    }
+
+    #[test]
+    fn grade_matrix_corroborated_missing_verification_only() {
+        let g = gate(0.8, true, Some(Bias::SelfReportingBias), false, false);
+        assert_eq!(g.grade(), MemoryGrade::Corroborated);
+        assert!(!g.can_promote_to_m3());
+        assert_eq!(
+            g.fail_reasons(),
+            vec!["sampling_bias present without cross-verification"]
+        );
+    }
+
+    #[test]
+    fn grade_matrix_unverified_low_credibility() {
+        let g = gate(0.5, true, None, true, false);
+        assert_eq!(g.grade(), MemoryGrade::Unverified, "0.5 is not > 0.5");
+        assert!(!g.can_promote_to_m3());
+        assert!(g.fail_reasons().contains(&"source_credibility <= 0.5"));
+    }
+
+    #[test]
+    fn grade_matrix_unverified_unclear() {
+        let g = gate(0.9, false, None, true, false);
+        assert_eq!(g.grade(), MemoryGrade::Unverified);
+        assert!(g.fail_reasons().contains(&"definition_clarity is false"));
+    }
+
+    #[test]
+    fn grade_matrix_unverified_frivolous() {
+        let g = gate(0.9, true, None, true, true);
+        assert_eq!(g.grade(), MemoryGrade::Unverified);
+        assert!(g.fail_reasons().contains(&"frivolous_expression is true"));
+    }
+
+    #[test]
+    fn grade_matrix_default_is_unverified() {
+        let g = InformationQualityGate::default();
+        assert_eq!(g.grade(), MemoryGrade::Unverified);
+    }
+
+    #[test]
+    fn grade_serializes_per_contract() {
+        for (g, expected) in [
+            (gate(0.8, true, None, true, false), "Actionable"),
+            (
+                gate(0.8, true, Some(Bias::SelfReportingBias), false, false),
+                "Corroborated",
+            ),
+            (InformationQualityGate::default(), "Unverified"),
+        ] {
+            let json = serde_json::to_string(&g.grade()).unwrap();
+            assert_eq!(json, format!("\"{expected}\""));
+            let round: MemoryGrade = serde_json::from_str(&json).unwrap();
+            assert_eq!(round, g.grade());
+        }
+    }
+
+    #[test]
+    fn grade_session_signal_vague_is_unverified_and_blocked() {
+        let (grade, g) = grade_session_signal("ok", false);
+        assert_eq!(grade, MemoryGrade::Unverified);
+        assert!(!g.can_promote_to_m3());
+        assert!(!g.definition_clarity);
+        assert!(g.frivolous_expression);
+        assert!(!g.fail_reasons().is_empty());
+    }
+
+    #[test]
+    fn grade_session_signal_specific_llm_is_actionable() {
+        let (grade, g) = grade_session_signal(
+            "migrated the session store from json blobs to sqlite wal",
+            true,
+        );
+        assert_eq!(grade, MemoryGrade::Actionable);
+        assert!(g.can_promote_to_m3());
+        assert_eq!(g.source_credibility, 0.7);
+        assert!(g.cross_verified);
+    }
+
+    #[test]
+    fn grade_session_signal_specific_keyword_actionable() {
+        let (grade, g) = grade_session_signal("fixed the login redirect loop on safari", false);
+        assert_eq!(grade, MemoryGrade::Actionable);
+        assert_eq!(g.source_credibility, 0.6);
+        assert!(!g.cross_verified);
+        assert!(g.sampling_bias.is_none(), "bias leg passes via is_none");
+    }
+
+    #[test]
+    fn grade_session_signal_unquantified_short_is_frivolous() {
+        let (grade, g) = grade_session_signal("refactor stuff maybe", false);
+        assert_eq!(grade, MemoryGrade::Unverified);
+        assert!(g.frivolous_expression);
     }
 
     #[test]

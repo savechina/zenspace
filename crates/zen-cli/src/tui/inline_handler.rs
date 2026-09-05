@@ -3,7 +3,7 @@ use tui_textarea::{Input, Key};
 
 use super::app::App;
 
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum InlineKeyAction {
     Submit,
     Quit,
@@ -201,6 +201,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         return InlineKeyAction::Continue;
     }
 
+    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT {
+        app.input.input(Input {
+            key: Key::Enter,
+            ctrl: false,
+            alt: false,
+            shift: true,
+        });
+        return InlineKeyAction::Continue;
+    }
+
     if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
         let text = app.input.lines().join("\n");
         let is_single_line = !text.contains('\n');
@@ -250,4 +260,47 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
     }
 
     InlineKeyAction::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline mode keybinding regression tests (mirrors the full-screen
+    //! handler tests in `handler.rs`, adapted to `InlineKeyAction`).
+    use super::*;
+    use crate::tui::app::App;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn test_app() -> App {
+        let config: &'static zen_core::config::ZenConfig = Box::leak(Box::default());
+        App::new(config)
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> InlineKeyAction {
+        handle_key(KeyEvent::new(code, modifiers), app)
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_not_submit() {
+        let mut app = test_app();
+        app.input.insert_str("hello");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert_eq!(app.input.lines(), vec!["hello", ""]);
+    }
+
+    #[test]
+    fn enter_submits_single_line() {
+        let mut app = test_app();
+        app.input.insert_str("hello");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+    }
+
+    #[test]
+    fn ctrl_enter_submits_multiline() {
+        let mut app = test_app();
+        app.input.insert_str("line1\nline2");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(action, InlineKeyAction::Submit);
+    }
 }

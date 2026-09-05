@@ -8,6 +8,7 @@ pub mod execution;
 pub mod executor;
 pub mod observability;
 pub mod orchestrator;
+pub mod output_schema;
 pub mod prompt;
 
 #[deprecated(
@@ -20,10 +21,17 @@ pub mod review;
 pub mod safety_hook;
 pub mod scheduler;
 pub mod skill_history;
+pub mod skill_hit_router;
 pub mod skill_loader;
+pub mod skill_precipitation;
 pub mod wiring;
 pub mod zen_agent;
 pub mod zen_skill;
+
+/// Turn-affinity scope for approval routing (SC-007, T103), re-exported
+/// so the gateway can set it around hosted turns without depending on
+/// zen-plugin directly.
+pub use zen_plugin::tools::approval_hook::APPROVAL_TURN;
 
 pub use agent_profile::{
     AgentClearance, AgentProfile, AgentProfileBuilder, Capability, CostPerToken, LlmPreference,
@@ -42,6 +50,7 @@ pub use orchestrator::AgentOrchestrator;
 pub use registry::{AgentRegistry, DefaultAgentRegistry, RegistryError};
 pub use review::{HermesValidator, MetisReviewer, MomusReviewer, QualityPipeline, ZeusEscalation};
 pub use rig_tap::{EVENT_TARGET, EventKind, ObservabilityEvent, extract_event};
+pub use skill_hit_router::{SKILL_HIT_MAX_HITS, SKILL_HIT_THRESHOLD, SkillHit, SkillHitRouter};
 pub use wiring::ZenWiring;
 pub use zen_agent::{IdentityContext, ZenAgent, ZenAgentBuilder, load_identity_files};
 pub use zen_skill::{ZenSkill, ZenTool};

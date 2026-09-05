@@ -107,4 +107,15 @@ impl<'a> QqBindingRepo<'a> {
             .map_err(SqliteError::TokioRusqlite)?;
         Ok(())
     }
+
+    /// All bound chat ids, most-recently-active first (T101: the qqbot
+    /// outbox drainer pushes staged briefs to exactly these chats — no
+    /// new config surface, no probing of never-seen openids).
+    pub async fn list_chat_ids(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT chat_id FROM qq_bindings ORDER BY updated_at DESC",
+        )
+        .fetch_all(self.client.pool())
+        .await?)
+    }
 }

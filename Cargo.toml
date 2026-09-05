@@ -161,6 +161,9 @@ zstd = "0.13"
 # Arrow for zero-copy inter-agent data transfer (FR-SO-005)
 arrow = "59"
 
+# JSON Schema validation for agent output conformance (T091)
+jsonschema = "0.29"
+
 futures = "0.3"
 
 # Fast embed: local ONNX inference for async batch embedding + Rerank pipeline

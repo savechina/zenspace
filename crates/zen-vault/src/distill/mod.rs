@@ -18,7 +18,7 @@ pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
 pub use hypothesis::{
     build_exploration_prompt, build_refinement_queue, confidence_for, gap_type, generate_from_gaps,
-    load_all, reverify, save, slug_for,
+    load_all, reverify, reverify_with_rejections, save, slug_for,
 };
 pub use merge::{
     MergeStrategy, WikiMergePlan, build_merge_plans, normalize_notion_name, trigram_jaccard,

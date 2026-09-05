@@ -68,12 +68,23 @@ impl ApprovalBroker {
     /// invocation parameter's type is `&ToolInvocation` (rig-compose);
     /// it stays unnameable here by design, so fields are read through
     /// inference and only primitives cross the broker boundary.
+    ///
+    /// Turn affinity (SC-007, T103): the first parameter carries the
+    /// calling turn when the dispatch hook runs inside a hosted turn's
+    /// task-local scope, and routes by EXACT turn match — concurrent
+    /// turns can never claim each other's routes regardless of firing
+    /// order. `None` (TUI/CLI, unscoped) keeps the legacy first-free
+    /// claim, which is unambiguous while a single context dispatches.
     pub fn callback(self: &Arc<Self>) -> zen_core::sandbox::ApprovalCallback {
         let broker = Arc::clone(self);
-        Arc::new(move |invocation: &_| {
+        Arc::new(move |turn: Option<String>, invocation: &_| {
             let name = invocation.name.to_string();
             let args = invocation.args.clone();
-            if broker.decide(name, args) {
+            let allowed = match turn {
+                Some(turn_id) => broker.decide_for(turn_id, name, args),
+                None => broker.decide(name, args),
+            };
+            if allowed {
                 zen_core::sandbox::ApprovalDecision::Allow
             } else {
                 zen_core::sandbox::ApprovalDecision::Deny
@@ -152,9 +163,20 @@ impl ApprovalBroker {
         self.decide(name, args)
     }
 
+    /// Turn-bound routing (SC-007, T103): the route whose `turn_id`
+    /// matches exactly. Unknown or already-claimed turns decay to Deny —
+    /// a turn never borrows another turn's surface.
+    pub fn route_for(&self, turn_id: String, name: String, args: Value) -> bool {
+        self.decide_for(turn_id, name, args)
+    }
+
     /// Sync entry point (runs on the sandbox hook's blocking thread):
     /// claims a free route, performs a blocking round-trip bounded by
     /// [`BROKER_DEADLINE`], and decays every failure to `Deny`.
+    ///
+    /// Legacy path: no turn context. Correct while a single context
+    /// dispatches; concurrent hosted turns must arrive with `Some(turn)`
+    /// (see [`Self::callback`]) and route by exact match instead.
     fn decide(&self, name: String, args: Value) -> bool {
         let route = {
             let routes = self.routes.lock().expect("routes lock");
@@ -166,6 +188,30 @@ impl ApprovalBroker {
                 return false;
             };
             let route = Arc::clone(&routes[idx]);
+            route.claimed.store(true, Ordering::SeqCst);
+            route
+        };
+
+        let outcome = self.blocking_round_trip(&route, name, args);
+        route.claimed.store(false, Ordering::SeqCst);
+        outcome
+    }
+
+    /// Exact-match variant of [`Self::decide`]: only the route registered
+    /// for `turn_id` may serve this invocation. Firing order across turns
+    /// is irrelevant — a later-registered turn can never claim an
+    /// earlier-registered turn's route (the SC-007 privilege-escalation
+    /// shape the legacy first-free scan permits).
+    fn decide_for(&self, turn_id: String, name: String, args: Value) -> bool {
+        let route = {
+            let routes = self.routes.lock().expect("routes lock");
+            let found = routes
+                .iter()
+                .find(|r| r.turn_id == turn_id && !r.claimed.load(Ordering::SeqCst));
+            let Some(route) = found else {
+                return false;
+            };
+            let route = Arc::clone(route);
             route.claimed.store(true, Ordering::SeqCst);
             route
         };

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 #[cfg(not(test))]
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use crate::errors::{ConfigError, ZenError};
 use crate::paths::ZenPaths;
@@ -19,7 +19,24 @@ static CONFIGS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../config");
 // ---------------------------------------------------------------------------
 
 #[cfg(not(test))]
-static CONFIG_CACHE: OnceLock<ZenConfig> = OnceLock::new();
+static CONFIG_CACHE: RwLock<Option<ZenConfig>> = RwLock::new(None);
+
+/// Drop the cached config so the next [`load_config`] re-reads files + env.
+///
+/// Production code never calls this (parse-once-per-process stands); it
+/// exists for integration tests, which link the normally-compiled crate
+/// (where `#[cfg(test)]` is off and the cache is live) and must observe
+/// mid-process env changes such as `ZEN_SKILLS_AUTO_ROUTE=0`.
+#[cfg(not(test))]
+pub fn invalidate_config_cache() {
+    if let Ok(mut guard) = CONFIG_CACHE.write() {
+        // Forget (leak) rather than drop: outstanding `&'static` borrows from
+        // earlier `load_config` calls must stay valid. Invalidations happen a
+        // handful of times per test process — bounded, deliberate leakage.
+        let old = guard.take();
+        std::mem::forget(old);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config structs — Provider/Agent separation (FR-002)
@@ -63,6 +80,8 @@ pub struct ZenConfig {
     pub sandbox: SandboxConfig,
     /// Agentic module sections (`[agentic.*]`, 005-agentic-loop).
     pub agentic: AgenticConfig,
+    /// Skill auto-routing (`[skills.*]`, 005-agentic-loop T076).
+    pub skills: SkillsConfig,
 }
 
 /// Sandbox hardening config — `[sandbox.*]` sections (T091).
@@ -108,6 +127,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             mcp_servers: Vec<McpServerConfig>,
             sandbox: SandboxConfig,
             agentic: AgenticConfig,
+            skills: SkillsConfig,
         }
 
         let shadow = ZenConfigShadow::deserialize(deserializer)?;
@@ -130,6 +150,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             mcp_servers: shadow.mcp_servers,
             sandbox: shadow.sandbox,
             agentic: shadow.agentic,
+            skills: shadow.skills,
         })
     }
 }
@@ -200,6 +221,17 @@ pub struct QqBotChannelConfig {
     pub allowed_users: Vec<String>,
     #[serde(default)]
     pub home_channel: Option<String>,
+    /// Morning-brief outbox drain tick, seconds (T101).
+    ///
+    /// Functionality: cadence at which the qqbot carrier sweeps
+    /// `logs/outbox/morning-brief-*.json` with an active send.
+    /// User impact: lower values deliver the 9am brief sooner after a
+    /// daemon restart; higher values reduce QQ API churn.
+    /// Default: absent → 300s.
+    /// Values: clamped to 60..=3600 at the CLI mapping layer.
+    /// Interaction: independent of the WS gateway/intent knobs.
+    #[serde(default)]
+    pub outbox_drain_interval_secs: Option<u64>,
 }
 
 /// WhatsApp channel configuration.
@@ -414,6 +446,8 @@ pub struct AgenticConfig {
     pub loop_cfg: LoopConfig,
     /// Per-turn tool dispatch loop — TOML `[agentic.tool_loop]` (T050).
     pub tool_loop: ToolLoopConfig,
+    /// Agent quality-gate tuning — TOML `[agentic.review]` (T092).
+    pub review: ReviewConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -549,6 +583,99 @@ impl ToolLoopConfig {
         self.max_rounds
             .unwrap_or(TOOL_MAX_ROUNDS_DEFAULT)
             .clamp(TOOL_MAX_ROUNDS_MIN, TOOL_MAX_ROUNDS_MAX)
+    }
+}
+
+/// Bounds for the quality-gate retry budgets (T092).
+const REVIEW_MAX_MOMUS_DEFAULT: u8 = 2;
+const REVIEW_MAX_MOMUS_MAX: u8 = 5;
+const REVIEW_MAX_HERMES_DEFAULT: u8 = 1;
+const REVIEW_MAX_HERMES_MAX: u8 = 5;
+
+/// Agent quality-gate configuration (005-agentic-loop, T092) —
+/// TOML `[agentic.review]`.
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: overrides the heuristic `QualityPipeline` budgets
+///   (`max_momus_retries`, `max_hermes_revisions`) and gates the LLM
+///   semantic-review stage for HIGH blast-radius tasks.
+/// - User impact: higher budgets trade latency for stricter gates;
+///   `llm_review_high_blast = false` restores the pure-heuristic fast
+///   path for every task (no LLM cost in review).
+/// - Default: retries 2, revisions 1, LLM stage on — matches the
+///   hardcoded pipeline behavior, so absent config changes nothing.
+/// - Interaction: env `ZEN_REVIEW_MAX_MOMUS_RETRIES` /
+///   `ZEN_REVIEW_MAX_HERMES_REVISIONS` / `ZEN_REVIEW_LLM_HIGH_BLAST`
+///   (5th layer) override file layers; clamps apply after the merge.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ReviewConfig {
+    /// Momus gate retries (absent → 2, clamped 0..=5).
+    pub max_momus_retries: Option<u8>,
+    /// Hermes revision rounds (absent → 1, clamped 0..=5).
+    pub max_hermes_revisions: Option<u8>,
+    /// LLM semantic-review stage for HIGH blast-radius tasks
+    /// (absent → true).
+    pub llm_review_high_blast: Option<bool>,
+}
+
+impl ReviewConfig {
+    /// Effective Momus retry budget: config value clamped to `0..=5`,
+    /// or the default 2 when absent.
+    pub fn max_momus_retries_or_default(&self) -> u8 {
+        self.max_momus_retries
+            .unwrap_or(REVIEW_MAX_MOMUS_DEFAULT)
+            .min(REVIEW_MAX_MOMUS_MAX)
+    }
+
+    /// Effective Hermes revision budget: config value clamped to `0..=5`,
+    /// or the default 1 when absent.
+    pub fn max_hermes_revisions_or_default(&self) -> u8 {
+        self.max_hermes_revisions
+            .unwrap_or(REVIEW_MAX_HERMES_DEFAULT)
+            .min(REVIEW_MAX_HERMES_MAX)
+    }
+
+    /// Whether the LLM semantic-review stage runs for HIGH blast-radius
+    /// tasks (default true).
+    pub fn llm_review_high_blast_or_default(&self) -> bool {
+        self.llm_review_high_blast.unwrap_or(true)
+    }
+}
+
+/// Skill sections — TOML `[skills.*]` (005-agentic-loop, T076).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Pi-style trigger-hit auto-routing — TOML `[skills.auto_route]`.
+    pub auto_route: SkillsAutoRouteConfig,
+}
+
+/// Skill hit auto-routing configuration (005-agentic-loop, T076) —
+/// TOML `[skills.auto_route]`.
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates `SkillHitRouter` globally — when enabled, the
+///   orchestrator matches the user query against skill triggers before
+///   `route()` and injects at most one matching skill prompt into the M1
+///   context (threshold 0.72, max_hits 1, contract skill-hit.json).
+/// - User impact: `enabled = false` disables all automatic skill prompt
+///   injection; skills remain manually runnable (`zen skill run`).
+/// - Default: `enabled = true` (absent section → enabled).
+/// - Interaction: a skill's own frontmatter `auto_route: false` opts that
+///   skill out independently (per-skill overrides the global switch); env
+///   `ZEN_SKILLS_AUTO_ROUTE` (5th layer) overrides any config file layer.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SkillsAutoRouteConfig {
+    /// Global auto-route switch (absent → enabled, contract skill-hit.json).
+    pub enabled: Option<bool>,
+}
+
+impl SkillsAutoRouteConfig {
+    /// Effective global switch: config value, or enabled when absent.
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 }
 
@@ -1335,8 +1462,14 @@ pub fn load_config() -> Result<&'static ZenConfig, ZenError> {
 
     #[cfg(not(test))]
     {
-        if let Some(config) = CONFIG_CACHE.get() {
-            return Ok(config);
+        if let Ok(guard) = CONFIG_CACHE.read()
+            && let Some(config) = guard.as_ref()
+        {
+            // SAFETY: the cached value lives for the process lifetime and is
+            // only replaced by `invalidate_config_cache` (test support), which
+            // never runs concurrently with production reads.
+            let ptr: *const ZenConfig = config;
+            return Ok(unsafe { &*ptr });
         }
 
         dotenvy::dotenv().ok();
@@ -1362,19 +1495,20 @@ pub fn load_config() -> Result<&'static ZenConfig, ZenError> {
         // 5. Environment overrides take highest priority
         let config = apply_env_overrides(merged);
 
-        CONFIG_CACHE.set(config).map_err(|_| {
-            ZenError::Config(ConfigError::ParseError {
-                path: "global".to_string(),
-                reason: "Config already initialized".to_string(),
-            })
-        })?;
-
-        CONFIG_CACHE.get().ok_or_else(|| {
+        let mut guard = CONFIG_CACHE.write().map_err(|_| {
             ZenError::Config(ConfigError::ParseError {
                 path: "global".to_string(),
                 reason: "Config initialization failed".to_string(),
             })
-        })
+        })?;
+        *guard = Some(config);
+        let ptr: *const ZenConfig = guard.as_ref().expect("value just stored");
+        // SAFETY: the value is owned by the process-lifetime static and is
+        // never dropped (`invalidate_config_cache` forgets instead of
+        // dropping); the guard is released before returning.
+        let static_ref: &'static ZenConfig = unsafe { &*ptr };
+        drop(guard);
+        Ok(static_ref)
     }
 }
 
@@ -1450,6 +1584,7 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         mcp_servers: merge_mcp_servers(base.mcp_servers, override_cfg.mcp_servers),
         sandbox: merge_sandbox(base.sandbox, override_cfg.sandbox),
         agentic: merge_agentic(base.agentic, override_cfg.agentic),
+        skills: merge_skills(base.skills, override_cfg.skills),
     })
 }
 
@@ -1457,12 +1592,29 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
     AgenticConfig {
         loop_cfg: merge_loop(base.loop_cfg, ov.loop_cfg),
         tool_loop: merge_tool_loop(base.tool_loop, ov.tool_loop),
+        review: merge_review(base.review, ov.review),
     }
 }
 
 fn merge_tool_loop(base: ToolLoopConfig, ov: ToolLoopConfig) -> ToolLoopConfig {
     ToolLoopConfig {
         max_rounds: ov.max_rounds.or(base.max_rounds),
+    }
+}
+
+fn merge_review(base: ReviewConfig, ov: ReviewConfig) -> ReviewConfig {
+    ReviewConfig {
+        max_momus_retries: ov.max_momus_retries.or(base.max_momus_retries),
+        max_hermes_revisions: ov.max_hermes_revisions.or(base.max_hermes_revisions),
+        llm_review_high_blast: ov.llm_review_high_blast.or(base.llm_review_high_blast),
+    }
+}
+
+fn merge_skills(base: SkillsConfig, ov: SkillsConfig) -> SkillsConfig {
+    SkillsConfig {
+        auto_route: SkillsAutoRouteConfig {
+            enabled: ov.auto_route.enabled.or(base.auto_route.enabled),
+        },
     }
 }
 
@@ -1742,6 +1894,8 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_embeddings_env(&mut config.embeddings);
     apply_loop_env(&mut config.agentic.loop_cfg);
     apply_tool_loop_env(&mut config.agentic.tool_loop);
+    apply_review_env(&mut config.agentic.review);
+    apply_skills_env(&mut config.skills.auto_route);
     config
 }
 
@@ -1750,6 +1904,28 @@ fn apply_tool_loop_env(cfg: &mut ToolLoopConfig) {
         && let Ok(n) = v.parse::<u8>()
     {
         cfg.max_rounds = Some(n.clamp(TOOL_MAX_ROUNDS_MIN, TOOL_MAX_ROUNDS_MAX));
+    }
+}
+
+fn apply_review_env(cfg: &mut ReviewConfig) {
+    if let Some(v) = env_str("ZEN_REVIEW_MAX_MOMUS_RETRIES")
+        && let Ok(n) = v.parse::<u8>()
+    {
+        cfg.max_momus_retries = Some(n.min(REVIEW_MAX_MOMUS_MAX));
+    }
+    if let Some(v) = env_str("ZEN_REVIEW_MAX_HERMES_REVISIONS")
+        && let Ok(n) = v.parse::<u8>()
+    {
+        cfg.max_hermes_revisions = Some(n.min(REVIEW_MAX_HERMES_MAX));
+    }
+    if let Some(v) = env_bool("ZEN_REVIEW_LLM_HIGH_BLAST") {
+        cfg.llm_review_high_blast = Some(v);
+    }
+}
+
+fn apply_skills_env(cfg: &mut SkillsAutoRouteConfig) {
+    if let Some(v) = env_bool("ZEN_SKILLS_AUTO_ROUTE") {
+        cfg.enabled = Some(v);
     }
 }
 
@@ -1898,6 +2074,7 @@ fn apply_channels_env(channels: &mut ChannelsConfig) {
                 client_secret: String::new(),
                 allowed_users: Vec::new(),
                 home_channel: None,
+                outbox_drain_interval_secs: None,
             });
         }
         let q = channels.qqbot.as_mut().unwrap();
@@ -2268,10 +2445,82 @@ provider = "anthropic"
     }
 
     #[test]
+    fn review_config_defaults_merge_and_env_override() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let absent = parse("");
+        assert_eq!(absent.agentic.review.max_momus_retries_or_default(), 2);
+        assert_eq!(absent.agentic.review.max_hermes_revisions_or_default(), 1);
+        assert!(absent.agentic.review.llm_review_high_blast_or_default());
+
+        let merged = merge_configs(
+            parse("[agentic.review]\nmax_momus_retries = 4\n"),
+            parse("[agentic.review]\nllm_review_high_blast = false\n"),
+        )
+        .unwrap();
+        assert_eq!(merged.agentic.review.max_momus_retries_or_default(), 4);
+        assert_eq!(merged.agentic.review.max_hermes_revisions_or_default(), 1);
+        assert!(!merged.agentic.review.llm_review_high_blast_or_default());
+
+        // SAFETY: test-only env mutation; ZEN_REVIEW_* are read by no
+        // sibling test in this binary and are removed at the end.
+        unsafe { std::env::set_var("ZEN_REVIEW_MAX_MOMUS_RETRIES", "99") };
+        unsafe { std::env::set_var("ZEN_REVIEW_LLM_HIGH_BLAST", "false") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.review.max_momus_retries_or_default(), 5);
+        assert!(!cfg.agentic.review.llm_review_high_blast_or_default());
+        unsafe { std::env::remove_var("ZEN_REVIEW_MAX_MOMUS_RETRIES") };
+        unsafe { std::env::remove_var("ZEN_REVIEW_LLM_HIGH_BLAST") };
+    }
+
+    #[test]
     fn embedded_config_ships_tool_loop_default_8() {
         let config = load_embedded_config().unwrap();
         assert_eq!(config.agentic.tool_loop.max_rounds, Some(8));
         assert_eq!(config.agentic.tool_loop.max_rounds_or_default(), 8);
+    }
+
+    #[test]
+    fn skills_auto_route_absent_section_defaults_enabled() {
+        let config: ZenConfig = toml::from_str("").unwrap();
+        assert_eq!(config.skills.auto_route.enabled, None);
+        assert!(config.skills.auto_route.enabled_or_default());
+    }
+
+    #[test]
+    fn skills_auto_route_parses_present_section() {
+        let config: ZenConfig = toml::from_str("[skills.auto_route]\nenabled = false\n").unwrap();
+        assert_eq!(config.skills.auto_route.enabled, Some(false));
+        assert!(!config.skills.auto_route.enabled_or_default());
+    }
+
+    #[test]
+    fn merge_skills_auto_route_override_layer_wins_absent_keeps_base() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let merged = merge_configs(
+            parse("[skills.auto_route]\nenabled = true\n"),
+            parse("[skills.auto_route]\nenabled = false\n"),
+        )
+        .unwrap();
+        assert!(!merged.skills.auto_route.enabled_or_default());
+
+        let merged_absent =
+            merge_configs(parse("[skills.auto_route]\nenabled = false\n"), parse("")).unwrap();
+        assert!(!merged_absent.skills.auto_route.enabled_or_default());
+    }
+
+    #[test]
+    fn skills_auto_route_env_override_respected() {
+        // SAFETY: test-only env mutation; ZEN_SKILLS_AUTO_ROUTE is read by no
+        // sibling test in this binary and is removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_SKILLS_AUTO_ROUTE", "0") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(!cfg.skills.auto_route.enabled_or_default());
+
+        unsafe { std::env::set_var("ZEN_SKILLS_AUTO_ROUTE", "true") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.skills.auto_route.enabled_or_default());
+
+        unsafe { std::env::remove_var("ZEN_SKILLS_AUTO_ROUTE") };
     }
 
     #[test]

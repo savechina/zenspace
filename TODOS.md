@@ -2,6 +2,22 @@
 
 ## Review
 
+### QQBot outbox drainer (morning-brief push completion)
+
+**What:** Gateway-side task draining `logs/outbox/morning-brief-*.json` via qqbot active send (`msg_id=None`), deleting each file on successful send, leaving failures for retry with warn log.
+
+**Why:** Completes FR-038's push face; without it the 9am brief never reaches chat — the outbox is currently write-only.
+
+**Pros:** True proactive push; reuses `QqBotApi::send_group/c2c_message`; fail-soft seam already tested producer-side.
+
+**Cons:** New gateway runtime surface (poll interval, recipient resolution from `chat_hint`, retry/backoff policy); touches the daemon tick.
+
+**Context:** Producer done 2026-09-03 (005-agentic-loop T079): `MorningBriefWorker` stages `{date, lines, chat_hint}` JSON; seam documented in `crates/zen-agents/src/scheduler/workers/morning_brief.rs`. Active-send API at `crates/zen-gateway/src/channel/qqbot/api.rs:46,61`. Constraint: zen-agents must not depend on zen-gateway — drainer lives gateway-side. Start by reading the qqbot adapter's active-send fallback (`adapter.rs:~528`).
+
+**Effort:** M
+**Priority:** P1
+**Depends on:** 005-agentic-loop T079 (done, `morning-brief` worker + outbox contract) — **IMPLEMENTED per 005-agentic-loop T101 [X] 2026-09-04: `crates/zen-gateway/src/channel/qqbot/outbox_drainer.rs` (`drain_once` + tick spawn, Public-only fail-closed, never deletes undelivered; recipients via `QqBindingRepo::list_chat_ids`, group-first/C2C-fallback)**
+
 ### Harden dispatch hold-transport contract (shutdown_write EOF test)
 
 **What:** Document `shutdown_write` as the only EOF path for detached SPAWNED tasks and add test that `abort + shutdown_write → EOF` while `abort` alone does not hang.

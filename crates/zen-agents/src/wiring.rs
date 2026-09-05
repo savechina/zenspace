@@ -980,7 +980,7 @@ mod tests {
     async fn approval_callback_gates_mutating_tool_in_ask_mode() {
         use zen_core::sandbox::{ApprovalCallback, ApprovalDecision};
 
-        let cb: ApprovalCallback = Arc::new(|_inv| ApprovalDecision::Deny);
+        let cb: ApprovalCallback = Arc::new(|_turn, _inv| ApprovalDecision::Deny);
         let hook = zen_plugin::tools::approval_hook::AskApprovalHook::new(SandboxMode::Ask)
             .with_callback(cb);
 
@@ -1011,7 +1011,7 @@ mod tests {
     fn set_approval_callback_swaps_hook_in_ask_mode() {
         use zen_core::sandbox::{ApprovalCallback, ApprovalDecision};
         let mut wiring = ZenWiring::with_sandbox_mode(SandboxMode::Ask, Vec::new(), None);
-        let cb: ApprovalCallback = Arc::new(|_inv| ApprovalDecision::Allow);
+        let cb: ApprovalCallback = Arc::new(|_turn, _inv| ApprovalDecision::Allow);
         wiring.set_approval_callback(cb);
         // Index 4 is the approval hook slot (see build_sandbox_hooks order).
         assert_eq!(wiring.sandbox_hooks.len(), 5);

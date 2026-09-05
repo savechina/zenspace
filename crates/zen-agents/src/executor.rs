@@ -189,7 +189,8 @@ impl AgentExecutor {
 
         // Build prompt with agent identity (SOUL.md/MEMORY.md/AGENTS.md)
         let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
-        let (response, tokens) = self.execute_with_retry(&provider, &prompt, &agent_name)?;
+        let (response, tokens, used_mock_fallback) =
+            self.execute_with_retry(&provider, &prompt, &agent_name)?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let cost = tokens as f64 * 0.002 / 1000.0; // ~$0.002/1K tokens estimate
@@ -200,7 +201,11 @@ impl AgentExecutor {
             metadata: ExecutionMetadata {
                 tokens_used: tokens,
                 cost_estimate: (cost * 1000.0).round() / 1000.0,
-                model_used: provider.to_string(),
+                model_used: if used_mock_fallback {
+                    format!("mock (fallback for {})", provider)
+                } else {
+                    provider.to_string()
+                },
                 duration_ms,
                 sensitivity,
             },
@@ -335,7 +340,7 @@ impl AgentExecutor {
         provider: &Provider,
         prompt: &str,
         agent_name: &str,
-    ) -> Result<(String, u32)> {
+    ) -> Result<(String, u32, bool)> {
         let mut last_error = None;
 
         for attempt in 0..=self.retry_policy.max_retries {
@@ -347,6 +352,8 @@ impl AgentExecutor {
                     agent = agent_name,
                     "Retrying agent execution"
                 );
+                // Sync by design: execute/execute_round and router.call are
+                // blocking, so this thread is already off the async runtime.
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
 
@@ -356,7 +363,7 @@ impl AgentExecutor {
                     if attempt > 0 {
                         info!(attempt, agent = agent_name, "Retry succeeded");
                     }
-                    return Ok((response, estimated_tokens));
+                    return Ok((response, estimated_tokens, false));
                 }
                 Err(e) => {
                     let category = ErrorCategory::from_error_message(&e.to_string());
@@ -396,7 +403,7 @@ impl AgentExecutor {
             )
         })?;
         let estimated_tokens = (prompt.len() + response.len()) as u32 / 4;
-        Ok((response, estimated_tokens))
+        Ok((response, estimated_tokens, true))
     }
 
     /// Execute a single agent request with streaming.
@@ -419,5 +426,47 @@ impl AgentExecutor {
         let result = self.execute(context, agent)?;
         callback(&result.response);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zen_provider::LlmConfig;
+
+    fn test_executor_no_retries() -> AgentExecutor {
+        AgentExecutor::new(DefaultRouter::new(LlmConfig::default())).with_retry_policy(
+            RetryPolicy {
+                max_retries: 0,
+                base_delay_ms: 0,
+                max_delay_ms: 0,
+                jitter: false,
+            },
+        )
+    }
+
+    #[test]
+    fn retry_exhaustion_flags_mock_fallback() {
+        // Unknown provider: route-independent deterministic failure (no
+        // instance exists), offline-safe. Single attempt then mock fallback.
+        let executor = test_executor_no_retries();
+        let (response, _, used_mock) = executor
+            .execute_with_retry(
+                &Provider::Unknown("definitely-not-a-provider".to_string()),
+                "hi",
+                "test",
+            )
+            .expect("mock fallback succeeds");
+        assert!(used_mock, "fallback provenance must be flagged");
+        assert!(!response.is_empty());
+    }
+
+    #[test]
+    fn mock_provider_direct_has_no_fallback_flag() {
+        let executor = test_executor_no_retries();
+        let (_, _, used_mock) = executor
+            .execute_with_retry(&Provider::Mock, "hi", "test")
+            .expect("mock direct succeeds");
+        assert!(!used_mock, "direct mock is not a fallback");
     }
 }

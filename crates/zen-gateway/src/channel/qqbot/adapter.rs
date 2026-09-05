@@ -89,6 +89,10 @@ pub struct QqBotAdapterOptions {
     pub allowed_users: Vec<String>,
     /// SQLite file for `qq_bindings` persistence.
     pub bindings_db: std::path::PathBuf,
+    /// Morning-brief outbox drain tick (T101). Mapped from
+    /// `[channels.qqbot] outbox_drain_interval_secs` (default 300s,
+    /// clamped 60..=3600); tests inject short values directly.
+    pub outbox_drain_interval: Duration,
     /// Audit JSONL sink (D3): accept/deny/reply/chat-error events.
     /// `None` disables file audit (tests); the daemon injects the same
     /// resolved path the hosting layer uses.
@@ -594,6 +598,49 @@ impl Channel for QqBotAdapter {
         let gateway_task =
             tokio::spawn(async move { gateway.run(events_tx, gateway_shutdown).await });
 
+        // Morning-brief outbox drainer (FR-038 push face, T101): staged
+        // `morning-brief-<date>.json` files deliver to bound chats on a
+        // tick. Outbox dir = the resolved logs dir the daemon injects via
+        // `audit_path`; `None` (tests) disables the drainer. Fail-closed:
+        // only `Public` briefs deliver (`consumer_allowlisted=false` —
+        // personal push is a future opt-in knob).
+        if let Some(outbox_dir) = self
+            .options
+            .audit_path
+            .clone()
+            .and_then(|p| p.parent().map(|d| d.join("outbox")))
+        {
+            let drainer = Arc::new(super::outbox_drainer::OutboxDrainer::new(
+                Arc::clone(&self.api),
+                outbox_dir,
+                false,
+            ));
+            let drain_bindings = Arc::clone(&bindings);
+            let mut drain_shutdown = shutdown.clone();
+            let drain_interval = self.options.outbox_drain_interval;
+            tokio::spawn(async move {
+                let list_chats = || async {
+                    zen_repo::QqBindingRepo::new(drain_bindings.as_ref())
+                        .list_chat_ids()
+                        .await
+                        .unwrap_or_default()
+                };
+                drainer.drain_once(&list_chats().await).await;
+                loop {
+                    tokio::select! {
+                        _ = drain_shutdown.changed() => {
+                            if *drain_shutdown.borrow_and_update() {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep(drain_interval) => {
+                            drainer.drain_once(&list_chats().await).await;
+                        }
+                    }
+                }
+            });
+        }
+
         let this = Arc::new(self.clone());
         let mut seen: HashSet<String> = HashSet::new();
         let mut seen_order: VecDeque<String> = VecDeque::new();
@@ -744,6 +791,7 @@ mod tests {
             token_url: "http://127.0.0.1:1/token".into(),
             allowed_users: vec!["a".into()],
             bindings_db: std::env::temp_dir().join("qqbot-adapter-tests.db"),
+            outbox_drain_interval: Duration::from_secs(60),
             audit_path: None,
         })
         .unwrap()

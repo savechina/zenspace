@@ -1027,9 +1027,13 @@ pub async fn turn_with(
     };
 
     let watchdog = crate::server::guards::watchdog_timeout();
+    let turn_scope = record.turn_id.clone();
     let execution = async move {
-        let outcome = executor
-            .execute_stream(&mut ctx, &prompt, &mut callback)
+        let outcome = zen_agents::APPROVAL_TURN
+            .scope(
+                Some(turn_scope),
+                executor.execute_stream(&mut ctx, &prompt, &mut callback),
+            )
             .await;
         (outcome, ctx)
     };

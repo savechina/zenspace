@@ -10,6 +10,17 @@ use zen_core::sandbox::{ApprovalCallback, ApprovalDecision, SandboxMode};
 
 use crate::tools::confidentiality_hook::{is_cloud_tool, is_mutating_tool};
 
+// Turn affinity for approval routing (SC-007).
+//
+// Read at `before_invocation` time (inside the turn's task tree) and
+// forwarded explicitly across the `spawn_blocking` boundary below,
+// which a task-local cannot cross on its own. Hosted turns set it via
+// `.scope()`; unset (`None`) preserves the legacy first-free-claim
+// behavior for single-context surfaces (TUI/CLI).
+tokio::task_local! {
+    pub static APPROVAL_TURN: Option<String>;
+}
+
 /// Wall-clock budget for an interactive approval callback. A prompt that does
 /// not resolve within this window is treated as `Deny` so a hung TUI/dialog
 /// can never wedge the dispatch loop (D26).
@@ -29,9 +40,10 @@ fn requires_approval(invocation: &ToolInvocation) -> bool {
 /// whose join handle fails, resolves to `Deny`.
 async fn decide_remotely(
     callback: ApprovalCallback,
+    turn: Option<String>,
     invocation: ToolInvocation,
 ) -> ApprovalDecision {
-    let join = tokio::task::spawn_blocking(move || callback(&invocation));
+    let join = tokio::task::spawn_blocking(move || callback(turn, &invocation));
     match tokio::time::timeout(APPROVAL_TIMEOUT, join).await {
         Ok(Ok(decision)) => decision,
         Ok(Err(_join_err)) => ApprovalDecision::Deny,
@@ -92,7 +104,11 @@ impl ToolDispatchHook for AskApprovalHook {
             return Ok(ToolDispatchAction::Continue);
         };
 
-        let decision = decide_remotely(callback, invocation.clone()).await;
+        // Turn affinity (SC-007): read inside the dispatch task, where the
+        // hosted turn's scope is visible, and carry the value across the
+        // spawn_blocking boundary explicitly. Unset outside hosted turns.
+        let turn: Option<String> = APPROVAL_TURN.try_get().ok().flatten();
+        let decision = decide_remotely(callback, turn, invocation.clone()).await;
         match decision {
             ApprovalDecision::Allow => Ok(ToolDispatchAction::Continue),
             ApprovalDecision::Deny => Ok(ToolDispatchAction::Terminate {
@@ -131,7 +147,7 @@ mod tests {
     fn counting_callback(allow: bool) -> (ApprovalCallback, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
         let count_clone = count.clone();
-        let cb: ApprovalCallback = Arc::new(move |_inv| {
+        let cb: ApprovalCallback = Arc::new(move |_turn, _inv| {
             count_clone.fetch_add(1, Ordering::SeqCst);
             if allow {
                 ApprovalDecision::Allow

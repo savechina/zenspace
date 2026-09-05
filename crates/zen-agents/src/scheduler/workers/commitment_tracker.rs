@@ -191,7 +191,7 @@ impl ZenWorker for CommitmentTracker {
         }
 
         let journal_entries_dir = paths.journal_entries();
-        let anti_talks = compute_all_anti_talk(&commitments, &journal_entries_dir);
+        let anti_talks = compute_all_anti_talk(&commitments, &journal_entries_dir, ctx.now);
         for at in &anti_talks {
             if at.is_warning {
                 warn!(
@@ -404,9 +404,34 @@ fn is_journaled(path: &Path) -> bool {
     JournalEntryState::migrate_from_frontmatter(path) && JournalEntryState::is_journaled(path)
 }
 
+/// Anti-talk detection window (FR-026 E4): mentions count only over journal
+/// entries dated within the last 90 days.
+const ANTI_TALK_WINDOW_DAYS: i64 = 90;
+
+/// Journal entries are named `{YYYY-MM-DD}-{session_id}.md`; parse the
+/// leading date and keep entries inside the 90-day window. Entries whose stem
+/// carries no parsable date are conservatively included.
+fn journal_entry_in_window(path: &Path, now: DateTime<Utc>) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return true;
+    };
+    let Some(entry_date) = stem
+        .get(..10)
+        .and_then(|head| chrono::NaiveDate::parse_from_str(head, "%Y-%m-%d").ok())
+    else {
+        return true;
+    };
+    let age_days = now
+        .date_naive()
+        .signed_duration_since(entry_date)
+        .num_days();
+    (0..ANTI_TALK_WINDOW_DAYS).contains(&age_days)
+}
+
 fn compute_anti_talk_indicator(
     commitment: &Commitment,
     journal_dir: &Path,
+    now: DateTime<Utc>,
 ) -> Result<AntiTalkIndicator> {
     let slug = commitment.slug();
     let what_lower = commitment.what.to_lowercase();
@@ -419,6 +444,9 @@ fn compute_anti_talk_indicator(
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
+                continue;
+            }
+            if !journal_entry_in_window(&path, now) {
                 continue;
             }
             let content = match fs::read_to_string(&path) {
@@ -449,10 +477,14 @@ fn compute_anti_talk_indicator(
     })
 }
 
-fn compute_all_anti_talk(commitments: &[Commitment], journal_dir: &Path) -> Vec<AntiTalkIndicator> {
+fn compute_all_anti_talk(
+    commitments: &[Commitment],
+    journal_dir: &Path,
+    now: DateTime<Utc>,
+) -> Vec<AntiTalkIndicator> {
     let mut indicators: Vec<AntiTalkIndicator> = commitments
         .iter()
-        .filter_map(|c| match compute_anti_talk_indicator(c, journal_dir) {
+        .filter_map(|c| match compute_anti_talk_indicator(c, journal_dir, now) {
             Ok(indicator) => Some(indicator),
             Err(e) => {
                 warn!(commitment = %c.what, error = %e, "failed to compute anti-talk indicator");
@@ -536,7 +568,7 @@ pub fn scan_commitment_gaps(paths: &ZenPaths, now: DateTime<Utc>) -> Vec<GapReco
     }
 
     let journal_dir = paths.journal_entries();
-    for at in compute_all_anti_talk(&commitments, &journal_dir) {
+    for at in compute_all_anti_talk(&commitments, &journal_dir, now) {
         if at.ratio > 5.0 {
             gaps.push(
                 GapRecord::new(
@@ -570,18 +602,22 @@ mod tests {
         fs::create_dir_all(&journal_dir).unwrap();
 
         // Overdue + anti-talk: past review_at, 10 mentions, 0 milestones.
+        let now = Utc::now();
         let mut c1 = Commitment::new("ship feature X");
-        c1.review_at = Some((Utc::now() - chrono::Duration::days(3)).date_naive());
+        c1.review_at = Some((now - chrono::Duration::days(3)).date_naive());
         c1.save(&commitments_dir).unwrap();
         let mentions = "talk about ship feature X again\n".repeat(10);
-        fs::write(journal_dir.join("2026-08-29.md"), &mentions).unwrap();
+        fs::write(
+            journal_dir.join(format!("{}.md", now.format("%Y-%m-%d"))),
+            &mentions,
+        )
+        .unwrap();
 
         // Healthy: future review_at, no mentions.
         let mut c2 = Commitment::new("balanced work");
-        c2.review_at = Some((Utc::now() + chrono::Duration::days(3)).date_naive());
+        c2.review_at = Some((now + chrono::Duration::days(3)).date_naive());
         c2.save(&commitments_dir).unwrap();
 
-        let now = Utc::now();
         let gaps = scan_commitment_gaps(&paths, now);
 
         assert_eq!(gaps.len(), 2, "expected overdue + anti-talk gaps");
@@ -754,8 +790,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let journal_dir = dir.path().join("memories/journal");
         fs::create_dir_all(&journal_dir).unwrap();
+        let now = Utc::now();
         fs::write(
-            journal_dir.join("2026-06-01.md"),
+            journal_dir.join(format!("{}.md", now.format("%Y-%m-%d"))),
             "# Journal\n\nNo relevant content.\n",
         )
         .unwrap();
@@ -764,7 +801,7 @@ mod tests {
         commitment.add_milestone("done", None);
         commitment.milestones[0].completed = true;
 
-        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir).unwrap();
+        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir, now).unwrap();
         assert_eq!(indicator.mention_count, 0);
         assert_eq!(indicator.milestone_count, 1);
         assert!(!indicator.is_warning);
@@ -775,14 +812,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let journal_dir = dir.path().join("memories/journal");
         fs::create_dir_all(&journal_dir).unwrap();
+        let now = Utc::now();
 
         let journal_content = "Talk about ship feature X a lot\n".repeat(10);
-        fs::write(journal_dir.join("2026-06-01.md"), &journal_content).unwrap();
+        fs::write(
+            journal_dir.join(format!("{}.md", now.format("%Y-%m-%d"))),
+            &journal_content,
+        )
+        .unwrap();
 
         let mut commitment = Commitment::new("ship feature X");
         commitment.add_milestone("done", None);
 
-        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir).unwrap();
+        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir, now).unwrap();
         assert_eq!(indicator.mention_count, 10);
         assert_eq!(indicator.milestone_count, 0);
         assert!(indicator.is_warning);
@@ -794,9 +836,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let journal_dir = dir.path().join("memories/journal");
         fs::create_dir_all(&journal_dir).unwrap();
+        let now = Utc::now();
 
         let journal_content = "ship feature X mentioned here\n".repeat(3);
-        fs::write(journal_dir.join("2026-06-01.md"), &journal_content).unwrap();
+        fs::write(
+            journal_dir.join(format!("{}.md", now.format("%Y-%m-%d"))),
+            &journal_content,
+        )
+        .unwrap();
 
         let mut commitment = Commitment::new("ship feature X");
         for i in 0..3 {
@@ -804,10 +851,39 @@ mod tests {
             commitment.milestones[i].completed = true;
         }
 
-        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir).unwrap();
+        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir, now).unwrap();
         assert_eq!(indicator.mention_count, 3);
         assert_eq!(indicator.milestone_count, 3);
         assert!(!indicator.is_warning);
+    }
+
+    #[test]
+    fn test_anti_talk_ignores_mentions_outside_90_day_window() {
+        let dir = tempdir().unwrap();
+        let journal_dir = dir.path().join("memories/journal");
+        fs::create_dir_all(&journal_dir).unwrap();
+        let now = Utc::now();
+        let date_name = |d: DateTime<Utc>| d.format("%Y-%m-%d").to_string();
+
+        let in_window = now - chrono::Duration::days(2);
+        fs::write(
+            journal_dir.join(format!("{}.md", date_name(in_window))),
+            "ship feature X\nship feature X\n",
+        )
+        .unwrap();
+
+        let out_of_window = now - chrono::Duration::days(ANTI_TALK_WINDOW_DAYS + 1);
+        fs::write(
+            journal_dir.join(format!("{}.md", date_name(out_of_window))),
+            "ship feature X\n".repeat(10),
+        )
+        .unwrap();
+
+        let commitment = Commitment::new("ship feature X");
+        let indicator = compute_anti_talk_indicator(&commitment, &journal_dir, now).unwrap();
+        assert_eq!(indicator.mention_count, 2, "stale mentions must not count");
+        assert!(!indicator.is_warning);
+        assert!(indicator.ratio <= 5.0);
     }
 
     #[test]
@@ -815,17 +891,27 @@ mod tests {
         let dir = tempdir().unwrap();
         let journal_dir = dir.path().join("memories/journal");
         fs::create_dir_all(&journal_dir).unwrap();
+        let now = Utc::now();
+        let date_name = |d: DateTime<Utc>| d.format("%Y-%m-%d").to_string();
 
         let mut c1 = Commitment::new("low talk");
         c1.add_milestone("m1", None);
         c1.milestones[0].completed = true;
-        fs::write(journal_dir.join("2026-06-01.md"), "low talk mentioned\n").unwrap();
+        fs::write(
+            journal_dir.join(format!("{}.md", date_name(now))),
+            "low talk mentioned\n",
+        )
+        .unwrap();
 
         let c2 = Commitment::new("high talk");
         let repeats = "high talk mentioned\n".repeat(20);
-        fs::write(journal_dir.join("2026-06-02.md"), &repeats).unwrap();
+        fs::write(
+            journal_dir.join(format!("{}.md", date_name(now - chrono::Duration::days(1)))),
+            &repeats,
+        )
+        .unwrap();
 
-        let indicators = compute_all_anti_talk(&[c1, c2], &journal_dir);
+        let indicators = compute_all_anti_talk(&[c1, c2], &journal_dir, now);
         assert_eq!(indicators.len(), 2);
         assert!(indicators[0].ratio >= indicators[1].ratio);
     }

@@ -6,61 +6,15 @@ use tracing::{debug, info, warn};
 
 use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
-use zen_core::sanitize::InputSanitizer;
-use zen_core::types::Sensitivity;
-use zen_memory::belief::Belief;
-use zen_memory::conversation::ConversationStore;
-use zen_memory::correction::Correction;
-use zen_memory::decision::{CostBreakdown, Decision};
-use zen_memory::dream::{ExtractedSignals, extract_durable_facts_from_entry};
-use zen_memory::feedback_signal::Feedback;
-use zen_memory::quality_gate::{DECISION_PRINCIPLES, EXTRACTION_GUARDRAILS};
-use zen_provider::{DefaultRouter, LlmRouterExt};
+use zen_provider::DefaultRouter;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::SessionState;
 
+mod session_journaler_signals;
+use session_journaler_signals as sig;
+
 const MIN_TURNS: usize = 1;
-
-struct PromptContext {
-    commitments_section: String,
-    beliefs_section: String,
-    anti_patterns_section: String,
-}
-
-impl PromptContext {
-    fn is_empty(&self) -> bool {
-        self.commitments_section.is_empty()
-            && self.beliefs_section.is_empty()
-            && self.anti_patterns_section.is_empty()
-    }
-
-    fn to_prompt_section(&self) -> String {
-        if self.is_empty() {
-            return String::new();
-        }
-        let mut s = String::from("\n--- Context ---\n");
-        if !self.commitments_section.is_empty() {
-            s.push_str(&self.commitments_section);
-            s.push('\n');
-        }
-        if !self.beliefs_section.is_empty() {
-            s.push_str(&self.beliefs_section);
-            s.push('\n');
-        }
-        if !self.anti_patterns_section.is_empty() {
-            s.push_str(&self.anti_patterns_section);
-            s.push('\n');
-        }
-        s
-    }
-}
-
-struct CommitmentSummary {
-    text: String,
-    status: String,
-    review_at: String,
-}
 
 pub struct SessionJournaler {
     scheduled: Option<&'static str>,
@@ -232,7 +186,10 @@ async fn process_session(
     router: Option<DefaultRouter>,
     fresh_eyes: bool,
 ) -> Result<usize> {
-    let store = ConversationStore::with_file(jsonl_path.to_path_buf(), session_id)?;
+    let store = zen_memory::conversation::ConversationStore::with_file(
+        jsonl_path.to_path_buf(),
+        session_id,
+    )?;
     let turns = store.load()?;
 
     if turns.len() < MIN_TURNS {
@@ -244,13 +201,13 @@ async fn process_session(
         return Ok(0);
     }
 
-    let conversation_text = build_conversation_text(&turns);
+    let conversation_text = sig::build_conversation_text(&turns);
 
     let matched_anti_patterns = if fresh_eyes {
         Vec::new()
     } else {
         let anti_patterns_dir = paths.vault().join("wiki/wisdom/anti-patterns");
-        let matched = check_anti_pattern_match(&conversation_text, &anti_patterns_dir);
+        let matched = sig::check_anti_pattern_match(&conversation_text, &anti_patterns_dir);
         if !matched.is_empty() {
             info!(
                 session_id = %session_id,
@@ -262,17 +219,17 @@ async fn process_session(
     };
 
     let prompt_context = if fresh_eyes {
-        PromptContext {
+        sig::PromptContext {
             commitments_section: String::new(),
             beliefs_section: String::new(),
             anti_patterns_section: String::new(),
         }
     } else {
-        load_prompt_context(paths).await
+        sig::load_prompt_context(paths).await
     };
 
-    let (signals, source) = if let Some(router) = router {
-        match extract_signals_via_llm(
+    let (mut signals, source) = if let Some(router) = router {
+        match sig::extract_signals_via_llm(
             &conversation_text,
             &prompt_context,
             router,
@@ -287,433 +244,48 @@ async fn process_session(
             }
             Ok(_) => {
                 debug!(session_id = %session_id, "LLM returned no signals, falling back to keyword");
-                (extract_signals_via_keyword(&conversation_text), "keyword")
+                (
+                    sig::extract_signals_via_keyword(&conversation_text),
+                    "keyword",
+                )
             }
             Err(e) => {
                 warn!(session_id = %session_id, error = %e, "LLM extraction failed, falling back to keyword");
-                (extract_signals_via_keyword(&conversation_text), "keyword")
+                (
+                    sig::extract_signals_via_keyword(&conversation_text),
+                    "keyword",
+                )
             }
         }
     } else {
-        (extract_signals_via_keyword(&conversation_text), "keyword")
+        (
+            sig::extract_signals_via_keyword(&conversation_text),
+            "keyword",
+        )
     };
 
-    let journal_content = build_journal_entry(session_id, turns.len(), &signals, source);
+    signals
+        .preferences
+        .extend(sig::derive_preferences(&conversation_text));
+
+    let (signals, filtered) =
+        sig::apply_quality_prefilter(&paths.vault(), signals, source == "llm");
+    if filtered > 0 {
+        debug!(
+            session_id = %session_id,
+            filtered = filtered,
+            "quality pre-filter dropped low-grade signals"
+        );
+    }
+
+    let journal_content = sig::build_journal_entry(session_id, turns.len(), &signals, source);
     write_journal_entry(paths, session_id, &journal_content)?;
 
-    save_typed_signals(paths, &signals);
+    sig::save_typed_signals(paths, &signals);
 
     append_journaled_marker(jsonl_path, source)?;
 
     Ok(signals.total())
-}
-
-fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
-    let vault = paths.vault();
-
-    for raw in &signals.decisions {
-        let parts: Vec<&str> = raw.splitn(3, "|||").collect();
-        if parts.is_empty() {
-            continue;
-        }
-        let text = parts[0].trim();
-        let context = parts.get(1).map(|s| s.trim()).unwrap_or("");
-        let _expected_value = parts.get(2).map(|s| s.trim()).unwrap_or("");
-
-        let id = Decision::slugify_title(text);
-        let mut decision = Decision::new(id, text.to_string(), "session".to_string());
-        decision.goal = context.to_string();
-        if let Err(e) = decision.save(&vault.join("wiki/wisdom/decisions")) {
-            warn!(error = %e, text = %text, "failed to save decision");
-        }
-    }
-
-    for raw in &signals.corrections {
-        let parts: Vec<&str> = raw.splitn(3, "|||").collect();
-        if parts.is_empty() {
-            continue;
-        }
-        let error_ref = parts[0].trim();
-        let fix = parts.get(1).map(|s| s.trim()).unwrap_or("");
-        let _cost_str = parts.get(2).map(|s| s.trim()).unwrap_or("");
-
-        let correction = Correction::new(error_ref, fix, CostBreakdown::default());
-        if let Err(e) = correction.save(&vault.join("wiki/wisdom/corrections")) {
-            warn!(error = %e, error_ref = %error_ref, "failed to save correction");
-        }
-    }
-
-    for raw in &signals.feedback {
-        let parts: Vec<&str> = raw.splitn(3, "|||").collect();
-        if parts.is_empty() {
-            continue;
-        }
-        let target = parts[0].trim();
-        let content = parts.get(1).map(|s| s.trim()).unwrap_or("");
-        let _sentiment = parts.get(2).map(|s| s.trim()).unwrap_or("");
-
-        let feedback = Feedback::new(target, content);
-        if let Err(e) = feedback.save(&vault.join("wiki/wisdom/feedback")) {
-            warn!(error = %e, target = %target, "failed to save feedback");
-        }
-    }
-
-    for raw in &signals.beliefs {
-        let parts: Vec<&str> = raw.splitn(2, "|||").collect();
-        if parts.is_empty() {
-            continue;
-        }
-        let statement = parts[0].trim();
-        let confidence = parts
-            .get(1)
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .unwrap_or(0.5);
-
-        let id = zen_memory::belief::slugify_proposition(statement);
-        let mut belief = Belief::new(id, statement.to_string(), "session".to_string());
-        belief.posterior = confidence.clamp(0.01, 0.99);
-        if let Err(e) = belief.save(&vault.join("wiki/wisdom/beliefs")) {
-            warn!(error = %e, statement = %statement, "failed to save belief candidate");
-        }
-    }
-
-    for raw in &signals.facts {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let fact = zen_memory::Fact::new(trimmed, "session", Vec::new());
-        if let Err(e) = fact.save(&vault.join("wiki/wisdom/facts")) {
-            warn!(error = %e, what = %trimmed, "failed to save fact");
-        }
-    }
-}
-
-async fn extract_signals_via_llm(
-    conversation_text: &str,
-    prompt_context: &PromptContext,
-    router: DefaultRouter,
-    matched_anti_patterns: &[String],
-    fresh_eyes: bool,
-) -> Result<ExtractedSignals> {
-    let truncated = if conversation_text.len() > 12000 {
-        let end = conversation_text
-            .char_indices()
-            .nth(12000)
-            .map(|(i, _)| i)
-            .unwrap_or(conversation_text.len());
-        format!("{}...", &conversation_text[..end])
-    } else {
-        conversation_text.to_string()
-    };
-
-    let context_section = prompt_context.to_prompt_section();
-
-    let anti_pattern_warning = if matched_anti_patterns.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nWARNING: Detected anti-patterns: {}. Force reflection extraction for these patterns.\n",
-            matched_anti_patterns.join(", ")
-        )
-    };
-
-    let fresh_eyes_note = if fresh_eyes {
-        "\n[FRESH EYES MODE] No prior context injected. Extract signals from conversation only.\n"
-    } else {
-        ""
-    };
-
-    let sanitizer = InputSanitizer::new();
-    let truncated = sanitizer.strip_dangerous_patterns(&truncated);
-
-    let prompt = format!(
-        r#"Extract typed signals from this development session conversation.
-
-Conversation:
-{truncated}
-{context_section}
-{anti_pattern_warning}
-{fresh_eyes_note}
-{EXTRACTION_GUARDRAILS}
-{DECISION_PRINCIPLES}
-Respond with ONLY a JSON object:
-{{
-  "facts": [
-    "Implemented JWT authentication with refresh token rotation",
-    "Decided to use SQLite for local storage instead of PostgreSQL"
-  ],
-  "reflections": [
-    "The login flow is too complex — users get confused at step 3",
-    "Should have tested the migration on a copy first"
-  ],
-  "commitments": [
-    "Simplify login to 2 steps by 2026-07-01",
-    "Write integration tests for the auth module this week"
-  ],
-  "decisions": [
-    {{"text": "Use SQLite over PostgreSQL for local-first storage", "context": "Need offline capability with minimal setup", "expected_value": "Lower ops cost, good enough for single-user"}}
-  ],
-  "corrections": [
-    {{"error": "Assumed all env vars were set in production", "correct_answer": "Validate env vars at startup and fail fast", "cost": "2h debugging deploy failure"}}
-  ],
-  "feedback": [
-    {{"target": "login-flow", "content": "Users abandon at step 3 of registration", "sentiment": "negative"}}
-  ],
-  "beliefs": [
-    {{"statement": "SQLite is sufficient for local-first apps under 1GB data", "confidence": 0.7}}
-  ],
-  "continue_doing": [
-    "Writing tests before implementation caught 3 regressions early",
-    "Pair programming on the API design reduced rework by half"
-  ]
-}}
-
-Rules:
-- **Facts**: past-tense, specific, durable — useful after 6 months. Technical decisions, bug fixes, learnings.
-- **Reflections**: what went wrong, what could be better, what surprised you. Self-critical, honest.
-- **Commitments**: what you (the user) plan to do next. Include a rough timeframe if mentioned.
-- **Decisions**: explicit choices between alternatives. Include context and expected value rationale.
-- **Corrections**: errors caught and fixed. Include what went wrong, the correct answer, and the cost.
-- **Feedback**: observations about code/process quality. Include target, content, and sentiment.
-- **Beliefs**: assumptions or opinions held by the user. Include a confidence score (0.0-1.0).
-- **Continue-doing**: positive actions or practices that worked well and should be repeated. Capture what went RIGHT — techniques, habits, or decisions that produced good outcomes. These are the "continue-doing" counterpart to reflections (stop-doing).
-- Do NOT include transient mechanics ("user asked about X", "assistant replied")
-- If a category is empty, return an empty array for it
-- If nothing of value happened in any category, return all empty arrays"#
-    );
-
-    let response = tokio::task::spawn_blocking(move || {
-        router.complete("signal_extraction", &prompt, Sensitivity::Private)
-    })
-    .await
-    .context("LLM signal extraction task panicked")??;
-
-    let json_str = if let Some(start) = response.find("```json") {
-        let after = &response[start + 7..];
-        if let Some(end) = after.find("```") {
-            &after[..end]
-        } else {
-            after
-        }
-    } else if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') {
-            &response[start..=end]
-        } else {
-            &response
-        }
-    } else {
-        &response
-    };
-
-    let parsed: serde_json::Value = serde_json::from_str(json_str.trim())
-        .context("failed to parse LLM signal extraction response")?;
-
-    let mut signals = ExtractedSignals::default();
-
-    if let Some(arr) = parsed["facts"].as_array() {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                let s = s.trim();
-                if !s.is_empty() && s != "No durable facts extracted." {
-                    signals.facts.push(s.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = parsed["reflections"].as_array() {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                let s = s.trim();
-                if !s.is_empty() {
-                    signals.reflections.push(s.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = parsed["commitments"].as_array() {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                let s = s.trim();
-                if !s.is_empty() {
-                    signals.commitments.push(s.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = parsed["decisions"].as_array() {
-        for item in arr {
-            if let Some(obj) = item.as_object()
-                && let Some(text) = obj.get("text").and_then(|v| v.as_str())
-            {
-                let text = text.trim().to_string();
-                if !text.is_empty() {
-                    let context = obj
-                        .get("context")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let ev = obj
-                        .get("expected_value")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    signals.decisions.push(format!("{text}|||{context}|||{ev}"));
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = parsed["corrections"].as_array() {
-        for item in arr {
-            if let Some(obj) = item.as_object()
-                && let Some(error) = obj.get("error").and_then(|v| v.as_str())
-            {
-                let error = error.trim().to_string();
-                if !error.is_empty() {
-                    let correct = obj
-                        .get("correct_answer")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let cost = obj
-                        .get("cost")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    signals
-                        .corrections
-                        .push(format!("{error}|||{correct}|||{cost}"));
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = parsed["feedback"].as_array() {
-        for item in arr {
-            if let Some(obj) = item.as_object()
-                && let Some(content) = obj.get("content").and_then(|v| v.as_str())
-            {
-                let content = content.trim().to_string();
-                if !content.is_empty() {
-                    let target = obj
-                        .get("target")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("session")
-                        .to_string();
-                    let sentiment = obj
-                        .get("sentiment")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("neutral")
-                        .to_string();
-                    signals
-                        .feedback
-                        .push(format!("{target}|||{content}|||{sentiment}"));
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = parsed["beliefs"].as_array() {
-        for item in arr {
-            if let Some(obj) = item.as_object()
-                && let Some(statement) = obj.get("statement").and_then(|v| v.as_str())
-            {
-                let statement = statement.trim().to_string();
-                if !statement.is_empty() {
-                    let confidence = obj
-                        .get("confidence")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.5);
-                    signals.beliefs.push(format!("{statement}|||{confidence}"));
-                }
-            }
-        }
-    }
-
-    if let Some(arr) = parsed["continue_doing"].as_array() {
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                let s = s.trim();
-                if !s.is_empty() {
-                    signals.continue_doing_candidates.push(s.to_string());
-                }
-            }
-        }
-    }
-
-    Ok(signals)
-}
-
-fn extract_signals_via_keyword(conversation_text: &str) -> ExtractedSignals {
-    let facts = extract_durable_facts_from_entry(conversation_text);
-    ExtractedSignals {
-        facts,
-        reflections: Vec::new(),
-        commitments: Vec::new(),
-        decisions: Vec::new(),
-        corrections: Vec::new(),
-        feedback: Vec::new(),
-        beliefs: Vec::new(),
-        continue_doing_candidates: Vec::new(),
-    }
-}
-
-fn build_conversation_text(turns: &[(String, String)]) -> String {
-    let mut text = String::new();
-    for (role, content) in turns {
-        text.push_str(&format!("{role}: {content}\n"));
-    }
-    text
-}
-
-fn build_journal_entry(
-    session_id: &str,
-    turn_count: usize,
-    signals: &ExtractedSignals,
-    source: &str,
-) -> String {
-    let now = Utc::now();
-    let date_str = now.format("%Y-%m-%d").to_string();
-    let timestamp_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    let mut entry = format!(
-        "---\nsession_id: {session_id}\ndate: {date_str}\nturn_count: {turn_count}\nsource: {source}\n---\n\n# Session Journal — {timestamp_str}\n\n"
-    );
-
-    entry.push_str("## Facts\n\n");
-    if signals.facts.is_empty() {
-        entry.push_str("_(no durable facts extracted)_\n\n");
-    } else {
-        for fact in &signals.facts {
-            entry.push_str(&format!("- {fact}\n"));
-        }
-        entry.push('\n');
-    }
-
-    entry.push_str("## Reflections\n\n");
-    if signals.reflections.is_empty() {
-        entry.push_str("_(no reflections extracted)_\n\n");
-    } else {
-        for refl in &signals.reflections {
-            entry.push_str(&format!("- {refl}\n"));
-        }
-        entry.push('\n');
-    }
-
-    entry.push_str("## Commitments\n\n");
-    if signals.commitments.is_empty() {
-        entry.push_str("_(no commitments extracted)_\n");
-    } else {
-        for comm in &signals.commitments {
-            entry.push_str(&format!("- {comm}\n"));
-        }
-    }
-
-    entry
 }
 
 fn write_journal_entry(paths: &ZenPaths, session_id: &str, content: &str) -> Result<()> {
@@ -784,173 +356,6 @@ fn extract_session_id(jsonl_path: &std::path::Path) -> String {
         .to_string()
 }
 
-fn check_anti_pattern_match(
-    session_text: &str,
-    anti_patterns_dir: &std::path::Path,
-) -> Vec<String> {
-    let mut matched = Vec::new();
-    if !anti_patterns_dir.is_dir() {
-        return matched;
-    }
-
-    let entries = match fs::read_dir(anti_patterns_dir) {
-        Ok(e) => e,
-        Err(_) => return matched,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "md") {
-            continue;
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let id = parse_frontmatter_field(&content, "id").unwrap_or_default();
-        if id.is_empty() {
-            continue;
-        }
-
-        let trigger = parse_frontmatter_field(&content, "trigger").unwrap_or_default();
-        if trigger.is_empty() {
-            continue;
-        }
-
-        let trigger_lower = trigger.to_lowercase();
-        let session_lower = session_text.to_lowercase();
-
-        let keywords: Vec<&str> = trigger_lower
-            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-            .filter(|w| w.len() > 3)
-            .collect();
-
-        let match_count = keywords
-            .iter()
-            .filter(|kw| session_lower.contains(*kw))
-            .count();
-        let threshold = (keywords.len() / 2).max(1);
-
-        if match_count >= threshold {
-            matched.push(id);
-        }
-    }
-
-    matched
-}
-
-async fn load_prompt_context(paths: &ZenPaths) -> PromptContext {
-    let commitments_section = load_top_commitments(paths, 5);
-    let beliefs_section = load_top_beliefs(paths, 5);
-    let anti_patterns_section = load_top_anti_patterns(paths, 5);
-    PromptContext {
-        commitments_section,
-        beliefs_section,
-        anti_patterns_section,
-    }
-}
-
-fn load_top_commitments(paths: &ZenPaths, n: usize) -> String {
-    let dir = paths.vault().join("memories/commitments");
-    let items = scan_commitments(&dir);
-    if items.is_empty() {
-        return String::new();
-    }
-    let top: Vec<&CommitmentSummary> = items.iter().take(n).collect();
-    let mut s = String::from("User's active commitments (prioritize signals relevant to these):\n");
-    for item in top {
-        s.push_str(&format!(
-            "- {} [{}, review: {}]\n",
-            item.text, item.status, item.review_at
-        ));
-    }
-    s
-}
-
-fn load_top_beliefs(paths: &ZenPaths, n: usize) -> String {
-    let dir = paths.vault().join("wiki/wisdom/beliefs");
-    let beliefs = match zen_memory::belief::Belief::load_all(&dir) {
-        Ok(b) => b,
-        Err(_) => return String::new(),
-    };
-    if beliefs.is_empty() {
-        return String::new();
-    }
-    let top = zen_memory::belief::top_by_priority(&beliefs, n);
-    let mut s = String::from("User's current beliefs (by confidence):\n");
-    for b in top {
-        s.push_str(&format!(
-            "- {} ({:.0}% confident)\n",
-            b.proposition,
-            b.posterior * 100.0
-        ));
-    }
-    s
-}
-
-fn load_top_anti_patterns(paths: &ZenPaths, n: usize) -> String {
-    let dir = paths.vault().join("wiki/wisdom/anti-patterns");
-    let signals = match zen_memory::AntiPatternSignal::load_all(&dir) {
-        Ok(s) => s,
-        Err(_) => return String::new(),
-    };
-    if signals.is_empty() {
-        return String::new();
-    }
-    let top = signals.iter().take(n);
-    let mut s = String::from("Known anti-patterns to watch for during extraction:\n");
-    for ap in top {
-        s.push_str(&format!("- {} (trigger: {})\n", ap.pattern, ap.trigger));
-    }
-    s
-}
-
-fn scan_commitments(dir: &std::path::Path) -> Vec<CommitmentSummary> {
-    let mut items = Vec::new();
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return items,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "md") {
-            continue;
-        }
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let text = parse_frontmatter_field(&content, "text").unwrap_or_default();
-        let status =
-            parse_frontmatter_field(&content, "status").unwrap_or_else(|| "open".to_string());
-        let review_at = parse_frontmatter_field(&content, "review_at").unwrap_or_default();
-        if status == "open" && !text.is_empty() {
-            items.push(CommitmentSummary {
-                text,
-                status,
-                review_at,
-            });
-        }
-    }
-    items.sort_by(|a, b| a.review_at.cmp(&b.review_at));
-    items
-}
-
-fn parse_frontmatter_field(content: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
-    for line in content.lines().take(15) {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&prefix) {
-            let val = rest.trim().trim_matches('"').to_string();
-            if !val.is_empty() {
-                return Some(val);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,238 +405,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_journal_entry() {
-        let session_id = "01JX0TEST000000000000000000";
-        let turn_count = 5;
-        let signals = ExtractedSignals {
-            facts: vec![
-                "completed auth module".to_string(),
-                "fixed login bug".to_string(),
-            ],
-            reflections: vec![],
-            commitments: vec![],
-            decisions: vec![],
-            corrections: vec![],
-            feedback: vec![],
-            beliefs: vec![],
-            continue_doing_candidates: vec![],
-        };
-
-        let entry = build_journal_entry(session_id, turn_count, &signals, "keyword");
-
-        assert!(entry.contains("session_id: 01JX0TEST000000000000000000"));
-        assert!(entry.contains("turn_count: 5"));
-        assert!(entry.contains("source: keyword"));
-        assert!(!entry.contains("journaled_at:"));
-        assert!(entry.contains("completed auth module"));
-        assert!(entry.contains("fixed login bug"));
-        assert!(entry.contains("## Facts"));
-        assert!(entry.contains("## Reflections"));
-        assert!(entry.contains("## Commitments"));
-    }
-
-    #[test]
-    fn test_build_journal_entry_empty_signals() {
-        let session_id = "01JX0TEST000000000000000000";
-        let signals = ExtractedSignals::default();
-        let entry = build_journal_entry(session_id, 3, &signals, "keyword");
-
-        assert!(entry.contains("_(no durable facts extracted)_"));
-        assert!(entry.contains("_(no reflections extracted)_"));
-        assert!(entry.contains("_(no commitments extracted)_"));
-    }
-
-    #[test]
-    fn test_build_journal_entry_all_sections() {
-        let session_id = "01JX0TEST000000000000000000";
-        let signals = ExtractedSignals {
-            facts: vec!["implemented auth".to_string()],
-            reflections: vec!["login flow too complex".to_string()],
-            commitments: vec!["simplify login by July".to_string()],
-            decisions: vec![],
-            corrections: vec![],
-            feedback: vec![],
-            beliefs: vec![],
-            continue_doing_candidates: vec![],
-        };
-        let entry = build_journal_entry(session_id, 10, &signals, "llm");
-
-        assert!(entry.contains("## Facts"));
-        assert!(entry.contains("- implemented auth"));
-        assert!(entry.contains("## Reflections"));
-        assert!(entry.contains("- login flow too complex"));
-        assert!(entry.contains("## Commitments"));
-        assert!(entry.contains("- simplify login by July"));
-        assert!(entry.contains("source: llm"));
-    }
-
-    #[test]
-    fn test_keyword_fallback_returns_facts_only() {
-        let conversation = "user: completed the auth module\nassistant: great";
-        let signals = extract_signals_via_keyword(conversation);
-
-        assert!(!signals.facts.is_empty(), "keyword should extract facts");
-        assert!(
-            signals.reflections.is_empty(),
-            "keyword returns no reflections"
-        );
-        assert!(
-            signals.commitments.is_empty(),
-            "keyword returns no commitments"
-        );
-    }
-
-    #[test]
-    fn test_build_conversation_text() {
-        let turns = vec![
-            ("user".to_string(), "Hello".to_string()),
-            ("assistant".to_string(), "Hi there!".to_string()),
-        ];
-
-        let text = build_conversation_text(&turns);
-
-        assert_eq!(text, "user: Hello\nassistant: Hi there!\n");
-    }
-
-    #[test]
     fn test_extract_session_id() {
         let path = std::path::PathBuf::from("/tmp/sessions/2026/06/20/test-session-id.jsonl");
         assert_eq!(extract_session_id(&path), "test-session-id");
-    }
-
-    #[test]
-    fn test_load_top_commitments_empty_dir() {
-        let _dir = tempfile::tempdir().unwrap();
-        let paths = ZenPaths::detect().unwrap_or_else(|_| {
-            panic!("ZenPaths::detect failed");
-        });
-        let result = load_top_commitments(&paths, 5);
-        assert!(result.is_empty() || result.contains("active commitments"));
-    }
-
-    #[test]
-    fn test_load_top_beliefs_empty_dir() {
-        let _dir = tempfile::tempdir().unwrap();
-        let paths = ZenPaths::detect().unwrap_or_else(|_| {
-            panic!("ZenPaths::detect failed");
-        });
-        let result = load_top_beliefs(&paths, 5);
-        assert!(result.is_empty() || result.contains("beliefs"));
-    }
-
-    #[test]
-    fn test_prompt_context_empty_to_prompt_section() {
-        let ctx = PromptContext {
-            commitments_section: String::new(),
-            beliefs_section: String::new(),
-            anti_patterns_section: String::new(),
-        };
-        assert!(ctx.is_empty());
-        assert!(ctx.to_prompt_section().is_empty());
-    }
-
-    #[test]
-    fn test_prompt_context_nonempty_has_sections() {
-        let ctx = PromptContext {
-            commitments_section: "commitments here\n".to_string(),
-            beliefs_section: "beliefs here\n".to_string(),
-            anti_patterns_section: String::new(),
-        };
-        assert!(!ctx.is_empty());
-        let section = ctx.to_prompt_section();
-        assert!(section.contains("--- Context ---"));
-        assert!(section.contains("commitments here"));
-        assert!(section.contains("beliefs here"));
-    }
-
-    #[test]
-    fn test_parse_frontmatter_field_found() {
-        let content = "---\ntext: Do the thing\nstatus: open\n---\n\nbody";
-        assert_eq!(
-            parse_frontmatter_field(content, "text"),
-            Some("Do the thing".to_string())
-        );
-        assert_eq!(
-            parse_frontmatter_field(content, "status"),
-            Some("open".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_frontmatter_field_missing() {
-        let content = "---\ntext: Do the thing\n---\n\nbody";
-        assert_eq!(parse_frontmatter_field(content, "status"), None);
-    }
-
-    #[test]
-    fn test_scan_commitments_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let items = scan_commitments(dir.path());
-        assert!(items.is_empty());
-    }
-
-    #[test]
-    fn test_scan_commitments_filters_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let content = "---\ntext: Open task\nstatus: open\nreview_at: 2026-07-01T00:00:00Z\n---\n\n# Commitment\n\nOpen task\n";
-        fs::write(dir.path().join("open.md"), content).unwrap();
-
-        let closed = "---\ntext: Done task\nstatus: done\nreview_at: 2026-06-01T00:00:00Z\n---\n\n# Commitment\n\nDone task\n";
-        fs::write(dir.path().join("closed.md"), closed).unwrap();
-
-        let items = scan_commitments(dir.path());
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].text, "Open task");
-    }
-
-    #[test]
-    fn test_check_anti_pattern_match_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let matched = check_anti_pattern_match("some session text", dir.path());
-        assert!(matched.is_empty());
-    }
-
-    #[test]
-    fn test_check_anti_pattern_match_nonexistent_dir() {
-        let matched = check_anti_pattern_match("text", std::path::Path::new("/nonexistent"));
-        assert!(matched.is_empty());
-    }
-
-    #[test]
-    fn test_check_anti_pattern_match_with_trigger() {
-        let dir = tempfile::tempdir().unwrap();
-        let ap_content = "---\nid: confirmation-bias\ntype: anti-pattern\ntrigger: \"Selectively gathering evidence that supports existing beliefs\"\nseverity: high\n---\n\n# Confirmation Bias\n\nBody\n";
-        fs::write(dir.path().join("confirmation-bias.md"), ap_content).unwrap();
-
-        let session =
-            "I only looked for evidence that supports my existing beliefs about the architecture";
-        let matched = check_anti_pattern_match(session, dir.path());
-        assert!(matched.contains(&"confirmation-bias".to_string()));
-    }
-
-    #[test]
-    fn test_check_anti_pattern_match_no_trigger_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let ap_content = "---\nid: anchoring-effect\ntype: anti-pattern\ntrigger: \"First number or estimate disproportionately influencing judgment\"\nseverity: med\n---\n\n# Anchoring\n\nBody\n";
-        fs::write(dir.path().join("anchoring-effect.md"), ap_content).unwrap();
-
-        let session =
-            "We discussed the project timeline and decided on a different approach entirely";
-        let matched = check_anti_pattern_match(session, dir.path());
-        assert!(matched.is_empty());
-    }
-
-    #[test]
-    fn test_check_anti_pattern_match_multiple_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let ap1 = "---\nid: pattern-a\ntype: anti-pattern\ntrigger: \"selectively gathering evidence supporting beliefs\"\nseverity: high\n---\n\nBody\n";
-        let ap2 = "---\nid: pattern-b\ntype: anti-pattern\ntrigger: \"generating face-saving excuses instead honest assessment\"\nseverity: high\n---\n\nBody\n";
-        fs::write(dir.path().join("a.md"), ap1).unwrap();
-        fs::write(dir.path().join("b.md"), ap2).unwrap();
-
-        let session = "I was selectively gathering evidence supporting my beliefs and also generating face-saving excuses instead honest assessment";
-        let matched = check_anti_pattern_match(session, dir.path());
-        assert!(matched.len() >= 2);
     }
 
     #[test]

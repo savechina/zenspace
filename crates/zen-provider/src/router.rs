@@ -718,6 +718,7 @@ impl DefaultRouter {
                 mcp_servers: Vec::new(),
                 sandbox: zen_core::config::SandboxConfig::default(),
                 agentic: zen_core::config::AgenticConfig::default(),
+                skills: zen_core::config::SkillsConfig::default(),
             },
             mock: MockProvider::default(),
             provider_cache: std::sync::Arc::new(std::sync::Mutex::new(providers)),

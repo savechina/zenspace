@@ -4,6 +4,11 @@ use std::collections::HashMap;
 use super::relationship::RelationKind;
 
 /// Types of notions that can be extracted from workspace content.
+///
+/// T069 (FR-021 Pi 5点): `Preference` and `Temporal` extend the taxonomy
+/// additively — serde variants append-only, `Person`/`Goal` already existed.
+/// All kinds dedup through the existing `notion_aliases` F1 flow
+/// (`normalize_notion_name` + `resolve_alias`); no new tables.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NotionKind {
     Function,
@@ -21,6 +26,8 @@ pub enum NotionKind {
     Goal,
     Path,
     Decision,
+    Preference,
+    Temporal,
 }
 
 impl std::fmt::Display for NotionKind {
@@ -41,6 +48,8 @@ impl std::fmt::Display for NotionKind {
             NotionKind::Goal => "goal",
             NotionKind::Path => "path",
             NotionKind::Decision => "decision",
+            NotionKind::Preference => "preference",
+            NotionKind::Temporal => "temporal",
         };
         write!(f, "{s}")
     }
@@ -63,6 +72,8 @@ pub fn parse_kind(s: &str) -> Option<NotionKind> {
         "goal" => Some(NotionKind::Goal),
         "path" => Some(NotionKind::Path),
         "decision" => Some(NotionKind::Decision),
+        "preference" => Some(NotionKind::Preference),
+        "temporal" => Some(NotionKind::Temporal),
         _ => None,
     }
 }

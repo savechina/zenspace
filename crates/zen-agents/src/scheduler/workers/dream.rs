@@ -76,6 +76,17 @@ impl ZenWorker for DreamWorker {
             report.entities_recomputed
         );
 
+        // FR-037 skill precipitation (Hybrid C): distill repeated successes
+        // / corrections into staged drafts; never fatal to the dream cycle.
+        let drafts_staged = match precipitate_skills(&paths).await {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!(error = %e, "skill precipitation failed; dream cycle unaffected");
+                0
+            }
+        };
+        info!("dream cycle: skill drafts staged = {drafts_staged}");
+
         Ok(WorkerReport {
             worker_id: self.id().to_string(),
             success: true,
@@ -84,4 +95,43 @@ impl ZenWorker for DreamWorker {
             llm_cost_usd: 0.0,
         })
     }
+}
+
+/// Detect and stage skill drafts from execution histories (FR-037).
+///
+/// Preference triggers come from the M4 preference pages under
+/// `vault/wiki/wisdom/preferences/` when present; read failures are
+/// non-fatal (drafts just seed with no triggers).
+async fn precipitate_skills(paths: &ZenPaths) -> anyhow::Result<usize> {
+    let precipitator =
+        crate::skill_precipitation::SkillPrecipitator::new(paths.skills(), paths.logs());
+    let history = crate::skill_history::SkillHistory::new(paths);
+    let names = precipitator.list_history_names()?;
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let preferences = load_preferences(paths).unwrap_or_default();
+    let drafts = precipitator.detect(&history, &names, &preferences)?;
+    if drafts.is_empty() {
+        return Ok(0);
+    }
+    precipitator.stage(&drafts)
+}
+
+/// Load M4 preference triples from `vault/wiki/wisdom/preferences/*.md`.
+fn load_preferences(paths: &ZenPaths) -> anyhow::Result<Vec<zen_memory::Preference>> {
+    let dir = paths.wiki().join("wisdom").join("preferences");
+    let mut preferences = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)?;
+        if let Some(p) = zen_memory::Preference::parse_page(&content) {
+            preferences.push(p);
+        }
+    }
+    Ok(preferences)
 }

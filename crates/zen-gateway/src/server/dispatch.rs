@@ -43,6 +43,24 @@ pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Handlers that outlive or stall past one recv-loop iteration — run on
 /// their own task so `session/cancel` and heartbeat `health/status` on
 /// the same connection are never head-of-line blocked behind them.
+///
+/// # EOF contract (hold-transport)
+///
+/// Every detached task spawned for these methods holds an
+/// `Arc<dyn Transport>` clone for its response send, so the carrier fd
+/// stays open for as long as any of them lives. Aborting the dispatch
+/// run loop ([`DispatchServer::run`]) therefore can NOT close the
+/// connection and can NOT deliver EOF to the client — it only stops
+/// new inbound frames from being read. The SOLE EOF path for a client
+/// waiting on a spawned method is the server-side write half-close
+/// `UdsTransport::shutdown_write` (`transport/uds.rs`), which is what
+/// connection owners must pair with the abort: the surface client kill
+/// path (`client/surface.rs`) and the crash-recovery suite
+/// (`tests/crash_recovery.rs`) both do `abort` + `shutdown_write`.
+/// Contract proven mechanically by `tests/dispatch_shutdown.rs`. The
+/// spawn model itself is intentional — responsiveness (an unblocked
+/// recv loop) beats owned teardown (prior learning
+/// dispatch-spawned-methods-hold-transport).
 const SPAWNED_METHODS: &[&str] = &["session/turn", "knowledge/search", "memory/putEntry"];
 const SLOW_POOL_METHODS: &[&str] = &[
     "health/status",
@@ -187,6 +205,12 @@ impl DispatchServer {
             } => {
                 if SPAWNED_METHODS.contains(&method.as_str()) {
                     // Hosted turns outlive the recv loop; respond async.
+                    // EOF CONTRACT: this detached task clones the
+                    // Arc<dyn Transport>, so it pins the carrier fd even
+                    // after `run` is aborted — delivering EOF to the
+                    // client requires the server-side write half-close
+                    // `UdsTransport::shutdown_write`; see the
+                    // SPAWNED_METHODS EOF contract.
                     let task = Arc::clone(this);
                     tokio::spawn(async move {
                         let response = Self::dispatch_request(&task, id, &method, params).await;

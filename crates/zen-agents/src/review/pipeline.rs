@@ -1,8 +1,67 @@
-use zen_core::types::Task;
+use std::sync::Arc;
 
 use zen_core::review::{HermesValidator, MetisReviewer, ReviewContext, ZeusEscalation};
+use zen_core::types::Task;
 
 use super::momus::MomusReviewer;
+
+/// Entropy at or above which a task counts as HIGH blast radius (T092).
+/// Same threshold the pipeline already used inline for the Zeus
+/// high-risk escalation — now shared with the LLM review gate.
+pub const HIGH_BLAST_ENTROPY: f64 = 0.8;
+
+/// Blast radius of a review task (T092): only HIGH tasks pay the LLM
+/// semantic-review cost; LOW tasks keep the pure-heuristic fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlastRadius {
+    Low,
+    High,
+}
+
+/// Classifies blast radius from the task's metadata sensitivity
+/// (same parse as `ReviewContext::from_task_with_metadata`) and
+/// semantic entropy: `Confidential` data or entropy above
+/// [`HIGH_BLAST_ENTROPY`] is HIGH.
+pub fn classify_blast_radius(task: &Task) -> BlastRadius {
+    let sensitivity = ReviewContext::from_task_with_metadata(task, 0).sensitivity;
+    if sensitivity == zen_core::types::Sensitivity::Confidential
+        || task.semantic_entropy > HIGH_BLAST_ENTROPY
+    {
+        BlastRadius::High
+    } else {
+        BlastRadius::Low
+    }
+}
+
+/// Verdict of the LLM semantic-review stage (T092).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticVerdict {
+    pub approved: bool,
+    pub note: String,
+}
+
+impl SemanticVerdict {
+    pub fn approve(note: impl Into<String>) -> Self {
+        Self {
+            approved: true,
+            note: note.into(),
+        }
+    }
+
+    pub fn reject(note: impl Into<String>) -> Self {
+        Self {
+            approved: false,
+            note: note.into(),
+        }
+    }
+}
+
+/// LLM semantic reviewer: production wires a completion-model call here;
+/// tests inject a mock. Async like `deliverable_cb` so callers can await
+/// a real model round-trip.
+pub type SemanticReviewer = Arc<
+    dyn Fn(&Task, &str, &str) -> futures::future::BoxFuture<'static, SemanticVerdict> + Send + Sync,
+>;
 
 #[derive(Debug)]
 pub struct PipelineResult {
@@ -20,6 +79,8 @@ pub struct QualityPipeline {
     zeus: ZeusEscalation,
     max_momus_retries: u8,
     max_hermes_revisions: u8,
+    llm_review_high_blast: bool,
+    semantic_reviewer: Option<SemanticReviewer>,
 }
 
 impl QualityPipeline {
@@ -31,12 +92,38 @@ impl QualityPipeline {
             zeus: ZeusEscalation::new(),
             max_momus_retries: 2,
             max_hermes_revisions: 1,
+            llm_review_high_blast: true,
+            semantic_reviewer: None,
         }
     }
 
     pub fn with_limits(mut self, max_momus_retries: u8, max_hermes_revisions: u8) -> Self {
         self.max_momus_retries = max_momus_retries;
         self.max_hermes_revisions = max_hermes_revisions;
+        self
+    }
+
+    /// Applies the `[agentic.review]` config layer (T092): effective
+    /// budgets (clamped) plus the LLM-stage gate. Absent config resolves
+    /// to the hardcoded defaults, so behavior is unchanged.
+    pub fn with_review_config(mut self, cfg: &zen_core::config::ReviewConfig) -> Self {
+        self.max_momus_retries = cfg.max_momus_retries_or_default();
+        self.max_hermes_revisions = cfg.max_hermes_revisions_or_default();
+        self.llm_review_high_blast = cfg.llm_review_high_blast_or_default();
+        self
+    }
+
+    /// Wires the LLM semantic-review stage (T092). Without a reviewer the
+    /// stage is skipped with a note — the heuristic pipeline stays the
+    /// fast path and current behavior is preserved.
+    pub fn with_semantic_reviewer(
+        mut self,
+        reviewer: impl Fn(&Task, &str, &str) -> futures::future::BoxFuture<'static, SemanticVerdict>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.semantic_reviewer = Some(Arc::new(reviewer));
         self
     }
 
@@ -85,6 +172,43 @@ impl QualityPipeline {
                         self.hermes.validate_deliverable(&task_with_revision, &raw);
 
                     if self.hermes.can_push(&hermes_validation) {
+                        // T092: LLM semantic-review stage — HIGH blast radius
+                        // only. The heuristic pipeline stays the fast path:
+                        // LOW tasks return here exactly as before.
+                        if classify_blast_radius(task) == BlastRadius::High
+                            && self.llm_review_high_blast
+                        {
+                            match &self.semantic_reviewer {
+                                Some(reviewer) => {
+                                    let verdict = reviewer(task, &current_plan, &raw).await;
+                                    if verdict.approved {
+                                        review_notes.push_str(&format!(
+                                            "LLM semantic review: APPROVED — {}\n",
+                                            verdict.note
+                                        ));
+                                    } else {
+                                        review_notes.push_str(&format!(
+                                            "LLM semantic review: REJECTED — {}\n",
+                                            verdict.note
+                                        ));
+                                        failed_attempts
+                                            .push(format!("LLM semantic veto: {}", verdict.note));
+                                        return PipelineResult {
+                                            plan_approved: true,
+                                            review_notes,
+                                            delivery_ready: false,
+                                            athena_shield: None,
+                                            failed_attempts,
+                                        };
+                                    }
+                                }
+                                None => {
+                                    review_notes.push_str(
+                                        "LLM semantic review: SKIPPED (no reviewer wired)\n",
+                                    );
+                                }
+                            }
+                        }
                         review_notes.push_str("Hermes validation: DELIVERY READY\n");
                         return PipelineResult {
                             plan_approved: true,
@@ -97,7 +221,7 @@ impl QualityPipeline {
 
                     hermes_revisions += 1;
                     if hermes_revisions > self.max_hermes_revisions {
-                        let is_high_risk = task.semantic_entropy > 0.8;
+                        let is_high_risk = task.semantic_entropy > HIGH_BLAST_ENTROPY;
                         let ctx = ReviewContext::from_task_with_metadata(task, hermes_revisions);
                         let should_escalate = self.zeus.should_escalate(
                             ctx.sensitivity,
@@ -210,10 +334,18 @@ impl Default for QualityPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use zen_core::types::{Task, TaskType};
 
     async fn mock_deliverable(plan: String) -> String {
         format!("Executed: {plan}")
+    }
+
+    fn confidential_task() -> Task {
+        let mut task = Task::new("rotate the signing keys", 0.4, TaskType::Code);
+        task.metadata
+            .insert("sensitivity".to_string(), "Confidential".to_string());
+        task
     }
 
     #[tokio::test]
@@ -279,5 +411,128 @@ mod tests {
             "Expected Hermes revision/limit/deadlock in review notes: {}",
             result.review_notes
         );
+    }
+
+    #[test]
+    fn blast_radius_classification() {
+        let low = Task::new("summarize the changelog", 0.4, TaskType::Text);
+        assert_eq!(classify_blast_radius(&low), BlastRadius::Low);
+        let high_entropy = Task::new("create then delete", 0.9, TaskType::Code);
+        assert_eq!(classify_blast_radius(&high_entropy), BlastRadius::High);
+        assert_eq!(
+            classify_blast_radius(&confidential_task()),
+            BlastRadius::High
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_stage_triggers_for_high_blast_task() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&invoked);
+        let pipeline = QualityPipeline::new().with_semantic_reviewer(move |_t, _p, _d| {
+            flag.store(true, Ordering::SeqCst);
+            Box::pin(async move { SemanticVerdict::approve("semantics sound") })
+        });
+        let plan = "1. Rotate the signing keys\n2. Verify pass";
+        let result = pipeline
+            .execute(&confidential_task(), plan, |p| {
+                Box::pin(async move { mock_deliverable(p).await })
+            })
+            .await;
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "HIGH task must trigger LLM stage"
+        );
+        assert!(result.delivery_ready);
+        assert!(
+            result
+                .review_notes
+                .contains("LLM semantic review: APPROVED"),
+            "notes: {}",
+            result.review_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_veto_blocks_delivery_for_high_blast_task() {
+        let pipeline = QualityPipeline::new().with_semantic_reviewer(|_t, _p, _d| {
+            Box::pin(async move { SemanticVerdict::reject("hallucinated key id") })
+        });
+        let plan = "1. Rotate the signing keys\n2. Verify pass";
+        let result = pipeline
+            .execute(&confidential_task(), plan, |p| {
+                Box::pin(async move { mock_deliverable(p).await })
+            })
+            .await;
+        assert!(!result.delivery_ready, "LLM veto must block delivery");
+        assert!(!result.failed_attempts.is_empty());
+        assert!(
+            result
+                .review_notes
+                .contains("LLM semantic review: REJECTED")
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_stage_skipped_for_low_blast_task() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&invoked);
+        let pipeline = QualityPipeline::new().with_semantic_reviewer(move |_t, _p, _d| {
+            flag.store(true, Ordering::SeqCst);
+            Box::pin(async move { SemanticVerdict::approve("n/a") })
+        });
+        let task = Task::new("create a feature with tests", 0.4, TaskType::Code);
+        let plan = "1. Create the feature\n2. Add tests\n3. Verify pass";
+        let result = pipeline
+            .execute(&task, plan, |p| {
+                Box::pin(async move { mock_deliverable(p).await })
+            })
+            .await;
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "LOW task must keep the fast path"
+        );
+        assert!(result.delivery_ready);
+        assert!(
+            !result.review_notes.contains("LLM semantic review"),
+            "notes: {}",
+            result.review_notes
+        );
+    }
+
+    #[tokio::test]
+    async fn review_config_overrides_budgets_and_disables_llm_stage() {
+        let cfg = zen_core::config::ReviewConfig {
+            max_momus_retries: Some(0),
+            max_hermes_revisions: Some(1),
+            llm_review_high_blast: Some(false),
+        };
+        let invoked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&invoked);
+        let pipeline = QualityPipeline::new()
+            .with_review_config(&cfg)
+            .with_semantic_reviewer(move |_t, _p, _d| {
+                flag.store(true, Ordering::SeqCst);
+                Box::pin(async move { SemanticVerdict::approve("n/a") })
+            });
+        // Gate off: HIGH task skips the reviewer entirely.
+        let plan = "1. Rotate the signing keys\n2. Verify pass";
+        let result = pipeline
+            .execute(&confidential_task(), plan, |p| {
+                Box::pin(async move { mock_deliverable(p).await })
+            })
+            .await;
+        assert!(!invoked.load(Ordering::SeqCst));
+        assert!(result.delivery_ready);
+
+        // Budgets applied: 0 Momus retries fails fast on a vetoed plan.
+        let strict = QualityPipeline::new().with_review_config(&cfg);
+        let veto = Task::new("create then delete", 0.9, TaskType::Code);
+        let denied = strict
+            .execute(&veto, "create the new table. delete the old table.", |p| {
+                Box::pin(async move { mock_deliverable(p).await })
+            })
+            .await;
+        assert!(!denied.plan_approved);
     }
 }

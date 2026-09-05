@@ -8,6 +8,8 @@ use tracing::{debug, info, warn};
 use zen_core::notion_graph::{NotionGraphProvider, SimpleNotion};
 use zen_core::paths::ZenPaths;
 
+use crate::quality_gate::{MemoryGrade, grade_session_signal};
+
 // ─── ExtractedSignals — Typed signals from session conversations ─────────
 
 /// Signals extracted from a session conversation, grouped by type.
@@ -30,6 +32,8 @@ pub struct ExtractedSignals {
     pub beliefs: Vec<String>,
     /// Positive actions that should be continued — inversion thinking counterpart to reflections.
     pub continue_doing_candidates: Vec<String>,
+    /// Preference triples `subject|||predicate|||object|||confidence` (FR-021 Pi point 2).
+    pub preferences: Vec<String>,
 }
 
 impl ExtractedSignals {
@@ -42,6 +46,7 @@ impl ExtractedSignals {
             && self.feedback.is_empty()
             && self.beliefs.is_empty()
             && self.continue_doing_candidates.is_empty()
+            && self.preferences.is_empty()
     }
 
     pub fn total(&self) -> usize {
@@ -53,6 +58,7 @@ impl ExtractedSignals {
             + self.feedback.len()
             + self.beliefs.len()
             + self.continue_doing_candidates.len()
+            + self.preferences.len()
     }
 }
 
@@ -83,11 +89,25 @@ impl ZenDream {
     ) -> Result<DreamReport, DreamError> {
         info!("dream cycle started for {date}");
 
-        let facts = extract_facts_from_journal_entries(zen_paths, date)?;
+        let extracted = extract_facts_from_journal_entries(zen_paths, date)?;
 
-        if facts.is_empty() {
+        if extracted.is_empty() {
             debug!("no durable facts extracted for {date}, skipping memory update");
             return Ok(DreamReport::empty(date));
+        }
+
+        // T073: M2→M3 promotion gate (contracts/memory-grade.json) — only
+        // signals whose InformationQualityGate::can_promote_to_m3() passes
+        // leave the M2 journal for MEMORY.md / the notion graph. Blocked
+        // signals stay in the M2 journal (never deleted), they just don't
+        // promote this cycle.
+        let (facts, gate_blocked) = gate_m2_to_m3_facts(&extracted);
+        if gate_blocked > 0 {
+            info!(
+                blocked = gate_blocked,
+                promoted = facts.len(),
+                "M2→M3 gate: low-quality signals stay in M2 journal"
+            );
         }
 
         info!(
@@ -100,6 +120,15 @@ impl ZenDream {
 
         if memory_updated {
             info!("MEMORY.md updated with {} new fact(s)", facts.len());
+        }
+
+        // FR-040: 3-line wake-up briefing artifact (fail-soft, best-effort).
+        let wake_lines: Vec<String> = facts.iter().take(3).cloned().collect();
+        if !wake_lines.is_empty()
+            && let Err(e) =
+                write_wake_up_brief(zen_paths, &date.format("%Y-%m-%d").to_string(), &wake_lines)
+        {
+            warn!(error = %e, "wake-up brief write failed; dream cycle unaffected");
         }
 
         let logs_compressed = compress_old_logs(zen_paths)?;
@@ -125,6 +154,7 @@ impl ZenDream {
             entities_decayed,
             entities_promoted,
             top_entities,
+            gate_blocked,
         };
 
         info!(
@@ -202,6 +232,8 @@ pub struct DreamReport {
     pub entities_decayed: usize,
     pub entities_promoted: usize,
     pub top_entities: Vec<String>,
+    /// Facts blocked by the M2→M3 InformationQualityGate this cycle (T073).
+    pub gate_blocked: usize,
 }
 
 impl DreamReport {
@@ -217,6 +249,7 @@ impl DreamReport {
             entities_decayed: 0,
             entities_promoted: 0,
             top_entities: Vec::new(),
+            gate_blocked: 0,
         }
     }
 }
@@ -298,7 +331,7 @@ fn extract_facts_from_journal_entries(
 }
 
 /// Parse bullet-list facts from a `## Facts` section in markdown.
-pub(crate) fn parse_facts_section(content: &str) -> Vec<String> {
+pub fn parse_facts_section(content: &str) -> Vec<String> {
     let mut facts = Vec::new();
     let mut in_facts_section = false;
 
@@ -359,6 +392,29 @@ pub fn extract_durable_facts_from_entry(content: &str) -> Vec<String> {
     }
 
     facts
+}
+
+// ─── T073: M2→M3 promotion gate ────────────────────────────────────────
+
+/// Split journal facts into promotable vs gate-blocked (T073).
+///
+/// Each fact is graded via `grade_session_signal` (single shared heuristic
+/// with the SessionJournaler pre-filter); only signals passing
+/// `InformationQualityGate::can_promote_to_m3()` may leave M2. The journal
+/// entry itself is never modified — blocking means "does not promote".
+fn gate_m2_to_m3_facts(facts: &[String]) -> (Vec<String>, usize) {
+    let mut promoted = Vec::with_capacity(facts.len());
+    let mut blocked = 0usize;
+    for fact in facts {
+        let (grade, gate) = grade_session_signal(fact, false);
+        if grade == MemoryGrade::Unverified || !gate.can_promote_to_m3() {
+            debug!(fact = %fact, reasons = ?gate.fail_reasons(), "M2→M3 gate blocked fact");
+            blocked += 1;
+        } else {
+            promoted.push(fact.clone());
+        }
+    }
+    (promoted, blocked)
 }
 
 // ─── Step 2: All Facts → MEMORY.md — Tasks 2 & 3 ────────────────────────
@@ -491,6 +547,16 @@ pub fn update_memory_from_facts(
         result
     };
 
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let (new_content, merged_away) = enforce_memory_cap(&new_content, &today);
+    if merged_away > 0 {
+        info!(
+            merged = merged_away,
+            cap = MEMORY_LINES_CAP,
+            "MEMORY.md bounded: older entries merged away (see git history)"
+        );
+    }
+
     let tmp_path = memory_path.with_extension("md.tmp");
     fs::write(&tmp_path, &new_content)?;
     fs::rename(&tmp_path, &memory_path)?;
@@ -510,6 +576,161 @@ fn dedupe_facts(facts: &[String]) -> Vec<String> {
         .filter(|f| seen.insert(f.to_lowercase()))
         .cloned()
         .collect()
+}
+
+// ─── T081: Bounded memory + negative space + wake-up + nudge ────────────
+
+/// Hard cap on MEMORY.md length (FR-040: 200 lines, then merge+supersede).
+pub const MEMORY_LINES_CAP: usize = 200;
+
+/// Enforce the MEMORY.md line cap by merging, never by silent truncation.
+///
+/// File order is newest-first within each section (entries insert at the
+/// section top), so keeping the first body lines in file order is
+/// newest-biased. All `#` headers survive; dropped entries are counted and
+/// summarized in one rollup line (full text recoverable from git history).
+/// Returns the capped content plus the number of merged-away entries.
+pub fn enforce_memory_cap(content: &str, date: &str) -> (String, usize) {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= MEMORY_LINES_CAP {
+        return (content.to_string(), 0);
+    }
+    let header_count = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .count();
+    // One slot is reserved for the rollup line; total output stays ≤ CAP.
+    let body_budget = MEMORY_LINES_CAP.saturating_sub(header_count + 1);
+    let mut kept: Vec<&str> = Vec::with_capacity(MEMORY_LINES_CAP);
+    let mut kept_body = 0usize;
+    let mut dropped = 0usize;
+    for line in &lines {
+        if line.trim_start().starts_with('#') {
+            kept.push(line);
+        } else if line.trim().is_empty() {
+            // Structural blanks ride along only while the cap allows.
+            if kept.len() + 1 < MEMORY_LINES_CAP {
+                kept.push(line);
+            }
+        } else if kept_body < body_budget {
+            kept.push(line);
+            kept_body += 1;
+        } else {
+            dropped += 1;
+        }
+    }
+    // Defensive trim: headers are uncapped, so trim oldest body lines from
+    // the end (file order is newest-first) until the rollup slot fits.
+    while kept.len() + 1 > MEMORY_LINES_CAP {
+        match kept
+            .iter()
+            .rposition(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        {
+            Some(idx) => {
+                kept.remove(idx);
+                dropped += 1;
+            }
+            None => break,
+        }
+    }
+    let rollup = memory_merge_rollup(dropped, date);
+    let mut result = kept.join("\n");
+    result.push('\n');
+    result.push_str(&rollup);
+    result.push('\n');
+    (result, dropped)
+}
+
+/// Rollup line recording a bounded-memory merge (never silent loss).
+pub fn memory_merge_rollup(dropped: usize, date: &str) -> String {
+    format!(
+        "- _Merged {dropped} older entries on {date} (bounded memory, cap {MEMORY_LINES_CAP} — full text in git history)_"
+    )
+}
+
+/// A falsified hypothesis kept as negative space (FR-040): records WHY a
+/// claim was rejected so the loop never re-proposes it.
+#[derive(Debug, Clone)]
+pub struct RejectedHypothesis {
+    pub claim: String,
+    pub falsifier: String,
+    pub because: String,
+    pub expiry: String,
+}
+
+impl RejectedHypothesis {
+    fn slug(&self) -> String {
+        self.claim
+            .to_lowercase()
+            .chars()
+            .filter_map(|c| {
+                if c.is_alphanumeric() {
+                    Some(c)
+                } else if c.is_whitespace() || c == '-' {
+                    Some('-')
+                } else {
+                    None
+                }
+            })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-")
+            .chars()
+            .take(48)
+            .collect()
+    }
+
+    /// Persist under `wiki/wisdom/rejected/<slug>.md` (atomic tmp+rename).
+    pub fn record(&self, zen_paths: &ZenPaths) -> Result<std::path::PathBuf, DreamError> {
+        let dir = zen_paths.wiki().join("wisdom").join("rejected");
+        fs::create_dir_all(&dir)?;
+        let target = dir.join(format!("{}.md", self.slug()));
+        let content = format!(
+            "---\nclaim: {:?}\nfalsifier: {:?}\nbecause: {:?}\nexpiry: {:?}\n---\n\n# Rejected: {}\n\nFalsified by {}. {}\n",
+            self.claim,
+            self.falsifier,
+            self.because,
+            self.expiry,
+            self.claim,
+            self.falsifier,
+            self.because
+        );
+        let tmp = target.with_extension("md.tmp");
+        fs::write(&tmp, &content)?;
+        fs::rename(&tmp, &target)?;
+        Ok(target)
+    }
+}
+
+/// Write the 3-line wake-up briefing artifact (`logs/wake-up-<date>.md`).
+pub fn write_wake_up_brief(
+    zen_paths: &ZenPaths,
+    date: &str,
+    lines: &[String],
+) -> Result<std::path::PathBuf, DreamError> {
+    let target = zen_paths.logs().join(format!("wake-up-{date}.md"));
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut content = format!("# Wake-up — {date}\n\n");
+    for line in lines.iter().take(3) {
+        content.push_str(&format!("- {line}\n"));
+    }
+    fs::write(&target, &content)?;
+    Ok(target)
+}
+
+/// Whether a memory nudge is due after `user_turns` user turns (every 10).
+pub fn memory_nudge_due(user_turns: u64) -> bool {
+    user_turns > 0 && user_turns.is_multiple_of(10)
+}
+
+/// Nudge text surfaced via logs + `logs/memory-nudges.jsonl` (auditable).
+/// The TUI/log viewer renders it; it never enters the model token stream.
+pub fn memory_nudge_text() -> &'static str {
+    "Memory nudge: 10 turns since the last check — run a quick review of open commitments?"
 }
 
 // ─── Post-Pipeline Helpers ────────────────────────────────────────────
@@ -876,6 +1097,30 @@ mod tests {
         assert!(facts2.is_empty(), "no facts section means no facts");
     }
 
+    #[test]
+    fn test_gate_m2_to_m3_blocks_vague_promotes_specific() {
+        let facts = vec![
+            "ok".to_string(),
+            "migrated the session store from json blobs to sqlite wal".to_string(),
+        ];
+        let (promoted, blocked) = gate_m2_to_m3_facts(&facts);
+        assert_eq!(blocked, 1);
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0], facts[1]);
+    }
+
+    #[test]
+    fn test_gate_m2_to_m3_never_reorders() {
+        let facts = vec![
+            "implemented the retry backoff for provider failures".to_string(),
+            "fixed the flaky websocket reconnect test".to_string(),
+            "added tracing spans around gateway dispatch".to_string(),
+        ];
+        let (promoted, blocked) = gate_m2_to_m3_facts(&facts);
+        assert_eq!(blocked, 0);
+        assert_eq!(promoted, facts);
+    }
+
     #[tokio::test]
     async fn test_recompute_entities_empty_dir() {
         let (_dir, paths) = setup_test_paths();
@@ -913,5 +1158,83 @@ mod tests {
 
         let count = recompute_entities(&paths, None).await.unwrap();
         assert_eq!(count, 0, "malformed file should be skipped, returning 0");
+    }
+
+    // ── T081/T082: bounded memory (200-line cap → merge, never truncate) ──
+
+    #[test]
+    fn test_memory_cap_short_file_untouched() {
+        let content = "# Memory\n\n## Recent Wisdom\n\n- a\n";
+        let (capped, dropped) = enforce_memory_cap(content, "2026-09-03");
+        assert_eq!(dropped, 0);
+        assert_eq!(capped, content);
+    }
+
+    #[test]
+    fn test_memory_cap_merges_newest_biased_with_rollup() {
+        let mut content = String::from("# Memory\n\n## Recent Wisdom\n\n");
+        for i in 0..300 {
+            content.push_str(&format!("- fact {i}\n"));
+        }
+        let (capped, dropped) = enforce_memory_cap(&content, "2026-09-03");
+        assert!(dropped > 0, "over-cap file must merge entries away");
+        assert!(
+            capped.lines().count() <= MEMORY_LINES_CAP,
+            "total stays within cap (rollup included), got {}",
+            capped.lines().count()
+        );
+        assert!(capped.contains("## Recent Wisdom"), "headers survive");
+        assert!(capped.contains("fact 0"), "newest entries survive");
+        assert!(!capped.contains("fact 299"), "oldest entries merged away");
+        assert!(
+            capped.contains(&memory_merge_rollup(dropped, "2026-09-03")),
+            "merge recorded, never silent"
+        );
+    }
+
+    #[test]
+    fn test_rejected_hypothesis_keeps_falsifier() {
+        let (_dir, paths) = setup_test_paths();
+        let r = RejectedHypothesis {
+            claim: "All meetings need agendas".to_string(),
+            falsifier: "2026-08 standup log".to_string(),
+            because: "3 standups without agendas still shipped".to_string(),
+            expiry: "2026-12-01".to_string(),
+        };
+        let path = r.record(&paths).unwrap();
+        assert!(path.is_file());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("2026-08 standup log"), "falsifier kept");
+        assert!(content.contains("expiry"), "expiry kept");
+    }
+
+    #[test]
+    fn test_wake_up_brief_is_three_lines() {
+        let (_dir, paths) = setup_test_paths();
+        let path = write_wake_up_brief(
+            &paths,
+            "2026-09-03",
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+        )
+        .unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# Wake-up — 2026-09-03"));
+        assert!(content.contains("- c"));
+        assert!(!content.contains("- d"), "capped at 3 lines");
+    }
+
+    #[test]
+    fn test_memory_nudge_every_ten_turns() {
+        assert!(!memory_nudge_due(0));
+        assert!(!memory_nudge_due(9));
+        assert!(memory_nudge_due(10));
+        assert!(memory_nudge_due(20));
+        assert!(!memory_nudge_due(21));
+        assert!(!memory_nudge_text().is_empty());
     }
 }

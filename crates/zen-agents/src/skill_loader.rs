@@ -7,11 +7,14 @@ use zen_core::paths::ZenPaths;
 
 /// A skill definition parsed from a Markdown file with YAML frontmatter.
 ///
-/// File format (`~/.zen/skills/<name>.md`):
+/// File format (`~/.zen/skills/<name>.md` or `~/.zen/skills/<name>/SKILL.md`,
+/// the D02 precipitation layout):
 /// ```text
 /// ---
 /// name: weekly-review
 /// description: Run a weekly knowledge review
+/// triggers: [weekly review, review my week]
+/// auto_route: true
 /// tools: [search, wiki]
 /// context_files:
 ///   - wiki/review-template.md
@@ -23,6 +26,13 @@ use zen_core::paths::ZenPaths;
 pub struct SkillDefinition {
     pub name: String,
     pub description: String,
+    /// Pi-style trigger phrases matched by SkillHitRouter (FR-037).
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    /// Per-skill auto-route opt-out (`[skills.auto_route]` global switch).
+    /// Absent → inherit the global enabled default (true).
+    #[serde(default)]
+    pub auto_route: Option<bool>,
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
@@ -30,6 +40,14 @@ pub struct SkillDefinition {
     #[serde(default)]
     pub prompt: String,
     pub body: String,
+}
+
+impl SkillDefinition {
+    /// Effective per-skill auto-route eligibility: explicit frontmatter
+    /// `auto_route: false` opts out; absent/true stays eligible.
+    pub fn is_auto_route_enabled(&self) -> bool {
+        self.auto_route.unwrap_or(true)
+    }
 }
 
 /// Loads skill definitions from Markdown files in `~/.zen/skills/`.
@@ -44,7 +62,10 @@ impl SkillLoader {
         }
     }
 
-    /// List all available skill names (file stems of `.md` files in the skills directory).
+    /// List all available skill names.
+    ///
+    /// Discovers both the flat layout (`<name>.md`) and the D02 precipitation
+    /// layout (`<name>/SKILL.md`); the name is the file stem / directory name.
     pub fn list_skills(&self) -> anyhow::Result<Vec<String>> {
         let mut skills = Vec::new();
 
@@ -60,6 +81,11 @@ impl SkillLoader {
                 && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
             {
                 skills.push(stem.to_string());
+            } else if path.is_dir()
+                && path.join("SKILL.md").is_file()
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                skills.push(stem.to_string());
             }
         }
 
@@ -68,17 +94,25 @@ impl SkillLoader {
         Ok(skills)
     }
 
-    /// Load a skill definition by name (without `.md` extension).
+    /// Load a skill definition by name.
+    ///
+    /// Tries the flat `<name>.md` first, then the D02 `<name>/SKILL.md`.
     pub fn load_skill(&self, name: &str) -> anyhow::Result<SkillDefinition> {
-        let path = self.skills_dir.join(format!("{name}.md"));
+        let flat = self.skills_dir.join(format!("{name}.md"));
+        let path = if flat.is_file() {
+            flat
+        } else {
+            self.skills_dir.join(name).join("SKILL.md")
+        };
         let content = fs::read_to_string(&path)?;
 
         parse_skill_file(name, &content)
     }
 
-    /// Check if a skill file exists.
+    /// Check if a skill file exists (either layout).
     pub fn skill_exists(&self, name: &str) -> bool {
         self.skills_dir.join(format!("{name}.md")).is_file()
+            || self.skills_dir.join(name).join("SKILL.md").is_file()
     }
 }
 
@@ -109,6 +143,8 @@ fn parse_skill_file(name: &str, content: &str) -> anyhow::Result<SkillDefinition
             return Ok(SkillDefinition {
                 name: name.to_string(),
                 description: String::new(),
+                triggers: Vec::new(),
+                auto_route: None,
                 tools: Vec::new(),
                 context_files: Vec::new(),
                 prompt: String::new(),
@@ -120,6 +156,8 @@ fn parse_skill_file(name: &str, content: &str) -> anyhow::Result<SkillDefinition
     // Parse frontmatter key-value pairs
     let mut fm_name = None;
     let mut fm_description = String::new();
+    let mut fm_triggers: Vec<String> = Vec::new();
+    let mut fm_auto_route: Option<bool> = None;
     let mut fm_tools = Vec::new();
     let mut fm_context_files = Vec::new();
     let mut fm_prompt = String::new();
@@ -149,6 +187,16 @@ fn parse_skill_file(name: &str, content: &str) -> anyhow::Result<SkillDefinition
                 match key.as_str() {
                     "name" => fm_name = Some(value.trim_matches('"').to_string()),
                     "description" => fm_description = value.trim_matches('"').to_string(),
+                    "triggers" => {
+                        // Parse `[a, b]` syntax; empty value → indented list below
+                        let triggers = parse_array_bracket(&value);
+                        if !triggers.is_empty() {
+                            fm_triggers = triggers;
+                        }
+                    }
+                    "auto_route" => {
+                        fm_auto_route = value.parse::<bool>().ok();
+                    }
                     "tools" => {
                         // Parse `[a, b]` syntax
                         let tools = parse_array_bracket(&value);
@@ -173,6 +221,9 @@ fn parse_skill_file(name: &str, content: &str) -> anyhow::Result<SkillDefinition
         if let Some(item) = trimmed_line.strip_prefix("- ") {
             let item_value = item.trim().trim_matches('"').to_string();
             match current_key.as_deref() {
+                Some("triggers") => {
+                    fm_triggers.push(item_value);
+                }
                 Some("tools") => {
                     fm_tools.push(item_value);
                 }
@@ -215,6 +266,8 @@ fn parse_skill_file(name: &str, content: &str) -> anyhow::Result<SkillDefinition
     Ok(SkillDefinition {
         name: fm_name.unwrap_or_else(|| name.to_string()),
         description: fm_description,
+        triggers: fm_triggers,
+        auto_route: fm_auto_route,
         tools: fm_tools,
         context_files: fm_context_files,
         prompt: fm_prompt,

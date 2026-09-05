@@ -656,6 +656,21 @@ fn resolve_model_tier(router: &DefaultRouter, host: &HostSourceContext) -> &'sta
     }
 }
 
+/// Persist reverify-rejected hypotheses as negative-space records under
+/// `wiki/wisdom/rejected/` (FR-040) so the loop never re-proposes falsified
+/// claims. Best-effort: a record failure is logged, never fails the cycle.
+fn record_rejected_hypotheses(paths: &ZenPaths, rejected: &[zen_memory::RejectedHypothesis]) {
+    for r in rejected {
+        match r.record(paths) {
+            Ok(path) => info!(
+                path = %path.display(),
+                "loop: hypothesis rejected — negative-space record persisted"
+            ),
+            Err(e) => warn!(error = %e, "loop: rejected hypothesis record failed (non-fatal)"),
+        }
+    }
+}
+
 /// `ZenWorker` implementation — the main cycle entry point.
 ///
 /// `execute()` runs the full 6-stage pipeline: pre-cycle guards, ingest
@@ -1115,13 +1130,16 @@ impl ZenWorker for ZenLoopWorker {
             }
 
             let wiki_dir = paths.vault().join("wiki");
-            match zen_vault::distill::reverify(
+            match zen_vault::distill::reverify_with_rejections(
                 &hypotheses_dir,
                 &wiki_dir,
                 chrono::Utc::now(),
                 chrono::Duration::days(loop_cfg.reverify_older_than_days_or_default() as i64),
             ) {
-                Ok(reverified) => report.hypotheses_reverified = reverified,
+                Ok((reverified, rejected)) => {
+                    report.hypotheses_reverified = reverified;
+                    record_rejected_hypotheses(&paths, &rejected);
+                }
                 Err(e) => warn!(error = %e, "loop: hypothesis reverify failed (non-fatal)"),
             }
         }
@@ -1359,5 +1377,53 @@ mod tests {
     fn journal_decision_payloads_empty_without_tag() {
         let content = "---\nsession_id: s1\n---\n\n## Facts\n\n- plain fact\n";
         assert!(journal_decision_payloads(content).is_empty());
+    }
+
+    #[test]
+    fn reverify_rejection_persists_negative_space_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let hypo_dir = paths.vault().join("wiki/wisdom/hypotheses");
+        let wiki_dir = paths.vault().join("wiki");
+        std::fs::create_dir_all(&hypo_dir).unwrap();
+
+        let h = zen_vault::distill::HypothesisSlug {
+            slug: "loop-reject-entity".into(),
+            hypothesis: "stale claim should be recorded".into(),
+            gap_kind: GapKind::OrphanEntity,
+            confidence: 0.7,
+            status: zen_vault::distill::HypothesisStatus::Exploring,
+            exploration_prompt: None,
+            evidence_refs: vec![],
+            created_from: "g1".into(),
+        };
+        zen_vault::distill::save(&h, &hypo_dir).unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(hypo_dir.join("loop-reject-entity.md"))
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+
+        let (_, rejected) = zen_vault::distill::reverify_with_rejections(
+            &hypo_dir,
+            &wiki_dir,
+            chrono::Utc::now(),
+            chrono::Duration::days(7),
+        )
+        .unwrap();
+        assert_eq!(rejected.len(), 1);
+
+        record_rejected_hypotheses(&paths, &rejected);
+
+        let rejected_dir = paths.wiki().join("wisdom").join("rejected");
+        let entries: Vec<_> = std::fs::read_dir(&rejected_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "exactly one rejection record written");
+        let content =
+            std::fs::read_to_string(rejected_dir.join("stale-claim-should-be-recorded.md"))
+                .unwrap();
+        assert!(content.contains("stale claim should be recorded"));
+        assert!(content.contains("falsifier"));
     }
 }

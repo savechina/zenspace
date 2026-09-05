@@ -468,6 +468,9 @@ pub fn create_default_scheduler() -> ZenScheduler {
     if let Err(e) = scheduler.register(EvidenceGatherer::new()) {
         warn!("scheduler: failed to register evidence-gatherer worker (non-critical): {e}");
     }
+    if let Err(e) = scheduler.register(MorningBriefWorker::new()) {
+        warn!("scheduler: failed to register morning-brief worker (non-critical): {e}");
+    }
 
     scheduler
 }
@@ -543,6 +546,12 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
 
     if let Err(e) = scheduler.register(EvidenceGatherer::new()) {
         warn!("scheduler: failed to register evidence-gatherer worker: {e}");
+    }
+
+    // ── Proactive heartbeat (005-agentic-loop FR-038): 9am brief staged to
+    //    the qqbot outbox; nightly distillation stays with DreamWorker.
+    if let Err(e) = scheduler.register(MorningBriefWorker::new()) {
+        warn!("scheduler: failed to register morning-brief worker: {e}");
     }
 
     // ── Knowledge-processing loop (005-agentic-loop): interval + enabled
@@ -646,7 +655,7 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 13);
+        assert_eq!(items.len(), 14);
         assert!(items.iter().any(|w| w.id == "memory-curator"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
@@ -660,5 +669,6 @@ mod tests {
         assert!(items.iter().any(|w| w.id == "express"));
         assert!(items.iter().any(|w| w.id == "memvid-indexer"));
         assert!(items.iter().any(|w| w.id == "evidence-gatherer"));
+        assert!(items.iter().any(|w| w.id == "morning-brief"));
     }
 }

@@ -4,6 +4,7 @@ use tui_textarea::{Input, Key};
 use super::app::InputMode;
 use super::selection::{Selection, TextPosition};
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum KeyAction {
     Submit,
     Quit,
@@ -295,6 +296,16 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.slash_state.dismiss();
                 return KeyAction::Continue;
             }
+            return KeyAction::Continue;
+        }
+        // T066: Shift+Enter always inserts a newline (never submits).
+        (KeyCode::Enter, KeyModifiers::SHIFT) => {
+            app.input.input(Input {
+                key: Key::Enter,
+                ctrl: false,
+                alt: false,
+                shift: true,
+            });
             return KeyAction::Continue;
         }
         (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -710,5 +721,74 @@ mod tests {
         press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
         assert_eq!(app.input.effective_mode(), InputMode::Selection);
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_not_submit() {
+        let mut app = test_app();
+        app.input.insert_str("hello");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(action, KeyAction::Continue);
+        assert_eq!(app.input.lines(), vec!["hello", ""]);
+    }
+
+    #[test]
+    fn enter_submits_single_line() {
+        let mut app = test_app();
+        app.input.insert_str("hello");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, KeyAction::Submit);
+    }
+
+    #[test]
+    fn ctrl_enter_submits_multiline() {
+        let mut app = test_app();
+        app.input.insert_str("line1\nline2");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Submit);
+    }
+
+    #[test]
+    fn paste_multiline_preserves_newlines() {
+        let mut app = test_app();
+        handle_paste("line1\nline2\nline3", &mut app);
+        assert_eq!(app.input.lines(), vec!["line1", "line2", "line3"]);
+    }
+    #[test]
+    fn memory_nudge_poll_toasts_unseen_entries_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let logs = temp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("memory-nudges.jsonl"),
+            "{\"kind\":\"memory.nudge\",\"user_turns\":10,\"text\":\"nudge one\"}\n\
+             {\"kind\":\"memory.nudge\",\"user_turns\":20,\"text\":\"nudge two\"}\n",
+        )
+        .unwrap();
+
+        let mut app = test_app();
+        app.poll_memory_nudges_in(&logs);
+        assert_eq!(
+            app.get_active_toast().as_deref(),
+            Some("nudge one"),
+            "first unseen nudge toasts"
+        );
+        // Marker advanced past both entries: a fresh app polls quiet.
+        let marker = std::fs::read_to_string(logs.join(".last-nudge-shown")).unwrap();
+        assert!(marker.contains("nudge two"), "marker covers all: {marker}");
+        let mut app2 = test_app();
+        app2.poll_memory_nudges_in(&logs);
+        assert!(
+            app2.get_active_toast().is_none(),
+            "no re-toast after marker advance"
+        );
+    }
+
+    #[test]
+    fn memory_nudge_poll_missing_file_is_silent_noop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = test_app();
+        app.poll_memory_nudges_in(&temp.path().join("logs"));
+        assert!(app.get_active_toast().is_none());
     }
 }

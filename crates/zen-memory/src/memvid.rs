@@ -337,14 +337,30 @@ impl ZenMemvidStore {
     pub fn persist_structured_turn(
         &self,
         session_id: &str,
-        _role: &str,
+        role: &str,
         content: &str,
     ) -> Result<(u64, Option<memvid_core::MemoryCardId>)> {
-        let opts = memvid_core::PutOptions::builder()
+        self.persist_structured_turn_tagged(session_id, role, content, None)
+    }
+
+    /// Like [`Self::persist_structured_turn`] with an extra frame tag
+    /// (e.g. `temporal_entity`, T071). Tag-only metadata — no new index,
+    /// no schema change.
+    pub fn persist_structured_turn_tagged(
+        &self,
+        session_id: &str,
+        _role: &str,
+        content: &str,
+        extra_tag: Option<&str>,
+    ) -> Result<(u64, Option<memvid_core::MemoryCardId>)> {
+        let mut builder = memvid_core::PutOptions::builder()
             .uri(session_id)
             .push_tag("turn")
-            .extract_triplets(true)
-            .build();
+            .extract_triplets(true);
+        if let Some(tag) = extra_tag {
+            builder = builder.push_tag(tag);
+        }
+        let opts = builder.build();
 
         let frame_id = self.store.put_text(content, opts)?;
         let card_result = MemoryCardBuilder::new()

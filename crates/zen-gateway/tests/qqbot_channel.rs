@@ -417,6 +417,7 @@ async fn spawn_stack(executor: Arc<dyn TurnExecutor>, drain: Duration) -> Stack 
             allowed_users: vec![ALLOWED_MEMBER.to_string(), ALLOWED_C2C_USER.to_string()],
             bindings_db: tmp.path().join("state.db"),
             audit_path: Some(tmp.path().join("audit.jsonl")),
+            outbox_drain_interval: std::time::Duration::from_secs(3600),
         }),
         turn_executor: Some(executor),
         ..GatewayDaemonConfig::default()
@@ -926,6 +927,7 @@ async fn dead_carrier_is_fatal_to_channel_not_daemon() {
             allowed_users: vec![ALLOWED_MEMBER.to_string()],
             bindings_db: tmp.path().join("state.db"),
             audit_path: None,
+            outbox_drain_interval: std::time::Duration::from_secs(3600),
         }),
         turn_executor: Some(Arc::new(DelayExec {
             calls: Arc::clone(&calls),

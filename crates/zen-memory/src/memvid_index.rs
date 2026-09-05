@@ -12,11 +12,20 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
+use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
 use crate::memvid::ZenMemvidStore;
 
 // ─── Data types ────────────────────────────────────────────────────────
+
+/// Frame tag applied to time-anchored chunks (T071, FR-021 Pi point 3).
+/// Tag-only metadata: no new index, no schema change.
+pub const TEMPORAL_ENTITY_TAG: &str = "temporal_entity";
+
+/// Recency half-life for time-anchored content (days), reusing the FR-025
+/// 30-day confidence half-life so all decay in the system shares one constant.
+pub const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 
 /// Report produced by a full indexing run.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -161,6 +170,7 @@ impl MemvidIndexer {
             .to_string_lossy()
             .replace('/', "-")
             .replace(".md", "");
+        let extra_tag = extract_anchor_date(&session_id).map(|_| TEMPORAL_ENTITY_TAG);
 
         let chunks = chunk_by_headers(&content);
         let mut indexed = 0usize;
@@ -170,7 +180,7 @@ impl MemvidIndexer {
             }
             let label = format!("[{}] {}", chunk.header, chunk.text.trim());
             if store
-                .persist_structured_turn(&session_id, "system", &label)
+                .persist_structured_turn_tagged(&session_id, "system", &label, extra_tag)
                 .is_ok()
             {
                 indexed += 1;
@@ -185,10 +195,14 @@ impl MemvidIndexer {
     ///
     /// Each file is chunked by `## ` headers (Facts, Reflections, Commitments, etc.)
     /// and each chunk is written to the store with a `"journal-{date}"` session id.
+    ///
+    /// T071: files are written oldest→newest (recency-weighted reorder — in the
+    /// append-order store, newer chunks land at higher frame ids) and every
+    /// time-anchored chunk is tagged `temporal_entity`.
     pub fn index_m2_episodic(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
         let journal_dir = self.workspace_root.join("memories").join("journal");
 
-        let files = list_md_files(&journal_dir)?;
+        let files = reorder_by_recency(list_md_files(&journal_dir)?);
         if files.is_empty() {
             debug!("M2: no journal files in {}", journal_dir.display());
             return Ok((0, 0));
@@ -223,13 +237,16 @@ impl MemvidIndexer {
                 Some(d) => format!("journal-{d}"),
                 None => "journal-unknown".to_string(),
             };
+            let temporal = extract_anchor_date(&session_id).is_some();
 
             for chunk in &chunks {
                 if chunk.text.trim().is_empty() {
                     continue;
                 }
                 let label = format!("[{}] {}", chunk.header, chunk.text.trim());
-                match store.persist_structured_turn(&session_id, "system", &label) {
+                let extra_tag = temporal.then_some(TEMPORAL_ENTITY_TAG);
+                match store.persist_structured_turn_tagged(&session_id, "system", &label, extra_tag)
+                {
                     Ok(_) => chunks_indexed += 1,
                     Err(e) => {
                         warn!(
@@ -300,16 +317,17 @@ impl MemvidIndexer {
 
     // ─── M4 (Wisdom) ────────────────────────────────────────────────
 
-    /// Index wisdom files across three subdirectories:
+    /// Index wisdom files across four subdirectories:
     /// - `wiki/wisdom/reflections/*.md`
     /// - `wiki/wisdom/anti-patterns/*.md`
     /// - `wiki/wisdom/models/*.md`
+    /// - `wiki/wisdom/preferences/*.md` (FR-021 Pi point 2, M4)
     ///
     /// Each file is stored in full with a `"knowledge-base"` session id.
     pub fn index_m4_wisdom(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
         let wisdom_root = self.workspace_root.join("wiki").join("wisdom");
 
-        let subdirs = ["reflections", "anti-patterns", "models"];
+        let subdirs = ["reflections", "anti-patterns", "models", "preferences"];
 
         let mut files_scanned = 0usize;
         let mut chunks_indexed = 0usize;
@@ -374,6 +392,56 @@ struct HeaderChunk {
     header: String,
     /// The body text belonging to this header.
     text: String,
+}
+
+/// Parse the time anchor from a `journal-YYYY-MM-DD` session id (T071).
+/// Returns `None` for non-date-scoped ids (e.g. `knowledge-base`).
+pub fn extract_anchor_date(session_id: &str) -> Option<NaiveDate> {
+    let date = session_id.strip_prefix("journal-")?;
+    if date.len() != 10 {
+        return None;
+    }
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+/// Recency weight of a time-anchored chunk: exponential decay with the
+/// FR-025 30-day confidence half-life (`0.5^(age_days/30)`). Undated
+/// (evergreen) content weighs a neutral 1.0.
+pub fn recency_weight(anchor: Option<NaiveDate>, now: NaiveDate) -> f64 {
+    match anchor {
+        Some(d) => {
+            let age = (now - d).num_days().max(0) as f64;
+            0.5_f64.powf(age / RECENCY_HALF_LIFE_DAYS)
+        }
+        None => 1.0,
+    }
+}
+
+/// Recency-weighted reorder (T071): oldest date-anchored files first so the
+/// newest content lands at the highest frame ids in the append-order store;
+/// undated files keep their relative order at the end. Weight-only — no new
+/// index, no schema change.
+pub fn reorder_by_recency(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    let keyed: Vec<(Option<NaiveDate>, usize, PathBuf)> = files
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                extract_date_from_filename(&p)
+                    .and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()),
+                i,
+                p,
+            )
+        })
+        .collect();
+    let mut keyed = keyed;
+    keyed.sort_by(|a, b| match (a.0, b.0) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1),
+    });
+    keyed.into_iter().map(|(_, _, p)| p).collect()
 }
 
 fn chunk_by_headers(content: &str) -> Vec<HeaderChunk> {
@@ -449,6 +517,10 @@ fn collect_current_checksums(workspace_root: &Path) -> Result<ChecksumMap> {
             .join("wisdom")
             .join("anti-patterns"),
         workspace_root.join("wiki").join("wisdom").join("models"),
+        workspace_root
+            .join("wiki")
+            .join("wisdom")
+            .join("preferences"),
     ];
     for dir in &dirs {
         if !dir.exists() {
@@ -766,5 +838,78 @@ mod tests {
         assert_eq!(report.files_scanned, 3); // 1 + 1 + 1
         assert_eq!(report.chunks_indexed, 4); // 2 + 1 + 1
         assert!(report.errors.is_empty());
+    }
+
+    // ── T071: temporal_entity tag + recency-weighted reorder ────────
+
+    #[test]
+    fn extract_anchor_date_parses_journal_ids_only() {
+        assert_eq!(
+            extract_anchor_date("journal-2026-06-01"),
+            Some(NaiveDate::from_ymd_opt(2026, 6, 1).unwrap())
+        );
+        assert_eq!(extract_anchor_date("knowledge-base"), None);
+        assert_eq!(extract_anchor_date("journal-unknown"), None);
+        assert_eq!(extract_anchor_date("journal-2026-6-1"), None);
+    }
+
+    #[test]
+    fn recency_weight_decays_with_30_day_half_life() {
+        let now = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        assert!((recency_weight(Some(today), now) - 1.0).abs() < 1e-9);
+
+        let thirty_days_ago = NaiveDate::from_ymd_opt(2026, 8, 2).unwrap();
+        assert!((recency_weight(Some(thirty_days_ago), now) - 0.5).abs() < 0.01);
+
+        let evergreen = recency_weight(None, now);
+        assert!((evergreen - 1.0).abs() < 1e-9);
+
+        // Future-dated (clock skew) never exceeds 1.0.
+        let future = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        assert!((recency_weight(Some(future), now) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reorder_by_recency_puts_oldest_first_undated_last() {
+        let dir = PathBuf::from("/journal");
+        let files = vec![
+            dir.join("2026-08-01.md"),
+            dir.join("notes.md"),
+            dir.join("2026-06-01.md"),
+            dir.join("2026-07-01.md"),
+        ];
+        let reordered = reorder_by_recency(files);
+        assert_eq!(
+            reordered,
+            vec![
+                dir.join("2026-06-01.md"),
+                dir.join("2026-07-01.md"),
+                dir.join("2026-08-01.md"),
+                dir.join("notes.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn m4_indexes_preferences_dir() {
+        let _guard = crate::memvid::lock_and_reset_singletons();
+        let tmp = TempDir::new().unwrap();
+
+        let pref_dir = tmp.path().join("wiki").join("wisdom").join("preferences");
+        std::fs::create_dir_all(&pref_dir).unwrap();
+        std::fs::write(
+            pref_dir.join("user-likes-rust.md"),
+            "# Preference\n\nBody.\n",
+        )
+        .unwrap();
+
+        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let db_path = tmp.path().join("test.mv2");
+        let mut store = ZenMemvidStore::new(db_path).unwrap();
+
+        let (files, chunks) = indexer.index_m4_wisdom(&mut store).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(chunks, 1);
     }
 }

@@ -26,7 +26,8 @@ pub enum ApprovalDecision {
     Deny,
 }
 
-pub type ApprovalCallback = Arc<dyn Fn(&ToolInvocation) -> ApprovalDecision + Send + Sync>;
+pub type ApprovalCallback =
+    Arc<dyn Fn(Option<String>, &ToolInvocation) -> ApprovalDecision + Send + Sync>;
 
 impl SandboxMode {
     pub fn as_str(&self) -> &'static str {

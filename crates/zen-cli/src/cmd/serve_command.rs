@@ -406,6 +406,10 @@ fn resolve_qqbot_channel(
         token_url: zen_gateway::channel::qqbot::DEFAULT_TOKEN_URL.to_string(),
         allowed_users: q.allowed_users.clone(),
         bindings_db,
+        // T101: drain tick from config, clamped 60..=3600 (default 300s).
+        outbox_drain_interval: std::time::Duration::from_secs(
+            q.outbox_drain_interval_secs.unwrap_or(300).clamp(60, 3600),
+        ),
         // Daemon resolves the shared audit sink; CLI side stays None
         // (overridden in serve_with_shutdown).
         audit_path: None,

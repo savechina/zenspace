@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 schemars = { workspace = true }
 arrow = { workspace = true }
 fs2 = { workspace = true }
+jsonschema = { workspace = true }
 
 [dev-dependencies]
 rig-core = { workspace = true, features = ["test-utils"] }

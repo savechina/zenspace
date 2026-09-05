@@ -18,6 +18,7 @@ pub mod memvid;
 pub mod memvid_index;
 pub mod mental_model;
 pub mod okr;
+pub mod preference;
 pub mod priority;
 pub mod prompt;
 pub mod quality_gate;
@@ -40,7 +41,10 @@ pub use decision::{
     AntiPatternReport, AntiPatternViolation, CostBreakdown, Decision, ExpectedValue, Outcome,
     OutcomeResult, Severity,
 };
-pub use dream::ZenDream;
+pub use dream::{
+    MEMORY_LINES_CAP, RejectedHypothesis, ZenDream, enforce_memory_cap, memory_merge_rollup,
+    memory_nudge_due, memory_nudge_text, write_wake_up_brief,
+};
 pub use fact::Fact;
 pub use feedback_signal::{Feedback, FeedbackDisposition, FeedbackProperties};
 pub use history::HistoryStore;
@@ -53,10 +57,12 @@ pub use memvid::{
 pub use memvid_index::{MemvidIndexReport, MemvidIndexer};
 pub use mental_model::MentalModelSignal;
 pub use okr::{CommitmentOkr, compute_commitment_completion_rate};
+pub use preference::{Preference, PreferencePredicate, preference_triggers};
 pub use prompt::{PromptAssembly, SYSTEM_PROMPT_DYNAMIC_BOUNDARY};
 pub use quality_gate::{
     Bias, DECISION_PRINCIPLES, DecisionPrincipleReport, DecisionPromotionReport,
-    EXTRACTION_GUARDRAILS, InformationQualityGate, check_decision_principles,
+    EXTRACTION_GUARDRAILS, InformationQualityGate, MIN_SIGNAL_TOKENS, MemoryGrade,
+    check_decision_principles, grade_session_signal,
 };
 pub use reflection_signal::ReflectionSignal;
 pub use seed::{SEED_FILE_COUNT, copy_seeds_to, seed_file_paths};

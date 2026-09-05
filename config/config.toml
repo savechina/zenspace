@@ -471,3 +471,16 @@ max_watchers = 8
 #
 [agentic.tool_loop]
 max_rounds = 8
+
+# =============================================================================
+# Skill auto-routing — Pi-style trigger hits (005-agentic-loop, T076)
+# =============================================================================
+#
+# When enabled, the orchestrator matches each user query against skill
+# triggers before routing and injects at most one matching skill prompt
+# into the session context (threshold 0.72, contract skill-hit.json).
+# Per-skill opt-out: `auto_route: false` in the skill's SKILL.md frontmatter.
+# Env override: ZEN_SKILLS_AUTO_ROUTE (5th config layer).
+#
+[skills.auto_route]
+enabled = true

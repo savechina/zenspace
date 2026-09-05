@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use super::types::{GapKind, GapRecord, HypothesisSlug, HypothesisStatus};
-use zen_memory::{extract_frontmatter, parse_field};
+use zen_memory::{RejectedHypothesis, extract_frontmatter, parse_field};
 
 // ─── Gap taxonomy mapping (7 eligible kinds) ───────────────────────────
 
@@ -810,11 +810,38 @@ pub fn reverify(
     now: DateTime<Utc>,
     older_than: chrono::Duration,
 ) -> Result<usize> {
+    reverify_with_rejections(hypotheses_dir, wiki_dir, now, older_than).map(|(count, _)| count)
+}
+
+/// As [`reverify`], but also returns every hypothesis that transitioned to
+/// `Rejected` during this pass so callers holding a [`zen_core::paths::ZenPaths`]
+/// can persist them to `wiki/wisdom/rejected/` via
+/// [`zen_memory::RejectedHypothesis::record`] (FR-040 negative space).
+///
+/// # Arguments
+///
+/// See [`reverify`] — identical semantics.
+///
+/// # Returns
+///
+/// A tuple of the transition count and the rejection records (one per
+/// hypothesis that entered `Rejected` in this pass, in scan order).
+///
+/// # Errors
+///
+/// Returns an error if directory I/O fails.
+pub fn reverify_with_rejections(
+    hypotheses_dir: &Path,
+    wiki_dir: &Path,
+    now: DateTime<Utc>,
+    older_than: chrono::Duration,
+) -> Result<(usize, Vec<RejectedHypothesis>)> {
     let mut count = 0;
+    let mut rejected = Vec::new();
     let cutoff = now - older_than;
 
     if !hypotheses_dir.is_dir() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     for entry in fs::read_dir(hypotheses_dir).with_context(|| {
@@ -903,6 +930,15 @@ pub fn reverify(
                     );
                     h.status = HypothesisStatus::Rejected;
                     transitioned = true;
+                    rejected.push(RejectedHypothesis {
+                        claim: h.hypothesis.clone(),
+                        falsifier: format!("missing wiki page for entity '{entity_lower}'"),
+                        because: format!(
+                            "reverify: hypothesis stale >{} days and subject entity page absent",
+                            older_than.num_days()
+                        ),
+                        expiry: now.format("%Y-%m-%d").to_string(),
+                    });
                 }
             }
 
@@ -914,7 +950,7 @@ pub fn reverify(
         }
     }
 
-    Ok(count)
+    Ok((count, rejected))
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -1272,5 +1308,45 @@ mod tests {
 
         let loaded = load_all(&hypo_dir).unwrap();
         assert_eq!(loaded[0].status, HypothesisStatus::Exploring);
+    }
+
+    #[test]
+    fn reverify_rejection_yields_negative_space_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hypo_dir = tmp.path().join("hypotheses");
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir_all(&hypo_dir).unwrap();
+        fs::create_dir_all(&wiki_dir).unwrap();
+
+        let h = HypothesisSlug {
+            slug: "reject-test-entity".into(),
+            hypothesis: "rust makes distill faster".into(),
+            gap_kind: GapKind::OrphanEntity,
+            confidence: 0.7,
+            status: HypothesisStatus::Exploring,
+            exploration_prompt: None,
+            evidence_refs: vec![],
+            created_from: "g1".into(),
+        };
+        save(&h, &hypo_dir).unwrap();
+
+        let hypo_file = hypo_dir.join("reject-test-entity.md");
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&hypo_file)
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+
+        let (count, rejected) =
+            reverify_with_rejections(&hypo_dir, &wiki_dir, Utc::now(), Duration::days(7)).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].claim, "rust makes distill faster");
+        assert!(rejected[0].falsifier.contains("entity"));
+
+        let loaded = load_all(&hypo_dir).unwrap();
+        assert_eq!(loaded[0].status, HypothesisStatus::Rejected);
     }
 }
