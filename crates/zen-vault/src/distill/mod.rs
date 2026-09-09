@@ -1,7 +1,10 @@
+pub mod adversarial;
 pub mod chat_import;
 pub mod checkpoint;
 pub mod contradiction;
 pub mod convert;
+pub mod correlation;
+pub mod discover_metrics;
 pub mod hypothesis;
 pub mod merge;
 pub mod notion_extraction;
@@ -13,9 +16,19 @@ pub mod transaction;
 pub mod types;
 pub mod wiki_compile;
 
+pub use adversarial::{
+    ARENA_REPORT_PREFIX, AdversarialReport, CaseResult, CliContestant, Contestant,
+    ContestantVerdict, EvalCase, INCUMBENT, NaiveBaseline, PhaseScore, ZenDistill, corpus,
+    judge_case, report_path, run_arena,
+};
 pub use chat_import::ChatImporter;
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
+pub use correlation::{Opportunity, correlate};
+pub use discover_metrics::{
+    DiscoverMetrics, DiscoverMetricsError, METRICS_FILE_NAME, REPORT_FILE_PREFIX, aggregate,
+    load_reports, write_metrics,
+};
 pub use hypothesis::{
     build_exploration_prompt, build_refinement_queue, confidence_for, gap_type, generate_from_gaps,
     load_all, reverify, reverify_with_rejections, save, slug_for,

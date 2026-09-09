@@ -33,6 +33,7 @@ use crate::cmd::auth_command::{self, AuthCommands};
 use crate::cmd::chat_command::{self, ChatArgs};
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::config_command::{self, ConfigCommands};
+use crate::cmd::discover_command::{self, DiscoverCommands};
 use crate::cmd::goal_command::{self, GoalCommands};
 use crate::cmd::habit_command::{self, HabitCommands};
 use crate::cmd::logs_command::{self, LogCommands};
@@ -162,6 +163,10 @@ enum Commands {
     Skill {
         #[command(subcommand)]
         operation: SkillCommands,
+    },
+    Discover {
+        #[command(subcommand)]
+        operation: DiscoverCommands,
     },
     Sandbox {
         #[command(flatten)]
@@ -312,6 +317,7 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Habit { ref operation } => habit_command::execute_command(operation),
         Commands::Goal { ref operation } => goal_command::execute_command(operation),
         Commands::Skill { ref operation } => skill_command::execute_command(operation).await,
+        Commands::Discover { ref operation } => discover_command::execute_command(operation).await,
         Commands::Sandbox { ref args } => sandbox_command::execute_command(args),
     }
 }

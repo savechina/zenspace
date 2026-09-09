@@ -8,6 +8,7 @@ pub mod memory_curator;
 pub mod memvid_indexer_worker;
 pub mod morning_brief;
 pub mod notion_extractor_worker;
+pub mod promotion_worker;
 pub mod reflection;
 pub mod session_journaler;
 pub mod subconscious;
@@ -25,6 +26,10 @@ pub use memory_curator::MemoryCurator;
 pub use memvid_indexer_worker::MemvidIndexerWorker;
 pub use morning_brief::MorningBriefWorker;
 pub use notion_extractor_worker::NotionExtractorWorker;
+pub use promotion_worker::{
+    PROMOTION_CONFIRMED_FILE, PROMOTION_QUEUE_FILE, PROMOTION_WORKER_SCHEDULE, PromotionItem,
+    PromotionStatus, PromotionTarget, PromotionWorker, route_target,
+};
 pub use reflection::ReflectionWorker;
 pub use session_journaler::SessionJournaler;
 pub use subconscious::SubconsciousWorker;

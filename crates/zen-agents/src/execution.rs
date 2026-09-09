@@ -12,7 +12,6 @@ pub struct AgentExecution {
     pub response: String,
     pub metadata: ExecutionMetadata,
     pub tool_calls: Vec<ToolCall>,
-    pub sub_agent_results: Vec<AgentExecution>,
 }
 
 /// Execution metadata captured during agent run.
@@ -23,6 +22,15 @@ pub struct ExecutionMetadata {
     pub model_used: String,
     pub duration_ms: u64,
     pub sensitivity: Sensitivity,
+    /// 006 US2: quality-gate review notes (None when the gate has not run).
+    pub quality_notes: Option<String>,
+    /// 006 US2: whether the quality gate cleared the answer for delivery.
+    #[serde(default = "default_true")]
+    pub delivery_ready: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A tool call made during agent execution.
@@ -45,32 +53,23 @@ impl AgentExecution {
                 model_used: String::new(),
                 duration_ms: 0,
                 sensitivity: Sensitivity::Private,
+                quality_notes: None,
+                delivery_ready: true,
             },
             tool_calls: Vec::new(),
-            sub_agent_results: Vec::new(),
         }
     }
 
-    /// Total tokens used across this execution and all sub-agents.
+    /// Total tokens used by this execution.
     #[must_use]
     pub fn total_tokens(&self) -> u32 {
         self.metadata.tokens_used
-            + self
-                .sub_agent_results
-                .iter()
-                .map(|r| r.total_tokens())
-                .sum::<u32>()
     }
 
-    /// Total cost estimate across this execution and all sub-agents.
+    /// Total cost estimate for this execution.
     #[must_use]
     pub fn total_cost(&self) -> f64 {
         self.metadata.cost_estimate
-            + self
-                .sub_agent_results
-                .iter()
-                .map(|r| r.total_cost())
-                .sum::<f64>()
     }
 }
 
@@ -80,7 +79,6 @@ mod tests {
 
     #[test]
     fn test_agent_execution_serialization_roundtrip() {
-        let sub = AgentExecution::minimal("sub", "sub response");
         let execution = AgentExecution {
             agent_name: "Sisyphus".to_string(),
             response: "Hello, world!".to_string(),
@@ -90,6 +88,8 @@ mod tests {
                 model_used: "gpt-4o-mini".to_string(),
                 duration_ms: 2345,
                 sensitivity: Sensitivity::Public,
+                quality_notes: None,
+                delivery_ready: true,
             },
             tool_calls: vec![
                 ToolCall {
@@ -103,7 +103,6 @@ mod tests {
                     result: "line 42: hello".to_string(),
                 },
             ],
-            sub_agent_results: vec![sub],
         };
 
         let json = serde_json::to_string(&execution).unwrap();
@@ -119,8 +118,6 @@ mod tests {
         assert_eq!(decoded.tool_calls.len(), 2);
         assert_eq!(decoded.tool_calls[0].tool_name, "read_file");
         assert_eq!(decoded.tool_calls[1].tool_name, "grep");
-        assert_eq!(decoded.sub_agent_results.len(), 1);
-        assert_eq!(decoded.sub_agent_results[0].agent_name, "sub");
     }
 
     #[test]
@@ -133,6 +130,5 @@ mod tests {
         assert_eq!(decoded.response, "ok");
         assert_eq!(decoded.metadata.tokens_used, 0);
         assert!(decoded.tool_calls.is_empty());
-        assert!(decoded.sub_agent_results.is_empty());
     }
 }

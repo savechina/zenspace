@@ -21,6 +21,7 @@ use zen_provider::DefaultRouter;
 use crate::delegate_tools;
 use crate::delegate_tools::ZenDelegateTools;
 use crate::execution::{AgentExecution, ExecutionMetadata, ToolCall};
+use crate::intent;
 use crate::registry::AgentRegistry;
 use crate::review::QualityPipeline;
 use crate::skill_hit_router::{SkillHit, SkillHitRouter, render_skill_prompt};
@@ -52,7 +53,7 @@ const M1_TOP_K: usize = 5;
 /// - FR-TUI-012: Agent preferences influence provider selection
 pub struct AgentOrchestrator {
     registry: crate::registry::DefaultAgentRegistry,
-    wiring: ZenWiring,
+    wiring: Arc<ZenWiring>,
     delegates: ZenDelegateTools,
     executor: crate::executor::AgentExecutor,
     token_budget: Arc<AtomicTokenBudget>,
@@ -66,6 +67,9 @@ pub struct AgentOrchestrator {
     max_tool_rounds: usize,
     /// FR-037 skill-hit matcher, consulted before every `route()`.
     skill_router: SkillHitRouter,
+    /// 006: parent sensitivity shared with DelegateTaskTool so delegated
+    /// sub-turns route under the same sensitivity policy.
+    delegate_sensitivity: crate::delegate_task::SharedSensitivity,
 }
 
 /// Resolve the tool-loop cap from the 5-layer merged config (T054).
@@ -78,6 +82,19 @@ fn resolve_max_tool_rounds() -> usize {
         Err(e) => {
             warn!(error = %e, "config load failed; tool loop falls back to default rounds");
             DEFAULT_MAX_TOOL_ROUNDS
+        }
+    }
+}
+
+/// Resolve the `[agentic.orchestrator] surface` profile (T378).
+/// Config load failure fails open to `full` — a broken config must never
+/// silently strip the orchestrator's direct tools.
+fn orchestrator_delegation_only() -> bool {
+    match zen_core::config::load_config() {
+        Ok(config) => config.agentic.orchestrator.delegation_only(),
+        Err(e) => {
+            warn!(error = %e, "config load failed; orchestrator surface stays full");
+            false
         }
     }
 }
@@ -132,7 +149,7 @@ fn emit_memory_nudge_if_due(paths: &ZenPaths, user_turns: u64) {
 impl AgentOrchestrator {
     pub fn new(router: DefaultRouter) -> Self {
         let registry = crate::registry::DefaultAgentRegistry::new();
-        let wiring = ZenWiring::new();
+        let wiring = Arc::new(ZenWiring::new());
         let memvid_store = wiring.memvid_store.clone();
         if memvid_store.is_some() {
             debug!("AgentOrchestrator: auto-wired memvid store from ZenWiring");
@@ -149,16 +166,17 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store,
-            quality_pipeline: QualityPipeline::new(),
+            quality_pipeline: Self::review_pipeline(&router),
             tool_overlay,
             max_tool_rounds,
             skill_router: SkillHitRouter::new(),
+            delegate_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
         }
     }
 
     pub fn with_token_budget(router: DefaultRouter, capacity: u64) -> Self {
         let registry = crate::registry::DefaultAgentRegistry::new();
-        let wiring = ZenWiring::new();
+        let wiring = Arc::new(ZenWiring::new());
         let memvid_store = wiring.memvid_store.clone();
         let tool_overlay = delegate_tools::load_tool_grant_overlay();
         let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
@@ -172,10 +190,11 @@ impl AgentOrchestrator {
             executor,
             token_budget,
             memvid_store,
-            quality_pipeline: QualityPipeline::new(),
+            quality_pipeline: Self::review_pipeline(&router),
             tool_overlay,
             max_tool_rounds,
             skill_router: SkillHitRouter::new(),
+            delegate_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
         }
     }
 
@@ -213,13 +232,242 @@ impl AgentOrchestrator {
     /// The mode drives the fs-tool path validators and the dispatch-time
     /// sandbox hook pipeline (rate limit → seatbelt → audit → approval).
     pub fn with_sandbox_mode(mut self, mode: zen_core::sandbox::SandboxMode) -> Self {
-        self.wiring = ZenWiring::with_sandbox_mode(mode, Vec::new(), None);
+        self.wiring = Arc::new(ZenWiring::with_sandbox_mode(mode, Vec::new(), None));
+        self.install_delegate_tool();
         self
+    }
+
+    /// 006: register `delegate.task` into the wiring tool registry.
+    ///
+    /// Called after every wiring (re)construction — registration is
+    /// idempotent-in-effect because a fresh `ZenWiring` starts empty.
+    /// The `[agentic.delegate] enabled=false` kill-switch skips it, which
+    /// removes the tool from every agent's reachable set.
+    fn install_delegate_tool(&self) {
+        let (enabled, timeout, max_depth, max_concurrent) = match zen_core::config::load_config() {
+            Ok(config) => (
+                config.agentic.delegate.enabled_or_default(),
+                config.agentic.delegate.timeout_or_default(),
+                config.agentic.delegate.max_depth_or_default(),
+                config.agentic.delegate.max_concurrent_or_default(),
+            ),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "config load failed; delegate tool falls back to enabled/300s"
+                );
+                (true, 300, 1, 4)
+            }
+        };
+        if !enabled {
+            info!("delegate.task disabled by [agentic.delegate] enabled=false");
+            return;
+        }
+        let tool = Arc::new(crate::delegate_task::DelegateTaskTool::new(
+            Arc::clone(&self.wiring),
+            self.executor.router().clone(),
+            self.tool_overlay.clone(),
+            self.memvid_store.clone(),
+            Arc::clone(&self.delegate_sensitivity),
+            Arc::clone(&self.token_budget),
+            std::time::Duration::from_secs(timeout),
+            max_depth,
+            max_concurrent,
+        ));
+        self.wiring
+            .tools
+            .register(Arc::clone(&tool) as Arc<dyn rig_compose::tool::Tool>);
+        // T375: plan.execute rides the same kill-switch and lifecycle —
+        // it executes DAG nodes through delegate.task's run_single.
+        let plan = crate::plan_task::PlanExecuteTool::new(
+            tool,
+            QualityPipeline::new(),
+            max_concurrent,
+            zen_core::paths::ZenPaths::detect()
+                .ok()
+                .map(|p| p.data().join("state.db")),
+        );
+        self.wiring.tools.register(Arc::new(plan));
+    }
+
+    /// Lazily ensure `delegate.task` is registered before agent building.
+    ///
+    /// Deferred to first-turn (not the constructors) so builder-phase
+    /// calls like `with_approval_callback` can still reach the wiring
+    /// through `Arc::get_mut`; the Arc is only cloned once a turn runs.
+    fn ensure_delegate_tool(&self) {
+        if self
+            .wiring
+            .tools
+            .get(crate::delegate_task::DELEGATE_TOOL_NAME)
+            .is_err()
+        {
+            self.install_delegate_tool();
+        }
+    }
+
+    /// 006: mirror the session sensitivity into the delegate tool's shared
+    /// cell so delegated sub-turns route under the same policy.
+    fn propagate_sensitivity(&self, sensitivity: Sensitivity) {
+        let mut cell = self
+            .delegate_sensitivity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cell = sensitivity;
+    }
+
+    /// 006 US2: the pipeline `Task` for a turn review — entropy stays 0.0
+    /// (no turn-level entropy estimate yet), so blast radius is HIGH only
+    /// via `Confidential` session metadata.
+    fn turn_review_task(query: &str, sensitivity: Sensitivity) -> zen_core::types::Task {
+        let mut task = zen_core::types::Task::new(query, 0.0, zen_core::types::TaskType::Text);
+        task.metadata
+            .insert("sensitivity".to_string(), sensitivity.to_string());
+        task
+    }
+
+    /// 006 US2 (D4) gate ladder, extracted for deterministic testing
+    /// (/review L9): run the pipeline once; on a Momus veto
+    /// (`plan_approved == false`) run EXACTLY one redraft round and
+    /// re-review — the re-review verdict is final.
+    ///
+    /// # Parameters
+    /// - `pipeline`: quality gate (Metis→Momus→Hermes→Zeus + semantic stage)
+    /// - `review_task`: the turn/plan review task (entropy + sensitivity metadata)
+    /// - `response`: the draft deliverable under review
+    /// - `redraft`: builds the replacement execution from the veto feedback
+    ///
+    /// # Returns
+    /// `(final verdict, feedback rounds issued 0|1, redrafted execution)`
+    /// — the execution is `Some` only when a round ran, so the caller can
+    /// swap in the redrafted metadata (tokens, model) it would have lost.
+    ///
+    /// # Errors
+    /// Propagates the redraft round's executor failure — a vetoed turn
+    /// that cannot be redrafted fails the whole execution (identical to
+    /// the pre-extraction inline behavior).
+    async fn review_with_feedback_round(
+        pipeline: &QualityPipeline,
+        review_task: &zen_core::types::Task,
+        response: &str,
+        mut redraft: impl FnMut(String) -> anyhow::Result<AgentExecution>,
+    ) -> anyhow::Result<(crate::review::PipelineResult, u8, Option<AgentExecution>)> {
+        let mut review = pipeline
+            .execute(review_task, response, |plan| Box::pin(async move { plan }))
+            .await;
+        let mut feedback_rounds = 0u8;
+        if !review.plan_approved {
+            let feedback = format!(
+                "Your draft answer was rejected by the quality gate:\n{}\nAddress the findings and answer the user again.",
+                review.review_notes
+            );
+            let redrafted = redraft(feedback)?;
+            feedback_rounds = 1;
+            review = pipeline
+                .execute(review_task, &redrafted.response, |plan| {
+                    Box::pin(async move { plan })
+                })
+                .await;
+            return Ok((review, feedback_rounds, Some(redrafted)));
+        }
+        Ok((review, feedback_rounds, None))
+    }
+
+    /// 006 US2: one `loop.turn.review` line in `<logs>/audit.jsonl`, same
+    /// file the gateway and ToolAuditHook append to.
+    fn append_turn_review_audit(
+        paths: &ZenPaths,
+        session_id: &str,
+        agent: &str,
+        intent: &intent::Intent,
+        review: &crate::review::PipelineResult,
+        feedback_rounds: u8,
+    ) {
+        let entry = serde_json::json!({
+            "kind": "loop.turn.review",
+            "session_id": session_id,
+            "agent": agent,
+            "intent_signal": intent.signal,
+            "intent_category": intent.category.as_str(),
+            "intent_source": format!("{:?}", intent.source),
+            "intent_confidence": intent.confidence,
+            "intent_acl": intent.acl.as_str(),
+            "plan_approved": review.plan_approved,
+            "delivery_ready": review.delivery_ready,
+            "feedback_rounds": feedback_rounds,
+            "failed_attempts": review.failed_attempts,
+        });
+        let log_path = paths.logs().join("audit.jsonl");
+        if let Some(parent) = log_path.parent()
+            && fs::create_dir_all(parent).is_ok()
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(f, "{entry}");
+            }
+        }
+    }
+
+    /// 006 US2 (D5): semantic reviewer for HIGH blast-radius turns — one
+    /// non-streaming LLM round over the draft. Fails open (heuristics
+    /// already passed) when routing or the model call errors.
+    fn review_pipeline(router: &DefaultRouter) -> QualityPipeline {
+        let review_router = router.clone();
+        QualityPipeline::new().with_semantic_reviewer(move |task, _plan, deliverable| {
+            let router = review_router.clone();
+            let prompt = format!(
+                "You are a delivery reviewer. Decide whether the draft answer is complete, correct, and safe to deliver.\nTask: {}\nDraft answer (truncated):\n{}\n\nRespond with exactly one line starting with \"APPROVED\" or \"REJECTED: <reason>\".",
+                task.user_input,
+                deliverable.chars().take(4000).collect::<String>()
+            );
+            let sensitivity =
+                zen_core::review::ReviewContext::from_task_with_metadata(task, 0).sensitivity;
+            Box::pin(async move {
+                let requirements = zen_provider::TaskRequirements {
+                    max_tokens: Some(512),
+                    sensitivity,
+                    preferred_model: None,
+                    budget_limit: None,
+                };
+                use zen_provider::LlmRouter as _;
+                let reply = router
+                    .route(&requirements)
+                    .and_then(|provider| router.call(provider, &prompt));
+                match reply {
+                    Ok(reply) => {
+                        let trimmed = reply.trim();
+                        if trimmed.to_uppercase().starts_with("APPROVED") {
+                            crate::review::SemanticVerdict::approve(trimmed.to_string())
+                        } else {
+                            let note = trimmed
+                                .strip_prefix("REJECTED:")
+                                .unwrap_or(trimmed)
+                                .trim()
+                                .to_string();
+                            crate::review::SemanticVerdict::reject(note)
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "semantic reviewer unavailable; failing open");
+                        crate::review::SemanticVerdict::approve(
+                            "reviewer unavailable; heuristic stages passed",
+                        )
+                    }
+                }
+            })
+        })
     }
 
     /// Register an interactive approval callback for `Ask` sandbox mode.
     pub fn with_approval_callback(mut self, callback: zen_core::sandbox::ApprovalCallback) -> Self {
-        self.wiring.set_approval_callback(callback);
+        match Arc::get_mut(&mut self.wiring) {
+            Some(wiring) => wiring.set_approval_callback(callback),
+            None => warn!("with_approval_callback: wiring already shared; callback not installed"),
+        }
         self
     }
 
@@ -248,11 +496,34 @@ impl AgentOrchestrator {
 
     async fn build_agent(&self, agent_name: &str) -> Result<ZenAgent> {
         let skills = delegate_tools::resolve_skill_ids_for_agent(agent_name);
-        let tools = delegate_tools::resolve_agent_tool_grants(
+        let mut tools = delegate_tools::resolve_agent_tool_grants(
             agent_name,
             &self.tool_overlay,
             &self.wiring.tools,
         );
+        // 006: delegate.task is registry-registered, not in the builtin
+        // grant map, so the orchestrator-tier agent gets it injected here.
+        // Sub-agents built via DelegateTaskTool never pass through this
+        // path — that asymmetry IS the depth-1 guard (spec D3).
+        if agent_name == "Sisyphus"
+            && self
+                .wiring
+                .tools
+                .get(crate::delegate_task::DELEGATE_TOOL_NAME)
+                .is_ok()
+        {
+            tools.push(crate::delegate_task::DELEGATE_TOOL_NAME.to_string());
+            tools.push(crate::plan_task::PLAN_TOOL_NAME.to_string());
+        }
+        // T378 `delegation-only`: the 001 A.8 ultra surface — Sisyphus
+        // keeps exactly the delegation tools; all direct tools move to
+        // scoped sub-agents.
+        if agent_name == "Sisyphus" && orchestrator_delegation_only() {
+            tools.retain(|t| {
+                t == crate::delegate_task::DELEGATE_TOOL_NAME
+                    || t == crate::plan_task::PLAN_TOOL_NAME
+            });
+        }
         debug!(
             "building agent: {}",
             delegate_tools::describe_agent(agent_name, &self.registry)
@@ -274,114 +545,12 @@ impl AgentOrchestrator {
         builder.build(&self.wiring, self.executor.router())
     }
 
-    fn classify_agent(&self, query: &str) -> String {
-        let lower = query.to_lowercase();
-
-        if lower.contains("implement")
-            || lower.contains("code")
-            || lower.contains("function")
-            || lower.contains("class")
-            || lower.contains("refactor")
-            || lower.contains("debug")
-        {
-            return "Hephaestus".to_string();
-        }
-
-        if lower.contains("research")
-            || lower.contains("explore")
-            || lower.contains("discover")
-            || lower.contains("find information")
-            || lower.contains("investigate")
-        {
-            return "Explore".to_string();
-        }
-
-        if lower.contains("analyze")
-            || lower.contains("analysis")
-            || lower.contains("deep")
-            || lower.contains("architecture")
-            || lower.contains("design")
-        {
-            return "Oracle".to_string();
-        }
-
-        if lower.contains("organize")
-            || lower.contains("knowledge")
-            || lower.contains("wiki")
-            || lower.contains("notes")
-            || lower.contains("catalog")
-            || lower.contains("dedup")
-        {
-            return "Librarian".to_string();
-        }
-
-        if lower.contains("consolidate")
-            || lower.contains("pipeline")
-            || lower.contains("merge")
-            || lower.contains("compile wiki")
-        {
-            return "Hermes".to_string();
-        }
-
-        if lower.contains("review")
-            || lower.contains("audit")
-            || lower.contains("check quality")
-            || lower.contains("security")
-        {
-            return "Momus".to_string();
-        }
-
-        if lower.contains("plan")
-            || lower.contains("strategy")
-            || lower.contains("roadmap")
-            || lower.contains("spec")
-            || lower.contains("milestone")
-        {
-            return "Prometheus".to_string();
-        }
-
-        if lower.contains("gap")
-            || lower.contains("tactical")
-            || lower.contains("assumption")
-            || lower.contains("feasibility")
-        {
-            return "Metis".to_string();
-        }
-
-        if lower.contains("batch")
-            || lower.contains("automate")
-            || lower.contains("routine")
-            || lower.contains("schedule")
-        {
-            return "Atlas".to_string();
-        }
-
-        if lower.contains("format")
-            || lower.contains("convert")
-            || lower.contains("download")
-            || lower.contains("clean")
-        {
-            return "Junior".to_string();
-        }
-
-        if lower.contains("value")
-            || lower.contains("align")
-            || lower.contains("priority")
-            || lower.contains("should we")
-        {
-            return "Zeus".to_string();
-        }
-
-        if lower.contains("image")
-            || lower.contains("chart")
-            || lower.contains("visual")
-            || lower.contains("diagram")
-            || lower.contains("screenshot")
-        {
-            return "Argus".to_string();
-        }
-
-        "Sisyphus".to_string()
+    /// Keyword intent routing (synchronous `route()` facade) — the
+    /// degraded-mode path; turns route through [`intent::classify`] first.
+    fn classify_intent(&self, query: &str) -> String {
+        intent::keyword_route(query)
+            .map(|i| i.agent)
+            .unwrap_or_else(|| "Sisyphus".to_string())
     }
 
     #[instrument(skip(self, session), fields(session_id = %session.session_id))]
@@ -393,10 +562,20 @@ impl AgentOrchestrator {
         let start = Instant::now();
         // FR-037: skill hits resolve before routing; a hit's prompt leads
         // the M1 context so the model sees the established procedure.
+        self.ensure_delegate_tool();
         self.inject_skill_hits(session, user_query);
-        let agent_name = self.classify_agent(user_query);
+        let intent = intent::classify(
+            self.executor.router(),
+            user_query,
+            session.sensitivity_policy,
+        )
+        .await;
+        let agent_name = intent.agent.clone();
         info!(
             agent = agent_name,
+            source = ?intent.source,
+            category = intent.category.as_str(),
+            confidence = intent.confidence,
             query_len = user_query.len(),
             "AgentOrchestrator: executing query"
         );
@@ -446,6 +625,7 @@ impl AgentOrchestrator {
         // Update the confidentiality gate for this session so cloud tools
         // are blocked when the session is Confidential (FR-009).
         self.wiring.set_sensitivity(session.sensitivity_policy);
+        self.propagate_sensitivity(session.sensitivity_policy);
 
         // Agentic tool loop: while the model requests tools, dispatch them
         // through the sandbox hook pipeline and feed results back, up to
@@ -555,31 +735,41 @@ impl AgentOrchestrator {
             .record_usage(reservation, actual_tokens, actual_tokens)
             .await;
 
-        // Check if the query suggests needing sub-agent help
-        let mut sub_agent_results = Vec::new();
-        let lower = user_query.to_lowercase();
-        if lower.contains("research") {
-            sub_agent_results.push(AgentExecution::minimal(
-                "Delegate::Oracle",
-                format!("Delegated research on: {user_query}"),
-            ));
+        // 006 US2 (D4): post-loop quality gate. A Momus veto gets exactly
+        // one feedback round (budget permitting); delivery is non-blocking
+        // — the verdict and notes ride on the execution metadata and audit.
+        let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
+        let draft_response = execution.response.clone();
+        let (review, feedback_rounds, redrafted) = Self::review_with_feedback_round(
+            &self.quality_pipeline,
+            &review_task,
+            &draft_response,
+            |feedback| {
+                let redrafted =
+                    self.executor
+                        .execute_round(&context, &zen_agent, &tool_manifest, &feedback)?;
+                tokens_spent += ((feedback.len() + redrafted.response.len()) / 4) as u64;
+                Ok(redrafted)
+            },
+        )
+        .await?;
+        if let Some(redrafted) = redrafted {
+            execution = redrafted;
         }
-        if lower.contains("analyze deeply") {
-            sub_agent_results.push(AgentExecution::minimal(
-                "Delegate::Metis",
-                format!("Deep analysis on: {user_query}"),
-            ));
-        }
-        if lower.contains("compare") {
-            sub_agent_results.push(AgentExecution::minimal(
-                "Delegate::Momus",
-                format!("Comparison analysis on: {user_query}"),
-            ));
+
+        if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+            Self::append_turn_review_audit(
+                &paths,
+                &session.session_id.to_string(),
+                &execution.agent_name,
+                &intent,
+                &review,
+                feedback_rounds,
+            );
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Build execution with sub-agent results
         let final_execution = AgentExecution {
             agent_name: execution.agent_name,
             response: execution.response,
@@ -589,13 +779,14 @@ impl AgentOrchestrator {
                 model_used: execution.metadata.model_used,
                 duration_ms,
                 sensitivity: execution.metadata.sensitivity,
+                quality_notes: Some(review.review_notes),
+                delivery_ready: review.delivery_ready,
             },
             tool_calls: if tool_calls.is_empty() {
                 execution.tool_calls
             } else {
                 tool_calls
             },
-            sub_agent_results,
         };
 
         crate::observability::emit_prompt_completed(
@@ -630,7 +821,9 @@ impl AgentOrchestrator {
 
     /// Verbose parser: returns invocations plus one diagnostic per fenced
     /// block that looked like a tool call but could not be dispatched.
-    fn parse_tool_invocations_verbose(response: &str) -> (Vec<ToolInvocation>, Vec<String>) {
+    pub(crate) fn parse_tool_invocations_verbose(
+        response: &str,
+    ) -> (Vec<ToolInvocation>, Vec<String>) {
         fn preview(block: &str) -> String {
             const PARSE_PREVIEW_CHARS: usize = 200;
             let head: String = block.chars().take(PARSE_PREVIEW_CHARS).collect();
@@ -691,7 +884,7 @@ impl AgentOrchestrator {
     }
 
     /// Render dispatch results as a compact prompt section for the next round.
-    fn results_to_prompt(results: &[ToolInvocationResult]) -> String {
+    pub(crate) fn results_to_prompt(results: &[ToolInvocationResult]) -> String {
         let entries: Vec<String> = results
             .iter()
             .map(|r| {
@@ -831,10 +1024,20 @@ impl AgentOrchestrator {
     ) -> Result<String> {
         let _start = Instant::now();
         // FR-037: same pre-route skill-hit injection as execute().
+        self.ensure_delegate_tool();
         self.inject_skill_hits(session, user_query);
-        let agent_name = self.classify_agent(user_query);
+        let intent = intent::classify(
+            self.executor.router(),
+            user_query,
+            session.sensitivity_policy,
+        )
+        .await;
+        let agent_name = intent.agent.clone();
         info!(
             agent = agent_name,
+            source = ?intent.source,
+            category = intent.category.as_str(),
+            confidence = intent.confidence,
             query_len = user_query.len(),
             "AgentOrchestrator: streaming execution"
         );
@@ -844,6 +1047,8 @@ impl AgentOrchestrator {
         session.agent_name.clone_from(&agent_name);
 
         self.wiring.connect_mcp_servers().await;
+        self.wiring.set_sensitivity(session.sensitivity_policy);
+        self.propagate_sensitivity(session.sensitivity_policy);
 
         let (mut response, mut native_calls) = zen_agent
             .execute_stream_round(user_query, session, None, &mut callback)
@@ -999,6 +1204,35 @@ impl AgentOrchestrator {
 
         zen_agent.persist_turn(&session.session_id.to_string(), user_query, &response);
 
+        // 006 US2 (D4/D5): post-hoc quality gate. Streamed tokens cannot be
+        // retracted, so a not-ready verdict is appended as a visible
+        // warning line and audited instead of blocking delivery.
+        let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
+        let review = self
+            .quality_pipeline
+            .execute(&review_task, &response, |plan| {
+                Box::pin(async move { plan })
+            })
+            .await;
+        if !review.delivery_ready {
+            let note = review
+                .failed_attempts
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "review flagged this answer".to_string());
+            callback(&format!("⚠️ quality gate: delivery not ready — {note}\n"));
+        }
+        if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+            Self::append_turn_review_audit(
+                &paths,
+                &session.session_id.to_string(),
+                &agent_name,
+                &intent,
+                &review,
+                0,
+            );
+        }
+
         // FR-040: memory nudge every 10 user turns. Logs + jsonl only — the
         // nudge never enters the model token stream (no callback pollution).
         let user_turns = session
@@ -1014,9 +1248,8 @@ impl AgentOrchestrator {
     }
 
     /// Route (keyword classification) — backward compatible public facade.
-    /// Internally delegates to classify_agent.
     pub fn route(&self, query: &str) -> String {
-        self.classify_agent(query)
+        self.classify_intent(query)
     }
 
     /// FR-037 skill-hit auto-route: match `user_query` against skill
@@ -1306,6 +1539,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_delegation_only_surface_strips_direct_tools() {
+        unsafe { std::env::set_var("ZEN_ORCHESTRATOR_SURFACE", "delegation-only") };
+        zen_core::config::invalidate_config_cache();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let orchestrator = AgentOrchestrator::new(router);
+        orchestrator.ensure_delegate_tool();
+        let agent = orchestrator
+            .build_agent("Sisyphus")
+            .await
+            .expect("agent builds");
+        let tools = agent.generic.tools();
+        assert!(
+            tools.get(crate::delegate_task::DELEGATE_TOOL_NAME).is_ok(),
+            "delegation stays available in delegation-only mode"
+        );
+        assert!(
+            tools.get(crate::plan_task::PLAN_TOOL_NAME).is_ok(),
+            "plan.execute stays available in delegation-only mode"
+        );
+        assert!(
+            tools.get("fs.read").is_err(),
+            "direct tools must be stripped in delegation-only mode"
+        );
+        assert!(
+            tools.get("web.search").is_err(),
+            "web tools must be stripped in delegation-only mode"
+        );
+
+        unsafe { std::env::remove_var("ZEN_ORCHESTRATOR_SURFACE") };
+        zen_core::config::invalidate_config_cache();
+    }
+
+    #[tokio::test]
+    async fn delegate_kill_switch_removes_both_tools_from_reachable_set() {
+        unsafe { std::env::set_var("ZEN_DELEGATE_ENABLED", "false") };
+        zen_core::config::invalidate_config_cache();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let orchestrator = AgentOrchestrator::new(router);
+        orchestrator.ensure_delegate_tool();
+        let agent = orchestrator
+            .build_agent("Sisyphus")
+            .await
+            .expect("agent builds");
+        let tools = agent.generic.tools();
+        assert!(
+            tools.get(crate::delegate_task::DELEGATE_TOOL_NAME).is_err(),
+            "kill-switch must remove delegate.task from every reachable set"
+        );
+        assert!(
+            tools.get(crate::plan_task::PLAN_TOOL_NAME).is_err(),
+            "kill-switch must remove plan.execute too (plans execute via delegation)"
+        );
+
+        unsafe { std::env::remove_var("ZEN_DELEGATE_ENABLED") };
+        zen_core::config::invalidate_config_cache();
+    }
+
     #[test]
     fn test_dispatch_hooks_pipeline_order() {
         let wiring = ZenWiring::new();
@@ -1449,5 +1740,156 @@ mod tests {
         let preview_line = line.lines().nth(1).expect("preview line");
         assert_eq!(preview_line.chars().count(), TOOL_PREVIEW_CHARS + 1);
         assert!(preview_line.ends_with('…'));
+    }
+
+    // ── 006 US2: turn quality gate ──────────────────────────────────────
+
+    fn reviewing_orchestrator(verdict: crate::review::SemanticVerdict) -> AgentOrchestrator {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let pipeline = QualityPipeline::new().with_semantic_reviewer(move |_t, _p, _d| {
+            let verdict = verdict.clone();
+            Box::pin(async move { verdict })
+        });
+        AgentOrchestrator::with_token_budget(router, 10_000_000).with_quality_pipeline(pipeline)
+    }
+
+    #[tokio::test]
+    async fn gate_records_review_notes_on_every_turn() {
+        let orchestrator =
+            reviewing_orchestrator(crate::review::SemanticVerdict::approve("semantics sound"));
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        let execution = orchestrator
+            .execute(&mut session, "summarize the architecture")
+            .await
+            .unwrap();
+        let notes = execution
+            .metadata
+            .quality_notes
+            .expect("gate must record review notes");
+        assert!(notes.contains("Momus gate: APPROVED"), "notes: {notes}");
+        // delivery_ready is a genuine gate verdict (Hermes may legitimately
+        // reject a degenerate mock answer), so only the verdict shape is
+        // asserted here — outcome coverage lives in the veto tests below.
+    }
+
+    #[tokio::test]
+    async fn streaming_gate_appends_warning_when_not_ready() {
+        let orchestrator = reviewing_orchestrator(crate::review::SemanticVerdict::reject(
+            "hallucinated key id",
+        ));
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        session.sensitivity_policy = Sensitivity::Confidential;
+        let mut streamed = String::new();
+        let response = orchestrator
+            .execute_stream(&mut session, "rotate the signing keys", |chunk| {
+                streamed.push_str(chunk)
+            })
+            .await
+            .unwrap();
+        assert!(!response.is_empty());
+        assert!(
+            streamed.contains("quality gate: delivery not ready"),
+            "streamed intermediates must carry the not-ready warning: {streamed}"
+        );
+    }
+
+    #[test]
+    fn turn_review_task_blast_radius_follows_sensitivity() {
+        let public = AgentOrchestrator::turn_review_task("summarize", Sensitivity::Public);
+        assert_eq!(
+            crate::review::pipeline::classify_blast_radius(&public),
+            crate::review::pipeline::BlastRadius::Low
+        );
+        let confidential =
+            AgentOrchestrator::turn_review_task("summarize", Sensitivity::Confidential);
+        assert_eq!(
+            crate::review::pipeline::classify_blast_radius(&confidential),
+            crate::review::pipeline::BlastRadius::High
+        );
+    }
+    #[tokio::test]
+    async fn gate_ladder_runs_exactly_one_feedback_round_on_momus_veto() {
+        let orchestrator = {
+            let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+                default_provider: Some("mock".to_string()),
+                ..Default::default()
+            });
+            AgentOrchestrator::with_token_budget(router, 10_000_000)
+        };
+        let task = AgentOrchestrator::turn_review_task("restructure storage", Sensitivity::Public);
+        // Deterministic Momus veto: create + delete across 2+ sentences is
+        // a blocking PlanInconsistency finding.
+        let vetoing = "create the users table. delete the users table.";
+        let mut redrafts = 0usize;
+        let (review, feedback_rounds, redrafted) = AgentOrchestrator::review_with_feedback_round(
+            &orchestrator.quality_pipeline,
+            &task,
+            vetoing,
+            |feedback| {
+                redrafts += 1;
+                assert!(
+                    feedback.contains("rejected by the quality gate"),
+                    "redraft must receive the veto feedback: {feedback}"
+                );
+                Ok(AgentExecution {
+                    agent_name: "Sisyphus".to_string(),
+                    response: "kept the table, only migrated it".to_string(),
+                    metadata: ExecutionMetadata {
+                        tokens_used: 1,
+                        cost_estimate: 0.0,
+                        model_used: "mock".to_string(),
+                        duration_ms: 0,
+                        sensitivity: Sensitivity::Public,
+                        quality_notes: None,
+                        delivery_ready: true,
+                    },
+                    tool_calls: Vec::new(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(feedback_rounds, 1, "a Momus veto gets exactly one redraft");
+        assert_eq!(redrafts, 1, "never more than one feedback round");
+        assert!(redrafted.is_some(), "the redrafted execution rides back");
+        assert!(
+            review.plan_approved,
+            "redrafts must receive the final re-review verdict: {review:?}"
+        );
+        assert!(
+            review.review_notes.contains("Momus gate: APPROVED"),
+            "the clean redraft passes the re-review: {review:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_ladder_skips_feedback_round_when_approved() {
+        let orchestrator = {
+            let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+                default_provider: Some("mock".to_string()),
+                ..Default::default()
+            });
+            AgentOrchestrator::with_token_budget(router, 10_000_000)
+        };
+        let task = AgentOrchestrator::turn_review_task("summarize", Sensitivity::Public);
+        let mut redrafts = 0usize;
+        let (review, feedback_rounds, redrafted) = AgentOrchestrator::review_with_feedback_round(
+            &orchestrator.quality_pipeline,
+            &task,
+            "1. Create the feature\n2. Add tests\n3. Verify pass",
+            |_| {
+                redrafts += 1;
+                unreachable!("no redraft may run when the gate approves");
+            },
+        )
+        .await
+        .unwrap();
+        assert!(review.plan_approved);
+        assert_eq!(feedback_rounds, 0);
+        assert_eq!(redrafts, 0);
+        assert!(redrafted.is_none());
     }
 }

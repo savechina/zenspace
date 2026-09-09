@@ -351,7 +351,7 @@ fn render_skill_md(draft: &SkillDraft) -> String {
     md
 }
 
-fn append_audit(logs_dir: &Path, event: serde_json::Value) -> Result<()> {
+pub(crate) fn append_audit(logs_dir: &Path, event: serde_json::Value) -> Result<()> {
     fs::create_dir_all(logs_dir)
         .with_context(|| format!("create logs dir: {}", logs_dir.display()))?;
     let path = logs_dir.join("audit.jsonl");

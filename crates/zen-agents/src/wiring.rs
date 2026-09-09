@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use rig_compose::budget::{AtomicBudget, DispatchBudgetHook};
 use rig_compose::context::InvestigationContext;
-use rig_compose::delegate::DelegateRegistry;
 use rig_compose::normalizer::ToolDispatchHook;
 use rig_compose::registry::{KernelError, SkillRegistry, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
@@ -201,7 +200,6 @@ fn instantiate_plugin(
 pub struct ZenWiring {
     pub skills: SkillRegistry,
     pub tools: ToolRegistry,
-    pub delegates: DelegateRegistry,
     pub memvid_store: Option<rig_memvid::MemvidStore>,
     pub tool_sensitivity: HashMap<String, Sensitivity>,
     sandbox_mode: SandboxMode,
@@ -289,7 +287,6 @@ impl ZenWiring {
 
         let skills = SkillRegistry::new();
         let mut tools = ToolRegistry::new();
-        let delegates = DelegateRegistry::new();
 
         skills.register(Arc::new(zen_vault::WikiCompiler::new()));
         skills.register(Arc::new(zen_vault::LearningLoop::new()));
@@ -491,7 +488,6 @@ impl ZenWiring {
         Self {
             skills,
             tools,
-            delegates,
             memvid_store,
             tool_sensitivity,
             sandbox_mode: mode,
@@ -841,19 +837,12 @@ mod tests {
     }
 
     #[test]
-    fn zen_wiring_delegates_is_empty() {
-        let wiring = ZenWiring::new();
-        assert!(wiring.delegates.is_empty());
-    }
-
-    #[test]
     fn zen_wiring_default_matches_new() {
         let wiring1 = ZenWiring::new();
         let wiring2 = ZenWiring::default();
 
         assert_eq!(wiring1.skills.len(), wiring2.skills.len());
         assert_eq!(wiring1.tools.len(), wiring2.tools.len());
-        assert_eq!(wiring1.delegates.len(), wiring2.delegates.len());
     }
 
     #[test]

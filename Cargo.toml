@@ -65,6 +65,7 @@ clap-verbosity-flag = { version = "3.0.4", features = ["tracing"] }
 
 # Scheduler (ZenScheduler — cron expression parsing, D11)
 cron = "0.17"
+chrono-tz = "0.10"
 
 # macOS Keychain (FR-061)
 security-framework = "3.0"

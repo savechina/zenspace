@@ -208,9 +208,10 @@ impl AgentExecutor {
                 },
                 duration_ms,
                 sensitivity,
+                quality_notes: None,
+                delivery_ready: true,
             },
             tool_calls: Vec::new(),
-            sub_agent_results: Vec::new(),
         })
     }
 

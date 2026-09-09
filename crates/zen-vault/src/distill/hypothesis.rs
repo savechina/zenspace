@@ -810,7 +810,7 @@ pub fn reverify(
     now: DateTime<Utc>,
     older_than: chrono::Duration,
 ) -> Result<usize> {
-    reverify_with_rejections(hypotheses_dir, wiki_dir, now, older_than).map(|(count, _)| count)
+    reverify_with_rejections(hypotheses_dir, wiki_dir, now, older_than).map(|(_, count, _)| count)
 }
 
 /// As [`reverify`], but also returns every hypothesis that transitioned to
@@ -835,13 +835,14 @@ pub fn reverify_with_rejections(
     wiki_dir: &Path,
     now: DateTime<Utc>,
     older_than: chrono::Duration,
-) -> Result<(usize, Vec<RejectedHypothesis>)> {
+) -> Result<(usize, usize, Vec<RejectedHypothesis>)> {
     let mut count = 0;
+    let mut validated = 0;
     let mut rejected = Vec::new();
     let cutoff = now - older_than;
 
     if !hypotheses_dir.is_dir() {
-        return Ok((0, Vec::new()));
+        return Ok((0, 0, Vec::new()));
     }
 
     for entry in fs::read_dir(hypotheses_dir).with_context(|| {
@@ -902,6 +903,7 @@ pub fn reverify_with_rejections(
                 );
                 h.status = HypothesisStatus::Validated;
                 transitioned = true;
+                validated += 1;
             }
 
             // Check 2: subject_entity page missing from wiki_dir → Rejected.
@@ -950,7 +952,7 @@ pub fn reverify_with_rejections(
         }
     }
 
-    Ok((count, rejected))
+    Ok((validated, count, rejected))
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -1339,8 +1341,9 @@ mod tests {
         f.set_times(std::fs::FileTimes::new().set_modified(old_time))
             .unwrap();
 
-        let (count, rejected) =
+        let (validated, count, rejected) =
             reverify_with_rejections(&hypo_dir, &wiki_dir, Utc::now(), Duration::days(7)).unwrap();
+        assert_eq!(validated, 0);
         assert_eq!(count, 1);
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].claim, "rust makes distill faster");

@@ -448,6 +448,10 @@ pub struct AgenticConfig {
     pub tool_loop: ToolLoopConfig,
     /// Agent quality-gate tuning — TOML `[agentic.review]` (T092).
     pub review: ReviewConfig,
+    /// Delegate sub-agent tuning — TOML `[agentic.delegate]` (006).
+    pub delegate: DelegateConfig,
+    /// Orchestrator tool surface — TOML `[agentic.orchestrator]` (T378).
+    pub orchestrator: OrchestratorConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -640,6 +644,108 @@ impl ReviewConfig {
     /// tasks (default true).
     pub fn llm_review_high_blast_or_default(&self) -> bool {
         self.llm_review_high_blast.unwrap_or(true)
+    }
+}
+
+/// Delegate sub-agent configuration — TOML `[agentic.delegate]` (006).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates the `delegate.task` tool — the model-driven
+///   sub-agent delegation path (real LLM sub-turns, depth-1 by grants).
+/// - User impact: `enabled = false` removes the tool from every agent's
+///   reachable set, so turns never delegate (status quo ante 006).
+/// - Default: enabled=true, timeout_secs=300 (clamped 30..=1800).
+/// - Interaction: the kill-switch only gates tool registration; sub-agent
+///   depth-1 exclusion and the token-budget gate apply independently.
+const DELEGATE_TIMEOUT_DEFAULT: u64 = 300;
+const DELEGATE_TIMEOUT_MIN: u64 = 30;
+const DELEGATE_TIMEOUT_MAX: u64 = 1800;
+const DELEGATE_DEPTH_DEFAULT: u32 = 1;
+const DELEGATE_DEPTH_MIN: u32 = 1;
+const DELEGATE_DEPTH_MAX: u32 = 3;
+const DELEGATE_CONCURRENT_DEFAULT: u32 = 4;
+const DELEGATE_CONCURRENT_MIN: u32 = 1;
+const DELEGATE_CONCURRENT_MAX: u32 = 8;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct DelegateConfig {
+    /// Delegate tool availability (absent → true).
+    pub enabled: Option<bool>,
+    /// Wall-clock budget per delegated sub-turn in seconds
+    /// (absent → 300, clamped 30..=1800).
+    pub timeout_secs: Option<u64>,
+    /// Delegation chain depth cap (absent → 1, clamped 1..=3).
+    /// 1 = orchestrator-only delegation (006 depth-1 behavior);
+    /// the 001 A.1 hierarchy target is 3 (L0→L1→L2).
+    pub max_depth: Option<u32>,
+    /// Parallel fan-out width for multi-task delegation
+    /// (absent → 4, clamped 1..=8).
+    pub max_concurrent: Option<u32>,
+}
+
+impl DelegateConfig {
+    /// Whether `delegate.task` is registered at all (default true).
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Effective per-delegation wall-clock budget (default 300, clamped).
+    pub fn timeout_or_default(&self) -> u64 {
+        self.timeout_secs
+            .unwrap_or(DELEGATE_TIMEOUT_DEFAULT)
+            .clamp(DELEGATE_TIMEOUT_MIN, DELEGATE_TIMEOUT_MAX)
+    }
+
+    /// Effective delegation depth cap (default 1, clamped 1..=3).
+    pub fn max_depth_or_default(&self) -> u32 {
+        self.max_depth
+            .unwrap_or(DELEGATE_DEPTH_DEFAULT)
+            .clamp(DELEGATE_DEPTH_MIN, DELEGATE_DEPTH_MAX)
+    }
+
+    /// Effective parallel fan-out width (default 4, clamped 1..=8).
+    pub fn max_concurrent_or_default(&self) -> u32 {
+        self.max_concurrent
+            .unwrap_or(DELEGATE_CONCURRENT_DEFAULT)
+            .clamp(DELEGATE_CONCURRENT_MIN, DELEGATE_CONCURRENT_MAX)
+    }
+}
+
+/// Orchestrator tool surface — TOML `[agentic.orchestrator]` (T378).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct OrchestratorConfig {
+    /// `full` (default) keeps Sisyphus's direct tool grants;
+    /// `delegation-only` strips every direct tool so all work happens
+    /// in scoped sub-agents via delegate.task / plan.execute
+    /// (001 A.8 ultra surface). Unknown values fall back to `full`.
+    pub surface: Option<String>,
+}
+
+pub const ORCHESTRATOR_SURFACE_DELEGATION_ONLY: &str = "delegation-only";
+pub const ORCHESTRATOR_SURFACE_FULL: &str = "full";
+
+impl OrchestratorConfig {
+    /// Effective surface string; invalid values warn and degrade to
+    /// `full` (a typo must never strip the orchestrator's tools).
+    pub fn surface_or_default(&self) -> &'static str {
+        match self.surface.as_deref() {
+            Some(ORCHESTRATOR_SURFACE_DELEGATION_ONLY) => ORCHESTRATOR_SURFACE_DELEGATION_ONLY,
+            Some(ORCHESTRATOR_SURFACE_FULL) | None => ORCHESTRATOR_SURFACE_FULL,
+            Some(other) => {
+                tracing::warn!(
+                    surface = other,
+                    "invalid [agentic.orchestrator] surface; falling back to full"
+                );
+                ORCHESTRATOR_SURFACE_FULL
+            }
+        }
+    }
+
+    /// True when the orchestrator must run delegation-only.
+    pub fn delegation_only(&self) -> bool {
+        self.surface_or_default() == ORCHESTRATOR_SURFACE_DELEGATION_ONLY
     }
 }
 
@@ -1593,6 +1699,19 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
         loop_cfg: merge_loop(base.loop_cfg, ov.loop_cfg),
         tool_loop: merge_tool_loop(base.tool_loop, ov.tool_loop),
         review: merge_review(base.review, ov.review),
+        delegate: merge_delegate(base.delegate, ov.delegate),
+        orchestrator: OrchestratorConfig {
+            surface: ov.orchestrator.surface.or(base.orchestrator.surface),
+        },
+    }
+}
+
+fn merge_delegate(base: DelegateConfig, ov: DelegateConfig) -> DelegateConfig {
+    DelegateConfig {
+        enabled: ov.enabled.or(base.enabled),
+        timeout_secs: ov.timeout_secs.or(base.timeout_secs),
+        max_depth: ov.max_depth.or(base.max_depth),
+        max_concurrent: ov.max_concurrent.or(base.max_concurrent),
     }
 }
 
@@ -1895,6 +2014,8 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_loop_env(&mut config.agentic.loop_cfg);
     apply_tool_loop_env(&mut config.agentic.tool_loop);
     apply_review_env(&mut config.agentic.review);
+    apply_delegate_env(&mut config.agentic.delegate);
+    apply_orchestrator_env(&mut config.agentic.orchestrator);
     apply_skills_env(&mut config.skills.auto_route);
     config
 }
@@ -1920,6 +2041,33 @@ fn apply_review_env(cfg: &mut ReviewConfig) {
     }
     if let Some(v) = env_bool("ZEN_REVIEW_LLM_HIGH_BLAST") {
         cfg.llm_review_high_blast = Some(v);
+    }
+}
+
+fn apply_delegate_env(cfg: &mut DelegateConfig) {
+    if let Some(v) = env_bool("ZEN_DELEGATE_ENABLED") {
+        cfg.enabled = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_DELEGATE_TIMEOUT_SECS")
+        && let Ok(n) = v.parse::<u64>()
+    {
+        cfg.timeout_secs = Some(n);
+    }
+    if let Some(v) = env_str("ZEN_DELEGATE_MAX_DEPTH")
+        && let Ok(n) = v.parse::<u32>()
+    {
+        cfg.max_depth = Some(n);
+    }
+    if let Some(v) = env_str("ZEN_DELEGATE_MAX_CONCURRENT")
+        && let Ok(n) = v.parse::<u32>()
+    {
+        cfg.max_concurrent = Some(n);
+    }
+}
+
+fn apply_orchestrator_env(cfg: &mut OrchestratorConfig) {
+    if let Some(v) = env_str("ZEN_ORCHESTRATOR_SURFACE") {
+        cfg.surface = Some(v);
     }
 }
 
@@ -2203,6 +2351,33 @@ pub fn consolidation_time(config: &ZenConfig) -> &str {
 /// Uses `subconscious_interval_minutes` to produce `"0 */N * * * *"`, falling
 /// back to `"0 */5 * * * *"` when the field is unset or invalid.
 impl CronConfig {
+    /// Resolve the IANA timezone cron schedules are evaluated in (E11).
+    ///
+    /// Scope logic:
+    /// - Functionality: interprets wall-clock fields in worker cron
+    ///   expressions ("9am", "2-4h") against this zone instead of Utc
+    /// - User impact: `CronConfig::default()` ships `Asia/Shanghai`, so the
+    ///   historical Utc-only behavior is restored to what the defaults
+    ///   always claimed; `ZEN_CRON_TZ` overrides per standard 5-layer config
+    /// - Default: Utc when unset or unparsable — a typo must never silently
+    ///   shift every schedule; the scheduler logs a warn on fallback
+    /// - Interaction: only affects schedule matching; worker `ctx.now` stays
+    ///   an absolute Utc instant
+    pub fn timezone_or_default(&self) -> chrono_tz::Tz {
+        match self.timezone.as_deref().map(str::parse) {
+            Some(Ok(tz)) => tz,
+            other => {
+                if other.is_some() {
+                    tracing::warn!(
+                        timezone = ?self.timezone,
+                        "cron: unparsable timezone, falling back to Utc"
+                    );
+                }
+                chrono_tz::UTC
+            }
+        }
+    }
+
     /// Generate a cron expression for the daily-log worker.
     pub fn daily_log_schedule(&self) -> Option<String> {
         self.subconscious_interval_minutes
@@ -2304,6 +2479,64 @@ mod tests {
         assert!(!config.sandbox.wasm.allow_filesystem_write);
         assert!(!config.sandbox.wasm.allow_network);
         assert!(!config.sandbox.wasm.allow_system);
+    }
+
+    #[test]
+    fn cron_timezone_or_default_parses_and_falls_back() {
+        let mut cfg = CronConfig::default();
+        assert_eq!(cfg.timezone_or_default(), chrono_tz::Asia::Shanghai);
+        cfg.timezone = Some("Not/AZone".into());
+        assert_eq!(cfg.timezone_or_default(), chrono_tz::UTC);
+        cfg.timezone = None;
+        assert_eq!(cfg.timezone_or_default(), chrono_tz::UTC);
+    }
+
+    #[test]
+    fn delegate_config_defaults_clamps_and_merges() {
+        let cfg = DelegateConfig::default();
+        assert!(cfg.enabled_or_default());
+        assert_eq!(cfg.timeout_or_default(), 300);
+
+        let clamped = DelegateConfig {
+            enabled: Some(false),
+            timeout_secs: Some(5),
+            max_depth: Some(9),
+            max_concurrent: Some(99),
+        };
+        assert!(!clamped.enabled_or_default());
+        assert_eq!(clamped.timeout_or_default(), 30);
+        assert_eq!(clamped.max_depth_or_default(), 3);
+        assert_eq!(clamped.max_concurrent_or_default(), 8);
+
+        let deeper = DelegateConfig {
+            max_depth: Some(3),
+            ..DelegateConfig::default()
+        };
+        assert_eq!(deeper.max_depth_or_default(), 3);
+
+        let ultra = OrchestratorConfig {
+            surface: Some(ORCHESTRATOR_SURFACE_DELEGATION_ONLY.to_string()),
+        };
+        assert!(ultra.delegation_only());
+        assert!(!OrchestratorConfig::default().delegation_only());
+        let typo = OrchestratorConfig {
+            surface: Some("delegation_only!".to_string()),
+        };
+        assert!(!typo.delegation_only(), "invalid surface degrades to full");
+        let merged_orch = merge_agentic(
+            AgenticConfig::default(),
+            AgenticConfig {
+                orchestrator: ultra,
+                ..AgenticConfig::default()
+            },
+        );
+        assert!(merged_orch.orchestrator.delegation_only());
+
+        let merged = merge_delegate(DelegateConfig::default(), clamped.clone());
+        assert!(!merged.enabled_or_default());
+        assert_eq!(merged.timeout_or_default(), 30);
+        let base_wins = merge_delegate(clamped, DelegateConfig::default());
+        assert!(!base_wins.enabled_or_default());
     }
 
     #[test]

@@ -26,6 +26,7 @@ use zen_vault::graph_router::{DocExtractor, is_routable_extension};
 use zen_vault::{DistillationPipeline, Reindexer};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
+use super::promotion_worker::{PromotionTarget, PromotionWorker};
 
 /// Return the path to the last cycle report file.
 ///
@@ -1136,11 +1137,44 @@ impl ZenWorker for ZenLoopWorker {
                 chrono::Utc::now(),
                 chrono::Duration::days(loop_cfg.reverify_older_than_days_or_default() as i64),
             ) {
-                Ok((reverified, rejected)) => {
+                Ok((validated, reverified, rejected)) => {
+                    report.hypotheses_validated = validated;
                     report.hypotheses_reverified = reverified;
+                    report.hypotheses_rejected = rejected.len();
                     record_rejected_hypotheses(&paths, &rejected);
                 }
                 Err(e) => warn!(error = %e, "loop: hypothesis reverify failed (non-fatal)"),
+            }
+
+            // ── Stage 5d: Promotion staging (PD-06 fusion) ─────────────────
+            // Validated hypotheses become Hybrid C promotion proposals in the
+            // same cycle that validates them. Absorbs the former nightly
+            // discover-loop worker; stage_from_validated is idempotent per
+            // source slug. Gated with 5c: no refinement ⇒ no new validations
+            // ⇒ nothing to stage.
+            match zen_vault::distill::load_all(&hypotheses_dir) {
+                Ok(slugs) => {
+                    let promoter = PromotionWorker::new(paths.logs(), paths.skills());
+                    match promoter.stage_from_validated(&paths.logs(), &slugs) {
+                        Ok(staged) => {
+                            report.promotions_applied = staged;
+                            report.skills_precipitated = promoter
+                                .pending(&paths.logs())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter(|item| item.target == PromotionTarget::SkillDraft)
+                                        .count()
+                                })
+                                .unwrap_or(0);
+                            if staged > 0 {
+                                info!(staged, "loop: promotions staged for Hybrid C gates");
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "loop: promotion staging failed (non-fatal)"),
+                    }
+                }
+                Err(e) => warn!(error = %e, "loop: hypothesis load for staging failed"),
             }
         }
 
@@ -1406,7 +1440,7 @@ mod tests {
         f.set_times(std::fs::FileTimes::new().set_modified(old_time))
             .unwrap();
 
-        let (_, rejected) = zen_vault::distill::reverify_with_rejections(
+        let (_, _, rejected) = zen_vault::distill::reverify_with_rejections(
             &hypo_dir,
             &wiki_dir,
             chrono::Utc::now(),

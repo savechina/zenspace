@@ -1,26 +1,29 @@
 #!/bin/bash
 # PURPOSE: Drop-in replacement for bin/zen with full test isolation.
-#          Same as `zen` but all data goes to .zentest/ (project-local).
+#          Same as `zen` but all data goes to $HOME/.zentest/ (global dev loop).
 #          ~/.zen is NEVER touched — production stays clean.
-#          Test data persists for debugging across runs.
+#          Test data persists for debugging across runs and repos.
 # USAGE:   bin/test-zen                          # opens TUI in isolated env
 #          bin/test-zen note create "test"       # runs command in isolated env
 #          bin/test-zen workspace init           # init in isolated env
-# EXPECTED: Identical behavior to bin/zen, all data in .zentest/
+# EXPECTED: Identical behavior to bin/zen, all data in ~/.zentest/
 # ERRORS:  Binary not built → `cargo build -p zen` first.
 #
 # Isolation:
-#   ZEN_HOME=.zentest      → ZenPaths.global_root = .zentest/ (not ~/.zen)
-#   HOME=/tmp/zen-tmp-XXX  → safety net: prevents any accidental ~/.zen fallback
+#   ZEN_HOME=$HOME/.zentest → ZenPaths.global_root = ~/.zentest/ (not ~/.zen)
+#   HOME=/tmp/zen-tmp-XXX     → safety net: prevents any accidental ~/.zen fallback
+#   (ZEN_TEST_DIR is resolved from the REAL home BEFORE the HOME override,
+#   so persistence survives the safety net.)
 #
 # Data management:
-#   Default: data persists in .zentest/ for debugging
-#   ZEN_TEST_CLEAN=1: wipe .zentest/ before run (fresh state)
-#   rm -rf .zentest/: manual cleanup
+#   Default: data persists in ~/.zentest/ for debugging
+#   ZEN_TEST_CLEAN=1: wipe ~/.zentest/ before run (fresh state)
+#   rm -rf ~/.zentest/: manual cleanup
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ZEN_TEST_DIR=".zentest"
+REAL_HOME="$HOME"
+ZEN_TEST_DIR="$REAL_HOME/.zentest"
 
 if [[ ! -f target/debug/zen ]]; then
   echo "==> Building zen binary..."
@@ -32,7 +35,7 @@ if [[ "${ZEN_TEST_CLEAN:-0}" == "1" ]]; then
   rm -rf "$ZEN_TEST_DIR"
 fi
 
-# Create .zentest if missing
+# Create ~/.zentest if missing
 mkdir -p "$ZEN_TEST_DIR"
 
 # Safety net: HOME points to temp dir so ~/.zen is never reached

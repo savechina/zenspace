@@ -88,7 +88,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
 | zen-repo | Unified data layer: SqliteClient + 9 domain repositories (FTS5, vec0, graph) | `crates/zen-repo/` |
 | zen-vault | 10+ services: note, wiki, search, distill, tindy, notion, ingest, graph_verify, intent | `crates/zen-vault/` |
-| zen-agents | 13 agents, 4-tier registry, blackboard, QualityPipeline | `crates/zen-agents/` |
+| zen-agents | 13 agents, 4-tier registry, QualityPipeline, plan-DAG executor | `crates/zen-agents/` |
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
 | zen-auth | Keychain + SecretRef resolution | `crates/zen-auth/` |
 | zen-plugin | Agent tools, WASM sandbox (wasmtime), MCP client, plugin registry | `crates/zen-plugin/` |
@@ -129,7 +129,7 @@ zen-provider → zen-core
 zen wiki distill → zen-vault (DistillationPipeline) → notion extraction → wiki compile → archive
 zen wiki loop run → ZenLoopWorker → budget gate → distill (normalize/txn/checkpoint) → ORAV self-correction → graph verify → hypothesis incubation → wisdom hooks → report/gaps/git
 zen wiki rebuild-memory → RPC to zen-gateway daemon → MemvidIndexer full reindex → replay from jsonl
-zen session start → zen-agents (ZenCoordinator) → blackboard → executor
+zen session start → zen-agents (AgentOrchestrator: INTENT_SIGNALS route → tool loop → quality gate) → executor
 zen wiki reindex → zen-vault (Reindexer, checksums, embeddings)
 zen wiki lint    → zen-vault (Linter, orphan pages, broken wikilinks)
 zen serve start  → zen-gateway daemon + ZenScheduler (cron workers: journal, dream, wisdom, subconscious)
@@ -195,14 +195,13 @@ zenspace/
 │   │       ├── registry.rs     # AgentRegistry, DefaultAgentRegistry
 │   │       ├── agent_profile.rs # Profile, Role, SensitivityLevel, LlmPreference
 │   │       ├── zen_agent.rs    # ZenAgent, IdentityContext, load_identity_files
-│   │       ├── orchestrator.rs # AgentOrchestrator
-│   │       ├── coordinator.rs  # ZenCoordinator
-│   │       ├── blackboard.rs   # Blackboard, Deliverable, Feedback, SystemEvent
+│   │       ├── orchestrator.rs # AgentOrchestrator (INTENT_SIGNALS routing, delegate.task, quality gate)
+│   │       ├── delegate_task.rs # DelegateTaskTool (006: real-LLM sub-turn delegation, depth-1 guard)
 │   │       ├── executor.rs     # AgentExecutor, RetryPolicy, ErrorCategory
 │   │       ├── execution.rs    # AgentExecution, ToolCall
 │   │       ├── review.rs       # QualityPipeline (Metis→Momus→Hermes→Zeus)
 │   │       ├── sandbox.rs      # WasmSandbox (wasmtime), ResourceLimits
-│   │       ├── scheduler/     # ZenScheduler: cron-driven ~30s tick, 15 background workers (session-journaler, dream, memory-curator, memvid-indexer, subconscious, notion-extractor, wiki-compiler, commitment-tracker, reflection, wisdom-synth, decision-tracker, express, evidence-gatherer, zen-loop, morning-brief)
+│   │       ├── scheduler/     # ZenScheduler: cron-driven ~30s tick, 16 background workers (session-journaler, dream, memory-curator, memvid-indexer, subconscious, notion-extractor, wiki-compiler, commitment-tracker, reflection, wisdom-synth, decision-tracker, express, evidence-gatherer, promotion, zen-loop, morning-brief)
 │   │       └── wiring.rs       # ZenWiring (DI wiring)
 │   ├── zen-provider/           # Multi-provider LLM routing
 │   │   └── src/
@@ -268,7 +267,7 @@ zenspace/
 |------|----------|-------|
 | Register agent | `crates/zen-agents/src/registry.rs` | DefaultAgentRegistry |
 | Agent definition | `crates/zen-agents/src/zen_agent.rs` | ZenAgentBuilder |
-| Blackboard change | `crates/zen-agents/src/blackboard.rs` | 4-channel shared memory |
+| Plan-DAG tool change | `crates/zen-agents/src/plan_task.rs` | plan.execute workflow executor (T375) |
 | Quality gate | `crates/zen-agents/src/review.rs` | Metis→Momus→Hermes→Zeus pipeline |
 | Sandbox extension | `crates/zen-agents/src/sandbox.rs` | WasmSandbox (wasmtime) |
 
@@ -507,6 +506,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen habit` | Habit tracking | `habit_command.rs` |
 | `zen goal` | Goal management | `goal_command.rs` |
 | `zen skill` | Skill management (list, run, progress, show, precipitate, confirm) | `skill_command.rs` |
+| `zen discover` | Self-learning gate surface (PD-06): run (one zen-loop cycle now — stages 5b/5c/5d), stage/queue, confirm/reject (Hybrid C promotion gate; BeliefEvidence applies `Belief::update` on confirm), report (discover metrics, reads `loop-last-report.json`), arena (distill regression gate vs baselines/external CLIs — losses recorded, never staged) | `discover_command.rs` |
 
 ## AGENT TOOL INVENTORY (v0.0.6)
 
@@ -529,6 +529,8 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 | `system.*` (5 tools) | Public/Private | zen-plugin/platform/ | health/notifications/calendar/daemon/fs_watcher — fs_watcher capped at 8 (FR-045), seatbelt arg-registry mediated (FR-035) |
 | `plugin.wasm_sandbox` | Private | zen-plugin/wasm_sandbox.rs | Permission gate on every invoke (FR-029), StoreLimits memory cap (FR-030), single impl (FR-031) |
 | `tier2_search`/`tier4_search`/`compute_embeddings` | Private | zen-vault | KB search tools via ZenTool adapter |
+| `delegate.task` (006/T373/T374) | inherits session | zen-agents/delegate_task.rs | Model-driven sub-agent delegation: args `{agent, prompt, description}` single-task or `{tasks:[...]}` fan-out (≤8/batch, batch width ≤4 passes the consumer gate); sub-turn runs a real LLM loop (≤4 rounds) on a sub-agent whose grants keep `delegate.*` only below the depth cap (`max_depth` default 1, clamp 1..=3, tier matrix: O→O 拒, P→P/O 拒, Specialist/Worker leaf); `spawn_allowed` + task-local depth chain; `should_delegate` gates (independent/consumer-decision/bounded≤32k chars/worth-it) logged as `loop.delegate.gates` audit lines; fan-out results are slot-ordered (results[i] ≡ tasks[i], mixed reject+run batches included); concurrency `[agentic.delegate].max_concurrent` (default 4, clamp 1..=8, env `ZEN_DELEGATE_MAX_CONCURRENT`); lazily registered at first orchestrator turn, kill-switch `[agentic.delegate].enabled`; structured Ok-error outputs, never panics the round |
+| `plan.execute` (T375/T376) | Private | zen-agents/plan_task.rs | Sisyphus-only plan-DAG executor: args `{name?, tasks:[{id, agent, prompt, depends_on?}], resume_plan_id?}` (checkpoint replay matches task_id AND agent — agent-drift reruns); Kahn layering ≤12 tasks/≤3 layers; per-task hard gates via the SHARED `DelegateTaskTool::validate_task` path (known-agent/tier-matrix/depth-cap/bounded-32k — Sisyphus is rejected as a task agent by the O→O rule); per-layer parallel batches through delegate `run_single` (token budget + wall-clock timeout); `build_sub_agent` strips `plan.execute` unconditionally; upstream failure → downstream skipped; merged deliverable through QualityPipeline (Hermes verdict in output + `loop.plan.completed` audit); persists to state.db `workflow_plans`/`workflow_tasks` (migration 006) with per-task idempotent checkpoints; `resume_plan_id` replays ok-checkpoints, re-runs pending; resume is claim-fenced (migration 007 `workflow_plans.owner` + `WorkflowRepo::claim_plan` conditional UPDATE — one live resume per plan, same-owner re-claim ok, stale claims >3600s stealable, lost race → `already being resumed`); terminal plans refuse resume; shares the `[agentic.delegate]` kill-switch (plans execute via delegation) |
 
 ### Host-OS Safety Hardening (v0.0.6, FR-035..045)
 
@@ -624,7 +626,7 @@ Agents are registered in `DefaultAgentRegistry` across 4 tiers:
 
 | Tier | Role | Example |
 |------|------|---------|
-| Orchestrator | Session coordination, routing | `ZenCoordinator` |
+| Orchestrator | Session coordination, routing | `AgentOrchestrator` (Sisyphus) |
 | Planner | Task planning, decomposition | `AgentOrchestrator` |
 | Specialist | Domain expertise (search, consolidate) | Agent-specific |
 | Worker | Execution, tool calling | `AgentExecutor` |
@@ -639,9 +641,20 @@ Agents are registered in `DefaultAgentRegistry` across 4 tiers:
 
 5 states: `Active → Paused → Archived → Error → Complete`
 
-### Blackboard (4 Channels)
+### Plan-DAG Workflows (T375-T376)
 
-Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task`
+`plan.execute` (Sisyphus-only) executes a model-drafted DAG `{name?, tasks:[{id, agent, prompt, depends_on}]}`:
+Kahn layering (≤12 tasks, ≤3 layers), per-layer parallel batches via `run_single`
+(inherits all delegate gates), upstream failure → downstream skipped, merged
+deliverable through QualityPipeline (Hermes verdict = completion signal), one
+`loop.plan.completed` audit line. Persistence (T376): `workflow_plans` +
+`workflow_tasks` (migration 006, `WorkflowRepo`); checkpoints idempotent on
+(plan_id, task_id); `resume_plan_id` replays ok-checkpoints and re-runs the rest;
+plans stuck in `running` are resumable, terminal plans refuse.
+
+Superseded: the 001 ADR-009 Blackboard mandate — see
+`docs/specs/006-multi-agent-orchestration/adr-001-blackboard-supersession.md`
+(direct tool returns + batch aggregation replaced in-memory channels; blackboard.rs deleted).
 
 ## PROVIDER TAXONOMY
 
@@ -682,6 +695,7 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
   ```
 - Schema migrations are forward-only additive (Principle XIII); `_sqlx_migrations` tracks applied versions; `sqlx::migrate!()` runs all pending on every `SqliteClient::open()`
 - `docs/specs/001-agentic-foundation/` has extensive architecture docs (~400KB)
+- **Cron timezone (E11, 2026-09-06)**: worker cron wall-clock fields evaluate in `[cron].timezone` (IANA name; `CronConfig::default()` ships `Asia/Shanghai`; env `ZEN_CRON_TIMEZONE`, 5-layer) via `CronConfig::timezone_or_default()` → `ZenScheduler::with_timezone` (wired in `create_configured_scheduler`, the serve/TUI path); unparsable name → Utc + warn (a typo must never silently shift schedules). `create_default_scheduler` (dormant, config-free) stays Utc by design. Tick fire decision anchors on the passed tick instant (`Schedule::after`), never the system clock (`upcoming`) — deterministic; worker `ctx.now` remains an absolute Utc instant
 - Karpathy guidelines skill installed at `.opencode/skills/karpathy-guidelines/`
 - zen-llm exists in directory but is not a workspace member (staged for integration)
 
@@ -695,13 +709,29 @@ Shared memory between agents: `Deliverable` / `Feedback` / `SystemEvent` / `Task
 
 ## Recent Changes
 
+- **Multi-agent orchestration fusion (2026-09-07, 006-multi-agent-orchestration)** — dead parallel system replaced by model-driven delegation + real quality gate:
+  - `delegate.task` (D1-D3): `DelegateTaskTool` runs a REAL LLM sub-turn (≤4 rounds, own `AgentExecutor` + `build_sub_agent`) instead of the deleted skills-carrier stub; depth-1 guard strips `delegate.*` grants (overlay included); `SharedSensitivity` propagates session policy to the sub-agent's `AgentContext`; kill-switch `[agentic.delegate].enabled` (default true), `timeout_secs` clamp 30..=1800 (env `ZEN_DELEGATE_ENABLED`/`ZEN_DELEGATE_TIMEOUT_SECS`); args `{agent, prompt, description}`; unknown agent / bad args / exhausted budget / timeout all return structured Ok-error output (never panic the round). Lazy-registered at first orchestrator turn (`ensure_delegate_tool`) so `with_approval_callback`'s `Arc::get_mut` stays viable
+  - Quality gate (D4-D5): `execute()` runs `QualityPipeline` (Metis→Momus→Hermes + async `SemanticReviewer` on HIGH blast radius) after the tool loop; Momus veto triggers exactly ONE feedback round then re-review; `ExecutionMetadata` gains `quality_notes: Option<String>` + `delivery_ready: bool` (serde default_true — pre-gate payloads stay decodable); `execute_stream()` runs the gate post-hoc and appends a `⚠️ quality gate: delivery not ready` callback line on veto; audit line `loop.turn.review` (plan_approved/delivery_ready/feedback_rounds) appended to `logs/audit.jsonl` per turn
+  - INTENT_SIGNALS salvage (D6): `ZenCoordinator` (948 lines), `AgentExecution::sub_agent_results`, `ZenWiring.delegates`, and the stub delegation block deleted; keyword routing survives as the `INTENT_SIGNALS` const table — `classify_intent` returns `(agent, signal)`; the signal rides the `loop.turn.review` audit entry; `route()` facade unchanged
+  - Reflection (D7): unchanged — `SessionJournaler` remains the async post-turn writer
+  - Known landmine (pre-existing, untouched): all six zen-provider sync `complete()` impls (`Runtime::new()` at ollama.rs:97 et al.) panic under async contexts when a live local model exists; the streaming path is unaffected. C1 (Phase C) owns the `spawn_blocking` fix
+- **001 vision convergence (2026-09-08, 006 T372-T379 via /speckit-converge)** — the 001 multi-agent scheduling vision lands on the 006 kernel:
+  - T372 intent: `zen-agents/src/intent.rs` — LLM-first classification into `Intent{category: Query|Action|System|Conversation, agent, signal, acl, confidence, source}`; confidence<0.7 → Conversation fallback; LLM failure/timeout (20s) degrades to the INTENT_SIGNALS keyword fast path; `router.route()` wrapped in `spawn_blocking` (ollama nested-Runtime panic safety); audit `loop.turn.review` gains intent_category/intent_source/intent_confidence/intent_acl
+  - T373 depth: `[agentic.delegate].max_depth` (default 1, clamp 1..=3, env `ZEN_DELEGATE_MAX_DEPTH`); `spawn_allowed(parent_tier, child_tier)` matrix; task-local `DELEGATE_DEPTH`/`DELEGATE_PARENT` chain (root parent "Sisyphus"); `build_sub_agent(agent, allow_child_delegation)` keeps `delegate.*` grants strictly below the cap
+  - T374 fan-out: delegate.task `tasks:[...]` collect mode — `should_delegate` gates (independent/consumer-decision/bounded 32k/worth-it advisory 50k tokens) audited as `loop.delegate.gates`; `max_concurrent` (default 4, clamp 1..=8) bounded batches via join_all; single-task keeps the legacy shape, multi-task returns `{results:[...]}`
+  - T375 plan-DAG: `plan.execute` (see Agent Tool Inventory) — Kahn topological layers, per-layer parallel execution, failure propagation, Hermes verdict as completion signal, summary-only return (plan artifacts stay out of parent context)
+  - T376 persistence: migration 006 `workflow_plans`/`workflow_tasks` + `WorkflowRepo`/`TaskCheckpoint`; per-task idempotent checkpoints ((plan_id, task_id) upsert); `resume_plan_id` replay; resumed plans close out to completed/failed
+  - T377 blackboard superseded: `blackboard.rs` + tests deleted; ADR at `docs/specs/006-multi-agent-orchestration/adr-001-blackboard-supersession.md`; inter-agent transport = direct tool returns + batch aggregation
+  - T378 surface profile: `[agentic.orchestrator] surface = full|delegation-only` (default full, env `ZEN_ORCHESTRATOR_SURFACE`); delegation-only strips every Sisyphus direct tool — only delegate.task + plan.execute remain (001 A.8 ultra surface); invalid values warn + fail open to full
+  - T379 gates: bin/test 2291 passed / 0 failed / 19 skipped; clippy --workspace --all-targets -D warnings clean; fmt --check clean
+
 - Binary/library separation: zen (bin) + zen-cli (lib) architecture documented
 - 29 CLI commands documented with dispatch file paths
 - 5-layer config inheritance model (Default → embedded → global → workspace → env)
 - Unified data layer: `SqliteClient` (tokio-rusqlite writer + sqlx pool); 9 domain repositories (Principle XII)
 - 5-tier search pipeline: ripgrep → FTS5 → vec0 embeddings → entity graph → LLM
 - Provider routing: 13 named providers across 3 protocol types (rig-native, openai-compatible, anthropic-compatible)
-- Agent system: 13 agents in 4 tiers, 3-layer permissions, 4-channel blackboard, QualityPipeline
+- Agent system: 13 agents in 4 tiers, 3-layer permissions, QualityPipeline (blackboard superseded by 006 ADR-001)
 - Corrected `excute_command` → `execute_command` across all 24 command files
 - Documented framework patterns: clap derive, rig-core Client/CompletionModel, FTS5 schema
 - **Architecture remediation (2026-06-01)**:

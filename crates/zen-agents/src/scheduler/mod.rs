@@ -148,6 +148,9 @@ pub struct ZenScheduler {
     worker_costs: Arc<RwLock<HashMap<String, f64>>>,
     /// Monthly cost cap per worker (USD). Workers exceeding this are skipped.
     cost_cap_usd: f64,
+    /// Timezone cron wall-clock fields are evaluated against (E11).
+    /// Utc unless the caller wires `CronConfig::timezone_or_default()`.
+    tz: chrono_tz::Tz,
 }
 
 impl ZenScheduler {
@@ -157,7 +160,21 @@ impl ZenScheduler {
             tick_interval: Duration::from_secs(DEFAULT_TICK_INTERVAL_SECONDS),
             worker_costs: Arc::new(RwLock::new(HashMap::new())),
             cost_cap_usd: 10.0,
+            tz: chrono_tz::UTC,
         }
+    }
+
+    /// Evaluate cron schedules in `tz` (E11): worker wall-clock fields
+    /// ("0 0 9 * * *") then mean that zone's local time. Pairs with
+    /// `CronConfig::timezone_or_default()`; defaults to Utc.
+    pub fn with_timezone(mut self, tz: chrono_tz::Tz) -> Self {
+        self.tz = tz;
+        self
+    }
+
+    /// The timezone cron schedules are evaluated in.
+    pub fn timezone(&self) -> chrono_tz::Tz {
+        self.tz
     }
 
     /// Set the per-worker monthly LLM cost cap (USD).
@@ -250,11 +267,20 @@ impl ZenScheduler {
                 debug!(worker = %id, "scheduler: skipping worker (still in flight)");
                 continue;
             }
-            let should_fire = schedule.upcoming(Utc).next().is_some_and(|next| {
-                let diff = (next - now).num_seconds().unsigned_abs();
-                // Fire if the next scheduled time is within the tick window
-                diff < interval.as_secs() + 1
-            });
+            // Anchor on the passed `now` (via `after`), NOT `upcoming` —
+            // `upcoming` re-anchors on the real system clock, which makes
+            // the fire decision depend on wall time instead of the tick
+            // instant and breaks deterministic/triggered evaluation.
+            let should_fire = schedule
+                .after(&now.with_timezone(&self.tz))
+                .next()
+                .is_some_and(|next| {
+                    let diff = (next.with_timezone(&Utc) - now)
+                        .num_seconds()
+                        .unsigned_abs();
+                    // Fire if the next scheduled time is within the tick window
+                    diff < interval.as_secs() + 1
+                });
 
             if should_fire {
                 debug!(worker = %id, "scheduler: firing worker");
@@ -418,6 +444,9 @@ pub struct WorkerSummary {
 /// - `memvid-indexer` (MemvidIndexerWorker): runs nightly 1AM (cron: `0 0 1 * * *`), ingests journal, wiki, wisdom into memvid store
 /// - `evidence-gatherer` (EvidenceGatherer): runs weekly Mon 6AM (cron: `0 0 6 * * 1`), scans beliefs with low evidence count, generates research suggestions
 pub fn create_default_scheduler() -> ZenScheduler {
+    // Utc on purpose: this constructor never loads config (dormant-safe
+    // set). The production serve/TUI path uses create_configured_scheduler,
+    // which honors [cron].timezone / ZEN_CRON_TIMEZONE.
     let mut scheduler = ZenScheduler::new();
 
     // ── Critical workers: failure panics (memory pipeline broken without them) ──
@@ -471,6 +500,16 @@ pub fn create_default_scheduler() -> ZenScheduler {
     if let Err(e) = scheduler.register(MorningBriefWorker::new()) {
         warn!("scheduler: failed to register morning-brief worker (non-critical): {e}");
     }
+    if let Err(e) = scheduler.register(PromotionWorker::with_paths()) {
+        warn!("scheduler: failed to register promotion worker (non-critical): {e}");
+    }
+
+    // Knowledge-processing loop: the default scheduler enables zen-loop with
+    // its built-in interval; the configured scheduler gates it on
+    // [agentic.loop] instead. Kept set-equal with create_configured_scheduler.
+    if let Err(e) = scheduler.register(ZenLoopWorker::new()) {
+        warn!("scheduler: failed to register zen-loop worker (non-critical): {e}");
+    }
 
     scheduler
 }
@@ -480,7 +519,7 @@ pub fn create_default_scheduler() -> ZenScheduler {
 /// Uses `default_daily_log_schedule()` / `default_night_dream_schedule()` as
 /// fallbacks when config fields are `None`.
 pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
-    let mut scheduler = ZenScheduler::new();
+    let mut scheduler = ZenScheduler::new().with_timezone(config.timezone_or_default());
 
     let dl_schedule = config
         .daily_log_schedule()
@@ -552,6 +591,13 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
     //    the qqbot outbox; nightly distillation stays with DreamWorker.
     if let Err(e) = scheduler.register(MorningBriefWorker::new()) {
         warn!("scheduler: failed to register morning-brief worker: {e}");
+    }
+
+    // ── RSI promotion routing (PD-04, PD-06 fusion): daily 4am, validated
+    //    hypotheses → Hybrid C promotion queue. Staging itself moved into
+    //    zen-loop stage 5d; the confirmations stay manual via discover CLI.
+    if let Err(e) = scheduler.register(PromotionWorker::with_paths()) {
+        warn!("scheduler: failed to register promotion worker: {e}");
     }
 
     // ── Knowledge-processing loop (005-agentic-loop): interval + enabled
@@ -626,6 +672,57 @@ mod tests {
         assert!(result.is_err());
     }
 
+    struct CountingWorker(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl ZenWorker for CountingWorker {
+        fn id(&self) -> &'static str {
+            "count"
+        }
+        fn description(&self) -> &'static str {
+            "counts executions"
+        }
+        fn schedule(&self) -> &'static str {
+            "0 0 9 * * *"
+        }
+        async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(WorkerReport {
+                worker_id: "count".to_string(),
+                success: true,
+                fact_count: 0,
+                duration_ms: 0,
+                llm_cost_usd: 0.0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_evaluates_cron_in_configured_timezone() {
+        use chrono::TimeZone;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 2026-09-06 00:59:50 Utc == 08:59:50 Shanghai: the 9am cron is due
+        // within the tick window in Shanghai, 8h away in Utc.
+        let now = Utc.with_ymd_and_hms(2026, 9, 6, 0, 59, 50).unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut shanghai = ZenScheduler::new().with_timezone(chrono_tz::Asia::Shanghai);
+        shanghai
+            .register(CountingWorker(Arc::clone(&counter)))
+            .unwrap();
+        shanghai.tick(now).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "9am fires in Shanghai");
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut utc = ZenScheduler::new();
+        utc.register(CountingWorker(Arc::clone(&counter))).unwrap();
+        utc.tick(now).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "not due in Utc");
+    }
+
     #[test]
     fn test_invalid_cron_expression() {
         let mut scheduler = ZenScheduler::new();
@@ -655,7 +752,7 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 14);
+        assert_eq!(items.len(), 16);
         assert!(items.iter().any(|w| w.id == "memory-curator"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
@@ -670,5 +767,38 @@ mod tests {
         assert!(items.iter().any(|w| w.id == "memvid-indexer"));
         assert!(items.iter().any(|w| w.id == "evidence-gatherer"));
         assert!(items.iter().any(|w| w.id == "morning-brief"));
+        assert!(items.iter().any(|w| w.id == "promotion"));
+        assert!(items.iter().any(|w| w.id == "zen-loop"));
+    }
+
+    #[test]
+    fn test_create_configured_scheduler_core_workers() {
+        // zen-loop is config-gated (enabled flag via load_config), so only
+        // the 15 core workers are asserted unconditionally.
+        let scheduler = create_configured_scheduler(&CronConfig::default());
+        let items = scheduler.list();
+        assert!(items.len() >= 15);
+        for id in [
+            "memory-curator",
+            "dream",
+            "subconscious",
+            "session-journaler",
+            "notion-extractor",
+            "wiki-compiler",
+            "commitment-tracker",
+            "reflection-worker",
+            "wisdom-synth",
+            "decision-tracker",
+            "express",
+            "memvid-indexer",
+            "evidence-gatherer",
+            "morning-brief",
+            "promotion",
+        ] {
+            assert!(
+                items.iter().any(|w| w.id == id),
+                "configured scheduler missing worker '{id}'"
+            );
+        }
     }
 }

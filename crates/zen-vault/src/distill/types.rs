@@ -72,6 +72,14 @@ pub struct LoopCycleReport {
     pub refinement_user_questions: usize,
     /// Hypotheses transitioned by periodic re-verify (FR-028, Stage 5c).
     pub hypotheses_reverified: usize,
+    /// Hypotheses transitioned to Validated by re-verify (PD-04/G7).
+    pub hypotheses_validated: usize,
+    /// Hypotheses transitioned to Rejected by re-verify (PD-04/G7).
+    pub hypotheses_rejected: usize,
+    /// Skill drafts precipitated this cycle (FR-037, PD-04/G7).
+    pub skills_precipitated: usize,
+    /// Validated learnings applied to wiki/beliefs/skills (PD-04/G3).
+    pub promotions_applied: usize,
     /// Raw sources routed through the graph Router & Join (FR-030, Stage 3a).
     pub raw_sources_routed: usize,
     /// Notions joined into the graph from raw sources (FR-030, Stage 3a).

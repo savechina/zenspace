@@ -283,6 +283,16 @@ const BUILTIN_AGENT_NAMES: &[&str] = &[
     "Zeus",
 ];
 
+/// Public read access for delegate-target validation (006 delegate.task).
+pub fn builtin_agent_names() -> &'static [&'static str] {
+    BUILTIN_AGENT_NAMES
+}
+
+/// Whether `agent_name` is a valid delegation target.
+pub fn is_builtin_agent(agent_name: &str) -> bool {
+    BUILTIN_AGENT_NAMES.contains(&agent_name)
+}
+
 impl ZenDelegateTools {
     pub fn new(wiring: &ZenWiring, router: &DefaultRouter) -> Self {
         Self::with_tool_overlay(wiring, router, load_tool_grant_overlay())

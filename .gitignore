@@ -45,5 +45,3 @@ docs/book/
 .sisyphus/
 .fastembed_cache
 logs/
-
-bin/commit-005-rsi.sh

@@ -11,4 +11,6 @@ pub use momus::{MomusFinding, MomusFindingType, MomusReview, MomusReviewer};
 
 // Pipeline orchestrator stays in zen-agents (composes Momus + pure reviewers)
 pub mod pipeline;
-pub use pipeline::{PipelineResult, QualityPipeline};
+pub use pipeline::{
+    BlastRadius, PipelineResult, QualityPipeline, SemanticReviewer, SemanticVerdict,
+};

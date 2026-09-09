@@ -74,3 +74,26 @@
 **Depends on:** None
 
 **Completed:** 2026-08-27 (spec patch, no code change — analyze C4 first)
+
+## Review (2026-09-09 /review — orchestration pattern)
+
+### Orchestration test-lake — RESOLVED 2026-09-09 (all 9 landed same day)
+
+Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias tests; plan/delegate parse + resume negatives; chunking slot-order both sites; workflow_repo negatives + concurrent checkpoints (migration 007 `owner` claim fence included); orchestrator `review_with_feedback_round` seam (veto → 1 redraft → re-review final). Gates 2321/0/19. List below kept as historical record.
+
+### Original accepted debt (post /review fix round)
+
+**What:** ~9 cheap test gaps from the 2026-09-09 pre-landing review (fix round landed #1-#5 + core tests; these remain):
+1. intent.rs low-confidence (`Ok(None)`→Fallback) and timeout rungs untestable — MockProvider reply is fixed; needs a DefaultRouter mock-response seam or a pure gate fn
+2. intent.rs `IntentCategory::parse` aliases ("read"/"search"→Query, "write"/"execute"→Action, "admin"/"config"→System, "chat"/"help"→Conversation) + negative-confidence clamp — pure test
+3. plan_task parse_plan negatives (missing tasks key / empty array / non-string id-agent-prompt-dep)
+4. plan_task resume negatives (unknown plan_id error, resume without state.db)
+5. plan_task resume with failed/skipped checkpoints + dependent-of-replayed-ok interaction
+6. delegate parse_requests fan-out negatives (empty tasks[], item missing agent/prompt) + tier rejection via scoped DELEGATE_PARENT through invoke
+7. max_concurrent chunking untested at both fan-out sites (delegate_task.rs invoke, plan_task.rs layers) — wide-batch tests
+8. workflow_repo negatives (duplicate create_plan PK err, load_plan unknown→None, complete_plan no-op) + concurrent checkpoint_task against the single writer
+9. orchestrator Momus-veto feedback-round branch has no deterministic seam (plan_approved not injectable)
+
+**Why:** All are negative-path/concurrency/resume-edge lakes; the two CRITICAL contract bugs they guard (mixed-batch ordering, plan gate bypass) are already fixed + pinned, so these are hardening.
+**Context:** crates/zen-agents/src/{intent,plan_task,delegate_task}.rs, crates/zen-repo/src/workflow_repo.rs, crates/zen-agents/src/orchestrator.rs. Review session findings #6-#14.
+**Effort:** M (a day of test writing). **Priority:** P2. **Depends:** none.

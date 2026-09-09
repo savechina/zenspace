@@ -4,6 +4,7 @@ pub mod auth_command;
 pub mod chat_command;
 pub mod cleanup_command;
 pub mod config_command;
+pub mod discover_command;
 pub mod goal_command;
 pub mod habit_command;
 pub mod logs_command;

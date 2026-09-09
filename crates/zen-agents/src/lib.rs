@@ -1,14 +1,15 @@
 pub mod agent_profile;
-pub mod blackboard;
 pub mod completion_model;
 pub mod context;
-pub mod coordinator;
+pub mod delegate_task;
 pub mod delegate_tools;
 pub mod execution;
 pub mod executor;
+pub mod intent;
 pub mod observability;
 pub mod orchestrator;
 pub mod output_schema;
+pub mod plan_task;
 pub mod prompt;
 
 #[deprecated(
@@ -37,12 +38,7 @@ pub use agent_profile::{
     AgentClearance, AgentProfile, AgentProfileBuilder, Capability, CostPerToken, LlmPreference,
     Role,
 };
-pub use blackboard::{
-    Blackboard, BlackboardHandle, BlackboardTask, Deliverable, DeliverableMetadata, Feedback,
-    FeedbackErrorType, SystemEvent, ValidationStatus,
-};
 pub use context::AgentContext;
-pub use coordinator::{EntropyConfig, ZenCoordinator};
 pub use execution::{AgentExecution, ExecutionMetadata, ToolCall};
 pub use executor::{AgentExecutor, ErrorCategory, RetryPolicy};
 pub use observability::{emit_prompt_completed, emit_prompt_failed, emit_prompt_started};

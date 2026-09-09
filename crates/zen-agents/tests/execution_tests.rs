@@ -1,10 +1,10 @@
 // 4D Test: AgentExecution, ExecutionMetadata, ToolCall
 //
 // Dimensions:
-//   Normal: Minimal creation, recursive totals
-//   Reverse: Empty sub-agent results, zero costs
-//   Adversarial: Deeply nested sub-agents, overflow costs
-//   Logic Tree: Token/cost accumulation across hierarchy
+//   Normal: Minimal creation, flat token/cost totals
+//   Reverse: Empty tool calls, zero costs
+//   Adversarial: Overflow costs, many tool calls
+//   Logic Tree: Metadata defaults and serde round-trip (006 quality fields)
 
 use zen_agents::{AgentExecution, ExecutionMetadata, ToolCall};
 use zen_core::types::Sensitivity;
@@ -21,7 +21,6 @@ fn minimal_creates_valid_execution() {
     assert_eq!(exec.metadata.tokens_used, 0);
     assert_eq!(exec.metadata.cost_estimate, 0.0);
     assert!(exec.tool_calls.is_empty());
-    assert!(exec.sub_agent_results.is_empty());
 }
 
 #[test]
@@ -35,47 +34,13 @@ fn total_tokens_flat() {
             model_used: "gpt-4".into(),
             duration_ms: 500,
             sensitivity: Sensitivity::Public,
+            quality_notes: None,
+            delivery_ready: true,
         },
         tool_calls: vec![],
-        sub_agent_results: vec![],
     };
     assert_eq!(exec.total_tokens(), 100);
     assert!((exec.total_cost() - 0.5).abs() < f64::EPSILON);
-}
-
-#[test]
-fn total_tokens_with_sub_agents() {
-    let sub = AgentExecution::minimal("sub", "sub response");
-    let sub_with_tokens = AgentExecution {
-        agent_name: "sub".into(),
-        response: "sub".into(),
-        metadata: ExecutionMetadata {
-            tokens_used: 50,
-            cost_estimate: 0.25,
-            model_used: "gpt-4".into(),
-            duration_ms: 200,
-            sensitivity: Sensitivity::Public,
-        },
-        tool_calls: vec![],
-        sub_agent_results: vec![sub],
-    };
-
-    let main = AgentExecution {
-        agent_name: "main".into(),
-        response: "main".into(),
-        metadata: ExecutionMetadata {
-            tokens_used: 200,
-            cost_estimate: 1.0,
-            model_used: "gpt-4".into(),
-            duration_ms: 1000,
-            sensitivity: Sensitivity::Public,
-        },
-        tool_calls: vec![],
-        sub_agent_results: vec![sub_with_tokens],
-    };
-
-    assert_eq!(main.total_tokens(), 250); // 200 + 50
-    assert!((main.total_cost() - 1.25).abs() < f64::EPSILON); // 1.0 + 0.25
 }
 
 #[test]
@@ -109,7 +74,7 @@ fn zero_tokens_and_cost() {
 }
 
 #[test]
-fn empty_sub_agent_list() {
+fn empty_tool_calls_list() {
     let exec = AgentExecution {
         agent_name: "a".into(),
         response: "r".into(),
@@ -119,9 +84,10 @@ fn empty_sub_agent_list() {
             model_used: "m".into(),
             duration_ms: 100,
             sensitivity: Sensitivity::Private,
+            quality_notes: None,
+            delivery_ready: true,
         },
         tool_calls: vec![],
-        sub_agent_results: vec![],
     };
     assert_eq!(exec.total_tokens(), 10);
     assert!((exec.total_cost() - 0.1).abs() < f64::EPSILON);
@@ -130,33 +96,6 @@ fn empty_sub_agent_list() {
 // ============================================================================
 // Adversarial Dimension
 // ============================================================================
-
-#[test]
-fn deeply_nested_sub_agents() {
-    let mut innermost = AgentExecution::minimal("depth-10", "leaf");
-    innermost.metadata.tokens_used = 1;
-    innermost.metadata.cost_estimate = 0.01;
-
-    let mut chain = innermost;
-    for i in 0..9 {
-        chain = AgentExecution {
-            agent_name: format!("depth-{}", 9 - i),
-            response: "".into(),
-            metadata: ExecutionMetadata {
-                tokens_used: 1,
-                cost_estimate: 0.01,
-                model_used: "m".into(),
-                duration_ms: 10,
-                sensitivity: Sensitivity::Public,
-            },
-            tool_calls: vec![],
-            sub_agent_results: vec![chain],
-        };
-    }
-
-    assert_eq!(chain.total_tokens(), 10);
-    assert!((chain.total_cost() - 0.10).abs() < f64::EPSILON);
-}
 
 #[test]
 fn very_large_tokens_count() {
@@ -169,9 +108,10 @@ fn very_large_tokens_count() {
             model_used: "gpt-4".into(),
             duration_ms: u64::MAX,
             sensitivity: Sensitivity::Confidential,
+            quality_notes: None,
+            delivery_ready: true,
         },
         tool_calls: vec![],
-        sub_agent_results: vec![],
     };
     assert_eq!(exec.total_tokens(), u32::MAX);
     assert_eq!(exec.total_cost(), f64::MAX);
@@ -203,22 +143,32 @@ fn metadata_fields_survive_minimal_construction() {
     assert_eq!(exec.metadata.duration_ms, 0);
 }
 
+// 006 US2: quality fields default open — absent JSON fields must decode to
+// delivery_ready=true so pre-gate persisted executions stay backward compatible.
 #[test]
-fn sub_agent_results_do_not_affect_main_agent_name() {
-    let sub = AgentExecution::minimal("sub", "response");
-    let main = AgentExecution {
-        agent_name: "orchestrator".into(),
-        response: "done".into(),
-        metadata: ExecutionMetadata {
-            tokens_used: 10,
-            cost_estimate: 0.1,
-            model_used: "m".into(),
-            duration_ms: 100,
-            sensitivity: Sensitivity::Public,
+fn quality_metadata_defaults_and_roundtrip() {
+    let exec = AgentExecution::minimal("agent", "hello");
+    assert!(exec.metadata.delivery_ready);
+    assert!(exec.metadata.quality_notes.is_none());
+
+    let legacy = r#"{
+        "agent_name": "agent",
+        "response": "r",
+        "metadata": {
+            "tokens_used": 1,
+            "cost_estimate": 0.0,
+            "model_used": "",
+            "duration_ms": 0,
+            "sensitivity": "Public"
         },
-        tool_calls: vec![],
-        sub_agent_results: vec![sub],
-    };
-    assert_eq!(main.agent_name, "orchestrator");
-    assert_eq!(main.sub_agent_results[0].agent_name, "sub");
+        "tool_calls": []
+    }"#;
+    let decoded: AgentExecution = serde_json::from_str(legacy).expect("legacy payload decodes");
+    assert!(decoded.metadata.delivery_ready);
+    assert!(decoded.metadata.quality_notes.is_none());
+
+    let encoded = serde_json::to_string(&exec).expect("encodes");
+    let decoded: AgentExecution = serde_json::from_str(&encoded).expect("round-trips");
+    assert_eq!(decoded.agent_name, "agent");
+    assert!(decoded.metadata.delivery_ready);
 }
