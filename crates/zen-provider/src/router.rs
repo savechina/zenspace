@@ -726,6 +726,26 @@ impl DefaultRouter {
         }
     }
 
+    /// Override the canned reply of the built-in mock provider (builder style).
+    ///
+    /// # Purpose
+    /// Deterministic driver for end-to-end tests: `mock` is the only keyless
+    /// always-available provider, and both [`LlmRouter::call`] and
+    /// [`LlmRouter::call_stream`] read `self.mock` directly. Injecting a reply
+    /// that contains a fenced ```json tool block lets integration tests drive
+    /// the real orchestrator tool loop (parse → dispatch → sub-agent LLM turn →
+    /// gate → audit) without a live model.
+    /// # Usage
+    /// Test code only:
+    /// `DefaultRouter::new(cfg).with_mock_response("```json ... ```")`.
+    /// The reply is embedded verbatim as `[mock] task=… reply=<response>`.
+    /// # Errors
+    /// None — pure field assignment.
+    pub fn with_mock_response(mut self, response: impl Into<String>) -> Self {
+        self.mock.response = response.into();
+        self
+    }
+
     /// Create a [`DefaultRouter`] configured for a specific provider and model at runtime.
     ///
     /// Accepts an explicit [`ZenConfig`] (from `load_config()`) to preserve the full

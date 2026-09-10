@@ -213,7 +213,14 @@ async fn kill_midturn_trial(trial: usize) -> Duration {
     // KILL (SIGKILL semantics): abrupt daemon abort — listener drops
     // without drain, stale socket file stays on disk — plus a hard
     // write-shutdown so the in-flight connection delivers EOF now.
+    // Awaiting the JoinHandle makes the kill atomic from the recovery
+    // path's perspective: a real SIGKILL closes every fd at once, but
+    // tokio's abort() is async — until the cancelled task is polled
+    // again the listener can still accept, and a probe connect that
+    // slips into that window succeeds before the fd vanishes (the
+    // handshake then dies on EPIPE; observed on loaded CI runners).
     daemon.abort();
+    let _ = daemon.await;
     killer.shutdown_write().await.expect("kill connection");
 
     // Never a silent hang: the in-flight turn fails visibly and fast.
