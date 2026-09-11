@@ -11,7 +11,11 @@ BIN="./target/debug/zen"
 [[ -x "$BIN" ]] || cargo build -p zen
 
 SESSION="zen-tui-smoke-$$"
-tmux new-session -d -s "$SESSION" -x 120 -y 30
+# Bare shell, no user RC: an interactive login shell (zsh + oh-my-zsh)
+# runs its update nag on startup — the [Y/n] prompt consumes sent
+# keystrokes and its redraw mangles the command, so the binary never
+# runs and the intro grep fails (observed on macOS with omz enabled).
+tmux new-session -d -s "$SESSION" -x 120 -y 30 "bash --noprofile --norc"
 trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true' EXIT
 
 tmux send-keys -t "$SESSION" "$BIN" Enter
