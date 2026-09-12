@@ -8,6 +8,7 @@ pub mod discover_metrics;
 pub mod hypothesis;
 pub mod merge;
 pub mod notion_extraction;
+pub mod orchestration_stats;
 pub mod pipeline;
 pub mod recovery;
 pub mod source_ingest;
@@ -37,6 +38,10 @@ pub use merge::{
     MergeStrategy, WikiMergePlan, build_merge_plans, normalize_notion_name, trigram_jaccard,
 };
 pub use notion_extraction::NotionExtractor;
+pub use orchestration_stats::{
+    AuditError, DelegateGatesStats, GatewayStats, IntentDist, OrchestrationStats,
+    PlanCompletedStats, TurnReviewStats, aggregate_orchestration,
+};
 pub use pipeline::{
     DistillationPipeline, DistillationPipelineInput, DistillationReport, ScopedRunOutcome,
     prune_context,

@@ -13,7 +13,8 @@ use zen_agents::scheduler::{PromotionWorker, WorkerContext, ZenLoopWorker, ZenWo
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
-    CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate, load_reports, run_arena,
+    CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate, aggregate_orchestration,
+    load_reports, run_arena,
 };
 
 #[derive(Subcommand)]
@@ -126,10 +127,15 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
             let history = load_reports(&paths.logs())
                 .map_err(|e| ZenError::Message(format!("discover metrics I/O error: {e}")))?;
             let metrics = aggregate(&history);
+            let orchestration = aggregate_orchestration(&paths.logs())
+                .map_err(|e| ZenError::Message(format!("orchestration stats I/O error: {e}")))?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&metrics)
-                    .map_err(|e| ZenError::Message(e.to_string()))?
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "rsi_health": metrics,
+                    "orchestration": orchestration,
+                }))
+                .map_err(|e| ZenError::Message(e.to_string()))?
             );
         }
         DiscoverCommands::Arena {
