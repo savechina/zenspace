@@ -67,8 +67,8 @@ The system follows a binary/library split: `zen` (thin binary wrapper) delegates
 - **Database**: SQLite (FTS5 + sqlite-vec for agentic module)
 - **Error Handling**: thiserror + anyhow
 - **Agent Orchestration**: rig-compose 0.3
-- **LLM Abstraction**: rig-core 0.41 (+ rig-agent 0.41 classic runtime — AgentRun state machine, PD-01 B target)
-- **Vector Store**: sqlite-vec + rig-sqlite 0.41
+- **LLM Abstraction**: rig-core 0.42 (+ rig-agent 0.42 classic runtime — AgentRun state machine, PD-01 B target)
+- **Vector Store**: sqlite-vec + rig-sqlite 0.42
 - **Template Engine**: tera + include_dir
 - **Configuration**: dotenvy + 5-layer inheritance
 
@@ -703,7 +703,7 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
 - No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)
 
- - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.41 (LLM abstraction; + rig-agent 0.41 AgentRun runtime planned for PD-01 B), rig-compose 0.5 (agent kernel), rig-sqlite 0.41 (vector store), rig-tap 0.1 (observability), rig-mcp 0.2 (MCP bridge), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
+ - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.42 (LLM abstraction; + rig-agent 0.42 AgentRun runtime, PD-01 B), rig-compose 0.5 (agent kernel), rig-sqlite 0.42 (vector store), rig-tap 0.1 (observability), rig-mcp 0.2 (MCP bridge), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
 - SQLite for derived indexes (FTS5, vector embeddings via sqlite-vec, entity graph, habits, finance), Markdown files as canonical source of truth, TOML for config (config.toml), habits (habits.toml), goals (goals.toml), budgets (budgets.toml), routines (routines.toml)
 - Binary/library split: `zen` binary (13 lines) → `zen-cli` library (exporting `shell()`)
 
@@ -735,7 +735,7 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 - **PD-01 landed (2026-09-12, 005-agentic-loop T112-T119)** — orchestrator loop migrated to rig-agent; all on branch `005-agentic-loop`:
   - T112 intent LLM telemetry: `LlmOutcome` (ok|low_confidence|timeout|unavailable|error|skipped) + `has_configured_provider()` fail-fast gate; `loop.turn.review` gains `intent_llm_outcome`/`intent_llm_ms` (p50/p95 surfaced by discover report)
-  - T113 deps: `rig-agent 0.41` in tree (lockstep with rig-core ^0.41); misleading `rig = { package = "rig-core" }` alias dropped — provider files import `rig_core::` directly (upstream `rig` is a different facade crate)
+  - T113 deps: `rig-agent 0.41` in tree (lockstep with rig-core ^0.41; both superseded by the T120 0.42 upgrade — same lockstep rule, now ^0.42); misleading `rig = { package = "rig-core" }` alias dropped — provider files import `rig_core::` directly (upstream `rig` is a different facade crate)
   - T114 PD-01 A native-primary dispatch: `resolve_invocations` replaces `merge_invocations` (deleted) — native calls dispatch directly; fenced parse only when zero native; both-present → native wins + `degraded` warn/callback, never double-dispatch; fenced fallback byte-identical to pre-PD-01 (contract-pinned)
   - T115 PD-01 B AgentRun: `execute`/`execute_stream` driven through `AgentRun` sans-I/O state machine (`next_step` → CallModel/CallTools → `model_response`/`tool_results`); zen keeps ALL I/O — provider stack (T096 budgets, stream timeouts, spawn_blocking guards), 5-hook dispatch pipeline, T114 policy; `max_turns` = resolved max_tool_rounds + 2 headroom (config keys/env unchanged, clamp stays emergency governance); usage/completion telemetry from `run.usage()`
   - T116 T108 output_schema: `agent_output_schema(name)` → `AgentRun::with_output_validation(schema, max_output_schema_retries)` in both loops; `validate_output`/`build_retry_prompt` retained for fenced fallback only; ≤2 retries (T091 contract)

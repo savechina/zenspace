@@ -58,7 +58,7 @@ fn tool_loop_wiring_default_env_override_and_instance_override() {
 
 fn native_call(name: &str, args: serde_json::Value) -> NativeToolCall {
     NativeToolCall::new(
-        "native-id".to_string(),
+        rig_core::completion::message::ToolCallId::new_or_mint("native-id"),
         ToolFunction::new(name.to_string(), args),
     )
 }

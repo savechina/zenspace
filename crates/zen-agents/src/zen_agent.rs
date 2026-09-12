@@ -1136,7 +1136,6 @@ impl ZenAgent {
         user_message: &str,
         session: &SessionContext,
     ) -> Result<(String, Vec<ToolCall>)> {
-        use rig_core::OneOrMany;
         use rig_core::completion::CompletionRequest;
         use rig_core::message::Message;
         use std::time::Instant;
@@ -1208,8 +1207,11 @@ impl ZenAgent {
 
         history_messages.push(Message::user(user_message));
 
-        let chat_history = OneOrMany::many(history_messages)
-            .unwrap_or_else(|_| OneOrMany::one(Message::user(user_message)));
+        let chat_history = if history_messages.is_empty() {
+            vec![Message::user(user_message)]
+        } else {
+            history_messages
+        };
 
         let request = CompletionRequest {
             model: None,
@@ -1403,7 +1405,6 @@ impl ZenAgent {
         session: &SessionContext,
         mut callback: impl FnMut(&str),
     ) -> Result<(String, Vec<ToolCall>)> {
-        use rig_core::OneOrMany;
         use rig_core::completion::{CompletionModel, CompletionRequest};
         use rig_core::message::Message;
 
@@ -1480,8 +1481,11 @@ impl ZenAgent {
 
         history_messages.push(Message::user(user_message));
 
-        let chat_history = OneOrMany::many(history_messages)
-            .unwrap_or_else(|_| OneOrMany::one(Message::user(user_message)));
+        let chat_history = if history_messages.is_empty() {
+            vec![Message::user(user_message)]
+        } else {
+            history_messages
+        };
 
         let request = CompletionRequest {
             model: None,
@@ -1561,15 +1565,14 @@ impl StreamToolCallAccumulator {
         self.text.push_str(token);
     }
 
-    fn fold<R: Clone>(&mut self, item: StreamedAssistantContent<R>) {
+    fn fold(&mut self, item: StreamedAssistantContent) {
         match item {
             StreamedAssistantContent::Text(t) => self.text.push_str(&t.text),
             StreamedAssistantContent::ToolCallDelta {
-                id,
                 internal_call_id,
                 content,
             } => {
-                let pending = self.pending_slot(&internal_call_id, &id);
+                let pending = self.pending_slot(&internal_call_id);
                 match content {
                     ToolCallDeltaContent::Name(name) => pending.name = Some(name),
                     ToolCallDeltaContent::Delta(fragment) => pending.args.push_str(&fragment),
@@ -1583,7 +1586,7 @@ impl StreamToolCallAccumulator {
         }
     }
 
-    fn pending_slot(&mut self, internal_call_id: &str, id: &str) -> &mut PendingToolCall {
+    fn pending_slot(&mut self, internal_call_id: &str) -> &mut PendingToolCall {
         // Position computed before any &mut borrow: the early-return-borrow
         // shape trips NLL Problem Case #3 (conditional borrow + later push).
         let existing = self.slots.iter().position(
@@ -1592,7 +1595,9 @@ impl StreamToolCallAccumulator {
         if existing.is_none() {
             self.slots.push(ToolCallSlot::Pending(PendingToolCall {
                 internal_call_id: internal_call_id.to_string(),
-                id: id.to_string(),
+                // rig 0.42 delta events carry no provider tool-call id —
+                // id-less deltas mint a handle at finish() (id-less wires).
+                id: String::new(),
                 name: None,
                 args: String::new(),
             }));
@@ -1633,7 +1638,10 @@ impl StreamToolCallAccumulator {
                     // keep the raw string as payload so arguments are never lost.
                     let arguments = serde_json::from_str::<serde_json::Value>(&p.args)
                         .unwrap_or_else(|_| serde_json::Value::String(p.args.clone()));
-                    calls.push(ToolCall::new(p.id, ToolFunction::new(name, arguments)));
+                    calls.push(ToolCall::new(
+                        rig_core::message::ToolCallId::new_or_mint(p.id),
+                        ToolFunction::new(name, arguments),
+                    ));
                 }
             }
         }
@@ -1950,16 +1958,12 @@ mod native_tool_call_tests {
     use super::*;
     use rig_core::streaming::ToolCallDeltaContent;
 
-    fn text_item(s: &str) -> StreamedAssistantContent<()> {
+    fn text_item(s: &str) -> StreamedAssistantContent {
         StreamedAssistantContent::Text(rig_core::message::Text::new(s.to_string()))
     }
 
-    fn delta_item(
-        internal_id: &str,
-        content: ToolCallDeltaContent,
-    ) -> StreamedAssistantContent<()> {
+    fn delta_item(internal_id: &str, content: ToolCallDeltaContent) -> StreamedAssistantContent {
         StreamedAssistantContent::ToolCallDelta {
-            id: format!("{internal_id}-provider"),
             internal_call_id: internal_id.to_string(),
             content,
         }
@@ -1969,10 +1973,10 @@ mod native_tool_call_tests {
         internal_id: &str,
         name: &str,
         args: serde_json::Value,
-    ) -> StreamedAssistantContent<()> {
+    ) -> StreamedAssistantContent {
         StreamedAssistantContent::ToolCall {
             tool_call: ToolCall::new(
-                format!("{internal_id}-provider"),
+                rig_core::message::ToolCallId::new_or_mint(format!("{internal_id}-provider")),
                 ToolFunction::new(name.to_string(), args),
             ),
             internal_call_id: internal_id.to_string(),
@@ -2089,7 +2093,7 @@ mod native_tool_call_tests {
     #[test]
     fn fenced_serialization_matches_parse_dialect() {
         let call = ToolCall::new(
-            "id1".to_string(),
+            rig_core::message::ToolCallId::new_or_mint("id1"),
             ToolFunction::new("web.search".to_string(), json!({"query": "rust"})),
         );
         let fenced = serialize_tool_calls_fenced(std::slice::from_ref(&call));
@@ -2109,7 +2113,7 @@ mod native_tool_call_tests {
     #[test]
     fn append_fenced_preserves_text_and_appends_block() {
         let call = ToolCall::new(
-            "id1".to_string(),
+            rig_core::message::ToolCallId::new_or_mint("id1"),
             ToolFunction::new("web.search".to_string(), json!({})),
         );
         let out = append_native_tool_calls_fenced("answer text".to_string(), &[call]);

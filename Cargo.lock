@@ -6363,16 +6363,16 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rig-agent"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b0796bbf47d7b76670401aac975bc619cf7fba3482b22dfe14992edaa9c2e04"
+checksum = "b66477c0d0a786358d078e7e3541a73089dd9009100d6e2b3fe3b0d730e8550f"
 dependencies = [
  "async-stream",
  "fastrand",
  "futures",
  "http",
  "indexmap",
- "rig-core 0.41.0",
+ "rig-core 0.42.0",
  "rig-derive",
  "schemars",
  "serde",
@@ -6479,9 +6479,9 @@ dependencies = [
 
 [[package]]
 name = "rig-core"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35f5520515ae8f6851adcbc6fde9eea8e96f657418c062e16c82cd81cce44e8e"
+checksum = "432d83e0facf16749f91fe729cbffca84437e8062d2f4e92f4f12e903693922d"
 dependencies = [
  "as-any",
  "async-stream",
@@ -6503,9 +6503,10 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
- "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite 0.29.0",
  "tracing",
  "tracing-futures",
  "url",
@@ -6513,9 +6514,9 @@ dependencies = [
 
 [[package]]
 name = "rig-derive"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb868fcebdf3ba425e3afad2e4926bb6d9e1188a856843b00bcee2e15c07424f"
+checksum = "de0a33f1bac45f16e50146c248bcbbfaa44518c7252d274e972c7f4ad71aaba7"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro-crate",
@@ -6597,16 +6598,17 @@ dependencies = [
 
 [[package]]
 name = "rig-sqlite"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9a90eb7df2bbe9062f806ebfe80a61f2b2d8ffd7be94d1410d6e6e77aa38612"
+checksum = "a0cedd820258f6b86f933eeb97105cae32fb7bff74642e3e65593dc631fb5f5a"
 dependencies = [
  "chrono",
- "rig-core 0.41.0",
+ "rig-core 0.42.0",
  "rusqlite",
  "serde",
  "serde_json",
  "sqlite-vec",
+ "thiserror 2.0.19",
  "tokio-rusqlite",
  "tracing",
  "zerocopy",
@@ -8352,9 +8354,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
@@ -8362,20 +8364,8 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tungstenite 0.28.0",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "tokio-tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
-dependencies = [
- "futures-util",
- "log",
- "tokio",
  "tungstenite 0.29.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -8665,25 +8655,6 @@ dependencies = [
 
 [[package]]
 name = "tungstenite"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "rustls",
- "rustls-pki-types",
- "sha1 0.10.7",
- "thiserror 2.0.19",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
@@ -8694,6 +8665,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.10.7",
  "thiserror 2.0.19",
 ]
@@ -10425,7 +10398,7 @@ dependencies = [
  "jsonschema",
  "rig-agent",
  "rig-compose 0.5.0",
- "rig-core 0.41.0",
+ "rig-core 0.42.0",
  "rig-mcp",
  "rig-memvid",
  "rig-resources",
@@ -10586,7 +10559,7 @@ dependencies = [
  "chrono",
  "include_dir",
  "rig-compose 0.5.0",
- "rig-core 0.41.0",
+ "rig-core 0.42.0",
  "rig-memvid",
  "serde",
  "serde_json",
@@ -10655,7 +10628,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rig-agent",
  "rig-compose 0.5.0",
- "rig-core 0.41.0",
+ "rig-core 0.42.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -10723,7 +10696,7 @@ dependencies = [
  "html2md",
  "reqwest 0.13.4",
  "rig-compose 0.5.0",
- "rig-core 0.41.0",
+ "rig-core 0.42.0",
  "rig-sqlite",
  "rusqlite",
  "schemars",

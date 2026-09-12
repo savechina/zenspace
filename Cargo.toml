@@ -124,8 +124,8 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # LLM agent orchestration framework
-rig-core = "0.41"
-rig-agent = "0.41"
+rig-core = "0.42"
+rig-agent = "0.42"
 
 # Composable agent kernel: stateless skills, transport-agnostic tools, registry-driven agents
 rig-compose = "0.5"
@@ -143,7 +143,7 @@ rig-tap = "0.3"
 
 # Persistent memory and vector store for Rig agents
 rig-memvid = { version = "0.4.2", features = ["context-projection", "compaction"] }
-rig-sqlite = "0.41"
+rig-sqlite = "0.42"
 
 # Utility crates — shared across workspace
 fastrand = "2"

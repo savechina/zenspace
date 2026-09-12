@@ -10,7 +10,6 @@ use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::{
     ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
-use rig_core::OneOrMany;
 use rig_core::completion::{AssistantContent, Usage, message::ToolCall as NativeToolCall};
 use rig_core::message::Message;
 use tracing::{debug, info, instrument, warn};
@@ -675,7 +674,7 @@ impl AgentOrchestrator {
                     let tool_results_text = match &prompt {
                         Message::User { content } => {
                             let text = match content.first() {
-                                rig_core::message::UserContent::Text(t) => t.text.clone(),
+                                Some(rig_core::message::UserContent::Text(t)) => t.text.clone(),
                                 _ => String::new(),
                             };
                             if text.starts_with("## Tool Results") {
@@ -739,14 +738,9 @@ impl AgentOrchestrator {
                         items
                     };
 
-                    let choice =
-                        OneOrMany::from_iter_optional(assistant_content).unwrap_or_else(|| {
-                            OneOrMany::one(AssistantContent::text(response_text.clone()))
-                        });
-
                     let model_turn = ModelTurn::new(
                         None,
-                        choice,
+                        assistant_content,
                         Usage::new(),
                         tool_names.clone(),
                         tool_names.clone(),
@@ -805,9 +799,10 @@ impl AgentOrchestrator {
                                 use rig_core::message::ToolResultContent;
                                 rig_core::message::UserContent::tool_result(
                                     c.tool_call.id.clone(),
-                                    OneOrMany::one(ToolResultContent::text(
+                                    c.tool_call.function.name.clone(),
+                                    vec![ToolResultContent::text(
                                         "no valid invocations to dispatch",
-                                    )),
+                                    )],
                                 )
                             })
                             .collect();
@@ -854,15 +849,16 @@ impl AgentOrchestrator {
                                 .enumerate()
                                 .map(|(i, r)| {
                                     use rig_core::message::ToolResultContent;
-                                    let call_id = calls
+                                    let call = calls
                                         .get(i)
-                                        .map(|c| c.tool_call.id.clone())
+                                        .map(|c| c.tool_call.id.as_str().to_string())
                                         .unwrap_or_default();
                                     rig_core::message::UserContent::tool_result(
-                                        call_id,
-                                        OneOrMany::one(ToolResultContent::text(
+                                        call,
+                                        r.invocation.name.to_string(),
+                                        vec![ToolResultContent::text(
                                             serde_json::to_string(&r.output).unwrap_or_default(),
-                                        )),
+                                        )],
                                     )
                                 })
                                 .collect();
@@ -882,7 +878,8 @@ impl AgentOrchestrator {
                                     use rig_core::message::ToolResultContent;
                                     rig_core::message::UserContent::tool_result(
                                         c.tool_call.id.clone(),
-                                        OneOrMany::one(ToolResultContent::text(err_msg.clone())),
+                                        c.tool_call.function.name.clone(),
+                                        vec![ToolResultContent::text(err_msg.clone())],
                                     )
                                 })
                                 .collect();
@@ -1270,7 +1267,7 @@ impl AgentOrchestrator {
                     let tool_results_text = match &prompt {
                         Message::User { content } => {
                             let text = match content.first() {
-                                rig_core::message::UserContent::Text(t) => t.text.clone(),
+                                Some(rig_core::message::UserContent::Text(t)) => t.text.clone(),
                                 _ => String::new(),
                             };
                             if text.starts_with("## Tool Results") {
@@ -1339,14 +1336,9 @@ impl AgentOrchestrator {
                         items
                     };
 
-                    let choice =
-                        OneOrMany::from_iter_optional(assistant_content).unwrap_or_else(|| {
-                            OneOrMany::one(AssistantContent::text(response_text.clone()))
-                        });
-
                     let model_turn = ModelTurn::new(
                         None,
-                        choice,
+                        assistant_content,
                         Usage::new(),
                         tool_names.clone(),
                         tool_names.clone(),
@@ -1400,7 +1392,8 @@ impl AgentOrchestrator {
                                 use rig_core::message::ToolResultContent;
                                 rig_core::message::UserContent::tool_result(
                                     c.tool_call.id.clone(),
-                                    OneOrMany::one(ToolResultContent::text("no valid invocations")),
+                                    c.tool_call.function.name.clone(),
+                                    vec![ToolResultContent::text("no valid invocations")],
                                 )
                             })
                             .collect();
@@ -1456,15 +1449,16 @@ impl AgentOrchestrator {
                                 .enumerate()
                                 .map(|(i, r)| {
                                     use rig_core::message::ToolResultContent;
-                                    let call_id = calls
+                                    let call = calls
                                         .get(i)
-                                        .map(|c| c.tool_call.id.clone())
+                                        .map(|c| c.tool_call.id.as_str().to_string())
                                         .unwrap_or_default();
                                     rig_core::message::UserContent::tool_result(
-                                        call_id,
-                                        OneOrMany::one(ToolResultContent::text(
+                                        call,
+                                        r.invocation.name.to_string(),
+                                        vec![ToolResultContent::text(
                                             serde_json::to_string(&r.output).unwrap_or_default(),
-                                        )),
+                                        )],
                                     )
                                 })
                                 .collect();
@@ -1485,7 +1479,8 @@ impl AgentOrchestrator {
                                     use rig_core::message::ToolResultContent;
                                     rig_core::message::UserContent::tool_result(
                                         c.tool_call.id.clone(),
-                                        OneOrMany::one(ToolResultContent::text(err_msg.clone())),
+                                        c.tool_call.function.name.clone(),
+                                        vec![ToolResultContent::text(err_msg.clone())],
                                     )
                                 })
                                 .collect();
@@ -1973,7 +1968,7 @@ mod tests {
 
     fn native_call(name: &str, args: serde_json::Value) -> NativeToolCall {
         NativeToolCall::new(
-            "native-id".to_string(),
+            rig_core::message::ToolCallId::new_or_mint("native-id"),
             rig_core::completion::message::ToolFunction::new(name.to_string(), args),
         )
     }

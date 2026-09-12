@@ -1,11 +1,9 @@
-use rig_core::OneOrMany;
 use rig_core::completion::{
     AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
-    GetTokenUsage, Usage,
+    Usage,
 };
 use rig_core::message::Message;
-use rig_core::streaming::{RawStreamingChoice, StreamingCompletionResponse};
-use serde::{Deserialize, Serialize};
+use rig_core::streaming::{RawStreamingChoice, StreamFinal, StreamingCompletionResponse};
 use std::sync::Arc;
 use zen_provider::LlmRouter;
 
@@ -58,23 +56,23 @@ fn stream_budget_for_next(token_count: usize) -> std::time::Duration {
     stream_budget(token_count == 0, first, inactivity)
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ZenCompletionResponse {
-    text: String,
-}
-
-impl GetTokenUsage for ZenCompletionResponse {
-    fn token_usage(&self) -> Usage {
-        let n = self.text.len() as u64 / 4; // conservative ~4 chars/token
-        Usage {
-            input_tokens: 0,
-            output_tokens: n,
-            total_tokens: n,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            tool_use_prompt_tokens: 0,
-            reasoning_tokens: 0,
-        }
+/// Conservative token estimate for a response body: ~4 chars/token.
+///
+/// rig-core 0.42 replaced the 0.41 `GetTokenUsage` trait with the concrete
+/// `Usage` struct carried by `StreamFinal`/`CompletionResponse`; zen's
+/// providers do not report usage, so the same len/4 heuristic that fed the
+/// old `ZenCompletionResponse::token_usage` feeds `Usage.output_tokens`
+/// (T096 budgets read these totals).
+fn estimate_tokens(text: &str) -> Usage {
+    let n = text.len() as u64 / 4; // conservative ~4 chars/token
+    Usage {
+        input_tokens: 0,
+        output_tokens: n,
+        total_tokens: n,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        tool_use_prompt_tokens: 0,
+        reasoning_tokens: 0,
     }
 }
 
@@ -101,27 +99,10 @@ impl ZenCompletionModel {
 }
 
 impl CompletionModel for ZenCompletionModel {
-    type Response = ZenCompletionResponse;
-    type StreamingResponse = ZenCompletionResponse;
-    type Client = ();
-
-    fn make(_: &(), model: impl Into<String>) -> Self {
-        let model_str = model.into();
-        let config = zen_provider::LlmConfig::default();
-        let router = zen_provider::DefaultRouter::new(config);
-        let provider = parse_provider_name(&model_str);
-
-        Self {
-            router: Arc::new(router),
-            provider,
-            model_name: model_str,
-        }
-    }
-
     async fn completion(
         &self,
         request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+    ) -> Result<CompletionResponse, CompletionError> {
         let prompt = extract_last_user_prompt(&request);
         let prompt_len = prompt.len();
 
@@ -146,20 +127,17 @@ impl CompletionModel for ZenCompletionModel {
             "completion_model: LLM completion succeeded"
         );
 
-        Ok(CompletionResponse {
-            choice: OneOrMany::one(AssistantContent::text(response_text.clone())),
-            usage: Usage::new(),
-            raw_response: ZenCompletionResponse {
-                text: response_text,
-            },
-            message_id: None,
-        })
+        Ok(CompletionResponse::new(
+            vec![AssistantContent::text(response_text.clone())],
+            Usage::new(),
+            self.model_name.clone(),
+        ))
     }
 
     async fn stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+    ) -> Result<StreamingCompletionResponse, CompletionError> {
         let prompt = extract_last_user_prompt(&request);
         let prompt_len = prompt.len();
 
@@ -191,9 +169,8 @@ impl CompletionModel for ZenCompletionModel {
         #[allow(clippy::type_complexity)]
         let boxed: std::pin::Pin<
             Box<
-                dyn futures::Stream<
-                        Item = Result<RawStreamingChoice<Self::StreamingResponse>, CompletionError>,
-                    > + Send,
+                dyn futures::Stream<Item = Result<RawStreamingChoice<StreamFinal>, CompletionError>>
+                    + Send,
             >,
         > = Box::pin(futures::stream::unfold(
             state,
@@ -221,9 +198,10 @@ impl CompletionModel for ZenCompletionModel {
                                     "completion_model: LLM stream completed"
                                 );
                                 Some((
-                                    Ok(RawStreamingChoice::FinalResponse(ZenCompletionResponse {
-                                        text,
-                                    })),
+                                    Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(
+                                        provider_name.clone(),
+                                        estimate_tokens(&text),
+                                    ))),
                                     (token_rx, done_rx, collected, token_count, provider_name),
                                 ))
                             }
@@ -267,7 +245,10 @@ impl CompletionModel for ZenCompletionModel {
             },
         ));
 
-        Ok(StreamingCompletionResponse::stream(boxed))
+        Ok(StreamingCompletionResponse::stream(
+            self.model_name.clone(),
+            boxed,
+        ))
     }
 }
 
@@ -334,7 +315,7 @@ mod tests {
         let request = CompletionRequest {
             model: None,
             preamble: None,
-            chat_history: OneOrMany::one(Message::user("Say hello")),
+            chat_history: vec![Message::user("Say hello")],
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -348,7 +329,7 @@ mod tests {
         let response = model.completion(request).await.expect("completion");
 
         let text = match response.choice.first() {
-            AssistantContent::Text(t) => t.text.clone(),
+            Some(AssistantContent::Text(t)) => t.text.clone(),
             _ => panic!("expected text response, got non-text"),
         };
         assert!(text.contains("mock"), "expected mock response, got: {text}");
@@ -361,7 +342,7 @@ mod tests {
         let request = CompletionRequest {
             model: None,
             preamble: Some("You are a test assistant.".to_string()),
-            chat_history: OneOrMany::one(Message::user("Hello")),
+            chat_history: vec![Message::user("Hello")],
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,
@@ -382,7 +363,7 @@ mod tests {
         let request = CompletionRequest {
             model: None,
             preamble: None,
-            chat_history: OneOrMany::one(Message::user("Hello")),
+            chat_history: vec![Message::user("Hello")],
             documents: Vec::new(),
             tools: Vec::new(),
             temperature: None,

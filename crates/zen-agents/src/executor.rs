@@ -17,8 +17,6 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use rig_core::OneOrMany;
-use rig_core::completion::{AssistantContent, CompletionResponse};
 use rig_core::message::ToolCall as NativeToolCall;
 use tracing::{info, instrument, warn};
 
@@ -472,25 +470,10 @@ impl AgentExecutor {
         let (response, _tokens, _used_mock) =
             self.execute_with_retry(&provider, &prompt, &context.agent_profile.name)?;
 
-        // Build a CompletionResponse to extract native tool calls.
-        // The zen completion model wraps the entire response as
-        // `AssistantContent::text`, so native_calls will typically be
-        // empty here (the non-streaming path doesn't produce native
-        // tool calls). The orchestrator falls back to fenced-JSON
-        // parsing via `resolve_invocations`.
-        let completion_response: CompletionResponse<()> = CompletionResponse {
-            choice: OneOrMany::one(AssistantContent::text(response.clone())),
-            usage: rig_core::completion::Usage::new(),
-            raw_response: (),
-            message_id: None,
-        };
-
-        let mut native_calls = Vec::new();
-        for content in completion_response.choice {
-            if let AssistantContent::ToolCall(call) = content {
-                native_calls.push(call);
-            }
-        }
+        // The router `complete()` path returns plain text — it cannot carry
+        // native provider tool calls, so the orchestrator falls back to
+        // fenced-JSON parsing via `resolve_invocations` (T114).
+        let native_calls: Vec<NativeToolCall> = Vec::new();
 
         Ok((response, native_calls))
     }
