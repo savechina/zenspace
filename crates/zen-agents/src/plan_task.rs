@@ -251,6 +251,40 @@ impl PlanExecuteTool {
     }
 }
 
+const UPSTREAM_SNIPPET_MAX_CHARS: usize = 4000;
+
+/// Extract the human-readable answer from a `run_single` outcome value —
+/// the success payload carries the sub-agent answer in `response`; any
+/// other shape falls back to the JSON itself.
+fn upstream_snippet(value: &serde_json::Value) -> String {
+    let text = match value.get("response").and_then(|v| v.as_str()) {
+        Some(response) => response.to_string(),
+        None => value.to_string(),
+    };
+    let mut snippet: String = text.chars().take(UPSTREAM_SNIPPET_MAX_CHARS).collect();
+    if text.chars().count() > UPSTREAM_SNIPPET_MAX_CHARS {
+        snippet.push_str("…[truncated]");
+    }
+    snippet
+}
+
+/// Append upstream OK outputs to a dependent task's prompt (eng-review D2:
+/// `depends_on` previously ordered execution only — downstream tasks ran
+/// their static prompts blind, so fan-in synthesis had no inputs).
+fn compose_task_prompt(base: &str, upstream: &[(String, String)]) -> String {
+    if upstream.is_empty() {
+        return base.to_string();
+    }
+    let mut prompt = String::from(base);
+    prompt.push_str(
+        "\n\n## Upstream task outputs\nYour task depends on the tasks below; their outputs are your inputs:",
+    );
+    for (id, snippet) in upstream {
+        prompt.push_str(&format!("\n\n### upstream task `{id}` output\n{snippet}"));
+    }
+    prompt
+}
+
 #[async_trait::async_trait]
 impl Tool for PlanExecuteTool {
     fn schema(&self) -> ToolSchema {
@@ -260,9 +294,13 @@ impl Tool for PlanExecuteTool {
                 Draft the plan as tasks with stable ids; list upstream task ids in \
                 `depends_on`. Independent tasks run in parallel; each task runs in a \
                 dedicated sub-agent context with its own tool grants. A failed task \
-                skips its downstream dependents. Use this instead of many manual \
-                delegate.task calls whenever the work has more than one step or any \
-                step depends on another. Caps: 12 tasks, 3 dependency layers."
+                skips its downstream dependents. Each downstream task's prompt is \
+                automatically extended with the outputs of its direct `depends_on` \
+                prerequisites, so write dependent prompts as synthesis over those \
+                outputs rather than repeating the upstream brief. Use this instead \
+                of many manual delegate.task calls whenever the work has more than \
+                one step or any step depends on another. Caps: 12 tasks, 3 \
+                dependency layers."
                 .to_string(),
             args_schema: serde_json::json!({
                 "type": "object",
@@ -435,17 +473,21 @@ impl Tool for PlanExecuteTool {
                 if outcomes[i].is_some() {
                     continue; // checkpoint replay: keep the recorded result
                 }
-                let blocked = plan.tasks[i].depends_on.iter().any(|dep| {
+                let mut upstream: Vec<(String, String)> = Vec::new();
+                let mut blocked = false;
+                for dep in &plan.tasks[i].depends_on {
                     let j = plan
                         .tasks
                         .iter()
                         .position(|t| &t.id == dep)
                         .expect("deps validated in parse_plan");
-                    matches!(
-                        outcomes[j].as_ref().map(|o| o.status),
-                        Some("failed") | Some("skipped") | None
-                    )
-                });
+                    match outcomes[j].as_ref() {
+                        Some(o) if o.status == "ok" => {
+                            upstream.push((dep.clone(), upstream_snippet(&o.value)));
+                        }
+                        _ => blocked = true,
+                    }
+                }
                 if blocked {
                     let outcome = TaskOutcome {
                         status: "skipped",
@@ -459,7 +501,7 @@ impl Tool for PlanExecuteTool {
                 }
                 let req = DelegateRequest {
                     agent: plan.tasks[i].agent.clone(),
-                    prompt: plan.tasks[i].prompt.clone(),
+                    prompt: compose_task_prompt(&plan.tasks[i].prompt, &upstream),
                     description: Some(format!("plan task `{}`", plan.tasks[i].id)),
                     independent: true,
                 };
@@ -1154,5 +1196,42 @@ mod tests {
         // The refusal leaves the plan running for its rightful owner.
         let row = repo.load_plan(&plan_id).await.unwrap().unwrap();
         assert_eq!(row.status, "running");
+    }
+
+    #[test]
+    fn upstream_snippet_prefers_response_field_and_truncates() {
+        let value = serde_json::json!({
+            "agent": "Explore",
+            "response": "found 3 notions",
+            "rounds": 1
+        });
+        assert_eq!(upstream_snippet(&value), "found 3 notions");
+
+        let opaque = serde_json::json!({ "error": "budget exhausted" });
+        assert_eq!(upstream_snippet(&opaque), r#"{"error":"budget exhausted"}"#);
+
+        let long = "x".repeat(UPSTREAM_SNIPPET_MAX_CHARS + 10);
+        let snippet = upstream_snippet(&serde_json::json!({ "response": long }));
+        assert!(snippet.starts_with(&"x".repeat(UPSTREAM_SNIPPET_MAX_CHARS)));
+        assert!(snippet.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn compose_task_prompt_passthrough_without_upstream() {
+        assert_eq!(compose_task_prompt("do the thing", &[]), "do the thing");
+    }
+
+    #[test]
+    fn compose_task_prompt_appends_upstream_outputs() {
+        let upstream = vec![
+            ("analysis".to_string(), "3 key findings".to_string()),
+            ("fetch".to_string(), "raw dataset rows".to_string()),
+        ];
+        let prompt = compose_task_prompt("synthesize a report", &upstream);
+        assert!(prompt.starts_with("synthesize a report"));
+        assert!(prompt.contains("upstream task `analysis` output"));
+        assert!(prompt.contains("3 key findings"));
+        assert!(prompt.contains("upstream task `fetch` output"));
+        assert!(prompt.contains("raw dataset rows"));
     }
 }

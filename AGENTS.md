@@ -725,6 +725,12 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
   - T378 surface profile: `[agentic.orchestrator] surface = full|delegation-only` (default full, env `ZEN_ORCHESTRATOR_SURFACE`); delegation-only strips every Sisyphus direct tool — only delegate.task + plan.execute remain (001 A.8 ultra surface); invalid values warn + fail open to full
   - T379 gates: bin/test 2291 passed / 0 failed / 19 skipped; clippy --workspace --all-targets -D warnings clean; fmt --check clean
 
+- **Eng-review D1-D4 remediation (2026-09-11)**:
+  - D1 panic guard: `AgentOrchestrator::review_pipeline` semantic-reviewer LLM call moved onto `spawn_blocking` — sync `route/call` hit the OllamaProvider nested-`Runtime::new` panic on the Confidential+local HIGH-blast path (same hazard guard as `intent::llm_classify`); join failure now maps to `LlmError::ProviderUnavailable` and fails open
+  - D2 plan-DAG dataflow: `plan.execute` injects direct `depends_on` outputs into downstream task prompts (`compose_task_prompt`/`upstream_snippet`, per-dep 4000-char snippet taken from the delegate `response` field; ok-checkpoint replay injects the recorded value); tool description now instructs synthesis-style dependent prompts
+  - D3 quality-gate scope: gate runs only for tool-mutating turns (`!tool_calls.is_empty()`) or Confidential sessions, in both `execute()` and `execute_stream()`; pure chat turns synthesize `PipelineResult { plan_approved: true, delivery_ready: true, review_notes: "quality gate skipped: no tool invocations this turn" }` (plan-shaped Momus heuristics vetoed ordinary conversational answers, burning one redraft round per chat turn)
+  - D4 intent routing contract documented (accepted behavior, not a bug): LLM path routes to 3 category-default agents (Query→Explore, Action→Hephaestus, System/Conversation→Sisyphus); `delegate.task`/`plan.execute` are reachable on the LLM path only via Sisyphus fallback — see `intent.rs` module doc "Routing scope"
+
 - Binary/library separation: zen (bin) + zen-cli (lib) architecture documented
 - 29 CLI commands documented with dispatch file paths
 - 5-layer config inheritance model (Default → embedded → global → workspace → env)

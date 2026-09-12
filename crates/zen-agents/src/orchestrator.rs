@@ -346,6 +346,10 @@ impl AgentOrchestrator {
     /// Propagates the redraft round's executor failure — a vetoed turn
     /// that cannot be redrafted fails the whole execution (identical to
     /// the pre-extraction inline behavior).
+    fn turn_gated(has_tool_calls: bool, sensitivity: Sensitivity) -> bool {
+        has_tool_calls || sensitivity == Sensitivity::Confidential
+    }
+
     async fn review_with_feedback_round(
         pipeline: &QualityPipeline,
         review_task: &zen_core::types::Task,
@@ -434,9 +438,24 @@ impl AgentOrchestrator {
                     budget_limit: None,
                 };
                 use zen_provider::LlmRouter as _;
-                let reply = router
-                    .route(&requirements)
-                    .and_then(|provider| router.call(provider, &prompt));
+                // spawn_blocking guard (same hazard as intent::llm_classify):
+                // route()/call() are sync and OllamaProvider constructs a
+                // nested tokio Runtime inside them — Runtime::new panics when
+                // invoked on an async worker thread. Run the call on a
+                // blocking thread so the Confidential+local path fails open
+                // (Err arm below) instead of panicking the turn.
+                let reply = tokio::task::spawn_blocking(move || {
+                    router
+                        .route(&requirements)
+                        .and_then(|provider| router.call(provider, &prompt))
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(zen_provider::LlmError::ProviderUnavailable {
+                        provider: "semantic-reviewer".to_string(),
+                        reason: format!("review task join failed: {e}"),
+                    })
+                });
                 match reply {
                     Ok(reply) => {
                         let trimmed = reply.trim();
@@ -738,21 +757,43 @@ impl AgentOrchestrator {
         // 006 US2 (D4): post-loop quality gate. A Momus veto gets exactly
         // one feedback round (budget permitting); delivery is non-blocking
         // — the verdict and notes ride on the execution metadata and audit.
-        let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
-        let draft_response = execution.response.clone();
-        let (review, feedback_rounds, redrafted) = Self::review_with_feedback_round(
-            &self.quality_pipeline,
-            &review_task,
-            &draft_response,
-            |feedback| {
-                let redrafted =
-                    self.executor
-                        .execute_round(&context, &zen_agent, &tool_manifest, &feedback)?;
-                tokens_spent += ((feedback.len() + redrafted.response.len()) / 4) as u64;
-                Ok(redrafted)
-            },
-        )
-        .await?;
+        // Scope (eng-review D3): the gate's plan-shaped heuristics veto
+        // ordinary conversational answers (word-count/keyword checks tuned
+        // for engineering plans), so pure chat turns skip it — the gate
+        // runs only for tool-mutating turns or Confidential sessions.
+        let gated = Self::turn_gated(!tool_calls.is_empty(), session.sensitivity_policy);
+        let (review, feedback_rounds, redrafted) = if gated {
+            let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
+            let draft_response = execution.response.clone();
+            Self::review_with_feedback_round(
+                &self.quality_pipeline,
+                &review_task,
+                &draft_response,
+                |feedback| {
+                    let redrafted = self.executor.execute_round(
+                        &context,
+                        &zen_agent,
+                        &tool_manifest,
+                        &feedback,
+                    )?;
+                    tokens_spent += ((feedback.len() + redrafted.response.len()) / 4) as u64;
+                    Ok(redrafted)
+                },
+            )
+            .await?
+        } else {
+            (
+                crate::review::PipelineResult {
+                    plan_approved: true,
+                    review_notes: "quality gate skipped: no tool invocations this turn".to_string(),
+                    delivery_ready: true,
+                    athena_shield: None,
+                    failed_attempts: Vec::new(),
+                },
+                0u8,
+                None,
+            )
+        };
         if let Some(redrafted) = redrafted {
             execution = redrafted;
         }
@@ -1207,13 +1248,26 @@ impl AgentOrchestrator {
         // 006 US2 (D4/D5): post-hoc quality gate. Streamed tokens cannot be
         // retracted, so a not-ready verdict is appended as a visible
         // warning line and audited instead of blocking delivery.
-        let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
-        let review = self
-            .quality_pipeline
-            .execute(&review_task, &response, |plan| {
-                Box::pin(async move { plan })
-            })
-            .await;
+        // Scope (eng-review D3, same rationale as execute()): only
+        // tool-mutating turns or Confidential sessions are gated — the
+        // plan-shaped heuristics veto ordinary conversational answers.
+        let gated = Self::turn_gated(!tool_calls.is_empty(), session.sensitivity_policy);
+        let review = if gated {
+            let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
+            self.quality_pipeline
+                .execute(&review_task, &response, |plan| {
+                    Box::pin(async move { plan })
+                })
+                .await
+        } else {
+            crate::review::PipelineResult {
+                plan_approved: true,
+                review_notes: "quality gate skipped: no tool invocations this turn".to_string(),
+                delivery_ready: true,
+                athena_shield: None,
+                failed_attempts: Vec::new(),
+            }
+        };
         if !review.delivery_ready {
             let note = review
                 .failed_attempts
@@ -1756,8 +1810,22 @@ mod tests {
         AgentOrchestrator::with_token_budget(router, 10_000_000).with_quality_pipeline(pipeline)
     }
 
+    #[test]
+    fn turn_gated_contract_pins_d3_scope() {
+        assert!(AgentOrchestrator::turn_gated(true, Sensitivity::Public));
+        assert!(!AgentOrchestrator::turn_gated(false, Sensitivity::Public));
+        assert!(AgentOrchestrator::turn_gated(
+            false,
+            Sensitivity::Confidential
+        ));
+        assert!(AgentOrchestrator::turn_gated(
+            true,
+            Sensitivity::Confidential
+        ));
+    }
+
     #[tokio::test]
-    async fn gate_records_review_notes_on_every_turn() {
+    async fn gate_skips_pure_chat_turns_and_records_skip_notes() {
         let orchestrator =
             reviewing_orchestrator(crate::review::SemanticVerdict::approve("semantics sound"));
         let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
@@ -1765,14 +1833,17 @@ mod tests {
             .execute(&mut session, "summarize the architecture")
             .await
             .unwrap();
+        // Eng-review D3: no tool invocations + Public session → gate is
+        // skipped; the skip note replaces Momus verdict notes.
         let notes = execution
             .metadata
             .quality_notes
-            .expect("gate must record review notes");
-        assert!(notes.contains("Momus gate: APPROVED"), "notes: {notes}");
-        // delivery_ready is a genuine gate verdict (Hermes may legitimately
-        // reject a degenerate mock answer), so only the verdict shape is
-        // asserted here — outcome coverage lives in the veto tests below.
+            .expect("skip path must still record notes");
+        assert!(
+            notes.contains("quality gate skipped"),
+            "plain chat turn must skip the gate: {notes}"
+        );
+        assert!(execution.metadata.delivery_ready);
     }
 
     #[tokio::test]

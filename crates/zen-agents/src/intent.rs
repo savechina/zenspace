@@ -19,6 +19,19 @@
 //! `keyword_route` is reused verbatim by `AgentOrchestrator::classify_intent`
 //! for the synchronous `route()` facade; the async [`classify`] is the
 //! execute/execute_stream path.
+//!
+//! # Routing scope (eng-review D4, accepted behavior)
+//! The LLM path maps categories to category-default agents
+//! (`default_agent`: Query→Explore, Action→Hephaestus,
+//! System/Conversation→Sisyphus); only the keyword path routes across the
+//! full INTENT_SIGNALS catalog. Consequence: `delegate.task` and
+//! `plan.execute` live on Sisyphus alone, so they are reachable on the LLM
+//! path only via System/Conversation/low-confidence fallback — a
+//! confidently-classified Query/Action turn runs as a leaf agent without
+//! delegation grants. Routing target for the same query can therefore
+//! differ between classifier-available and degraded runs. Changing this is
+//! a product decision (specialist ownership vs. always-orchestrate), not a
+//! bug fix.
 
 use std::time::Duration;
 
