@@ -657,8 +657,12 @@ impl AgentOrchestrator {
         let mut round = 0;
         let mut tokens_spent: u64 = 0;
         while round < self.max_tool_rounds {
-            let (invocations, parse_errors) =
-                Self::parse_tool_invocations_verbose(&execution.response);
+            // T114: Native-first dispatch. The non-streaming executor doesn't
+            // produce native tool calls yet (T115 adds AgentRun), so
+            // native_calls is always empty — this always falls through to
+            // fenced-JSON parsing, byte-identical to pre-T114.
+            let (invocations, parse_errors, _degraded) =
+                Self::resolve_invocations(&execution.response, &[]);
             if invocations.is_empty() {
                 if parse_errors.is_empty() {
                     break;
@@ -945,40 +949,56 @@ impl AgentOrchestrator {
         entries.join("\n---\n")
     }
 
-    /// Merge fenced-JSON invocations parsed from model text with native
-    /// provider tool calls captured from the stream (T053).
+    /// T114 PD-01 A: native-primary dispatch policy.
     ///
-    /// Fenced-JSON stays first (existing dispatch order); native calls are
-    /// appended after normalizer validation. A native call identical to an
-    /// already-parsed fenced one (same tool + args) is deduped so providers
-    /// echoing their own calls as text do not dispatch twice.
-    fn merge_invocations(
+    /// When native provider tool calls are present, they are dispatched
+    /// directly and fenced-JSON parsing is skipped entirely. When only
+    /// fenced blocks exist, the existing `parse_tool_invocations_verbose`
+    /// path runs byte-identically to pre-T114. When both appear in one
+    /// response, native wins and fenced payloads are logged as degraded,
+    /// never double-dispatched.
+    ///
+    /// Returns `(invocations, parse_errors, degraded)`.
+    pub fn resolve_invocations(
         response: &str,
-        native: &[NativeToolCall],
-    ) -> (Vec<ToolInvocation>, Vec<String>) {
-        let (mut invocations, errors) = Self::parse_tool_invocations_verbose(response);
-        for err in &errors {
-            warn!(error = %err, "fenced tool block unparseable during merge");
+        native_calls: &[NativeToolCall],
+    ) -> (Vec<ToolInvocation>, Vec<String>, bool) {
+        if native_calls.is_empty() {
+            let (invocations, parse_errors) = Self::parse_tool_invocations_verbose(response);
+            return (invocations, parse_errors, false);
         }
-        for call in native {
-            let Ok(invocation) =
-                ToolInvocation::new(call.function.name.clone(), call.function.arguments.clone())
-            else {
-                warn!(
-                    tool = %call.function.name,
-                    "native tool call rejected by normalizer, skipped"
-                );
-                continue;
-            };
-            if invocations.iter().any(|existing| {
-                existing.name == invocation.name && existing.args == invocation.args
-            }) {
-                debug!(tool = %invocation.name, "native tool call duplicates fenced-JSON, deduped");
-                continue;
+
+        let mut invocations = Vec::new();
+        let mut errors = Vec::new();
+        for call in native_calls {
+            match ToolInvocation::new(call.function.name.clone(), call.function.arguments.clone()) {
+                Ok(invocation) => invocations.push(invocation),
+                Err(e) => {
+                    warn!(
+                        tool = %call.function.name,
+                        "native tool call rejected by normalizer, skipped: {e}"
+                    );
+                    errors.push(format!(
+                        "native tool call rejected ({name}): {e}",
+                        name = call.function.name
+                    ));
+                }
             }
-            invocations.push(invocation);
         }
-        (invocations, errors)
+
+        let has_fenced = response.contains("```json");
+        let degraded = if has_fenced {
+            warn!(
+                native_count = native_calls.len(),
+                "both native and fenced tool calls present; \
+                 dispatching native only (degraded)"
+            );
+            true
+        } else {
+            false
+        };
+
+        (invocations, errors, degraded)
     }
 
     /// Mid-loop token ceiling: stop dispatching when the session budget is
@@ -1106,7 +1126,11 @@ impl AgentOrchestrator {
         let mut round = 0;
         let mut tokens_spent: u64 = 0;
         while round < self.max_tool_rounds {
-            let (invocations, parse_errors) = Self::merge_invocations(&response, &native_calls);
+            let (invocations, parse_errors, degraded) =
+                Self::resolve_invocations(&response, &native_calls);
+            if degraded {
+                callback("⚠️ degraded: native tool calls dispatched, fenced blocks ignored\n");
+            }
             if invocations.is_empty() {
                 if parse_errors.is_empty() {
                     break;
@@ -1726,52 +1750,81 @@ mod tests {
     }
 
     #[test]
-    fn merge_invocations_unifies_fenced_and_native() {
+    fn resolve_invocations_native_only_dispatches_without_fenced() {
+        let native = vec![native_call(
+            "web.search",
+            serde_json::json!({"query": "rust"}),
+        )];
+
+        let (invocations, errors, degraded) =
+            AgentOrchestrator::resolve_invocations("plain answer", &native);
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].name.as_str(), "web.search");
+        assert_eq!(invocations[0].args["query"], "rust");
+        assert!(
+            errors.is_empty(),
+            "no errors expected for valid native call"
+        );
+        assert!(!degraded, "no fenced blocks present → not degraded");
+    }
+
+    #[test]
+    fn resolve_invocations_fenced_fallback_byte_identical() {
+        let response = "```json\n{\"tool\": \"fs.read\", \"args\": {\"path\": \"/tmp/x\"}}\n```";
+
+        let (invocations, errors, degraded) = AgentOrchestrator::resolve_invocations(response, &[]);
+        assert_eq!(invocations.len(), 1, "fenced block parsed");
+        assert_eq!(invocations[0].name.as_str(), "fs.read");
+        assert_eq!(invocations[0].args["path"], "/tmp/x");
+        assert!(errors.is_empty());
+        assert!(!degraded, "no native calls → not degraded");
+    }
+
+    #[test]
+    fn resolve_invocations_both_present_native_wins() {
         let response = "```json\n{\"tool\": \"fs.read\", \"args\": {\"path\": \"/tmp/x\"}}\n```";
         let native = vec![native_call(
             "web.search",
             serde_json::json!({"query": "rust"}),
         )];
 
-        let (merged, _) = AgentOrchestrator::merge_invocations(response, &native);
-        let names: Vec<&str> = merged.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["fs.read", "web.search"],
-            "native call was swallowed"
+        let (invocations, errors, degraded) =
+            AgentOrchestrator::resolve_invocations(response, &native);
+        assert!(
+            degraded,
+            "both native and fenced present → degraded must be true"
         );
-        assert_eq!(merged[1].args["query"], "rust");
+        assert_eq!(
+            invocations.len(),
+            1,
+            "only native call dispatched, fenced ignored"
+        );
+        assert_eq!(invocations[0].name.as_str(), "web.search");
+        assert!(errors.is_empty(), "valid native call produces no errors");
     }
 
     #[test]
-    fn merge_invocations_dedups_native_duplicate_of_fenced() {
-        let response = "```json\n{\"tool\": \"web.search\", \"args\": {\"query\": \"rust\"}}\n```";
-        let native = vec![native_call(
-            "web.search",
-            serde_json::json!({"query": "rust"}),
-        )];
-
-        let (merged, _) = AgentOrchestrator::merge_invocations(response, &native);
-        assert_eq!(merged.len(), 1, "identical call dispatched twice");
-    }
-
-    #[test]
-    fn merge_invocations_rejects_invalid_native_name() {
+    fn resolve_invocations_invalid_native_name_logged_as_error() {
         let native = vec![native_call("", serde_json::json!({}))];
-        let (merged, _) = AgentOrchestrator::merge_invocations("plain answer", &native);
-        assert!(merged.is_empty(), "invalid native call must not dispatch");
+        let (invocations, errors, _degraded) =
+            AgentOrchestrator::resolve_invocations("plain answer", &native);
+        assert!(
+            invocations.is_empty(),
+            "invalid native call must not dispatch"
+        );
+        assert_eq!(errors.len(), 1, "one error for the invalid name");
     }
 
     #[test]
-    fn merge_invocations_native_only_round_still_dispatches() {
-        let native = vec![native_call(
-            "web.search",
-            serde_json::json!({"query": "zenspace"}),
-        )];
-
-        let (merged, _) = AgentOrchestrator::merge_invocations("no fenced blocks here", &native);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].name.as_str(), "web.search");
+    fn resolve_invocations_fenced_errors_preserved_when_no_native() {
+        let response = "```json\n{\"tool\": \"x\"}\n```";
+        let (invocations, errors, _degraded) =
+            AgentOrchestrator::resolve_invocations(response, &[]);
+        assert!(invocations.is_empty(), "missing args → no invocation");
+        assert!(
+            !errors.is_empty(),
+            "parse error must surface (T105 dropout prevention)"
+        );
     }
 
     #[test]
