@@ -133,8 +133,6 @@ rig-compose = "0.5"
 # Resource adapters and projection helpers for rig-compose (Evidence → ContextItem bridge)
 rig-resources = "0.2"
 
-rig-memory = "0.38.2"
-
 # MCP bridge for rig-compose tools
 rig-mcp = "0.2"
 
@@ -142,7 +140,12 @@ rig-mcp = "0.2"
 rig-tap = "0.3"
 
 # Persistent memory and vector store for Rig agents
-rig-memvid = { version = "0.4.2", features = ["context-projection", "compaction"] }
+# NOTE(T120): `compaction` feature dropped — zen uses its own MemvidStoringCompactor
+# (zen-memory/src/memvid.rs), never rig-memvid's rig-memory-gated compaction APIs.
+# Dropping it removes the rig-memory 0.1.x → rig-core 0.38.2 duplicate from the tree.
+# The remaining rig-core 0.37 duplicate (rig-memvid + rig-tap hard-pin ^0.37) is
+# upstream-blocked: no rig-memvid/rig-tap release or branch supports rig-core 0.42 yet.
+rig-memvid = { version = "0.4.2", features = ["context-projection"] }
 rig-sqlite = "0.42"
 
 # Utility crates — shared across workspace

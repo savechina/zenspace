@@ -6447,38 +6447,6 @@ dependencies = [
 
 [[package]]
 name = "rig-core"
-version = "0.38.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "557f11c26c2c2ea61d9cb843ce5adff138cc5785f58ff4b87d779de8acaa32ae"
-dependencies = [
- "as-any",
- "async-stream",
- "base64 0.22.1",
- "bytes",
- "eventsource-stream",
- "fastrand",
- "futures",
- "futures-timer",
- "glob",
- "http",
- "mime",
- "mime_guess",
- "nanoid",
- "ordered-float 5.3.0",
- "pin-project-lite",
- "reqwest 0.13.4",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "tracing-futures",
- "url",
-]
-
-[[package]]
-name = "rig-core"
 version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "432d83e0facf16749f91fe729cbffca84437e8062d2f4e92f4f12e903693922d"
@@ -6541,16 +6509,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rig-memory"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eccdf77b80fcddc6b99c57df0759da788397d9be129c2e63c7242f2803c771d4"
-dependencies = [
- "rig-core 0.38.2",
- "tracing",
-]
-
-[[package]]
 name = "rig-memory-policy"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6573,7 +6531,6 @@ dependencies = [
  "memvid-core",
  "rig-compose 0.4.3",
  "rig-core 0.37.0",
- "rig-memory",
  "rig-memory-policy",
  "serde",
  "serde_json",
