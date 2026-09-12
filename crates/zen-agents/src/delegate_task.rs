@@ -25,6 +25,7 @@ use crate::executor::AgentExecutor;
 use crate::registry::{AgentRegistry, DefaultAgentRegistry};
 use crate::wiring::ZenWiring;
 use crate::zen_agent::ZenAgent;
+use zen_memory::memvid_store::MemvidStore;
 
 pub const DELEGATE_TOOL_NAME: &str = "delegate.task";
 
@@ -54,7 +55,7 @@ pub struct DelegateTaskTool {
     executor: AgentExecutor,
     registry: DefaultAgentRegistry,
     overlay: Vec<String>,
-    memvid_store: Option<rig_memvid::MemvidStore>,
+    memvid_store: Option<MemvidStore>,
     sensitivity: SharedSensitivity,
     token_budget: Arc<AtomicTokenBudget>,
     timeout: Duration,
@@ -68,7 +69,7 @@ impl DelegateTaskTool {
         wiring: Arc<ZenWiring>,
         router: DefaultRouter,
         overlay: Vec<String>,
-        memvid_store: Option<rig_memvid::MemvidStore>,
+        memvid_store: Option<MemvidStore>,
         sensitivity: SharedSensitivity,
         token_budget: Arc<AtomicTokenBudget>,
         timeout: Duration,

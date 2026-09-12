@@ -124,13 +124,14 @@ pub async fn search(store: SharedStore, params: Value) -> Result<Value, RpcError
 
     // SearchRequest has serde defaults for every non-essential field;
     // building via JSON keeps us forward-compatible with memvid-core.
-    let request: rig_memvid::memvid_core::SearchRequest = serde_json::from_value(json!({
-        "query": query,
-        "top_k": top_k as usize,
-        "snippet_chars": 160,
-        "uri": uri,
-    }))
-    .map_err(|e| RpcError::invalid_params(METHOD, &format!("bad search request: {e}")))?;
+    let request: zen_memory::memvid_store::memvid_core::SearchRequest =
+        serde_json::from_value(json!({
+            "query": query,
+            "top_k": top_k as usize,
+            "snippet_chars": 160,
+            "uri": uri,
+        }))
+        .map_err(|e| RpcError::invalid_params(METHOD, &format!("bad search request: {e}")))?;
 
     let guard = require_store(&store).await?;
     let zstore = guard.as_ref().expect("checked non-None");

@@ -17,6 +17,7 @@ use tracing::{debug, info, instrument, warn};
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::{MessageRole, RetrievedNote, Sensitivity, SessionContext};
 use zen_memory::ZenMemvidStore;
+use zen_memory::memvid_store::MemvidStore;
 use zen_provider::DefaultRouter;
 
 use crate::delegate_tools;
@@ -59,7 +60,7 @@ pub struct AgentOrchestrator {
     delegates: ZenDelegateTools,
     executor: crate::executor::AgentExecutor,
     token_budget: Arc<AtomicTokenBudget>,
-    memvid_store: Option<rig_memvid::MemvidStore>,
+    memvid_store: Option<MemvidStore>,
     quality_pipeline: QualityPipeline,
     /// FR-046 `[agents] tools` overlay applied on top of the builtin
     /// per-agent grant map when building agents and delegates.

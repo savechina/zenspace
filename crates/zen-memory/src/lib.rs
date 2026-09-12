@@ -16,6 +16,7 @@ pub mod journal;
 pub mod memory_service;
 pub mod memvid;
 pub mod memvid_index;
+pub mod memvid_store;
 pub mod mental_model;
 pub mod okr;
 pub mod preference;

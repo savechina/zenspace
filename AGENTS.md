@@ -53,7 +53,7 @@ The system follows a binary/library split: `zen` (thin binary wrapper) delegates
 
 **Reference Systems** (reuse patterns from):
 - `rig-compose` for agent orchestration (GenericAgent, CoordinatorAgent, DelegateTool)
-- `rig-memvid` for context management (vector store, prompt hooks, compaction)
+- `memvid-core` for context management (engine only; the store wrapper `zen-memory::memvid_store::MemvidStore` is zen-native)
 - `rig-model-meta` for model abstraction (traits, telemetry)
 - Claude Code's system prompt assembly (18-section architecture, cache boundary)
 - LangChain's ChatPromptTemplate (role-separated messages)
@@ -679,6 +679,11 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## NOTES
 
+- **Codex-style owned domain layers (T121, 2026-09-12)**: `rig-tap` + `rig-memvid` dropped; zen owns both thin domain layers in-house (openai/codex pattern: own the domain schema/client layer, keep engines external — codex AGENTS.md "resist adding to core", PR #667 remove-unneeded-dep, PR #4252 own-the-client):
+  - (a) `zen-agents/src/telemetry.rs` — `TelemetryEvent{version, conversation_id, occurred_at_millis, kind}` + 3-variant `EventKind` (prompt_started/completed/failed, serde internally-tagged snake_case, None fields omitted) + `ErrorClass::Unknown` + `emit_kind()` → `tracing::info!(target: "zen_tap", SCHEMA_VERSION = 1)` (replaces rig-tap's 1386-line event schema — zen only ever emitted 3 variants; `ObservabilityEvent`/`extract_event` had zero consumers)
+  - (b) `zen-memory/src/memvid_store.rs` — `MemvidStore` = `Arc<Mutex<memvid_core::Memvid>>` + `from_memvid`/`open`/`open_or_create`/`open_read_only`/`put_text`/`put_memory_card`/`search`/`entity_memories`/`frame_count`/`stats` + `select_cards(CardSelection::ForPrincipal)` (recency-ordered; replaces rig-memvid's 5.7k lines incl. its unused `rig::vector_store` trait integration and 832-line cards_context; memvid-core engine dep unchanged)
+  - Result: `cargo tree --duplicates` = single `rig-core 0.42.0` + single `rig-compose 0.5.0` — the 0.37/0.38.2 islands and the rig-compose 0.4.3 duplicate eliminated at the root (rig-memvid + rig-tap were the only 0.37 pullers)
+  - Tests: 2363/0/19 (baseline 2357, +6: 4 telemetry serde + 2 store roundtrip)
 - Project uses Rust edition 2024 (stable toolchain, MSRV 1.80+)
 - zen-repo uses the unified `SqliteClient` (tokio-rusqlite writer + sqlx pool) with 9 domain repositories
 - **Agentic gateway (004)**: sole-owner daemon owns the memvid store RW; chat/TUI route through it via `SurfaceClient` (`ZEN_SANDBOX_MODE=ask` enables Q3 approval routing to the originating surface). Protocol frozen by `docs/specs/004-agentic-gateway/contracts/`; error catalog -32000..-32099 is closed/additive-only. Guards: watchdog 900s (`ZEN_TURN_WATCHDOG_SECS`), circuit breaker 5→60s, doom-loop 20 turns/10min, stale-client GC 30s — rejections are `-32020 guard-rejected{guard,reason}` + audit line in `<logs>/audit.jsonl`; turn lifecycle audit kinds `gateway.turn.started` (turnId/sessionId/agent, once per registration) and `gateway.turn.completed` (outcome completed|cancelled, exactly once at first terminal transition; `tokens` omitted until `TurnExecutor` reports usage) emitted from `server/hosting.rs` (T054). LLM streaming budgets (zen-agents `completion_model`): first-token 600s (`ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS`, covers cold local-model load+prefill), inter-token 120s (`ZEN_STREAM_INACTIVITY_TIMEOUT_SECS`); client turn ceiling 960s (`ZEN_TURN_TIMEOUT_SECS`) — invariant: turn ceiling > watchdog > first-token budget
@@ -703,7 +708,7 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
 - No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)
 
- - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.42 (LLM abstraction; + rig-agent 0.42 AgentRun runtime, PD-01 B), rig-compose 0.5 (agent kernel), rig-sqlite 0.42 (vector store), rig-tap 0.3 (observability), rig-mcp 0.2 (MCP bridge), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
+ - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.42 (LLM abstraction; + rig-agent 0.42 AgentRun runtime, PD-01 B), rig-compose 0.5 (agent kernel), rig-sqlite 0.42 (vector store), rig-mcp 0.2 (MCP bridge), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
 - SQLite for derived indexes (FTS5, vector embeddings via sqlite-vec, entity graph, habits, finance), Markdown files as canonical source of truth, TOML for config (config.toml), habits (habits.toml), goals (goals.toml), budgets (budgets.toml), routines (routines.toml)
 - Binary/library split: `zen` binary (13 lines) → `zen-cli` library (exporting `shell()`)
 

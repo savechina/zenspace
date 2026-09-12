@@ -9,13 +9,13 @@ use rig_compose::context::{Evidence, InvestigationContext, Signal};
 use rig_core::completion::message::{ToolCall, ToolFunction};
 use rig_core::completion::{AssistantContent, CompletionModel, ToolDefinition};
 use rig_core::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
-use rig_memvid::{CardSelection, MemoryCardContext};
 use serde_json::json;
 use tracing::{debug, instrument, warn};
 use zen_core::notion_graph::NotionGraphProvider;
 use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::{MessageRole, SessionContext};
+use zen_memory::memvid_store::{CardSelection, MemvidStore, select_cards};
 use zen_provider::DefaultRouter;
 
 use crate::completion_model::ZenCompletionModel;
@@ -575,7 +575,7 @@ pub struct ZenAgent {
     pub completion_model: ZenCompletionModel,
     identity: Option<IdentityContext>,
     signals: Option<SelfLearningSignals>,
-    memvid_store: Option<rig_memvid::MemvidStore>,
+    memvid_store: Option<MemvidStore>,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
     pub context_budget_chars: usize,
 }
@@ -727,12 +727,11 @@ impl ZenAgent {
     #[instrument(skip(self), fields(session_id, query_len = query.len()))]
     fn retrieve_memories_structured(&self, session_id: &str, query: &str) -> Option<Vec<String>> {
         self.memvid_store.as_ref().and_then(|store| {
-            let ctx = MemoryCardContext::new(
-                store.clone(),
-                CardSelection::ForPrincipal(session_id.to_string()),
-            );
-
-            match ctx.select(query) {
+            match select_cards(
+                store,
+                &CardSelection::ForPrincipal(session_id.to_string()),
+                query,
+            ) {
                 Ok(cards) if !cards.is_empty() => {
                     tracing::info!(
                         session_id,
@@ -1688,7 +1687,7 @@ pub struct ZenAgentBuilder {
     skill_ids: Vec<String>,
     tool_ids: Vec<String>,
     zen_paths: Option<ZenPaths>,
-    memvid_store: Option<rig_memvid::MemvidStore>,
+    memvid_store: Option<MemvidStore>,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
     context_budget_chars: usize,
 }
@@ -1721,7 +1720,7 @@ impl ZenAgentBuilder {
         self
     }
 
-    pub fn with_memvid_store(mut self, store: rig_memvid::MemvidStore) -> Self {
+    pub fn with_memvid_store(mut self, store: MemvidStore) -> Self {
         self.memvid_store = Some(store);
         self
     }

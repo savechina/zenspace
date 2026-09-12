@@ -34,6 +34,7 @@ use zen_core::sandbox::{
 };
 use zen_core::types::Sensitivity;
 use zen_memory::ZenMemvidStore;
+use zen_memory::memvid_store::MemvidStore;
 use zen_plugin::registry::{Lifecycle, PluginEntry};
 use zen_plugin::wasm_sandbox::{WasmPermissions, WasmSandbox};
 use zen_plugin::{Plugin, PluginApi, WasmPlugin};
@@ -200,7 +201,7 @@ fn instantiate_plugin(
 pub struct ZenWiring {
     pub skills: SkillRegistry,
     pub tools: ToolRegistry,
-    pub memvid_store: Option<rig_memvid::MemvidStore>,
+    pub memvid_store: Option<MemvidStore>,
     pub tool_sensitivity: HashMap<String, Sensitivity>,
     sandbox_mode: SandboxMode,
     sandbox_hooks: Vec<Box<dyn ToolDispatchHook>>,
@@ -212,7 +213,7 @@ impl ZenWiring {
     /// Create a new `ZenWiring` with all skills and tools registered.
     ///
     /// When `ZenPaths::detect()` succeeds and `<memory>/memvid.db` can be
-    /// opened, the resulting [`rig_memvid::MemvidStore`] is exposed via
+    /// opened, the resulting [`MemvidStore`] is exposed via
     /// [`Self::memvid_store`] for downstream consumers (orchestrator,
     /// executor). Otherwise `memvid_store` is `None` and the registries
     /// are still usable.
@@ -646,7 +647,7 @@ impl ZenWiring {
         )
     }
 
-    fn try_open_memvid_store() -> Option<rig_memvid::MemvidStore> {
+    fn try_open_memvid_store() -> Option<MemvidStore> {
         let paths = ZenPaths::detect().ok()?;
         let store_path = paths.memory().join(MEMVID_STORE_FILE);
 

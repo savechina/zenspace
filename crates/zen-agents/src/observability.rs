@@ -1,4 +1,4 @@
-use rig_tap::{EventKind, emit_kind};
+use crate::telemetry::{ErrorClass, EventKind, emit_kind};
 
 pub fn emit_prompt_started(model: &str, conversation_id: &str, messages_in: usize) {
     emit_kind(
@@ -40,7 +40,7 @@ pub fn emit_prompt_failed(model: &str, conversation_id: &str, error: &str) {
         conversation_id,
         EventKind::PromptFailed {
             model: model.to_string(),
-            error_class: rig_tap::ErrorClass::Unknown,
+            error_class: ErrorClass::Unknown,
             message: error.to_string(),
             retriable: false,
             provider_error_code: None,

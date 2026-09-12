@@ -1,22 +1,18 @@
 use std::time::Instant;
 
-use rig_memvid::MemvidStore;
 use tempfile::TempDir;
+use zen_memory::memvid_store::{MemvidStore, memvid_core};
 
 fn bench_retrieval(n: usize, label: &str) {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().join("bench.mv2");
-    let store = MemvidStore::builder()
-        .path(&db_path)
-        .enable_lex()
-        .open_or_create()
-        .expect("store creation");
+    let store = MemvidStore::open_or_create(&db_path).expect("store creation");
 
     for i in 0..n {
         store
             .put_text(
                 &format!("Turn {i}: user asks about topic {i}. Assistant responds with info {i}."),
-                rig_memvid::memvid_core::PutOptions::default(),
+                memvid_core::PutOptions::default(),
             )
             .expect("put_text");
     }
@@ -38,17 +34,13 @@ fn bench_retrieval(n: usize, label: &str) {
 fn bench_retrieval_100_frames() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().join("bench.mv2");
-    let store = MemvidStore::builder()
-        .path(&db_path)
-        .enable_lex()
-        .open_or_create()
-        .expect("store creation");
+    let store = MemvidStore::open_or_create(&db_path).expect("store creation");
 
     for i in 0..100 {
         store
             .put_text(
                 &format!("Turn {i}: user asks about topic {i}. Assistant responds with info {i}."),
-                rig_memvid::memvid_core::PutOptions::default(),
+                memvid_core::PutOptions::default(),
             )
             .expect("put_text");
     }

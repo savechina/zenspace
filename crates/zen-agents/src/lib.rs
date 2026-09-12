@@ -11,6 +11,7 @@ pub mod orchestrator;
 pub mod output_schema;
 pub mod plan_task;
 pub mod prompt;
+pub mod telemetry;
 
 #[deprecated(
     since = "0.1.0",
@@ -45,8 +46,8 @@ pub use observability::{emit_prompt_completed, emit_prompt_failed, emit_prompt_s
 pub use orchestrator::AgentOrchestrator;
 pub use registry::{AgentRegistry, DefaultAgentRegistry, RegistryError};
 pub use review::{HermesValidator, MetisReviewer, MomusReviewer, QualityPipeline, ZeusEscalation};
-pub use rig_tap::{EVENT_TARGET, EventKind, ObservabilityEvent, extract_event};
 pub use skill_hit_router::{SKILL_HIT_MAX_HITS, SKILL_HIT_THRESHOLD, SkillHit, SkillHitRouter};
+pub use telemetry::{EVENT_TARGET, EventKind, TelemetryEvent};
 pub use wiring::ZenWiring;
 pub use zen_agent::{IdentityContext, ZenAgent, ZenAgentBuilder, load_identity_files};
 pub use zen_skill::{ZenSkill, ZenTool};

@@ -26,8 +26,6 @@ rig-agent = { workspace = true }
 rig-compose = { workspace = true }
 rig-resources = { workspace = true }
 rig-mcp = { workspace = true }
-rig-tap = { workspace = true }
-rig-memvid = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

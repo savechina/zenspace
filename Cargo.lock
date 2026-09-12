@@ -18,6 +18,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "adobe-cmap-parser"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae8abfa9a4688de8fc9f42b3f013b6fffec18ed8a554f5f113577e0b9b3212a3"
+dependencies = [
+ "pom",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,6 +1171,12 @@ name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d43a04d8753f35258c91f8ec639f792891f748a1edbd759cf1dcea3382ad83c"
+
+[[package]]
+name = "cff-parser"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31f5b6e9141c036f3ff4ce7b2f7e432b0f00dee416ddcd4f17741d189ddc2e9d"
 
 [[package]]
 name = "cfg-if"
@@ -2473,6 +2488,15 @@ checksum = "de48cc4d1c1d97a20fd819def54b890cadde72ed3ad0c614822a0a433361be96"
 dependencies = [
  "cfg-if",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "euclid"
+version = "0.20.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bb7ef65b3777a325d1eeefefab5b6d4959da54747e33bd6258e789640f307ad"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -4197,6 +4221,34 @@ dependencies = [
 
 [[package]]
 name = "lopdf"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7184fdea2bc3cd272a1acec4030c321a8f9875e877b3f92a53f2f6033fdc289"
+dependencies = [
+ "aes",
+ "bitflags 2.13.1",
+ "cbc",
+ "ecb",
+ "encoding_rs",
+ "flate2",
+ "getrandom 0.3.4",
+ "indexmap",
+ "itoa",
+ "log",
+ "md-5 0.10.6",
+ "nom 8.0.0",
+ "nom_locate",
+ "rand 0.9.5",
+ "rangemap",
+ "sha2 0.10.9",
+ "stringprep",
+ "thiserror 2.0.19",
+ "ttf-parser",
+ "weezl",
+]
+
+[[package]]
+name = "lopdf"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f560f57dfb9142a02d673e137622fd515d4231e51feb8b4af28d92647d83f35b"
@@ -4517,11 +4569,12 @@ dependencies = [
  "hex",
  "libc",
  "log",
- "lopdf",
+ "lopdf 0.39.0",
  "lz4_flex",
  "memchr",
  "memmap2",
  "once_cell",
+ "pdf-extract",
  "quick-xml 0.31.0",
  "regex",
  "same-file",
@@ -4623,15 +4676,6 @@ name = "murmurhash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
-
-[[package]]
-name = "nanoid"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ffa00dec017b5b1a8b7cf5e2c008bfda1aa7e0697ac1508b491fdf2622fb4d8"
-dependencies = [
- "rand 0.8.7",
-]
 
 [[package]]
 name = "ndarray"
@@ -5207,6 +5251,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pdf-extract"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e28ba1758a3d3f361459645780e09570b573fc3c82637449e9963174c813a98"
+dependencies = [
+ "adobe-cmap-parser",
+ "cff-parser",
+ "encoding_rs",
+ "euclid 0.20.14",
+ "log",
+ "lopdf 0.38.0",
+ "postscript",
+ "type1-encoding-parser",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5481,6 +5542,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pom"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60f6ce597ecdcc9a098e7fddacb1065093a3d66446fa16c675e7e71d1b5c28e6"
+
+[[package]]
 name = "portable-atomic"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5527,6 +5594,12 @@ dependencies = [
  "embedded-io 0.6.1",
  "serde",
 ]
+
+[[package]]
+name = "postscript"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78451badbdaebaf17f053fd9152b3ffb33b516104eacb45e7864aaa9c712f306"
 
 [[package]]
 name = "potential_utf"
@@ -6372,7 +6445,7 @@ dependencies = [
  "futures",
  "http",
  "indexmap",
- "rig-core 0.42.0",
+ "rig-core",
  "rig-derive",
  "schemars",
  "serde",
@@ -6381,21 +6454,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-futures",
-]
-
-[[package]]
-name = "rig-compose"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78bdff250637d2dafca60c1118358303f05f900e160365e9e458497789b1c726"
-dependencies = [
- "async-trait",
- "dashmap",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -6411,38 +6469,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "rig-core"
-version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6bd308c89a90f89ce7cd6641a078c7d2a2c55fb5a4147fd48b5a0989c3430bd"
-dependencies = [
- "as-any",
- "async-stream",
- "base64 0.22.1",
- "bytes",
- "eventsource-stream",
- "fastrand",
- "futures",
- "futures-timer",
- "glob",
- "http",
- "mime",
- "mime_guess",
- "nanoid",
- "ordered-float 5.3.0",
- "pin-project-lite",
- "reqwest 0.13.4",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "tracing-futures",
- "url",
 ]
 
 [[package]]
@@ -6500,41 +6526,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7ebcbba1e5f9ce07cdb171e32278cab6a8e249642e38bcc8b1273571652a300"
 dependencies = [
  "async-trait",
- "rig-compose 0.5.0",
+ "rig-compose",
  "rmcp",
  "serde",
  "serde_json",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rig-memory-policy"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6283614baf1bde69738368ce00ed83300914e058f514e0fdda44a3e9553f318f"
-dependencies = [
- "blake3",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
-name = "rig-memvid"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0478bbe6c26c38dccad87636468888c513892f3a6f584591a1f22ea4cd6872a5"
-dependencies = [
- "futures",
- "memvid-core",
- "rig-compose 0.4.3",
- "rig-core 0.37.0",
- "rig-memory-policy",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -6546,7 +6542,7 @@ checksum = "5756f70e3ddec45144d4b56518d42c5a5f2265161ad2373da0907a0db749583d"
 dependencies = [
  "async-trait",
  "parking_lot",
- "rig-compose 0.5.0",
+ "rig-compose",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -6560,7 +6556,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0cedd820258f6b86f933eeb97105cae32fb7bff74642e3e65593dc631fb5f5a"
 dependencies = [
  "chrono",
- "rig-core 0.42.0",
+ "rig-core",
  "rusqlite",
  "serde",
  "serde_json",
@@ -6569,19 +6565,6 @@ dependencies = [
  "tokio-rusqlite",
  "tracing",
  "zerocopy",
-]
-
-[[package]]
-name = "rig-tap"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85a5354ddca67090e11298176a0b07c6cb6555c4100028296cda6f0d388ea3f2"
-dependencies = [
- "rig-core 0.37.0",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tracing",
 ]
 
 [[package]]
@@ -8664,6 +8647,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 
 [[package]]
+name = "type1-encoding-parser"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa10c302f5a53b7ad27fd42a3996e23d096ba39b5b8dd6d9e683a05b01bee749"
+dependencies = [
+ "pom",
+]
+
+[[package]]
 name = "typed-builder"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9614,7 +9606,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7012add459f951456ec9d6c7e6fc340b1ce15d6fc9629f8c42853412c029e57e"
 dependencies = [
  "bitflags 1.3.2",
- "euclid",
+ "euclid 0.22.14",
  "lazy_static",
  "serde",
  "wezterm-dynamic",
@@ -10328,7 +10320,7 @@ name = "zen"
 version = "0.0.8"
 dependencies = [
  "dotenvy",
- "rig-compose 0.5.0",
+ "rig-compose",
  "serde_json",
  "tempfile",
  "tokio",
@@ -10354,12 +10346,10 @@ dependencies = [
  "home",
  "jsonschema",
  "rig-agent",
- "rig-compose 0.5.0",
- "rig-core 0.42.0",
+ "rig-compose",
+ "rig-core",
  "rig-mcp",
- "rig-memvid",
  "rig-resources",
- "rig-tap",
  "schemars",
  "serde",
  "serde_json",
@@ -10412,7 +10402,7 @@ dependencies = [
  "ratatui",
  "ratatui-themes",
  "reqwest 0.13.4",
- "rig-compose 0.5.0",
+ "rig-compose",
  "rpassword",
  "serde",
  "serde_json",
@@ -10458,7 +10448,7 @@ dependencies = [
  "libc",
  "notify",
  "notify-rust",
- "rig-compose 0.5.0",
+ "rig-compose",
  "rusqlite",
  "serde",
  "serde_json",
@@ -10484,9 +10474,8 @@ dependencies = [
  "futures-util",
  "libc",
  "reqwest 0.13.4",
- "rig-compose 0.5.0",
+ "rig-compose",
  "rig-mcp",
- "rig-memvid",
  "serde",
  "serde_json",
  "sysinfo",
@@ -10515,9 +10504,9 @@ dependencies = [
  "blake3",
  "chrono",
  "include_dir",
- "rig-compose 0.5.0",
- "rig-core 0.42.0",
- "rig-memvid",
+ "memvid-core",
+ "rig-compose",
+ "rig-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -10549,7 +10538,7 @@ dependencies = [
  "readabilityrs",
  "regex",
  "reqwest 0.13.4",
- "rig-compose 0.5.0",
+ "rig-compose",
  "rig-mcp",
  "schemars",
  "scraper 0.27.0",
@@ -10584,8 +10573,8 @@ dependencies = [
  "home",
  "reqwest 0.13.4",
  "rig-agent",
- "rig-compose 0.5.0",
- "rig-core 0.42.0",
+ "rig-compose",
+ "rig-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -10652,8 +10641,8 @@ dependencies = [
  "chrono",
  "html2md",
  "reqwest 0.13.4",
- "rig-compose 0.5.0",
- "rig-core 0.42.0",
+ "rig-compose",
+ "rig-core",
  "rig-sqlite",
  "rusqlite",
  "schemars",

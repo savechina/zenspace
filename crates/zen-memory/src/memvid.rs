@@ -1,7 +1,6 @@
+use crate::memvid_store::{MemvidStore, memvid_core};
 use anyhow::Result;
 use memvid_core::{MemoryCardBuilder, Ticket};
-use rig_memvid::MemvidStore;
-use rig_memvid::memvid_core;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
