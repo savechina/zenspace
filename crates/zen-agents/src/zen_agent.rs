@@ -1221,7 +1221,7 @@ impl ZenAgent {
             max_tokens: Some(2048),
             tool_choice: None,
             additional_params: None,
-            output_schema: None,
+            output_schema: crate::output_schema::agent_output_schema(self.generic.name()),
             record_telemetry_content: false,
         };
 
@@ -1493,7 +1493,7 @@ impl ZenAgent {
             max_tokens: Some(2048),
             tool_choice: None,
             additional_params: None,
-            output_schema: None,
+            output_schema: crate::output_schema::agent_output_schema(self.generic.name()),
             record_telemetry_content: false,
         };
 

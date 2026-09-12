@@ -17,6 +17,9 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use rig_core::OneOrMany;
+use rig_core::completion::{AssistantContent, CompletionResponse};
+use rig_core::message::ToolCall as NativeToolCall;
 use tracing::{info, instrument, warn};
 
 use zen_core::sanitize::InputSanitizer;
@@ -427,6 +430,120 @@ impl AgentExecutor {
         let result = self.execute(context, agent)?;
         callback(&result.response);
         Ok(result)
+    }
+
+    /// T115: Single-model-call helper for the AgentRun driver loop (sync).
+    ///
+    /// Builds the full prompt (system identity + tool manifest + user
+    /// content + tool results), routes to a provider, calls the LLM with
+    /// retry, and returns the response text plus any native provider
+    /// `ToolCall`s extracted from the `CompletionResponse`.
+    ///
+    /// The orchestrator drives this from `AgentRun::next_step()` when it
+    /// receives `AgentRunStep::CallModel`.
+    #[instrument(skip(self, context, agent), fields(agent_name = %context.agent_profile.name, sensitivity = ?context.sensitivity))]
+    pub fn execute_model_call(
+        &self,
+        context: &AgentContext,
+        agent: &crate::ZenAgent,
+        tool_manifest: &str,
+        tool_results: &str,
+    ) -> Result<(String, Vec<NativeToolCall>)> {
+        let requirements = TaskRequirements {
+            max_tokens: Some(context.max_tokens as u32),
+            sensitivity: context.sensitivity,
+            preferred_model: None,
+            budget_limit: None,
+        };
+
+        let provider = self
+            .router
+            .route_with_preferences(&requirements, &context.preferences)
+            .or_else(|e| {
+                info!("Preference routing failed: {e}, falling back");
+                self.router.route(&requirements)
+            })
+            .unwrap_or_else(|e| {
+                warn!("All routing failed: {e}, using mock fallback");
+                Provider::Mock
+            });
+
+        let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
+        let (response, _tokens, _used_mock) =
+            self.execute_with_retry(&provider, &prompt, &context.agent_profile.name)?;
+
+        // Build a CompletionResponse to extract native tool calls.
+        // The zen completion model wraps the entire response as
+        // `AssistantContent::text`, so native_calls will typically be
+        // empty here (the non-streaming path doesn't produce native
+        // tool calls). The orchestrator falls back to fenced-JSON
+        // parsing via `resolve_invocations`.
+        let completion_response: CompletionResponse<()> = CompletionResponse {
+            choice: OneOrMany::one(AssistantContent::text(response.clone())),
+            usage: rig_core::completion::Usage::new(),
+            raw_response: (),
+            message_id: None,
+        };
+
+        let mut native_calls = Vec::new();
+        for content in completion_response.choice {
+            if let AssistantContent::ToolCall(call) = content {
+                native_calls.push(call);
+            }
+        }
+
+        Ok((response, native_calls))
+    }
+
+    /// T115: Streaming-model-call helper for the AgentRun driver loop.
+    ///
+    /// Uses the router's `call_stream` to accumulate tokens while
+    /// forwarding each chunk to `callback`. Returns the full accumulated
+    /// response text plus any native provider `ToolCall`s captured from
+    /// the stream.
+    #[instrument(skip(self, context, agent, callback), fields(agent_name = %context.agent_profile.name))]
+    pub async fn execute_model_call_stream(
+        &self,
+        context: &AgentContext,
+        agent: &crate::ZenAgent,
+        tool_manifest: &str,
+        tool_results: &str,
+        mut callback: impl FnMut(&str) + Send + 'static,
+    ) -> Result<(String, Vec<NativeToolCall>)> {
+        let requirements = TaskRequirements {
+            max_tokens: Some(context.max_tokens as u32),
+            sensitivity: context.sensitivity,
+            preferred_model: None,
+            budget_limit: None,
+        };
+
+        let provider = self
+            .router
+            .route_with_preferences(&requirements, &context.preferences)
+            .or_else(|e| {
+                info!("Preference routing failed: {e}, falling back");
+                self.router.route(&requirements)
+            })
+            .unwrap_or_else(|e| {
+                warn!("All routing failed: {e}, using mock fallback");
+                Provider::Mock
+            });
+
+        let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
+
+        let stream_resp = self.router.call_stream(provider, &prompt)?;
+
+        let mut full_response = String::new();
+        let native_calls: Vec<NativeToolCall> = Vec::new();
+
+        let mut token_rx = stream_resp.token_rx;
+
+        while let Some(text) = token_rx.recv().await {
+            callback(&text);
+            full_response.push_str(&text);
+        }
+
+        Ok((full_response, native_calls))
     }
 }
 

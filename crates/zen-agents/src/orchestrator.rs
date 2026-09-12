@@ -1,16 +1,18 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use rig_agent::agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome};
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
-// Aliased: crate::execution::ToolCall (dispatch record) already owns the
-// short name; this is rig-core's native provider tool call.
 use rig_compose::normalizer::{
     ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
-use rig_core::completion::message::ToolCall as NativeToolCall;
+use rig_core::OneOrMany;
+use rig_core::completion::{AssistantContent, Usage, message::ToolCall as NativeToolCall};
+use rig_core::message::Message;
 use tracing::{debug, info, instrument, warn};
 
 use zen_core::sanitize::InputSanitizer;
@@ -22,6 +24,7 @@ use crate::delegate_tools;
 use crate::delegate_tools::ZenDelegateTools;
 use crate::execution::{AgentExecution, ExecutionMetadata, ToolCall};
 use crate::intent;
+use crate::output_schema::{agent_output_schema_value, max_output_schema_retries};
 use crate::registry::AgentRegistry;
 use crate::review::QualityPipeline;
 use crate::skill_hit_router::{SkillHit, SkillHitRouter, render_skill_prompt};
@@ -582,8 +585,6 @@ impl AgentOrchestrator {
         user_query: &str,
     ) -> Result<AgentExecution> {
         let start = Instant::now();
-        // FR-037: skill hits resolve before routing; a hit's prompt leads
-        // the M1 context so the model sees the established procedure.
         self.ensure_delegate_tool();
         self.inject_skill_hits(session, user_query);
         let (intent, llm_telemetry) = intent::classify(
@@ -604,17 +605,14 @@ impl AgentOrchestrator {
         );
 
         let zen_agent = self.build_agent(&agent_name).await?;
-
         session.agent_name.clone_from(&agent_name);
 
-        // Architecture: Orchestrator → Registry → AgentProfile by name
         let profile = self
             .registry
             .find_by_name(&agent_name)
             .map_err(|e| anyhow::anyhow!("Agent not found: {}", e))?
             .clone();
 
-        // FR-TUI-012: AgentContext with preferences from profile
         let context =
             crate::AgentContext::new(profile.clone(), user_query.to_string(), session.clone())
                 .with_preferences(profile.llm_preferences.clone());
@@ -633,150 +631,284 @@ impl AgentOrchestrator {
         }
         let reservation = reservation.unwrap();
 
-        // Execution: AgentContext (routing) + ZenAgent (instance) → Executor.
-        // The first round advertises the agent-scoped tool manifest (honours
-        // the per-agent whitelist from AGENT_TOOLS) so the model can emit
-        // fenced-JSON tool calls for tools the agent actually holds.
-        let tool_manifest = zen_agent.tool_manifest();
-        let mut execution =
-            self.executor
-                .execute_round(&context, &zen_agent, &tool_manifest, "")?;
-
-        // Connect stdio MCP servers once per process (idempotent, non-fatal).
         self.wiring.connect_mcp_servers().await;
-
-        // Update the confidentiality gate for this session so cloud tools
-        // are blocked when the session is Confidential (FR-009).
         self.wiring.set_sensitivity(session.sensitivity_policy);
         self.propagate_sensitivity(session.sensitivity_policy);
 
-        // Agentic tool loop: while the model requests tools, dispatch them
-        // through the sandbox hook pipeline and feed results back, up to
-        // `max_tool_rounds` iterations ([agentic.tool_loop], T054).
+        let tool_manifest = zen_agent.tool_manifest();
+        let tool_names: BTreeSet<String> = zen_agent
+            .tool_definitions()
+            .into_iter()
+            .map(|td| td.name)
+            .collect();
+
+        let output_schema = agent_output_schema_value(&agent_name).cloned();
+        let output_retries = max_output_schema_retries();
+        let mut run = AgentRun::new(Message::user(user_query))
+            .max_turns(self.max_tool_rounds + 2)
+            .with_output_validation(output_schema, output_retries)
+            .with_history(
+                session
+                    .conversation
+                    .iter()
+                    .map(|t| match t.role {
+                        MessageRole::User => Message::user(&t.content),
+                        MessageRole::Assistant => Message::assistant(&t.content),
+                        MessageRole::System | MessageRole::Tool => Message::system(&t.content),
+                    })
+                    .collect(),
+            );
+
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut round = 0;
         let mut tokens_spent: u64 = 0;
-        while round < self.max_tool_rounds {
-            // T114: Native-first dispatch. The non-streaming executor doesn't
-            // produce native tool calls yet (T115 adds AgentRun), so
-            // native_calls is always empty — this always falls through to
-            // fenced-JSON parsing, byte-identical to pre-T114.
-            let (invocations, parse_errors, _degraded) =
-                Self::resolve_invocations(&execution.response, &[]);
-            if invocations.is_empty() {
-                if parse_errors.is_empty() {
-                    break;
-                }
-                // The model attempted a tool call but the block was malformed.
-                // Breaking here would echo the block as the final answer with
-                // nothing executed and no diagnostic (the reported dropout).
-                // Instead feed the diagnostics back so the model self-corrects;
-                // the round cap bounds worst-case retries.
-                round += 1;
-                for err in &parse_errors {
-                    warn!(error = %err, round, "fenced tool block unparseable");
-                    tool_calls.push(ToolCall {
-                        tool_name: "<parse>".to_string(),
-                        arguments: String::new(),
-                        result: err.clone(),
-                    });
-                }
-                let feedback = format!(
-                    "Your previous tool call block could not be parsed and was NOT executed:\n{}\nRe-emit exactly one valid ```json block with {{\"tool\": \"<name>\", \"args\": {{...}}}}.",
-                    parse_errors.join("\n")
-                );
-                execution =
-                    self.executor
-                        .execute_round(&context, &zen_agent, &tool_manifest, &feedback)?;
-                tokens_spent += ((feedback.len() + execution.response.len()) / 4) as u64;
-                continue;
-            }
-            round += 1;
+        let mut last_model_used = String::new();
+        let mut final_response = String::new();
+        let mut dispatch_round: usize = 0;
 
-            if round > 1
-                && Self::tool_loop_over_budget(
-                    self.token_budget.tokens_consumed().await,
-                    tokens_spent,
-                    self.token_budget.capacity(),
-                )
-            {
-                warn!(round, tokens_spent, "tool loop token budget exhausted");
-                tool_calls.push(ToolCall {
-                    tool_name: "<budget>".to_string(),
-                    arguments: String::new(),
-                    result: "tool loop token budget exhausted; history preserved, resume next turn"
-                        .to_string(),
-                });
-                break;
-            }
-
-            let hooks = self.wiring.dispatch_hooks();
-            match dispatch_tool_invocations_with_hooks(
-                zen_agent.generic.tools(),
-                &invocations,
-                &hooks,
-            )
-            .await
-            {
-                Ok(mut results) => {
-                    for result in &mut results {
-                        let screened = Self::screen_tool_output(&result.output);
-                        if screened != result.output {
-                            warn!(
-                                tool = %result.invocation.name,
-                                "tool output contained screened patterns"
-                            );
-                            result.output = screened;
+        loop {
+            match run.next_step()? {
+                AgentRunStep::CallModel {
+                    prompt,
+                    history: _,
+                    turn,
+                } => {
+                    let tool_results_text = match &prompt {
+                        Message::User { content } => {
+                            let text = match content.first() {
+                                rig_core::message::UserContent::Text(t) => t.text.clone(),
+                                _ => String::new(),
+                            };
+                            if text.starts_with("## Tool Results") {
+                                text
+                            } else {
+                                String::new()
+                            }
                         }
-                    }
-                    for result in &results {
-                        tool_calls.push(ToolCall {
-                            tool_name: result.invocation.name.to_string(),
-                            arguments: result.invocation.args.to_string(),
-                            result: result.output.to_string(),
-                        });
-                    }
-                    let results_json = Self::results_to_prompt(&results);
-                    execution = self.executor.execute_round(
+                        _ => String::new(),
+                    };
+                    let tool_results_str = if tool_results_text.is_empty() {
+                        ""
+                    } else {
+                        &tool_results_text
+                    };
+
+                    let (response_text, native_calls) = self.executor.execute_model_call(
                         &context,
                         &zen_agent,
                         &tool_manifest,
-                        &results_json,
+                        tool_results_str,
                     )?;
-                    tokens_spent += ((results_json.len() + execution.response.len()) / 4) as u64;
+
+                    let (invocations, parse_errors, _degraded) =
+                        Self::resolve_invocations(&response_text, &native_calls);
+
+                    if !parse_errors.is_empty() {
+                        for err in &parse_errors {
+                            warn!(error = %err, turn, "fenced tool block unparseable");
+                            tool_calls.push(ToolCall {
+                                tool_name: "<parse>".to_string(),
+                                arguments: String::new(),
+                                result: err.clone(),
+                            });
+                        }
+                        let feedback = format!(
+                            "Your previous tool call block could not be parsed and was NOT executed:\n{}\nRe-emit exactly one valid ```json block with {{\"tool\": \"<name>\", \"args\": {{...}}}}.",
+                            parse_errors.join("\n")
+                        );
+                        let mut new_run = AgentRun::new(Message::user(&feedback))
+                            .max_turns(self.max_tool_rounds + 2 - turn);
+                        for msg in run.messages() {
+                            new_run = new_run.with_history(vec![msg.clone()]);
+                        }
+                        run = new_run;
+                        continue;
+                    }
+
+                    let assistant_content: Vec<AssistantContent> = if invocations.is_empty() {
+                        vec![AssistantContent::text(response_text.clone())]
+                    } else {
+                        let mut items: Vec<AssistantContent> =
+                            vec![AssistantContent::text(response_text.clone())];
+                        for (idx, inv) in invocations.iter().enumerate() {
+                            items.push(AssistantContent::tool_call(
+                                format!("call_{idx}"),
+                                inv.name.clone(),
+                                inv.args.clone(),
+                            ));
+                        }
+                        items
+                    };
+
+                    let choice =
+                        OneOrMany::from_iter_optional(assistant_content).unwrap_or_else(|| {
+                            OneOrMany::one(AssistantContent::text(response_text.clone()))
+                        });
+
+                    let model_turn = ModelTurn::new(
+                        None,
+                        choice,
+                        Usage::new(),
+                        tool_names.clone(),
+                        tool_names.clone(),
+                    );
+
+                    match run.model_response(model_turn)? {
+                        ModelTurnOutcome::Continue { .. } => {}
+                        ModelTurnOutcome::NeedsResolution(_) => {
+                            run.resolve_invalid_tool_call(
+                                rig_agent::agent::hook::InvalidToolCallAction::skip(
+                                    "invalid tool call",
+                                ),
+                            )?;
+                        }
+                        ModelTurnOutcome::TurnRetried => continue,
+                    }
+
+                    final_response = response_text;
+                    last_model_used = if context.agent_profile.llm_preferences.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{:?}", context.agent_profile.llm_preferences)
+                    };
                 }
-                Err(e) => {
-                    warn!(error = %e, round, "tool dispatch terminated by sandbox hook");
-                    tool_calls.push(ToolCall {
-                        tool_name: "<dispatch>".to_string(),
-                        arguments: String::new(),
-                        result: format!("blocked by sandbox: {e}"),
-                    });
+                AgentRunStep::CallTools { calls } => {
+                    dispatch_round += 1;
+                    if dispatch_round > self.max_tool_rounds {
+                        break;
+                    }
+                    let mut invocations = Vec::new();
+                    for pending in &calls {
+                        if pending.preresolved_result.is_some() {
+                            continue;
+                        }
+                        let tc = &pending.tool_call;
+                        match ToolInvocation::new(
+                            tc.function.name.clone(),
+                            tc.function.arguments.clone(),
+                        ) {
+                            Ok(inv) => invocations.push(inv),
+                            Err(e) => {
+                                warn!(tool = %tc.function.name, "tool invocation rejected: {e}");
+                                tool_calls.push(ToolCall {
+                                    tool_name: tc.function.name.clone(),
+                                    arguments: tc.function.arguments.to_string(),
+                                    result: format!("rejected: {e}"),
+                                });
+                            }
+                        }
+                    }
+
+                    if invocations.is_empty() {
+                        let results: Vec<rig_core::message::UserContent> = calls
+                            .iter()
+                            .map(|c| {
+                                use rig_core::message::ToolResultContent;
+                                rig_core::message::UserContent::tool_result(
+                                    c.tool_call.id.clone(),
+                                    OneOrMany::one(ToolResultContent::text(
+                                        "no valid invocations to dispatch",
+                                    )),
+                                )
+                            })
+                            .collect();
+                        run.tool_results(results)?;
+                        continue;
+                    }
+
+                    for invocation in &invocations {
+                        tool_calls.push(ToolCall {
+                            tool_name: invocation.name.to_string(),
+                            arguments: invocation.args.to_string(),
+                            result: String::new(),
+                        });
+                    }
+
+                    let hooks = self.wiring.dispatch_hooks();
+                    match dispatch_tool_invocations_with_hooks(
+                        zen_agent.generic.tools(),
+                        &invocations,
+                        &hooks,
+                    )
+                    .await
+                    {
+                        Ok(mut results) => {
+                            for result in &mut results {
+                                let screened = Self::screen_tool_output(&result.output);
+                                if screened != result.output {
+                                    warn!(
+                                        tool = %result.invocation.name,
+                                        "tool output contained screened patterns"
+                                    );
+                                    result.output = screened;
+                                }
+                            }
+                            for result in &results {
+                                if let Some(tc) = tool_calls.iter_mut().rev().find(|t| {
+                                    t.tool_name == result.invocation.name && t.result.is_empty()
+                                }) {
+                                    tc.result = result.output.to_string();
+                                }
+                            }
+                            let tool_results: Vec<rig_core::message::UserContent> = results
+                                .iter()
+                                .enumerate()
+                                .map(|(i, r)| {
+                                    use rig_core::message::ToolResultContent;
+                                    let call_id = calls
+                                        .get(i)
+                                        .map(|c| c.tool_call.id.clone())
+                                        .unwrap_or_default();
+                                    rig_core::message::UserContent::tool_result(
+                                        call_id,
+                                        OneOrMany::one(ToolResultContent::text(
+                                            serde_json::to_string(&r.output).unwrap_or_default(),
+                                        )),
+                                    )
+                                })
+                                .collect();
+                            run.tool_results(tool_results)?;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "tool dispatch terminated by sandbox hook");
+                            tool_calls.push(ToolCall {
+                                tool_name: "<dispatch>".to_string(),
+                                arguments: String::new(),
+                                result: format!("blocked by sandbox: {e}"),
+                            });
+                            let err_msg = format!("blocked by sandbox: {e}");
+                            let results: Vec<rig_core::message::UserContent> = calls
+                                .iter()
+                                .map(|c| {
+                                    use rig_core::message::ToolResultContent;
+                                    rig_core::message::UserContent::tool_result(
+                                        c.tool_call.id.clone(),
+                                        OneOrMany::one(ToolResultContent::text(err_msg.clone())),
+                                    )
+                                })
+                                .collect();
+                            run.tool_results(results)?;
+                        }
+                    }
+                }
+                AgentRunStep::Done(response) => {
+                    final_response = response.output;
                     break;
                 }
             }
         }
 
-        let actual_tokens = (execution.response.len() / 4 + user_query.len() / 4) as u64;
+        let actual_tokens = (final_response.len() / 4 + user_query.len() / 4) as u64;
         self.token_budget
             .record_usage(reservation, actual_tokens, actual_tokens)
             .await;
 
-        // 006 US2 (D4): post-loop quality gate. A Momus veto gets exactly
-        // one feedback round (budget permitting); delivery is non-blocking
-        // — the verdict and notes ride on the execution metadata and audit.
-        // Scope (eng-review D3): the gate's plan-shaped heuristics veto
-        // ordinary conversational answers (word-count/keyword checks tuned
-        // for engineering plans), so pure chat turns skip it — the gate
-        // runs only for tool-mutating turns or Confidential sessions.
         let gated = Self::turn_gated(!tool_calls.is_empty(), session.sensitivity_policy);
-        let (review, feedback_rounds, redrafted) = if gated {
+        let (review, feedback_rounds, _redrafted) = if gated {
             let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
-            let draft_response = execution.response.clone();
             Self::review_with_feedback_round(
                 &self.quality_pipeline,
                 &review_task,
-                &draft_response,
+                &final_response,
                 |feedback| {
                     let redrafted = self.executor.execute_round(
                         &context,
@@ -802,15 +934,12 @@ impl AgentOrchestrator {
                 None,
             )
         };
-        if let Some(redrafted) = redrafted {
-            execution = redrafted;
-        }
 
         if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
             Self::append_turn_review_audit(
                 &paths,
                 &session.session_id.to_string(),
-                &execution.agent_name,
+                &agent_name,
                 &intent,
                 &llm_telemetry,
                 &review,
@@ -821,22 +950,18 @@ impl AgentOrchestrator {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let final_execution = AgentExecution {
-            agent_name: execution.agent_name,
-            response: execution.response,
+            agent_name: agent_name.clone(),
+            response: final_response.clone(),
             metadata: ExecutionMetadata {
-                tokens_used: execution.metadata.tokens_used,
-                cost_estimate: execution.metadata.cost_estimate,
-                model_used: execution.metadata.model_used,
+                tokens_used: run.usage().input_tokens as u32 + run.usage().output_tokens as u32,
+                cost_estimate: 0.0,
+                model_used: last_model_used,
                 duration_ms,
-                sensitivity: execution.metadata.sensitivity,
+                sensitivity: session.sensitivity_policy,
                 quality_notes: Some(review.review_notes),
                 delivery_ready: review.delivery_ready,
             },
-            tool_calls: if tool_calls.is_empty() {
-                execution.tool_calls
-            } else {
-                tool_calls
-            },
+            tool_calls,
         };
 
         crate::observability::emit_prompt_completed(
@@ -855,8 +980,6 @@ impl AgentOrchestrator {
             &final_execution.response,
         );
 
-        // FR-040: memory nudge every 10 user turns (same cadence/path as
-        // execute_stream — shared emit_memory_nudge_if_due helper).
         let user_turns = session
             .conversation
             .iter()
@@ -1001,12 +1124,6 @@ impl AgentOrchestrator {
         (invocations, errors, degraded)
     }
 
-    /// Mid-loop token ceiling: stop dispatching when the session budget is
-    /// exhausted. Remainder stays in session history; the user resumes next turn.
-    fn tool_loop_over_budget(consumed: u64, spent_this_turn: u64, capacity: u64) -> bool {
-        consumed.saturating_add(spent_this_turn) >= capacity
-    }
-
     /// Screen one tool output before prompt injection (T098).
     ///
     /// Walks string values recursively so line-oriented filters engage on
@@ -1089,7 +1206,6 @@ impl AgentOrchestrator {
         mut callback: impl FnMut(&str),
     ) -> Result<String> {
         let _start = Instant::now();
-        // FR-037: same pre-route skill-hit injection as execute().
         self.ensure_delegate_tool();
         self.inject_skill_hits(session, user_query);
         let (intent, llm_telemetry) = intent::classify(
@@ -1110,142 +1226,275 @@ impl AgentOrchestrator {
         );
 
         let zen_agent = self.build_agent(&agent_name).await?;
-
         session.agent_name.clone_from(&agent_name);
 
         self.wiring.connect_mcp_servers().await;
         self.wiring.set_sensitivity(session.sensitivity_policy);
         self.propagate_sensitivity(session.sensitivity_policy);
 
-        let (mut response, mut native_calls) = zen_agent
-            .execute_stream_round(user_query, session, None, &mut callback)
-            .await?;
+        let tool_names: BTreeSet<String> = zen_agent
+            .tool_definitions()
+            .into_iter()
+            .map(|td| td.name)
+            .collect();
+
+        let output_schema = agent_output_schema_value(&agent_name).cloned();
+        let output_retries = max_output_schema_retries();
+        let mut run = AgentRun::new(Message::user(user_query))
+            .max_turns(self.max_tool_rounds + 2)
+            .with_output_validation(output_schema, output_retries)
+            .with_history(
+                session
+                    .conversation
+                    .iter()
+                    .map(|t| match t.role {
+                        MessageRole::User => Message::user(&t.content),
+                        MessageRole::Assistant => Message::assistant(&t.content),
+                        MessageRole::System | MessageRole::Tool => Message::system(&t.content),
+                    })
+                    .collect(),
+            );
 
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut interaction_turns: Vec<(&str, String)> = Vec::new();
-        let mut round = 0;
-        let mut tokens_spent: u64 = 0;
-        while round < self.max_tool_rounds {
-            let (invocations, parse_errors, degraded) =
-                Self::resolve_invocations(&response, &native_calls);
-            if degraded {
-                callback("⚠️ degraded: native tool calls dispatched, fenced blocks ignored\n");
-            }
-            if invocations.is_empty() {
-                if parse_errors.is_empty() {
-                    break;
-                }
-                round += 1;
-                for err in &parse_errors {
-                    warn!(error = %err, round, "fenced tool block unparseable");
-                    callback(&format!("⚠️ tool block ignored: {err}\n"));
-                    tool_calls.push(ToolCall {
-                        tool_name: "<parse>".to_string(),
-                        arguments: String::new(),
-                        result: err.clone(),
-                    });
-                }
-                let feedback = format!(
-                    "Your previous tool call block could not be parsed and was NOT executed:\n{}\nRe-emit exactly one valid ```json block with {{\"tool\": \"<name>\", \"args\": {{...}}}}.",
-                    parse_errors.join("\n")
-                );
-                interaction_turns.push(("assistant", response.clone()));
-                interaction_turns.push(("tool", feedback.clone()));
-                let (next_response, next_native_calls) = zen_agent
-                    .execute_stream_round(user_query, session, Some(&feedback), &mut callback)
-                    .await?;
-                tokens_spent += ((feedback.len() + next_response.len()) / 4) as u64;
-                response = next_response;
-                native_calls = next_native_calls;
-                continue;
-            }
-            round += 1;
+        let mut final_response = String::new();
+        let mut dispatch_round: usize = 0;
 
-            if round > 1
-                && Self::tool_loop_over_budget(
-                    self.token_budget.tokens_consumed().await,
-                    tokens_spent,
-                    self.token_budget.capacity(),
-                )
-            {
-                warn!(
-                    round,
-                    tokens_spent, "streaming tool loop token budget exhausted"
-                );
-                callback(
-                    "⏹️ tool loop token budget exhausted; history preserved, resume next turn\n",
-                );
-                tool_calls.push(ToolCall {
-                    tool_name: "<budget>".to_string(),
-                    arguments: String::new(),
-                    result: "tool loop token budget exhausted; history preserved, resume next turn"
-                        .to_string(),
-                });
-                break;
-            }
-
-            for invocation in &invocations {
-                callback(&format!("🔧 {} …\n", invocation.name.as_str()));
-            }
-            let dispatch_started = Instant::now();
-            let hooks = self.wiring.dispatch_hooks();
-            match dispatch_tool_invocations_with_hooks(
-                zen_agent.generic.tools(),
-                &invocations,
-                &hooks,
-            )
-            .await
-            {
-                Ok(mut results) => {
-                    let duration_ms = dispatch_started.elapsed().as_millis();
-                    for result in &mut results {
-                        let screened = Self::screen_tool_output(&result.output);
-                        if screened != result.output {
-                            warn!(
-                                tool = %result.invocation.name,
-                                "tool output contained screened patterns"
-                            );
-                            result.output = screened;
+        loop {
+            match run.next_step()? {
+                AgentRunStep::CallModel {
+                    prompt,
+                    history: _,
+                    turn,
+                } => {
+                    let tool_results_text = match &prompt {
+                        Message::User { content } => {
+                            let text = match content.first() {
+                                rig_core::message::UserContent::Text(t) => t.text.clone(),
+                                _ => String::new(),
+                            };
+                            if text.starts_with("## Tool Results") {
+                                Some(text)
+                            } else {
+                                None
+                            }
                         }
-                    }
-                    for result in &results {
-                        tool_calls.push(ToolCall {
-                            tool_name: result.invocation.name.to_string(),
-                            arguments: result.invocation.args.to_string(),
-                            result: result.output.to_string(),
-                        });
-                        callback(&Self::tool_done_line(result, duration_ms));
-                    }
-                    let results_json = Self::results_to_prompt(&results);
-                    info!(
-                        round,
-                        tool_count = results.len(),
-                        "streaming tool dispatch succeeded, re-streaming"
-                    );
-                    let assistant_text =
-                        append_native_tool_calls_fenced(response.clone(), &native_calls);
-                    interaction_turns.push(("assistant", assistant_text));
-                    interaction_turns.push(("tool", results_json.clone()));
-                    let (next_response, next_native_calls) = zen_agent
+                        _ => None,
+                    };
+
+                    let (response_text, native_calls) = zen_agent
                         .execute_stream_round(
                             user_query,
                             session,
-                            Some(&results_json),
+                            tool_results_text.as_deref(),
                             &mut callback,
                         )
                         .await?;
-                    tokens_spent += ((results_json.len() + next_response.len()) / 4) as u64;
-                    response = next_response;
-                    native_calls = next_native_calls;
+
+                    let (invocations, parse_errors, degraded) =
+                        Self::resolve_invocations(&response_text, &native_calls);
+                    if degraded {
+                        callback(
+                            "⚠️ degraded: native tool calls dispatched, fenced blocks ignored\n",
+                        );
+                    }
+
+                    if !parse_errors.is_empty() {
+                        for err in &parse_errors {
+                            warn!(error = %err, turn, "fenced tool block unparseable");
+                            callback(&format!("⚠️ tool block ignored: {err}\n"));
+                            tool_calls.push(ToolCall {
+                                tool_name: "<parse>".to_string(),
+                                arguments: String::new(),
+                                result: err.clone(),
+                            });
+                        }
+                        let feedback = format!(
+                            "Your previous tool call block could not be parsed and was NOT executed:\n{}\nRe-emit exactly one valid ```json block with {{\"tool\": \"<name>\", \"args\": {{...}}}}.",
+                            parse_errors.join("\n")
+                        );
+                        interaction_turns.push(("assistant", response_text.clone()));
+                        interaction_turns.push(("tool", feedback.clone()));
+                        let mut new_run = AgentRun::new(Message::user(&feedback))
+                            .max_turns(self.max_tool_rounds + 2 - turn);
+                        for msg in run.messages() {
+                            new_run = new_run.with_history(vec![msg.clone()]);
+                        }
+                        run = new_run;
+                        continue;
+                    }
+
+                    let assistant_content: Vec<AssistantContent> = if invocations.is_empty() {
+                        vec![AssistantContent::text(response_text.clone())]
+                    } else {
+                        let mut items: Vec<AssistantContent> =
+                            vec![AssistantContent::text(response_text.clone())];
+                        for (idx, inv) in invocations.iter().enumerate() {
+                            items.push(AssistantContent::tool_call(
+                                format!("call_{idx}"),
+                                inv.name.clone(),
+                                inv.args.clone(),
+                            ));
+                        }
+                        items
+                    };
+
+                    let choice =
+                        OneOrMany::from_iter_optional(assistant_content).unwrap_or_else(|| {
+                            OneOrMany::one(AssistantContent::text(response_text.clone()))
+                        });
+
+                    let model_turn = ModelTurn::new(
+                        None,
+                        choice,
+                        Usage::new(),
+                        tool_names.clone(),
+                        tool_names.clone(),
+                    );
+
+                    match run.model_response(model_turn)? {
+                        ModelTurnOutcome::Continue { .. } => {}
+                        ModelTurnOutcome::NeedsResolution(_) => {
+                            run.resolve_invalid_tool_call(
+                                rig_agent::agent::hook::InvalidToolCallAction::skip(
+                                    "invalid tool call",
+                                ),
+                            )?;
+                        }
+                        ModelTurnOutcome::TurnRetried => continue,
+                    }
+
+                    final_response = response_text;
                 }
-                Err(e) => {
-                    warn!(error = %e, round, "streaming tool dispatch terminated by sandbox hook");
-                    tool_calls.push(ToolCall {
-                        tool_name: "<dispatch>".to_string(),
-                        arguments: String::new(),
-                        result: format!("blocked by sandbox: {e}"),
-                    });
-                    callback(&format!("❌ tool dispatch blocked: {e}\n"));
+                AgentRunStep::CallTools { calls } => {
+                    dispatch_round += 1;
+                    if dispatch_round > self.max_tool_rounds {
+                        break;
+                    }
+                    let mut invocations = Vec::new();
+                    for pending in &calls {
+                        if pending.preresolved_result.is_some() {
+                            continue;
+                        }
+                        let tc = &pending.tool_call;
+                        match ToolInvocation::new(
+                            tc.function.name.clone(),
+                            tc.function.arguments.clone(),
+                        ) {
+                            Ok(inv) => invocations.push(inv),
+                            Err(e) => {
+                                warn!(tool = %tc.function.name, "tool invocation rejected: {e}");
+                                tool_calls.push(ToolCall {
+                                    tool_name: tc.function.name.clone(),
+                                    arguments: tc.function.arguments.to_string(),
+                                    result: format!("rejected: {e}"),
+                                });
+                            }
+                        }
+                    }
+
+                    if invocations.is_empty() {
+                        let results: Vec<rig_core::message::UserContent> = calls
+                            .iter()
+                            .map(|c| {
+                                use rig_core::message::ToolResultContent;
+                                rig_core::message::UserContent::tool_result(
+                                    c.tool_call.id.clone(),
+                                    OneOrMany::one(ToolResultContent::text("no valid invocations")),
+                                )
+                            })
+                            .collect();
+                        run.tool_results(results)?;
+                        continue;
+                    }
+
+                    for invocation in &invocations {
+                        callback(&format!("🔧 {} …\n", invocation.name.as_str()));
+                        tool_calls.push(ToolCall {
+                            tool_name: invocation.name.to_string(),
+                            arguments: invocation.args.to_string(),
+                            result: String::new(),
+                        });
+                    }
+
+                    let dispatch_started = Instant::now();
+                    let hooks = self.wiring.dispatch_hooks();
+                    match dispatch_tool_invocations_with_hooks(
+                        zen_agent.generic.tools(),
+                        &invocations,
+                        &hooks,
+                    )
+                    .await
+                    {
+                        Ok(mut results) => {
+                            let duration_ms = dispatch_started.elapsed().as_millis();
+                            for result in &mut results {
+                                let screened = Self::screen_tool_output(&result.output);
+                                if screened != result.output {
+                                    warn!(
+                                        tool = %result.invocation.name,
+                                        "tool output contained screened patterns"
+                                    );
+                                    result.output = screened;
+                                }
+                            }
+                            for result in &results {
+                                if let Some(tc) = tool_calls.iter_mut().rev().find(|t| {
+                                    t.tool_name == result.invocation.name && t.result.is_empty()
+                                }) {
+                                    tc.result = result.output.to_string();
+                                }
+                                callback(&Self::tool_done_line(result, duration_ms));
+                            }
+                            let assistant_text =
+                                append_native_tool_calls_fenced(final_response.clone(), &[]);
+                            interaction_turns.push(("assistant", assistant_text));
+                            let results_json = Self::results_to_prompt(&results);
+                            interaction_turns.push(("tool", results_json));
+                            let tool_results: Vec<rig_core::message::UserContent> = results
+                                .iter()
+                                .enumerate()
+                                .map(|(i, r)| {
+                                    use rig_core::message::ToolResultContent;
+                                    let call_id = calls
+                                        .get(i)
+                                        .map(|c| c.tool_call.id.clone())
+                                        .unwrap_or_default();
+                                    rig_core::message::UserContent::tool_result(
+                                        call_id,
+                                        OneOrMany::one(ToolResultContent::text(
+                                            serde_json::to_string(&r.output).unwrap_or_default(),
+                                        )),
+                                    )
+                                })
+                                .collect();
+                            run.tool_results(tool_results)?;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "tool dispatch terminated by sandbox hook");
+                            tool_calls.push(ToolCall {
+                                tool_name: "<dispatch>".to_string(),
+                                arguments: String::new(),
+                                result: format!("blocked by sandbox: {e}"),
+                            });
+                            callback(&format!("❌ tool dispatch blocked: {e}\n"));
+                            let err_msg = format!("blocked by sandbox: {e}");
+                            let results: Vec<rig_core::message::UserContent> = calls
+                                .iter()
+                                .map(|c| {
+                                    use rig_core::message::ToolResultContent;
+                                    rig_core::message::UserContent::tool_result(
+                                        c.tool_call.id.clone(),
+                                        OneOrMany::one(ToolResultContent::text(err_msg.clone())),
+                                    )
+                                })
+                                .collect();
+                            run.tool_results(results)?;
+                        }
+                    }
+                }
+                AgentRunStep::Done(response) => {
+                    final_response = response.output;
                     break;
                 }
             }
@@ -1258,9 +1507,9 @@ impl AgentOrchestrator {
                 .expect("interaction_turns roles are hardcoded (assistant/tool)");
             session.add_turn(parsed, content);
         }
-        session.add_turn(MessageRole::Assistant, &response);
+        session.add_turn(MessageRole::Assistant, &final_response);
 
-        let actual_tokens = (response.len() / 4 + user_query.len() / 4) as u64;
+        let actual_tokens = (final_response.len() / 4 + user_query.len() / 4) as u64;
         let reservation = self
             .token_budget
             .try_reserve_tokens(actual_tokens)
@@ -1273,19 +1522,13 @@ impl AgentOrchestrator {
                 .await;
         }
 
-        zen_agent.persist_turn(&session.session_id.to_string(), user_query, &response);
+        zen_agent.persist_turn(&session.session_id.to_string(), user_query, &final_response);
 
-        // 006 US2 (D4/D5): post-hoc quality gate. Streamed tokens cannot be
-        // retracted, so a not-ready verdict is appended as a visible
-        // warning line and audited instead of blocking delivery.
-        // Scope (eng-review D3, same rationale as execute()): only
-        // tool-mutating turns or Confidential sessions are gated — the
-        // plan-shaped heuristics veto ordinary conversational answers.
         let gated = Self::turn_gated(!tool_calls.is_empty(), session.sensitivity_policy);
         let review = if gated {
             let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
             self.quality_pipeline
-                .execute(&review_task, &response, |plan| {
+                .execute(&review_task, &final_response, |plan| {
                     Box::pin(async move { plan })
                 })
                 .await
@@ -1318,8 +1561,6 @@ impl AgentOrchestrator {
             );
         }
 
-        // FR-040: memory nudge every 10 user turns. Logs + jsonl only — the
-        // nudge never enters the model token stream (no callback pollution).
         let user_turns = session
             .conversation
             .iter()
@@ -1329,7 +1570,7 @@ impl AgentOrchestrator {
             emit_memory_nudge_if_due(&paths, user_turns);
         }
 
-        Ok(response)
+        Ok(final_response)
     }
 
     /// Route (keyword classification) — backward compatible public facade.
@@ -1517,18 +1758,6 @@ mod tests {
     fn test_screen_tool_output_leaves_clean_untouched() {
         let output = serde_json::json!({"content": "plain summary", "count": 1u64});
         assert_eq!(AgentOrchestrator::screen_tool_output(&output), output);
-    }
-
-    #[test]
-    fn test_tool_loop_over_budget_boundary() {
-        assert!(!AgentOrchestrator::tool_loop_over_budget(90, 9, 100));
-        assert!(AgentOrchestrator::tool_loop_over_budget(90, 10, 100));
-        assert!(AgentOrchestrator::tool_loop_over_budget(0, 0, 0));
-        assert!(AgentOrchestrator::tool_loop_over_budget(
-            u64::MAX,
-            u64::MAX,
-            u64::MAX
-        ));
     }
 
     #[test]
