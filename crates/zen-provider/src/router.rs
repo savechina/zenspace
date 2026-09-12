@@ -508,6 +508,15 @@ impl DefaultRouter {
         Some(instance)
     }
 
+    /// Config-level provider availability check — no network probe, no key
+    /// resolution. Returns `true` when `resolve_provider` would return
+    /// `Some` (i.e. a provider is configured for the default task context).
+    /// Used by the intent fail-fast gate (T112) to skip the LLM classify
+    /// attempt when no capable provider is wired.
+    pub fn has_configured_provider(&self) -> bool {
+        Self::resolve_provider(&self.config, TaskContext::Default_).is_some()
+    }
+
     /// Build a keyless provider instance (ollama / mock). Never resolves
     /// secrets, so it is safe at construction time.
     fn create_provider_instance_without_key(

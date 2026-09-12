@@ -67,8 +67,8 @@ The system follows a binary/library split: `zen` (thin binary wrapper) delegates
 - **Database**: SQLite (FTS5 + sqlite-vec for agentic module)
 - **Error Handling**: thiserror + anyhow
 - **Agent Orchestration**: rig-compose 0.3
-- **LLM Abstraction**: rig-core 0.37
-- **Vector Store**: sqlite-vec + rig-sqlite 0.2
+- **LLM Abstraction**: rig-core 0.41 (+ rig-agent 0.41 classic runtime — AgentRun state machine, PD-01 B target)
+- **Vector Store**: sqlite-vec + rig-sqlite 0.41
 - **Template Engine**: tera + include_dir
 - **Configuration**: dotenvy + 5-layer inheritance
 
@@ -703,13 +703,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
 - No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)
 
- - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.37 (LLM abstraction), rig-compose 0.4 (agent kernel), rig-sqlite 0.2 (vector store), rig-tap 0.1 (observability), rig-mcp 0.2 (MCP bridge), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
+ - Rust edition 2024 (stable toolchain, MSRV 1.80+) + clap 4.5 (CLI derive), tokio 1.47 (async runtime), rusqlite 0.32 (SQLite FTS5 + sqlite-vec), rig-core 0.41 (LLM abstraction; + rig-agent 0.41 AgentRun runtime planned for PD-01 B), rig-compose 0.5 (agent kernel), rig-sqlite 0.41 (vector store), rig-tap 0.1 (observability), rig-mcp 0.2 (MCP bridge), rmcp 0.1 (MCP server), wasmtime 24 (WASM sandbox), security-framework 3 (macOS Keychain), serde/serde_json 1.0, tera (template engine), include_dir (embedded templates), ratatui 0.30 + crossterm 0.28 (TUI), axum 0.8 (gateway), sqlx 0.8 (async SQLite), ort 2.0 (ONNX runtime for embeddings)
 - SQLite for derived indexes (FTS5, vector embeddings via sqlite-vec, entity graph, habits, finance), Markdown files as canonical source of truth, TOML for config (config.toml), habits (habits.toml), goals (goals.toml), budgets (budgets.toml), routines (routines.toml)
 - Binary/library split: `zen` binary (13 lines) → `zen-cli` library (exporting `shell()`)
 
 ## Recent Changes
 
-- **Multi-agent orchestration fusion (2026-09-07, 006-multi-agent-orchestration)** — dead parallel system replaced by model-driven delegation + real quality gate:
+- **Multi-agent orchestration fusion (2026-09-07, 006-agentic-orchestration)** — dead parallel system replaced by model-driven delegation + real quality gate:
   - `delegate.task` (D1-D3): `DelegateTaskTool` runs a REAL LLM sub-turn (≤4 rounds, own `AgentExecutor` + `build_sub_agent`) instead of the deleted skills-carrier stub; depth-1 guard strips `delegate.*` grants (overlay included); `SharedSensitivity` propagates session policy to the sub-agent's `AgentContext`; kill-switch `[agentic.delegate].enabled` (default true), `timeout_secs` clamp 30..=1800 (env `ZEN_DELEGATE_ENABLED`/`ZEN_DELEGATE_TIMEOUT_SECS`); args `{agent, prompt, description}`; unknown agent / bad args / exhausted budget / timeout all return structured Ok-error output (never panic the round). Lazy-registered at first orchestrator turn (`ensure_delegate_tool`) so `with_approval_callback`'s `Arc::get_mut` stays viable
   - Quality gate (D4-D5): `execute()` runs `QualityPipeline` (Metis→Momus→Hermes + async `SemanticReviewer` on HIGH blast radius) after the tool loop; Momus veto triggers exactly ONE feedback round then re-review; `ExecutionMetadata` gains `quality_notes: Option<String>` + `delivery_ready: bool` (serde default_true — pre-gate payloads stay decodable); `execute_stream()` runs the gate post-hoc and appends a `⚠️ quality gate: delivery not ready` callback line on veto; audit line `loop.turn.review` (plan_approved/delivery_ready/feedback_rounds) appended to `logs/audit.jsonl` per turn
   - INTENT_SIGNALS salvage (D6): `ZenCoordinator` (948 lines), `AgentExecution::sub_agent_results`, `ZenWiring.delegates`, and the stub delegation block deleted; keyword routing survives as the `INTENT_SIGNALS` const table — `classify_intent` returns `(agent, signal)`; the signal rides the `loop.turn.review` audit entry; `route()` facade unchanged

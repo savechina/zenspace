@@ -384,6 +384,7 @@ impl AgentOrchestrator {
         session_id: &str,
         agent: &str,
         intent: &intent::Intent,
+        llm_telemetry: &intent::LlmTelemetry,
         review: &crate::review::PipelineResult,
         feedback_rounds: u8,
     ) {
@@ -396,6 +397,8 @@ impl AgentOrchestrator {
             "intent_source": format!("{:?}", intent.source),
             "intent_confidence": intent.confidence,
             "intent_acl": intent.acl.as_str(),
+            "intent_llm_outcome": llm_telemetry.outcome.as_str(),
+            "intent_llm_ms": llm_telemetry.elapsed_ms,
             "plan_approved": review.plan_approved,
             "delivery_ready": review.delivery_ready,
             "feedback_rounds": feedback_rounds,
@@ -583,7 +586,7 @@ impl AgentOrchestrator {
         // the M1 context so the model sees the established procedure.
         self.ensure_delegate_tool();
         self.inject_skill_hits(session, user_query);
-        let intent = intent::classify(
+        let (intent, llm_telemetry) = intent::classify(
             self.executor.router(),
             user_query,
             session.sensitivity_policy,
@@ -595,6 +598,7 @@ impl AgentOrchestrator {
             source = ?intent.source,
             category = intent.category.as_str(),
             confidence = intent.confidence,
+            llm_outcome = llm_telemetry.outcome.as_str(),
             query_len = user_query.len(),
             "AgentOrchestrator: executing query"
         );
@@ -804,6 +808,7 @@ impl AgentOrchestrator {
                 &session.session_id.to_string(),
                 &execution.agent_name,
                 &intent,
+                &llm_telemetry,
                 &review,
                 feedback_rounds,
             );
@@ -1067,7 +1072,7 @@ impl AgentOrchestrator {
         // FR-037: same pre-route skill-hit injection as execute().
         self.ensure_delegate_tool();
         self.inject_skill_hits(session, user_query);
-        let intent = intent::classify(
+        let (intent, llm_telemetry) = intent::classify(
             self.executor.router(),
             user_query,
             session.sensitivity_policy,
@@ -1079,6 +1084,7 @@ impl AgentOrchestrator {
             source = ?intent.source,
             category = intent.category.as_str(),
             confidence = intent.confidence,
+            llm_outcome = llm_telemetry.outcome.as_str(),
             query_len = user_query.len(),
             "AgentOrchestrator: streaming execution"
         );
@@ -1282,6 +1288,7 @@ impl AgentOrchestrator {
                 &session.session_id.to_string(),
                 &agent_name,
                 &intent,
+                &llm_telemetry,
                 &review,
                 0,
             );
