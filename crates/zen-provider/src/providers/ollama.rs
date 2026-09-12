@@ -1,9 +1,9 @@
-use rig::client::{CompletionClient, Nothing};
-use rig::completion::CompletionModel;
-use rig::providers::ollama;
-use rig::streaming::StreamedAssistantContent;
 use rig_agent::AgentBuilder;
 use rig_agent::completion::Prompt;
+use rig_core::client::{CompletionClient, Nothing};
+use rig_core::completion::CompletionModel;
+use rig_core::providers::ollama;
+use rig_core::streaming::StreamedAssistantContent;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 

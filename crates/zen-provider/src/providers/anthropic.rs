@@ -1,7 +1,7 @@
-use rig::client::CompletionClient;
-use rig::providers::anthropic;
 use rig_agent::AgentBuilder;
 use rig_agent::completion::Prompt;
+use rig_core::client::CompletionClient;
+use rig_core::providers::anthropic;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 

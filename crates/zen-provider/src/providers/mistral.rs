@@ -1,7 +1,7 @@
-use rig::client::CompletionClient;
-use rig::providers::mistral;
 use rig_agent::AgentBuilder;
 use rig_agent::completion::Prompt;
+use rig_core::client::CompletionClient;
+use rig_core::providers::mistral;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 

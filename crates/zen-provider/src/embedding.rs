@@ -8,9 +8,9 @@ use tracing::{info, warn};
 use zen_core::config::ZenConfig;
 
 use crate::router::resolve_api_key;
-use rig::client::{EmbeddingsClient, Nothing};
-use rig::embeddings::EmbeddingModel as RigEmbeddingModel;
-use rig::providers::{ollama, openai};
+use rig_core::client::{EmbeddingsClient, Nothing};
+use rig_core::embeddings::EmbeddingModel as RigEmbeddingModel;
+use rig_core::providers::{ollama, openai};
 
 pub trait EmbeddingProvider: Send + Sync + std::fmt::Debug {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;

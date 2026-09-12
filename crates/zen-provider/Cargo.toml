@@ -18,7 +18,7 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
-rig = { workspace = true }
+rig-core = { workspace = true }
 rig-agent = { workspace = true }
 rig-compose = { workspace = true }
 fastembed = { workspace = true }
