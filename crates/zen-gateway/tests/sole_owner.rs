@@ -28,6 +28,9 @@ fn daemon_config(dir: &std::path::Path) -> GatewayDaemonConfig {
         socket_path: dir.join("gateway.sock"),
         memory_path: Some(dir.join("memory.mv2")),
         db_path: Some(dir.join("state.db")),
+        // T111/T118: never let the daemon fall back to the real ~/.zen audit
+        // sink (latent risk if a turn is ever added to this suite).
+        audit_path: Some(dir.join("audit.jsonl")),
         ..Default::default()
     }
 }

@@ -54,6 +54,9 @@ unicode-width = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
 
 [dev-dependencies]
+# T111/T118: test builds must never resolve the real ~/.zen — the
+# test-support feature makes user_root() read ZEN_HOME fresh + temp-fallback.
+zen-core = { path = "../zen-core", features = ["test-support"] }
 portable-pty = "0.9.0"
 tempfile = { workspace = true }
 vt100 = "0.16.2"

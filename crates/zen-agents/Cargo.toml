@@ -37,7 +37,11 @@ fs2 = { workspace = true }
 jsonschema = { workspace = true }
 
 [dev-dependencies]
+# T111/T118: test builds must never resolve the real ~/.zen — the
+# test-support feature makes user_root() read ZEN_HOME fresh + temp-fallback.
+zen-core = { path = "../zen-core", features = ["test-support"] }
 rig-core = { workspace = true, features = ["test-utils"] }
 wat = "1"
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+home = { workspace = true }

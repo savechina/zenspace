@@ -10421,6 +10421,7 @@ dependencies = [
  "fastrand",
  "fs2",
  "futures",
+ "home",
  "jsonschema",
  "rig-agent",
  "rig-compose 0.5.0",

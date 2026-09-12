@@ -26,6 +26,15 @@ libc = { workspace = true }
 url = { workspace = true }
 rusqlite = { workspace = true }
 
+[features]
+# Test-only (T111/T118): makes `user_root()` read ZEN_HOME fresh on every
+# call and fall back to a per-process temp dir when ZEN_HOME is unset, so
+# test binaries that link zen-core WITHOUT `cfg(test)` (integration tests
+# and inline `#[cfg(test)]` modules of dependent crates) never resolve the
+# developer's real `~/.zen`. Enabled via `[dev-dependencies]` in crates
+# whose tests emit audit lines (zen-agents, zen-gateway, zen-cli).
+test-support = []
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }

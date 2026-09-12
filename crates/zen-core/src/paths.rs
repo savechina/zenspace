@@ -18,17 +18,35 @@ static USER_ROOT: LazyLock<PathBuf> = LazyLock::new(|| -> PathBuf {
 });
 
 pub fn user_root() -> PathBuf {
-    // In test mode, read env var directly to allow test isolation
-    #[cfg(test)]
+    // Test seam (T111/T118): in test builds — zen-core's own `cfg(test)` or
+    // the `test-support` feature enabled by consumer dev-dependencies — read
+    // ZEN_HOME fresh on every call so a frozen per-binary home takes effect
+    // even after the first resolution, and fall back to a per-process temp
+    // dir instead of the real `~/.zen` when ZEN_HOME is unset. Integration
+    // tests must never write audit lines into the developer's global root.
+    #[cfg(any(test, feature = "test-support"))]
     {
         env::var(ZEN_HOME_ENV)
             .map(PathBuf::from)
-            .unwrap_or_else(|_| home::home_dir().map(|h| h.join(".zen")).unwrap_or_default())
+            .unwrap_or_else(|_| test_home_fallback())
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         USER_ROOT.clone()
     }
+}
+
+/// Per-process temp home used when a test build has no `ZEN_HOME` set.
+/// Leaked for the process lifetime (tests only); keeps every audit write
+/// inside the OS temp dir instead of the developer's real `~/.zen`.
+#[cfg(any(test, feature = "test-support"))]
+fn test_home_fallback() -> PathBuf {
+    static TEST_HOME: LazyLock<PathBuf> = LazyLock::new(|| {
+        let base = std::env::temp_dir().join(format!("zen-test-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        base
+    });
+    TEST_HOME.clone()
 }
 
 pub struct ZenPaths {

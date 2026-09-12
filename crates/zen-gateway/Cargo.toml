@@ -32,4 +32,7 @@ rig-compose = { workspace = true }
 rig-mcp = { workspace = true }
 
 [dev-dependencies]
+# T111/T118: test builds must never resolve the real ~/.zen — the
+# test-support feature makes user_root() read ZEN_HOME fresh + temp-fallback.
+zen-core = { path = "../zen-core", features = ["test-support"] }
 tempfile = { workspace = true }
