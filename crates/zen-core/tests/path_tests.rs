@@ -94,7 +94,7 @@ fn detect_with_workspace_sets_workspace_root() {
 }
 
 #[test]
-fn config_file_uses_workspace_when_present() {
+fn config_file_always_global() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "project-a");
     unsafe {
@@ -104,8 +104,8 @@ fn config_file_uses_workspace_when_present() {
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let cfg = paths.config_file();
     assert!(
-        cfg.starts_with(&ws),
-        "config_file should be under workspace: {cfg:?}"
+        cfg.starts_with(&home_path),
+        "config_file should be under global_root (Path Spec v2): {cfg:?}"
     );
     assert!(
         cfg.ends_with("config.toml"),
@@ -296,7 +296,7 @@ fn finance_is_under_user_data() {
 }
 
 #[test]
-fn output_under_workspace_when_present() {
+fn output_always_global() {
     let (_tmp, home_path) = setup_zen_home();
     let ws = setup_workspace(&home_path, "output-project");
     unsafe {
@@ -306,8 +306,8 @@ fn output_under_workspace_when_present() {
     let paths = ZenPaths::detect().expect("detect() should succeed");
     let out = paths.output();
     assert!(
-        out.starts_with(&ws),
-        "output should be under workspace: {out:?}"
+        out.starts_with(&home_path),
+        "output should be under global_root (Path Spec v2): {out:?}"
     );
     assert!(out.ends_with("output"), "output path: {out:?}");
 
@@ -326,39 +326,6 @@ fn output_under_global_when_no_workspace() {
         "output should be under global: {out:?}"
     );
     assert!(out.ends_with("output"), "output path: {out:?}");
-}
-
-#[test]
-fn user_data_under_workspace_when_present() {
-    let (_tmp, home_path) = setup_zen_home();
-    let ws = setup_workspace(&home_path, "ws");
-    unsafe {
-        std::env::set_var("ZEN_WORKSPACE", &ws);
-    }
-
-    let paths = ZenPaths::detect().expect("detect() should succeed");
-    let data_path = paths.user_data("custom-data");
-    assert!(
-        data_path.starts_with(&ws),
-        "user_data should be under workspace: {data_path:?}"
-    );
-    assert!(data_path.ends_with("custom-data"));
-
-    unsafe {
-        std::env::remove_var("ZEN_WORKSPACE");
-    }
-}
-
-#[test]
-fn user_data_under_global_when_no_workspace() {
-    let (_tmp, home_path) = setup_zen_home();
-    let paths = ZenPaths::detect().expect("detect() should succeed");
-    let data_path = paths.user_data("custom-data");
-    assert!(
-        data_path.starts_with(&home_path),
-        "user_data should be under global: {data_path:?}"
-    );
-    assert!(data_path.ends_with("custom-data"));
 }
 
 // ============================================================================
@@ -434,82 +401,46 @@ fn cache_with_unicode_domain() {
     );
 }
 
-#[test]
-fn user_data_with_empty_domain() {
-    let (_tmp, _) = setup_zen_home();
-    let paths = ZenPaths::detect().expect("detect() should succeed");
-    let data_path = paths.user_data("");
-    assert!(
-        data_path.to_string_lossy().ends_with("/"),
-        "Empty domain user_data ends with separator: {data_path:?}"
-    );
-}
-
-#[test]
-fn user_data_with_long_domain() {
-    let (_tmp, _) = setup_zen_home();
-    let paths = ZenPaths::detect().expect("detect() should succeed");
-    let long = "a".repeat(1000);
-    let data_path = paths.user_data(&long);
-    assert!(
-        data_path.to_string_lossy().ends_with(&long),
-        "Long domain should be preserved: {}",
-        data_path.display()
-    );
-}
-
 // ============================================================================
 // LOGIC TREE — Workspace-dependent methods exercise both branches
 // ============================================================================
 
-/// Helper to check that a method returns different paths based on workspace presence.
-fn assert_path_differs_by_workspace<F>(method: F)
-where
-    F: Fn(&ZenPaths) -> PathBuf,
-{
-    // Without workspace
-    {
-        let (_tmp, home_path) = setup_zen_home();
-        let paths = ZenPaths::detect().expect("detect() should succeed");
-        let without_ws = method(&paths);
-        assert!(
-            without_ws.starts_with(&home_path),
-            "Without workspace, path should start with global_root: {without_ws:?}"
-        );
+#[test]
+fn config_file_always_global_regardless_of_workspace() {
+    // Path Spec v2 (T18): config is global-only
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws-check");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
     }
-
-    // With workspace
-    {
-        let (_tmp, home_path) = setup_zen_home();
-        let ws = setup_workspace(&home_path, "ws-check");
-        unsafe {
-            std::env::set_var("ZEN_WORKSPACE", &ws);
-        }
-        let paths = ZenPaths::detect().expect("detect() should succeed");
-        let with_ws = method(&paths);
-        assert!(
-            with_ws.starts_with(&ws),
-            "With workspace, path should start with workspace_root: {with_ws:?}"
-        );
-        unsafe {
-            std::env::remove_var("ZEN_WORKSPACE");
-        }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    let cfg = paths.config_file();
+    assert!(
+        cfg.starts_with(&home_path),
+        "config_file should always be under global_root: {cfg:?}"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
     }
 }
 
 #[test]
-fn config_file_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.config_file());
-}
-
-#[test]
-fn output_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.output());
-}
-
-#[test]
-fn user_data_differs_by_workspace() {
-    assert_path_differs_by_workspace(|p| p.user_data("test-domain"));
+fn output_always_global_regardless_of_workspace() {
+    // Path Spec v2 (T18): output is global-only
+    let (_tmp, home_path) = setup_zen_home();
+    let ws = setup_workspace(&home_path, "ws-check");
+    unsafe {
+        std::env::set_var("ZEN_WORKSPACE", &ws);
+    }
+    let paths = ZenPaths::detect().expect("detect() should succeed");
+    let out = paths.output();
+    assert!(
+        out.starts_with(&home_path),
+        "output should always be under global_root: {out:?}"
+    );
+    unsafe {
+        std::env::remove_var("ZEN_WORKSPACE");
+    }
 }
 
 #[test]
@@ -708,28 +639,4 @@ fn plugins_always_global() {
     unsafe {
         std::env::remove_var("ZEN_WORKSPACE");
     }
-}
-
-// ── User_data domain variations ──
-
-#[test]
-fn user_data_nested_domain() {
-    let (_tmp, _) = setup_zen_home();
-    let paths = ZenPaths::detect().expect("detect() should succeed");
-    let data = paths.user_data("a/b/c");
-    assert!(
-        data.to_string_lossy().ends_with("a/b/c"),
-        "Nested domain: {data:?}"
-    );
-}
-
-#[test]
-fn user_data_domain_with_spaces() {
-    let (_tmp, _) = setup_zen_home();
-    let paths = ZenPaths::detect().expect("detect() should succeed");
-    let data = paths.user_data("my custom data");
-    assert!(
-        data.to_string_lossy().contains("my custom data"),
-        "Spaces preserved: {data:?}"
-    );
 }

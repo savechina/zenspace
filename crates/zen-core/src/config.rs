@@ -1458,12 +1458,11 @@ impl Default for CronConfig {
 
 impl Default for PluginConfig {
     fn default() -> Self {
-        let home = home::home_dir()
-            .map(|h| h.display().to_string())
-            .unwrap_or_default();
+        let zen_root = crate::paths::user_root();
+        let root_str = zen_root.display().to_string();
         Self {
-            base_path: Some(format!("{home}/.zen/plugins")),
-            wasm_cache_path: Some(format!("{home}/.zen/plugins/cache")),
+            base_path: Some(format!("{root_str}/plugins")),
+            wasm_cache_path: Some(format!("{root_str}/plugins/cache")),
             plugins: HashMap::new(),
         }
     }
@@ -1532,15 +1531,18 @@ impl Default for FinanceConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Config loading (T023) — Priority: env → workspace → global → embedded
+// Config loading (T023) — Priority: env → global → embedded → Default
 // ---------------------------------------------------------------------------
 
 /// Load AgenticConfig with the full priority chain (cached):
-/// 1. Environment variables (`ZEN_*`)
-/// 2. Workspace `.zen/config.toml` (upward search from cwd)
+/// 1. Rust `Default` impl
+/// 2. Embedded `config/config.toml`
 /// 3. Global `~/.zen/config.toml`
-/// 4. Embedded `config/config.toml`
-/// 5. Rust `Default` impl
+/// 4. Environment variables (`ZEN_*`)
+///
+/// Path Spec v2 (T18/D8-rev1): workspace config.toml is IGNORED — config
+/// is global-only. `.zen/` survives as project context marker + sandbox
+/// allowlist only.
 ///
 /// Keychain resolution (FR-061 `SecretRef`) is deferred to zen-auth (T033-T034).
 ///
@@ -1550,19 +1552,14 @@ impl Default for FinanceConfig {
 pub fn load_config() -> Result<&'static ZenConfig, ZenError> {
     #[cfg(test)]
     {
-        // In test mode, always load fresh config to allow env var changes
         dotenvy::dotenv().ok();
         let paths = ZenPaths::detect().map_err(ZenError::Path)?;
         let embedded = load_embedded_config()?;
         let global = load_file_config(paths.global_root().join("config.toml")).unwrap_or_default();
-        let workspace = match paths.workspace_root() {
-            Some(w) => load_file_config(w.join("config.toml")).unwrap_or_default(),
-            None => ZenConfig::default(),
-        };
+        // Path Spec v2 (T18/D8-rev1): 4-layer merge only.
+        // Workspace config.toml is IGNORED — config is global-only.
         let merged = merge_configs(embedded, global)?;
-        let merged = merge_configs(merged, workspace)?;
         let config = apply_env_overrides(merged);
-        // Leak the config to get a 'static reference (acceptable for tests)
         Ok(Box::leak(Box::new(config)))
     }
 
@@ -1588,15 +1585,11 @@ pub fn load_config() -> Result<&'static ZenConfig, ZenError> {
         // 2. Global config from ~/.zen/config.toml (T025)
         let global = load_file_config(paths.global_root().join("config.toml")).unwrap_or_default();
 
-        // 3. Workspace config from .zen/config.toml (T025, upward search via ZenPaths)
-        let workspace = match paths.workspace_root() {
-            Some(w) => load_file_config(w.join("config.toml")).unwrap_or_default(),
-            None => ZenConfig::default(),
-        };
+        // 3. Path Spec v2 (T18/D8-rev1): 4-layer merge only.
+        // Workspace config.toml is IGNORED — config is global-only.
 
-        // 4. Merge: embedded ← global ← workspace
+        // 4. Merge: embedded ← global
         let merged = merge_configs(embedded, global)?;
-        let merged = merge_configs(merged, workspace)?;
 
         // 5. Environment overrides take highest priority
         let config = apply_env_overrides(merged);
@@ -2421,15 +2414,12 @@ pub fn default_wisdom_synthesis_schedule() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-/// Persist model selection to workspace config file.
-/// Falls back to global `~/.zen/config.toml` if no workspace is detected.
-/// Existing lines for these keys are replaced; new keys are appended.
+/// Persist model selection to global config file (`~/.zen/config.toml`).
+/// Path Spec v2 (T18): always writes to global root — workspace config.toml
+/// is ignored. Existing lines for these keys are replaced; new keys are appended.
 pub fn save_model_selection(provider: &str, model: &str) -> Result<(), ZenError> {
     let paths = ZenPaths::detect().map_err(ZenError::Path)?;
-    let config_dir = paths
-        .workspace_root()
-        .unwrap_or_else(|| paths.global_root())
-        .clone();
+    let config_dir = paths.global_root().clone();
     std::fs::create_dir_all(&config_dir).ok();
     let config_path = config_dir.join("config.toml");
 

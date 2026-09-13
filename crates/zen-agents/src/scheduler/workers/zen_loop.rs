@@ -1242,14 +1242,14 @@ fn journal_decision_payloads(content: &str) -> Vec<String> {
 ///   logged (`nothing to commit` at debug, real errors at warn) and never
 ///   fail the cycle
 fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
-    let Some(workspace_root) = paths.workspace_root() else {
-        debug!("loop: no workspace root — skipping git commit");
-        return;
-    };
+    // Path Spec v2 (T18-C2): git target is the vault repo, not the
+    // workspace root. vault/ is always global (personal knowledge follows
+    // the user, not the project).
+    let vault_path = paths.vault();
 
     let inside = std::process::Command::new("git")
         .arg("-C")
-        .arg(workspace_root)
+        .arg(&vault_path)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output();
     let inside_work_tree = matches!(
@@ -1257,22 +1257,19 @@ fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
         Ok(out) if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
     );
     if !inside_work_tree {
-        debug!(workspace = %workspace_root.display(), "loop: workspace not a git work tree — skipping git commit");
+        debug!(vault = %vault_path.display(), "loop: vault not a git work tree — skipping git commit");
         return;
     }
 
-    // Containment: only commit when zen-managed trees actually live inside
-    // this work tree. When they live elsewhere (e.g. workspace_root resolved
-    // to an unrelated source repo), `git add` would sweep that repo's own
-    // dirty state into a "loop:" commit — observed in the wild (T041).
+    // Containment: only commit files inside the vault work tree.
     let managed: Vec<PathBuf> = [paths.vault(), paths.logs(), paths.memory()]
         .into_iter()
-        .filter(|p| p.starts_with(workspace_root))
+        .filter(|p| p.starts_with(&vault_path))
         .collect();
     if managed.is_empty() {
         debug!(
-            workspace = %workspace_root.display(),
-            "loop: vault/logs/memory outside work tree — skipping git commit"
+            vault = %vault_path.display(),
+            "loop: managed paths outside vault work tree — skipping git commit"
         );
         return;
     }
@@ -1287,7 +1284,7 @@ fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
     );
 
     let mut add_cmd = std::process::Command::new("git");
-    add_cmd.arg("-C").arg(workspace_root).arg("add").arg("--");
+    add_cmd.arg("-C").arg(&vault_path).arg("add").arg("--");
     for managed_path in &managed {
         add_cmd.arg(managed_path);
     }
@@ -1296,7 +1293,7 @@ fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
             warn!(
-                workspace = %workspace_root.display(),
+                vault = %vault_path.display(),
                 stderr = %String::from_utf8_lossy(&out.stderr).trim(),
                 "loop: git add failed (cycle continues)"
             );
@@ -1310,12 +1307,12 @@ fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
 
     let commit = std::process::Command::new("git")
         .arg("-C")
-        .arg(workspace_root)
+        .arg(&vault_path)
         .args(["commit", "-m", &message])
         .output();
     match commit {
         Ok(out) if out.status.success() => {
-            info!(workspace = %workspace_root.display(), "loop: git history committed");
+            info!(vault = %vault_path.display(), "loop: git history committed");
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -1324,7 +1321,7 @@ fn commit_cycle_to_git(paths: &ZenPaths, report: &LoopCycleReport) {
                 debug!("loop: git commit skipped — nothing to commit");
             } else {
                 warn!(
-                    workspace = %workspace_root.display(),
+                    vault = %vault_path.display(),
                     stderr = %stderr.trim(),
                     "loop: git commit failed (cycle continues)"
                 );
@@ -1459,5 +1456,68 @@ mod tests {
                 .unwrap();
         assert!(content.contains("stale claim should be recorded"));
         assert!(content.contains("falsifier"));
+    }
+
+    #[test]
+    fn commit_cycle_to_git_commits_to_vault_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let git_ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&vault)
+            .args(["init"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("skip: git binary unavailable");
+            return;
+        }
+
+        std::fs::write(vault.join("log.md"), "# cycle log\n").unwrap();
+
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        let report = LoopCycleReport {
+            cycle_id: "cycle-contract-test-001".into(),
+            notes_processed: 3,
+            pages_created: 1,
+            merged_count: 2,
+            quarantined_count: 0,
+            ..LoopCycleReport::default()
+        };
+
+        commit_cycle_to_git(&paths, &report);
+
+        let log_out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&vault)
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        assert!(log_out.status.success(), "git log should succeed");
+        let log = String::from_utf8_lossy(&log_out.stdout);
+        assert!(
+            log.contains("loop: cycle-contract-test-001"),
+            "commit message must appear in git log: {log}"
+        );
+    }
+
+    #[test]
+    fn commit_cycle_to_git_skips_non_git_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        let report = LoopCycleReport {
+            cycle_id: "cycle-no-git-001".into(),
+            ..LoopCycleReport::default()
+        };
+
+        commit_cycle_to_git(&paths, &report);
     }
 }

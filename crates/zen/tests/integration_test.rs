@@ -60,9 +60,11 @@ fn test_zen_workspace_init_creates_zen_dir() {
 
     let zen_dir = test.cwd.join(".zen");
     assert!(zen_dir.exists(), ".zen/ directory should be created");
+    // Path Spec v2 (T18-C1): workspace init no longer writes config.toml stub.
+    // Config is global-only (~/.zen/config.toml).
     assert!(
-        zen_dir.join("config.toml").exists(),
-        "config.toml should be created"
+        !zen_dir.join("config.toml").exists(),
+        "config.toml should NOT be created in workspace .zen/"
     );
     assert!(zen_dir.join("output").exists(), "output/ should be created");
 }

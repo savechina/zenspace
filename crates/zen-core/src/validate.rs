@@ -45,7 +45,7 @@ impl Default for RoleSeparationValidator {
 impl RoleSeparationValidator {
     pub fn new() -> Self {
         Self {
-            zen_root: home::home_dir().unwrap_or_default().join(".zen"),
+            zen_root: crate::paths::user_root(),
         }
     }
 

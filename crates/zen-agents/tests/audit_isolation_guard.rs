@@ -23,11 +23,13 @@ use std::time::SystemTime;
 use zen_agents::orchestrator::AgentOrchestrator;
 use zen_core::types::SessionContext;
 
-/// The REAL global audit file, resolved via `home::home_dir()` — NOT
+/// The REAL global audit file, resolved via `real_production_root()` — NOT
 /// `ZenPaths::detect()`, which resolves to the frozen temp ZEN_HOME inside
 /// this binary.
 fn real_audit_path() -> Option<PathBuf> {
-    home::home_dir().map(|h| h.join(".zen").join("logs").join("audit.jsonl"))
+    let root = zen_core::paths::real_production_root();
+    let path = root.join("logs").join("audit.jsonl");
+    if path.exists() { Some(path) } else { None }
 }
 
 fn real_audit_snapshot() -> Option<(u64, SystemTime)> {
@@ -100,4 +102,19 @@ fn real_audit_jsonl_untouched_by_orchestrator_turn() {
             "real audit.jsonl must not contain the guard session marker"
         );
     }
+}
+
+#[test]
+fn test_zen_home_never_points_to_production() {
+    let _guard = common::begin();
+    let test_home = zen_core::paths::user_root();
+    let prod_home = zen_core::paths::real_production_root();
+    assert_ne!(
+        test_home, prod_home,
+        "test ZEN_HOME must never equal the real production ~/.zen root"
+    );
+    assert!(
+        !test_home.starts_with(&prod_home),
+        "test ZEN_HOME must not be inside the real production ~/.zen tree"
+    );
 }

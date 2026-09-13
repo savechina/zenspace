@@ -2,6 +2,13 @@
 set -euo pipefail
 set -x
 
+# Path Spec v2 (T17): default ZEN_HOME to ~/.zentest when unset.
+# This ensures integration tests never write to the developer's real ~/.zen.
+if [ -z "${ZEN_HOME:-}" ]; then
+    export ZEN_HOME="$HOME/.zentest"
+    mkdir -p "$ZEN_HOME"
+fi
+
 # Limit build-time link parallelism (the OOM vector on ARM CI) —
 # cargo honors CARGO_BUILD_JOBS, NOT nextest's --build-jobs.
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"

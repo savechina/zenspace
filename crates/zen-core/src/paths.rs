@@ -49,6 +49,17 @@ fn test_home_fallback() -> PathBuf {
     TEST_HOME.clone()
 }
 
+/// Return the REAL production `~/.zen` root, bypassing ZEN_HOME.
+///
+/// Used by integration tests that must assert the developer's real global
+/// root is untouched. In test builds `user_root()` returns the frozen temp
+/// ZEN_HOME (or its fallback); this helper always resolves via
+/// `home::home_dir().join(".zen")`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn real_production_root() -> PathBuf {
+    home::home_dir().map(|h| h.join(".zen")).unwrap_or_default()
+}
+
 pub struct ZenPaths {
     global_root: PathBuf,
     workspace_root: Option<PathBuf>,
@@ -77,17 +88,9 @@ impl ZenPaths {
     }
 
     pub fn config_file(&self) -> PathBuf {
-        self.workspace_root
-            .as_ref()
-            .map(|w| w.join(CONFIG_FILE))
-            .unwrap_or_else(|| self.global_root.join(CONFIG_FILE))
-    }
-
-    pub fn user_data(&self, domain: &str) -> PathBuf {
-        match &self.workspace_root {
-            Some(w) => w.join(domain),
-            None => self.global_root.join(domain),
-        }
+        // Path Spec v2 (T18/D8-rev1): config is global-only — always at
+        // `~/.zen/config.toml`. Workspace config.toml is IGNORED (never read).
+        self.global_root.join(CONFIG_FILE)
     }
 
     pub fn cache(&self, domain: &str) -> PathBuf {
@@ -226,10 +229,7 @@ impl ZenPaths {
     }
 
     pub fn output(&self) -> PathBuf {
-        self.workspace_root
-            .as_ref()
-            .map(|w| w.join(OUTPUT_DIR))
-            .unwrap_or_else(|| self.global_root.join(OUTPUT_DIR))
+        self.global_root.join(OUTPUT_DIR)
     }
 
     pub fn plugins(&self) -> PathBuf {
@@ -301,19 +301,16 @@ mod tests {
     }
 
     #[test]
-    fn fr052_output_dir_prefers_workspace() {
+    fn output_always_global() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
         assert_eq!(paths.output(), tmp.path().join("output"));
     }
 
     #[test]
-    fn fr052_output_dir_falls_back_to_global() {
+    fn config_file_always_global() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = ZenPaths {
-            global_root: tmp.path().to_path_buf(),
-            workspace_root: None,
-        };
-        assert_eq!(paths.output(), tmp.path().join("output"));
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        assert_eq!(paths.config_file(), tmp.path().join("config.toml"));
     }
 }

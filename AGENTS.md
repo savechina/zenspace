@@ -152,7 +152,7 @@ zenspace/
 │   │   └── tests/              # Integration tests (ZenTest harness)
 │   ├── zen-core/               # Core infrastructure (13 public modules)
 │   │   └── src/
-│   │       ├── config.rs       # 5-layer config (Default/embedded/global/workspace/env)
+│   │       ├── config.rs       # 4-layer config (Default/embedded/global/env)
 │   │       ├── errors.rs       # ZenError (8 variants), AgenticError (20+ variants)
 │   │       ├── paths.rs        # ZenPaths (global_root + workspace_root dual-scope)
 │   │       ├── constants.rs    # Directory constants + 13 provider URLs/models
@@ -367,7 +367,7 @@ system.
 - **Error flow**: thiserror for library → anyhow for app → ZenError as top-level; AgenticError auto-categories via ErrorCategory
 - **CLI pattern**: `main.rs` (bin) → `zen_cli::shell()` (lib) → clap Parser → `execute_command()` dispatch
 - **Config**: 5-layer merge (Default → embedded → global `~/.zen/` → workspace `.zen/` → `ZEN_*` env vars)
-- **Path scoping**: ZenPaths dual-scope: workspace root for knowledge (inbox/raw/wiki), global root for system (db/sessions/memory/logs)
+- **Path scoping**: Path Spec v2 — single root `ZEN_HOME` (production `~/.zen`, dev/test `~/.zentest`). Config is global-only (4-layer: Default → embedded → global `~/.zen/config.toml` → env). `.zen/` directory is project context marker + sandbox allowlist only (no config/user_data/output workspace-awareness).
 - **Tests**: Integration only (no inline `#[cfg(test)]` in most crates). Custom ZenTest/ZenOutput harness.
 - **Lint**: `bin/lint` → `-D warnings` + `--allow dead_code`
 - **Command files**: Pattern `src/cmd/{name}_command.rs` with `pub fn execute_command(...)` dispatcher (note: correctly spelled now)
@@ -749,7 +749,7 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
   - Gate: `bin/test` 2357 passed / 0 failed / 19 skipped (baseline 2307); `bin/lint` clean; discover-report ↔ awk-script parity verified
 - Binary/library separation: zen (bin) + zen-cli (lib) architecture documented
 - 29 CLI commands documented with dispatch file paths
-- 5-layer config inheritance model (Default → embedded → global → workspace → env)
+- 4-layer config inheritance model (Default → embedded → global → env)
 - Unified data layer: `SqliteClient` (tokio-rusqlite writer + sqlx pool); 9 domain repositories (Principle XII)
 - 5-tier search pipeline: ripgrep → FTS5 → vec0 embeddings → entity graph → LLM
 - Provider routing: 13 named providers across 3 protocol types (rig-native, openai-compatible, anthropic-compatible)
@@ -800,7 +800,7 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
   - T092 LLM review stage: `BlastRadius::{Low,High}` (`Confidential` metadata or entropy > 0.8, shared `HIGH_BLAST_ENTROPY`); async `SemanticReviewer` hook runs after Hermes READY for HIGH only when `[agentic.review] llm_review_high_blast` (default true); veto → `delivery_ready=false`. New `[agentic.review]` keys: `max_momus_retries` (2⸱0-5), `max_hermes_revisions` (1⸱0-5), `llm_review_high_blast` (true) + `ZEN_REVIEW_*` env, 5-layer merged
   - T101 outbox drainer: gateway `channel/qqbot/outbox_drainer.rs` (`drain_once` + tick spawn in `run()`, gated on `audit_path`); recipients = live `qq_bindings` via additive `QqBindingRepo::list_chat_ids()`; group-first/C2C-fallback; Public-only fail-closed; never deletes undelivered
   - T093/T096-T099: identity-file 256KiB cap + sanitizer on 5 prompt reads; streaming query strip parity; per-round token accounting + mid-loop bailout; recursive tool-output screening both loops; `decide_tool_action` pure (trio skip now blocking); T095 mock provenance `(String,u32,bool)` + `model_used` fallback flag; T102 dispatch EOF contract test; T091 `output_schema.rs` module done (27/27), pipeline wiring (replace `output_schema: None` + ≤2 retry) deferred follow-up
-  - T104 missing targets created (5 files, 12 tests): `tool_loop_contract`, `web_search_multiloop`, `session_multiturn`, `vault_write_e2e`, `fs_write_contract`. Open findings (not fixed): workspace config layer path disputed (docs `.zen/config.toml` vs code `workspace_root.join("config.toml")`); `user_root()` process-once `LazyLock` — integration tests must use one frozen ZEN_HOME + file rewrite + `invalidate_config_cache()`
+  - T104 missing targets created (5 files, 12 tests): `tool_loop_contract`, `web_search_multiloop`, `session_multiturn`, `vault_write_e2e`, `fs_write_contract`. Resolved findings: workspace config layer dispute closed by T18 (config global-only, 4-layer merge); `user_root()` test-seam via `test-support` cfg feature (T118)
   - Gate: 2307 passed / 19 skipped / 0 failed; `fmt --check` + `clippy --workspace --all-targets -D warnings` clean
   - Config-cache note: `load_config()` caches per process in non-test builds (`#[cfg(test)]` does not propagate to deps) — integration tests mutating env must call `zen_core::config::invalidate_config_cache()`; cluster quorum counts observations, not unique texts (`detect_cluster`)
 

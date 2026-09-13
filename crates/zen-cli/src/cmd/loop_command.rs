@@ -171,7 +171,7 @@ async fn run_cycle(dry_run: bool, json: bool) -> Result<(), ZenError> {
     let config = zen_core::config::load_config().map_err(|e| ZenError::Message(e.to_string()))?;
     let loop_cfg = &config.agentic.loop_cfg;
 
-    let mut scheduler = ZenScheduler::new();
+    let mut scheduler = ZenScheduler::new().with_timezone(config.cron.timezone_or_default());
     let worker = ZenLoopWorker::new()
         .with_schedule(loop_cfg.interval_or_default())
         .with_dry_run(dry_run);

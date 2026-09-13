@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use zen_core::paths::ZenPaths;
+use zen_core::paths::{ZenPaths, user_root};
 use zen_core::tempfile_lifecycle::TempfileDropGuard;
 
 #[derive(Debug, Error)]
@@ -405,11 +405,7 @@ impl PluginRegistry {
     pub fn new() -> Self {
         let plugin_dir = ZenPaths::detect()
             .map(|p| p.global_root().join("plugins"))
-            .unwrap_or_else(|_| {
-                home::home_dir()
-                    .map(|h| h.join(".zen").join("plugins"))
-                    .unwrap_or_else(|| PathBuf::from(".zen/plugins"))
-            });
+            .unwrap_or_else(|_| user_root().join("plugins"));
 
         Self {
             plugins: HashMap::new(),
