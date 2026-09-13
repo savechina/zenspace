@@ -262,11 +262,6 @@ impl ZenScheduler {
             if !enabled {
                 continue;
             }
-            // F5: skip a worker that is still running from a previous tick.
-            if in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                debug!(worker = %id, "scheduler: skipping worker (still in flight)");
-                continue;
-            }
             // Anchor on the passed `now` (via `after`), NOT `upcoming` —
             // `upcoming` re-anchors on the real system clock, which makes
             // the fire decision depend on wall time instead of the tick
@@ -281,16 +276,27 @@ impl ZenScheduler {
                     // Fire if the next scheduled time is within the tick window
                     diff < interval.as_secs() + 1
                 });
-
-            if should_fire {
-                debug!(worker = %id, "scheduler: firing worker");
-                to_fire.push((
-                    id.clone(),
-                    Arc::clone(worker),
-                    ctx.clone(),
-                    Arc::clone(in_flight),
-                ));
+            if !should_fire {
+                continue;
             }
+            // F5: skip a worker that is still running from a previous FIRE.
+            // The flag is claimed ONLY once the fire decision is made:
+            // InFlightGuard lives inside the spawned fire task, so claiming
+            // the flag before the decision latches it forever on the first
+            // out-of-window tick and the worker never fires again
+            // (regression: production daemons ran 16 workers, zero cron
+            // fires — pinned by tick_out_of_window_does_not_latch_in_flight).
+            if in_flight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                debug!(worker = %id, "scheduler: skipping worker (still in flight)");
+                continue;
+            }
+            debug!(worker = %id, "scheduler: firing worker");
+            to_fire.push((
+                id.clone(),
+                Arc::clone(worker),
+                ctx.clone(),
+                Arc::clone(in_flight),
+            ));
         }
 
         for (id, worker, ctx, in_flight) in to_fire {
@@ -721,6 +727,43 @@ mod tests {
         utc.tick(now).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 0, "not due in Utc");
+    }
+
+    #[tokio::test]
+    async fn tick_out_of_window_does_not_latch_in_flight() {
+        use chrono::TimeZone;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Regression (B5 pilot, 2026-09-14): in_flight.swap(true) ran BEFORE
+        // the fire decision, so the first out-of-window tick latched the flag
+        // with no InFlightGuard to clear it — every later tick skipped the
+        // worker as "still in flight" and production daemons never fired any
+        // cron worker (16 registered, zero fires over 60min).
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut sched = ZenScheduler::new();
+        sched
+            .register(CountingWorker(Arc::clone(&counter)))
+            .unwrap();
+
+        sched
+            .tick(Utc.with_ymd_and_hms(2026, 9, 14, 8, 0, 0).unwrap())
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "out-of-window tick (08:00 vs 09:00 cron) must not fire"
+        );
+
+        sched
+            .tick(Utc.with_ymd_and_hms(2026, 9, 14, 8, 59, 50).unwrap())
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "in-window tick (08:59:50, 10s to cron) must fire after an out-of-window tick"
+        );
     }
 
     #[test]
