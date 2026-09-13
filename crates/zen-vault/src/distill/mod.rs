@@ -11,8 +11,10 @@ pub mod notion_extraction;
 pub mod orchestration_stats;
 pub mod pipeline;
 pub mod recovery;
+pub mod reward_sidecar;
 pub mod source_ingest;
 pub mod stages;
+pub mod tool_call_log;
 pub mod transaction;
 pub mod types;
 pub mod wiki_compile;
@@ -39,7 +41,7 @@ pub use merge::{
 };
 pub use notion_extraction::NotionExtractor;
 pub use orchestration_stats::{
-    AuditError, DelegateGatesStats, GatewayStats, IntentDist, OrchestrationStats,
+    AuditError, DelegateGatesStats, GatewayStats, IntentDist, LivenessStats, OrchestrationStats,
     PlanCompletedStats, TurnReviewStats, aggregate_orchestration,
 };
 pub use pipeline::{
@@ -47,8 +49,15 @@ pub use pipeline::{
     prune_context,
 };
 pub use recovery::RecoveryManager;
+pub use reward_sidecar::{
+    card_id_from_path, increment_access, increment_citations, increment_corrections, read_reward,
+    write_reward,
+};
 pub use source_ingest::SourceIngester;
 pub use stages::LlmDistillStage;
+pub use tool_call_log::{
+    ToolCallAggregate, aggregate_all_sessions, aggregate_tool_calls, append_tool_call,
+};
 pub use transaction::TransactionScope;
 pub use types::{
     Belief, Commitment, CommitmentLifecycle, CycleOutcome, Decision, GapKind, GapRecord,

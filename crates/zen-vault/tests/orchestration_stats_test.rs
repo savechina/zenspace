@@ -62,6 +62,7 @@ fn orchestration_stats_full_sections() {
     assert!(display.contains("[gateway]"));
     assert!(display.contains("[delegate.gates]"));
     assert!(display.contains("[plan.completed]"));
+    assert!(display.contains("[liveness]"));
     assert!(display.contains("Query"));
     assert!(display.contains("Hephaestus"));
 }
@@ -92,4 +93,95 @@ fn orchestration_stats_serialization_roundtrip() {
     let deserialized: zen_vault::distill::OrchestrationStats = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.turn_review.turns, 1);
     assert_eq!(deserialized.gateway.turns_started, 1);
+}
+
+#[test]
+fn liveness_section_appears_in_display() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("audit.jsonl"), "").unwrap();
+    let stats = aggregate_orchestration(dir.path()).unwrap();
+    let display = stats.to_string();
+    assert!(display.contains("[liveness]"));
+    assert!(display.contains("total_cycles=0"));
+}
+
+#[test]
+fn liveness_populated_from_loop_report_files() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("audit.jsonl"), "").unwrap();
+
+    let report = serde_json::json!({
+        "finished_at": "2026-09-13T08:00:00Z",
+        "duration_ms": 15000,
+        "outcome": "completed"
+    });
+    fs::write(
+        dir.path().join("loop-report-20260913.json"),
+        serde_json::to_string(&report).unwrap(),
+    )
+    .unwrap();
+
+    let stats = aggregate_orchestration(dir.path()).unwrap();
+    assert_eq!(stats.liveness.total_cycles, 1);
+    assert_eq!(stats.liveness.failed_cycles, 0);
+    assert_eq!(
+        stats.liveness.last_cycle_outcome.as_deref(),
+        Some("completed")
+    );
+    assert_eq!(
+        stats.liveness.last_cycle_timestamp.as_deref(),
+        Some("2026-09-13T08:00:00Z")
+    );
+}
+
+#[test]
+fn liveness_populated_from_last_report() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("audit.jsonl"), "").unwrap();
+
+    let report = serde_json::json!({
+        "finished_at": "2026-09-13T09:00:00Z",
+        "duration_ms": 12000,
+        "outcome": "completed"
+    });
+    fs::write(
+        dir.path().join("loop-last-report.json"),
+        serde_json::to_string(&report).unwrap(),
+    )
+    .unwrap();
+
+    let stats = aggregate_orchestration(dir.path()).unwrap();
+    assert_eq!(stats.liveness.last_cycle_duration_ms, Some(12000));
+    assert_eq!(
+        stats.liveness.last_cycle_outcome.as_deref(),
+        Some("completed")
+    );
+    assert_eq!(
+        stats.liveness.last_cycle_timestamp.as_deref(),
+        Some("2026-09-13T09:00:00Z")
+    );
+}
+
+#[test]
+fn liveness_counts_failed_cycles() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("audit.jsonl"), "").unwrap();
+
+    let report_ok = serde_json::json!({"outcome": "completed"});
+    fs::write(
+        dir.path().join("loop-report-20260913.json"),
+        serde_json::to_string(&report_ok).unwrap(),
+    )
+    .unwrap();
+
+    let report_fail = serde_json::json!({"outcome": "failed"});
+    fs::write(
+        dir.path().join("loop-report-20260914.json"),
+        serde_json::to_string(&report_fail).unwrap(),
+    )
+    .unwrap();
+
+    let stats = aggregate_orchestration(dir.path()).unwrap();
+    assert_eq!(stats.liveness.total_cycles, 2);
+    assert_eq!(stats.liveness.failed_cycles, 1);
 }

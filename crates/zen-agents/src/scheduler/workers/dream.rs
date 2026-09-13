@@ -87,6 +87,45 @@ impl ZenWorker for DreamWorker {
         };
         info!("dream cycle: skill drafts staged = {drafts_staged}");
 
+        // FR-035: scan verified corrections for recurrence within 30-day window
+        let corrections_dir = paths.wiki().join("wisdom").join("corrections");
+        let (corrections_scanned, corrections_high_recurrence) =
+            zen_memory::scan_correction_recurrence(&corrections_dir, 30);
+        if corrections_scanned > 0 {
+            info!(
+                scanned = corrections_scanned,
+                high_recurrence = corrections_high_recurrence,
+                "FR-035 correction recurrence scan complete"
+            );
+        }
+
+        // FR-036: aggregate tool call outcomes, flag tools with <70% success
+        let sessions_dir = paths.sessions();
+        let tool_aggs = zen_vault::distill::aggregate_all_sessions(&sessions_dir);
+        let tool_calls_flagged = tool_aggs
+            .iter()
+            .filter(|a| a.success_rate < 70.0 && a.total_calls >= 5)
+            .count();
+        let tool_call_entries_scanned: usize =
+            tool_aggs.iter().map(|a| a.total_calls as usize).sum();
+        if tool_call_entries_scanned > 0 {
+            for agg in &tool_aggs {
+                if agg.success_rate < 70.0 && agg.total_calls >= 5 {
+                    tracing::warn!(
+                        tool = %agg.tool,
+                        success_rate = agg.success_rate,
+                        total_calls = agg.total_calls,
+                        "FR-036 tool flagged: success rate below 70%"
+                    );
+                }
+            }
+            info!(
+                entries_scanned = tool_call_entries_scanned,
+                tools_flagged = tool_calls_flagged,
+                "FR-036 tool call aggregation complete"
+            );
+        }
+
         Ok(WorkerReport {
             worker_id: self.id().to_string(),
             success: true,

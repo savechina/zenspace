@@ -43,8 +43,9 @@ pub use decision::{
     OutcomeResult, Severity,
 };
 pub use dream::{
-    MEMORY_LINES_CAP, RejectedHypothesis, ZenDream, enforce_memory_cap, memory_merge_rollup,
-    memory_nudge_due, memory_nudge_text, write_wake_up_brief,
+    ExtractedSignals, RejectedHypothesis, ZenDream, enforce_memory_cap,
+    extract_durable_facts_from_entry, memory_nudge_due, memory_nudge_text, parse_facts_section,
+    scan_correction_recurrence, write_wake_up_brief,
 };
 pub use fact::Fact;
 pub use feedback_signal::{Feedback, FeedbackDisposition, FeedbackProperties};

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use tracing::{debug, info, warn};
 
 use zen_core::notion_graph::{NotionGraphProvider, SimpleNotion};
@@ -155,6 +155,10 @@ impl ZenDream {
             entities_promoted,
             top_entities,
             gate_blocked,
+            corrections_scanned: 0,
+            corrections_high_recurrence: 0,
+            tool_call_entries_scanned: 0,
+            tool_calls_flagged: 0,
         };
 
         info!(
@@ -234,6 +238,14 @@ pub struct DreamReport {
     pub top_entities: Vec<String>,
     /// Facts blocked by the M2→M3 InformationQualityGate this cycle (T073).
     pub gate_blocked: usize,
+    /// FR-035: corrections scanned for recurrence this cycle.
+    pub corrections_scanned: usize,
+    /// FR-035: corrections with recurrence_rate > 0.5 (boost priority).
+    pub corrections_high_recurrence: usize,
+    /// FR-036: tool call entries aggregated this cycle.
+    pub tool_call_entries_scanned: usize,
+    /// FR-036: tools with success rate < 70% flagged.
+    pub tool_calls_flagged: usize,
 }
 
 impl DreamReport {
@@ -250,6 +262,10 @@ impl DreamReport {
             entities_promoted: 0,
             top_entities: Vec::new(),
             gate_blocked: 0,
+            corrections_scanned: 0,
+            corrections_high_recurrence: 0,
+            tool_call_entries_scanned: 0,
+            tool_calls_flagged: 0,
         }
     }
 }
@@ -962,6 +978,55 @@ fn md5_hex(input: &str) -> String {
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+// ─── FR-035: Correction recurrence scan ────────────────────────────────
+
+pub fn scan_correction_recurrence(
+    corrections_dir: &std::path::Path,
+    window_days: i64,
+) -> (usize, usize) {
+    use crate::correction::Correction;
+
+    let corrections = match Correction::load_all(corrections_dir) {
+        Ok(c) => c,
+        Err(_) => return (0, 0),
+    };
+
+    let now = Utc::now();
+    let window_start = now - chrono::Duration::days(window_days);
+    let mut scanned = 0usize;
+    let mut high_recurrence = 0usize;
+
+    for mut correction in corrections {
+        if !correction.is_verified() {
+            continue;
+        }
+        if correction.created_at < window_start {
+            continue;
+        }
+        scanned += 1;
+
+        let verified_at = correction.verified_at.unwrap_or(correction.created_at);
+        let days_since_verified = (now - verified_at).num_days().max(1) as f64;
+        let recurrence_rate = correction.recurrence_count as f64 / days_since_verified;
+
+        if recurrence_rate > 0.5 {
+            high_recurrence += 1;
+        }
+
+        if correction.recurrence_count > 0 || correction.last_recurrence_at.is_none() {
+            continue;
+        }
+
+        correction.last_recurrence_at = Some(now);
+        let dir = corrections_dir;
+        if let Err(e) = correction.save(dir) {
+            warn!(error = %e, correction_id = %correction.id, "failed to update correction recurrence");
+        }
+    }
+
+    (scanned, high_recurrence)
 }
 
 #[cfg(test)]

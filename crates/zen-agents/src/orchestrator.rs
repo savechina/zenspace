@@ -617,6 +617,17 @@ impl AgentOrchestrator {
             crate::AgentContext::new(profile.clone(), user_query.to_string(), session.clone())
                 .with_preferences(profile.llm_preferences.clone());
 
+        // FR-034: increment reward sidecar access_count for each retrieved memory
+        if let Ok(paths) = ZenPaths::detect() {
+            let reward_dir = paths.memory().join(".reward");
+            for note in &context.session.knowledge {
+                let card_id = zen_vault::distill::card_id_from_path(&note.path);
+                if let Err(e) = zen_vault::distill::increment_access(&reward_dir, &card_id) {
+                    debug!(error = %e, card_id, "FR-034 reward access increment failed");
+                }
+            }
+        }
+
         let estimated_tokens = user_query.len() / 4 + 512;
         let reservation = self
             .token_budget
@@ -820,6 +831,7 @@ impl AgentOrchestrator {
                     }
 
                     let hooks = self.wiring.dispatch_hooks();
+                    let dispatch_start = Instant::now();
                     match dispatch_tool_invocations_with_hooks(
                         zen_agent.generic.tools(),
                         &invocations,
@@ -828,6 +840,7 @@ impl AgentOrchestrator {
                     .await
                     {
                         Ok(mut results) => {
+                            let dispatch_duration = dispatch_start.elapsed().as_millis() as u64;
                             for result in &mut results {
                                 let screened = Self::screen_tool_output(&result.output);
                                 if screened != result.output {
@@ -843,6 +856,36 @@ impl AgentOrchestrator {
                                     t.tool_name == result.invocation.name && t.result.is_empty()
                                 }) {
                                     tc.result = result.output.to_string();
+                                }
+
+                                // FR-036: append RLVR ToolCall record to tool_calls.jsonl
+                                let output_str = result.output.to_string();
+                                let is_err = output_str.starts_with("Error")
+                                    || output_str.starts_with("error");
+                                let rlvr_record = zen_vault::distill::types::ToolCall {
+                                    tool: result.invocation.name.clone(),
+                                    success: !is_err,
+                                    latency_ms: dispatch_duration / results.len().max(1) as u64,
+                                    error_category: if is_err {
+                                        Some("ToolError".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    recorded_at: chrono::Utc::now(),
+                                };
+                                let paths = match ZenPaths::detect() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        debug!(error = %e, "FR-036 ZenPaths detect failed");
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) = zen_vault::distill::append_tool_call(
+                                    &paths.sessions(),
+                                    &session.session_id.to_string(),
+                                    &rlvr_record,
+                                ) {
+                                    debug!(error = %e, "FR-036 tool call log append failed");
                                 }
                             }
                             let tool_results: Vec<rig_core::message::UserContent> = results
@@ -891,6 +934,26 @@ impl AgentOrchestrator {
                 AgentRunStep::Done(response) => {
                     final_response = response.output;
                     break;
+                }
+            }
+        }
+
+        // FR-034: increment downstream_citations when retrieved content appears in response
+        if let Ok(paths) = ZenPaths::detect() {
+            let reward_dir = paths.memory().join(".reward");
+            let response_lower = final_response.to_lowercase();
+            for note in &context.session.knowledge {
+                let snippet = note
+                    .content
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                    .to_lowercase();
+                if snippet.len() > 20 && response_lower.contains(&snippet) {
+                    let card_id = zen_vault::distill::card_id_from_path(&note.path);
+                    if let Err(e) = zen_vault::distill::increment_citations(&reward_dir, &card_id) {
+                        debug!(error = %e, card_id, "FR-034 reward citation increment failed");
+                    }
                 }
             }
         }
@@ -1230,6 +1293,17 @@ impl AgentOrchestrator {
         self.wiring.set_sensitivity(session.sensitivity_policy);
         self.propagate_sensitivity(session.sensitivity_policy);
 
+        // FR-034: increment reward sidecar access_count for each retrieved memory
+        if let Ok(paths) = ZenPaths::detect() {
+            let reward_dir = paths.memory().join(".reward");
+            for note in &session.knowledge {
+                let card_id = zen_vault::distill::card_id_from_path(&note.path);
+                if let Err(e) = zen_vault::distill::increment_access(&reward_dir, &card_id) {
+                    debug!(error = %e, card_id, "FR-034 reward access increment failed");
+                }
+            }
+        }
+
         let tool_names: BTreeSet<String> = zen_agent
             .tool_definitions()
             .into_iter()
@@ -1439,6 +1513,36 @@ impl AgentOrchestrator {
                                     tc.result = result.output.to_string();
                                 }
                                 callback(&Self::tool_done_line(result, duration_ms));
+
+                                // FR-036: append RLVR ToolCall record to tool_calls.jsonl
+                                let output_str = result.output.to_string();
+                                let is_err = output_str.starts_with("Error")
+                                    || output_str.starts_with("error");
+                                let rlvr_record = zen_vault::distill::types::ToolCall {
+                                    tool: result.invocation.name.clone(),
+                                    success: !is_err,
+                                    latency_ms: duration_ms as u64 / results.len().max(1) as u64,
+                                    error_category: if is_err {
+                                        Some("ToolError".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    recorded_at: chrono::Utc::now(),
+                                };
+                                let paths = match ZenPaths::detect() {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        debug!(error = %e, "FR-036 ZenPaths detect failed");
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) = zen_vault::distill::append_tool_call(
+                                    &paths.sessions(),
+                                    &session.session_id.to_string(),
+                                    &rlvr_record,
+                                ) {
+                                    debug!(error = %e, "FR-036 tool call log append failed");
+                                }
                             }
                             let assistant_text =
                                 append_native_tool_calls_fenced(final_response.clone(), &[]);

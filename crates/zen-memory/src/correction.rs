@@ -47,6 +47,12 @@ pub struct Correction {
     pub verified_at: Option<DateTime<Utc>>,
     /// When this correction was created.
     pub created_at: DateTime<Utc>,
+    /// FR-035: number of times this error recurred after correction.
+    #[serde(default)]
+    pub recurrence_count: u64,
+    /// FR-035: timestamp of the most recent recurrence detection.
+    #[serde(default)]
+    pub last_recurrence_at: Option<DateTime<Utc>>,
 }
 
 // ─── Slugify ────────────────────────────────────────────────────────────
@@ -80,6 +86,8 @@ impl Correction {
             fix: fix.to_string(),
             verified_at: None,
             created_at: now,
+            recurrence_count: 0,
+            last_recurrence_at: None,
         }
     }
 
@@ -117,6 +125,12 @@ impl Correction {
         md.push_str(&format!("created_at: {}\n", self.created_at.to_rfc3339()));
         if let Some(va) = self.verified_at {
             md.push_str(&format!("verified_at: {}\n", va.to_rfc3339()));
+        }
+        if self.recurrence_count > 0 {
+            md.push_str(&format!("recurrence_count: {}\n", self.recurrence_count));
+        }
+        if let Some(lr) = self.last_recurrence_at {
+            md.push_str(&format!("last_recurrence_at: {}\n", lr.to_rfc3339()));
         }
         md.push_str("---\n\n");
         md.push_str(&format!("# Correction: {}\n\n", self.error_ref));
@@ -210,6 +224,14 @@ impl Correction {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
+        let recurrence_count = parse_field(&fm, "recurrence_count")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let last_recurrence_at = parse_field(&fm, "last_recurrence_at")
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
         Ok(Correction {
             id,
             error_ref,
@@ -217,6 +239,8 @@ impl Correction {
             fix,
             verified_at,
             created_at,
+            recurrence_count,
+            last_recurrence_at,
         })
     }
 }

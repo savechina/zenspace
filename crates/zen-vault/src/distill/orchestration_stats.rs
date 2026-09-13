@@ -101,6 +101,17 @@ pub struct OrchestrationStats {
     pub gateway: GatewayStats,
     pub delegate_gates: DelegateGatesStats,
     pub plan_completed: PlanCompletedStats,
+    pub liveness: LivenessStats,
+}
+
+/// E8: Loop-cycle liveness telemetry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LivenessStats {
+    pub last_cycle_timestamp: Option<String>,
+    pub last_cycle_duration_ms: Option<u64>,
+    pub last_cycle_outcome: Option<String>,
+    pub total_cycles: usize,
+    pub failed_cycles: usize,
 }
 
 // Lightweight JSON field extractors that work on raw lines without full
@@ -308,6 +319,51 @@ pub fn aggregate_orchestration(dir: &Path) -> Result<OrchestrationStats, AuditEr
                 * 100.0;
     }
 
+    // E8: aggregate liveness from loop-cycle report files
+    let mut liveness = LivenessStats::default();
+    if let Ok(report_dir) = fs::read_dir(dir) {
+        for entry in report_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !(name.starts_with("loop-report-") && name.ends_with(".json")) {
+                continue;
+            }
+            liveness.total_cycles += 1;
+            let content = match fs::read_to_string(entry.path()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let report = match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if let Some(ts) = report.get("finished_at").and_then(|v| v.as_str()) {
+                liveness.last_cycle_timestamp = Some(ts.to_string());
+            }
+            if let Some(outcome) = report.get("outcome").and_then(|v| v.as_str()) {
+                liveness.last_cycle_outcome = Some(outcome.to_string());
+                if outcome == "failed" || outcome == "aborted" {
+                    liveness.failed_cycles += 1;
+                }
+            }
+        }
+    }
+    let last_report = dir.join("loop-last-report.json");
+    if last_report.exists()
+        && let Ok(content) = fs::read_to_string(&last_report)
+        && let Ok(report) = serde_json::from_str::<serde_json::Value>(&content)
+    {
+        if let Some(ts) = report.get("finished_at").and_then(|v| v.as_str()) {
+            liveness.last_cycle_timestamp = Some(ts.to_string());
+        }
+        if let Some(dur) = report.get("duration_ms").and_then(|v| v.as_u64()) {
+            liveness.last_cycle_duration_ms = Some(dur);
+        }
+        if let Some(outcome) = report.get("outcome").and_then(|v| v.as_str()) {
+            liveness.last_cycle_outcome = Some(outcome.to_string());
+        }
+    }
+    stats.liveness = liveness;
+
     Ok(stats)
 }
 
@@ -383,6 +439,23 @@ impl std::fmt::Display for OrchestrationStats {
             pc.delivery_not_ready,
             pc.delivery_not_ready_pct,
         )?;
+
+        writeln!(f)?;
+
+        let lv = &self.liveness;
+        writeln!(
+            f,
+            "[liveness] total_cycles={}  failed_cycles={}  last_outcome={}",
+            lv.total_cycles,
+            lv.failed_cycles,
+            lv.last_cycle_outcome.as_deref().unwrap_or("none"),
+        )?;
+        if let Some(ref ts) = lv.last_cycle_timestamp {
+            writeln!(f, "  last_run={ts}")?;
+        }
+        if let Some(dur) = lv.last_cycle_duration_ms {
+            writeln!(f, "  last_duration_ms={dur}")?;
+        }
 
         Ok(())
     }
