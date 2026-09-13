@@ -492,7 +492,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen wps` | Work process utilities | `wps_command.rs` |
 | `zen version` | Show version | `cli.rs` inline |
 | `zen session` | Session lifecycle | `session_command.rs` |
-| `zen serve` | Gateway daemon: start [--foreground] [--http] / status / stop / mcp; `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
+| `zen serve` | Gateway daemon: start [--foreground] [--http] / status / stop / mcp / install / uninstall (macOS launchd LaunchAgent); `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
 | `zen agent` | Agent registry | `agent_command.rs` |
 | `zen workspace` | `.zen/` structure | `workspace_command.rs` |
 | `zen config` | Config layers | `config_command.rs` |
@@ -507,6 +507,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen goal` | Goal management | `goal_command.rs` |
 | `zen skill` | Skill management (list, run, progress, show, precipitate, confirm) | `skill_command.rs` |
 | `zen discover` | Self-learning gate surface (PD-06): run (one zen-loop cycle now — stages 5b/5c/5d), stage/queue, confirm/reject (Hybrid C promotion gate; BeliefEvidence applies `Belief::update` on confirm), report (discover metrics, reads `loop-last-report.json`), arena (distill regression gate vs baselines/external CLIs — losses recorded, never staged) | `discover_command.rs` |
+| `zen doctor` | System health: 7 liveness probes (config, state.db, memories, daemon, loop, provider, vault); `--json` machine output; exit 0 all-green / 1 any-fail | `doctor_command.rs` |
 
 ## AGENT TOOL INVENTORY (v0.0.6)
 
@@ -544,6 +545,52 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 - **Process hardening** (FR-044): `zen-core/src/process_hardening.rs` — PT_DENY_ATTACH/prctl, RLIMIT_CORE=0, LD_*/DYLD_* strip at startup
 - **Plugin framework** (FR-032..034): `Plugin` trait + `PluginApi`; `ZenWiring::with_sandbox_mode` accepts `Option<&PluginRegistry>` (FR-033 bridge); PluginKind pruned to Tool/Hook
 - **Plugin integrity** (FR-043): manifest `sha256` verified (HashMismatch rejection); macOS `.dylib` codesign-verified
+
+### launchd Persistence (macOS-only)
+
+`zen serve install` / `zen serve uninstall` manage a macOS LaunchAgent for the gateway daemon:
+
+```
+zen serve install
+  Functionality: writes ~/Library/LaunchAgents/dev.zen.serve.plist with:
+    - Label: dev.zen.serve
+    - ProgramArguments: zen serve start --foreground
+    - RunAtLoad: true (auto-start on login)
+    - KeepAlive: true (respawn on crash)
+    - ThrottleInterval: 60 (crash-loop throttle)
+    - EnvironmentVariables: HOME + PATH (/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin)
+    - StandardOutPath/ErrorPath: {global_root}/logs/serve.{out,err}.log
+  User impact: daemon starts automatically on login; after install, `zen serve start` may cause a second instance (socket guard prevents conflicts)
+  Default: not installed — user must run explicitly
+  Interaction: `zen serve uninstall` reverses; explicit `zen serve start` works independently of launchd
+
+zen serve uninstall
+  Functionality: launches `launchctl bootout gui/{uid}/dev.zen.serve` (tolerates "not loaded") then removes the plist file
+  User impact: daemon stops starting on login; running instance unaffected
+  Default: no-op when not installed (tolerant)
+  Interaction: after uninstall, manual `zen serve start` works as before
+```
+
+Implementation: `render_plist()` is a pure function (unit-testable); `gui_domain()` resolves UID via `id -u` (not `process::id()` which returns PID). Non-macOS platforms return a clear `ZenError` at runtime.
+
+### zen doctor System Health
+
+`zen doctor` runs 7 liveness probes with JSON/human dual output (Principle IX):
+
+```
+zen doctor [--json]
+  Functionality: runs 7 isolated health checks:
+    1. config: load_config() succeeds (4-layer global)
+    2. state.db: exists + readable (file header check)
+    3. memories: memvid store under {global}/memories/ exists (count/size)
+    4. daemon: gateway socket alive (UDS connect or file-exists)
+    5. loop: last cycle evidence (loop-last-report.json mtime <2× interval)
+    6. provider: configured provider resolves API key OR ollama-local
+    7. vault: {global}/vault/ exists, git work-tree, inbox/wiki/raw counts
+  User impact: exit 0 all-green / exit 1 any-fail; --json for machine parsing
+  Default: human-readable one-line-per-check output
+  Interaction: exit code follows Principle IX conventional exit codes
+```
 
 ### Plugin Runtime Hardening (v0.0.6, FR-046..051)
 

@@ -214,6 +214,10 @@ fn default_spawn() -> anyhow::Result<()> {
         // (codex THREAD_UNLOADING_DELAY parity); explicit `zen serve
         // start` never sets this and runs until `zen serve stop`.
         .env("ZEN_GATEWAY_IDLE_EXIT_SECS", "1800")
+        // T16: implicit spawns run a pure gateway (sessions/hosting/guards)
+        // without the 16-worker scheduler; explicit `zen serve start` or
+        // launchd-managed daemons keep the scheduler.
+        .env("ZEN_SERVE_NO_SCHEDULER", "1")
         .stdout(Stdio::null())
         .stdin(Stdio::null());
     match spawn_log_path() {

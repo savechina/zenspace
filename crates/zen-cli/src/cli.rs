@@ -34,6 +34,7 @@ use crate::cmd::chat_command::{self, ChatArgs};
 use crate::cmd::cleanup_command::{self, CleanupCommands};
 use crate::cmd::config_command::{self, ConfigCommands};
 use crate::cmd::discover_command::{self, DiscoverCommands};
+use crate::cmd::doctor_command;
 use crate::cmd::goal_command::{self, GoalCommands};
 use crate::cmd::habit_command::{self, HabitCommands};
 use crate::cmd::logs_command::{self, LogCommands};
@@ -171,6 +172,12 @@ enum Commands {
     Sandbox {
         #[command(flatten)]
         args: SandboxArgs,
+    },
+    /// Run system health checks (7 liveness probes)
+    Doctor {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -319,5 +326,6 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Skill { ref operation } => skill_command::execute_command(operation).await,
         Commands::Discover { ref operation } => discover_command::execute_command(operation).await,
         Commands::Sandbox { ref args } => sandbox_command::execute_command(args),
+        Commands::Doctor { json } => doctor_command::execute_command(json),
     }
 }

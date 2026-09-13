@@ -1,7 +1,7 @@
 use clap::Subcommand;
 use colored::Colorize;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tracing::info;
@@ -47,6 +47,23 @@ pub enum ServeCommands {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Install zen serve as a macOS launchd LaunchAgent (macOS only)
+    ///
+    /// Functionality: writes a LaunchAgent plist to ~/Library/LaunchAgents/
+    ///   and bootstraps it via launchctl so `zen serve start --foreground`
+    ///   runs persistently with KeepAlive + crash-loop throttle.
+    /// User impact: after install, the daemon starts automatically on login.
+    /// Default: not installed — user must run `zen serve install` explicitly.
+    /// Interaction: `zen serve uninstall` reverses; `zen serve start` while
+    ///   installed causes a second instance (single-instance guard is socket-based).
+    Install,
+    /// Uninstall the zen serve launchd LaunchAgent (macOS only)
+    ///
+    /// Functionality: boots out the LaunchAgent and removes the plist file.
+    /// User impact: daemon stops starting on login; running instance unaffected.
+    /// Default: no-op when not installed (tolerant).
+    /// Interaction: after uninstall, `zen serve start` works as manual start.
+    Uninstall,
 }
 
 const PID_FILE_NAME: &str = "daemon.pid";
@@ -108,6 +125,184 @@ fn clean_stale_pid(path: &Path) {
 fn ensure_pid_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
+    }
+}
+
+/// Returns `true` when the scheduler should be started.
+/// Implicit gateway spawns set `ZEN_SERVE_NO_SCHEDULER=1` so the daemon
+/// runs as a pure gateway (sessions/hosting/guards only). Explicit
+/// `zen serve start` leaves the env unset and gets the full scheduler.
+pub(crate) fn scheduler_enabled() -> bool {
+    std::env::var("ZEN_SERVE_NO_SCHEDULER")
+        .map(|v| v != "1")
+        .unwrap_or(true)
+}
+
+const LAUNCHD_LABEL: &str = "dev.zen.serve";
+
+pub(crate) fn render_plist(zen_bin: &Path, logs_dir: &Path) -> String {
+    let out_log = logs_dir.join("serve.out.log");
+    let err_log = logs_dir.join("serve.err.log");
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/user".into());
+    let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+        <string>serve</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+        <key>PATH</key>
+        <string>{path}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{out}</string>
+    <key>StandardErrorPath</key>
+    <string>{err}</string>
+</dict>
+</plist>"#,
+        label = LAUNCHD_LABEL,
+        bin = zen_bin.display(),
+        home = home,
+        path = path,
+        out = out_log.display(),
+        err = err_log.display(),
+    )
+}
+
+fn plist_path() -> Result<PathBuf, ZenError> {
+    let home =
+        std::env::var("HOME").map_err(|e| ZenError::Service(format!("HOME not set: {e}")))?;
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist")))
+}
+
+fn gui_domain() -> Result<String, ZenError> {
+    let out = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|e| ZenError::Service(format!("id -u: {e}")))?;
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
+        return Err(ZenError::Service(
+            "cannot resolve user UID via `id -u`".into(),
+        ));
+    }
+    Ok(format!("gui/{uid}"))
+}
+
+fn install_launchd() -> Result<(), ZenError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err(ZenError::Service(
+            "launchd persistence is macOS-only".to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let zen_bin = std::env::current_exe()
+            .map_err(|e| ZenError::Service(format!("cannot find zen binary: {e}")))?;
+        let paths = ZenPaths::detect()?;
+        let logs_dir = paths.logs();
+        std::fs::create_dir_all(&logs_dir)
+            .map_err(|e| ZenError::Service(format!("create logs dir: {e}")))?;
+
+        let plist = render_plist(&zen_bin, &logs_dir);
+        let dest = plist_path()?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ZenError::Service(format!("create LaunchAgents dir: {e}")))?;
+        }
+        std::fs::write(&dest, &plist)
+            .map_err(|e| ZenError::Service(format!("write plist: {e}")))?;
+
+        let domain = gui_domain()?;
+
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("{}/{}", domain, LAUNCHD_LABEL)])
+            .output();
+
+        let output = std::process::Command::new("launchctl")
+            .args(["bootstrap", &domain, dest.to_str().unwrap_or("")])
+            .output()
+            .map_err(|e| ZenError::Service(format!("launchctl bootstrap: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("Load failed") || stderr.contains("already loaded") {
+                println!("{} LaunchAgent reloaded", "✅".green());
+            } else {
+                return Err(ZenError::Service(format!(
+                    "launchctl bootstrap failed: {}",
+                    stderr.trim()
+                )));
+            }
+        } else {
+            println!("{} LaunchAgent installed", "✅".green());
+        }
+        println!("  Label:  {}", LAUNCHD_LABEL);
+        println!("  Plist:  {}", dest.display());
+        println!("  Binary: {}", zen_bin.display());
+        Ok(())
+    }
+}
+
+fn uninstall_launchd() -> Result<(), ZenError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err(ZenError::Service(
+            "launchd persistence is macOS-only".to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let domain = gui_domain()?;
+
+        let output = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("{}/{}", domain, LAUNCHD_LABEL)])
+            .output()
+            .map_err(|e| ZenError::Service(format!("launchctl bootout: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("Could not find specified service") {
+                println!("{} LaunchAgent not loaded (no-op)", "ℹ️".blue());
+            } else {
+                eprintln!("{} bootout warning: {}", "⚠️".yellow(), stderr.trim());
+            }
+        } else {
+            println!("{} LaunchAgent unloaded", "✅".green());
+        }
+
+        let dest = plist_path()?;
+        if dest.exists() {
+            std::fs::remove_file(&dest)
+                .map_err(|e| ZenError::Service(format!("remove plist: {e}")))?;
+            println!("  Removed: {}", dest.display());
+        }
+        Ok(())
     }
 }
 
@@ -348,6 +543,8 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
 
             Ok(())
         }
+        ServeCommands::Install => install_launchd(),
+        ServeCommands::Uninstall => uninstall_launchd(),
     }
 }
 
@@ -443,12 +640,16 @@ async fn run_uds_foreground(
     };
     let socket = config.socket_path.display().to_string();
 
-    let zen_config = zen_core::config::load_config()?;
-    let scheduler = zen_agents::scheduler::create_configured_scheduler(&zen_config.cron);
-    tokio::spawn(async move {
-        scheduler.run().await;
-    });
-    info!("Background scheduler started");
+    if scheduler_enabled() {
+        let zen_config = zen_core::config::load_config()?;
+        let scheduler = zen_agents::scheduler::create_configured_scheduler(&zen_config.cron);
+        tokio::spawn(async move {
+            scheduler.run().await;
+        });
+        info!("Background scheduler started");
+    } else {
+        info!("scheduler disabled (implicit spawn)");
+    }
 
     if interactive {
         println!("{} Gateway daemon started", "✅".green());
@@ -669,5 +870,68 @@ fn fetch_http_body(host: &str, port: u16, path: &str) -> Option<String> {
         Some(response[idx + 4..].to_string())
     } else {
         Some(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_enabled_by_default() {
+        unsafe { std::env::remove_var("ZEN_SERVE_NO_SCHEDULER") };
+        assert!(scheduler_enabled());
+    }
+
+    #[test]
+    fn scheduler_disabled_when_flag_set() {
+        unsafe { std::env::set_var("ZEN_SERVE_NO_SCHEDULER", "1") };
+        assert!(!scheduler_enabled());
+        unsafe { std::env::remove_var("ZEN_SERVE_NO_SCHEDULER") };
+    }
+
+    #[test]
+    fn scheduler_enabled_for_empty_string() {
+        unsafe { std::env::set_var("ZEN_SERVE_NO_SCHEDULER", "") };
+        assert!(scheduler_enabled());
+        unsafe { std::env::remove_var("ZEN_SERVE_NO_SCHEDULER") };
+    }
+
+    #[test]
+    fn render_plist_contains_required_keys() {
+        let plist = render_plist(
+            Path::new("/usr/local/bin/zen"),
+            Path::new("/home/user/.zen/logs"),
+        );
+        assert!(plist.contains("<string>dev.zen.serve</string>"));
+        assert!(plist.contains("<true/>"));
+        assert!(plist.contains("<integer>60</integer>"));
+        assert!(plist.contains("/usr/local/bin/zen"));
+        assert!(plist.contains("serve"));
+        assert!(plist.contains("start"));
+        assert!(plist.contains("--foreground"));
+        assert!(plist.contains("/home/user/.zen/logs/serve.out.log"));
+        assert!(plist.contains("/home/user/.zen/logs/serve.err.log"));
+    }
+
+    #[test]
+    fn render_plist_has_environment_variables() {
+        let plist = render_plist(Path::new("/opt/homebrew/bin/zen"), Path::new("/tmp/logs"));
+        assert!(plist.contains("HOME"));
+        assert!(plist.contains("PATH"));
+        assert!(plist.contains("/opt/homebrew/bin"));
+    }
+
+    #[test]
+    fn gui_domain_returns_valid_format() {
+        let result = gui_domain();
+        assert!(result.is_ok(), "gui_domain failed: {:?}", result.err());
+        let domain = result.unwrap();
+        assert!(domain.starts_with("gui/"));
+        let uid_str = domain.strip_prefix("gui/").unwrap();
+        assert!(
+            !uid_str.is_empty() && uid_str.chars().all(|c| c.is_ascii_digit()),
+            "UID must be numeric, got: {uid_str}"
+        );
     }
 }
