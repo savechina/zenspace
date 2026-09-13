@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use tracing::{info, warn};
 
 /// Ingests files from a raw directory into the notes workspace.
@@ -104,7 +105,19 @@ impl SourceIngester {
                 let Some(file_name) = staged.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                let dest_name = format!("{host_hash}_{file_name}");
+                let is_txt = ext.eq_ignore_ascii_case("txt");
+                // .txt files are converted to frontmatter-wrapped .md at promote
+                // time so the downstream distill inbox scan (ext == "md" only)
+                // picks them up as notes.
+                let dest_name = if is_txt {
+                    let stem = staged
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("note");
+                    format!("{host_hash}_{stem}.md")
+                } else {
+                    format!("{host_hash}_{file_name}")
+                };
                 let dest = inbox.join(&dest_name);
                 if dest.exists() {
                     // Previous promotion still awaiting distill — retry later.
@@ -114,11 +127,45 @@ impl SourceIngester {
                 fs::create_dir_all(&promoted_dir).ok();
                 // Ledger record keeps the ORIGINAL staged name — the sweep's
                 // seen-set checks `_incoming/{hash}/promoted/{filename}`.
-                fs::copy(&staged, promoted_dir.join(file_name))
-                    .with_context(|| format!("ledger record: {}", promoted_dir.display()))?;
-                fs::rename(&staged, &dest).with_context(|| {
-                    format!("promote {} -> {}", staged.display(), dest.display())
-                })?;
+                if is_txt {
+                    // Read content; non-UTF-8 files are skipped (warn, no
+                    // ledger entry, no move — consistent with skip semantics).
+                    let content = match fs::read_to_string(&staged) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(
+                                file = %file_name,
+                                error = %e,
+                                "skipping non-UTF-8 txt file during promote"
+                            );
+                            continue;
+                        }
+                    };
+                    fs::copy(&staged, promoted_dir.join(file_name)).with_context(|| {
+                        format!("ledger record: {}", promoted_dir.display())
+                    })?;
+                    // Wrap in frontmatter so the distill inbox scan recognises
+                    // it as a note.  source traces back to the host hash for
+                    // provenance; sensitivity inherits the local-only default.
+                    let now = Utc::now().to_rfc3339();
+                    let id = uuid::Uuid::now_v7().to_string();
+                    let md_content = format!(
+                        "---\nid: \"{id}\"\ntags: [\"host-import\"]\nsource: \"host:{host_hash}\"\nsource_id: null\nsensitivity: private\ncreated_at: \"{now}\"\nupdated_at: \"{now}\"\ndomain: []\nproject: null\n---\n\n{content}"
+                    );
+                    fs::write(&dest, md_content).with_context(|| {
+                        format!("write converted note: {}", dest.display())
+                    })?;
+                    fs::remove_file(&staged).with_context(|| {
+                        format!("remove staged txt: {}", staged.display())
+                    })?;
+                } else {
+                    fs::copy(&staged, promoted_dir.join(file_name)).with_context(|| {
+                        format!("ledger record: {}", promoted_dir.display())
+                    })?;
+                    fs::rename(&staged, &dest).with_context(|| {
+                        format!("promote {} -> {}", staged.display(), dest.display())
+                    })?;
+                }
                 *promoted.entry(host_hash.to_string()).or_insert(0) += 1;
             }
         }
@@ -140,9 +187,11 @@ impl Default for SourceIngester {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::note::parse_frontmatter;
+    use zen_core::types::Sensitivity;
 
     #[test]
-    fn promote_incoming_moves_staging_into_inbox_once() {
+    fn promote_incoming_moves_md_and_converts_txt_to_md() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = dir.path().join("inbox");
         let staging = inbox.join("_incoming").join("ab12cd34");
@@ -155,17 +204,57 @@ mod tests {
         assert_eq!(promoted.get("ab12cd34"), Some(&2));
 
         assert!(inbox.join("ab12cd34_report.md").is_file());
-        assert!(inbox.join("ab12cd34_data.txt").is_file());
+        assert_eq!(
+            fs::read_to_string(inbox.join("ab12cd34_report.md")).unwrap(),
+            "# Report"
+        );
+
+        assert!(!inbox.join("ab12cd34_data.txt").exists());
+        let converted = fs::read_to_string(inbox.join("ab12cd34_data.md")).unwrap();
+        assert!(converted.starts_with("---\n"));
+        assert!(converted.contains("tags: [\"host-import\"]"));
+        assert!(converted.contains("source: \"host:ab12cd34\""));
+        let parsed = parse_frontmatter(&converted).unwrap();
+        assert_eq!(parsed.content, "raw text");
+        assert_eq!(parsed.tags, vec!["host-import".to_string()]);
+        assert_eq!(parsed.source, "host:ab12cd34");
+        // uuid v7 starts with "01"
+        assert!(parsed.id.starts_with("01"));
+
         assert!(!inbox.join("ab12cd34_skip.bin").exists());
         assert!(!staging.join("report.md").exists());
+        assert!(!staging.join("data.txt").exists());
         assert_eq!(
             fs::read_to_string(staging.join("promoted").join("report.md")).unwrap(),
             "# Report"
+        );
+        assert_eq!(
+            fs::read_to_string(staging.join("promoted").join("data.txt")).unwrap(),
+            "raw text"
         );
 
         // Second run: nothing left pending — no double promotion.
         let again = SourceIngester::new().promote_incoming(&inbox).unwrap();
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn promote_incoming_txt_frontmatter_parses_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("deadbeef");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("note.txt"), "Hello world").unwrap();
+
+        SourceIngester::new().promote_incoming(&inbox).unwrap();
+
+        let md = fs::read_to_string(inbox.join("deadbeef_note.md")).unwrap();
+        let note = parse_frontmatter(&md).unwrap();
+        assert_eq!(note.content, "Hello world");
+        assert!(!note.id.is_empty());
+        assert_eq!(note.sensitivity, Sensitivity::Private);
+        assert!(note.domain.is_empty());
+        assert!(note.project.is_none());
     }
 
     #[test]
@@ -184,6 +273,35 @@ mod tests {
             fs::read_to_string(inbox.join("ef987654_note.md")).unwrap(),
             "v1 still pending distill"
         );
+    }
+
+    #[test]
+    fn promote_incoming_txt_defers_when_converted_target_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("cafe0001");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("note.txt"), "v2 text").unwrap();
+        fs::write(inbox.join("cafe0001_note.md"), "v1 still pending").unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert!(promoted.is_empty());
+        assert!(staging.join("note.txt").is_file());
+    }
+
+    #[test]
+    fn promote_incoming_non_utf8_txt_skipped_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("bad00001");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("binary.txt"), b"\xff\xfe\x00\x01invalid utf8").unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert!(promoted.is_empty());
+        assert!(!inbox.join("bad00001_binary.md").exists());
+        assert!(staging.join("binary.txt").is_file());
+        assert!(!staging.join("promoted").join("binary.txt").exists());
     }
 
     #[test]
