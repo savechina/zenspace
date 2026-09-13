@@ -141,9 +141,8 @@ impl SourceIngester {
                             continue;
                         }
                     };
-                    fs::copy(&staged, promoted_dir.join(file_name)).with_context(|| {
-                        format!("ledger record: {}", promoted_dir.display())
-                    })?;
+                    fs::copy(&staged, promoted_dir.join(file_name))
+                        .with_context(|| format!("ledger record: {}", promoted_dir.display()))?;
                     // Wrap in frontmatter so the distill inbox scan recognises
                     // it as a note.  source traces back to the host hash for
                     // provenance; sensitivity inherits the local-only default.
@@ -152,16 +151,13 @@ impl SourceIngester {
                     let md_content = format!(
                         "---\nid: \"{id}\"\ntags: [\"host-import\"]\nsource: \"host:{host_hash}\"\nsource_id: null\nsensitivity: private\ncreated_at: \"{now}\"\nupdated_at: \"{now}\"\ndomain: []\nproject: null\n---\n\n{content}"
                     );
-                    fs::write(&dest, md_content).with_context(|| {
-                        format!("write converted note: {}", dest.display())
-                    })?;
-                    fs::remove_file(&staged).with_context(|| {
-                        format!("remove staged txt: {}", staged.display())
-                    })?;
+                    fs::write(&dest, md_content)
+                        .with_context(|| format!("write converted note: {}", dest.display()))?;
+                    fs::remove_file(&staged)
+                        .with_context(|| format!("remove staged txt: {}", staged.display()))?;
                 } else {
-                    fs::copy(&staged, promoted_dir.join(file_name)).with_context(|| {
-                        format!("ledger record: {}", promoted_dir.display())
-                    })?;
+                    fs::copy(&staged, promoted_dir.join(file_name))
+                        .with_context(|| format!("ledger record: {}", promoted_dir.display()))?;
                     fs::rename(&staged, &dest).with_context(|| {
                         format!("promote {} -> {}", staged.display(), dest.display())
                     })?;
