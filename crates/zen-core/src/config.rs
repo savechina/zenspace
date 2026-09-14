@@ -462,7 +462,7 @@ pub struct AgenticConfig {
 /// - Default: enabled=true, 5-min cron, merge threshold 0.82, pure-duplicate 0.98,
 ///   max_attempts 3, min_free_bytes 100 MiB, host_sources empty (FR-033 off),
 ///   hypothesis_refinement true, reverify_older_than_days 7,
-///   raw_graph_routing true, cas_commit true.
+///   raw_graph_routing true, cas_commit true, host_stage_timeout_secs 60.
 /// - Interaction: `ZEN_LOOP_*` env vars override any config layer (5th layer).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -499,6 +499,10 @@ pub struct LoopConfig {
     /// Commit distill wiki writes via FR-032 OCC/CAS (VersionSnapshot +
     /// commit_conditional) instead of unconditional commit. Default true.
     pub cas_commit: Option<bool>,
+    /// Per-host-source staging timeout in seconds. A source whose directory
+    /// scan exceeds this is skipped with a 30-minute backoff (macOS TCC
+    /// denial can hang `opendir` indefinitely). Default 60.
+    pub host_stage_timeout_secs: Option<u64>,
 }
 
 impl LoopConfig {
@@ -544,6 +548,12 @@ impl LoopConfig {
 
     pub fn cas_commit_or_default(&self) -> bool {
         self.cas_commit.unwrap_or(true)
+    }
+
+    /// Per-source staging timeout in seconds. Default 60 (covers the
+    /// worst-case macOS TCC stall; healthy directories finish in <1s).
+    pub fn host_stage_timeout_secs_or_default(&self) -> u64 {
+        self.host_stage_timeout_secs.unwrap_or(60)
     }
 
     pub fn is_extension_skipped(&self, ext: &str) -> bool {
@@ -1751,6 +1761,7 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
             .or(base.reverify_older_than_days),
         raw_graph_routing: ov.raw_graph_routing.or(base.raw_graph_routing),
         cas_commit: ov.cas_commit.or(base.cas_commit),
+        host_stage_timeout_secs: ov.host_stage_timeout_secs.or(base.host_stage_timeout_secs),
     }
 }
 
@@ -2099,6 +2110,12 @@ fn apply_loop_env(cfg: &mut LoopConfig) {
         if !list.is_empty() {
             cfg.skip_extensions = Some(list);
         }
+    }
+    if let Some(v) = env_str("ZEN_LOOP_HOST_STAGE_TIMEOUT_SECS")
+        && let Ok(n) = v.parse::<u64>()
+        && n > 0
+    {
+        cfg.host_stage_timeout_secs = Some(n);
     }
 }
 

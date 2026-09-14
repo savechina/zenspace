@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
@@ -87,6 +87,11 @@ fn save_attempts(logs_dir: &Path, attempts: &HashMap<String, u8>) {
     }
 }
 
+/// Cooldown for sources that timed out on a previous staging attempt.
+/// Within this window the source is skipped entirely (no `spawn_blocking`
+/// thread is wasted on a known-stuck directory).
+const HOST_STAGE_BACKOFF: Duration = Duration::from_secs(30 * 60); // 30 minutes
+
 /// The cron-driven knowledge-processing loop worker.
 ///
 /// Executes the full cycle: pre-cycle guards, ingest sweep, distill,
@@ -108,6 +113,14 @@ pub struct ZenLoopWorker {
     dry_run: bool,
     /// `[agentic.loop] enabled = false` — execute() becomes a no-op.
     cron_enabled: bool,
+    /// Explicit per-source staging timeout override. `None` → read
+    /// `[agentic.loop] host_stage_timeout_secs` (default 60s). Test seam
+    /// via `with_host_stage_timeout(Duration)`.
+    host_stage_timeout: Option<Duration>,
+    /// Backoff map: sources that timed out on a previous staging attempt
+    /// within `HOST_STAGE_BACKOFF` are skipped to avoid leaking blocked
+    /// threads. Key = host_path, Value = time of the last timeout.
+    host_stage_backoff: std::sync::Mutex<HashMap<PathBuf, Instant>>,
 }
 
 impl ZenLoopWorker {
@@ -125,6 +138,8 @@ impl ZenLoopWorker {
             cycles: AtomicU32::new(0),
             dry_run: false,
             cron_enabled: true,
+            host_stage_timeout: None,
+            host_stage_backoff: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -168,6 +183,14 @@ impl ZenLoopWorker {
     /// The modified worker (builder pattern).
     pub fn disabled(mut self) -> Self {
         self.cron_enabled = false;
+        self
+    }
+
+    /// Override the per-source staging timeout (default: config
+    /// `[agentic.loop] host_stage_timeout_secs`, 60s). `Duration::ZERO`
+    /// forces an immediate timeout (useful for testing the skip/backoff path).
+    pub fn with_host_stage_timeout(mut self, timeout: Duration) -> Self {
+        self.host_stage_timeout = Some(timeout);
         self
     }
 
@@ -239,7 +262,73 @@ impl ZenLoopWorker {
                 );
                 continue;
             }
-            let staged = stage_host_dir(ctx, loop_cfg, &inbox);
+
+            // Backoff check: skip sources that timed out recently to avoid
+            // leaking another blocked spawn_blocking thread.
+            {
+                let backoff = self
+                    .host_stage_backoff
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(last_timeout) = backoff.get(&ctx.host_path)
+                    && last_timeout.elapsed() < HOST_STAGE_BACKOFF
+                {
+                    debug!(
+                        source = %ctx.host_path.display(),
+                        remaining_secs = (HOST_STAGE_BACKOFF - last_timeout.elapsed()).as_secs(),
+                        "loop: host source in backoff — skipped (timed out recently)"
+                    );
+                    continue;
+                }
+            }
+
+            // Stage the directory off the tokio runtime via spawn_blocking,
+            // bounded by per-source timeout. This prevents a synchronous FS
+            // stall (e.g. macOS TCC read_dir hang) from wedging the worker.
+            let ctx_clone = ctx.clone();
+            let loop_cfg_clone = loop_cfg.clone();
+            let inbox_owned = inbox.to_path_buf();
+            let timeout = self.host_stage_timeout.unwrap_or_else(|| {
+                Duration::from_secs(loop_cfg.host_stage_timeout_secs_or_default())
+            });
+            let staged = match tokio::time::timeout(
+                timeout,
+                tokio::task::spawn_blocking(move || {
+                    stage_host_dir(&ctx_clone, &loop_cfg_clone, &inbox_owned)
+                }),
+            )
+            .await
+            {
+                Ok(Ok(staged)) => staged,
+                Ok(Err(join_err)) => {
+                    // spawn_blocking panicked — should not happen but handle it.
+                    warn!(
+                        source = %ctx.host_path.display(),
+                        error = %join_err,
+                        "loop: host stage_host_dir panicked (possible macOS TCC restriction on a protected directory — grant Full Disk Access to the zen binary)"
+                    );
+                    self.record_host_timeout(&ctx.host_path);
+                    self.emit_host_skip_audit(paths, ctx, cycle_id, config, "spawn_panic");
+                    continue;
+                }
+                Err(_elapsed) => {
+                    // Timeout: the blocking syscall is stuck and the thread
+                    // is leaked (spawn_blocking cannot be cancelled). Record
+                    // the backoff so we don't stack more stuck threads.
+                    warn!(
+                        source = %ctx.host_path.display(),
+                        timeout_secs = timeout.as_secs(),
+                        "loop: host stage_host_dir timed out (possible macOS TCC restriction on a protected directory — grant Full Disk Access to the zen binary)"
+                    );
+                    self.record_host_timeout(&ctx.host_path);
+                    self.emit_host_skip_audit(paths, ctx, cycle_id, config, "timeout");
+                    continue;
+                }
+            };
+
+            // On success: clear any stale backoff entry.
+            self.clear_host_backoff(&ctx.host_path);
+
             if !staged.is_empty() {
                 info!(
                     source = %ctx.host_path.display(),
@@ -327,6 +416,54 @@ impl ZenLoopWorker {
             if let Err(e) = append_jsonl_line(&audit_path, &audit) {
                 warn!(error = %e, "loop: host audit append failed");
             }
+        }
+    }
+
+    fn record_host_timeout(&self, host_path: &Path) {
+        let mut backoff = self
+            .host_stage_backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        backoff.insert(host_path.to_path_buf(), Instant::now());
+    }
+
+    fn clear_host_backoff(&self, host_path: &Path) {
+        let mut backoff = self
+            .host_stage_backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        backoff.remove(host_path);
+    }
+
+    fn emit_host_skip_audit(
+        &self,
+        paths: &ZenPaths,
+        ctx: &HostSourceContext,
+        cycle_id: &str,
+        config: &zen_core::config::ZenConfig,
+        skipped_reason: &str,
+    ) {
+        let model_tier = {
+            let router = DefaultRouter::from_agentic(config);
+            resolve_model_tier(&router, ctx)
+        };
+        let audit = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "kind": "loop.host.ingested",
+            "cycle_id": cycle_id,
+            "source": ctx.host_path.to_string_lossy(),
+            "sensitivity": ctx.sensitivity.to_string(),
+            "model_tier": model_tier,
+            "worker_type": ctx.worker_type.map(|k| k.as_str()),
+            "raw_policy": ctx.raw_policy.as_str(),
+            "allow_cloud": ctx.allow_cloud,
+            "staged": 0,
+            "promoted": 0,
+            "skipped": skipped_reason,
+        });
+        let audit_path = paths.logs().join("audit.jsonl");
+        if let Err(e) = append_jsonl_line(&audit_path, &audit) {
+            warn!(error = %e, "loop: host skip-audit append failed");
         }
     }
 
@@ -1374,6 +1511,7 @@ async fn persist_report_and_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zen_core::config::ZenConfig;
 
     #[test]
     fn worker_metadata_matches_contract() {
@@ -1519,5 +1657,244 @@ mod tests {
         };
 
         commit_cycle_to_git(&paths, &report);
+    }
+
+    #[tokio::test]
+    async fn host_stage_timeout_zero_skips_source_and_populates_backoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_dir = tmp.path().join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("note.md"), "# test\n").unwrap();
+
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.logs()).ok();
+
+        let ctx = HostSourceContext {
+            host_path: host_dir.clone(),
+            host_hash: "aabbccdd".into(),
+            worker_type: None,
+            raw_policy: zen_core::config::HostRawPolicy::IndexOnly,
+            sensitivity: Sensitivity::Private,
+            allow_cloud: false,
+            para_target: None,
+            m_tier: None,
+            workspace_id: None,
+        };
+
+        let config = ZenConfig::default();
+        let loop_cfg = &config.agentic.loop_cfg;
+
+        // Use a very short timeout: 1ns. The spawn_blocking task starts
+        // immediately but the JoinHandle poll races the timeout deadline.
+        // For a single-file temp dir, stage_host_dir completes in <1ms,
+        // so we also pre-populate the backoff to test the skip path.
+        let worker = ZenLoopWorker::new().with_host_stage_timeout(Duration::from_nanos(1));
+        // Pre-populate backoff to test the skip-on-backoff path.
+        worker.record_host_timeout(&host_dir);
+
+        worker
+            .sweep_host_sources(
+                &paths,
+                loop_cfg,
+                std::slice::from_ref(&ctx),
+                &config,
+                "cycle-timeout-001",
+            )
+            .await;
+
+        // The source should still be in the backoff map (not cleared,
+        // because the source was skipped, not staged successfully).
+        let backoff = worker.host_stage_backoff.lock().unwrap();
+        assert!(
+            backoff.contains_key(&host_dir),
+            "backoff map must contain the timed-out source"
+        );
+        drop(backoff);
+
+        // No files should have been staged (backoff prevented the attempt).
+        let incoming = paths.inbox().join("_incoming").join("aabbccdd");
+        assert!(
+            !incoming.exists() || std::fs::read_dir(&incoming).unwrap().count() == 0,
+            "no files should be staged after timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_stage_healthy_dir_stages_within_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_dir = tmp.path().join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("note.md"), "# test\n").unwrap();
+
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.logs()).ok();
+
+        let ctx = HostSourceContext {
+            host_path: host_dir.clone(),
+            host_hash: "deadbeef".into(),
+            worker_type: None,
+            raw_policy: zen_core::config::HostRawPolicy::IndexOnly,
+            sensitivity: Sensitivity::Private,
+            allow_cloud: false,
+            para_target: None,
+            m_tier: None,
+            workspace_id: None,
+        };
+
+        let config = ZenConfig::default();
+        let loop_cfg = &config.agentic.loop_cfg;
+
+        // Generous timeout on a healthy single-file dir: staging must
+        // succeed and the source must never enter backoff.
+        let worker = ZenLoopWorker::new().with_host_stage_timeout(Duration::from_millis(500));
+        worker
+            .sweep_host_sources(
+                &paths,
+                loop_cfg,
+                std::slice::from_ref(&ctx),
+                &config,
+                "cycle-healthy-001",
+            )
+            .await;
+
+        // File should have been staged (fast dir, generous timeout).
+        // promote_incoming renames .md as {host_hash}_{file_name}.
+        let promoted_file = paths.inbox().join("deadbeef_note.md");
+        assert!(
+            promoted_file.exists(),
+            "note.md should be staged in inbox as deadbeef_note.md"
+        );
+
+        // Backoff map should NOT contain the healthy source.
+        let backoff = worker.host_stage_backoff.lock().unwrap();
+        assert!(
+            !backoff.contains_key(&host_dir),
+            "healthy source must not be in backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_stage_backoff_prevents_second_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_dir = tmp.path().join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("note.md"), "# test\n").unwrap();
+
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.logs()).ok();
+
+        let ctx = HostSourceContext {
+            host_path: host_dir.clone(),
+            host_hash: "55667788".into(),
+            worker_type: None,
+            raw_policy: zen_core::config::HostRawPolicy::IndexOnly,
+            sensitivity: Sensitivity::Private,
+            allow_cloud: false,
+            para_target: None,
+            m_tier: None,
+            workspace_id: None,
+        };
+
+        let config = ZenConfig::default();
+        let loop_cfg = &config.agentic.loop_cfg;
+
+        let worker = ZenLoopWorker::new().with_host_stage_timeout(Duration::from_millis(500));
+
+        // Pre-populate backoff to simulate a previous timeout.
+        worker.record_host_timeout(&host_dir);
+        {
+            let backoff = worker.host_stage_backoff.lock().unwrap();
+            assert!(backoff.contains_key(&host_dir), "backoff must be populated");
+        }
+
+        // Sweep: backoff should prevent the staging attempt entirely.
+        worker
+            .sweep_host_sources(
+                &paths,
+                loop_cfg,
+                std::slice::from_ref(&ctx),
+                &config,
+                "cycle-backoff-001",
+            )
+            .await;
+
+        // Backoff entry still present (source was skipped, not cleared).
+        {
+            let backoff = worker.host_stage_backoff.lock().unwrap();
+            assert!(
+                backoff.contains_key(&host_dir),
+                "backoff entry must persist across sweep"
+            );
+        }
+
+        // No files staged (backoff skipped the source).
+        let incoming = paths.inbox().join("_incoming").join("55667788");
+        assert!(
+            !incoming.exists() || std::fs::read_dir(&incoming).unwrap().count() == 0,
+            "no files should be staged while source is in backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_stage_success_clears_backoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_dir = tmp.path().join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("note.md"), "# test\n").unwrap();
+
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.logs()).ok();
+
+        let ctx = HostSourceContext {
+            host_path: host_dir.clone(),
+            host_hash: "cafebabe".into(),
+            worker_type: None,
+            raw_policy: zen_core::config::HostRawPolicy::IndexOnly,
+            sensitivity: Sensitivity::Private,
+            allow_cloud: false,
+            para_target: None,
+            m_tier: None,
+            workspace_id: None,
+        };
+
+        let config = ZenConfig::default();
+        let loop_cfg = &config.agentic.loop_cfg;
+
+        let worker = ZenLoopWorker::new().with_host_stage_timeout(Duration::from_secs(10));
+
+        // Simulate a stale backoff entry from a previous cycle (>30min ago)
+        // so the backoff check passes and staging proceeds.
+        {
+            let mut backoff = worker.host_stage_backoff.lock().unwrap();
+            backoff.insert(
+                host_dir.clone(),
+                Instant::now() - Duration::from_secs(60 * 60),
+            );
+        }
+        assert!(
+            worker
+                .host_stage_backoff
+                .lock()
+                .unwrap()
+                .contains_key(&host_dir)
+        );
+
+        // Sweep with generous timeout: staging should succeed and clear backoff.
+        worker
+            .sweep_host_sources(
+                &paths,
+                loop_cfg,
+                std::slice::from_ref(&ctx),
+                &config,
+                "cycle-clear-001",
+            )
+            .await;
+
+        // Backoff entry should have been cleared on success.
+        let backoff = worker.host_stage_backoff.lock().unwrap();
+        assert!(
+            !backoff.contains_key(&host_dir),
+            "successful staging must clear the backoff entry"
+        );
     }
 }
