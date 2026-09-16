@@ -280,10 +280,13 @@ pub fn render_slash_popup(
     }
 
     let visible_count = state.visible_count();
-    let popup_height = (visible_count as u16) + 2;
-    let popup_y = input_area.y.saturating_sub(popup_height);
-    let popup_area =
-        ratatui::layout::Rect::new(input_area.x, popup_y, input_area.width, popup_height);
+    let popup_y = input_area.y.saturating_sub(visible_count as u16);
+    let popup_area = ratatui::layout::Rect::new(
+        input_area.x,
+        popup_y,
+        input_area.width,
+        visible_count as u16,
+    );
 
     render_slash_popup_inner(frame, state, popup_area, theme, registry, MAX_POPUP_ROWS);
 }
@@ -300,9 +303,7 @@ pub fn render_slash_popup_inline(
     if !state.visible || state.filtered_indices.is_empty() {
         return;
     }
-    // Row budget follows the actual popup area (2 border rows) so a layout
-    // that had to shrink the popup never renders rows outside its region.
-    let max_rows = (popup_area.height.saturating_sub(2) as usize).clamp(1, INLINE_POPUP_ROWS);
+    let max_rows = (popup_area.height as usize).clamp(1, INLINE_POPUP_ROWS);
     render_slash_popup_inner(frame, state, popup_area, theme, registry, max_rows);
 }
 
@@ -317,15 +318,6 @@ fn render_slash_popup_inner(
     frame.render_widget(ratatui::widgets::Clear, popup_area);
 
     let bg_color = theme.bg();
-    let block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_style(theme.text_muted())
-        .title(" Commands ")
-        .style(Style::default().bg(bg_color));
-
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
     let visible_count = state.filtered_indices.len().min(max_rows);
     let start = if state.selected >= max_rows {
         state.selected - max_rows + 1
@@ -347,14 +339,14 @@ fn render_slash_popup_inner(
         let cmd = &registry.all_commands()[cmd_idx];
         let is_selected = row + start == state.selected;
 
-        let name_style = if is_selected {
-            selected_style
+        let (prefix, name_style) = if is_selected {
+            ("▸ ", selected_style)
         } else {
-            unselected_style
+            ("  ", unselected_style)
         };
 
         let mut spans = vec![Span::styled(
-            format!("  /{}", cmd.name),
+            format!("{}  /{}", prefix, cmd.name),
             name_style.patch(row_bg),
         )];
         if !cmd.aliases.is_empty() {
@@ -376,10 +368,15 @@ fn render_slash_popup_inner(
 
         let line = Line::from(spans);
 
-        if row as u16 >= inner.height {
+        if row as u16 >= popup_area.height {
             break;
         }
-        let row_area = ratatui::layout::Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let row_area = ratatui::layout::Rect::new(
+            popup_area.x,
+            popup_area.y + row as u16,
+            popup_area.width,
+            1,
+        );
         frame.render_widget(ratatui::widgets::Paragraph::new(line), row_area);
     }
 }
