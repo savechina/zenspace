@@ -3,6 +3,7 @@ pub mod cell;
 mod clipboard;
 mod handler;
 mod highlight;
+mod history_search;
 mod inline;
 mod inline_handler;
 mod inline_ui;

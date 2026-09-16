@@ -52,6 +52,7 @@ arboard = { workspace = true }
 base64 = { workspace = true }
 unicode-width = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
+nucleo-matcher = { workspace = true }
 
 [dev-dependencies]
 # T111/T118: test builds must never resolve the real ~/.zen — the

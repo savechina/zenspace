@@ -63,6 +63,9 @@ fs_extra = "1.3.0"
 glob = "0.3.3"
 clap-verbosity-flag = { version = "3.0.4", features = ["tracing"] }
 
+# Fuzzy matching for Ctrl+R history search (Constitution XI: reuse fzf-v2 engine)
+nucleo-matcher = "0.3.1"
+
 # Scheduler (ZenScheduler — cron expression parsing, D11)
 cron = "0.17"
 chrono-tz = "0.10"
