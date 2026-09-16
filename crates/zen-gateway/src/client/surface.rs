@@ -108,6 +108,9 @@ pub enum SurfaceError {
     /// Link-level failure (dial/spawn/handshake/transport dead). The
     /// surface should show the degraded banner; the next call retries.
     Offline(String),
+    /// The turn was cancelled (e.g. user pressed Esc). Not a hard
+    /// failure — the surface should render a cancellation notice.
+    Cancelled,
 }
 
 impl std::fmt::Display for SurfaceError {
@@ -115,6 +118,7 @@ impl std::fmt::Display for SurfaceError {
         match self {
             Self::Rpc(e) => write!(f, "gateway rpc error {}: {}", e.code, e.message),
             Self::Offline(msg) => write!(f, "gateway offline: {msg}"),
+            Self::Cancelled => write!(f, "gateway turn cancelled"),
         }
     }
 }
@@ -515,6 +519,13 @@ impl SurfaceClient {
                     );
                     run().await
                 }
+                // Server returned "turn cancelled" (-32603) — a clean,
+                // well-defined cancellation signal (Esc-to-interrupt).
+                Err(SurfaceError::Rpc(e))
+                    if e.code == -32603 && e.message.contains("cancelled") =>
+                {
+                    Err(SurfaceError::Cancelled)
+                }
                 Err(other) => Err(other),
             }
         };
@@ -523,6 +534,52 @@ impl SurfaceClient {
             .expect("active turns lock")
             .remove(&turn_id);
         outcome
+    }
+
+    /// Sends `session/cancel` for every turn currently tracked as
+    /// in-flight on this surface. Advisory: cancelling a terminal or
+    /// unknown turn is a no-op server-side.
+    ///
+    /// Returns the number of cancel requests that were successfully
+    /// dispatched (individual RPC failures are logged and skipped).
+    ///
+    /// Safe to call concurrently with an in-flight
+    /// [`turn_with_recovery`] — the active-turn snapshot is taken
+    /// under a short read lock before any RPC is sent.
+    pub async fn cancel_active_turns(&self) -> usize {
+        // Snapshot active turn IDs under a brief read lock — never
+        // hold across await.
+        let turn_ids: Vec<String> = {
+            let active = self.active_turns.read().expect("active turns lock");
+            active.iter().cloned().collect()
+        };
+        if turn_ids.is_empty() {
+            return 0;
+        }
+        let client = match self.ensure_link().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "cancel_active_turns: link unavailable");
+                return 0;
+            }
+        };
+        let mut count = 0;
+        for turn_id in &turn_ids {
+            let params = serde_json::json!({ "turnId": turn_id });
+            match client.request("session/cancel", params).await {
+                Ok(_) => {
+                    count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        turn_id = %turn_id,
+                        error = %e,
+                        "cancel_active_turns: RPC failed for turn"
+                    );
+                }
+            }
+        }
+        count
     }
 
     /// One dial+send of `session/turn`; recovery layers on top of this.
@@ -885,5 +942,225 @@ mod tests {
                 .is_some_and(tokio::task::JoinHandle::is_finished),
             "replacement pump must stay live for the next redial"
         );
+    }
+
+    /// cancel_active_turns returns 0 when no turns are in flight.
+    #[tokio::test]
+    async fn cancel_no_active_turns_returns_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("cancel_zero.sock");
+        serve_canned(&sock).await;
+        let surface = open_test_surface(&sock).await;
+        let count = surface.cancel_active_turns().await;
+        assert_eq!(count, 0);
+    }
+
+    /// cancel_active_turns sends session/cancel for each tracked turn
+    /// and returns the count of successful cancels.
+    #[tokio::test]
+    async fn cancel_active_turn_sends_rpc_and_returns_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("cancel_one.sock");
+        let listener = uds::bind_socket(&sock).await.unwrap();
+
+        // Shared state: the turn handler waits on this notify;
+        // the cancel handler signals it.
+        let cancel_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cancel_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let notify_clone = cancel_notify.clone();
+        let seen_clone = cancel_seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(side) = uds::accept_transport(&listener).await else {
+                    return;
+                };
+                let n1 = notify_clone.clone();
+                let n2 = notify_clone.clone();
+                let s1 = seen_clone.clone();
+                let server = crate::server::dispatch::DispatchServer::new(side)
+                    .handle("session/start", |params| async move {
+                        let id = params
+                            .get("sessionId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("minted")
+                            .to_string();
+                        Ok(serde_json::json!({"sessionId": id, "agent": "auto"}))
+                    })
+                    .unwrap()
+                    .handle("session/turn", move |_params| {
+                        let n = n1.clone();
+                        async move {
+                            tokio::time::timeout(std::time::Duration::from_secs(10), n.notified())
+                                .await
+                                .map_err(|_| {
+                                    crate::protocol::RpcError::internal(
+                                        "timeout waiting for cancel",
+                                    )
+                                })?;
+                            Err(crate::protocol::RpcError::internal("turn cancelled"))
+                        }
+                    })
+                    .unwrap()
+                    .handle("session/cancel", move |_params| {
+                        let n = n2.clone();
+                        let s = s1.clone();
+                        async move {
+                            s.store(true, std::sync::atomic::Ordering::SeqCst);
+                            n.notify_one();
+                            Ok(serde_json::json!({"outcome": "cancelled"}))
+                        }
+                    })
+                    .unwrap();
+                let _ = server.run().await;
+            }
+        });
+
+        let surface = std::sync::Arc::new(open_test_surface(&sock).await);
+
+        // Start a turn that will stall.
+        let turn_surface = std::sync::Arc::clone(&surface);
+        let turn_handle = tokio::spawn(async move {
+            turn_surface
+                .turn_with_recovery("s1", "hello", Vec::new())
+                .await
+        });
+
+        // Wait until the turn is registered in active_turns.
+        for _ in 0..500 {
+            if !surface.active_turns.read().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !surface.active_turns.read().unwrap().is_empty(),
+            "turn must be registered before cancel"
+        );
+
+        // Cancel should send session/cancel and return 1.
+        let count = surface.cancel_active_turns().await;
+        assert_eq!(count, 1, "must report one successful cancel");
+
+        // The server must have received the cancel.
+        for _ in 0..100 {
+            if cancel_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            cancel_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "server must have received session/cancel"
+        );
+
+        // The turn must complete (not hang).
+        let result = tokio::time::timeout(Duration::from_secs(5), turn_handle)
+            .await
+            .expect("turn must not hang after cancel")
+            .expect("turn task must not panic");
+
+        // After cancel, turn_with_recovery returns SurfaceError::Cancelled.
+        assert!(
+            matches!(result, Err(SurfaceError::Cancelled)),
+            "cancelled turn must return SurfaceError::Cancelled, got: {result:?}"
+        );
+    }
+
+    /// turn_with_recovery returns Cancelled (not a hard Rpc error) when
+    /// the server cancels the turn — this is the shape the TUI agent
+    /// needs to render "⚠ cancelled".
+    #[tokio::test]
+    async fn cancelled_turn_returns_surface_cancelled_not_rpc_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("cancel_err.sock");
+        let listener = uds::bind_socket(&sock).await.unwrap();
+
+        let cancel_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify_clone = cancel_notify.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(side) = uds::accept_transport(&listener).await else {
+                    return;
+                };
+                let n1 = notify_clone.clone();
+                let n2 = notify_clone.clone();
+                let server = crate::server::dispatch::DispatchServer::new(side)
+                    .handle("session/start", |params| async move {
+                        let id = params
+                            .get("sessionId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("minted")
+                            .to_string();
+                        Ok(serde_json::json!({"sessionId": id, "agent": "auto"}))
+                    })
+                    .unwrap()
+                    .handle("session/turn", move |_params| {
+                        let n = n1.clone();
+                        async move {
+                            tokio::time::timeout(std::time::Duration::from_secs(10), n.notified())
+                                .await
+                                .map_err(|_| crate::protocol::RpcError::internal("timeout"))?;
+                            Err(crate::protocol::RpcError::internal("turn cancelled"))
+                        }
+                    })
+                    .unwrap()
+                    .handle("session/cancel", move |_params| {
+                        let n = n2.clone();
+                        async move {
+                            n.notify_one();
+                            Ok(serde_json::json!({"outcome": "cancelled"}))
+                        }
+                    })
+                    .unwrap();
+                let _ = server.run().await;
+            }
+        });
+
+        let surface = std::sync::Arc::new(open_test_surface(&sock).await);
+        let turn_surface = std::sync::Arc::clone(&surface);
+        let turn_handle = tokio::spawn(async move {
+            turn_surface
+                .turn_with_recovery("s1", "prompt", Vec::new())
+                .await
+        });
+
+        // Wait for turn registration.
+        for _ in 0..500 {
+            if !surface.active_turns.read().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Cancel.
+        surface.cancel_active_turns().await;
+
+        // Verify the error type is Cancelled, not Rpc.
+        let result = tokio::time::timeout(Duration::from_secs(5), turn_handle)
+            .await
+            .expect("turn must not hang")
+            .expect("task must not panic");
+
+        match &result {
+            Err(SurfaceError::Cancelled) => {} // expected
+            other => panic!("expected SurfaceError::Cancelled, got: {other:?}"),
+        }
+    }
+
+    /// Advisory double-cancel is safe: calling cancel_active_turns twice
+    /// does not panic or return an error.
+    #[tokio::test]
+    async fn advisory_double_cancel_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("cancel_double.sock");
+        serve_canned(&sock).await;
+        let surface = open_test_surface(&sock).await;
+
+        // No active turns — both calls return 0 without RPC errors.
+        let c1 = surface.cancel_active_turns().await;
+        let c2 = surface.cancel_active_turns().await;
+        assert_eq!(c1, 0);
+        assert_eq!(c2, 0);
     }
 }
