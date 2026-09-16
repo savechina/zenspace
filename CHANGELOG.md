@@ -153,9 +153,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Lazy WASM module precompile: `WasmPluginTool` caches compiled
     `Module` via `OnceLock`, wasm bytes held as `Arc<Vec<u8>>`
     (FR-051).
+- **TUI inline-mode UX improvements** (spec `002-agentic-tui`, branch
+  `002-agentic-tui`, 2026-09-15):
+  - Ctrl+R reverse history search (`history_search.rs`): footer-based
+    reverse-i-search with case-insensitive substring matching, newest-first
+    ordering, seen-set dedup; Up/Down cycle through matches; Enter accepts
+    (editable, no auto-submit); Esc/Ctrl+C/D exit restoring draft.
+  - History draft preservation (`app.rs`): Up snapshots unsent draft; Down
+    past newest restores it; submit clears draft + position. Cursor placed
+    at end-of-text after recall via `InputCell::new_at_end`.
+  - Fuzzy history search (2026-09-16): Ctrl+R matching upgraded from
+    substring-only to tiered fuzzy via `nucleo-matcher 0.3.1` (fzf-v2
+    similarity, helix/atuin lineage) — exact substring matches always
+    outrank fuzzy matches; equal scores break by recency (newest first);
+    footer preview highlights matched characters with `REVERSED | BOLD`
+    (Codex `inline_input.rs` parity). Slash popup stays prefix-only
+    (TODOS D9 scope unchanged).
+
+### Changed
+
+- **TUI slash popup: borderless dropdown below input** (ADR-003, 2026-09-15):
+  inline mode slash popup now renders as a borderless bare-row dropdown
+  directly below the input box (Codex-style), with `▸ ` selector prefix
+  on the selected row, up to 6 visible rows (adaptive — shrinks on small
+  viewports, never clips the input's 3 rows or the footer's 1 row).
+  Layout reordered to `[filler, tail, INPUT, POPUP, toast, footer]`.
+  Fullscreen mode retains above-input position.
+- **TUI thinking display collapse** (ADR-005, 2026-09-15): with `/thinking`
+  ON, live think blocks render only in the viewport tail (header
+  `⏳ Thinking… (Ns)` + last 3 dim-italic reasoning lines); on close, a
+  single `✓ Thought for Ns` summary is committed to scrollback. Reasoning
+  never pollutes transcript. `/thinking` OFF remains zero-output.
+- **TUI markdown table fence unwrap** (ADR-005, 2026-09-15): whole-content
+  ` ```md ` / ` ```markdown ` fences containing tables (`| row + |---|`
+  delimiter) are unwrapped so tui-markdown renders native tables. Scoped to
+  whole-content fences only; inline fences unaffected.
 
 ### Fixed
 
+- **TUI inline-mode PR-review remediation** (2026-09-16, ADR-005 amendment):
+  - Duplicate `✓ Thought for Ns` summaries — three drain call sites
+    (per-chunk, completion, poll) double-committed the thinking summary;
+    `StreamCollector` now guards with a `thinking_summary_committed`
+    once-flag (regression-tested).
+  - Cursor reset after history recall — `TextArea::new` places the cursor
+    at (0,0); the synthetic `Key::End` workaround was end-of-line (broke
+    multi-line entries); recall paths now use `InputCell::new_at_end`
+    (split on newline, `CursorMove::Bottom` + `CursorMove::End`).
+  - Draft preservation unreachable — the navigation gate required
+    `text == last_recalled_text`, blocking Up while composing; replaced
+    with row-0/last-row boundary gates, `last_recalled_text` removed.
+  - No-match search exit — Enter inside Ctrl+R with no match restores the
+    pre-search draft instead of leaking the query into the input.
+  - Esc-to-interrupt — Esc while a turn is in flight fires `session/cancel`
+    via the new `SurfaceClient::cancel_active_turns()`, clears the message
+    queue ("N queued discarded" toast), renders `⚠ cancelled` in scrollback;
+    cancelled turns resolve `SurfaceError::Cancelled` (never retried);
+    footer shows `esc to interrupt` while streaming. Ctrl+C remains Quit.
+  - Binding parity (Codex) — Ctrl+L clears output (/clear equivalent),
+    Ctrl+U kills to line head, Ctrl+D deletes forward / exits when empty;
+    INPUT_HINT documents the bindings.
 - **TUI inline stream display bugs** (2026-08-16, spec `002-agentic-tui`
   T039-T052):
   - Blank band / lost banner in streamed output — root-caused to
