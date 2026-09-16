@@ -28,6 +28,7 @@ use zen_core::paths::ZenPaths;
 use zen_core::types::{MessageRole, SessionContext};
 
 use super::cell::{BannerCell, ErrorCell, MarkdownCell, OutputCell, PlainCell};
+use super::history_search::HistorySearch;
 use super::model_picker::ModelPickerState;
 use super::render::normalize_compact_markdown;
 use super::selection::Selection;
@@ -83,7 +84,7 @@ fn main() { println!("echo"); }
 const MAX_QUEUE_SIZE: usize = 10;
 const TOAST_DURATION_SECS: u64 = 3;
 const PASTE_MODE_SECS: u64 = 2;
-const INPUT_HINT: &str = "Input (Enter=send, Shift+Enter=newline, Ctrl+D=exit)";
+const INPUT_HINT: &str = "Input (Enter=send, Shift+Enter=newline, Ctrl+R=search, Ctrl+D=exit)";
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputMode {
@@ -107,6 +108,30 @@ impl InputCell {
     pub fn new(text: impl Into<String>) -> Self {
         let mut textarea = TextArea::new(vec![text.into()]);
         textarea.set_block(Self::input_block());
+        Self {
+            textarea,
+            mode: InputMode::Default,
+            paste_timestamp: None,
+            selected_cell_idx: 0,
+            just_exited_selection: false,
+        }
+    }
+
+    /// BUG-2+L3: Create an InputCell with cursor at the END of the text.
+    /// This is the correct builder for history recall and search accept,
+    /// where the cursor should be at the end of the recalled text.
+    pub fn new_at_end(text: impl Into<String>) -> Self {
+        let text: String = text.into();
+        let lines: Vec<String> = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(String::from).collect()
+        };
+        let mut textarea = TextArea::new(lines);
+        textarea.set_block(Self::input_block());
+        // Move cursor to the end of the text (bottom row, end of line).
+        textarea.move_cursor(tui_textarea::CursorMove::Bottom);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
         Self {
             textarea,
             mode: InputMode::Default,
@@ -352,7 +377,7 @@ pub struct App {
     pub current_query: String,
     pub command_history: Vec<String>,
     pub history_position: Option<usize>,
-    pub last_recalled_text: Option<String>,
+    pub history_draft: Option<String>,
     pub config: &'static zen_core::config::ZenConfig,
     session: Option<SessionContext>,
     pub current_variant: Option<String>,
@@ -400,6 +425,7 @@ pub struct App {
     output_cache: Option<OutputCache>,
     theme_generation: u64,
     pub loop_panel: crate::tui::loop_panel::LoopPanelState,
+    pub history_search: HistorySearch,
 }
 
 impl App {
@@ -415,6 +441,12 @@ impl App {
 
     pub(crate) fn create_input_textarea(text: impl Into<String>) -> InputCell {
         InputCell::new(text)
+    }
+
+    /// BUG-2+L3: Create an InputCell with cursor at the END of the text.
+    /// Use this for history recall and search accept operations.
+    pub(crate) fn create_input_textarea_at_end(text: impl Into<String>) -> InputCell {
+        InputCell::new_at_end(text)
     }
 
     pub fn new(config: &'static zen_core::config::ZenConfig) -> Self {
@@ -442,7 +474,7 @@ impl App {
             current_query: String::new(),
             command_history: Vec::new(),
             history_position: None,
-            last_recalled_text: None,
+            history_draft: None,
             config,
             session: None,
             current_variant: None,
@@ -478,6 +510,7 @@ impl App {
             inline_mode: false,
             output_cache: None,
             theme_generation: 0,
+            history_search: HistorySearch::new(),
             loop_panel: crate::tui::loop_panel::LoopPanelState::default(),
             last_nudge_poll: None,
         };
@@ -909,7 +942,9 @@ impl App {
         if self.command_history.len() > MAX_HISTORY {
             self.command_history.remove(0);
         }
+        // W1: clear draft and position so next Up starts fresh.
         self.history_position = None;
+        self.history_draft = None;
         self.persist_history(cmd);
     }
 
@@ -941,6 +976,14 @@ impl App {
         if self.command_history.is_empty() {
             return;
         }
+        // W1: snapshot the user's unsent draft on first Up into history.
+        if self.history_position.is_none() {
+            let draft = self.input.lines().join(
+                "
+",
+            );
+            self.history_draft = Some(draft);
+        }
         let new_pos = match self.history_position {
             None => self.command_history.len() - 1,
             Some(0) => 0,
@@ -949,8 +992,8 @@ impl App {
         self.history_position = Some(new_pos);
         self.input.enter_history_mode();
         if let Some(entry) = self.command_history.get(new_pos) {
-            self.last_recalled_text = Some(entry.clone());
-            self.input = Self::create_input_textarea(entry.clone());
+            // BUG-2+L3: Use new_at_end to position cursor at end of recalled text.
+            self.input = Self::create_input_textarea_at_end(entry.clone());
             self.input.enter_history_mode();
         }
     }
@@ -959,17 +1002,19 @@ impl App {
         match self.history_position {
             None => {}
             Some(p) if p + 1 >= self.command_history.len() => {
+                // W1: restore the user's draft instead of clearing.
+                let draft = self.history_draft.take().unwrap_or_default();
                 self.history_position = None;
-                self.last_recalled_text = None;
-                self.input = Self::create_input_textarea("");
+                // BUG-2+L3: Use new_at_end to position cursor at end of restored draft.
+                self.input = Self::create_input_textarea_at_end(draft);
                 self.input.exit_mode();
             }
             Some(p) => {
                 self.history_position = Some(p + 1);
                 self.input.enter_history_mode();
                 if let Some(entry) = self.command_history.get(p + 1) {
-                    self.last_recalled_text = Some(entry.clone());
-                    self.input = Self::create_input_textarea(entry.clone());
+                    // BUG-2+L3: Use new_at_end to position cursor at end of recalled text.
+                    self.input = Self::create_input_textarea_at_end(entry.clone());
                     self.input.enter_history_mode();
                 }
             }
@@ -977,28 +1022,27 @@ impl App {
     }
 
     /// Codex pattern: decide if Up/Down should navigate history or move cursor
-    pub fn should_navigate_history(&self) -> bool {
+    /// BUG-3: Up navigates history iff cursor is on the first row (row 0).
+    /// This follows Codex/bash semantics: Up while composing stashes draft
+    /// and recalls history; multi-line editing moves cursor up unless on
+    /// first line.
+    pub fn should_navigate_history_up(&self) -> bool {
         if self.command_history.is_empty() {
             return false;
         }
-        let text = self.input.lines().join("\n");
-        // Empty text → always history mode
-        if text.is_empty() {
-            return true;
-        }
-        // Cursor must be at line boundary (start or end)
         let cursor = self.input.cursor();
-        let at_boundary = cursor == (0, 0) || {
-            let lines = self.input.lines();
-            let last_line_idx = lines.len().saturating_sub(1);
-            let last_line_len = lines[last_line_idx].len();
-            cursor == (last_line_idx, last_line_len)
-        };
-        if !at_boundary {
+        cursor.0 == 0
+    }
+
+    /// BUG-3: Down navigates history iff history_position is Some AND cursor
+    /// is on the last row. This allows Down-past-end to restore draft.
+    pub fn should_navigate_history_down(&self) -> bool {
+        if self.history_position.is_none() {
             return false;
         }
-        // Text must match last recalled entry (user hasn't edited)
-        self.last_recalled_text.as_deref() == Some(&text)
+        let cursor = self.input.cursor();
+        let last_row = self.input.lines().len().saturating_sub(1);
+        cursor.0 == last_row
     }
 
     pub fn handle_command(&mut self, cmd: &str) {
@@ -1290,8 +1334,14 @@ Use /thinking to show/hide thinking process."#;
                     let _ = done_tx.send((Ok(response), Some(session)));
                 }
                 Err(e) => {
-                    let _ = done_tx
-                        .send((Err(format!("{}: {e}", surface.link_state().banner())), None));
+                    if matches!(e, zen_gateway::client::SurfaceError::Cancelled) {
+                        // Cancelled turn: send a sentinel so poll_llm_response
+                        // handles it cleanly (no red error banner).
+                        let _ = done_tx.send((Err("[[CANCELLED]]".into()), None));
+                    } else {
+                        let _ = done_tx
+                            .send((Err(format!("{}: {e}", surface.link_state().banner())), None));
+                    }
                 }
             }
         });
@@ -1570,15 +1620,48 @@ Use /thinking to show/hide thinking process."#;
                         }
                         (Err(e), _) => {
                             completed_indices.push(idx);
-                            tracing::warn!(error = %e, "TUI chat: LLM response error");
-                            // FR-011/012: gateway-class failures keep the
-                            // degraded banner pinned in the status line.
-                            self.status_hint = e.starts_with("gateway: offline").then(|| {
-                                "gateway: offline — memory & agent features degraded (retrying)"
-                                    .to_string()
-                            });
-                            self.stream_collector.clear();
-                            self.push_output(format!("[LLM] Error: {}", e), true);
+                            if e == "[[CANCELLED]]" {
+                                // Esc-to-interrupt: clean completion, not a failure.
+                                // Drain any tokens that arrived before the cancel.
+                                let remaining: Vec<_> = {
+                                    let reasoning_style = self
+                                        .theme
+                                        .as_ref()
+                                        .text_muted()
+                                        .add_modifier(ratatui::style::Modifier::ITALIC);
+                                    let (committed, pending) =
+                                        self.stream_collector.drain_and_tail_filtered(
+                                            reasoning_style,
+                                            self.show_thinking,
+                                        );
+                                    let mut r = committed;
+                                    r.extend(pending);
+                                    r
+                                };
+                                if !remaining.is_empty() {
+                                    self.enqueue_scrollback(remaining);
+                                }
+                                self.stream_collector.clear();
+                                self.viewport_tail.clear();
+                                // Render cancellation notice (not a red error)
+                                let cancel_line = Line::from(ratatui::text::Span::styled(
+                                    "\u{26a0} cancelled",
+                                    self.theme.as_ref().text_muted(),
+                                ));
+                                self.enqueue_scrollback(vec![cancel_line]);
+                                self.status_hint = None;
+                                self.current_response_tokens = 0;
+                            } else {
+                                tracing::warn!(error = %e, "TUI chat: LLM response error");
+                                // FR-011/012: gateway-class failures keep the
+                                // degraded banner pinned in the status line.
+                                self.status_hint = e.starts_with("gateway: offline").then(|| {
+                                    "gateway: offline \u{2014} memory & agent features degraded (retrying)"
+                                        .to_string()
+                                });
+                                self.stream_collector.clear();
+                                self.push_output(format!("[LLM] Error: {}", e), true);
+                            }
                         }
                     }
                 }

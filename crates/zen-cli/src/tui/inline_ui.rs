@@ -124,51 +124,103 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let footer_area = chunks[5];
 
-    let mut footer_spans: Vec<Span<'static>> = Vec::with_capacity(12);
-    footer_spans.push(Span::styled(
-        " Zen ",
-        Style::default()
-            .fg(Color::Black)
-            .bg(info_accent)
-            .add_modifier(Modifier::BOLD),
-    ));
-    footer_spans.push(Span::styled(" | ", muted));
-    footer_spans.push(Span::styled(format!(" {} ", app.model), accent_fg));
-    if app.reading_mode {
-        footer_spans.push(Span::styled(
-            " | \u{23f8} reading — PageDown resumes",
+    let footer_spans: Vec<Span<'static>> = if app.history_search.active {
+        // W2: reverse-i-search footer -- replaces the normal status bar.
+        let hs = &app.history_search;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
+        spans.push(Span::styled(
+            " Zen ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(info_accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" ", muted));
+        spans.push(Span::styled(
+            "(reverse-i-search)`",
             Style::default().fg(info_accent),
         ));
-    }
-    if let Some(hint) = app.status_hint.as_deref() {
-        // T056: visible pre-LLM progress instead of a silent freeze.
-        footer_spans.push(Span::styled(
-            format!(" | \u{23f3} {hint}"),
-            Style::default().fg(info_accent),
-        ));
-    } else if app.is_streaming {
-        footer_spans.push(Span::styled(
-            " | \u{23f3}",
+        spans.push(Span::styled(
+            hs.query.clone(),
             Style::default()
                 .fg(info_accent)
                 .add_modifier(Modifier::BOLD),
         ));
-    }
-    footer_spans.push(Span::styled(" | ", muted));
-    footer_spans.push(Span::styled(
-        format!("{} tok", app.current_response_tokens),
-        accent_fg,
-    ));
-    if app.session_id.is_some() {
-        footer_spans.push(Span::styled(" | ", muted));
-        footer_spans.push(Span::styled(
-            app.session_id.clone().unwrap_or_default(),
+        spans.push(Span::styled("': ", Style::default().fg(info_accent)));
+        if let Some(m) = hs.current_match() {
+            let display: String = m.chars().take(60).collect();
+            let indices = hs.current_match_indices();
+            let highlight_style = Style::default()
+                .fg(info_accent)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD);
+            if indices.is_empty() {
+                spans.push(Span::styled(display, accent_fg));
+            } else {
+                let index_set: std::collections::HashSet<usize> = indices.iter().copied().collect();
+                for (i, ch) in display.chars().enumerate() {
+                    let style = if index_set.contains(&i) {
+                        highlight_style
+                    } else {
+                        accent_fg
+                    };
+                    spans.push(Span::styled(ch.to_string(), style));
+                }
+            }
+        } else {
+            spans.push(Span::styled("no match", muted));
+        }
+        spans
+    } else {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(12);
+        spans.push(Span::styled(
+            " Zen ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(info_accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" | ", muted));
+        spans.push(Span::styled(format!(" {} ", app.model), accent_fg));
+        if app.reading_mode {
+            spans.push(Span::styled(
+                " | \u{23f8} reading — PageDown resumes",
+                Style::default().fg(info_accent),
+            ));
+        }
+        if let Some(hint) = app.status_hint.as_deref() {
+            let hint = if app.is_streaming {
+                format!("{hint} — esc to interrupt")
+            } else {
+                hint.to_string()
+            };
+            spans.push(Span::styled(
+                format!(" | \u{23f3} {hint}"),
+                Style::default().fg(info_accent),
+            ));
+        } else if app.is_streaming {
+            spans.push(Span::styled(
+                " | \u{23f3} esc to interrupt",
+                Style::default()
+                    .fg(info_accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(" | ", muted));
+        spans.push(Span::styled(
+            format!("{} tok", app.current_response_tokens),
             accent_fg,
         ));
-    }
-    footer_spans.push(Span::styled(" | ", muted));
-    footer_spans.push(Span::styled(app.workspace.clone(), accent_fg));
-
+        if app.session_id.is_some() {
+            spans.push(Span::styled(" | ", muted));
+            spans.push(Span::styled(
+                app.session_id.clone().unwrap_or_default(),
+                accent_fg,
+            ));
+        }
+        spans.push(Span::styled(" | ", muted));
+        spans.push(Span::styled(app.workspace.clone(), accent_fg));
+        spans
+    };
     let footer_line = Line::from(footer_spans);
     let footer = Paragraph::new(footer_line).style(Style::default().bg(bg_color));
     frame.render_widget(footer, footer_area);
@@ -293,10 +345,10 @@ mod tests {
         app.slash_state.selected = 0;
         let buf = draw_ui(60, 8, &mut app);
 
-        // Popup (4 rows) hugs the top; its border title is visible.
+        // Popup renders at top; first row shows the selected command.
         assert!(
-            row_text(&buf, 0).contains("Commands"),
-            "popup top border/title must render on row 0: {:?}",
+            row_text(&buf, 0).contains("\u{25b8}"),
+            "popup first row must render command selector: {:?}",
             row_text(&buf, 0)
         );
         // Input box keeps its full 3 rows directly below the popup.
@@ -325,7 +377,7 @@ mod tests {
         let buf = draw_ui(60, 6, &mut app);
 
         // popup = min(4, 6 - 3 - 1) = 2 rows; input + footer intact below.
-        assert!(row_text(&buf, 0).contains("Commands"));
+        assert!(row_text(&buf, 0).contains("\u{25b8}"));
         assert!(
             row_text(&buf, 2).contains("Input"),
             "input must start right under the shrunken popup: {:?}",
@@ -345,7 +397,7 @@ mod tests {
         let buf = draw_ui(60, 12, &mut app);
 
         assert!(
-            row_text(&buf, 4).contains("Commands"),
+            row_text(&buf, 4).contains("\u{25b8}"),
             "popup must start at row 4 (filler 0..4): {:?}",
             row_text(&buf, 4)
         );
@@ -400,5 +452,136 @@ mod tests {
         let buf = draw_ui(12, 8, &mut app);
         let footer = row_text(&buf, 7);
         assert!(footer.contains("Zen"), "footer must survive narrow width");
+    }
+
+    // === W2: History Search Footer ===
+
+    /// W2: when history_search.active, the footer shows the
+    /// reverse-i-search prompt instead of the normal status bar.
+    #[test]
+    fn w2_history_search_footer_shows_reverse_i_search() {
+        let mut app = test_app();
+        app.history_search.active = true;
+        app.history_search.query = "test".to_string();
+        app.history_search.matches = vec!["test match".to_string()];
+        app.history_search.match_index = 0;
+        let buf = draw_ui(60, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("(reverse-i-search)`"),
+            "footer must show reverse-i-search prompt: {footer:?}"
+        );
+        assert!(
+            footer.contains("test"),
+            "footer must show the query: {footer:?}"
+        );
+        assert!(
+            footer.contains("test match"),
+            "footer must show the current match: {footer:?}"
+        );
+    }
+
+    /// W2: when history_search.active with no match, footer shows "no match".
+    #[test]
+    fn w2_history_search_footer_no_match() {
+        let mut app = test_app();
+        app.history_search.active = true;
+        app.history_search.query = "zzz".to_string();
+        app.history_search.matches = vec![];
+        let buf = draw_ui(60, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("(reverse-i-search)`"),
+            "footer must show search prompt: {footer:?}"
+        );
+        assert!(
+            footer.contains("no match"),
+            "footer must show no match: {footer:?}"
+        );
+    }
+
+    // === Esc-to-interrupt ===
+
+    /// Esc-to-interrupt footer: while streaming (no status hint), the footer
+    /// shows the interrupt affordance.
+    #[test]
+    fn footer_shows_esc_to_interrupt_while_streaming() {
+        let mut app = test_app();
+        app.is_streaming = true;
+        let buf = draw_ui(60, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("esc to interrupt"),
+            "footer must show interrupt affordance while streaming: {footer:?}"
+        );
+    }
+
+    /// Esc-to-interrupt footer: while idle, the footer does NOT show "esc to interrupt".
+    #[test]
+    fn footer_no_esc_to_interrupt_while_idle() {
+        let mut app = test_app();
+        app.is_streaming = false;
+        let buf = draw_ui(60, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            !footer.contains("\u{23f3}"),
+            "footer must NOT show hourglass while idle: {footer:?}"
+        );
+    }
+
+    /// Esc-to-interrupt footer: status_hint takes precedence over streaming hint.
+    #[test]
+    fn footer_status_hint_takes_precedence_over_streaming() {
+        let mut app = test_app();
+        app.is_streaming = true;
+        app.status_hint = Some("preparing context".to_string());
+        // Wide viewport: hint + interrupt affordance must not truncate.
+        let buf = draw_ui(100, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("preparing context"),
+            "status_hint must take precedence: {footer:?}"
+        );
+        // Streaming + hint: the interrupt affordance rides along with the hint.
+        assert!(
+            footer.contains("esc to interrupt"),
+            "streaming footer must keep interrupt affordance next to hint: {footer:?}"
+        );
+    }
+
+    // === W2+FUZZY: Highlight test ===
+
+    /// W2+FUZZY: matched characters in the search footer use REVERSED|BOLD style.
+    #[test]
+    fn w2_fuzzy_highlight_uses_reversed_bold() {
+        let mut app = test_app();
+        app.history_search.active = true;
+        app.history_search.query = "wl".to_string();
+        app.history_search.matches = vec!["zen wiki list".to_string()];
+        app.history_search.match_index = 0;
+        // Simulate highlight indices for "wl" in "zen wiki list":
+        // w=4, l=9 (char positions for w and l in "zen wiki list")
+        app.history_search.matched_indices = vec![vec![4, 9]];
+        let buf = draw_ui(80, 8, &mut app);
+        let footer_y = 7u16;
+        // Footer layout: " Zen (reverse-i-search)`wl': zen wiki list"
+        // Find the 'w' in "wiki" (char pos 4 of "zen wiki list") and check style.
+        let mut found_highlight = false;
+        for x in 0..buf.area.width {
+            if let Some(cell) = buf.cell((x, footer_y))
+                && cell.symbol() == "w"
+            {
+                let style = cell.style();
+                let mods = style.add_modifier;
+                if mods.contains(Modifier::REVERSED) && mods.contains(Modifier::BOLD) {
+                    found_highlight = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_highlight,
+            "footer must apply REVERSED|BOLD to matched chars"
+        );
     }
 }

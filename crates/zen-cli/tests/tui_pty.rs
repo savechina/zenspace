@@ -201,7 +201,7 @@ fn e3_inline_slash_popup_keeps_input() {
     let mut tui = Tui::spawn(&[]);
     tui.wait_for("Input (Enter=send", "composer ready");
     tui.send(b"/");
-    tui.wait_for("Commands", "slash popup");
+    tui.wait_for("▸ /help", "slash popup");
     tui.wait_for("Input (Enter=send", "composer intact under popup");
     tui.send(b"\x1b"); // Esc dismisses
 }
@@ -254,7 +254,7 @@ fn e7_fullscreen_slash_popup_keeps_input() {
     let mut tui = Tui::spawn(&[("ZEN_TUI_FULLSCREEN", "1")]);
     tui.wait_for("Zen Agentic TUI", "fullscreen ready");
     tui.send(b"/");
-    tui.wait_for("Commands", "fullscreen slash popup");
+    tui.wait_for("▸ /help", "fullscreen slash popup");
     // The composer still shows the typed slash.
     tui.wait_for("/", "composer visible under popup");
     tui.send(b"\x1b");

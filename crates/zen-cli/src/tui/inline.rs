@@ -198,6 +198,14 @@ pub(crate) fn inline_tick<B: Backend>(
         }
     }
 
+    // W3: while reasoning is active, tick dirty at least once per second so
+    // the `⏳ Thinking… (Ns)` elapsed timer repaints. The StreamCollector
+    // renders the timer inside the tail lines — this just ensures the inline
+    // viewport redraws when the displayed second changes.
+    if app.show_thinking && app.stream_collector.thinking_timer_changed() {
+        state.dirty = true;
+    }
+
     if response_just_completed {
         let reasoning_style = app
             .theme
@@ -236,6 +244,29 @@ pub(crate) fn inline_tick<B: Backend>(
                     InlineKeyAction::Quit => {
                         app.save_session_state();
                         app.running = false;
+                    }
+                    InlineKeyAction::CancelTurn => {
+                        // Esc-to-interrupt: clear queued messages, cancel active turn via RPC
+                        let queued_count = app.message_queue.len();
+                        app.message_queue.clear();
+                        if let Some(surface) = super::prewarm::take_client() {
+                            let surface = surface.clone();
+                            tokio::spawn(async move {
+                                let count = surface.cancel_active_turns().await;
+                                tracing::info!(cancelled_turns = count, "Esc: cancel RPC sent");
+                            });
+                            if queued_count > 0 {
+                                app.show_toast(format!(
+                                    "turn cancelled \u{2014} {queued_count} queued discarded"
+                                ));
+                            } else {
+                                app.show_toast("turn cancelled".to_string());
+                            }
+                        } else {
+                            app.show_toast(
+                                "cancel unavailable \u{2014} gateway offline".to_string(),
+                            );
+                        }
                     }
                     InlineKeyAction::Continue => {}
                 }
@@ -888,5 +919,32 @@ mod tests {
             .unwrap();
         assert!(one < two, "turns must keep chronological order");
         assert!(!app.is_streaming);
+    }
+
+    /// Esc-to-interrupt: CancelTurn clears the message queue.
+    #[test]
+    fn cancel_turn_clears_message_queue() {
+        let (mut app, _tokens_tx, _done_tx) = scripted_stream("test");
+        let mut terminal = anchored_terminal(80, 24);
+        let mut state = InlineLoopState::new();
+
+        // Queue some messages
+        app.message_queue.push_back("queued1".to_string());
+        app.message_queue.push_back("queued2".to_string());
+        assert_eq!(app.message_queue.len(), 2);
+
+        // Simulate CancelTurn via key event
+        let exit = inline_tick(
+            &mut app,
+            &mut terminal,
+            &mut state,
+            Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+        )
+        .expect("tick");
+        assert!(!exit);
+        assert!(
+            app.message_queue.is_empty(),
+            "CancelTurn must clear message_queue"
+        );
     }
 }

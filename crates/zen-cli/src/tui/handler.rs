@@ -230,7 +230,7 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.slash_state.move_up();
                 return KeyAction::Continue;
             }
-            if app.should_navigate_history() {
+            if app.should_navigate_history_up() {
                 app.history_up();
             } else {
                 app.input.input(Input {
@@ -251,7 +251,7 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.slash_state.move_down();
                 return KeyAction::Continue;
             }
-            if app.should_navigate_history() {
+            if app.should_navigate_history_down() {
                 app.history_down();
             } else {
                 app.input.input(Input {
