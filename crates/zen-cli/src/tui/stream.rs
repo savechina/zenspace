@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::tui::markdown::StreamingMarkdown;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -22,7 +24,20 @@ pub struct StreamCollector {
     tool_blocks: Vec<ToolIntermediate>,
     rendered_tools: usize,
     tools_expanded: bool,
+    // W3: When reasoning first appeared in this turn. Used for the elapsed
+    // timer in the `⏳ Thinking… (Ns)` / `✓ Thought for Ns` headers.
+    reasoning_started_at: Option<Instant>,
+    // W3: Throttle timer repaints — only redraw when the displayed second
+    // changes (avoids busy-looping at 30fps just for the counter).
+    last_rendered_think_secs: Option<u64>,
+    // BUG-1: Guard to ensure the thinking summary is committed exactly once.
+    // Without this, each drain after think-close would re-push the ✓ line.
+    thinking_summary_committed: bool,
 }
+
+/// Maximum reasoning lines kept in the pending tail viewport (header + N lines).
+/// Must stay ≤4 total (header + 3 body lines) to fit the 2-4 row tail viewport.
+const THINKING_BODY_MAX_LINES: usize = 3;
 
 impl StreamCollector {
     pub fn new() -> Self {
@@ -38,6 +53,9 @@ impl StreamCollector {
             tool_blocks: Vec::new(),
             rendered_tools: 0,
             tools_expanded: false,
+            reasoning_started_at: None,
+            last_rendered_think_secs: None,
+            thinking_summary_committed: false,
         }
     }
 
@@ -197,9 +215,13 @@ impl StreamCollector {
     /// `show_thinking` is false, reasoning blocks are omitted from BOTH the
     /// committed and pending regions (they are stripped from the final
     /// response anyway) instead of flashing through the viewport.
-    /// `show_thinking` is false, reasoning blocks are omitted from BOTH the
-    /// committed and pending regions (they are stripped from the final
-    /// response anyway) instead of flashing through the viewport.
+    ///
+    /// W3: when `show_thinking` is true, reasoning is NEVER committed to
+    /// scrollback while active. Instead:
+    /// - Active think: `⏳ Thinking… (Ns)` header + last 3 lines → pending
+    ///   tail only (never committed).
+    /// - Think close: exactly one `✓ Thought for Ns` line → committed, then
+    ///   a blank separator. No reasoning body reaches scrollback.
     pub fn drain_and_tail_filtered(
         &mut self,
         reasoning_style: Style,
@@ -228,6 +250,11 @@ impl StreamCollector {
         let (text, reasoning, in_think) = self.get_or_compute_split(&self.buffer.clone());
         self.reasoning_active = in_think;
 
+        // Record the instant when reasoning first appears in this turn.
+        if self.reasoning_started_at.is_none() && !reasoning.is_empty() {
+            self.reasoning_started_at = Some(Instant::now());
+        }
+
         // MdStream::append ACCUMULATES its input; feed only the suffix that
         // arrived since the last render, or every already-committed block gets
         // re-emitted (duplicate scrollback output). The split can transiently
@@ -246,40 +273,55 @@ impl StreamCollector {
         let mut committed: Vec<Line<'static>> = Vec::new();
         let mut pending: Vec<Line<'static>> = Vec::new();
 
+        // W3: Collapsed thinking display (Codex pattern: reasoning never
+        // pollutes the transcript). Only when show_thinking is true.
         if !reasoning.is_empty() && show_thinking {
-            let header_text = if in_think { "Thinking..." } else { "Thought" };
-            let header = Line::from(Span::styled(header_text, reasoning_style));
+            let elapsed_secs = self.thinking_elapsed_secs();
+            let header_text = if in_think {
+                format!("\u{23f3} Thinking\u{2026} ({elapsed_secs}s)")
+            } else {
+                format!("\u{2713} Thought for {elapsed_secs}s")
+            };
 
             let reasoning_update = self.reasoning_renderer.append(reasoning_delta);
 
-            let reasoning_committed: Vec<Line<'static>> = reasoning_update
-                .committed
-                .iter()
-                .flat_map(|b| b.lines.iter().cloned())
-                .map(|l| Self::indent_line(l))
-                .collect();
-
-            if !reasoning_committed.is_empty() {
-                committed.push(header.clone());
-                committed.extend(reasoning_committed);
-            }
-
-            if let Some(pending_block) = &reasoning_update.pending {
-                if committed.is_empty() {
-                    pending.push(header);
+            if in_think {
+                // ACTIVE THINK: all reasoning goes to pending tail ONLY.
+                // Header + last 3 rendered reasoning lines. Never committed.
+                let mut all_reasoning_lines: Vec<Line<'static>> = reasoning_update
+                    .committed
+                    .iter()
+                    .flat_map(|b| b.lines.iter().cloned())
+                    .map(|l| Self::indent_line(l))
+                    .collect();
+                if let Some(ref pending_block) = reasoning_update.pending {
+                    all_reasoning_lines.extend(
+                        pending_block
+                            .lines
+                            .iter()
+                            .cloned()
+                            .map(|l| Self::indent_line(l)),
+                    );
                 }
-                for rl in &pending_block.lines {
-                    pending.push(Self::indent_line(rl.clone()));
-                }
-            }
 
-            if !in_think && (!committed.is_empty() || !pending.is_empty()) {
-                let target = if pending.is_empty() {
-                    &mut committed
-                } else {
-                    &mut pending
-                };
-                target.push(Line::from(Span::raw("")));
+                // Cap to last 3 lines so pending stays ≤4 total (header + 3).
+                let start = all_reasoning_lines
+                    .len()
+                    .saturating_sub(THINKING_BODY_MAX_LINES);
+                let tail_lines = &all_reasoning_lines[start..];
+
+                let header = Line::from(Span::styled(header_text, reasoning_style));
+                pending.push(header);
+                for rl in tail_lines {
+                    pending.push(rl.clone());
+                }
+            } else if !self.thinking_summary_committed {
+                // BUG-1: THINK CLOSE: commit exactly ONE summary line, no body.
+                // The once-guard prevents duplicate ✓ lines on repeated drains.
+                committed.push(Line::from(Span::styled(header_text, reasoning_style)));
+                // Blank separator after the thought summary.
+                committed.push(Line::from(Span::raw("")));
+                self.thinking_summary_committed = true;
             }
         }
 
@@ -306,6 +348,17 @@ impl StreamCollector {
                 committed.extend(block.lines.iter().cloned());
             }
             if let Some(pending_block) = &text_update.pending {
+                // W4a: mdstream 0.3.0 guarantees pending blocks only contain
+                // complete lines (it breaks out of append_core's line-processing
+                // loop when `line_has_newline` returns false — see
+                // mdstream/src/stream/engine.rs L90-96). No newline gate needed;
+                // partial lines stay in the LineBuffer until the next chunk arrives.
+                //
+                // W4c: mdstream also handles table holdback correctly —
+                // `BlockMode::Table` is tracked by BlockMachine; tables commit
+                // atomically (only when a blank line triggers `after_blank_line_decision`
+                // in BoundaryDetector, which means the table is complete). No
+                // speculative holdback scanner needed at this layer.
                 pending.extend(pending_block.lines.iter().cloned());
             }
         }
@@ -317,6 +370,29 @@ impl StreamCollector {
         let mut spans = vec![Span::raw("  ")];
         spans.extend(line.spans);
         Line::from(spans)
+    }
+
+    /// W3: elapsed seconds since reasoning first appeared in this turn.
+    pub fn thinking_elapsed_secs(&self) -> u64 {
+        self.reasoning_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    /// W3: whether the timer display changed since last render tick.
+    /// Returns true when the displayed second differs from the last render,
+    /// signalling the inline event loop to redraw.
+    pub fn thinking_timer_changed(&mut self) -> bool {
+        if !self.reasoning_active {
+            return false;
+        }
+        let now_secs = self.thinking_elapsed_secs();
+        if self.last_rendered_think_secs != Some(now_secs) {
+            self.last_rendered_think_secs = Some(now_secs);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn finalize_and_drain(&mut self) -> (String, Option<String>) {
@@ -350,6 +426,11 @@ impl StreamCollector {
         self.reasoning_fed_len = 0;
         self.tool_blocks.clear();
         self.rendered_tools = 0;
+        // W3: reset thinking timer for the next turn.
+        self.reasoning_started_at = None;
+        self.last_rendered_think_secs = None;
+        // BUG-1: reset the once-guard so next turn can commit its summary.
+        self.thinking_summary_committed = false;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -430,8 +511,9 @@ mod tests {
 
     #[test]
     fn filtered_mode_shows_reasoning_when_enabled() {
+        // W3: open think tag â reasoning renders in pending tail only.
         let mut c = StreamCollector::new();
-        c.push_delta("<think>visible reasoning</think>Answer");
+        c.push_delta("<think>visible reasoning");
         let (committed, pending) = c.drain_and_tail_filtered(Style::default(), true);
         let all: String = committed
             .iter()
@@ -441,6 +523,10 @@ mod tests {
         assert!(
             all.contains("visible reasoning"),
             "reasoning must render: {all:?}"
+        );
+        assert!(
+            all.contains("\u{23f3}"),
+            "must have thinking header: {all:?}"
         );
     }
 
@@ -644,5 +730,216 @@ mod tests {
         let mut c = StreamCollector::new();
         c.push_delta("text before\n🔧 web.search x\nmiddle");
         assert_eq!(c.buffer(), "text before\nmiddle");
+    }
+
+    // --- W3: Thinking collapse tests ---
+
+    /// W3: while a think block is open, reasoning renders ONLY in the pending
+    /// tail with the `⏳ Thinking… (` header. No reasoning body reaches
+    /// committed scrollback.
+    #[test]
+    fn thinking_active_pending_only() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>Let me think step by step");
+        let (committed, pending) = c.drain_and_tail_filtered(Style::default(), true);
+
+        // Committed must NOT contain any reasoning body or header.
+        let committed_text = lines_text(&committed);
+        assert!(
+            !committed_text.contains("Let me think"),
+            "reasoning body must NOT be in committed: {committed_text:?}"
+        );
+        assert!(
+            !committed_text.contains("Thinking"),
+            "thinking header must NOT be in committed: {committed_text:?}"
+        );
+
+        // Pending must contain the header with ⏳ and the reasoning.
+        let pending_text = lines_text(&pending);
+        assert!(
+            pending_text.contains("\u{23f3} Thinking\u{2026}"),
+            "pending must have ⏳ Thinking… header: {pending_text:?}"
+        );
+        assert!(
+            pending_text.contains("Let me think"),
+            "pending must show reasoning body: {pending_text:?}"
+        );
+    }
+
+    /// W3: when think block closes, exactly one `✓ Thought for Ns` line is
+    /// committed with a blank separator. No reasoning body in committed.
+    #[test]
+    fn thinking_close_commits_summary_only() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>reasoning content</think>The answer.");
+        let (committed, pending) = c.drain_and_tail_filtered(Style::default(), true);
+
+        let committed_text = lines_text(&committed);
+        // Must contain the ✓ summary.
+        assert!(
+            committed_text.contains("\u{2713} Thought for"),
+            "committed must have ✓ Thought for: {committed_text:?}"
+        );
+        // Must NOT contain the reasoning body.
+        assert!(
+            !committed_text.contains("reasoning content"),
+            "committed must NOT contain reasoning body: {committed_text:?}"
+        );
+        // Pending must contain the answer text (from text_renderer).
+        let pending_text = lines_text(&pending);
+        assert!(
+            pending_text.contains("The answer."),
+            "pending must have answer text: {pending_text:?}"
+        );
+    }
+
+    /// W3: show_thinking=false still emits zero reasoning (unchanged contract).
+    #[test]
+    fn thinking_disabled_emits_zero_reasoning() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>secret</think>visible answer");
+        let (committed, pending) = c.drain_and_tail_filtered(Style::default(), false);
+        let all = lines_text(&committed) + &lines_text(&pending);
+        assert!(
+            !all.contains("secret"),
+            "thinking disabled must hide reasoning: {all:?}"
+        );
+        assert!(
+            !all.contains("Thinking") && !all.contains("Thought"),
+            "thinking disabled must hide headers: {all:?}"
+        );
+        assert!(
+            all.contains("visible answer"),
+            "text must still render: {all:?}"
+        );
+    }
+
+    /// W3: the pending tail caps reasoning lines to last 3 (header + 3 body).
+    #[test]
+    fn thinking_pending_caps_lines() {
+        let mut c = StreamCollector::new();
+        // Simulate long reasoning that produces many rendered lines.
+        let reasoning = (0..20)
+            .map(|i| format!("Line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        c.push_delta(&format!("<think>{reasoning}"));
+        let (_, pending) = c.drain_and_tail_filtered(Style::default(), true);
+        // Header (1 line) + ≤3 body lines = ≤4 lines total.
+        assert!(
+            pending.len() <= 4,
+            "pending must be ≤4 lines (header + 3 body), got {}",
+            pending.len()
+        );
+        // Verify the header is present.
+        assert!(
+            lines_text(&[pending[0].clone()]).contains("\u{23f3}"),
+            "first line must be the header"
+        );
+    }
+
+    /// W3: thinking_elapsed_secs returns non-zero after reasoning starts.
+    #[test]
+    fn thinking_elapsed_nonzero() {
+        let mut c = StreamCollector::new();
+        assert_eq!(c.thinking_elapsed_secs(), 0, "before reasoning, elapsed=0");
+        c.push_delta("<think>thinking");
+        let _ = c.drain_and_tail_filtered(Style::default(), true);
+        // The instant was set on first reasoning delta.
+        assert!(
+            c.thinking_elapsed_secs() < 2,
+            "elapsed should be small right after start"
+        );
+    }
+
+    /// W3: clear() resets the thinking timer.
+    #[test]
+    fn clear_resets_thinking_timer() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>thinking");
+        let _ = c.drain_and_tail_filtered(Style::default(), true);
+        assert!(c.reasoning_started_at.is_some());
+        c.clear();
+        assert!(
+            c.reasoning_started_at.is_none(),
+            "clear must reset reasoning_started_at"
+        );
+        assert_eq!(c.thinking_elapsed_secs(), 0);
+    }
+
+    // BUG-1: Regression tests for duplicate thinking summary commits.
+
+    /// BUG-1: After think-close, multiple drains must NOT produce duplicate
+    /// summary lines in committed output.
+    #[test]
+    fn thinking_summary_committed_once_across_drains() {
+        let mut c = StreamCollector::new();
+        // Push think tags that close in the same chunk.
+        c.push_delta("<think>reasoning</think>chunk1");
+        let (c1, _) = c.drain_and_tail_filtered(Style::default(), true);
+        let text1 = lines_text(&c1);
+        assert!(
+            text1.contains("\u{2713} Thought for"),
+            "first drain must have checkmark: {:?}",
+            text1
+        );
+
+        // Push more text, drain again.
+        c.push_delta("chunk2");
+        let (c2, _) = c.drain_and_tail_filtered(Style::default(), true);
+        let text2 = lines_text(&c2);
+
+        // Push final text, drain once more.
+        c.push_delta("chunk3");
+        let (c3, _) = c.drain_and_tail_filtered(Style::default(), true);
+        let text3 = lines_text(&c3);
+
+        // Across ALL committed outputs, exactly ONE line contains the summary.
+        let all_committed = format!("{}\\n{}\\n{}", text1, text2, text3);
+        let count = all_committed.matches("\u{2713} Thought for").count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one summary line across all drains, got {}: {:?}",
+            count, all_committed
+        );
+    }
+
+    /// BUG-1: Drain twice with NO new delta after close - second drain's
+    /// committed contains no summary line.
+    #[test]
+    fn thinking_summary_no_duplicate_on_idle_drain() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>reasoning</think>answer");
+        let (c1, _) = c.drain_and_tail_filtered(Style::default(), true);
+        assert!(lines_text(&c1).contains("\u{2713} Thought for"));
+
+        // Second drain with no new content - must NOT emit another summary.
+        let (c2, _) = c.drain_and_tail_filtered(Style::default(), true);
+        let text2 = lines_text(&c2);
+        assert!(
+            !text2.contains("\u{2713} Thought for"),
+            "second idle drain must not duplicate summary: {:?}",
+            text2
+        );
+    }
+
+    /// BUG-1: clear() resets the once-guard so a new turn can commit its summary.
+    #[test]
+    fn thinking_summary_guard_resets_on_clear() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>reasoning</think>answer");
+        let (c1, _) = c.drain_and_tail_filtered(Style::default(), true);
+        assert!(lines_text(&c1).contains("\u{2713} Thought for"));
+
+        // Clear (simulates new turn).
+        c.clear();
+
+        // Push new think block, drain - must commit a new summary.
+        c.push_delta("<think>more reasoning</think>more answer");
+        let (c2, _) = c.drain_and_tail_filtered(Style::default(), true);
+        assert!(
+            lines_text(&c2).contains("\u{2713} Thought for"),
+            "after clear, new turn must commit summary"
+        );
     }
 }

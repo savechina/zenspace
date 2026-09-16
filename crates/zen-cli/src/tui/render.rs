@@ -1,9 +1,82 @@
+/// W4b: Strip outer ```md / ```markdown fences when the entire content is a
+/// single fenced block whose body contains a markdown table (a `|...|` row
+/// followed by a `|---|`-style delimiter). Returns the unwrapped body so
+/// tui-markdown renders a native table instead of a code block.
+///
+/// Only applies to whole-content fences (Codex `unwrap_markdown_fences`
+/// equivalent); never touches embedded fences within larger documents.
+fn unwrap_md_table_fence(content: &str) -> &str {
+    let trimmed = content.trim_start();
+    // Must start with ```md or ```markdown
+    let rest = if let Some(r) = trimmed.strip_prefix("```") {
+        r
+    } else {
+        return content;
+    };
+    let after_lang = if let Some(r) = rest.strip_prefix("md") {
+        r
+    } else if let Some(r) = rest.strip_prefix("markdown") {
+        r
+    } else {
+        return content;
+    };
+    // After the lang tag, the rest of the opening line must be whitespace or empty.
+    if !after_lang.chars().next().is_none_or(|c| c.is_whitespace()) {
+        return content;
+    }
+
+    // Must end with ``` (closing fence).
+    let trimmed_end = content.trim_end();
+    let Some(body_with_closing_fence) = trimmed_end.strip_suffix("```") else {
+        return content;
+    };
+    // Body starts after the opening fence line (skip past the first newline).
+    let body = match body_with_closing_fence.find("\n") {
+        Some(idx) => body_with_closing_fence[idx + 1..].trim(),
+        None => return content,
+    };
+    if body.is_empty() {
+        return content;
+    }
+
+    // Check for a markdown table: a |...| line followed by a |---|-style delimiter.
+    let mut has_table = false;
+    let mut lines = body.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        if t.starts_with('|')
+            && t.ends_with('|')
+            && t.matches('|').count() >= 2
+            && let Some(next) = lines.peek()
+        {
+            let nt = next.trim();
+            if nt.starts_with('|') && nt.ends_with('|') {
+                let cells: Vec<&str> = nt[1..nt.len() - 1].split('|').collect();
+                if cells.iter().all(|c| {
+                    c.trim()
+                        .chars()
+                        .all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
+                }) {
+                    has_table = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if has_table { body } else { content }
+}
+
 /// Normalize compact markdown by inserting blank lines before block elements.
 ///
 /// Handles headings (`#`), code fences (` ``` `), list items (`- `, `* `, `+ `, `N. `),
 /// blockquotes (`>`), and table rows (`|`). Respects inline code boundaries and avoids
 /// false positives like `this - that` being turned into list items.
 pub fn normalize_compact_markdown(content: &str) -> String {
+    // W4b: whole-content ```md fence containing a table → strip fence so
+    // tui-markdown renders a native table instead of a code block.
+    let content = unwrap_md_table_fence(content);
+
     if !content.contains(' ') {
         return content.to_string();
     }
@@ -328,5 +401,103 @@ mod tests {
         let input = "# Heading text";
         let normalized = normalize_compact_markdown(input);
         assert_eq!(normalized, "# Heading text");
+    }
+
+    // --- W4b: Fence unwrap tests ---
+
+    /// W4b: whole-content ```md fence containing a markdown table strips the
+    /// outer fence so tui-markdown renders a native table.
+    #[test]
+    fn fence_unwrap_md_table() {
+        let input = "```md
+| Name | Score |
+|------|-------|
+| Alice | 95 |
+```";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            !normalized.starts_with("```"),
+            "fence must be stripped: {normalized:?}"
+        );
+        assert!(
+            normalized.contains("| Name | Score |"),
+            "table header must survive: {normalized:?}"
+        );
+        assert!(
+            normalized.contains("| Alice | 95 |"),
+            "table data must survive: {normalized:?}"
+        );
+        // The separator row should be present (either original or inserted).
+        assert!(
+            normalized.contains("|------|-------|") || normalized.contains("|---|"),
+            "separator row must be present: {normalized:?}"
+        );
+    }
+
+    /// W4b: ```markdown variant also unwraps.
+    #[test]
+    fn fence_unwrap_markdown_variant() {
+        let input = "```markdown
+| A | B |
+|---|---|
+| 1 | 2 |
+```";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            !normalized.starts_with("```"),
+            "```markdown fence must be stripped: {normalized:?}"
+        );
+        assert!(normalized.contains("| A | B |"));
+    }
+
+    /// W4b: non-table ```md content stays fenced (no unwrap).
+    #[test]
+    fn fence_unwrap_non_table_stays() {
+        let input = "```md
+Just some plain text
+```";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            normalized.starts_with("```"),
+            "non-table md fence must stay: {normalized:?}"
+        );
+    }
+
+    /// W4b: embedded ```md (not whole-content) stays fenced.
+    #[test]
+    fn fence_unwrap_embedded_stays() {
+        let input = "Some text
+
+```md
+| A | B |
+|---|---|
+```
+
+More text";
+        let normalized = normalize_compact_markdown(input);
+        assert!(
+            normalized.contains("```md"),
+            "embedded fence must stay: {normalized:?}"
+        );
+    }
+
+    /// W4b: ```rust fence is not touched.
+    #[test]
+    fn fence_unwrap_rust_not_touched() {
+        let input = "```rust
+fn main() {}
+```";
+        let normalized = normalize_compact_markdown(input);
+        assert!(normalized.starts_with("```rust"));
+    }
+
+    /// W4b: empty body in fence does not unwrap.
+    #[test]
+    fn fence_unwrap_empty_body() {
+        let input = "```md
+
+```";
+        let normalized = normalize_compact_markdown(input);
+        assert!(normalized.starts_with("```md"));
     }
 }
