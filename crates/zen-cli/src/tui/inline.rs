@@ -298,11 +298,14 @@ pub(crate) fn inline_tick<B: Backend>(
             // shows the newest content.
             app.deferred_scrollback
                 .extend(app.scrollback_queue.drain(..));
-        } else {
-            super::scrollback_inserter::insert_scrollback_queue(
-                terminal,
-                &mut app.scrollback_queue,
-            )?;
+        } else if let Err(e) =
+            super::scrollback_inserter::insert_scrollback_queue(terminal, &mut app.scrollback_queue)
+        {
+            // D2: a terminal I/O hiccup must not kill the REPL -- defer the
+            // blocks so they retry on the next flush / reading-mode exit.
+            tracing::error!(error = %e, "scrollback insert failed; deferring blocks");
+            app.deferred_scrollback
+                .extend(app.scrollback_queue.drain(..));
         }
         state.dirty = true;
     }
@@ -341,7 +344,14 @@ fn run_inline_session(
     // first Enter does not pay the cold-start price on this thread.
     super::prewarm::spawn();
 
-    super::scrollback_inserter::insert_scrollback_queue(terminal, &mut app.scrollback_queue)?;
+    if let Err(e) =
+        super::scrollback_inserter::insert_scrollback_queue(terminal, &mut app.scrollback_queue)
+    {
+        // D2: same contract as the in-loop flush -- never kill the session.
+        tracing::error!(error = %e, "scrollback insert failed; deferring blocks");
+        app.deferred_scrollback
+            .extend(app.scrollback_queue.drain(..));
+    }
 
     let mut state = InlineLoopState::new();
     loop {
@@ -945,6 +955,27 @@ mod tests {
         assert!(
             app.message_queue.is_empty(),
             "CancelTurn must clear message_queue"
+        );
+    }
+
+    /// D2 regression: a scrollback insert error does not kill the REPL --
+    /// blocks are moved to deferred_scrollback instead.
+    #[test]
+    fn s12_scrollback_insert_error_does_not_kill_repl() {
+        let mut app = prepare_inline_app(test_config());
+        app.scrollback_queue.clear();
+        app.enqueue_scrollback(vec![ratatui::text::Line::from("should survive")]);
+        assert!(!app.scrollback_queue.is_empty());
+
+        let mut terminal = anchored_terminal(80, 24);
+        let result = insert_scrollback_queue(&mut terminal, &mut app.scrollback_queue);
+        if result.is_err() {
+            app.deferred_scrollback
+                .extend(app.scrollback_queue.drain(..));
+        }
+        assert!(
+            app.scrollback_queue.is_empty(),
+            "scrollback queue must be drained after insert or deferral"
         );
     }
 }
