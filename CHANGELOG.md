@@ -191,7 +191,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **TUI inline-mode PR-review remediation** (2026-09-16, ADR-005 amendment):
+- **TUI inline-mode open-TODO sweep + multiline slash commands** (2026-09-17,
+  TODOS D2/D4/D10/UX4/UX5 + review follow-up):
+  - Scrollback insert errors no longer kill the REPL (D2): the in-loop and
+    startup `insert_scrollback_queue` call sites log the error and defer the
+    blocks into `deferred_scrollback` for retry on the next flush instead of
+    propagating `?` and terminating the session.
+  - Footer feedback (D4/D10): `\U0001F9E0` indicator while `/thinking` is on;
+    the active picker is announced (` | /commands`, ` | sessions`, ` | models`).
+  - Slash popup empty state (UX4): a non-empty filter with zero matches now
+    keeps the popup open with a dim italic `no matches` row instead of silently
+    disappearing; selection indexing is guarded for empty lists.
+  - Slash popup scroll markers (UX5): dim `\u25B2`/`\u25BC` markers appear when
+    the visible window is not at the top/bottom of the filtered command list.
+  - Multiline slash commands: plain Enter now submits ANY non-empty buffer
+    (the footer hint always promised "Enter=send"); Shift+Enter remains the
+    only newline input. `\n/exit` + Enter executes (matches Hermes' trimmed
+    recognition; `text\n/exit` stays a chat message per Codex/Hermes
+    convention), and the slash popup predicate trims leading whitespace so
+    suggestions show for buffers with a blank first line.
+  - Flaky test: `scheduler_disabled_when_flag_set` and its two sibling tests
+    now serialize process-env mutation behind an `ENV_LOCK` mutex (10/10 green).
+ (2026-09-16, ADR-005 amendment):
   - Duplicate `✓ Thought for Ns` summaries — three drain call sites
     (per-chunk, completion, poll) double-committed the thinking summary;
     `StreamCollector` now guards with a `thinking_summary_committed`
