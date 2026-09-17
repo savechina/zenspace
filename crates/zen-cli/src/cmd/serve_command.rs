@@ -876,15 +876,21 @@ fn fetch_http_body(host: &str, port: u16, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize env-mutating tests to prevent cross-thread races on ZEN_SERVE_NO_SCHEDULER.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn scheduler_enabled_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("ZEN_SERVE_NO_SCHEDULER") };
         assert!(scheduler_enabled());
     }
 
     #[test]
     fn scheduler_disabled_when_flag_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("ZEN_SERVE_NO_SCHEDULER", "1") };
         assert!(!scheduler_enabled());
         unsafe { std::env::remove_var("ZEN_SERVE_NO_SCHEDULER") };
@@ -892,6 +898,7 @@ mod tests {
 
     #[test]
     fn scheduler_enabled_for_empty_string() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("ZEN_SERVE_NO_SCHEDULER", "") };
         assert!(scheduler_enabled());
         unsafe { std::env::remove_var("ZEN_SERVE_NO_SCHEDULER") };
