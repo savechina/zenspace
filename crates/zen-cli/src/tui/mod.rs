@@ -12,6 +12,7 @@ pub mod markdown;
 pub mod model_picker;
 mod prewarm;
 mod render;
+mod scheduler_gate;
 pub mod scrollback_inserter;
 pub mod selection;
 pub mod session_picker;

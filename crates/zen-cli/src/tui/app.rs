@@ -2466,11 +2466,10 @@ pub fn run_app(
     );
     app.push_output(format!("Workspace: {}", app.workspace), false);
 
-    // Spawn the background scheduler (auto-cancelled when TUI exits).
-    let scheduler = zen_agents::scheduler::create_configured_scheduler(&config.cron);
-    tokio::spawn(async move {
-        scheduler.run().await;
-    });
+    // In-app learning scheduler: probe-gated (skips when a daemon
+    // already hosts one), learning-core workers only. Auto-cancelled
+    // when the TUI exits.
+    super::scheduler_gate::spawn(config);
     // T061: pre-warm the gateway link in the background exactly like the
     // inline path, so the first Enter does not pay the cold-start price here.
     super::prewarm::spawn();

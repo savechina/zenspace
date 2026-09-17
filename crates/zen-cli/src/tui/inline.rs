@@ -335,10 +335,9 @@ fn run_inline_session(
 ) -> Result<()> {
     let config = app.config;
 
-    let scheduler = zen_agents::scheduler::create_configured_scheduler(&config.cron);
-    tokio::spawn(async move {
-        scheduler.run().await;
-    });
+    // In-app learning scheduler: probe-gated (skips when a daemon
+    // already hosts one), learning-core workers only.
+    super::scheduler_gate::spawn(config);
 
     // T053: pre-warm the gateway link in the background so the
     // first Enter does not pay the cold-start price on this thread.
