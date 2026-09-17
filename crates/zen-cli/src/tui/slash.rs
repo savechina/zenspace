@@ -194,9 +194,20 @@ impl SlashState {
             }
 
             let token = stripped.split_whitespace().next().unwrap_or("");
-            self.filter = token.to_lowercase();
+            let new_filter = token.to_lowercase();
+            // Recompute every call (cheap: ~18 commands) so a first-time or
+            // re-shown filter always has a populated match list; only the
+            // selection resets on an actual filter change (Codex semantics).
+            let changed = new_filter != self.filter;
+            self.filter = new_filter;
             self.recompute_filtered(registry);
-            self.selected = 0;
+            if changed {
+                self.selected = 0;
+            } else {
+                self.selected = self
+                    .selected
+                    .min(self.filtered_indices.len().saturating_sub(1));
+            }
             // UX4: keep popup visible when filter is non-empty (show "no matches")
             self.visible = !self.filter.is_empty() || !self.filtered_indices.is_empty();
         } else {
@@ -254,14 +265,6 @@ impl SlashState {
     pub fn visible_count(&self) -> usize {
         self.filtered_indices.len().min(MAX_POPUP_ROWS)
     }
-
-    pub fn at_first(&self) -> bool {
-        self.selected == 0
-    }
-
-    pub fn at_last(&self) -> bool {
-        self.selected + 1 >= self.filtered_indices.len()
-    }
 }
 
 impl Default for SlashState {
@@ -293,7 +296,7 @@ pub fn render_slash_popup(
     render_slash_popup_inner(frame, state, popup_area, theme, registry, MAX_POPUP_ROWS);
 }
 
-const INLINE_POPUP_ROWS: usize = 4;
+const INLINE_POPUP_ROWS: usize = 8;
 
 pub fn render_slash_popup_inline(
     frame: &mut ratatui::Frame,
@@ -348,10 +351,10 @@ fn render_slash_popup_inner(
     let has_items_below = start + visible_count < total;
 
     let selected_style = Style::default()
-        .fg(theme.info_accent())
+        .fg(ratatui::style::Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    let unselected_style = Style::default();
-    let desc_style = theme.text_muted();
+    let unselected_name_style = Style::default();
+    let unselected_desc_style = theme.text_muted();
     for (row, &cmd_idx) in state.filtered_indices[start..start + visible_count]
         .iter()
         .enumerate()
@@ -359,40 +362,60 @@ fn render_slash_popup_inner(
         let cmd = &registry.all_commands()[cmd_idx];
         let is_selected = row + start == state.selected;
 
-        let (prefix, name_style) = if is_selected {
-            ("▸ ", selected_style)
-        } else {
-            ("  ", unselected_style)
-        };
-
-        let mut spans = vec![Span::styled(
-            format!("{}  /{}", prefix, cmd.name),
-            name_style.patch(row_bg),
-        )];
-        if !cmd.aliases.is_empty() {
-            let alias_str = cmd
-                .aliases
-                .iter()
-                .map(|a| format!("/{}", a))
-                .collect::<Vec<_>>()
-                .join(" ");
+        let mut spans = Vec::new();
+        if is_selected {
+            // Codex: selected row — entire row Cyan + Bold
             spans.push(Span::styled(
-                format!(" ({})", alias_str),
-                desc_style.patch(row_bg),
+                format!("  /{}", cmd.name),
+                selected_style.patch(row_bg),
+            ));
+            if !cmd.aliases.is_empty() {
+                let alias_str = cmd
+                    .aliases
+                    .iter()
+                    .map(|a| format!("/{}", a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                spans.push(Span::styled(
+                    format!(" ({})", alias_str),
+                    selected_style.patch(row_bg),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("  {}", cmd.description),
+                selected_style.patch(row_bg),
+            ));
+        } else {
+            // Codex: unselected — name default, aliases+description dim
+            spans.push(Span::styled(
+                format!("  /{}", cmd.name),
+                unselected_name_style.patch(row_bg),
+            ));
+            if !cmd.aliases.is_empty() {
+                let alias_str = cmd
+                    .aliases
+                    .iter()
+                    .map(|a| format!("/{}", a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                spans.push(Span::styled(
+                    format!(" ({})", alias_str),
+                    unselected_desc_style.patch(row_bg),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("  {}", cmd.description),
+                unselected_desc_style.patch(row_bg),
             ));
         }
-        spans.push(Span::styled(
-            format!("  {}", cmd.description),
-            desc_style.patch(row_bg),
-        ));
 
         // UX5: append scroll indicator to first/last rendered row
         if row == 0 && has_items_above {
-            spans.push(Span::styled("  ▲", desc_style.patch(row_bg)));
+            spans.push(Span::styled("  ▲", unselected_desc_style.patch(row_bg)));
         }
         let is_last_rendered = row + 1 == visible_count;
         if is_last_rendered && has_items_below {
-            spans.push(Span::styled("  ▼", desc_style.patch(row_bg)));
+            spans.push(Span::styled("  ▼", unselected_desc_style.patch(row_bg)));
         }
 
         let line = Line::from(spans);
@@ -499,6 +522,44 @@ mod tests {
         );
     }
 
+    /// Codex parity: the selected row is highlighted by color/weight only —
+    /// no "▸" glyph prefix.
+    #[test]
+    fn render_selected_row_has_no_glyph_prefix() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let registry = create_default_registry();
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 8);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+        for y in 0..8 {
+            assert!(
+                !row_text(y).contains('\u{25B8}'),
+                "no glyph prefix expected (Codex style): {:?}",
+                row_text(y)
+            );
+        }
+    }
+
     // === UX5: Scroll indicators ===
 
     #[test]
@@ -507,18 +568,18 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut registry = SlashCommandRegistry::new();
-        // Register 10 commands so we can scroll
-        for i in 0..10 {
+        // Register 12 commands so we can scroll within the 8-row window
+        for i in 0..12 {
             registry.register(format!("cmd{}", i), vec![], format!("Command {}", i));
         }
         let mut state = SlashState::new();
         state.on_input_change("/", &registry);
-        // Select item 5 out of 10 — mid-list with max_rows=4
-        state.selected = 5;
+        // Select item 8 of 12 — window start = 1 (items above AND below)
+        state.selected = 8;
 
-        let backend = TestBackend::new(60, 6);
+        let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 6);
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 10);
         let theme = crate::tui::theme::ZenTheme;
         terminal
             .draw(|frame| {
@@ -542,7 +603,7 @@ mod tests {
             "first row must show ▲ when scrolled: {first:?}"
         );
         // Last row should have ▼ (not at bottom)
-        let last = row_text(3);
+        let last = row_text(7);
         assert!(
             last.contains("▼"),
             "last row must show ▼ when not at bottom: {last:?}"
@@ -555,16 +616,16 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut registry = SlashCommandRegistry::new();
-        for i in 0..10 {
+        for i in 0..12 {
             registry.register(format!("cmd{}", i), vec![], format!("Command {}", i));
         }
         let mut state = SlashState::new();
         state.on_input_change("/", &registry);
         state.selected = 0; // at top
 
-        let backend = TestBackend::new(60, 6);
+        let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 6);
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 10);
         let theme = crate::tui::theme::ZenTheme;
         terminal
             .draw(|frame| {
@@ -586,7 +647,7 @@ mod tests {
             !first.contains("▲"),
             "first row must NOT show ▲ at top: {first:?}"
         );
-        let last = row_text(3);
+        let last = row_text(7);
         assert!(
             last.contains("▼"),
             "last row must show ▼ when not at bottom: {last:?}"
@@ -599,16 +660,16 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut registry = SlashCommandRegistry::new();
-        for i in 0..6 {
+        for i in 0..12 {
             registry.register(format!("cmd{}", i), vec![], format!("Command {}", i));
         }
         let mut state = SlashState::new();
         state.on_input_change("/", &registry);
-        state.selected = 5; // last item
+        state.selected = 11; // last item
 
-        let backend = TestBackend::new(60, 6);
+        let backend = TestBackend::new(60, 10);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 6);
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 10);
         let theme = crate::tui::theme::ZenTheme;
         terminal
             .draw(|frame| {
