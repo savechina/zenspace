@@ -195,6 +195,10 @@ async fn two_clients_cross_visibility_and_sole_owner() {
     assert_eq!(status["clients"], 2);
     assert_eq!(status["storeHealth"], "ok");
     assert_eq!(status["activeTurns"], 0);
+    assert_eq!(
+        status["scheduler"], false,
+        "default daemon does not host scheduler"
+    );
 
     // Sole-owner: second service open refuses (process claim), and a
     // second bind on the live socket refuses (atomic bind claim).
@@ -214,6 +218,30 @@ async fn two_clients_cross_visibility_and_sole_owner() {
         other => panic!("serve did not end cleanly: {other:?}"),
     }
     assert!(!socket.exists(), "socket file removed after shutdown");
+
+    // Phase 2: scheduler_hosted=true — explicit zen serve start.
+    let config_scheduler = GatewayDaemonConfig {
+        scheduler_hosted: true,
+        ..daemon_config(tmp.path())
+    };
+    let socket_sched = config_scheduler.socket_path.clone();
+    let server_sched = tokio::spawn(GatewayService::serve(config_scheduler));
+    let client_sched = connect_client(&socket_sched).await;
+    handshake(&client_sched).await;
+    let status_sched = rpc(&client_sched, 10, "health/status", json!({}))
+        .await
+        .expect("scheduler-status ok");
+    assert_eq!(
+        status_sched["scheduler"], true,
+        "explicit zen serve start reports scheduler hosted"
+    );
+    assert_eq!(status_sched["protocolVersion"], SERVER_PROTOCOL_VERSION);
+    let _ = rpc(&client_sched, 11, "shutdown", json!({})).await;
+    let finished_sched = tokio::time::timeout(Duration::from_secs(15), server_sched).await;
+    match finished_sched {
+        Ok(Ok(Ok(()))) => {}
+        other => panic!("phase-2 serve did not end cleanly: {other:?}"),
+    }
 
     // Release the process-lifetime memvid singletons so tantivy watcher
     // threads exit and the test binary can terminate.

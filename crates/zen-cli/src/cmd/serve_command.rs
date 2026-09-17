@@ -636,6 +636,7 @@ async fn run_uds_foreground(
         http: http_cfg,
         qqbot: qqbot_cfg,
         idle_exit,
+        scheduler_hosted: scheduler_enabled(),
         ..GatewayDaemonConfig::default()
     };
     let socket = config.socket_path.display().to_string();

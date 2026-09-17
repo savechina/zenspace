@@ -1067,6 +1067,7 @@ mod tests {
                             serde_json::json!({
                                 "serverVersion": "scripted",
                                 "storeHealth": "ok",
+                                "scheduler": false,
                             }),
                         ),
                         other => Frame::error_response(

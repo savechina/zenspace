@@ -245,6 +245,13 @@ pub struct GatewayDaemonConfig {
     /// Hosted-turn executor override (P4 in-process isomorphic testing,
     /// design P4): `None` builds the real orchestrator stack.
     pub turn_executor: Option<std::sync::Arc<dyn crate::server::hosting::TurnExecutor>>,
+    /// Whether this gateway process hosts a `ZenScheduler` (16-worker
+    /// cron scheduler). Surfaces on `health/status.scheduler` so the TUI
+    /// can avoid double-spawning its own in-app scheduler when an
+    /// explicit `zen serve start` (scheduler on) is already running.
+    /// Default `false` — implicit daemons (`default_spawn`,
+    /// `ZEN_SERVE_NO_SCHEDULER=1`) never host the scheduler.
+    pub scheduler_hosted: bool,
 }
 
 impl Default for GatewayDaemonConfig {
@@ -261,6 +268,7 @@ impl Default for GatewayDaemonConfig {
             http: None,
             qqbot: None,
             turn_executor: None,
+            scheduler_hosted: false,
         }
     }
 }
@@ -299,6 +307,7 @@ pub struct GatewayService {
     /// compression pass never suppresses the 30s replay cadence).
     compress_running: Arc<std::sync::atomic::AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
+    scheduler_hosted: bool,
     _claim: SoleOwnerClaim,
 }
 
@@ -449,8 +458,22 @@ impl GatewayService {
             replay_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compress_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_tx,
+            scheduler_hosted: config.scheduler_hosted,
             _claim: claim,
         })
+    }
+
+    /// Marks this gateway as hosting a `ZenScheduler`, surfacing
+    /// `scheduler: true` on `health/status` so the TUI coexistence
+    /// guard can skip its own in-app scheduler spawn.
+    pub fn with_scheduler_hosted(mut self, hosted: bool) -> Self {
+        self.scheduler_hosted = hosted;
+        self
+    }
+
+    /// Returns whether this gateway process hosts a `ZenScheduler`.
+    pub fn is_scheduler_hosted(&self) -> bool {
+        self.scheduler_hosted
     }
 
     /// Builds the hosted-turn executor exactly as `zen chat` does
@@ -713,6 +736,7 @@ impl GatewayService {
             "storeHealth": self.store_health().await,
             "activeTurns": self.hosting.turns.active_count(),
             "replay": self.replay_counters.snapshot(),
+            "scheduler": self.scheduler_hosted,
         });
         if self.mode == GatewayMode::Embedded {
             snapshot["mode"] = serde_json::json!("embedded");

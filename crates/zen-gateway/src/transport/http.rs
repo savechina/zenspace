@@ -306,6 +306,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "status": if service.store_health().await == "unavailable" { "degraded" } else { "healthy" },
         "version": env!("CARGO_PKG_VERSION"),
         "agents": service.agents_count().await,
+        "scheduler": service.is_scheduler_hosted(),
     }))
 }
 
