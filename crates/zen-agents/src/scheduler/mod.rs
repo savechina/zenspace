@@ -377,6 +377,15 @@ impl ZenScheduler {
         })
     }
 
+    /// Return the IDs of all registered workers (deterministic insertion order).
+    ///
+    /// Used as the test seam for profile-based worker-set assertions.
+    // Unit C will consume this accessor; scoped allow until then.
+    #[allow(dead_code)]
+    pub fn worker_ids(&self) -> Vec<String> {
+        self.workers.keys().cloned().collect()
+    }
+
     /// List all registered workers with their schedules and descriptions.
     pub fn list(&self) -> Vec<WorkerSummary> {
         self.workers
@@ -428,6 +437,44 @@ pub struct WorkerSummary {
     pub schedule: String,
     pub description: String,
     pub enabled: bool,
+}
+
+// ─── Scheduler profiles ────────────────────────────────────────────────
+
+/// Worker-set profile that controls which background workers a
+/// [`ZenScheduler`] registers.
+///
+/// Profiles let the same scheduler infrastructure serve two distinct
+/// hosting contexts without duplicating registration logic:
+///
+/// | Profile | Host | Workers | Rationale |
+/// |---------|------|---------|-----------|
+/// | `Full` | `zen serve start` daemon | All 16 | Daemon is the sole owner of the memvid store and the morning-brief outbox — needs every worker. |
+/// | `InApp` | TUI session (in-process) | 14 (excludes `memvid-indexer`, `morning-brief`) | The memvid indexer requires exclusive file-system flock held by the daemon; morning-brief stages to an outbox consumed by the daemon's `OutboxDrainer`. Running either in the TUI would race the daemon. |
+///
+/// Both profiles share identical cron schedules (from `CronConfig`), timezone
+/// wiring (`with_timezone`), and per-worker config gates (e.g.
+/// `[agentic.loop].enabled` for `zen-loop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SchedulerProfile {
+    /// Full daemon profile — all 16 background workers.
+    ///
+    /// Used by `zen serve start` where the process is the sole long-lived
+    /// owner of shared resources (memvid store, outbox drainer, git
+    /// work-tree).
+    Full,
+
+    /// In-app learning-core profile — 14 workers, excluding
+    /// `memvid-indexer` and `morning-brief`.
+    ///
+    /// Used by the TUI when hosting a lightweight in-process scheduler for
+    /// the learning-core pipeline. The two excluded workers are
+    /// daemon-exclusive:
+    /// - **`memvid-indexer`**: acquires an exclusive flock on the memvid
+    ///   store; the daemon already holds it.
+    /// - **`morning-brief`**: stages outbox files consumed by the daemon's
+    ///   `OutboxDrainer`; a TUI duplicate would create races.
+    InApp,
 }
 
 // ─── Convenience constructor ──────────────────────────────────────────
@@ -520,11 +567,19 @@ pub fn create_default_scheduler() -> ZenScheduler {
     scheduler
 }
 
-/// Create a [`ZenScheduler`] wired with `CronConfig` values for worker schedules.
+/// Create a [`ZenScheduler`] wired with `CronConfig` values for worker
+/// schedules, selecting the worker set via [`SchedulerProfile`].
 ///
 /// Uses `default_daily_log_schedule()` / `default_night_dream_schedule()` as
 /// fallbacks when config fields are `None`.
-pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
+///
+/// The two profiles share identical cron schedules, timezone wiring, and
+/// per-worker config gates — the only difference is which workers are
+/// registered (see [`SchedulerProfile`] docs for the exclusion rationale).
+pub fn create_configured_scheduler_with(
+    config: &CronConfig,
+    profile: SchedulerProfile,
+) -> ZenScheduler {
     let mut scheduler = ZenScheduler::new().with_timezone(config.timezone_or_default());
 
     let dl_schedule = config
@@ -585,7 +640,11 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
         warn!("scheduler: failed to register express worker: {e}");
     }
 
-    if let Err(e) = scheduler.register(MemvidIndexerWorker::new()) {
+    // Daemon-only: memvid-indexer holds an exclusive flock on the memvid
+    // store — the TUI must not race the daemon's instance.
+    if profile == SchedulerProfile::Full
+        && let Err(e) = scheduler.register(MemvidIndexerWorker::new())
+    {
         warn!("scheduler: failed to register memvid-indexer worker: {e}");
     }
 
@@ -593,21 +652,20 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
         warn!("scheduler: failed to register evidence-gatherer worker: {e}");
     }
 
-    // ── Proactive heartbeat (005-agentic-loop FR-038): 9am brief staged to
-    //    the qqbot outbox; nightly distillation stays with DreamWorker.
-    if let Err(e) = scheduler.register(MorningBriefWorker::new()) {
+    // Daemon-only: morning-brief stages outbox files consumed by the
+    // daemon's OutboxDrainer — a TUI duplicate would create races.
+    if profile == SchedulerProfile::Full
+        && let Err(e) = scheduler.register(MorningBriefWorker::new())
+    {
         warn!("scheduler: failed to register morning-brief worker: {e}");
     }
 
-    // ── RSI promotion routing (PD-04, PD-06 fusion): daily 4am, validated
-    //    hypotheses → Hybrid C promotion queue. Staging itself moved into
-    //    zen-loop stage 5d; the confirmations stay manual via discover CLI.
     if let Err(e) = scheduler.register(PromotionWorker::with_paths()) {
         warn!("scheduler: failed to register promotion worker: {e}");
     }
 
-    // ── Knowledge-processing loop (005-agentic-loop): interval + enabled
-    //    come from [agentic.loop]; disabled → manual-only (`zen wiki loop run`).
+    // Knowledge-processing loop: interval + enabled come from
+    // [agentic.loop]; disabled → manual-only (`zen wiki loop run`).
     if let Ok(config) = zen_core::config::load_config() {
         let loop_cfg = &config.agentic.loop_cfg;
         let mut loop_worker = ZenLoopWorker::new().with_schedule(loop_cfg.interval_or_default());
@@ -620,6 +678,15 @@ pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
     }
 
     scheduler
+}
+
+/// Create a [`ZenScheduler`] wired with `CronConfig` values for worker schedules.
+///
+/// Convenience wrapper around [`create_configured_scheduler_with`] with
+/// [`SchedulerProfile::Full`] — all 16 workers registered. Existing call
+/// sites (TUI, serve command) use this entry point.
+pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
+    create_configured_scheduler_with(config, SchedulerProfile::Full)
 }
 
 #[cfg(test)]
@@ -841,6 +908,132 @@ mod tests {
             assert!(
                 items.iter().any(|w| w.id == id),
                 "configured scheduler missing worker '{id}'"
+            );
+        }
+    }
+
+    // ── SchedulerProfile tests ─────────────────────────────────────────
+
+    /// Expected worker IDs for each profile.
+    const FULL_WORKERS: &[&str] = &[
+        "memory-curator",
+        "subconscious",
+        "dream",
+        "session-journaler",
+        "notion-extractor",
+        "wiki-compiler",
+        "commitment-tracker",
+        "reflection-worker",
+        "wisdom-synth",
+        "decision-tracker",
+        "express",
+        "memvid-indexer",
+        "evidence-gatherer",
+        "morning-brief",
+        "promotion",
+        "zen-loop",
+    ];
+
+    const INAPP_WORKERS: &[&str] = &[
+        "memory-curator",
+        "subconscious",
+        "dream",
+        "session-journaler",
+        "notion-extractor",
+        "wiki-compiler",
+        "commitment-tracker",
+        "reflection-worker",
+        "wisdom-synth",
+        "decision-tracker",
+        "express",
+        "evidence-gatherer",
+        "promotion",
+        "zen-loop",
+    ];
+
+    #[test]
+    fn test_full_profile_has_all_16_workers() {
+        let scheduler =
+            create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::Full);
+        let ids = scheduler.worker_ids();
+        assert_eq!(ids.len(), 16, "Full profile must register 16 workers");
+        for expected in FULL_WORKERS {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "Full profile missing worker '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inapp_profile_has_14_workers() {
+        let scheduler =
+            create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::InApp);
+        let ids = scheduler.worker_ids();
+
+        // Exactly 14 workers (zen-loop may or may not register depending on
+        // load_config; assert >= 14 to handle the config-gated edge).
+        assert!(
+            ids.len() >= 14,
+            "InApp profile must register at least 14 workers, got {}",
+            ids.len()
+        );
+
+        // Inclusion: all 14 expected workers present.
+        for expected in INAPP_WORKERS {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "InApp profile missing worker '{expected}'"
+            );
+        }
+
+        // Exclusion: daemon-only workers must NOT be present.
+        assert!(
+            !ids.contains(&"memvid-indexer".to_string()),
+            "InApp profile must NOT include 'memvid-indexer' (daemon flock)"
+        );
+        assert!(
+            !ids.contains(&"morning-brief".to_string()),
+            "InApp profile must NOT include 'morning-brief' (daemon outbox drainer)"
+        );
+    }
+
+    #[test]
+    fn test_create_configured_scheduler_delegates_to_full() {
+        let scheduler = create_configured_scheduler(&CronConfig::default());
+        let ids = scheduler.worker_ids();
+        assert!(
+            ids.contains(&"memvid-indexer".to_string()),
+            "create_configured_scheduler must include memvid-indexer (Full profile)"
+        );
+        assert!(
+            ids.contains(&"morning-brief".to_string()),
+            "create_configured_scheduler must include morning-brief (Full profile)"
+        );
+    }
+
+    #[test]
+    fn test_inapp_profiles_same_cron_schedules_as_full() {
+        let full = create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::Full);
+        let inapp =
+            create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::InApp);
+
+        let full_map: std::collections::HashMap<_, _> = full
+            .list()
+            .into_iter()
+            .map(|w| (w.id.clone(), w.schedule))
+            .collect();
+        let inapp_map: std::collections::HashMap<_, _> = inapp
+            .list()
+            .into_iter()
+            .map(|w| (w.id.clone(), w.schedule))
+            .collect();
+
+        for (id, schedule) in &inapp_map {
+            assert_eq!(
+                full_map.get(id).map(String::as_str),
+                Some(schedule.as_str()),
+                "InApp worker '{id}' has a different cron schedule than Full"
             );
         }
     }
