@@ -374,18 +374,17 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
 
     if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
         let text = app.input.lines().join("\n");
-        let is_single_line = !text.contains('\n');
         let is_empty = text.trim().is_empty();
-        app.input.input(Input {
-            key: Key::Enter,
-            ctrl: false,
-            alt: false,
-            shift: false,
-        });
-        if is_single_line && !is_empty {
-            return InlineKeyAction::Submit;
+        if is_empty {
+            app.input.input(Input {
+                key: Key::Enter,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+            return InlineKeyAction::Continue;
         }
-        return InlineKeyAction::Continue;
+        return InlineKeyAction::Submit;
     }
 
     if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -811,5 +810,33 @@ mod tests {
             text.contains("line1") && text.contains("line2"),
             "Ctrl+D at line end must join lines: got {text}"
         );
+    }
+
+    // === Multi-line Enter submit (FIX 1) ===
+
+    #[test]
+    fn enter_submits_multiline_buffer() {
+        let mut app = test_app();
+        app.input.insert_str("hello\nworld");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+    }
+
+    #[test]
+    fn enter_submits_multiline_with_trailing_slash_command() {
+        let mut app = test_app();
+        app.input.insert_str("hello\n/exit");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+    }
+
+    #[test]
+    fn enter_submit_multiline_does_not_insert_newline() {
+        let mut app = test_app();
+        app.input.insert_str("line1\nline2");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+        // Buffer must still be exactly the original text (no extra newline inserted)
+        assert_eq!(app.input.lines().join("\n"), "line1\nline2");
     }
 }
