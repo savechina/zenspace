@@ -434,6 +434,11 @@ pub struct CronConfig {
     /// If a worker's cumulative cost exceeds this cap, it skips execution
     /// until the next monthly reset. Default: 10.0 (sane for personal use).
     pub llm_cost_cap_usd: Option<f64>,
+    /// In-app (TUI-hosted) scheduler kill switch. When true, the TUI
+    /// spawns the learning-core worker subset for its lifetime; when
+    /// false, learning runs only under an explicit `zen serve start`.
+    /// Default: true.
+    pub tui_scheduler: Option<bool>,
 }
 
 /// Agentic module sections — `[agentic.*]` (005-agentic-loop).
@@ -1462,6 +1467,7 @@ impl Default for CronConfig {
             wisdom_synthesis_schedule: Some("0 0 2 * * 7".into()),
             fresh_eyes_mode: Some(false),
             llm_cost_cap_usd: Some(10.0),
+            tui_scheduler: Some(true),
         }
     }
 }
@@ -1874,6 +1880,7 @@ fn merge_cron(base: CronConfig, ov: CronConfig) -> CronConfig {
         ),
         fresh_eyes_mode: ov.fresh_eyes_mode.or(base.fresh_eyes_mode),
         llm_cost_cap_usd: ov.llm_cost_cap_usd.or(base.llm_cost_cap_usd),
+        tui_scheduler: ov.tui_scheduler.or(base.tui_scheduler),
     }
 }
 
@@ -2151,6 +2158,9 @@ fn apply_cron_env(cron: &mut CronConfig) {
     if let Some(v) = env_str("ZEN_CRON_WISDOM_SYNTHESIS") {
         cron.wisdom_synthesis_schedule = Some(v);
     }
+    if let Some(v) = env_bool("ZEN_TUI_SCHEDULER") {
+        cron.tui_scheduler = Some(v);
+    }
 }
 
 fn apply_plugin_env(plugin: &mut PluginConfig) {
@@ -2392,6 +2402,21 @@ impl CronConfig {
     pub fn daily_log_schedule(&self) -> Option<String> {
         self.subconscious_interval_minutes
             .map(|mins| format!("0 */{mins} * * * *"))
+    }
+
+    /// In-app (TUI-hosted) scheduler gate.
+    ///
+    /// Scope logic:
+    /// - Functionality: lets the TUI spawn the learning-core worker
+    ///   subset for the app's lifetime, no daemon required
+    /// - User impact: false disables all background learning outside an
+    ///   explicit `zen serve start`
+    /// - Default: true (background learning while the app is in use)
+    /// - Interaction: independent of the daemon's own scheduler gate
+    ///   (`ZEN_SERVE_NO_SCHEDULER`); coexistence arbitration is the
+    ///   TUI's job (health/status `scheduler` probe)
+    pub fn tui_scheduler_or_default(&self) -> bool {
+        self.tui_scheduler.unwrap_or(true)
     }
 
     /// Generate a cron expression for the dream (nightly consolidation) worker.
