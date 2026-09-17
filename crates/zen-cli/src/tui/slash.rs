@@ -185,7 +185,8 @@ impl SlashState {
     }
 
     pub fn on_input_change(&mut self, input: &str, registry: &SlashCommandRegistry) {
-        if let Some(stripped) = input.strip_prefix('/') {
+        let trimmed = input.trim_start();
+        if let Some(stripped) = trimmed.strip_prefix('/') {
             let has_space = stripped.contains(' ');
             if has_space {
                 self.visible = false;
@@ -196,7 +197,8 @@ impl SlashState {
             self.filter = token.to_lowercase();
             self.recompute_filtered(registry);
             self.selected = 0;
-            self.visible = !self.filtered_indices.is_empty();
+            // UX4: keep popup visible when filter is non-empty (show "no matches")
+            self.visible = !self.filter.is_empty() || !self.filtered_indices.is_empty();
         } else {
             self.visible = false;
         }
@@ -275,7 +277,7 @@ pub fn render_slash_popup(
     theme: &dyn OutputTheme,
     registry: &SlashCommandRegistry,
 ) {
-    if !state.visible || state.filtered_indices.is_empty() {
+    if !state.visible {
         return;
     }
 
@@ -300,7 +302,7 @@ pub fn render_slash_popup_inline(
     theme: &dyn OutputTheme,
     registry: &SlashCommandRegistry,
 ) {
-    if !state.visible || state.filtered_indices.is_empty() {
+    if !state.visible {
         return;
     }
     let max_rows = (popup_area.height as usize).clamp(1, INLINE_POPUP_ROWS);
@@ -318,20 +320,38 @@ fn render_slash_popup_inner(
     frame.render_widget(ratatui::widgets::Clear, popup_area);
 
     let bg_color = theme.bg();
-    let visible_count = state.filtered_indices.len().min(max_rows);
+    let row_bg = Style::default().bg(bg_color);
+
+    // UX4: when filter is non-empty but no matches, show "no matches" row
+    if state.filtered_indices.is_empty() && !state.filter.is_empty() {
+        let no_match_line = Line::from(vec![Span::styled(
+            "  no matches",
+            theme
+                .text_muted()
+                .add_modifier(Modifier::ITALIC)
+                .patch(row_bg),
+        )]);
+        let row_area = ratatui::layout::Rect::new(popup_area.x, popup_area.y, popup_area.width, 1);
+        frame.render_widget(ratatui::widgets::Paragraph::new(no_match_line), row_area);
+        return;
+    }
+
+    let total = state.filtered_indices.len();
+    let visible_count = total.min(max_rows);
     let start = if state.selected >= max_rows {
         state.selected - max_rows + 1
     } else {
         0
     };
+    // UX5: scroll indicators
+    let has_items_above = start > 0;
+    let has_items_below = start + visible_count < total;
 
     let selected_style = Style::default()
         .fg(theme.info_accent())
         .add_modifier(Modifier::BOLD);
     let unselected_style = Style::default();
     let desc_style = theme.text_muted();
-    let row_bg = Style::default().bg(bg_color);
-
     for (row, &cmd_idx) in state.filtered_indices[start..start + visible_count]
         .iter()
         .enumerate()
@@ -366,6 +386,15 @@ fn render_slash_popup_inner(
             desc_style.patch(row_bg),
         ));
 
+        // UX5: append scroll indicator to first/last rendered row
+        if row == 0 && has_items_above {
+            spans.push(Span::styled("  ▲", desc_style.patch(row_bg)));
+        }
+        let is_last_rendered = row + 1 == visible_count;
+        if is_last_rendered && has_items_below {
+            spans.push(Span::styled("  ▼", desc_style.patch(row_bg)));
+        }
+
         let line = Line::from(spans);
 
         if row as u16 >= popup_area.height {
@@ -378,5 +407,278 @@ fn render_slash_popup_inner(
             1,
         );
         frame.render_widget(ratatui::widgets::Paragraph::new(line), row_area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === UX4: No-matches empty state ===
+
+    #[test]
+    fn filter_no_matches_keeps_popup_visible_with_message() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("help".to_string(), vec![], "Show help".to_string());
+        let mut state = SlashState::new();
+        state.on_input_change("/zzz", &registry);
+        assert!(
+            state.visible,
+            "popup must stay visible for non-empty filter"
+        );
+        assert!(state.filtered_indices.is_empty(), "no matches expected");
+        assert_eq!(state.filter, "zzz");
+    }
+
+    #[test]
+    fn filter_empty_matches_all() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("help".to_string(), vec![], "Show help".to_string());
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        assert!(state.visible, "popup visible for empty prefix");
+        assert!(
+            !state.filtered_indices.is_empty(),
+            "all commands match empty prefix"
+        );
+    }
+
+    #[test]
+    fn move_up_down_on_empty_filtered_no_panic() {
+        let registry = SlashCommandRegistry::new();
+        let mut state = SlashState::new();
+        state.on_input_change("/zzz", &registry);
+        assert!(state.filtered_indices.is_empty());
+        // Must not panic
+        state.move_up();
+        state.move_down();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn selected_command_on_empty_filtered_returns_none() {
+        let registry = SlashCommandRegistry::new();
+        let mut state = SlashState::new();
+        state.on_input_change("/zzz", &registry);
+        assert!(state.selected_command(&registry).is_none());
+    }
+
+    #[test]
+    fn render_no_matches_shows_popup_with_message() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("help".to_string(), vec![], "Show help".to_string());
+        let mut state = SlashState::new();
+        state.on_input_change("/zzz", &registry);
+        assert!(state.visible);
+
+        let backend = TestBackend::new(60, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 4);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+        let first_row = row_text(0);
+        assert!(
+            first_row.contains("no matches"),
+            "popup must show 'no matches' row: {first_row:?}"
+        );
+    }
+
+    // === UX5: Scroll indicators ===
+
+    #[test]
+    fn scroll_indicators_mid_list_shows_both() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut registry = SlashCommandRegistry::new();
+        // Register 10 commands so we can scroll
+        for i in 0..10 {
+            registry.register(format!("cmd{}", i), vec![], format!("Command {}", i));
+        }
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        // Select item 5 out of 10 — mid-list with max_rows=4
+        state.selected = 5;
+
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 6);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+
+        // First row should have ▲ (scrolled down from top)
+        let first = row_text(0);
+        assert!(
+            first.contains("▲"),
+            "first row must show ▲ when scrolled: {first:?}"
+        );
+        // Last row should have ▼ (not at bottom)
+        let last = row_text(3);
+        assert!(
+            last.contains("▼"),
+            "last row must show ▼ when not at bottom: {last:?}"
+        );
+    }
+
+    #[test]
+    fn scroll_indicators_at_top_no_up_arrow() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut registry = SlashCommandRegistry::new();
+        for i in 0..10 {
+            registry.register(format!("cmd{}", i), vec![], format!("Command {}", i));
+        }
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        state.selected = 0; // at top
+
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 6);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+
+        let first = row_text(0);
+        assert!(
+            !first.contains("▲"),
+            "first row must NOT show ▲ at top: {first:?}"
+        );
+        let last = row_text(3);
+        assert!(
+            last.contains("▼"),
+            "last row must show ▼ when not at bottom: {last:?}"
+        );
+    }
+
+    #[test]
+    fn scroll_indicators_at_bottom_no_down_arrow() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut registry = SlashCommandRegistry::new();
+        for i in 0..6 {
+            registry.register(format!("cmd{}", i), vec![], format!("Command {}", i));
+        }
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        state.selected = 5; // last item
+
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 60, 6);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+
+        let first = row_text(0);
+        assert!(
+            first.contains("▲"),
+            "first row must show ▲ when scrolled: {first:?}"
+        );
+        let last = row_text(3);
+        assert!(
+            !last.contains("▼"),
+            "last row must NOT show ▼ at bottom: {last:?}"
+        );
+    }
+
+    // === Multi-line slash command popup (FIX 2) ===
+
+    #[test]
+    fn on_input_change_leading_newline_before_slash_shows_popup() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("exit".to_string(), vec![], "Exit TUI".to_string());
+        let mut state = SlashState::new();
+        // Buffer with leading blank line then /ex — trim_start strips the newline
+        state.on_input_change("\n/ex", &registry);
+        assert!(
+            state.visible,
+            "popup must show for buffer whose trim_start begins with /"
+        );
+        assert_eq!(state.filter, "ex");
+    }
+
+    #[test]
+    fn on_input_change_leading_newline_slash_empty_filter_shows_all() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("exit".to_string(), vec![], "Exit TUI".to_string());
+        let mut state = SlashState::new();
+        state.on_input_change("\n/", &registry);
+        assert!(
+            state.visible,
+            "popup must show for \n/ (bare slash after newline)"
+        );
+        assert!(
+            !state.filtered_indices.is_empty(),
+            "all commands match empty prefix"
+        );
+    }
+
+    #[test]
+    fn on_input_change_text_before_slash_hides_popup() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("exit".to_string(), vec![], "Exit TUI".to_string());
+        let mut state = SlashState::new();
+        // "hello" before the / means trim_start still starts with 'h', not '/'
+        state.on_input_change("hello\n/exit", &registry);
+        assert!(
+            !state.visible,
+            "popup must hide when text precedes the slash"
+        );
     }
 }

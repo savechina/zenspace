@@ -210,6 +210,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             format!("{} tok", app.current_response_tokens),
             accent_fg,
         ));
+        if app.show_thinking {
+            spans.push(Span::styled(" | ", muted));
+            spans.push(Span::styled("🧠", Style::default().fg(info_accent)));
+        }
+        // D10: active-picker indicator
+        if app.slash_state.visible {
+            spans.push(Span::styled(" | ", muted));
+            spans.push(Span::styled(" /commands", Style::default().fg(info_accent)));
+        } else if app.session_picker.visible {
+            spans.push(Span::styled(" | ", muted));
+            spans.push(Span::styled(" sessions", Style::default().fg(info_accent)));
+        } else if app.model_picker.visible {
+            spans.push(Span::styled(" | ", muted));
+            spans.push(Span::styled(" models", Style::default().fg(info_accent)));
+        }
         if app.session_id.is_some() {
             spans.push(Span::styled(" | ", muted));
             spans.push(Span::styled(
@@ -582,6 +597,72 @@ mod tests {
         assert!(
             found_highlight,
             "footer must apply REVERSED|BOLD to matched chars"
+        );
+    }
+
+    /// D4 regression: footer shows brain icon when show_thinking is true,
+    /// absent when false (per Codex: absence, not dimmed icon).
+    #[test]
+    fn thinking_indicator_in_footer() {
+        let mut app = test_app();
+        app.show_thinking = true;
+        let buf = draw_ui(80, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("🧠"),
+            "footer must show brain icon when show_thinking=true: {footer:?}"
+        );
+
+        let mut app2 = test_app();
+        app2.show_thinking = false;
+        let buf2 = draw_ui(80, 8, &mut app2);
+        let footer2 = row_text(&buf2, 7);
+        assert!(
+            !footer2.contains("🧠"),
+            "footer must NOT show brain icon when show_thinking=false: {footer2:?}"
+        );
+    }
+
+    /// D10 regression: footer shows active picker indicator.
+    #[test]
+    fn active_picker_indicator_in_footer() {
+        // Slash popup active
+        let mut app = test_app();
+        app.slash_state.visible = true;
+        let buf = draw_ui(80, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("/commands"),
+            "footer must show /commands when slash popup visible: {footer:?}"
+        );
+
+        // Session picker active
+        let mut app2 = test_app();
+        app2.session_picker.visible = true;
+        let buf2 = draw_ui(80, 8, &mut app2);
+        let footer2 = row_text(&buf2, 7);
+        assert!(
+            footer2.contains("sessions"),
+            "footer must show sessions when session picker visible: {footer2:?}"
+        );
+
+        // Model picker active
+        let mut app3 = test_app();
+        app3.model_picker.visible = true;
+        let buf3 = draw_ui(80, 8, &mut app3);
+        let footer3 = row_text(&buf3, 7);
+        assert!(
+            footer3.contains("models"),
+            "footer must show models when model picker visible: {footer3:?}"
+        );
+
+        // No picker active
+        let mut app4 = test_app();
+        let buf4 = draw_ui(80, 8, &mut app4);
+        let footer4 = row_text(&buf4, 7);
+        assert!(
+            !footer4.contains("/commands"),
+            "footer must NOT show /commands when no picker visible: {footer4:?}"
         );
     }
 }
