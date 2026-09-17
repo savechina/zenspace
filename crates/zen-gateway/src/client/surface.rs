@@ -473,6 +473,22 @@ impl SurfaceClient {
         Ok(parsed)
     }
 
+    /// health/status probe — raw JSON snapshot (`serverVersion`,
+    /// `scheduler`, `storeHealth`, ...). The TUI's in-app scheduler gate
+    /// reads `scheduler: bool` to detect a daemon-hosted scheduler and
+    /// avoid double-spawning.
+    ///
+    /// # Errors
+    /// [`SurfaceError::Rpc`] on catalog errors;
+    /// [`SurfaceError::Offline`] when the link cannot be established.
+    pub async fn health_status(&self) -> Result<serde_json::Value, SurfaceError> {
+        let client = self.ensure_link().await?;
+        match client.request("health/status", serde_json::json!({})).await {
+            Ok(result) => Ok(result),
+            Err(e) => Err(self.classify(&client, e).await),
+        }
+    }
+
     /// session/turn with a client-minted turnId, the full turn budget,
     /// and reconnect-between-turns semantics: a dead link fails this
     /// turn as [`SurfaceError::Offline`] (banner-visible, FR-011/012)
