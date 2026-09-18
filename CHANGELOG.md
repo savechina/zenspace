@@ -191,7 +191,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **TUI inline-mode open-TODO sweep + multiline slash commands** (2026-09-17,
+- **Slash popup Codex parity — dropdown visuals + keyboard selection**
+  (2026-09-17, user-reported regression):
+  - Arrow keys now move the popup selection and the selection PERSISTS
+    (the Up/Down arms used to re-run `on_input_change` after every press,
+    resetting `selected` to 0 — arrows could never select anything), with
+    Codex wrap-around at both ends; `Ctrl+N`/`Ctrl+P` are aliases.
+  - `Enter` with a visible popup executes the SELECTED command (buffer is
+    rewritten to the full command and submitted); no-match filters still
+    submit the raw buffer. Esc keeps the typed text.
+  - Codex-style dropdown rendering: borderless rows, entire selected row in
+    Cyan+Bold (no glyph), unselected names normal with dim
+    aliases/descriptions, max 8 rows, and dynamic height that shrinks to the
+    filtered match count (min 1 for the "no matches" row). ADR-003 marked
+    Superseded accordingly.
+ (2026-09-17,
   TODOS D2/D4/D10/UX4/UX5 + review follow-up):
   - Scrollback insert errors no longer kill the REPL (D2): the in-loop and
     startup `insert_scrollback_queue` call sites log the error and defer the

@@ -294,48 +294,54 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         return InlineKeyAction::Continue;
     }
 
-    if key.code == KeyCode::Up && key.modifiers == KeyModifiers::NONE {
+    // A1: Up and Ctrl+P — slash popup navigation (wrap, no stomp)
+    if (key.code == KeyCode::Up && key.modifiers == KeyModifiers::NONE)
+        || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
         if app.slash_state.visible {
-            if app.slash_state.at_first() {
-                app.slash_state.dismiss();
+            app.slash_state.move_up();
+            return InlineKeyAction::Continue;
+        }
+        // Plain Up: history navigation; Ctrl+P without popup: no-op
+        if key.modifiers == KeyModifiers::NONE {
+            if app.should_navigate_history_up() {
                 app.history_up();
             } else {
-                app.slash_state.move_up();
+                app.input.input(Input {
+                    key: Key::Up,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
             }
-        } else if app.should_navigate_history_up() {
-            app.history_up();
-        } else {
-            app.input.input(Input {
-                key: Key::Up,
-                ctrl: false,
-                alt: false,
-                shift: false,
-            });
+            let input = app.input.lines().join("\n");
+            app.slash_state.on_input_change(&input, &app.slash_registry);
         }
-        let input = app.input.lines().join("\n");
-        app.slash_state.on_input_change(&input, &app.slash_registry);
         return InlineKeyAction::Continue;
     }
-    if key.code == KeyCode::Down && key.modifiers == KeyModifiers::NONE {
+    // A2: Down and Ctrl+N — slash popup navigation (wrap, no stomp)
+    if (key.code == KeyCode::Down && key.modifiers == KeyModifiers::NONE)
+        || (key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
         if app.slash_state.visible {
-            if app.slash_state.at_last() {
-                app.slash_state.dismiss();
+            app.slash_state.move_down();
+            return InlineKeyAction::Continue;
+        }
+        // Plain Down: history navigation; Ctrl+N without popup: no-op
+        if key.modifiers == KeyModifiers::NONE {
+            if app.should_navigate_history_down() {
                 app.history_down();
             } else {
-                app.slash_state.move_down();
+                app.input.input(Input {
+                    key: Key::Down,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
             }
-        } else if app.should_navigate_history_down() {
-            app.history_down();
-        } else {
-            app.input.input(Input {
-                key: Key::Down,
-                ctrl: false,
-                alt: false,
-                shift: false,
-            });
+            let input = app.input.lines().join("\n");
+            app.slash_state.on_input_change(&input, &app.slash_registry);
         }
-        let input = app.input.lines().join("\n");
-        app.slash_state.on_input_change(&input, &app.slash_registry);
         return InlineKeyAction::Continue;
     }
 
@@ -353,12 +359,6 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         return InlineKeyAction::Continue;
     }
     if key.code == KeyCode::PageDown {
-        return InlineKeyAction::Continue;
-    }
-    if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return InlineKeyAction::Continue;
-    }
-    if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::CONTROL) {
         return InlineKeyAction::Continue;
     }
 
@@ -383,6 +383,17 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                 shift: false,
             });
             return InlineKeyAction::Continue;
+        }
+        // A4: Execute selected slash command on Enter
+        if app.slash_state.visible
+            && let Some(cmd) = app.slash_state.selected_command(&app.slash_registry)
+        {
+            let text = format!("/{}", cmd);
+            app.input.select_all();
+            app.input.cut();
+            app.input.insert_str(&text);
+            app.slash_state.dismiss();
+            return InlineKeyAction::Submit;
         }
         return InlineKeyAction::Submit;
     }
@@ -437,6 +448,77 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> InlineKeyAction {
         handle_key(KeyEvent::new(code, modifiers), app)
+    }
+
+    /// Slash popup: Down moves the selection and it PERSISTS (regression —
+    /// the old code re-ran on_input_change after every arrow press, stomping
+    /// selected back to 0, so arrows could never select).
+    #[test]
+    fn slash_popup_arrow_keys_move_selection_and_persist() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(app.slash_state.visible, "popup visible for /");
+        assert_eq!(app.slash_state.selected, 0);
+        let len = app.slash_state.filtered_indices.len();
+        assert!(len > 1, "registry must have multiple commands");
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.slash_state.selected, 1, "Down must move and persist");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.slash_state.selected, 2);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.slash_state.selected, 1, "Up must move and persist");
+
+        // Codex semantics: wrap at both ends.
+        app.slash_state.selected = len - 1;
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.slash_state.selected, 0, "Down wraps to first");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.slash_state.selected, len - 1, "Up wraps to last");
+    }
+
+    /// Ctrl+N / Ctrl+P are popup-navigation aliases (Codex parity).
+    #[test]
+    fn slash_popup_ctrl_n_ctrl_p_move_selection() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert_eq!(app.slash_state.selected, 1);
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(app.slash_state.selected, 0);
+    }
+
+    /// Enter with a visible popup executes the SELECTED command (Codex
+    /// semantics) — the buffer is rewritten to the full command and submitted.
+    #[test]
+    fn slash_popup_enter_executes_selected_command() {
+        let mut app = test_app();
+        for c in "/exi".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.slash_state.visible);
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "/exit",
+            "Enter must execute the selected command"
+        );
+    }
+
+    /// Enter with a visible but empty popup falls through: raw buffer is
+    /// submitted unchanged (handle_command reports the unknown command).
+    #[test]
+    fn slash_popup_enter_no_match_submits_raw_buffer() {
+        let mut app = test_app();
+        for c in "/zzz".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.slash_state.visible);
+        assert!(app.slash_state.filtered_indices.is_empty());
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+        assert_eq!(app.input.lines().join("\n"), "/zzz");
     }
 
     #[test]

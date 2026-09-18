@@ -10,7 +10,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 const INPUT_HEIGHT: u16 = 3;
 const FOOTER_HEIGHT: u16 = 1;
-const POPUP_HEIGHT: u16 = 4;
+const POPUP_HEIGHT: u16 = 8;
 const MIN_TAIL_HEIGHT: u16 = 2;
 const MAX_TAIL_HEIGHT: u16 = 4;
 
@@ -42,7 +42,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let toast_height = if toast.is_some() { 1 } else { 0 };
     let fixed_rows = INPUT_HEIGHT + FOOTER_HEIGHT + toast_height;
     let popup_height = if any_picker {
-        POPUP_HEIGHT.min(area_height.saturating_sub(fixed_rows))
+        let max_h = if app.slash_state.visible {
+            let count = app.slash_state.filtered_indices.len();
+            if count == 0 {
+                1u16
+            } else {
+                (count as u16).min(8)
+            }
+        } else {
+            POPUP_HEIGHT
+        };
+        max_h.min(area_height.saturating_sub(fixed_rows))
     } else {
         0
     };
@@ -360,11 +370,11 @@ mod tests {
         app.slash_state.selected = 0;
         let buf = draw_ui(60, 8, &mut app);
 
-        // Popup renders at top; first row shows the selected command.
+        // Popup renders above input; first command row shows the selected command.
         assert!(
-            row_text(&buf, 0).contains("\u{25b8}"),
-            "popup first row must render command selector: {:?}",
-            row_text(&buf, 0)
+            row_text(&buf, 1).contains("/"),
+            "popup row: {:?}",
+            row_text(&buf, 1)
         );
         // Input box keeps its full 3 rows directly below the popup.
         assert!(
@@ -382,6 +392,44 @@ mod tests {
         assert!(row_text(&buf, 7).contains("Zen"), "footer must survive");
     }
 
+    /// Codex parity: the slash popup height is dynamic — it shrinks to the
+    /// filtered match count (min 1 for the "no matches" row) instead of
+    /// always reserving the full POPUP_HEIGHT.
+    #[test]
+    fn slash_popup_height_is_dynamic() {
+        // 1 match → 1 popup row: filler above stays empty.
+        let mut app = test_app();
+        app.slash_state.visible = true;
+        app.slash_state.filtered_indices = vec![0];
+        let buf = draw_ui(60, 12, &mut app);
+        assert!(
+            row_text(&buf, 7).contains("/"),
+            "single match occupies the row above the input: {:?}",
+            row_text(&buf, 7)
+        );
+        assert!(
+            row_text(&buf, 0).trim().is_empty(),
+            "no popup rows above a 1-row popup: {:?}",
+            row_text(&buf, 0)
+        );
+
+        // 18 matches → full 8-row window starting at the top.
+        let mut app2 = test_app();
+        app2.slash_state.visible = true;
+        app2.slash_state.filtered_indices = (0..18).collect();
+        let buf2 = draw_ui(60, 12, &mut app2);
+        assert!(
+            row_text(&buf2, 0).contains("/"),
+            "8-row popup reaches the top of a 12-row viewport: {:?}",
+            row_text(&buf2, 0)
+        );
+        assert!(
+            row_text(&buf2, 7).contains("/"),
+            "popup bottom still sits directly above the input: {:?}",
+            row_text(&buf2, 7)
+        );
+    }
+
     /// The popup shrinks on small viewports instead of squeezing the input.
     #[test]
     fn popup_shrinks_in_small_viewport() {
@@ -391,8 +439,8 @@ mod tests {
         app.slash_state.selected = 0;
         let buf = draw_ui(60, 6, &mut app);
 
-        // popup = min(4, 6 - 3 - 1) = 2 rows; input + footer intact below.
-        assert!(row_text(&buf, 0).contains("\u{25b8}"));
+        // popup = min(3, 6 - 3 - 1) = 2 rows; input + footer intact below.
+        assert!(row_text(&buf, 0).contains("/"));
         assert!(
             row_text(&buf, 2).contains("Input"),
             "input must start right under the shrunken popup: {:?}",
@@ -412,9 +460,9 @@ mod tests {
         let buf = draw_ui(60, 12, &mut app);
 
         assert!(
-            row_text(&buf, 4).contains("\u{25b8}"),
-            "popup must start at row 4 (filler 0..4): {:?}",
-            row_text(&buf, 4)
+            row_text(&buf, 5).contains("/"),
+            "popup must start at row 5 (filler 0..5): {:?}",
+            row_text(&buf, 5)
         );
         assert!(
             row_text(&buf, 8).contains("Input"),
@@ -422,7 +470,7 @@ mod tests {
             row_text(&buf, 8)
         );
         assert!(row_text(&buf, 11).contains("Zen"));
-        for y in 0..4u16 {
+        for y in 0..5u16 {
             assert_eq!(row_text(&buf, y), "", "filler rows must stay blank");
         }
     }
