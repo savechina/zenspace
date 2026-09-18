@@ -201,9 +201,11 @@ fn e3_inline_slash_popup_keeps_input() {
     let mut tui = Tui::spawn(&[]);
     tui.wait_for("Input (Enter=send", "composer ready");
     tui.send(b"/");
-    tui.wait_for("▸ /help", "slash popup");
+    // Codex-parity popup (ADR-003 superseded): no glyph — rows render as
+    // "/help (/h)  description"; the alias-paren form is popup-only text.
+    tui.wait_for("/help (/h)", "slash popup");
     tui.wait_for("Input (Enter=send", "composer intact under popup");
-    tui.send(b"\x1b"); // Esc dismisses
+    tui.send(b"\x1b"); // Esc dismisses (keeps the typed text — Codex behavior)
 }
 
 /// E4 (SC-006): a local slash command flows through the real Enter path and
@@ -254,7 +256,8 @@ fn e7_fullscreen_slash_popup_keeps_input() {
     let mut tui = Tui::spawn(&[("ZEN_TUI_FULLSCREEN", "1")]);
     tui.wait_for("Zen Agentic TUI", "fullscreen ready");
     tui.send(b"/");
-    tui.wait_for("▸ /help", "fullscreen slash popup");
+    // Codex-parity popup: no glyph — alias-paren form is popup-only text.
+    tui.wait_for("/help (/h)", "fullscreen slash popup");
     // The composer still shows the typed slash.
     tui.wait_for("/", "composer visible under popup");
     tui.send(b"\x1b");
@@ -263,6 +266,9 @@ fn e7_fullscreen_slash_popup_keeps_input() {
     // Alt+<byte> (that is how terminals encode Alt), which would swallow
     // both keys.
     std::thread::sleep(Duration::from_millis(400));
+    // Esc kept the "/" (Codex behavior) — Ctrl+D on a non-empty buffer
+    // deletes a char instead of quitting, so clear the line first.
+    tui.send(b"\x15"); // Ctrl+U — clear line
     tui.send(b"\x04");
     tui.wait_exit();
 }
@@ -281,6 +287,9 @@ fn e8_inline_survives_resize() {
     tui.resize(ROWS, COLS); // restore
     tui.send(b"still-alive");
     tui.wait_for("still-alive", "input accepted after resizes");
+    // Ctrl+D is conditional (empty input quits, non-empty deletes forward),
+    // so clear the line before quitting.
+    tui.send(b"\x15"); // Ctrl+U — clear line
     tui.send(b"\x04");
     tui.wait_exit();
 }
@@ -417,8 +426,10 @@ fn e13_echo_streaming_commits_blocks_without_duplication() {
 }
 
 /// E14 (streaming E2E, `ZEN_TEST_ECHO_LLM=1`): `/thinking` toggles reasoning
-/// visibility. With thinking enabled before the turn, the echo script's
-/// `<think>` block renders into native scrollback.
+/// visibility. With thinking enabled before the turn, the W3 collapsed-thinking
+/// display (Codex pattern) commits the `✓ Thought for Ns` summary — full
+/// reasoning NEVER pollutes the transcript (it shows only as a live tail
+/// while the think block is still streaming).
 #[test]
 #[ignore]
 fn e14_echo_streaming_thinking_toggle_surfaces_reasoning() {
@@ -428,8 +439,35 @@ fn e14_echo_streaming_thinking_toggle_surfaces_reasoning() {
     std::thread::sleep(Duration::from_millis(300)); // let the toggle ack render
     tui.send(b"hello echo\r");
 
-    tui.wait_for("understand the user", "reasoning visible in scrollback");
+    tui.wait_for("Thought for", "collapsed thinking summary in scrollback");
     tui.wait_for("A paragraph with", "committed paragraph in scrollback");
+    let screen = tui.screen();
+    assert!(
+        !screen.contains("understand the user"),
+        "W3: full reasoning must stay collapsed out of the transcript:\n{screen}"
+    );
     tui.send(b"\x04");
     tui.wait_exit();
+}
+
+/// E15 (popup nav, Codex parity — regression for the 2026-09-17 user report):
+/// Up/Down move the popup selection and Enter executes the SELECTED command.
+/// "/" + Down selects `/exit` (row 2), so Enter must quit the app — if the
+/// selection were stuck on row 1, /help would print and the app would stay
+/// alive (the old selected-reset-to-0 stomp bug).
+#[test]
+#[ignore]
+fn e15_inline_slash_popup_arrow_select_and_enter_executes() {
+    let mut tui = Tui::spawn(&[]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+    tui.send(b"/");
+    tui.wait_for("/help (/h)", "slash popup open");
+    tui.send(b"\x1b[B"); // Down — move selection to /exit
+    std::thread::sleep(Duration::from_millis(200));
+    tui.send(b"\r"); // Enter — execute the selected command
+    let status = tui.wait_exit();
+    assert!(
+        status.success(),
+        "slash-popup Enter should execute the selected /exit and quit, got {status}"
+    );
 }
