@@ -57,6 +57,15 @@ pub trait NotionsRepository {
 
     async fn insert_relationship(&self, req: &InsertRelationshipRequest<'_>) -> Result<()>;
 
+    async fn insert_relationship_temporal(
+        &self,
+        req: &InsertRelationshipRequest<'_>,
+    ) -> Result<usize>;
+
+    async fn invalidate_relationship(&self, id: &str, t_invalid: &str) -> Result<bool>;
+
+    async fn relationships_as_of(&self, ts: &str) -> Result<Vec<RelationRow>>;
+
     async fn load_known_notion_names(&self) -> Result<Vec<String>>;
 
     async fn load_all_entities(&self) -> Result<Vec<NotionRow>>;
@@ -99,6 +108,14 @@ pub trait NotionsRepository {
     ) -> Result<Option<ShortestPathResult>>;
 
     async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>>;
+
+    async fn personalized_pagerank(
+        &self,
+        seeds: &[String],
+        iterations: usize,
+        damping: f64,
+        restart: f64,
+    ) -> Result<Vec<PageRankResult>>;
 
     async fn connected_components(&self) -> Result<Vec<ComponentResult>>;
 

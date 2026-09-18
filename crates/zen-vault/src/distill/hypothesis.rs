@@ -429,6 +429,56 @@ pub fn generate_from_gaps(gaps: &[GapRecord]) -> Vec<HypothesisSlug> {
     out
 }
 
+/// Generate hypotheses enriched with failure history: per-gap-type stepping
+/// stones (DGM: do not repeat a falsified claim) and recent reflection
+/// guidance (Reflexion) are appended to each exploration prompt. Missing
+/// history is a no-op — behaviour matches [`generate_from_gaps`].
+pub fn generate_from_gaps_with_history(
+    gaps: &[GapRecord],
+    rejected_dir: &Path,
+    reflections_dir: &Path,
+) -> Vec<HypothesisSlug> {
+    let mut hypotheses = generate_from_gaps(gaps);
+    if hypotheses.is_empty() {
+        return hypotheses;
+    }
+    let rejected = super::archive::load_rejected(rejected_dir);
+    let guidance = super::reflection::recent_reflections(reflections_dir, 3);
+
+    for h in &mut hypotheses {
+        let mut block = String::new();
+        if let Some(gt) = gap_type(h.gap_kind) {
+            let stones: Vec<_> = rejected
+                .iter()
+                .filter(|r| r.claim.contains(gt))
+                .take(2)
+                .collect();
+            if !stones.is_empty() {
+                block.push_str("Prior failed attempts for this gap type (do not repeat):\n");
+                for stone in stones {
+                    block.push_str(&format!(
+                        "- {} — falsified by {} ({})\n",
+                        stone.claim, stone.falsifier, stone.because
+                    ));
+                }
+            }
+        }
+        if let Some(guidance_block) = super::reflection::render_reflection_block(&guidance) {
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str(&guidance_block);
+        }
+        if block.is_empty() {
+            continue;
+        }
+        let base = h.exploration_prompt.take().unwrap_or_default();
+        h.exploration_prompt = Some(format!("{base}\n\n{}", block.trim_end()));
+    }
+
+    hypotheses
+}
+
 // ─── Refinement queue ──────────────────────────────────────────────────
 
 /// Build a refinement queue from existing hypotheses.
@@ -1351,5 +1401,54 @@ mod tests {
 
         let loaded = load_all(&hypo_dir).unwrap();
         assert_eq!(loaded[0].status, HypothesisStatus::Rejected);
+    }
+
+    #[test]
+    fn generation_with_history_embeds_failures_and_is_noop_without_them() {
+        use crate::distill::types::{GapKind, GapRecord};
+
+        let gap = GapRecord::new(GapKind::OrphanEntity, "c1", "orphan: Foo").with_entity("Foo");
+        let dir = tempfile::TempDir::new().unwrap();
+        let rejected_dir = dir.path().join("rejected");
+        let reflections_dir = dir.path().join("reflections");
+
+        let plain = generate_from_gaps_with_history(
+            std::slice::from_ref(&gap),
+            &rejected_dir,
+            &reflections_dir,
+        );
+        let baseline = generate_from_gaps(std::slice::from_ref(&gap));
+        assert_eq!(
+            plain[0].exploration_prompt, baseline[0].exploration_prompt,
+            "no history ⇒ prompts match the plain generation path"
+        );
+
+        std::fs::create_dir_all(&rejected_dir).unwrap();
+        std::fs::write(
+            rejected_dir.join("orphan-foo.md"),
+            "---\nclaim: \"Gap 'orphan' detected: entity Foo unreachable\"\nfalsifier: \"missing wiki page for entity 'foo'\"\nbecause: \"reverify\"\nexpiry: \"2026-01-01\"\n---\n",
+        )
+        .unwrap();
+        crate::distill::reflection::record_reflection(
+            &reflections_dir,
+            &zen_memory::RejectedHypothesis {
+                claim: "Gap 'orphan' detected: entity Foo unreachable".to_string(),
+                falsifier: "missing wiki page for entity 'foo'".to_string(),
+                because: "reverify".to_string(),
+                expiry: "2026-01-01".to_string(),
+            },
+        )
+        .unwrap();
+
+        let enriched = generate_from_gaps_with_history(&[gap], &rejected_dir, &reflections_dir);
+        let prompt = enriched[0].exploration_prompt.as_deref().unwrap();
+        assert!(
+            prompt.contains("do not repeat"),
+            "stepping stones must be embedded: {prompt}"
+        );
+        assert!(
+            prompt.contains("Prior failed attempts"),
+            "reflection guidance must be embedded: {prompt}"
+        );
     }
 }

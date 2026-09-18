@@ -98,9 +98,18 @@ impl ZenWorker for DreamWorker {
                 "FR-035 correction recurrence scan complete"
             );
         }
+        // FR-035: high recurrence (>0.5 recurrence rate on any verified
+        // correction, i.e. high_recurrence > 0) boosts the loss-aversion
+        // guard for the decision quality gate until the next clean scan.
+        if corrections_high_recurrence > 0 {
+            write_loss_aversion_boost(&paths, corrections_high_recurrence, corrections_scanned);
+        } else if loss_aversion_boost_path(&paths).exists() {
+            let _ = std::fs::remove_file(loss_aversion_boost_path(&paths));
+        }
 
         // FR-036: aggregate tool call outcomes, flag tools with <70% success
         let sessions_dir = paths.sessions();
+        zen_vault::distill::prune_expired_sessions(&sessions_dir, 30);
         let tool_aggs = zen_vault::distill::aggregate_all_sessions(&sessions_dir);
         let tool_calls_flagged = tool_aggs
             .iter()
@@ -173,4 +182,64 @@ fn load_preferences(paths: &ZenPaths) -> anyhow::Result<Vec<zen_memory::Preferen
         }
     }
     Ok(preferences)
+}
+
+/// FR-035 loss-aversion boost marker lives at `logs/loss-aversion-boost.json`.
+pub(super) fn loss_aversion_boost_path(paths: &ZenPaths) -> std::path::PathBuf {
+    paths.logs().join("loss-aversion-boost.json")
+}
+
+/// Record the active boost; `updated_at` drives the 30-day freshness window.
+pub(super) fn write_loss_aversion_boost(paths: &ZenPaths, high: usize, scanned: usize) {
+    let payload = serde_json::json!({
+        "high_recurrence": high,
+        "scanned": scanned,
+        "updated_at": Utc::now().to_rfc3339(),
+    });
+    let target = loss_aversion_boost_path(paths);
+    let _ = std::fs::create_dir_all(paths.logs());
+    let _ = std::fs::write(&target, payload.to_string());
+}
+
+/// FR-035 boost is active while the marker exists and was written within
+/// the 30-day recurrence window; dream rewrites or removes it nightly.
+pub(super) fn loss_aversion_boost_active(paths: &ZenPaths) -> bool {
+    let Ok(raw) = std::fs::read_to_string(loss_aversion_boost_path(paths)) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    value["updated_at"]
+        .as_str()
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .is_some_and(|ts| (Utc::now() - ts.with_timezone(&Utc)).num_days() <= 30)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boost_marker_roundtrip_activates_and_expires() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+
+        assert!(!loss_aversion_boost_active(&paths));
+
+        write_loss_aversion_boost(&paths, 2, 5);
+        assert!(loss_aversion_boost_active(&paths));
+
+        let stale = serde_json::json!({
+            "high_recurrence": 1,
+            "scanned": 2,
+            "updated_at": (Utc::now() - chrono::Duration::days(31)).to_rfc3339(),
+        });
+        std::fs::write(loss_aversion_boost_path(&paths), stale.to_string())
+            .expect("write stale marker");
+        assert!(
+            !loss_aversion_boost_active(&paths),
+            "31-day-old marker is outside the FR-035 window"
+        );
+    }
 }

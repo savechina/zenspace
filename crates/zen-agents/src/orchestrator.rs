@@ -149,6 +149,77 @@ fn emit_memory_nudge_if_due(paths: &ZenPaths, user_turns: u64) {
     }
 }
 
+/// FR-034 correction markers (bilingual). Heuristic Tier-1 instrumentation:
+/// a turn matching any marker counts as correcting prior output.
+const CORRECTION_MARKERS: &[&str] = &[
+    "不对",
+    "错了",
+    "不是这样",
+    "纠正",
+    "说错了",
+    "搞错了",
+    "wrong",
+    "incorrect",
+    "not right",
+    "correction:",
+];
+
+fn is_user_correction(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    CORRECTION_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// FR-034 reward sidecar bookkeeping for one turn: `access_count` for every
+/// memory in context, plus `correction_count` when the turn corrects prior
+/// output while those memories were in context.
+fn increment_reward_for_query(paths: &ZenPaths, knowledge: &[RetrievedNote], user_query: &str) {
+    let reward_dir = paths.memory().join(".reward");
+    let correction = is_user_correction(user_query);
+    for note in knowledge {
+        let card_id = zen_vault::distill::card_id_from_path(&note.path);
+        if let Err(e) = zen_vault::distill::increment_access(&reward_dir, &card_id) {
+            debug!(error = %e, card_id, "FR-034 reward access increment failed");
+        }
+        if correction
+            && let Err(e) = zen_vault::distill::increment_corrections(&reward_dir, &card_id)
+        {
+            debug!(error = %e, card_id, "FR-034 reward correction increment failed");
+        }
+    }
+}
+
+/// FR-040: surface the nightly 3-line wake-up brief in M1 context once per
+/// date. Idempotent within a session because the note path carries the date.
+fn inject_wake_up_brief(paths: &ZenPaths, session: &mut SessionContext) -> bool {
+    let date = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let rel = format!("logs/wake-up-{date}.md");
+    if session.knowledge.iter().any(|n| n.path == rel) {
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(paths.logs().join(format!("wake-up-{date}.md"))) else {
+        return false;
+    };
+    let content = content.trim();
+    if content.is_empty() {
+        return false;
+    }
+    session.knowledge.insert(
+        0,
+        RetrievedNote {
+            path: rel,
+            content: content.to_string(),
+            sensitivity: Sensitivity::Private,
+            relevance: 0.35,
+        },
+    );
+    session.knowledge.truncate(M1_TOP_K);
+    info!("FR-040 wake-up brief injected into M1 context");
+    true
+}
+
 impl AgentOrchestrator {
     pub fn new(router: DefaultRouter) -> Self {
         let registry = crate::registry::DefaultAgentRegistry::new();
@@ -586,6 +657,9 @@ impl AgentOrchestrator {
     ) -> Result<AgentExecution> {
         let start = Instant::now();
         self.ensure_delegate_tool();
+        if let Ok(paths) = ZenPaths::detect() {
+            inject_wake_up_brief(&paths, session);
+        }
         self.inject_skill_hits(session, user_query);
         let (intent, llm_telemetry) = intent::classify(
             self.executor.router(),
@@ -617,15 +691,10 @@ impl AgentOrchestrator {
             crate::AgentContext::new(profile.clone(), user_query.to_string(), session.clone())
                 .with_preferences(profile.llm_preferences.clone());
 
-        // FR-034: increment reward sidecar access_count for each retrieved memory
+        // FR-034: reward sidecar bookkeeping for this turn (access, plus
+        // corrections when the user is correcting prior output).
         if let Ok(paths) = ZenPaths::detect() {
-            let reward_dir = paths.memory().join(".reward");
-            for note in &context.session.knowledge {
-                let card_id = zen_vault::distill::card_id_from_path(&note.path);
-                if let Err(e) = zen_vault::distill::increment_access(&reward_dir, &card_id) {
-                    debug!(error = %e, card_id, "FR-034 reward access increment failed");
-                }
-            }
+            increment_reward_for_query(&paths, &context.session.knowledge, user_query);
         }
 
         let estimated_tokens = user_query.len() / 4 + 512;
@@ -1268,6 +1337,9 @@ impl AgentOrchestrator {
     ) -> Result<String> {
         let _start = Instant::now();
         self.ensure_delegate_tool();
+        if let Ok(paths) = ZenPaths::detect() {
+            inject_wake_up_brief(&paths, session);
+        }
         self.inject_skill_hits(session, user_query);
         let (intent, llm_telemetry) = intent::classify(
             self.executor.router(),
@@ -1293,15 +1365,10 @@ impl AgentOrchestrator {
         self.wiring.set_sensitivity(session.sensitivity_policy);
         self.propagate_sensitivity(session.sensitivity_policy);
 
-        // FR-034: increment reward sidecar access_count for each retrieved memory
+        // FR-034: reward sidecar bookkeeping for this turn (access, plus
+        // corrections when the user is correcting prior output).
         if let Ok(paths) = ZenPaths::detect() {
-            let reward_dir = paths.memory().join(".reward");
-            for note in &session.knowledge {
-                let card_id = zen_vault::distill::card_id_from_path(&note.path);
-                if let Err(e) = zen_vault::distill::increment_access(&reward_dir, &card_id) {
-                    debug!(error = %e, card_id, "FR-034 reward access increment failed");
-                }
-            }
+            increment_reward_for_query(&paths, &session.knowledge, user_query);
         }
 
         let tool_names: BTreeSet<String> = zen_agent
@@ -2351,5 +2418,90 @@ mod tests {
         assert_eq!(feedback_rounds, 0);
         assert_eq!(redrafts, 0);
         assert!(redrafted.is_none());
+    }
+
+    #[test]
+    fn correction_markers_recognized_bilingually() {
+        assert!(is_user_correction("不对，应该是 300 而不是 3000"));
+        assert!(is_user_correction("That is wrong — the key rotates yearly"));
+        assert!(is_user_correction("correction: the deadline moved"));
+        assert!(!is_user_correction("请总结一下这个架构"));
+        assert!(!is_user_correction("summarize the architecture"));
+    }
+
+    #[test]
+    fn reward_bookkeeping_counts_corrections_only_on_correction_turns() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let reward_dir = paths.memory().join(".reward");
+        let knowledge = vec![RetrievedNote {
+            path: "memories/journal/fact-a.md".to_string(),
+            content: "fact a".to_string(),
+            sensitivity: Sensitivity::Private,
+            relevance: 0.8,
+        }];
+        let card_id = zen_vault::distill::card_id_from_path(&knowledge[0].path);
+
+        increment_reward_for_query(&paths, &knowledge, "summarize this");
+        let after_access = zen_vault::distill::read_reward(&reward_dir, &card_id);
+        assert_eq!(after_access.access_count, 1);
+        assert_eq!(after_access.correction_count, 0);
+
+        increment_reward_for_query(&paths, &knowledge, "不对，这个说法错了");
+        let after_correction = zen_vault::distill::read_reward(&reward_dir, &card_id);
+        assert_eq!(after_correction.access_count, 2);
+        assert_eq!(
+            after_correction.correction_count, 1,
+            "FR-034 correction_count tracks corrections referencing the memory source"
+        );
+    }
+
+    #[test]
+    fn wake_up_brief_injected_once_per_date() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let date = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        zen_memory::write_wake_up_brief(
+            &paths,
+            &date,
+            &[
+                "Focus: finish the lease wiring".to_string(),
+                "Watch: review queue is 3 deep".to_string(),
+                "Next: commit fixes".to_string(),
+            ],
+        )
+        .expect("brief written");
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+
+        assert!(inject_wake_up_brief(&paths, &mut session));
+        assert_eq!(session.knowledge.len(), 1);
+        assert!(
+            session.knowledge[0].path.contains(&date),
+            "brief note path carries the date: {}",
+            session.knowledge[0].path
+        );
+        assert!(
+            session.knowledge[0]
+                .content
+                .contains("finish the lease wiring")
+        );
+
+        assert!(
+            !inject_wake_up_brief(&paths, &mut session),
+            "same-date second injection is a no-op (idempotent within session)"
+        );
+        assert_eq!(session.knowledge.len(), 1);
+    }
+
+    #[test]
+    fn wake_up_brief_absent_is_a_no_op() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        assert!(!inject_wake_up_brief(&paths, &mut session));
+        assert!(session.knowledge.is_empty());
     }
 }

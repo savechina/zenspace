@@ -107,13 +107,22 @@ const ALTERNATIVE_MARKERS: &[&str] = &[
 
 /// Run all 10 anti-pattern checks and return aggregated report.
 pub fn check_all(d: &Decision) -> AntiPatternReport {
+    check_all_with_boost(d, false)
+}
+
+/// Run all 10 anti-pattern checks with an optional FR-035 loss-aversion
+/// guard boost. When `loss_aversion_boosted` is true (dream worker detected
+/// correction recurrence_rate > 0.5 in the 30-day window), the
+/// loss-aversion check trips in strict mode: sunk cost + unrecoverable is
+/// sufficient for a CRIT violation even when the stated loss is affordable.
+pub fn check_all_with_boost(d: &Decision, loss_aversion_boosted: bool) -> AntiPatternReport {
     let mut violations = Vec::new();
 
     let checks: Vec<Option<AntiPatternViolation>> = vec![
         check_misplaced_priority(d),
         check_legal_risk_blind(d),
         check_inertia_thinking(d),
-        check_loss_aversion(d),
+        check_loss_aversion(d, loss_aversion_boosted),
         check_emotional_impulse(d),
         check_fluke_mindset(d),
         check_authority_blindness(d),
@@ -302,13 +311,16 @@ fn check_inertia_thinking(d: &Decision) -> Option<AntiPatternViolation> {
     }
 }
 
-/// Check for sunk cost trap with unaffordable loss.
-fn check_loss_aversion(d: &Decision) -> Option<AntiPatternViolation> {
+/// Check for sunk cost trap with unaffordable loss. `boosted` (FR-035)
+/// drops the `!loss_affordable` conjunct: repeated correction recurrence
+/// means the stated affordability can no longer be trusted.
+fn check_loss_aversion(d: &Decision, boosted: bool) -> Option<AntiPatternViolation> {
     if d.cost_analysis.sunk > 0.0
         && !d.cost_analysis.is_recoverable
-        && d.expected_value
-            .as_ref()
-            .is_some_and(|ev| !ev.loss_affordable)
+        && (boosted
+            || d.expected_value
+                .as_ref()
+                .is_some_and(|ev| !ev.loss_affordable))
     {
         Some(AntiPatternViolation {
             pattern_id: "loss_aversion".into(),
@@ -604,6 +616,38 @@ mod tests {
                 .iter()
                 .any(|v| v.pattern_id == "loss_aversion"),
             "should not trigger when recoverable"
+        );
+    }
+
+    #[test]
+    fn test_loss_aversion_boost_trips_on_affordable_sunk_cost() {
+        let mut d = make_decision();
+        d.cost_analysis = CostBreakdown {
+            sunk: 5000.0,
+            is_recoverable: false,
+            ..CostBreakdown::default()
+        };
+        d.expected_value = Some(ExpectedValue {
+            success_probability: 0.3,
+            payoff_if_success: 10000.0,
+            loss_if_failure: 20000.0,
+            is_positive_ev: false,
+            loss_affordable: true,
+        });
+
+        assert!(
+            !check_all(&d)
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "loss_aversion"),
+            "unboosted check tolerates an affordable unrecoverable sunk cost"
+        );
+        assert!(
+            check_all_with_boost(&d, true)
+                .violations
+                .iter()
+                .any(|v| v.pattern_id == "loss_aversion"),
+            "FR-035 boost must trip on recurring corrections despite affordability"
         );
     }
 

@@ -588,17 +588,21 @@ impl ZenLoopWorker {
         gaps: &mut Vec<GapRecord>,
         report: &mut LoopCycleReport,
     ) {
-        use zen_memory::decision_check::check_all;
+        use zen_memory::decision_check::check_all_with_boost;
         use zen_memory::quality_gate::check_decision_principles;
 
         let decisions_dir = paths.vault().join("wiki").join("wisdom").join("decisions");
         let quarantine_dir = paths.archive().join("quarantine");
+        let boosted = super::dream::loss_aversion_boost_active(paths);
+        if boosted {
+            warn!("FR-035 loss-aversion guard boosted (correction recurrence > 0.5)");
+        }
 
         if decisions_dir.is_dir()
             && let Ok(decisions) = zen_memory::decision::Decision::load_all(&decisions_dir)
         {
             for decision in decisions {
-                let anti_report = check_all(&decision);
+                let anti_report = check_all_with_boost(&decision, boosted);
                 let principles = check_decision_principles(&decision);
                 if !principles.all_passed && !anti_report.has_crit {
                     warn!(
@@ -676,7 +680,7 @@ impl ZenLoopWorker {
                     text.to_string(),
                     "journal".to_string(),
                 );
-                if check_all(&decision).has_crit {
+                if check_all_with_boost(&decision, boosted).has_crit {
                     gaps.push(
                         GapRecord::new(
                             GapKind::DecisionBlocked,
@@ -798,6 +802,7 @@ fn resolve_model_tier(router: &DefaultRouter, host: &HostSourceContext) -> &'sta
 /// `wiki/wisdom/rejected/` (FR-040) so the loop never re-proposes falsified
 /// claims. Best-effort: a record failure is logged, never fails the cycle.
 fn record_rejected_hypotheses(paths: &ZenPaths, rejected: &[zen_memory::RejectedHypothesis]) {
+    let reflections_dir = paths.wiki().join("wisdom").join("reflections");
     for r in rejected {
         match r.record(paths) {
             Ok(path) => info!(
@@ -805,6 +810,12 @@ fn record_rejected_hypotheses(paths: &ZenPaths, rejected: &[zen_memory::Rejected
                 "loop: hypothesis rejected — negative-space record persisted"
             ),
             Err(e) => warn!(error = %e, "loop: rejected hypothesis record failed (non-fatal)"),
+        }
+        // Reflexion: capture why it failed so the next generation pass is
+        // framed by the failure instead of repeating it.
+        match zen_vault::distill::reflection::record_reflection(&reflections_dir, r) {
+            Ok(path) => debug!(path = %path.display(), "loop: rejection reflection recorded"),
+            Err(e) => warn!(error = %e, "loop: rejection reflection failed (non-fatal)"),
         }
     }
 }
@@ -1182,13 +1193,36 @@ impl ZenWorker for ZenLoopWorker {
         // repeated cycles converge instead of duplicating.
         {
             let hypotheses_dir = paths.vault().join("wiki/wisdom/hypotheses");
-            let slugs = zen_vault::distill::generate_from_gaps(&gaps);
+            let rejected_dir = paths.vault().join("wiki/wisdom/rejected");
+            let reflections_dir = paths.vault().join("wiki/wisdom/reflections");
+            let slugs = zen_vault::distill::generate_from_gaps_with_history(
+                &gaps,
+                &rejected_dir,
+                &reflections_dir,
+            );
             for slug in &slugs {
                 if let Err(e) = zen_vault::distill::save(slug, &hypotheses_dir) {
                     warn!(error = %e, slug = %slug.slug, "loop: hypothesis save failed");
                 }
             }
             report.hypotheses_generated = slugs.len();
+
+            // AlphaEvolve/DGM archive: re-classify the current hypothesis set
+            // (evidence × gap-domain × freshness) so parent selection can
+            // illuminate diverse cells instead of only the top scorer.
+            let archive_file = zen_vault::distill::archive::archive_path(&paths.logs());
+            match zen_vault::distill::archive::Archive::refresh(
+                &hypotheses_dir,
+                &rejected_dir,
+                &archive_file,
+            ) {
+                Ok(archive) => info!(
+                    entries = archive.entries.len(),
+                    cells = archive.cell_count(),
+                    "loop: hypothesis archive refreshed"
+                ),
+                Err(e) => warn!(error = %e, "loop: hypothesis archive refresh failed (non-fatal)"),
+            }
 
             // FR-031a: declare this cycle's slugs as placeholder page slots
             // (placeholders.json) so concurrent writers downgrade creates to

@@ -64,6 +64,10 @@ pub struct RelationRow {
     pub valid_until: Option<String>,
     pub recorded_at: Option<String>,
     pub weight: f64,
+    /// RFC3339 UTC start of the validity window; '' = valid since epoch (raw inserts).
+    pub t_valid: String,
+    /// RFC3339 UTC end of the validity window (exclusive); NULL = open-ended, still valid.
+    pub t_invalid: Option<String>,
 }
 
 #[derive(FromRow)]

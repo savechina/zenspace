@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod fusion;
 mod service;
 mod tier2;
 mod tier3;
@@ -10,6 +11,7 @@ mod tier4;
 mod tier5;
 pub mod tier_selector;
 
+pub use fusion::{FusedResult, RRF_K, RankedList, reciprocal_rank_fusion};
 pub use service::SearchService;
 pub use tier_selector::TierSelector;
 pub use tier2::{Tier2Search, Tier2SearchTool};

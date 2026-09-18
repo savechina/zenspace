@@ -35,6 +35,70 @@ pub struct NotionsRepo<'a> {
     client: &'a SqliteClient,
 }
 
+/// Directed snapshot of currently-valid entity edges shared by the
+/// [`pagerank`](NotionsRepo::pagerank) and
+/// [`personalized_pagerank`](NotionsRepo::personalized_pagerank) iterations.
+struct GraphCore {
+    name_by_idx: Vec<String>,
+    name_to_idx: HashMap<String, usize>,
+    id_to_idx: HashMap<String, usize>,
+    out_degree: Vec<usize>,
+    inbound: Vec<Vec<usize>>,
+}
+
+/// Power-iteration core: `pr` starts at `teleport`, then each round applies
+/// `pr[i] ← restart·teleport[i] + damping·(dangling_sum·teleport[i] +
+/// Σ_{src→i} pr[src]/out[src])`. Dangling mass (nodes without out-edges)
+/// redistributes along `teleport`, so a uniform teleport reproduces classic
+/// PageRank. Returns all entities sorted by descending score.
+fn run_pagerank_core(
+    core: &GraphCore,
+    teleport: Vec<f64>,
+    iterations: usize,
+    damping: f64,
+    restart: f64,
+) -> Vec<PageRankResult> {
+    let n = core.name_by_idx.len();
+    let mut pr = teleport.clone();
+
+    for _ in 0..iterations {
+        let dangling_sum: f64 = pr
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| core.out_degree[*i] == 0)
+            .map(|(_, &score)| score)
+            .sum();
+
+        let mut new_pr = vec![0.0; n];
+        for i in 0..n {
+            new_pr[i] = (restart + damping * dangling_sum) * teleport[i];
+            for &src_idx in &core.inbound[i] {
+                if core.out_degree[src_idx] > 0 {
+                    new_pr[i] += damping * pr[src_idx] / core.out_degree[src_idx] as f64;
+                }
+            }
+        }
+
+        pr = new_pr;
+    }
+
+    let mut results: Vec<PageRankResult> = pr
+        .iter()
+        .enumerate()
+        .map(|(i, &score)| PageRankResult {
+            notion: core.name_by_idx[i].clone(),
+            score,
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    results
+}
+
 impl<'a> NotionsRepo<'a> {
     pub fn new(client: &'a SqliteClient) -> Self {
         Self { client }
@@ -254,8 +318,9 @@ impl<'a> NotionsRepo<'a> {
                 conn.execute(
                     "INSERT OR REPLACE INTO relationships \
                      (id, source_notion_id, target_notion_id, relation_type, confidence, \
-                      source_note_ids, created_at, description, valid_from, valid_until, weight) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      source_note_ids, created_at, description, valid_from, valid_until, weight, \
+                      t_valid) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?7)",
                     rusqlite::params![
                         id,
                         source_id,
@@ -275,6 +340,128 @@ impl<'a> NotionsRepo<'a> {
             .await
             .map_err(SqliteError::TokioRusqlite)?;
         Ok(())
+    }
+
+    /// Temporal insert with contradiction resolution (Graphiti pattern).
+    ///
+    /// Records `t_valid` = `req.created_at` (RFC3339 UTC) and an open-ended
+    /// `t_invalid` (NULL), then atomically soft-invalidates every currently
+    /// open edge that shares (source_notion_id, relation_type) but points at a
+    /// *different* target: its `t_invalid` becomes this edge's `t_valid`, since
+    /// two open-ended windows `[t0, ∞)` always overlap temporally.
+    ///
+    /// Policy:
+    /// - Rows are never deleted — superseded facts stay queryable via
+    ///   [`Self::relationships_as_of`].
+    /// - Re-asserting the same (source, relation_type, target) is not a
+    ///   contradiction and invalidates nothing.
+    ///
+    /// Returns the number of edges invalidated by this insert.
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the writer transaction fails.
+    pub async fn insert_relationship_temporal(
+        &self,
+        req: &InsertRelationshipRequest<'_>,
+    ) -> Result<usize> {
+        let id = req.id.to_string();
+        let source_id = req.source_id.to_string();
+        let target_id = req.target_id.to_string();
+        let rel_type = req.rel_type.to_string();
+        let confidence = req.confidence;
+        let source_note_ids = req.source_note_ids.unwrap_or("").to_string();
+        let created_at = req.created_at.to_string();
+        let description = req.description.unwrap_or("").to_string();
+        let valid_from = req.valid_from.map(|s| s.to_string());
+        let valid_until = req.valid_until.map(|s| s.to_string());
+        let weight = req.weight.unwrap_or(1.0);
+
+        self.client
+            .writer()
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                let invalidated = tx.execute(
+                    "UPDATE relationships SET t_invalid = ?1 \
+                     WHERE source_notion_id = ?2 AND relation_type = ?3 \
+                       AND target_notion_id != ?4 AND t_invalid IS NULL AND id != ?5",
+                    rusqlite::params![created_at, source_id, rel_type, target_id, id],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO relationships \
+                     (id, source_notion_id, target_notion_id, relation_type, confidence, \
+                      source_note_ids, created_at, description, valid_from, valid_until, weight, \
+                      t_valid) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?7)",
+                    rusqlite::params![
+                        id,
+                        source_id,
+                        target_id,
+                        rel_type,
+                        confidence,
+                        source_note_ids,
+                        created_at,
+                        description,
+                        valid_from,
+                        valid_until,
+                        weight
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(invalidated)
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)
+    }
+
+    /// Soft-invalidates an edge by stamping `t_invalid` (RFC3339 UTC).
+    ///
+    /// The row is never deleted: [`Self::relationships_as_of`] with a timestamp
+    /// before `t_invalid` still returns it. First invalidation wins — an
+    /// already-closed edge keeps its original stamp. Returns `true` only when
+    /// an open edge was closed (`false` for unknown ids or closed edges).
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the writer update fails.
+    pub async fn invalidate_relationship(&self, id: &str, t_invalid: &str) -> Result<bool> {
+        let id = id.to_string();
+        let t_invalid = t_invalid.to_string();
+
+        self.client
+            .writer()
+            .call(move |conn| {
+                let rows = conn.execute(
+                    "UPDATE relationships SET t_invalid = ?1 \
+                     WHERE id = ?2 AND t_invalid IS NULL",
+                    rusqlite::params![t_invalid, id],
+                )?;
+                Ok(rows > 0)
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)
+    }
+
+    /// Point-in-time query: every edge valid at `ts` (RFC3339 UTC).
+    ///
+    /// The validity window is half-open `[t_valid, t_invalid)`: an edge is
+    /// returned when `t_valid <= ts` and (`t_invalid IS NULL` or
+    /// `t_invalid > ts`). `t_valid = ''` (raw inserts without an explicit
+    /// value) means valid since the epoch. Comparison is lexicographic —
+    /// callers must pass RFC3339 UTC strings for ordering to hold.
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the query fails.
+    pub async fn relationships_as_of(&self, ts: &str) -> Result<Vec<RelationRow>> {
+        Ok(sqlx::query_as::<_, RelationRow>(
+            "SELECT id, source_notion_id, target_notion_id, relation_type, confidence, \
+             source_note_ids, created_at, description, valid_from, valid_until, \
+             recorded_at, weight, t_valid, t_invalid \
+             FROM relationships \
+             WHERE t_valid <= ?1 AND (t_invalid IS NULL OR t_invalid > ?1) \
+             ORDER BY t_valid, id",
+        )
+        .bind(ts)
+        .fetch_all(self.client.pool())
+        .await?)
     }
 
     pub async fn load_known_notion_names(&self) -> Result<Vec<String>> {
@@ -324,7 +511,7 @@ impl<'a> NotionsRepo<'a> {
         Ok(sqlx::query_as::<_, RelationRow>(
             "SELECT id, source_notion_id, target_notion_id, relation_type, confidence, \
              source_note_ids, created_at, description, valid_from, valid_until, \
-             recorded_at, weight \
+             recorded_at, weight, t_valid, t_invalid \
              FROM relationships WHERE source_notion_id = ?1",
         )
         .bind(notion_id)
@@ -336,7 +523,7 @@ impl<'a> NotionsRepo<'a> {
         Ok(sqlx::query_as::<_, RelationRow>(
             "SELECT id, source_notion_id, target_notion_id, relation_type, confidence, \
              source_note_ids, created_at, description, valid_from, valid_until, \
-             recorded_at, weight \
+             recorded_at, weight, t_valid, t_invalid \
              FROM relationships WHERE source_notion_id = ?1 OR target_notion_id = ?1",
         )
         .bind(notion_id)
@@ -412,12 +599,12 @@ impl<'a> NotionsRepo<'a> {
              edge_set(from_id, to_id, relation_type, direction) AS ( \
                  SELECT source_notion_id, target_notion_id, relation_type, 'outbound' \
                  FROM relationships \
-                 WHERE (valid_until IS NULL OR valid_until = '') \
+                 WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL \
                    AND (?3 = '' OR relation_type = ?3) \
                  UNION ALL \
                  SELECT target_notion_id, source_notion_id, relation_type, 'inbound' \
                  FROM relationships \
-                 WHERE (valid_until IS NULL OR valid_until = '') \
+                 WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL \
                    AND (?3 = '' OR relation_type = ?3) \
              ), \
              bfs(id, name, depth, source_name, relation_type, direction, path) AS ( \
@@ -479,10 +666,12 @@ impl<'a> NotionsRepo<'a> {
             "WITH RECURSIVE \
              edge_set(from_id, to_id, weight) AS ( \
                  SELECT source_notion_id, target_notion_id, weight \
-                 FROM relationships WHERE (valid_until IS NULL OR valid_until = '') \
+                 FROM relationships \
+                 WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL \
                  UNION ALL \
                  SELECT target_notion_id, source_notion_id, weight \
-                 FROM relationships WHERE (valid_until IS NULL OR valid_until = '') \
+                 FROM relationships \
+                 WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL \
              ), \
              walker(id, name, total_weight, depth, path_names, path_ids) AS ( \
                  SELECT id, name, 0.0, 0, name, ',' || id || ',' \
@@ -534,91 +723,133 @@ impl<'a> NotionsRepo<'a> {
         Ok(all.into_iter().find(|r| r.notion == dst_name))
     }
 
-    pub async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>> {
+    async fn load_graph_core(&self) -> Result<GraphCore> {
         let notion_rows = sqlx::query("SELECT id, name FROM notions ORDER BY name")
             .fetch_all(self.client.pool())
             .await?;
 
-        let notions: Vec<(String, String)> = notion_rows
-            .iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
-            .collect();
-
-        let n = notions.len();
-        if n == 0 {
-            return Ok(Vec::new());
+        let n = notion_rows.len();
+        let mut name_by_idx = Vec::with_capacity(n);
+        let mut name_to_idx = HashMap::new();
+        let mut id_to_idx = HashMap::with_capacity(n);
+        for (i, row) in notion_rows.iter().enumerate() {
+            let id = row.get::<String, _>(0);
+            let name = row.get::<String, _>(1);
+            id_to_idx.insert(id, i);
+            name_to_idx.entry(name.clone()).or_insert(i);
+            name_by_idx.push(name);
         }
-
-        let edge_rows = sqlx::query(
-            "SELECT source_notion_id, target_notion_id FROM relationships \
-             WHERE valid_until IS NULL OR valid_until = ''",
-        )
-        .fetch_all(self.client.pool())
-        .await?;
-
-        let edges: Vec<(String, String)> = edge_rows
-            .iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
-            .collect();
-
-        let id_to_idx: HashMap<String, usize> = notions
-            .iter()
-            .enumerate()
-            .map(|(i, (id, _))| (id.clone(), i))
-            .collect();
-
-        let name_by_idx: Vec<String> = notions.iter().map(|(_, name)| name.clone()).collect();
 
         let mut out_degree = vec![0usize; n];
         let mut inbound: Vec<Vec<usize>> = vec![Vec::new(); n];
 
-        for (src, tgt) in &edges {
-            if let (Some(&src_idx), Some(&tgt_idx)) = (id_to_idx.get(src), id_to_idx.get(tgt)) {
-                out_degree[src_idx] += 1;
-                inbound[tgt_idx].push(src_idx);
-            }
-        }
+        if n > 0 {
+            let edge_rows = sqlx::query(
+                "SELECT source_notion_id, target_notion_id FROM relationships \
+                 WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL",
+            )
+            .fetch_all(self.client.pool())
+            .await?;
 
-        let n_f64 = n as f64;
-        let mut pr = vec![1.0 / n_f64; n];
-
-        for _ in 0..iterations {
-            let dangling_sum: f64 = pr
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| out_degree[*i] == 0)
-                .map(|(_, &score)| score)
-                .sum();
-            let dangling_share = damping * dangling_sum / n_f64;
-
-            let mut new_pr = vec![(1.0 - damping) / n_f64 + dangling_share; n];
-
-            for i in 0..n {
-                for &src_idx in &inbound[i] {
-                    if out_degree[src_idx] > 0 {
-                        new_pr[i] += damping * pr[src_idx] / out_degree[src_idx] as f64;
-                    }
+            for row in &edge_rows {
+                let src = row.get::<String, _>(0);
+                let tgt = row.get::<String, _>(1);
+                if let (Some(&src_idx), Some(&tgt_idx)) = (id_to_idx.get(&src), id_to_idx.get(&tgt))
+                {
+                    out_degree[src_idx] += 1;
+                    inbound[tgt_idx].push(src_idx);
                 }
             }
-
-            pr = new_pr;
         }
 
-        let mut results: Vec<PageRankResult> = pr
+        Ok(GraphCore {
+            name_by_idx,
+            name_to_idx,
+            id_to_idx,
+            out_degree,
+            inbound,
+        })
+    }
+
+    /// Global PageRank over currently-valid edges.
+    ///
+    /// Equivalent to [`Self::personalized_pagerank`] with a uniform teleport
+    /// vector and `restart = 1.0 - damping`; scores sum to ~1.0.
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the graph cannot be loaded.
+    pub async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>> {
+        let core = self.load_graph_core().await?;
+        let n = core.name_by_idx.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(run_pagerank_core(
+            &core,
+            vec![1.0 / n as f64; n],
+            iterations,
+            damping,
+            1.0 - damping,
+        ))
+    }
+
+    /// Personalized PageRank (HippoRAG pattern): seeded retrieval ranking over
+    /// the directed entity graph of currently-valid edges (`t_invalid IS NULL`).
+    ///
+    /// Each iteration the random walk teleports back to the seed distribution
+    /// with probability `restart` instead of jumping uniformly:
+    ///
+    /// ```text
+    /// pr[i] ← restart·teleport[i]
+    ///       + damping·(dangling_sum·teleport[i] + Σ_{src→i} pr[src]/out[src])
+    /// ```
+    ///
+    /// with `pr` initialized to `teleport` (uniform over resolved seeds). The
+    /// canonical parameterization is `restart = 1.0 - damping` (e.g. 0.15 /
+    /// 0.85); other combinations still rank but do not conserve total mass.
+    ///
+    /// Seeds match notion *names* first, then ids; unrecognized seeds are
+    /// ignored. Returns every entity sorted by descending personalized score —
+    /// entities unreachable from the seeds score ≈ 0. Returns an empty vector
+    /// when the graph is empty or no seed resolves.
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the graph cannot be loaded.
+    pub async fn personalized_pagerank(
+        &self,
+        seeds: &[String],
+        iterations: usize,
+        damping: f64,
+        restart: f64,
+    ) -> Result<Vec<PageRankResult>> {
+        let core = self.load_graph_core().await?;
+        let n = core.name_by_idx.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let seed_idx: HashSet<usize> = seeds
             .iter()
-            .enumerate()
-            .map(|(i, &score)| PageRankResult {
-                notion: name_by_idx[i].clone(),
-                score,
+            .filter_map(|seed| {
+                core.name_to_idx
+                    .get(seed)
+                    .or_else(|| core.id_to_idx.get(seed))
+                    .copied()
             })
             .collect();
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if seed_idx.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        Ok(results)
+        let share = 1.0 / seed_idx.len() as f64;
+        let mut teleport = vec![0.0; n];
+        for &i in &seed_idx {
+            teleport[i] = share;
+        }
+
+        Ok(run_pagerank_core(
+            &core, teleport, iterations, damping, restart,
+        ))
     }
 
     pub async fn connected_components(&self) -> Result<Vec<ComponentResult>> {
@@ -638,7 +869,7 @@ impl<'a> NotionsRepo<'a> {
 
         let edge_rows = sqlx::query(
             "SELECT source_notion_id, target_notion_id FROM relationships \
-             WHERE valid_until IS NULL OR valid_until = ''",
+             WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL",
         )
         .fetch_all(self.client.pool())
         .await?;
@@ -848,6 +1079,21 @@ impl crate::traits::notions::NotionsRepository for NotionsRepo<'_> {
         NotionsRepo::insert_relationship(self, req).await
     }
 
+    async fn insert_relationship_temporal(
+        &self,
+        req: &InsertRelationshipRequest<'_>,
+    ) -> Result<usize> {
+        NotionsRepo::insert_relationship_temporal(self, req).await
+    }
+
+    async fn invalidate_relationship(&self, id: &str, t_invalid: &str) -> Result<bool> {
+        NotionsRepo::invalidate_relationship(self, id, t_invalid).await
+    }
+
+    async fn relationships_as_of(&self, ts: &str) -> Result<Vec<RelationRow>> {
+        NotionsRepo::relationships_as_of(self, ts).await
+    }
+
     async fn load_known_notion_names(&self) -> Result<Vec<String>> {
         NotionsRepo::load_known_notion_names(self).await
     }
@@ -920,6 +1166,16 @@ impl crate::traits::notions::NotionsRepository for NotionsRepo<'_> {
 
     async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>> {
         NotionsRepo::pagerank(self, iterations, damping).await
+    }
+
+    async fn personalized_pagerank(
+        &self,
+        seeds: &[String],
+        iterations: usize,
+        damping: f64,
+        restart: f64,
+    ) -> Result<Vec<PageRankResult>> {
+        NotionsRepo::personalized_pagerank(self, seeds, iterations, damping, restart).await
     }
 
     async fn connected_components(&self) -> Result<Vec<ComponentResult>> {

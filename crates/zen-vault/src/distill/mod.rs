@@ -1,4 +1,5 @@
 pub mod adversarial;
+pub mod archive;
 pub mod chat_import;
 pub mod checkpoint;
 pub mod contradiction;
@@ -11,6 +12,7 @@ pub mod notion_extraction;
 pub mod orchestration_stats;
 pub mod pipeline;
 pub mod recovery;
+pub mod reflection;
 pub mod reward_sidecar;
 pub mod source_ingest;
 pub mod stages;
@@ -34,7 +36,7 @@ pub use discover_metrics::{
 };
 pub use hypothesis::{
     build_exploration_prompt, build_refinement_queue, confidence_for, gap_type, generate_from_gaps,
-    load_all, reverify, reverify_with_rejections, save, slug_for,
+    generate_from_gaps_with_history, load_all, reverify, reverify_with_rejections, save, slug_for,
 };
 pub use merge::{
     MergeStrategy, WikiMergePlan, build_merge_plans, normalize_notion_name, trigram_jaccard,
@@ -57,6 +59,7 @@ pub use source_ingest::SourceIngester;
 pub use stages::LlmDistillStage;
 pub use tool_call_log::{
     ToolCallAggregate, aggregate_all_sessions, aggregate_tool_calls, append_tool_call,
+    prune_expired_sessions,
 };
 pub use transaction::TransactionScope;
 pub use types::{

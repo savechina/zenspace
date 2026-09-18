@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 use zen_repo::SqliteClient;
 
 use super::{
-    GraphResult, SearchResult, Tier1Search, Tier2Search, Tier3Search, Tier4Search, Tier5Search,
-    TierSelector,
+    FusedResult, GraphResult, RRF_K, RankedList, SearchResult, Tier1Search, Tier2Search,
+    Tier3Search, Tier4Search, Tier5Search, TierSelector, reciprocal_rank_fusion,
 };
 use zen_provider::DefaultRouter;
 
@@ -23,6 +23,13 @@ pub struct SearchService {
 /// a limit (`zen search --limit`).
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 
+/// Per-tier RRF weights for fused auto-search. FTS5 and vec0 are independent
+/// retrieval signals (lexical vs semantic) and share full trust; graph
+/// traversal is directional/relation-driven, hence the lower weight.
+const TIER2_WEIGHT: f64 = 1.0;
+const TIER3_WEIGHT: f64 = 1.0;
+const TIER4_WEIGHT: f64 = 0.8;
+
 impl SearchService {
     pub fn new(router: DefaultRouter) -> Self {
         Self {
@@ -33,10 +40,98 @@ impl SearchService {
         }
     }
 
+    /// Fused multi-signal search (RRF): runs the indexed tiers in parallel —
+    /// FTS5 (lexical), vec0 (semantic, when embeddings are computable) and
+    /// the entity graph — then fuses their rankings.
+    ///
+    /// Tier failures degrade gracefully: a failing or unavailable tier
+    /// contributes nothing and is warn-logged; the remaining tiers still
+    /// produce a ranked result. Hits carry provenance (which tiers matched)
+    /// so callers can explain ranking.
+    pub async fn search_fused(
+        &self,
+        query: &str,
+        base_dir: &Path,
+        client: &SqliteClient,
+        limit: Option<usize>,
+    ) -> Result<Vec<FusedResult>> {
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+
+        let embedding = match crate::tindy::compute_embeddings_for_text(query) {
+            Ok(embedding) => Some(embedding),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "tier3 (vec0) unavailable for fusion: query embedding failed"
+                );
+                None
+            }
+        };
+
+        let (fts, semantic, graph) = tokio::join!(
+            self.tier2.search_in_dir(client, query, base_dir, limit),
+            async {
+                match &embedding {
+                    Some(embedding) => self.tier3.search(client, embedding, limit).await,
+                    None => Ok(Vec::new()),
+                }
+            },
+            self.tier4.search(client, query, 3),
+        );
+
+        let mut lists = Vec::new();
+        match fts {
+            Ok(rows) => lists.push(RankedList {
+                source: "fts5",
+                weight: TIER2_WEIGHT,
+                results: rows
+                    .into_iter()
+                    .map(|f| SearchResult {
+                        file: PathBuf::from(f.path),
+                        line: 0,
+                        content: f.snippet,
+                    })
+                    .collect(),
+            }),
+            Err(e) => warn!(error = %e, "tier2 (fts5) failed during fusion"),
+        }
+        match semantic {
+            Ok(rows) if !rows.is_empty() => lists.push(RankedList {
+                source: "vec0",
+                weight: TIER3_WEIGHT,
+                results: rows,
+            }),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "tier3 (vec0) failed during fusion"),
+        }
+        match graph {
+            Ok(rows) => lists.push(RankedList {
+                source: "graph",
+                weight: TIER4_WEIGHT,
+                results: rows.into_iter().map(graph_to_search).collect(),
+            }),
+            Err(e) => warn!(error = %e, "tier4 (graph) failed during fusion"),
+        }
+
+        let fused = reciprocal_rank_fusion(&lists, RRF_K, limit);
+        info!(
+            query_len = query.len(),
+            contributing_tiers = lists.len(),
+            results_count = fused.len(),
+            "SearchService: fused search complete"
+        );
+        Ok(fused)
+    }
+
     /// Search across all tiers.
     ///
-    /// If `tier` is `Some`, uses that tier directly.
-    /// If `tier` is `None`, uses [`TierSelector::select_tier`] to auto-select.
+    /// If `tier` is `Some`, uses that tier directly (and `tier = 5` runs
+    /// LLM synthesis).
+    /// If `tier` is `None`, [`TierSelector::select_tier`] decides; the
+    /// ordinary multi-word case (selected tier 2) is served by
+    /// [`SearchService::search_fused`] (RRF over FTS5 + vec0 + graph) instead
+    /// of FTS5 alone. Explicit intents (`similar:` / `graph:` / `summarize:`)
+    /// and single-word lookups keep their single-tier routing.
     ///
     /// `limit` caps the number of results returned by each tier, defaulting
     /// to [`DEFAULT_SEARCH_LIMIT`].
@@ -49,8 +144,30 @@ impl SearchService {
         domain_filter: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<SearchResult>> {
-        let selected = tier.unwrap_or_else(|| TierSelector::select_tier(query));
         let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        let selected = match tier {
+            Some(explicit) => explicit,
+            None => {
+                let preferred = TierSelector::select_tier(query);
+                if preferred == 2 {
+                    let fused = self
+                        .search_fused(query, base_dir, client, Some(limit))
+                        .await?;
+                    let results: Vec<SearchResult> = fused.into_iter().map(|f| f.result).collect();
+                    let results = match domain_filter {
+                        Some(domain) => filter_by_domain(results, domain)?,
+                        None => results,
+                    };
+                    info!(
+                        query_len = query.len(),
+                        results_count = results.len(),
+                        "SearchService: fused auto search complete"
+                    );
+                    return Ok(results);
+                }
+                preferred
+            }
+        };
 
         info!(
             query_len = query.len(),
