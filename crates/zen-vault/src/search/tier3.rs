@@ -2,12 +2,17 @@ use anyhow::Result;
 use rig_core::Embed;
 use rig_sqlite::{Column, ColumnValue, SqliteVectorStoreTable};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tracing::debug;
 use zen_repo::{
     EmbeddingsRepo, InsertNoteEmbeddingRequest, InsertNotionEmbeddingRequest, SqliteClient,
 };
 
 use super::SearchResult;
+use crate::tools::{
+    SharedSqliteClient, ZenTool, ZenToolError, ZenToolResult, args_schema_string_limit,
+    result_schema_array,
+};
 
 // ---------------------------------------------------------------------------
 // Tier 3 search: sqlite-vec KNN cosine similarity + rig-sqlite integration
@@ -137,6 +142,70 @@ impl Tier3Search {
 impl std::fmt::Debug for Tier3Search {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tier3Search").finish()
+    }
+}
+
+/// Agent-facing wrapper exposing vec0 semantic (KNN) search as a tool.
+///
+/// Complements `tier2_search` (keyword/FTS5) and `tier4_search` (entity
+/// graph) with meaning-based retrieval: the query is embedded before the KNN
+/// lookup, so prefer it when the user's words may differ from the note text.
+pub struct Tier3SearchTool {
+    db: SharedSqliteClient,
+    inner: Tier3Search,
+}
+
+impl Tier3SearchTool {
+    pub fn new(db: SharedSqliteClient) -> Self {
+        Self {
+            db,
+            inner: Tier3Search,
+        }
+    }
+}
+
+impl ZenTool for Tier3SearchTool {
+    fn schema(&self) -> crate::tools::ToolSchema {
+        crate::tools::ToolSchema {
+            name: "tier3_search".to_string(),
+            description: "Semantic similarity search over notes and entities using sqlite-vec \
+                          embeddings (query is embedded first; use for meaning-based lookups \
+                          where exact keywords may differ)."
+                .to_string(),
+            args_schema: args_schema_string_limit(),
+            result_schema: result_schema_array(),
+        }
+    }
+
+    async fn invoke(&self, args: Value) -> ZenToolResult {
+        let query = args.get("query").and_then(Value::as_str).ok_or_else(|| {
+            ZenToolError::InvalidArgs("missing required field: query".to_string())
+        })?;
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+
+        let embedding = crate::tindy::compute_embeddings_for_text(query)
+            .map_err(|e| ZenToolError::ExecutionFailed(format!("query embedding failed: {e}")))?;
+
+        let client = self.db.get().await.map_err(ZenToolError::ExecutionFailed)?;
+
+        let results = self
+            .inner
+            .search(&client, &embedding, limit)
+            .await
+            .map_err(|e| ZenToolError::ExecutionFailed(e.to_string()))?;
+
+        let formatted: Vec<Value> = results
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "path": r.file.to_string_lossy(),
+                    "line": r.line,
+                    "snippet": r.content,
+                })
+            })
+            .collect();
+
+        Ok(json!({ "results": formatted }))
     }
 }
 

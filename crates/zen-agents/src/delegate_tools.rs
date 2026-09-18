@@ -70,6 +70,7 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Sisyphus",
         &[
             "tier2_search",
+            "tier3_search",
             "tier4_search",
             "compute_embeddings",
             "fs.read",
@@ -113,6 +114,7 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Hermes",
         &[
             "tier2_search",
+            "tier3_search",
             "tier4_search",
             "fs.read",
             "fs.list",
@@ -138,6 +140,7 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Momus",
         &[
             "tier2_search",
+            "tier3_search",
             "tier4_search",
             "fs.read",
             "fs.list",
@@ -151,6 +154,7 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Oracle",
         &[
             "tier2_search",
+            "tier3_search",
             "tier4_search",
             "fs.read",
             "fs.list",
@@ -213,6 +217,7 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Hephaestus",
         &[
             "tier2_search",
+            "tier3_search",
             "tier4_search",
             "compute_embeddings",
             "fs.read",
@@ -255,6 +260,7 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Zeus",
         &[
             "tier2_search",
+            "tier3_search",
             "tier4_search",
             "fs.read",
             "fs.list",
@@ -575,14 +581,19 @@ mod tests {
 
     // ── FR-046 (T106): grant regression tests ────────────────────────────
 
-    /// Frozen snapshot of the pre-FR-046 static grant map (task spec
-    /// FR-046 test 1): with an empty overlay the resolved grants must be
-    /// byte-for-byte identical to this table.
+    /// Frozen baseline of default grants (task spec FR-046 test 1): with an
+    /// empty overlay the resolved grants must be byte-for-byte identical to
+    /// this table, so accidental grant drift fails the build.
+    ///
+    /// Sanctioned amendment: `tier3_search` added to the search-capable agents
+    /// (2026-09-18) so vec0 semantic retrieval is reachable from agent turns,
+    /// not only from gateway RPC.
     const PRIOR_STATIC_AGENT_TOOLS: &[(&str, &[&str])] = &[
         (
             "Sisyphus",
             &[
                 "tier2_search",
+                "tier3_search",
                 "tier4_search",
                 "compute_embeddings",
                 "fs.read",
@@ -626,6 +637,7 @@ mod tests {
             "Hermes",
             &[
                 "tier2_search",
+                "tier3_search",
                 "tier4_search",
                 "fs.read",
                 "fs.list",
@@ -651,6 +663,7 @@ mod tests {
             "Momus",
             &[
                 "tier2_search",
+                "tier3_search",
                 "tier4_search",
                 "fs.read",
                 "fs.list",
@@ -664,6 +677,7 @@ mod tests {
             "Oracle",
             &[
                 "tier2_search",
+                "tier3_search",
                 "tier4_search",
                 "fs.read",
                 "fs.list",
@@ -726,6 +740,7 @@ mod tests {
             "Hephaestus",
             &[
                 "tier2_search",
+                "tier3_search",
                 "tier4_search",
                 "compute_embeddings",
                 "fs.read",
@@ -768,6 +783,7 @@ mod tests {
             "Zeus",
             &[
                 "tier2_search",
+                "tier3_search",
                 "tier4_search",
                 "fs.read",
                 "fs.list",

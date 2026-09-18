@@ -15,7 +15,7 @@ pub use fusion::{FusedResult, RRF_K, RankedList, reciprocal_rank_fusion};
 pub use service::SearchService;
 pub use tier_selector::TierSelector;
 pub use tier2::{Tier2Search, Tier2SearchTool};
-pub use tier3::Tier3Search;
+pub use tier3::{Tier3Search, Tier3SearchTool};
 pub use tier4::{GraphResult, Tier4Search, Tier4SearchTool};
 pub use tier5::Tier5Search;
 

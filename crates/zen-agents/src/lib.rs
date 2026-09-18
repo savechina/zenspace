@@ -22,6 +22,7 @@ pub mod registry;
 pub mod review;
 pub mod safety_hook;
 pub mod scheduler;
+pub mod skill_embedding;
 pub mod skill_history;
 pub mod skill_hit_router;
 pub mod skill_loader;

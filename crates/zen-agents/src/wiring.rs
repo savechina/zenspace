@@ -307,12 +307,15 @@ impl ZenWiring {
                     zen_vault::Tier2SearchTool::new(kb_db.clone()),
                 )));
                 tools.register(Arc::new(ZenToolToolAdapter::new(
+                    zen_vault::Tier3SearchTool::new(kb_db.clone()),
+                )));
+                tools.register(Arc::new(ZenToolToolAdapter::new(
                     zen_vault::Tier4SearchTool::new(kb_db),
                 )));
             }
             Err(e) => {
                 tracing::warn!(
-                    "workspace not detected ({}): tier2_search/tier4_search not registered",
+                    "workspace not detected ({}): tier2_search/tier3_search/tier4_search not registered",
                     e
                 );
             }
@@ -823,7 +826,7 @@ mod tests {
     #[test]
     fn zen_wiring_registers_all_tools() {
         let wiring = ZenWiring::new();
-        assert_eq!(wiring.tools.len(), 21);
+        assert_eq!(wiring.tools.len(), 22);
 
         assert!(wiring.tools.get("tier2_search").is_ok());
         assert!(wiring.tools.get("tier4_search").is_ok());
@@ -1052,7 +1055,7 @@ mod tests {
             Some(&registry),
         );
         // Failure is isolated: wiring still constructs with all builtin tools.
-        assert_eq!(wiring.tools.len(), 21);
+        assert_eq!(wiring.tools.len(), 22);
     }
 
     fn write_wasm_plugin(dir: &std::path::Path, id: &str) {
@@ -1099,7 +1102,7 @@ mod tests {
         // Exported func registered under {plugin_id}.{func}; _start excluded.
         assert!(wiring.tools.get("demo_plugin.ping").is_ok());
         assert!(wiring.tools.get("demo_plugin._start").is_err());
-        assert_eq!(wiring.tools.len(), 22);
+        assert_eq!(wiring.tools.len(), 23);
 
         // Plugin tools default to Private sensitivity and stay MCP-exposed
         // (non-Confidential) per build_mcp_registry filtering.
@@ -1206,7 +1209,7 @@ mod tests {
 
         // Integrity-failed plugin is isolated: no tools, echo unaffected.
         assert!(wiring.tools.get("bogus.hello").is_err());
-        assert_eq!(wiring.tools.len(), 22, "21 builtin tools + echo.hello");
+        assert_eq!(wiring.tools.len(), 23, "22 builtin tools + echo.hello");
     }
 
     // ── FR-035: arg-registry end-to-end via ZenWiring hook pipeline ─────────
@@ -1601,7 +1604,7 @@ mod tests {
             wiring.tools.get("good.ping").is_ok(),
             "sibling plugin's tools must still register"
         );
-        assert_eq!(wiring.tools.len(), 22, "21 builtin tools + good.ping only");
+        assert_eq!(wiring.tools.len(), 23, "22 builtin tools + good.ping only");
     }
 
     // ── FR-046c(4): grant overlay does not change MCP exposure ───────────

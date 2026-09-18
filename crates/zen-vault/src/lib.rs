@@ -32,7 +32,7 @@ pub use notion::{
 };
 pub use search::{
     GraphResult, SearchResult, SearchService, Tier1Search, Tier2Search, Tier2SearchTool,
-    Tier3Search, Tier4Search, Tier4SearchTool, Tier5Search, TierSelector,
+    Tier3Search, Tier3SearchTool, Tier4Search, Tier4SearchTool, Tier5Search, TierSelector,
 };
 pub use tindy::{
     ChangeDetector, ComputeEmbeddings, EmbeddingResult, GapType, KnowledgeGap, LearningLoop,

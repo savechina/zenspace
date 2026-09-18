@@ -24,6 +24,7 @@
 //! [`score_trigger`] — the threshold, max_hits and gating stay identical.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use zen_repo::normalize_alias;
 use zen_vault::distill::trigram_jaccard;
@@ -38,6 +39,23 @@ pub const SKILL_HIT_MAX_HITS: usize = 1;
 
 /// Rendered skill prompt cap injected into M1 (chars, ~1k tokens).
 pub const SKILL_PROMPT_MAX_CHARS: usize = 4000;
+
+/// Optional semantic scorer for skill matching (Voyager-style embedding
+/// retrieval over skill descriptions).
+///
+/// Injected via [`SkillHitRouter::with_scorer`]. Implementations return
+/// `None` when they cannot score (no cached embedding, no backend), and the
+/// router then falls back to lexical scoring alone — so a scorer can never
+/// make retrieval worse or fail a turn.
+///
+/// The trait is synchronous and holds no I/O: any embedding work (model
+/// calls, cache refresh) belongs to the caller, keeping the per-turn routing
+/// path free of the embedding runtime (see the module docs).
+pub trait SkillScorer: Send + Sync {
+    /// Semantic similarity in `0.0..=1.0` between the normalized query and a
+    /// skill, or `None` when unavailable.
+    fn score_skill(&self, query_norm: &str, skill: &SkillDefinition) -> Option<f32>;
+}
 
 /// One matched skill (contract `skill-hit.json` output shape).
 #[derive(Debug, Clone, PartialEq)]
@@ -61,10 +79,21 @@ pub struct SkillHit {
 /// - Default: threshold 0.72, at most 1 hit.
 /// - Interaction: skills with empty `triggers` can never hit; disabled
 ///   skills must be filtered by the caller (`is_auto_route_enabled`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SkillHitRouter {
     threshold: f32,
     max_hits: usize,
+    scorer: Option<Arc<dyn SkillScorer>>,
+}
+
+impl std::fmt::Debug for SkillHitRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkillHitRouter")
+            .field("threshold", &self.threshold)
+            .field("max_hits", &self.max_hits)
+            .field("has_scorer", &self.scorer.is_some())
+            .finish()
+    }
 }
 
 impl Default for SkillHitRouter {
@@ -79,7 +108,15 @@ impl SkillHitRouter {
         Self {
             threshold: SKILL_HIT_THRESHOLD,
             max_hits: SKILL_HIT_MAX_HITS,
+            scorer: None,
         }
+    }
+
+    /// Attach a semantic scorer; without one the router stays purely lexical.
+    #[must_use]
+    pub fn with_scorer(mut self, scorer: Arc<dyn SkillScorer>) -> Self {
+        self.scorer = Some(scorer);
+        self
     }
 
     pub fn threshold(&self) -> f32 {
@@ -119,10 +156,20 @@ impl SkillHitRouter {
                 let score = score_trigger(&query_norm, &trigger_norm);
                 if score >= self.threshold {
                     matched.push(trigger.clone());
-                    best = best.max(score);
                 }
+                best = best.max(score);
             }
-            if !matched.is_empty() {
+            // Semantic promotion (Voyager-style): a scorer may only raise a
+            // skill's score, never lower it, so retrieval can only improve
+            // and the lexical path stays the guaranteed floor.
+            if let Some(semantic) = self
+                .scorer
+                .as_ref()
+                .and_then(|scorer| scorer.score_skill(&query_norm, skill))
+            {
+                best = best.max(semantic.clamp(0.0, 1.0));
+            }
+            if best >= self.threshold {
                 hits.push(SkillHit {
                     skill: skill.name.clone(),
                     score: best,
@@ -268,6 +315,71 @@ mod tests {
     fn empty_query_never_hits() {
         let router = SkillHitRouter::new();
         assert!(router.route("   ", &[def("x", &["x"])]).is_empty());
+    }
+
+    struct StubScorer(std::collections::HashMap<String, f32>);
+
+    impl SkillScorer for StubScorer {
+        fn score_skill(&self, _query_norm: &str, skill: &SkillDefinition) -> Option<f32> {
+            self.0.get(&skill.name).copied()
+        }
+    }
+
+    #[test]
+    fn semantic_scorer_promotes_differently_worded_skill_over_lexical_decoy() {
+        let scorer = Arc::new(StubScorer(std::collections::HashMap::from([
+            // Semantically related, wording differs from the query.
+            ("weekly-review".to_string(), 0.85),
+            // Lexically overlapping decoy the semantic scorer does not know.
+            ("review-words".to_string(), 0.0),
+        ])));
+        let router = SkillHitRouter::new().with_scorer(scorer);
+        let skills = vec![
+            def("review-words", &["review the weekly words"]),
+            def("weekly-review", &["retrospective"]),
+        ];
+
+        let hits = router.route("let us do the weekly words review", &skills);
+        assert_eq!(
+            hits.len(),
+            1,
+            "max_hits=1 must pick the promoted skill: {hits:?}"
+        );
+        assert_eq!(hits[0].skill, "weekly-review");
+        assert_eq!(
+            hits[0].score, 0.85,
+            "semantic score promotes above the lexical candidate"
+        );
+        assert!(
+            hits[0].triggers_matched.is_empty(),
+            "a semantic-only hit has no textual trigger"
+        );
+    }
+
+    #[test]
+    fn scorer_absent_or_unavailable_keeps_lexical_behaviour() {
+        let lexical = SkillHitRouter::new();
+        let skills = vec![def("weekly-review", &["weekly review"])];
+        let query = "please do a weekly review";
+
+        let baseline = lexical.route(query, &skills);
+
+        let all_none = SkillHitRouter::new()
+            .with_scorer(Arc::new(StubScorer(std::collections::HashMap::new())));
+        assert_eq!(
+            all_none.route(query, &skills),
+            baseline,
+            "a scorer with no data must be byte-identical to the lexical path"
+        );
+
+        let low = SkillHitRouter::new().with_scorer(Arc::new(StubScorer(
+            std::collections::HashMap::from([("weekly-review".to_string(), 0.1)]),
+        )));
+        assert_eq!(
+            low.route(query, &skills),
+            baseline,
+            "a scorer may never lower a lexically-earned hit"
+        );
     }
 
     #[test]
