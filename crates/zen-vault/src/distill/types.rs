@@ -466,7 +466,10 @@ pub struct VerificationNode {
 
 /// RLVR Tier-1 MemoryCard reward sidecar (FR-034) —
 /// persisted at `memories/.reward/{card_id}.json`, additive & non-destructive.
+/// `#[serde(default)]` keeps sidecars written by older builds decodable when
+/// new fields appear (forward-compatible reads reset only the new fields).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemoryReward {
     /// Total retrieval count for this memory card.
     pub access_count: u64,

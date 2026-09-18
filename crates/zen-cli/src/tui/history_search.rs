@@ -6,7 +6,8 @@
 
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-/// Substring matches always outrank fuzzy matches: score = SUBSTRING_BASE + recency_index.
+/// Substring matches always outrank fuzzy matches: substring score is a
+/// constant `SUBSTRING_BASE`; within a tier, recency (newest first) breaks ties.
 const SUBSTRING_BASE: u32 = 1_000_000;
 
 /// Reverse-i-search state machine. Owned by `App` as `Option<HistorySearch>`.
@@ -25,8 +26,6 @@ pub struct HistorySearch {
     /// Highlighted character indices per match (char positions, not byte offsets).
     /// Populated by fuzzy/substring matching; empty for entries without indices.
     pub matched_indices: Vec<Vec<usize>>,
-    /// Composite sort key per match (score DESC, recency tiebreak).
-    pub matched_scores: Vec<u32>,
     /// Reused nucleo-matcher engine (~135KB scratch, created once).
     fuzzy_matcher: Matcher,
 }
@@ -40,7 +39,6 @@ impl HistorySearch {
             match_index: 0,
             draft_snapshot: String::new(),
             matched_indices: Vec::new(),
-            matched_scores: Vec::new(),
             fuzzy_matcher: Matcher::new(Config::DEFAULT),
         }
     }
@@ -52,7 +50,6 @@ impl HistorySearch {
         self.matches.clear();
         self.match_index = 0;
         self.matched_indices.clear();
-        self.matched_scores.clear();
         self.draft_snapshot = current_text.to_string();
     }
 
@@ -63,7 +60,6 @@ impl HistorySearch {
         self.matches.clear();
         self.match_index = 0;
         self.matched_indices.clear();
-        self.matched_scores.clear();
         // draft_snapshot preserved until next enter() clears it
     }
 
@@ -110,7 +106,7 @@ impl HistorySearch {
     /// Recompute matches: case-insensitive substring + fuzzy matching via nucleo-matcher.
     ///
     /// Tiered scoring:
-    /// - **Substring tier**: candidate contains query (case-insensitive) → score = SUBSTRING_BASE + recency_index.
+    /// - **Substring tier**: candidate contains query (case-insensitive) → score = SUBSTRING_BASE (constant); recency orders within the tier.
     ///   Substring matches always outrank fuzzy-only matches.
     /// - **Fuzzy tier**: nucleo-matcher fuzzy_match score (algorithmic, u16→u32).
     /// - No match → excluded.
@@ -119,7 +115,6 @@ impl HistorySearch {
     pub(crate) fn recompute_matches(&mut self, history: &[String]) {
         self.matches.clear();
         self.matched_indices.clear();
-        self.matched_scores.clear();
 
         if self.query.is_empty() {
             // Empty query = full history newest-first, no filtering, no indices
@@ -128,7 +123,6 @@ impl HistorySearch {
                 if seen.insert(entry.clone()) {
                     self.matches.push(entry.clone());
                     self.matched_indices.push(Vec::new());
-                    self.matched_scores.push(0);
                 }
             }
         } else {
@@ -148,10 +142,12 @@ impl HistorySearch {
 
                 let entry_lower = entry.to_lowercase();
                 if entry_lower.contains(query_lower_str) {
-                    // Substring tier: find the char indices of the query occurrence
-                    let start = entry_lower.find(query_lower_str).unwrap_or(0);
+                    // `find` returns a BYTE offset; the renderer highlights
+                    // by CHAR index — convert or CJK entries misalign.
+                    let byte_start = entry_lower.find(query_lower_str).unwrap_or(0);
+                    let char_start = entry_lower[..byte_start].chars().count();
                     let indices: Vec<usize> =
-                        (start..start + query_lower.chars().count()).collect();
+                        (char_start..char_start + self.query.chars().count()).collect();
                     candidates.push((entry.clone(), true, SUBSTRING_BASE, indices, recency));
                 } else {
                     // Fuzzy tier: nucleo-matcher
@@ -174,7 +170,6 @@ impl HistorySearch {
             candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.4.cmp(&b.4)));
 
             for (text, _is_sub, _score, indices, _recency) in candidates {
-                self.matched_scores.push(0); // scores not exposed; sort already done
                 self.matched_indices.push(indices);
                 self.matches.push(text);
             }
@@ -450,6 +445,41 @@ mod tests {
                 "substring indices must be contiguous: {indices:?}"
             );
         }
+    }
+
+    #[test]
+    fn substring_indices_are_char_positions_for_cjk_entries() {
+        // Multibyte chars before the match: `find` byte offset (中文abc →
+        // "abc" at byte 6) must surface as CHAR indices [2, 3, 4], not [6..8].
+        let history = vec!["中文abc".into(), "你好zen世界".into()];
+        let mut hs = HistorySearch::new();
+        hs.enter("");
+        hs.query = "abc".into();
+        hs.recompute_matches(&history);
+        assert_eq!(hs.matches, vec!["中文abc".to_string()]);
+        assert_eq!(hs.current_match_indices(), vec![2, 3, 4]);
+
+        hs.query = "zen".into();
+        hs.recompute_matches(&history);
+        assert_eq!(hs.matches, vec!["你好zen世界".to_string()]);
+        assert_eq!(hs.current_match_indices(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn substring_indices_cjk_highlight_lands_on_match() {
+        // End-to-end invariant: the chars at the highlighted indices spell
+        // the query (the property the renderer relies on).
+        let history = vec!["知识库wiki笔记".into()];
+        let mut hs = HistorySearch::new();
+        hs.enter("");
+        hs.query = "wiki".into();
+        hs.recompute_matches(&history);
+        let indices = hs.current_match_indices();
+        let matched: String = indices
+            .iter()
+            .filter_map(|&i| hs.matches[0].chars().nth(i))
+            .collect();
+        assert_eq!(matched, "wiki");
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::types::ToolCall;
@@ -33,37 +33,22 @@ pub fn append_tool_call(log_dir: &Path, session_id: &str, record: &ToolCall) -> 
     Ok(())
 }
 
-pub fn aggregate_tool_calls(log_dir: &Path, session_id: &str) -> Vec<ToolCallAggregate> {
-    let path = log_dir.join(session_id).join("tool_calls.jsonl");
-    if !path.exists() {
-        return Vec::new();
-    }
+/// Per-tool outcome/latency samples plus error-category tallies shared by
+/// the aggregation folds.
+#[derive(Default)]
+struct ToolFold {
+    by_tool: HashMap<String, Vec<(bool, u64)>>,
+    error_counts: HashMap<String, HashMap<String, u64>>,
+}
 
-    let window_start = Utc::now() - Duration::days(30);
-    let file = match fs::File::open(&path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-    let reader = BufReader::new(file);
-
-    let mut by_tool: HashMap<String, Vec<(bool, u64)>> = HashMap::new();
-    let mut error_counts: HashMap<String, HashMap<String, u64>> = HashMap::new();
-
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let record: ToolCall = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
+impl ToolFold {
+    /// Fold one deserialized record into the tally, dropping entries older
+    /// than the window start.
+    fn fold_record(&mut self, record: ToolCall, window_start: DateTime<Utc>) {
         if record.recorded_at < window_start {
-            continue;
+            return;
         }
-
-        by_tool
+        self.by_tool
             .entry(record.tool.clone())
             .or_default()
             .push((record.success, record.latency_ms));
@@ -71,7 +56,8 @@ pub fn aggregate_tool_calls(log_dir: &Path, session_id: &str) -> Vec<ToolCallAgg
         if !record.success
             && let Some(cat) = &record.error_category
         {
-            *error_counts
+            *self
+                .error_counts
                 .entry(record.tool.clone())
                 .or_default()
                 .entry(cat.clone())
@@ -79,127 +65,108 @@ pub fn aggregate_tool_calls(log_dir: &Path, session_id: &str) -> Vec<ToolCallAgg
         }
     }
 
-    let mut aggregates: Vec<ToolCallAggregate> = Vec::new();
-
-    for (tool, entries) in &by_tool {
-        let total = entries.len() as u64;
-        let success_count = entries.iter().filter(|(s, _)| *s).count() as u64;
-        let success_rate = if total > 0 {
-            success_count as f64 / total as f64 * 100.0
-        } else {
-            0.0
+    /// Fold every JSONL line of a `tool_calls.jsonl` file, silently
+    /// skipping malformed lines and I/O errors.
+    fn fold_file(&mut self, path: &Path, window_start: DateTime<Utc>) {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return,
         };
-
-        let mut latencies: Vec<u64> = entries.iter().map(|(_, l)| *l).collect();
-        latencies.sort_unstable();
-        let median = percentile(&latencies, 0.5);
-        let p95 = percentile(&latencies, 0.95);
-
-        let most_common_error = error_counts
-            .get(tool)
-            .and_then(|errs| errs.iter().max_by_key(|(_, c)| *c).map(|(k, _)| k.clone()));
-
-        aggregates.push(ToolCallAggregate {
-            tool: tool.clone(),
-            total_calls: total,
-            success_count,
-            success_rate,
-            median_latency_ms: median,
-            p95_latency_ms: p95,
-            most_common_error,
-        });
+        let reader = BufReader::new(file);
+        for line_result in reader.lines() {
+            let Ok(line) = line_result else { break };
+            if let Ok(record) = serde_json::from_str::<ToolCall>(&line) {
+                self.fold_record(record, window_start);
+            }
+        }
     }
 
-    aggregates.sort_by_key(|b| std::cmp::Reverse(b.total_calls));
-    aggregates
+    fn finalize(self) -> Vec<ToolCallAggregate> {
+        let ToolFold {
+            by_tool,
+            error_counts,
+        } = self;
+        let mut aggregates: Vec<ToolCallAggregate> = by_tool
+            .into_iter()
+            .map(|(tool, entries)| {
+                let total = entries.len() as u64;
+                let success_count = entries.iter().filter(|(s, _)| *s).count() as u64;
+                let success_rate = if total > 0 {
+                    success_count as f64 / total as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let mut latencies: Vec<u64> = entries.iter().map(|(_, l)| *l).collect();
+                latencies.sort_unstable();
+                let most_common_error = error_counts
+                    .get(&tool)
+                    .and_then(|errs| errs.iter().max_by_key(|(_, c)| *c).map(|(k, _)| k.clone()));
+                ToolCallAggregate {
+                    tool,
+                    total_calls: total,
+                    success_count,
+                    success_rate,
+                    median_latency_ms: percentile(&latencies, 0.5),
+                    p95_latency_ms: percentile(&latencies, 0.95),
+                    most_common_error,
+                }
+            })
+            .collect();
+        aggregates.sort_by_key(|b| std::cmp::Reverse(b.total_calls));
+        aggregates
+    }
+}
+
+pub fn aggregate_tool_calls(log_dir: &Path, session_id: &str) -> Vec<ToolCallAggregate> {
+    let window_start = Utc::now() - Duration::days(30);
+    let mut fold = ToolFold::default();
+    fold.fold_file(
+        &log_dir.join(session_id).join("tool_calls.jsonl"),
+        window_start,
+    );
+    fold.finalize()
 }
 
 pub fn aggregate_all_sessions(log_dir: &Path) -> Vec<ToolCallAggregate> {
     let window_start = Utc::now() - Duration::days(30);
+    let mut fold = ToolFold::default();
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("tool_calls.jsonl");
+            if path.exists() {
+                fold.fold_file(&path, window_start);
+            }
+        }
+    }
+    fold.finalize()
+}
 
-    let mut by_tool: HashMap<String, Vec<(bool, u64)>> = HashMap::new();
-    let mut error_counts: HashMap<String, HashMap<String, u64>> = HashMap::new();
-
-    let entries = match fs::read_dir(log_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
+/// Best-effort GC for expired session logs: a `tool_calls.jsonl` whose
+/// mtime predates the retention window cannot contain in-window records
+/// (mtime tracks the last append), so its session directory is removed.
+/// Keeps session logs bounded on disk and aggregation O(active sessions).
+pub fn prune_expired_sessions(log_dir: &Path, retention_days: i64) {
+    let cutoff = Utc::now() - Duration::days(retention_days);
+    let cutoff_sys = std::time::SystemTime::from(cutoff);
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return;
     };
-
     for entry in entries.flatten() {
-        let tool_calls_path = entry.path().join("tool_calls.jsonl");
-        if !tool_calls_path.exists() {
+        let dir = entry.path();
+        let log_path = dir.join("tool_calls.jsonl");
+        let Ok(meta) = fs::metadata(&log_path) else {
             continue;
-        }
-        let file = match fs::File::open(&tool_calls_path) {
-            Ok(f) => f,
-            Err(_) => continue,
         };
-        let reader = BufReader::new(file);
-
-        for line_result in reader.lines() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            let record: ToolCall = match serde_json::from_str(&line) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            if record.recorded_at < window_start {
-                continue;
-            }
-
-            by_tool
-                .entry(record.tool.clone())
-                .or_default()
-                .push((record.success, record.latency_ms));
-
-            if !record.success
-                && let Some(cat) = &record.error_category
-            {
-                *error_counts
-                    .entry(record.tool.clone())
-                    .or_default()
-                    .entry(cat.clone())
-                    .or_insert(0) += 1;
-            }
+        let expired = meta.modified().map(|m| m < cutoff_sys).unwrap_or(false);
+        if expired {
+            let _ = fs::remove_file(&log_path);
+            let _ = fs::remove_dir(&dir);
+            tracing::debug!(
+                session_dir = %dir.display(),
+                "pruned expired tool-call session log"
+            );
         }
     }
-
-    let mut aggregates: Vec<ToolCallAggregate> = Vec::new();
-
-    for (tool, entries) in &by_tool {
-        let total = entries.len() as u64;
-        let success_count = entries.iter().filter(|(s, _)| *s).count() as u64;
-        let success_rate = if total > 0 {
-            success_count as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
-
-        let mut latencies: Vec<u64> = entries.iter().map(|(_, l)| *l).collect();
-        latencies.sort_unstable();
-        let median = percentile(&latencies, 0.5);
-        let p95 = percentile(&latencies, 0.95);
-
-        let most_common_error = error_counts
-            .get(tool)
-            .and_then(|errs| errs.iter().max_by_key(|(_, c)| *c).map(|(k, _)| k.clone()));
-
-        aggregates.push(ToolCallAggregate {
-            tool: tool.clone(),
-            total_calls: total,
-            success_count,
-            success_rate,
-            median_latency_ms: median,
-            p95_latency_ms: p95,
-            most_common_error,
-        });
-    }
-
-    aggregates.sort_by_key(|b| std::cmp::Reverse(b.total_calls));
-    aggregates
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -298,5 +265,75 @@ mod tests {
 
         let aggs = aggregate_tool_calls(log_dir, "real-session");
         assert_eq!(aggs.len(), 1);
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped_not_fatal() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path();
+
+        append_tool_call(log_dir, "s-mixed", &sample_record("fs.read", true, 50)).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(log_dir.join("s-mixed").join("tool_calls.jsonl"))
+            .unwrap();
+        writeln!(f, "{{ garbage").unwrap();
+        append_tool_call(log_dir, "s-mixed", &sample_record("fs.read", true, 80)).unwrap();
+
+        let aggs = aggregate_tool_calls(log_dir, "s-mixed");
+        assert_eq!(aggs[0].total_calls, 2);
+    }
+
+    #[test]
+    fn prune_removes_expired_session_dirs_only() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path();
+
+        append_tool_call(
+            log_dir,
+            "fresh-session",
+            &sample_record("fs.read", true, 50),
+        )
+        .unwrap();
+        append_tool_call(
+            log_dir,
+            "stale-session",
+            &sample_record("fs.read", true, 10),
+        )
+        .unwrap();
+
+        // Age the stale session's log past the retention window.
+        let stale_log = log_dir.join("stale-session").join("tool_calls.jsonl");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 45);
+        File::options()
+            .write(true)
+            .open(&stale_log)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        prune_expired_sessions(log_dir, 30);
+
+        assert!(
+            log_dir
+                .join("fresh-session")
+                .join("tool_calls.jsonl")
+                .exists()
+        );
+        assert!(!log_dir.join("stale-session").exists());
+    }
+
+    #[test]
+    fn prune_leaves_foreign_files_alone() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path();
+
+        fs::write(log_dir.join("stray.txt"), "not a session").unwrap();
+        fs::create_dir(log_dir.join("empty-dir")).unwrap();
+
+        prune_expired_sessions(log_dir, 30);
+
+        assert!(log_dir.join("stray.txt").exists());
+        assert!(log_dir.join("empty-dir").exists());
     }
 }

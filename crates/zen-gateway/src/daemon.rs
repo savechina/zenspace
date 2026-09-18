@@ -252,6 +252,12 @@ pub struct GatewayDaemonConfig {
     /// Default `false` — implicit daemons (`default_spawn`,
     /// `ZEN_SERVE_NO_SCHEDULER=1`) never host the scheduler.
     pub scheduler_hosted: bool,
+    /// Live scheduler presence, flipped by the scheduler host task once
+    /// the cross-process scheduler lease is acquired (a TUI holding the
+    /// lease delays the daemon's takeover). When `Some`, this overrides
+    /// `scheduler_hosted` on `health/status` so the flag never claims a
+    /// scheduler that is not actually running.
+    pub scheduler_live: Option<Arc<AtomicBool>>,
 }
 
 impl Default for GatewayDaemonConfig {
@@ -269,6 +275,7 @@ impl Default for GatewayDaemonConfig {
             qqbot: None,
             turn_executor: None,
             scheduler_hosted: false,
+            scheduler_live: None,
         }
     }
 }
@@ -308,6 +315,7 @@ pub struct GatewayService {
     compress_running: Arc<std::sync::atomic::AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     scheduler_hosted: bool,
+    scheduler_live: Option<Arc<AtomicBool>>,
     _claim: SoleOwnerClaim,
 }
 
@@ -459,6 +467,7 @@ impl GatewayService {
             compress_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_tx,
             scheduler_hosted: config.scheduler_hosted,
+            scheduler_live: config.scheduler_live.clone(),
             _claim: claim,
         })
     }
@@ -471,9 +480,14 @@ impl GatewayService {
         self
     }
 
-    /// Returns whether this gateway process hosts a `ZenScheduler`.
+    /// Returns whether this gateway process currently hosts a live
+    /// `ZenScheduler`: the lease-gated live flag when present, else the
+    /// static config flag.
     pub fn is_scheduler_hosted(&self) -> bool {
-        self.scheduler_hosted
+        self.scheduler_live
+            .as_ref()
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(self.scheduler_hosted)
     }
 
     /// Builds the hosted-turn executor exactly as `zen chat` does
@@ -736,7 +750,7 @@ impl GatewayService {
             "storeHealth": self.store_health().await,
             "activeTurns": self.hosting.turns.active_count(),
             "replay": self.replay_counters.snapshot(),
-            "scheduler": self.scheduler_hosted,
+            "scheduler": self.is_scheduler_hosted(),
         });
         if self.mode == GatewayMode::Embedded {
             snapshot["mode"] = serde_json::json!("embedded");

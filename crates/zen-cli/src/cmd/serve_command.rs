@@ -3,6 +3,8 @@ use colored::Colorize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tracing::info;
 
@@ -632,19 +634,39 @@ async fn run_uds_foreground(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_secs);
+    // Lease-gated scheduler presence: health/status must not claim a
+    // scheduler that is still waiting out a TUI-held lease, so the flag
+    // flips only after the daemon actually acquires the lease.
+    let scheduler_live = Arc::new(AtomicBool::new(false));
     let config = GatewayDaemonConfig {
         http: http_cfg,
         qqbot: qqbot_cfg,
         idle_exit,
         scheduler_hosted: scheduler_enabled(),
+        scheduler_live: Some(scheduler_live.clone()),
         ..GatewayDaemonConfig::default()
     };
     let socket = config.socket_path.display().to_string();
 
     if scheduler_enabled() {
         let zen_config = zen_core::config::load_config()?;
-        let scheduler = zen_agents::scheduler::create_configured_scheduler(&zen_config.cron);
+        let cron = zen_config.cron.clone();
         tokio::spawn(async move {
+            // The daemon outlives TUIs, so it retries until the lease is
+            // free (typical acquire is immediate: no TUI holds it).
+            // `_lease` must stay alive for the scheduler's lifetime —
+            // dropping it releases the mutual exclusion.
+            let _lease = loop {
+                match ZenPaths::detect()
+                    .ok()
+                    .and_then(|paths| zen_agents::scheduler::SchedulerLease::try_acquire(&paths))
+                {
+                    Some(lease) => break lease,
+                    None => tokio::time::sleep(Duration::from_secs(30)).await,
+                }
+            };
+            scheduler_live.store(true, std::sync::atomic::Ordering::Relaxed);
+            let scheduler = zen_agents::scheduler::create_configured_scheduler(&cron);
             scheduler.run().await;
         });
         info!("Background scheduler started");

@@ -28,6 +28,8 @@ use cron::Schedule;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
+pub mod lease;
+pub use lease::SchedulerLease;
 pub use workers::*;
 use zen_core::config::{
     CronConfig, default_daily_log_schedule, default_night_dream_schedule,

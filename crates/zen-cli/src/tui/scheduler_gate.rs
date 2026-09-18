@@ -2,21 +2,24 @@
 //! learning-core scheduler for its lifetime (in-app background
 //! learning, daemon-optional) and spawns it when safe.
 //!
-//! Coexistence rule: spawn unless `[cron] tui_scheduler` is off OR a
-//! live daemon reports `scheduler: true` via health/status (an explicit
-//! `zen serve start` already hosts the full scheduler). Implicit
-//! daemons (TUI/chat-spawned, `ZEN_SERVE_NO_SCHEDULER=1`) report false
-//! and never suppress the in-app spawn; an unreachable/absent daemon
-//! means the TUI is the only learner and must spawn.
+//! Coexistence rule: spawn unless `[cron] tui_scheduler` is off, a live
+//! daemon reports `scheduler: true` via health/status (an explicit
+//! `zen serve start` already hosts the full scheduler), or the
+//! cross-process scheduler lease is held (another TUI got there first —
+//! probe-then-spawn alone is TOCTOU). Implicit daemons (TUI/chat-spawned,
+//! `ZEN_SERVE_NO_SCHEDULER=1`) report false and never suppress the
+//! in-app spawn; an unreachable/absent daemon means the TUI is the only
+//! learner and must spawn.
 
 use std::time::Duration;
 
 use zen_core::config::ZenConfig;
+use zen_core::paths::ZenPaths;
 
 /// Probe budget: bounded wait for the prewarmed surface + one health
 /// RPC. Beyond this, treat the daemon as absent (fail open — the
-/// scheduler markers make double-fire idempotent, but learning delay
-/// is real).
+/// scheduler lease + worker markers make double-fire safe, but learning
+/// delay is real).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pure coexistence decision (unit-testable).
@@ -72,6 +75,22 @@ pub(crate) fn spawn(config: &ZenConfig) {
             );
             return;
         }
+        // Cross-process mutual exclusion: another TUI (or a daemon that
+        // has not yet surfaced `scheduler: true`) may already hold the
+        // lease. Fail closed here — learning resumes in the next TUI
+        // session once the current holder exits.
+        let lease = match ZenPaths::detect()
+            .ok()
+            .and_then(|paths| zen_agents::scheduler::SchedulerLease::try_acquire(&paths))
+        {
+            Some(lease) => lease,
+            None => {
+                tracing::info!(
+                    "tui scheduler: lease held by another scheduler host, skipping in-app spawn"
+                );
+                return;
+            }
+        };
         tracing::info!(
             ?daemon_scheduler,
             "tui scheduler: spawning learning-core scheduler in-process"
@@ -81,6 +100,7 @@ pub(crate) fn spawn(config: &ZenConfig) {
             zen_agents::scheduler::SchedulerProfile::InApp,
         );
         scheduler.run().await;
+        drop(lease);
     });
 }
 
