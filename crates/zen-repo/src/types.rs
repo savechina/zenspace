@@ -80,25 +80,10 @@ pub struct GraphSearchResult {
     pub direction: String,
 }
 
-#[derive(FromRow, Debug, Clone)]
-pub struct ShortestPathResult {
-    pub notion: String,
-    pub distance: f64,
-    pub depth: u32,
-    pub path: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct PageRankResult {
     pub notion: String,
     pub score: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct ComponentResult {
-    pub notion: String,
-    pub component_id: i64,
-    pub component_size: i64,
 }
 
 /// A community detected by the partitioner (T141).

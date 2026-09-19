@@ -2,8 +2,7 @@
 
 use crate::client::Result;
 use crate::types::{
-    ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionRow, PageRankResult,
-    RelationRow, ShortestPathResult,
+    GraphSearchResult, InsertRelationshipRequest, NotionRow, PageRankResult, RelationRow,
 };
 
 pub trait NotionsRepository {
@@ -94,19 +93,6 @@ pub trait NotionsRepository {
         relation_type_filter: &str,
     ) -> Result<Vec<GraphSearchResult>>;
 
-    async fn shortest_paths_all(
-        &self,
-        notion_name: &str,
-        max_depth: u32,
-    ) -> Result<Vec<ShortestPathResult>>;
-
-    async fn shortest_path(
-        &self,
-        src_name: &str,
-        dst_name: &str,
-        max_depth: u32,
-    ) -> Result<Option<ShortestPathResult>>;
-
     async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>>;
 
     async fn personalized_pagerank(
@@ -116,8 +102,6 @@ pub trait NotionsRepository {
         damping: f64,
         restart: f64,
     ) -> Result<Vec<PageRankResult>>;
-
-    async fn connected_components(&self) -> Result<Vec<ComponentResult>>;
 
     async fn apply_confidence_decay(&self, half_life_days: f64) -> Result<usize>;
 

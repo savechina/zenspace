@@ -5,8 +5,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{
-    Community, CommunityMember, ComponentResult, GraphSearchResult, InsertRelationshipRequest,
-    NoteStageRow, NotionRow, PageRankResult, RelationRow, ShortestPathResult,
+    Community, CommunityMember, GraphSearchResult, InsertRelationshipRequest, NoteStageRow,
+    NotionRow, PageRankResult, RelationRow,
 };
 
 /// Canonical alias normalization (FR-022). Applied on both write
@@ -663,76 +663,6 @@ impl<'a> NotionsRepo<'a> {
         Ok(results)
     }
 
-    pub async fn shortest_paths_all(
-        &self,
-        notion_name: &str,
-        max_depth: u32,
-    ) -> Result<Vec<ShortestPathResult>> {
-        if notion_name.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let rows = sqlx::query(
-            "WITH RECURSIVE \
-             edge_set(from_id, to_id, weight) AS ( \
-                 SELECT source_notion_id, target_notion_id, weight \
-                 FROM relationships \
-                 WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL \
-                 UNION ALL \
-                 SELECT target_notion_id, source_notion_id, weight \
-                 FROM relationships \
-                 WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL \
-             ), \
-             walker(id, name, total_weight, depth, path_names, path_ids) AS ( \
-                 SELECT id, name, 0.0, 0, name, ',' || id || ',' \
-                 FROM notions WHERE name = ?1 \
-                 UNION ALL \
-                 SELECT e.id, e.name, w.total_weight + edge.weight, w.depth + 1, \
-                        w.path_names || ' -> ' || e.name, w.path_ids || e.id || ',' \
-                 FROM walker w \
-                 JOIN edge_set edge ON edge.from_id = w.id \
-                 JOIN notions e ON e.id = edge.to_id \
-                 WHERE w.depth < ?2 \
-                   AND instr(w.path_ids, ',' || e.id || ',') = 0 \
-             ) \
-             SELECT pe.name as notion, \
-                    pe.total_weight as distance, \
-                    pe.depth as depth, \
-                    pe.path_names as path \
-             FROM walker pe \
-             WHERE pe.depth > 0 AND pe.total_weight = ( \
-                 SELECT MIN(pe2.total_weight) FROM walker pe2 WHERE pe2.name = pe.name \
-             ) \
-             ORDER BY pe.total_weight, pe.name",
-        )
-        .bind(notion_name)
-        .bind(max_depth)
-        .fetch_all(self.client.pool())
-        .await?;
-
-        let results = rows
-            .into_iter()
-            .map(|row| ShortestPathResult {
-                notion: row.get::<String, _>("notion"),
-                distance: row.get::<f64, _>("distance"),
-                depth: row.get::<i64, _>("depth") as u32,
-                path: row.get::<String, _>("path"),
-            })
-            .collect();
-
-        Ok(results)
-    }
-
-    pub async fn shortest_path(
-        &self,
-        src_name: &str,
-        dst_name: &str,
-        max_depth: u32,
-    ) -> Result<Option<ShortestPathResult>> {
-        let all = self.shortest_paths_all(src_name, max_depth).await?;
-        Ok(all.into_iter().find(|r| r.notion == dst_name))
-    }
-
     async fn load_graph_core(&self) -> Result<GraphCore> {
         let notion_rows = sqlx::query("SELECT id, name FROM notions ORDER BY name")
             .fetch_all(self.client.pool())
@@ -860,87 +790,6 @@ impl<'a> NotionsRepo<'a> {
         Ok(run_pagerank_core(
             &core, teleport, iterations, damping, restart,
         ))
-    }
-
-    pub async fn connected_components(&self) -> Result<Vec<ComponentResult>> {
-        let notion_rows = sqlx::query("SELECT id, name FROM notions ORDER BY name")
-            .fetch_all(self.client.pool())
-            .await?;
-
-        let notions: Vec<(String, String)> = notion_rows
-            .iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
-            .collect();
-
-        let n = notions.len();
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-
-        let edge_rows = sqlx::query(
-            "SELECT source_notion_id, target_notion_id FROM relationships \
-             WHERE (valid_until IS NULL OR valid_until = '') AND t_invalid IS NULL",
-        )
-        .fetch_all(self.client.pool())
-        .await?;
-
-        let id_to_idx: HashMap<String, usize> = notions
-            .iter()
-            .enumerate()
-            .map(|(i, (id, _))| (id.clone(), i))
-            .collect();
-
-        let mut adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-        for row in &edge_rows {
-            let src = row.get::<String, _>(0);
-            let tgt = row.get::<String, _>(1);
-            if let (Some(&s), Some(&t)) = (id_to_idx.get(&src), id_to_idx.get(&tgt)) {
-                adj[s].insert(t);
-                adj[t].insert(s);
-            }
-        }
-
-        let mut component_id = vec![-1i64; n];
-        let mut component_sizes: HashMap<i64, i64> = HashMap::new();
-        let mut current_component = 0i64;
-
-        for start in 0..n {
-            if component_id[start] != -1 {
-                continue;
-            }
-
-            let mut queue = vec![start];
-            let mut visited = HashSet::new();
-            visited.insert(start);
-            component_id[start] = current_component;
-
-            while let Some(node) = queue.pop() {
-                for &neighbor in &adj[node] {
-                    if !visited.contains(&neighbor) {
-                        visited.insert(neighbor);
-                        component_id[neighbor] = current_component;
-                        queue.push(neighbor);
-                    }
-                }
-            }
-
-            let size = visited.len() as i64;
-            component_sizes.insert(current_component, size);
-
-            current_component += 1;
-        }
-
-        let results = notions
-            .iter()
-            .enumerate()
-            .map(|(i, (_, name))| ComponentResult {
-                notion: name.clone(),
-                component_id: component_id[i],
-                component_size: component_sizes[&component_id[i]],
-            })
-            .collect();
-
-        Ok(results)
     }
 
     /// Deterministic Louvain communities over the undirected weighted projection
@@ -1409,23 +1258,6 @@ impl crate::traits::notions::NotionsRepository for NotionsRepo<'_> {
         NotionsRepo::bfs_search_filtered(self, notion_name, max_depth, relation_type_filter).await
     }
 
-    async fn shortest_paths_all(
-        &self,
-        notion_name: &str,
-        max_depth: u32,
-    ) -> Result<Vec<ShortestPathResult>> {
-        NotionsRepo::shortest_paths_all(self, notion_name, max_depth).await
-    }
-
-    async fn shortest_path(
-        &self,
-        src_name: &str,
-        dst_name: &str,
-        max_depth: u32,
-    ) -> Result<Option<ShortestPathResult>> {
-        NotionsRepo::shortest_path(self, src_name, dst_name, max_depth).await
-    }
-
     async fn pagerank(&self, iterations: usize, damping: f64) -> Result<Vec<PageRankResult>> {
         NotionsRepo::pagerank(self, iterations, damping).await
     }
@@ -1438,10 +1270,6 @@ impl crate::traits::notions::NotionsRepository for NotionsRepo<'_> {
         restart: f64,
     ) -> Result<Vec<PageRankResult>> {
         NotionsRepo::personalized_pagerank(self, seeds, iterations, damping, restart).await
-    }
-
-    async fn connected_components(&self) -> Result<Vec<ComponentResult>> {
-        NotionsRepo::connected_components(self).await
     }
 
     async fn apply_confidence_decay(&self, half_life_days: f64) -> Result<usize> {
