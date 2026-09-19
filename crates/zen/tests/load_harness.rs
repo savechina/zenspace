@@ -34,14 +34,20 @@ const QUARANTINE_LIMIT: f64 = 0.05;
 /// budget needs (100 notes / 10 per cycle = 10), so hitting it means stranding.
 const MAX_CYCLES: usize = 30;
 
-fn seed_notes(test: &ZenTest, count: usize) {
+/// Seed `count` notes named `<prefix>-000.md` …
+///
+/// The prefix keeps the baseline note out of the batch's namespace: with the
+/// same name and content it would be the same FR-011 identity, and the dedup
+/// would (correctly) discard it as an already-archived duplicate instead of
+/// counting it toward the batch.
+fn seed_notes(test: &ZenTest, prefix: &str, count: usize) {
     let inbox = test.cwd.join("vault").join("inbox");
     fs::create_dir_all(&inbox).expect("create inbox dir");
     for index in 0..count {
         fs::write(
-            inbox.join(format!("load-{index:03}.md")),
+            inbox.join(format!("{prefix}-{index:03}.md")),
             format!(
-                "---\ntags: [load]\n---\n\n# Load note {index}\n\n\
+                "---\ntags: [load]\n---\n\n# {prefix} note {index}\n\n\
                  The cache router handles {index} requests with retry logic, \
                  backoff, and a bounded queue.\n"
             ),
@@ -121,7 +127,7 @@ fn sc004_batch_of_100_notes_is_processed_without_degradation_or_loss() {
     assert!(init.success(), "workspace init failed: {}", init.stderr());
 
     // Baseline: one note, one cycle — the reference point for degradation.
-    seed_notes(&test, 1);
+    seed_notes(&test, "baseline", 1);
     let (baseline_elapsed, baseline_report) = run_cycle(&test);
     assert_eq!(metric(&baseline_report, "notes_processed"), 1);
     let baseline_per_note = baseline_elapsed.as_secs_f64() / 1.0;
@@ -131,7 +137,7 @@ fn sc004_batch_of_100_notes_is_processed_without_degradation_or_loss() {
     // at the start of the next cycle — so the batch is drained over several
     // cycles and the measured rate is what SC-004 ("100+ notes per hour")
     // actually constrains.
-    seed_notes(&test, BATCH);
+    seed_notes(&test, "load", BATCH);
     assert_eq!(inbox_depth(&test), BATCH, "batch must be fully seeded");
 
     let archive_dir = test.cwd.join("vault").join("archive");
