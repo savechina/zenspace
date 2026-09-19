@@ -3,9 +3,9 @@
 #          Same as `zen` but all data goes to $HOME/.zentest/ (global dev loop).
 #          ~/.zen is NEVER touched — production stays clean.
 #          Test data persists for debugging across runs and repos.
-# USAGE:   bin/test-zen                          # opens TUI in isolated env
-#          bin/test-zen note create "test"       # runs command in isolated env
-#          bin/test-zen workspace init           # init in isolated env
+# USAGE:   bin/zentest                          # opens TUI in isolated env
+#          bin/zentest note create "test"       # runs command in isolated env
+#          bin/zentest workspace init           # init in isolated env
 # EXPECTED: Identical behavior to bin/zen, all data in ~/.zentest/
 # ERRORS:  Binary not built → `cargo build -p zen` first.
 #

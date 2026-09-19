@@ -427,6 +427,16 @@ impl Default for LoopBudget {
 }
 
 impl LoopBudget {
+    /// Budget with explicit ceilings, consumed counters zeroed.
+    pub fn with_limits(max_steps: u32, max_tokens: u32) -> Self {
+        Self {
+            max_steps,
+            max_tokens,
+            consumed_steps: 0,
+            consumed_tokens: 0,
+        }
+    }
+
     /// Consume one step; returns false when over budget → pending pool.
     pub fn consume_step(&mut self) -> bool {
         if self.consumed_steps >= self.max_steps {

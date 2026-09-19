@@ -508,6 +508,14 @@ pub struct LoopConfig {
     /// scan exceeds this is skipped with a 30-minute backoff (macOS TCC
     /// denial can hang `opendir` indefinitely). Default 60.
     pub host_stage_timeout_secs: Option<u64>,
+    /// Per-cycle step budget (FR-032 LoopBudget): notes processed per cycle;
+    /// the remainder is deferred to `vault/archive/pending/` and re-queued next
+    /// cycle. Default 10 — SC-004 requires 100+ notes/hour and the default
+    /// 5-minute interval gives 12 cycles/hour, so fewer than 9 steps/cycle
+    /// cannot meet it (the previous fixed 5 capped throughput at 60/hour).
+    pub max_steps: Option<u32>,
+    /// Per-cycle token budget (FR-032 LoopBudget). Default 8000.
+    pub max_tokens: Option<u32>,
 }
 
 impl LoopConfig {
@@ -529,6 +537,18 @@ impl LoopConfig {
 
     pub fn max_attempts_or_default(&self) -> u32 {
         self.max_attempts.unwrap_or(3)
+    }
+
+    /// Per-cycle note budget. Default 10 so the default 5-minute interval
+    /// yields ≥100 notes/hour (SC-004); clamped to 1..=100 so a typo cannot
+    /// disable the loop's budget or make a single cycle unbounded.
+    pub fn max_steps_or_default(&self) -> u32 {
+        self.max_steps.unwrap_or(10).clamp(1, 100)
+    }
+
+    /// Per-cycle token budget. Default 8000; clamped to 1..=1_000_000.
+    pub fn max_tokens_or_default(&self) -> u32 {
+        self.max_tokens.unwrap_or(8_000).clamp(1, 1_000_000)
     }
 
     pub fn min_free_bytes_or_default(&self) -> u64 {
@@ -1768,6 +1788,8 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
         raw_graph_routing: ov.raw_graph_routing.or(base.raw_graph_routing),
         cas_commit: ov.cas_commit.or(base.cas_commit),
         host_stage_timeout_secs: ov.host_stage_timeout_secs.or(base.host_stage_timeout_secs),
+        max_steps: ov.max_steps.or(base.max_steps),
+        max_tokens: ov.max_tokens.or(base.max_tokens),
     }
 }
 
@@ -2123,6 +2145,16 @@ fn apply_loop_env(cfg: &mut LoopConfig) {
         && n > 0
     {
         cfg.host_stage_timeout_secs = Some(n);
+    }
+    if let Some(v) = env_u32("ZEN_LOOP_MAX_STEPS")
+        && v > 0
+    {
+        cfg.max_steps = Some(v);
+    }
+    if let Some(v) = env_u32("ZEN_LOOP_MAX_TOKENS")
+        && v > 0
+    {
+        cfg.max_tokens = Some(v);
     }
 }
 

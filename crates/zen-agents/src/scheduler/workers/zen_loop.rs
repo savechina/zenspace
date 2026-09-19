@@ -714,6 +714,58 @@ fn inbox_listing(inbox: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Move budget-deferred notes from `vault/archive/pending/` back into the
+/// inbox so the next cycle processes them. Returns how many were re-queued.
+///
+/// The pipeline defers over-budget notes to the pending pool (T033/FR-032);
+/// that pool is only a staging area, so without this the notes would never
+/// re-enter the pipeline. A note whose move fails stays in the pool and is
+/// retried next cycle, so nothing is dropped on a transient error.
+fn requeue_pending(paths: &ZenPaths, logs_dir: &Path) -> usize {
+    let pending_dir = paths.archive().join("pending");
+    let Ok(entries) = std::fs::read_dir(&pending_dir) else {
+        return 0;
+    };
+    let mut requeued = 0usize;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let source = entry.path();
+        let is_markdown = source
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        if !source.is_file() || !is_markdown {
+            continue;
+        }
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let dest = paths.inbox().join(name);
+        if dest.exists() {
+            continue;
+        }
+        match std::fs::rename(&source, &dest) {
+            Ok(()) => requeued += 1,
+            Err(e) => warn!(
+                source = %source.display(),
+                error = %e,
+                "loop: pending note re-queue failed (retried next cycle)"
+            ),
+        }
+    }
+    if requeued > 0
+        && let Err(e) = append_jsonl_line(
+            &logs_dir.join("audit.jsonl"),
+            &serde_json::json!({
+                "kind": "loop.pending.requeued",
+                "count": requeued,
+            }),
+        )
+    {
+        warn!(error = %e, "loop: pending re-queue audit append failed");
+    }
+    requeued
+}
+
 /// Stage new host files into `_incoming/{host_hash}/` (T043).
 ///
 /// A file is staged only when neither the pending slot nor the promoted
@@ -906,6 +958,18 @@ impl ZenWorker for ZenLoopWorker {
         let mut gaps: Vec<GapRecord> = Vec::new();
         self.ingest_sweep(&paths, &mut gaps, &cycle_id).await;
 
+        // T033 (FR-032) / SC-004: re-queue notes deferred to the pending pool
+        // by a previous cycle's budget. Without this the pool is write-only —
+        // deferred notes would never re-enter the pipeline and would be
+        // silently lost (found by the SC-004 load harness).
+        let requeued = requeue_pending(&paths, &logs_dir);
+        if requeued > 0 {
+            info!(
+                requeued,
+                "loop: re-queued budget-deferred notes from pending pool"
+            );
+        }
+
         // T018: snapshot pre-cycle checksums for the concurrent-modification
         // gate — a file edited mid-cycle is left for the next cycle.
         let inbox_before = inbox_listing(&paths.inbox());
@@ -942,9 +1006,14 @@ impl ZenWorker for ZenLoopWorker {
         };
         let pipeline =
             DistillationPipeline::new().with_cas_commit(loop_cfg.cas_commit_or_default());
-        // T033 (FR-032): per-cycle LoopBudget — constructs from config defaults
-        // since LoopConfig doesn't expose max_steps/max_tokens fields yet.
-        let mut budget = LoopBudget::default();
+        // T033 (FR-032): per-cycle LoopBudget from `[agentic.loop] max_steps` /
+        // `max_tokens`. Notes deferred to the pending pool are re-queued at the
+        // start of the next cycle (see `requeue_pending`), so the budget bounds
+        // per-cycle work without stranding notes.
+        let mut budget = LoopBudget::with_limits(
+            loop_cfg.max_steps_or_default(),
+            loop_cfg.max_tokens_or_default(),
+        );
         let distill = pipeline
             .run_scoped(
                 &paths.inbox(),

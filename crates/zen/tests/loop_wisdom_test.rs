@@ -434,8 +434,11 @@ fn sc015_budget_pending_pool_and_git_history() {
         assert!(out.status.success(), "git {:?} failed", args);
     }
 
-    // 7 notes > LoopBudget max_steps (5): the overflow defers to
-    // vault/archive/pending/ instead of the normal archive.
+    // 7 notes > the configured per-cycle step budget (2): the overflow defers
+    // to vault/archive/pending/ instead of the normal archive. The budget is
+    // set explicitly so this keeps testing deferral independently of the
+    // default (which SC-004 raised to 10 notes/cycle).
+    test.env.insert("ZEN_LOOP_MAX_STEPS".into(), "2".into());
     for i in 1..=7 {
         seed_inbox_note(
             &test,
@@ -453,6 +456,20 @@ fn sc015_budget_pending_pool_and_git_history() {
     assert!(
         !pending.is_empty(),
         "SC-015: over-budget notes must defer to vault/archive/pending"
+    );
+
+    // The pending pool is a staging area, not a terminus: the next cycle must
+    // re-queue and drain it. Without this the deferred notes would never be
+    // processed again (found by the SC-004 load harness).
+    run_loop(&test);
+    let pending_after =
+        find_files_recursively(&test.cwd.join("vault").join("archive").join("pending"));
+    assert!(
+        pending_after.len() < pending.len(),
+        "deferred notes must be re-queued and drained on the next cycle: \
+         before={} after={}",
+        pending.len(),
+        pending_after.len()
     );
 
     let logs = test.cwd.join(".zen").join("logs");

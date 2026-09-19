@@ -1,0 +1,20 @@
+#!/bin/bash
+# PURPOSE: Run the SC-004 load harness — a 100-note inbox batch through one
+#          processing loop cycle in an isolated ZEN_HOME, asserting the spec's
+#          measurable outcomes (spec.md:183): <60 min wall time, zero note
+#          loss, <=5% quarantine, and per-note cost within 2x the single-note
+#          baseline.
+# USAGE:   bin/load-harness            # run the harness
+#          bin/load-harness --nocapture  # also print the measured metrics
+# EXPECTED: test result: ok. 1 passed ... plus a "SC-004 load harness:" metrics
+#           line when --nocapture is passed.
+# ERRORS:  Test failure names the breached threshold and the measured value.
+#          Binary not built → run `cargo build -p zen` first.
+#
+# Isolation: the harness (crates/zen/tests/load_harness.rs) uses the ZenTest
+# temporary ZEN_HOME, so ~/.zen is never touched and no provider keys leak into
+# the run — it exercises the deterministic heuristic path.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+exec cargo test -p zen --test load_harness -- --ignored "$@"
