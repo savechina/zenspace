@@ -457,6 +457,8 @@ pub struct AgenticConfig {
     pub delegate: DelegateConfig,
     /// Orchestrator tool surface — TOML `[agentic.orchestrator]` (T378).
     pub orchestrator: OrchestratorConfig,
+    /// Intent classification tuning — TOML `[agentic.intent]` (T168).
+    pub intent: IntentConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -817,6 +819,32 @@ impl OrchestratorConfig {
     /// True when the orchestrator must run delegation-only.
     pub fn delegation_only(&self) -> bool {
         self.surface_or_default() == ORCHESTRATOR_SURFACE_DELEGATION_ONLY
+    }
+}
+
+/// Intent classification configuration — TOML `[agentic.intent]` (T168).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates the L1 shadow observation at the intent decision
+///   point — the embedding router runs after the production decision and
+///   records a `loop.decision` audit line; it never affects routing.
+/// - User impact: enabling it starts accumulating calibration data (L1 vs
+///   production disagreements are the highest-information samples for T173).
+/// - Default: false — per-turn cost is unchanged until the user opts in.
+/// - Interaction: `ZEN_INTENT_SHADOW_EMBEDDING` env var overrides any config
+///   layer (5th layer).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct IntentConfig {
+    /// Run the L1 embedding rung in shadow (observation-only) after each
+    /// intent classification. Default false.
+    pub shadow_embedding: Option<bool>,
+}
+
+impl IntentConfig {
+    /// Effective shadow-embedding flag (default false).
+    pub fn shadow_embedding_or_default(&self) -> bool {
+        self.shadow_embedding.unwrap_or(false)
     }
 }
 
@@ -1768,6 +1796,9 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
         orchestrator: OrchestratorConfig {
             surface: ov.orchestrator.surface.or(base.orchestrator.surface),
         },
+        intent: IntentConfig {
+            shadow_embedding: ov.intent.shadow_embedding.or(base.intent.shadow_embedding),
+        },
     }
 }
 
@@ -2088,6 +2119,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_review_env(&mut config.agentic.review);
     apply_delegate_env(&mut config.agentic.delegate);
     apply_orchestrator_env(&mut config.agentic.orchestrator);
+    apply_intent_env(&mut config.agentic.intent);
     apply_skills_env(&mut config.skills.auto_route);
     config
 }
@@ -2140,6 +2172,12 @@ fn apply_delegate_env(cfg: &mut DelegateConfig) {
 fn apply_orchestrator_env(cfg: &mut OrchestratorConfig) {
     if let Some(v) = env_str("ZEN_ORCHESTRATOR_SURFACE") {
         cfg.surface = Some(v);
+    }
+}
+
+fn apply_intent_env(cfg: &mut IntentConfig) {
+    if let Some(v) = env_bool("ZEN_INTENT_SHADOW_EMBEDDING") {
+        cfg.shadow_embedding = Some(v);
     }
 }
 
@@ -2795,6 +2833,35 @@ provider = "anthropic"
         assert_eq!(cfg.agentic.tool_loop.max_rounds_or_default(), 16);
 
         unsafe { std::env::remove_var("ZEN_TOOL_MAX_ROUNDS") };
+    }
+
+    #[test]
+    fn intent_shadow_embedding_defaults_off_and_env_overrides() {
+        // Default: shadow observation off — per-turn cost unchanged until opt-in.
+        assert!(
+            !ZenConfig::default()
+                .agentic
+                .intent
+                .shadow_embedding_or_default()
+        );
+
+        // TOML layer: [agentic.intent] shadow_embedding = true.
+        let config: ZenConfig =
+            toml::from_str("[agentic.intent]\nshadow_embedding = true\n").unwrap();
+        assert!(config.agentic.intent.shadow_embedding_or_default());
+
+        // 5th layer: ZEN_INTENT_SHADOW_EMBEDDING env override.
+        // SAFETY: test-only env mutation; read by no sibling test in this
+        // binary and removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_INTENT_SHADOW_EMBEDDING", "1") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.intent.shadow_embedding_or_default());
+
+        unsafe { std::env::set_var("ZEN_INTENT_SHADOW_EMBEDDING", "false") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(!cfg.agentic.intent.shadow_embedding_or_default());
+
+        unsafe { std::env::remove_var("ZEN_INTENT_SHADOW_EMBEDDING") };
     }
 
     #[test]

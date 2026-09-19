@@ -126,6 +126,21 @@ fn auto_route_enabled() -> bool {
     }
 }
 
+/// T168: `[agentic.intent] shadow_embedding` gate — L1 shadow observation at
+/// the intent decision point is opt-in (default off) so per-turn cost is
+/// unchanged until the user enables it to accumulate calibration data.
+/// Config load failure fails closed (shadow off) — observation must never
+/// surprise a misconfigured workspace.
+fn shadow_embedding_enabled() -> bool {
+    match zen_core::config::load_config() {
+        Ok(config) => config.agentic.intent.shadow_embedding_or_default(),
+        Err(e) => {
+            warn!(error = %e, "config load failed; intent shadow observation stays off");
+            false
+        }
+    }
+}
+
 /// FR-040: emit the memory nudge when `user_turns` hits the 10-turn
 /// cadence ([`zen_memory::memory_nudge_due`]). Logs + `logs/memory-nudges.jsonl`
 /// append only — the nudge never enters the model token stream (no callback
@@ -774,6 +789,20 @@ impl AgentOrchestrator {
             session.sensitivity_policy,
         )
         .await;
+        // T168: L1 shadow observation — records the L1 embedding rung's
+        // verdict alongside the production decision; never affects routing.
+        if shadow_embedding_enabled()
+            && let Ok(paths) = ZenPaths::detect()
+        {
+            crate::decision::run_intent_shadow(
+                &paths,
+                &session.session_id.to_string(),
+                user_query,
+                &intent,
+                None,
+            )
+            .await;
+        }
         let agent_name = intent.agent.clone();
         info!(
             agent = agent_name,
@@ -1467,6 +1496,20 @@ impl AgentOrchestrator {
             session.sensitivity_policy,
         )
         .await;
+        // T168: L1 shadow observation — records the L1 embedding rung's
+        // verdict alongside the production decision; never affects routing.
+        if shadow_embedding_enabled()
+            && let Ok(paths) = ZenPaths::detect()
+        {
+            crate::decision::run_intent_shadow(
+                &paths,
+                &session.session_id.to_string(),
+                user_query,
+                &intent,
+                None,
+            )
+            .await;
+        }
         let agent_name = intent.agent.clone();
         info!(
             agent = agent_name,

@@ -1,6 +1,7 @@
 pub mod agent_profile;
 pub mod completion_model;
 pub mod context;
+pub mod decision;
 pub mod delegate_task;
 pub mod delegate_tools;
 pub mod execution;
@@ -41,6 +42,10 @@ pub use agent_profile::{
     Role,
 };
 pub use context::AgentContext;
+pub use decision::{
+    DecisionError, DecisionFn, DecisionOutcome, DecisionRung, EmbeddingIntentRouter, KeywordRung,
+    LlmRung, TextEmbedder, VaultTextEmbedder,
+};
 pub use execution::{AgentExecution, ExecutionMetadata, ToolCall};
 pub use executor::{AgentExecutor, ErrorCategory, RetryPolicy};
 pub use observability::{emit_prompt_completed, emit_prompt_failed, emit_prompt_started};
