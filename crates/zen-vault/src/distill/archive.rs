@@ -107,6 +107,21 @@ pub struct ArchiveCell {
 }
 
 impl ArchiveCell {
+    /// Classify a hypothesis into its deterministic cell. Single classifier
+    /// shared by [`Archive::refresh`] and [`Archive::prioritize`] so candidate
+    /// cells are directly comparable with archived ones.
+    pub fn of(h: &HypothesisSlug, rejected: &[RejectedHypothesis]) -> Self {
+        Self {
+            evidence: EvidenceAxis::of(h),
+            kind: KindAxis::of(h.gap_kind),
+            freshness: if is_revisiting(h, rejected) {
+                FreshnessAxis::Revisited
+            } else {
+                FreshnessAxis::Fresh
+            },
+        }
+    }
+
     pub fn key(&self) -> String {
         format!(
             "{}|{}|{}",
@@ -170,22 +185,11 @@ impl Archive {
         let rejected = load_rejected(rejected_dir);
         let entries = hypotheses
             .iter()
-            .map(|h| {
-                let freshness = if is_revisiting(h, &rejected) {
-                    FreshnessAxis::Revisited
-                } else {
-                    FreshnessAxis::Fresh
-                };
-                ArchiveEntry {
-                    slug: h.slug.clone(),
-                    cell: ArchiveCell {
-                        evidence: EvidenceAxis::of(h),
-                        kind: KindAxis::of(h.gap_kind),
-                        freshness,
-                    },
-                    score: h.confidence,
-                    status: format!("{:?}", h.status).to_lowercase(),
-                }
+            .map(|h| ArchiveEntry {
+                slug: h.slug.clone(),
+                cell: ArchiveCell::of(h, &rejected),
+                score: h.confidence,
+                status: format!("{:?}", h.status).to_lowercase(),
             })
             .collect();
         let archive = Self { entries };
@@ -200,6 +204,41 @@ impl Archive {
             .map(|e| e.cell.key())
             .collect::<std::collections::BTreeSet<_>>()
             .len()
+    }
+
+    /// Order `hypotheses` so under-illuminated regions of hypothesis space come
+    /// first — the curriculum signal, choosing what to pursue from accumulated
+    /// state instead of file order.
+    ///
+    /// Each hypothesis is classified into its deterministic cell via
+    /// [`ArchiveCell::of`]; a cell already well represented in the archive, or
+    /// already claimed by an earlier candidate in this same batch, ranks lower.
+    /// Ties keep input order and an empty archive preserves input order
+    /// exactly, so this reprioritises without changing which items are present.
+    pub fn prioritize(
+        &self,
+        hypotheses: &[HypothesisSlug],
+        rejected: &[RejectedHypothesis],
+    ) -> Vec<HypothesisSlug> {
+        let mut occupied: BTreeMap<String, usize> = BTreeMap::new();
+        for entry in &self.entries {
+            *occupied.entry(entry.cell.key()).or_default() += 1;
+        }
+
+        let mut claimed: BTreeMap<String, usize> = BTreeMap::new();
+        let mut ranked: Vec<(usize, usize)> = Vec::with_capacity(hypotheses.len());
+        for (index, hypothesis) in hypotheses.iter().enumerate() {
+            let key = ArchiveCell::of(hypothesis, rejected).key();
+            let crowdedness =
+                occupied.get(&key).copied().unwrap_or(0) + claimed.get(&key).copied().unwrap_or(0);
+            *claimed.entry(key).or_default() += 1;
+            ranked.push((crowdedness, index));
+        }
+        ranked.sort_unstable();
+        ranked
+            .into_iter()
+            .map(|(_, index)| hypotheses[index].clone())
+            .collect()
     }
 
     /// Pick up to `n` parent slugs, round-robining across occupied cells so
@@ -348,6 +387,84 @@ mod tests {
         assert_eq!(KindAxis::of(GapKind::OrphanEntity), KindAxis::Structural);
         assert_eq!(KindAxis::of(GapKind::DecisionBlocked), KindAxis::Judgment);
         assert_eq!(KindAxis::of(GapKind::CommitmentOverdue), KindAxis::Process);
+    }
+
+    #[test]
+    fn prioritize_puts_under_illuminated_cells_first() {
+        let crowded = hypothesis("crowded", GapKind::OrphanEntity, 0.7, 1);
+        let archive = Archive {
+            entries: vec![
+                ArchiveEntry {
+                    slug: "crowded".to_string(),
+                    cell: ArchiveCell::of(&crowded, &[]),
+                    score: 1.0,
+                    status: "exploring".to_string(),
+                },
+                ArchiveEntry {
+                    slug: "crowded-two".to_string(),
+                    cell: ArchiveCell::of(&crowded, &[]),
+                    score: 1.0,
+                    status: "exploring".to_string(),
+                },
+            ],
+        };
+        let fresh = hypothesis("fresh", GapKind::DecisionBlocked, 0.7, 1);
+
+        let ordered = archive.prioritize(&[crowded.clone(), fresh.clone()], &[]);
+        assert_eq!(
+            ordered[0].slug, "fresh",
+            "empty cell outranks a crowded one"
+        );
+        assert_eq!(ordered[1].slug, "crowded");
+    }
+
+    #[test]
+    fn prioritize_spreads_within_a_batch() {
+        let same_cell = hypothesis("x1", GapKind::OrphanEntity, 0.7, 1);
+        let archive = Archive {
+            entries: vec![ArchiveEntry {
+                slug: "x1".to_string(),
+                cell: ArchiveCell::of(&same_cell, &[]),
+                score: 1.0,
+                status: "exploring".to_string(),
+            }],
+        };
+        let repeat = hypothesis("x2", GapKind::OrphanEntity, 0.7, 1);
+        let other_cell = hypothesis("y1", GapKind::DecisionBlocked, 0.7, 1);
+
+        let ordered = archive.prioritize(
+            &[same_cell.clone(), repeat.clone(), other_cell.clone()],
+            &[],
+        );
+        assert_eq!(
+            ordered.iter().map(|h| h.slug.as_str()).collect::<Vec<_>>(),
+            vec!["y1", "x1", "x2"],
+            "unoccupied cell first, then the already-claimed cell, then its repeat"
+        );
+    }
+
+    #[test]
+    fn prioritize_is_deterministic_and_preserves_input_when_empty() {
+        let empty = Archive::default();
+        let candidates = vec![
+            hypothesis("a", GapKind::OrphanEntity, 0.7, 1),
+            hypothesis("b", GapKind::DecisionBlocked, 0.7, 0),
+            hypothesis("c", GapKind::OrphanEntity, 0.7, 3),
+        ];
+        let first = empty.prioritize(&candidates, &[]);
+        let second = empty.prioritize(&candidates, &[]);
+        assert_eq!(
+            first.iter().map(|h| h.slug.clone()).collect::<Vec<_>>(),
+            candidates
+                .iter()
+                .map(|h| h.slug.clone())
+                .collect::<Vec<_>>(),
+            "no archive knowledge ⇒ input order is preserved exactly"
+        );
+        assert_eq!(
+            first.iter().map(|h| h.slug.clone()).collect::<Vec<_>>(),
+            second.iter().map(|h| h.slug.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

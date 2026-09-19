@@ -35,8 +35,9 @@ pub use discover_metrics::{
     load_reports, write_metrics,
 };
 pub use hypothesis::{
-    build_exploration_prompt, build_refinement_queue, confidence_for, gap_type, generate_from_gaps,
-    generate_from_gaps_with_history, load_all, reverify, reverify_with_rejections, save, slug_for,
+    build_exploration_prompt, build_refinement_queue, build_refinement_queue_prioritized,
+    confidence_for, gap_type, generate_from_gaps, generate_from_gaps_with_history, load_all,
+    reverify, reverify_with_rejections, save, slug_for,
 };
 pub use merge::{
     MergeStrategy, WikiMergePlan, build_merge_plans, normalize_notion_name, trigram_jaccard,

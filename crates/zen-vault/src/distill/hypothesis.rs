@@ -481,6 +481,18 @@ pub fn generate_from_gaps_with_history(
 
 // ─── Refinement queue ──────────────────────────────────────────────────
 
+/// Curriculum-ordered refinement queue: unresolved hypotheses are reordered by
+/// [`super::archive::Archive::prioritize`] so under-explored cells of
+/// hypothesis space surface first, then rendered by
+/// [`build_refinement_queue`] exactly as before.
+pub fn build_refinement_queue_prioritized(
+    slugs: &[HypothesisSlug],
+    archive: &super::archive::Archive,
+    rejected: &[zen_memory::RejectedHypothesis],
+) -> (Vec<String>, Vec<String>) {
+    build_refinement_queue(&archive.prioritize(slugs, rejected))
+}
+
 /// Build a refinement queue from existing hypotheses.
 ///
 /// Separates unresolved hypotheses (status is neither `Validated` nor
@@ -1292,6 +1304,49 @@ mod tests {
         assert!(user.iter().all(|q| q.contains("open")));
         assert!(!ext.iter().any(|p| p.contains("resolved")));
         assert!(!user.iter().any(|q| q.contains("resolved")));
+    }
+
+    #[test]
+    fn prioritized_queue_orders_under_explored_cells_first() {
+        let crowded = HypothesisSlug {
+            slug: "crowded".into(),
+            hypothesis: "well trodden".into(),
+            gap_kind: GapKind::OrphanEntity,
+            confidence: 0.7,
+            status: HypothesisStatus::Exploring,
+            exploration_prompt: Some("re-read".into()),
+            evidence_refs: vec!["raw/a.md".into()],
+            created_from: "g1".into(),
+        };
+        let fresh = HypothesisSlug {
+            slug: "fresh-cell".into(),
+            hypothesis: "unexplored region".into(),
+            gap_kind: GapKind::DecisionBlocked,
+            confidence: 0.7,
+            status: HypothesisStatus::Exploring,
+            exploration_prompt: Some("re-read".into()),
+            evidence_refs: vec!["raw/b.md".into()],
+            created_from: "g2".into(),
+        };
+        let archive = super::super::archive::Archive {
+            entries: vec![super::super::archive::ArchiveEntry {
+                slug: "crowded".into(),
+                cell: super::super::archive::ArchiveCell::of(&crowded, &[]),
+                score: 1.0,
+                status: "exploring".into(),
+            }],
+        };
+
+        let (external, questions) =
+            build_refinement_queue_prioritized(&[crowded, fresh], &archive, &[]);
+
+        assert_eq!(external.len(), 2);
+        assert_eq!(questions.len(), 2);
+        assert!(
+            external[0].contains("fresh-cell"),
+            "under-explored cell leads the work list: {external:?}"
+        );
+        assert!(external[1].contains("crowded"));
     }
 
     #[test]

@@ -1277,14 +1277,21 @@ impl ZenWorker for ZenLoopWorker {
                     Vec::new()
                 }
             };
+            let archive = zen_vault::distill::archive::Archive::load(
+                &zen_vault::distill::archive::archive_path(&paths.logs()),
+            );
+            let rejected = zen_vault::distill::archive::load_rejected(
+                &paths.vault().join("wiki/wisdom/rejected"),
+            );
             let (fetch_prompts, user_questions) =
-                zen_vault::distill::build_refinement_queue(&slugs);
+                zen_vault::distill::build_refinement_queue_prioritized(&slugs, &archive, &rejected);
             report.refinement_fetch_prompts = fetch_prompts.len();
             report.refinement_user_questions = user_questions.len();
 
             let queue = serde_json::json!({
                 "cycle_id": report.cycle_id,
                 "generated_at": chrono::Utc::now().to_rfc3339(),
+                "occupied_cells": archive.cell_count(),
                 "fetch_prompts": fetch_prompts,
                 "user_questions": user_questions,
             });
