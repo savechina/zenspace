@@ -307,6 +307,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "agents": service.agents_count().await,
         "scheduler": service.is_scheduler_hosted(),
+        "scheduler_pending": service.is_scheduler_waiting(),
     }))
 }
 

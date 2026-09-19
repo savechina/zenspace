@@ -8,7 +8,7 @@ use super::relationship::RelationKind;
 /// T069 (FR-021 Pi 5点): `Preference` and `Temporal` extend the taxonomy
 /// additively — serde variants append-only, `Person`/`Goal` already existed.
 /// All kinds dedup through the existing `notion_aliases` F1 flow
-/// (`normalize_notion_name` + `resolve_alias`); no new tables.
+/// (`zen_repo::normalize_alias` + `resolve_alias`); no new tables.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NotionKind {
     Function,

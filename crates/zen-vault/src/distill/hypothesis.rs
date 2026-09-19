@@ -872,7 +872,22 @@ pub fn reverify(
     now: DateTime<Utc>,
     older_than: chrono::Duration,
 ) -> Result<usize> {
-    reverify_with_rejections(hypotheses_dir, wiki_dir, now, older_than).map(|(_, count, _)| count)
+    reverify_with_rejections(hypotheses_dir, wiki_dir, now, older_than)
+        .map(|outcome| outcome.transition_count)
+}
+
+/// Outcome of one reverify pass: which hypotheses validated, how many
+/// transitions happened, and which were rejected — each rejected record
+/// paired with its hypothesis slug so callers can record discovery-tree
+/// nodes with genuine parent links (T140).
+#[derive(Debug, Clone, Default)]
+pub struct ReverifyOutcome {
+    /// Hypothesis slugs that transitioned to `Validated` this pass.
+    pub validated_slugs: Vec<String>,
+    /// Total transitions (validated + rejected) this pass.
+    pub transition_count: usize,
+    /// Rejected hypotheses, each paired with its hypothesis slug.
+    pub rejected: Vec<(String, RejectedHypothesis)>,
 }
 
 /// As [`reverify`], but also returns every hypothesis that transitioned to
@@ -886,8 +901,10 @@ pub fn reverify(
 ///
 /// # Returns
 ///
-/// A tuple of the transition count and the rejection records (one per
-/// hypothesis that entered `Rejected` in this pass, in scan order).
+/// A [`ReverifyOutcome`] with the validated hypothesis slugs, the total
+/// transition count (validated + rejected), and the rejection records (one
+/// per hypothesis that entered `Rejected` in this pass, in scan order, each
+/// paired with its hypothesis slug).
 ///
 /// # Errors
 ///
@@ -897,14 +914,14 @@ pub fn reverify_with_rejections(
     wiki_dir: &Path,
     now: DateTime<Utc>,
     older_than: chrono::Duration,
-) -> Result<(usize, usize, Vec<RejectedHypothesis>)> {
+) -> Result<ReverifyOutcome> {
+    let mut validated_slugs = Vec::new();
     let mut count = 0;
-    let mut validated = 0;
     let mut rejected = Vec::new();
     let cutoff = now - older_than;
 
     if !hypotheses_dir.is_dir() {
-        return Ok((0, 0, Vec::new()));
+        return Ok(ReverifyOutcome::default());
     }
 
     for entry in fs::read_dir(hypotheses_dir).with_context(|| {
@@ -965,7 +982,7 @@ pub fn reverify_with_rejections(
                 );
                 h.status = HypothesisStatus::Validated;
                 transitioned = true;
-                validated += 1;
+                validated_slugs.push(h.slug.clone());
             }
 
             // Check 2: subject_entity page missing from wiki_dir → Rejected.
@@ -994,15 +1011,18 @@ pub fn reverify_with_rejections(
                     );
                     h.status = HypothesisStatus::Rejected;
                     transitioned = true;
-                    rejected.push(RejectedHypothesis {
-                        claim: h.hypothesis.clone(),
-                        falsifier: format!("missing wiki page for entity '{entity_lower}'"),
-                        because: format!(
-                            "reverify: hypothesis stale >{} days and subject entity page absent",
-                            older_than.num_days()
-                        ),
-                        expiry: now.format("%Y-%m-%d").to_string(),
-                    });
+                    rejected.push((
+                        h.slug.clone(),
+                        RejectedHypothesis {
+                            claim: h.hypothesis.clone(),
+                            falsifier: format!("missing wiki page for entity '{entity_lower}'"),
+                            because: format!(
+                                "reverify: hypothesis stale >{} days and subject entity page absent",
+                                older_than.num_days()
+                            ),
+                            expiry: now.format("%Y-%m-%d").to_string(),
+                        },
+                    ));
                 }
             }
 
@@ -1014,7 +1034,11 @@ pub fn reverify_with_rejections(
         }
     }
 
-    Ok((validated, count, rejected))
+    Ok(ReverifyOutcome {
+        validated_slugs,
+        transition_count: count,
+        rejected,
+    })
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -1446,13 +1470,14 @@ mod tests {
         f.set_times(std::fs::FileTimes::new().set_modified(old_time))
             .unwrap();
 
-        let (validated, count, rejected) =
+        let outcome =
             reverify_with_rejections(&hypo_dir, &wiki_dir, Utc::now(), Duration::days(7)).unwrap();
-        assert_eq!(validated, 0);
-        assert_eq!(count, 1);
-        assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0].claim, "rust makes distill faster");
-        assert!(rejected[0].falsifier.contains("entity"));
+        assert_eq!(outcome.validated_slugs.len(), 0);
+        assert_eq!(outcome.transition_count, 1);
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].0, "reject-test-entity");
+        assert_eq!(outcome.rejected[0].1.claim, "rust makes distill faster");
+        assert!(outcome.rejected[0].1.falsifier.contains("entity"));
 
         let loaded = load_all(&hypo_dir).unwrap();
         assert_eq!(loaded[0].status, HypothesisStatus::Rejected);

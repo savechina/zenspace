@@ -71,7 +71,14 @@ impl SelfLearningSignals {
 
         let corrections = load_corrections(&wiki_dir.join("wisdom/corrections"), &mut tracker);
         let feedback = load_feedback(&wiki_dir.join("wisdom/feedback"), &mut tracker);
-        let beliefs = load_beliefs(&wiki_dir.join("wisdom/beliefs"), &mut tracker);
+        // T130/T132: the belief surface is a read-side split of the M4 dir
+        // (durable wisdom vs needs-evidence) plus the demoted-beliefs dir,
+        // which re-enters the M2 working tier instead of vanishing.
+        let beliefs = load_beliefs(
+            &wiki_dir.join("wisdom/beliefs"),
+            &zen_paths.memory().join("demoted-beliefs"),
+            &mut tracker,
+        );
         let virtue_logs = load_virtue_logs(&memories_dir.join("virtue_logs"));
         let reflections = load_reflections(&wiki_dir.join("wisdom/reflections"));
         let mental_models = load_mental_models(&wiki_dir.join("wisdom/models"));
@@ -189,6 +196,7 @@ fn load_feedback(
 
 fn load_beliefs(
     dir: &std::path::Path,
+    demoted_dir: &std::path::Path,
     tracker: &mut zen_memory::priority::ReinforcementTracker,
 ) -> String {
     let mut beliefs = match zen_memory::Belief::load_all(dir) {
@@ -198,36 +206,79 @@ fn load_beliefs(
             return String::new();
         }
     };
+    // T132: demoted beliefs re-enter the M2 working tier instead of vanishing.
+    let mut demoted = match zen_memory::Belief::load_all(demoted_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(dir = %demoted_dir.display(), error = %e, "failed to load demoted beliefs");
+            Vec::new()
+        }
+    };
 
-    if beliefs.is_empty() {
+    if beliefs.is_empty() && demoted.is_empty() {
         return String::new();
     }
 
     let now = chrono::Utc::now();
-    let pruned = zen_memory::priority::prune_beliefs(&mut beliefs, now);
+    let pruned = zen_memory::priority::prune_stale_from_prompt(&mut beliefs, now);
     if !pruned.is_empty() {
-        tracing::debug!(count = pruned.len(), "pruned stale low-confidence beliefs");
+        tracing::debug!(
+            count = pruned.len(),
+            "pruned stale low-confidence beliefs from prompt"
+        );
     }
 
     let reinforced_ids: std::collections::HashSet<String> = {
-        let reinforced = zen_memory::priority::reinforce_beliefs(&beliefs, tracker);
-        reinforced.into_iter().map(|b| b.id.clone()).collect()
+        let mut ids = std::collections::HashSet::new();
+        for b in zen_memory::priority::reinforce_beliefs(&beliefs, tracker) {
+            ids.insert(b.id.clone());
+        }
+        for b in zen_memory::priority::reinforce_beliefs(&demoted, tracker) {
+            ids.insert(b.id.clone());
+        }
+        ids
     };
 
-    for b in &mut beliefs {
+    for b in beliefs.iter_mut().chain(demoted.iter_mut()) {
         if let Err(e) = tracker.record_retrieval(&b.id) {
             warn!(belief_id = %b.id, error = %e, "failed to record retrieval for belief");
         }
         b.reinforce();
     }
 
+    // Save each belief back to its own directory — demoted beliefs stay in
+    // demoted-beliefs/ on disk (T132: only the prompt surface merges them).
     for b in &beliefs {
         if let Err(e) = b.save(dir) {
             warn!(belief_id = %b.id, error = %e, "failed to save reinforced belief");
         }
     }
+    for b in &demoted {
+        if let Err(e) = b.save(demoted_dir) {
+            warn!(belief_id = %b.id, error = %e, "failed to save reinforced demoted belief");
+        }
+    }
 
-    let mut sorted = beliefs;
+    // T130: read-side split — promotable AND provenance-capped reliable
+    // beliefs surface as durable wisdom; everything else stays in the
+    // needs-evidence section.
+    let (durable, needs_evidence) = partition_belief_surface(beliefs, demoted);
+
+    let mut out = String::new();
+    if !durable.is_empty() {
+        out.push_str("💎 Durable wisdom (provenance-backed):\n");
+        for b in &durable {
+            out.push_str(&format!(
+                "- \"{}\" (confidence: {:.0}%, reliability: {:.0}%)\n",
+                b.proposition,
+                b.posterior * 100.0,
+                b.reliability() * 100.0
+            ));
+        }
+        out.push('\n');
+    }
+
+    let mut sorted = needs_evidence;
     sorted.sort_by(|a, b| {
         a.posterior
             .partial_cmp(&b.posterior)
@@ -235,21 +286,50 @@ fn load_beliefs(
     });
     let top: Vec<_> = sorted.into_iter().take(5).collect();
 
-    let mut out = String::from("🔍 Low-confidence beliefs (need evidence):\n");
-    for b in &top {
-        let marker = if reinforced_ids.contains(b.id.as_str()) {
-            " [REINFORCED]"
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "- \"{}\"{} (confidence: {:.0}%)\n",
-            b.proposition,
-            marker,
-            b.posterior * 100.0
-        ));
+    if !top.is_empty() {
+        out.push_str("🔍 Low-confidence beliefs (need evidence):\n");
+        for b in &top {
+            let marker = if reinforced_ids.contains(b.id.as_str()) {
+                " [REINFORCED]"
+            } else {
+                ""
+            };
+            out.push_str(&render_needs_evidence_line(b, marker));
+        }
     }
     out
+}
+
+/// Render one M2 needs-evidence line: proposition, reinforcement marker,
+/// posterior confidence, and the Noisy-OR candidate probability
+/// ([`zen_memory::Belief::noisy_or_candidate`]).
+fn render_needs_evidence_line(b: &zen_memory::Belief, marker: &str) -> String {
+    format!(
+        "- \"{}\"{} (confidence: {:.0}%, candidate: {:.0}%)\n",
+        b.proposition,
+        marker,
+        b.posterior * 100.0,
+        b.noisy_or_candidate() * 100.0
+    )
+}
+
+/// T130: split beliefs into the durable-wisdom surface and the
+/// needs-evidence surface.
+///
+/// A belief surfaces as durable wisdom only when it is promotable
+/// ([`zen_memory::Belief::should_promote`]) AND provenance-capped reliable
+/// ([`zen_memory::Belief::reliability`] `>= DURABLE_WISDOM_RELIABILITY`).
+/// Everything else — including demoted beliefs re-entering the M2 tier —
+/// stays in the needs-evidence section.
+fn partition_belief_surface(
+    beliefs: Vec<zen_memory::Belief>,
+    demoted: Vec<zen_memory::Belief>,
+) -> (Vec<zen_memory::Belief>, Vec<zen_memory::Belief>) {
+    let mut all = beliefs;
+    all.extend(demoted);
+    all.into_iter().partition(|b| {
+        b.should_promote() && b.reliability() >= zen_memory::belief::DURABLE_WISDOM_RELIABILITY
+    })
 }
 
 fn load_virtue_logs(dir: &std::path::Path) -> String {
@@ -2151,5 +2231,107 @@ mod native_tool_call_tests {
         let missing = dir.join("NOPE.md");
         assert!(read_identity_file(&missing).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod belief_surface_tests {
+    use super::*;
+    use zen_memory::belief::{Belief, SourceType};
+
+    fn belief_with_evidence(id: &str, posterior: f64, source: SourceType, supports: u32) -> Belief {
+        let mut b = Belief::new(id.into(), format!("proposition {id}"), "test".into());
+        for _ in 0..supports {
+            b.update(true, source.clone(), None);
+        }
+        b.posterior = posterior;
+        b
+    }
+
+    #[test]
+    fn anonymous_internet_high_posterior_stays_in_needs_evidence() {
+        // 6 AnonymousInternet supports → promotable, but reliability is
+        // capped at 0.2 → must NOT surface as durable wisdom.
+        let b = belief_with_evidence("anon", 0.95, SourceType::AnonymousInternet, 6);
+        assert!(b.should_promote());
+        let (durable, needs_evidence) = partition_belief_surface(vec![b], vec![]);
+        assert!(
+            durable.is_empty(),
+            "anonymous-internet belief leaked to durable wisdom"
+        );
+        assert_eq!(needs_evidence.len(), 1);
+    }
+
+    #[test]
+    fn self_observation_high_posterior_surfaces_as_durable_wisdom() {
+        let b = belief_with_evidence("self", 0.95, SourceType::SelfObservation, 6);
+        assert!(b.should_promote());
+        let (durable, needs_evidence) = partition_belief_surface(vec![b], vec![]);
+        assert_eq!(durable.len(), 1);
+        assert!(needs_evidence.is_empty());
+    }
+
+    #[test]
+    fn no_evidence_high_confidence_does_not_pass() {
+        // Promotable by count, but no provenance → unproven → stays in
+        // the needs-evidence section.
+        let mut b = Belief::new("noev".into(), "prop".into(), "test".into());
+        b.posterior = 0.99;
+        b.evidence_count = 6;
+        assert!(b.should_promote());
+        let (durable, needs_evidence) = partition_belief_surface(vec![b], vec![]);
+        assert!(
+            durable.is_empty(),
+            "no-evidence belief leaked to durable wisdom"
+        );
+        assert_eq!(needs_evidence.len(), 1);
+    }
+
+    #[test]
+    fn promoted_and_reliable_surfaces_as_durable_wisdom() {
+        let b = belief_with_evidence("promoted", 0.95, SourceType::SelfObservation, 6);
+        assert!(b.should_promote());
+        assert!(b.reliability() >= zen_memory::belief::DURABLE_WISDOM_RELIABILITY);
+        let (durable, _) = partition_belief_surface(vec![b], vec![]);
+        assert_eq!(durable.len(), 1);
+    }
+
+    #[test]
+    fn demoted_belief_is_still_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beliefs_dir = tmp.path().join("beliefs");
+        let demoted_dir = tmp.path().join("demoted");
+        let tracker_path = tmp.path().join("tracker.json");
+
+        let mut b = Belief::new("demoted-1".into(), "old belief".into(), "test".into());
+        b.posterior = 0.1;
+        b.save(&demoted_dir).unwrap();
+
+        let mut tracker = zen_memory::priority::ReinforcementTracker::new(tracker_path);
+        let out = load_beliefs(&beliefs_dir, &demoted_dir, &mut tracker);
+
+        assert!(
+            out.contains("old belief"),
+            "demoted belief vanished from the prompt surface: {out}"
+        );
+        assert!(
+            out.contains("🔍 Low-confidence beliefs (need evidence)"),
+            "demoted belief must re-enter the needs-evidence section: {out}"
+        );
+    }
+
+    #[test]
+    fn needs_evidence_section_renders_noisy_or_candidate() {
+        // Two AnonymousInternet supports → candidate 1 - (0.8 × 0.8) = 0.36.
+        // (In-memory belief: the markdown evidence log is display-only, so a
+        // disk-reloaded belief has no evidence entries and candidate 0.0.)
+        let mut b = Belief::new("cand".into(), "candidate prop".into(), "test".into());
+        b.update(true, SourceType::AnonymousInternet, None);
+        b.update(true, SourceType::AnonymousInternet, None);
+        let line = render_needs_evidence_line(&b, "");
+        assert!(
+            line.contains("candidate: 36%"),
+            "M2 line must render the Noisy-OR candidate: {line}"
+        );
     }
 }

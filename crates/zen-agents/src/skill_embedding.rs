@@ -1,11 +1,19 @@
 //! On-disk embedding cache and a cache-backed [`crate::skill_hit_router::SkillScorer`]
 //! (Voyager pattern: skill reuse keyed by meaning rather than wording).
 //!
-//! Embedding work is deliberately *outside* the per-turn routing path: the
-//! caller computes a query embedding and keeps skill embeddings fresh in the
-//! cache, then hands both to [`EmbeddingSkillScorer`]. Without that wiring the
-//! router stays purely lexical, so no embedding runtime is pulled into turn
-//! handling (see `skill_hit_router` module docs).
+//! # Dormant by design (T075 / T134)
+//!
+//! [`EmbeddingSkillScorer`] and [`SkillHitRouter::with_scorer`] are **dormant**:
+//! embedding work must stay OFF the per-turn routing path (T075), so the scorer
+//! is deliberately not wired into production routing and `with_scorer` is
+//! therefore test-only. A reader must not mistake this module for delivered
+//! functionality.
+//!
+//! Activation requires a *non-per-turn* call site — session start or skill
+//! discovery — where the caller computes a query embedding and keeps skill
+//! embeddings fresh in the cache, then hands both to [`EmbeddingSkillScorer`].
+//! Until that wiring exists the router stays purely lexical, so no embedding
+//! runtime is pulled into turn handling (see `skill_hit_router` module docs).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -224,6 +224,8 @@ impl PlanExecuteTool {
     /// The pipeline `Task` for the plan review — same shape as the
     /// orchestrator's turn-review task (entropy 0.0, sensitivity metadata).
     fn review_task(summary: &str, sensitivity: Sensitivity) -> zen_core::types::Task {
+        // semantic_entropy is a placeholder (0.0) until T169's calibrated
+        // complexity classifier feeds real values into the P8 routing tiers.
         let mut task = zen_core::types::Task::new(summary, 0.0, zen_core::types::TaskType::Text);
         task.metadata
             .insert("sensitivity".to_string(), sensitivity.to_string());

@@ -5,11 +5,6 @@ use zen_core::types::Task;
 
 use super::momus::MomusReviewer;
 
-/// Entropy at or above which a task counts as HIGH blast radius (T092).
-/// Same threshold the pipeline already used inline for the Zeus
-/// high-risk escalation — now shared with the LLM review gate.
-pub const HIGH_BLAST_ENTROPY: f64 = 0.8;
-
 /// Blast radius of a review task (T092): only HIGH tasks pay the LLM
 /// semantic-review cost; LOW tasks keep the pure-heuristic fast path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,14 +14,14 @@ pub enum BlastRadius {
 }
 
 /// Classifies blast radius from the task's metadata sensitivity
-/// (same parse as `ReviewContext::from_task_with_metadata`) and
-/// semantic entropy: `Confidential` data or entropy above
-/// [`HIGH_BLAST_ENTROPY`] is HIGH.
+/// (same parse as `ReviewContext::from_task_with_metadata`).
+/// `Confidential` data is HIGH; everything else is LOW. The former
+/// semantic-entropy leg was removed (T172): no production writer feeds
+/// `Task.semantic_entropy` (both `Task::new` sites hardcode 0.0), so
+/// entropy can no longer drive blast radius.
 pub fn classify_blast_radius(task: &Task) -> BlastRadius {
     let sensitivity = ReviewContext::from_task_with_metadata(task, 0).sensitivity;
-    if sensitivity == zen_core::types::Sensitivity::Confidential
-        || task.semantic_entropy > HIGH_BLAST_ENTROPY
-    {
+    if sensitivity == zen_core::types::Sensitivity::Confidential {
         BlastRadius::High
     } else {
         BlastRadius::Low
@@ -221,7 +216,6 @@ impl QualityPipeline {
 
                     hermes_revisions += 1;
                     if hermes_revisions > self.max_hermes_revisions {
-                        let is_high_risk = task.semantic_entropy > HIGH_BLAST_ENTROPY;
                         let ctx = ReviewContext::from_task_with_metadata(task, hermes_revisions);
                         let should_escalate = self.zeus.should_escalate(
                             ctx.sensitivity,
@@ -229,7 +223,7 @@ impl QualityPipeline {
                             ctx.token_budget,
                         );
 
-                        if should_escalate || is_high_risk {
+                        if should_escalate {
                             review_notes.push_str("Hermes deadlock detected, escalating to Zeus\n");
                             let zeus_review = self.zeus.final_review(&ctx);
                             if let Some(shield) = zeus_review.athena_shield {
@@ -417,8 +411,11 @@ mod tests {
     fn blast_radius_classification() {
         let low = Task::new("summarize the changelog", 0.4, TaskType::Text);
         assert_eq!(classify_blast_radius(&low), BlastRadius::Low);
+        // T172: entropy no longer drives blast radius — a high-entropy task
+        // without Confidential metadata is LOW (no production writer feeds
+        // semantic_entropy; both Task::new sites hardcode 0.0).
         let high_entropy = Task::new("create then delete", 0.9, TaskType::Code);
-        assert_eq!(classify_blast_radius(&high_entropy), BlastRadius::High);
+        assert_eq!(classify_blast_radius(&high_entropy), BlastRadius::Low);
         assert_eq!(
             classify_blast_radius(&confidential_task()),
             BlastRadius::High

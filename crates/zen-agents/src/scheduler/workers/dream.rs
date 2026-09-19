@@ -76,6 +76,13 @@ impl ZenWorker for DreamWorker {
             report.entities_recomputed
         );
 
+        // FR-040: ensure today's wake-up brief exists. `run_cycle` writes it
+        // with the top-3 extracted facts when facts exist; when the cycle
+        // extracted nothing (the common case) the per-turn reader
+        // (`inject_wake_up_brief`) would find no file, so write a
+        // report-derived brief.
+        ensure_wake_up_brief(&paths, &report);
+
         // FR-037 skill precipitation (Hybrid C): distill repeated successes
         // / corrections into staged drafts; never fatal to the dream cycle.
         let drafts_staged = match precipitate_skills(&paths).await {
@@ -87,24 +94,27 @@ impl ZenWorker for DreamWorker {
         };
         info!("dream cycle: skill drafts staged = {drafts_staged}");
 
-        // FR-035: scan verified corrections for recurrence within 30-day window
+        // FR-035: scan verified corrections for recurrence within 30-day window.
+        // A load error is surfaced (never silently (0,0)) and leaves the boost
+        // marker untouched — fail-closed, a read failure must not delete it.
         let corrections_dir = paths.wiki().join("wisdom").join("corrections");
-        let (corrections_scanned, corrections_high_recurrence) =
-            zen_memory::scan_correction_recurrence(&corrections_dir, 30);
-        if corrections_scanned > 0 {
-            info!(
-                scanned = corrections_scanned,
-                high_recurrence = corrections_high_recurrence,
-                "FR-035 correction recurrence scan complete"
-            );
-        }
-        // FR-035: high recurrence (>0.5 recurrence rate on any verified
-        // correction, i.e. high_recurrence > 0) boosts the loss-aversion
-        // guard for the decision quality gate until the next clean scan.
-        if corrections_high_recurrence > 0 {
-            write_loss_aversion_boost(&paths, corrections_high_recurrence, corrections_scanned);
-        } else if loss_aversion_boost_path(&paths).exists() {
-            let _ = std::fs::remove_file(loss_aversion_boost_path(&paths));
+        match zen_memory::scan_correction_recurrence(&corrections_dir, 30) {
+            Ok((corrections_scanned, corrections_high_recurrence)) => {
+                if corrections_scanned > 0 {
+                    info!(
+                        scanned = corrections_scanned,
+                        high_recurrence = corrections_high_recurrence,
+                        "FR-035 correction recurrence scan complete"
+                    );
+                }
+                // FR-035: high recurrence (>0.5 recurrence rate on any verified
+                // correction, i.e. high_recurrence > 0) boosts the loss-aversion
+                // guard for the decision quality gate until the next clean scan.
+                apply_loss_aversion_boost(&paths, corrections_scanned, corrections_high_recurrence);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "FR-035 correction recurrence scan failed; boost marker untouched");
+            }
         }
 
         // FR-036: aggregate tool call outcomes, flag tools with <70% success
@@ -201,6 +211,46 @@ pub(super) fn write_loss_aversion_boost(paths: &ZenPaths, high: usize, scanned: 
     let _ = std::fs::write(&target, payload.to_string());
 }
 
+/// FR-035: write the loss-aversion boost marker when the scan found high
+/// recurrence; delete it on a clean scan. A scan that found nothing
+/// (`scanned == 0`) carries no information, so it leaves an existing marker
+/// untouched — the marker self-expires via its 30-day freshness window.
+pub(super) fn apply_loss_aversion_boost(paths: &ZenPaths, scanned: usize, high: usize) {
+    if high > 0 {
+        write_loss_aversion_boost(paths, high, scanned);
+    } else if scanned > 0 && loss_aversion_boost_path(paths).exists() {
+        let _ = std::fs::remove_file(loss_aversion_boost_path(paths));
+    }
+}
+
+/// FR-040: ensure today's wake-up brief exists at `logs/wake-up-<date>.md`.
+/// `ZenDream::run_cycle` writes it with the top-3 extracted facts when facts
+/// exist; when the cycle extracted nothing (the common case) the per-turn
+/// reader (`inject_wake_up_brief`) would find no file, so write a
+/// report-derived brief. Returns true when a brief was written.
+pub(super) fn ensure_wake_up_brief(
+    paths: &ZenPaths,
+    report: &zen_memory::dream::DreamReport,
+) -> bool {
+    let date = report.date.format("%Y-%m-%d").to_string();
+    let target = paths.logs().join(format!("wake-up-{date}.md"));
+    if target.exists() {
+        return false;
+    }
+    let lines = vec![
+        format!("Facts extracted: {}", report.facts_extracted),
+        format!("Memory updated: {}", report.memory_updated),
+        format!("Entities recomputed: {}", report.entities_recomputed),
+    ];
+    match zen_memory::write_wake_up_brief(paths, &date, &lines) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "wake-up brief write failed; dream cycle unaffected");
+            false
+        }
+    }
+}
+
 /// FR-035 boost is active while the marker exists and was written within
 /// the 30-day recurrence window; dream rewrites or removes it nightly.
 pub(super) fn loss_aversion_boost_active(paths: &ZenPaths) -> bool {
@@ -240,6 +290,54 @@ mod tests {
         assert!(
             !loss_aversion_boost_active(&paths),
             "31-day-old marker is outside the FR-035 window"
+        );
+    }
+
+    #[test]
+    fn boost_marker_written_on_high_recurrence_deleted_on_clean_scan() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+
+        apply_loss_aversion_boost(&paths, 5, 2);
+        assert!(loss_aversion_boost_active(&paths));
+
+        apply_loss_aversion_boost(&paths, 5, 0);
+        assert!(!loss_aversion_boost_active(&paths));
+        assert!(!loss_aversion_boost_path(&paths).exists());
+
+        apply_loss_aversion_boost(&paths, 2, 1);
+        assert!(loss_aversion_boost_active(&paths));
+        apply_loss_aversion_boost(&paths, 0, 0);
+        assert!(
+            loss_aversion_boost_active(&paths),
+            "no-op scan must not clear an active boost"
+        );
+    }
+
+    #[test]
+    fn wake_up_brief_ensured_when_cycle_writes_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let report = zen_memory::DreamReport {
+            date: chrono::Utc::now().date_naive(),
+            facts_extracted: 3,
+            memory_updated: true,
+            entities_recomputed: 5,
+            ..Default::default()
+        };
+
+        assert!(ensure_wake_up_brief(&paths, &report));
+        let date = report.date.format("%Y-%m-%d").to_string();
+        let target = paths.logs().join(format!("wake-up-{date}.md"));
+        assert!(target.exists());
+        let content = std::fs::read_to_string(&target).expect("brief readable");
+        assert!(content.contains("Facts extracted: 3"));
+        assert!(content.contains("Memory updated: true"));
+        assert!(content.contains("Entities recomputed: 5"));
+
+        assert!(
+            !ensure_wake_up_brief(&paths, &report),
+            "existing brief is not rewritten"
         );
     }
 }

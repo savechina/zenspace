@@ -84,6 +84,10 @@ pub struct LoopCycleReport {
     pub raw_sources_routed: usize,
     /// Notions joined into the graph from raw sources (FR-030, Stage 3a).
     pub raw_notions_joined: usize,
+    /// Communities persisted by the T141 Stage 4b summarization run.
+    pub communities_persisted: usize,
+    /// Community wiki pages written by the T141 Stage 4b summarization run.
+    pub community_pages_written: usize,
     /// Page creates downgraded to updates via PlaceholderRegistry (FR-031).
     pub placeholder_downgrades: usize,
     /// True when the cycle's wiki writes were rolled back by CAS drift
@@ -197,55 +201,6 @@ impl GapKind {
             GapKind::CommitmentOverdue => "commitment_overdue",
             GapKind::SelfCognitionBlocked => "self_cognition_blocked",
             GapKind::AntiTalkSuspect => "anti_talk_suspect",
-        }
-    }
-}
-
-/// Per-note processing state machine (data-model §1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobState {
-    Queued,
-    Processing,
-    Completed,
-    Failed,
-    Quarantined,
-}
-
-/// One note's journey through the current cycle (data-model §1).
-///
-/// The in-memory struct is a per-cycle cache; durable identity comes from
-/// `notes_meta.content_hash` + `last_completed_stage` (F3, FR-011), so
-/// dedup survives a crash and is never in-memory-only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessingJob {
-    /// Note id (notes_meta.note_id) — durable identity for dedup (FR-011 F3).
-    pub note_id: String,
-    /// Vault-relative inbox path of the note file.
-    pub source_path: PathBuf,
-    /// SHA-256 content_hash for crash-safe dedup; never in-memory-only.
-    pub checksum: String,
-    /// Current FSM state (Queued→Processing→Completed/Failed→Quarantined).
-    pub state: JobState,
-    /// Retry attempts consumed; max via LoopConfig.max_attempts (default 3).
-    pub attempts: u8,
-    /// Last failure message, if any.
-    pub last_error: Option<String>,
-}
-
-impl ProcessingJob {
-    pub fn new(
-        note_id: impl Into<String>,
-        source_path: PathBuf,
-        checksum: impl Into<String>,
-    ) -> Self {
-        Self {
-            note_id: note_id.into(),
-            source_path,
-            checksum: checksum.into(),
-            state: JobState::Queued,
-            attempts: 0,
-            last_error: None,
         }
     }
 }
@@ -557,13 +512,6 @@ mod tests {
         report.outcome = Some(CycleOutcome::Completed);
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"completed\""));
-    }
-
-    #[test]
-    fn processing_job_starts_queued() {
-        let job = ProcessingJob::new("n1", PathBuf::from("inbox/a.md"), "hash");
-        assert_eq!(job.state, JobState::Queued);
-        assert_eq!(job.attempts, 0);
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub use decision::{
     OutcomeResult, Severity,
 };
 pub use dream::{
-    ExtractedSignals, RejectedHypothesis, ZenDream, enforce_memory_cap,
+    DreamReport, ExtractedSignals, RejectedHypothesis, ZenDream, enforce_memory_cap,
     extract_durable_facts_from_entry, memory_nudge_due, memory_nudge_text, parse_facts_section,
     scan_correction_recurrence, write_wake_up_brief,
 };

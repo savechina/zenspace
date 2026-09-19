@@ -1,5 +1,6 @@
 pub mod beliefs_repo;
 pub mod client;
+pub mod communities;
 pub mod dispatch_repo;
 pub mod embeddings_repo;
 pub mod goals_repo;
@@ -14,6 +15,7 @@ pub mod types;
 
 pub use beliefs_repo::BeliefsRepo;
 pub use client::{SqliteClient, SqliteError, probe_latest_version};
+pub use communities::{Adjacency, louvain_communities};
 pub use dispatch_repo::{DispatchRepo, DispatchTaskRow};
 pub use embeddings_repo::EmbeddingsRepo;
 pub use goals_repo::GoalsRepo;

@@ -1,4 +1,5 @@
 pub mod brief;
+pub mod communities;
 pub mod dispatch;
 pub mod distill;
 pub mod goal;
@@ -15,11 +16,12 @@ pub mod tools;
 pub use tools::SharedSqliteClient;
 pub mod wiki;
 
+pub use communities::{CommunitySummaryReport, run_community_summarization};
 pub use distill::{
-    ChatImporter, Checkpoint, CheckpointManager, Contradiction, ContradictionDetector,
-    DistillationPipeline, DistillationPipelineInput, DistillationReport, NotionExtractor,
-    RecoveryManager, ScopedRunOutcome, SourceIngester, TransactionScope, WikiCompiler,
-    prune_context,
+    Checkpoint, CheckpointManager, Contradiction, ContradictionDetector, DiscoveryNode,
+    DiscoveryTree, DistillationPipeline, DistillationPipelineInput, DistillationReport,
+    NotionExtractor, RecoveryManager, ScopedRunOutcome, SourceIngester, TransactionScope,
+    WikiCompiler, discovery_tree_path, prune_context,
 };
 pub use graph_verify::{GraphIntegrityVerifier, wiki_page_inventory};
 pub use ingest::{

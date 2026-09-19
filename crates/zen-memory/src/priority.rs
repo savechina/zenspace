@@ -254,29 +254,6 @@ impl ReinforcementTracker {
         self.counts.get(notion_id).copied().unwrap_or(0)
     }
 
-    /// Get notions not retrieved within the given number of days.
-    ///
-    /// These are candidates for compression / archival (§8.3.3).
-    pub fn get_stale_episodes(&self, days_threshold: u32) -> Vec<String> {
-        let cutoff = Utc::now().date_naive() - Duration::days(days_threshold as i64);
-        self.last_accessed
-            .iter()
-            .filter(|entry| entry.1 < &cutoff)
-            .map(|entry| entry.0.clone())
-            .collect()
-    }
-
-    /// Get notions that have been retrieved at least `min_hits` times.
-    ///
-    /// Frequently-retrieved notions are candidates for wiki promotion.
-    pub fn get_frequent_entities(&self, min_hits: u32) -> Vec<String> {
-        self.counts
-            .iter()
-            .filter(|entry| *entry.1 >= min_hits)
-            .map(|entry| entry.0.clone())
-            .collect()
-    }
-
     /// Persist the current state to the JSON sidecar file.
     pub fn save(&self) -> Result<(), PriorityError> {
         let file = ReinforcementFile {
@@ -367,14 +344,19 @@ pub fn reinforce_beliefs<'a>(
     scored.into_iter().map(|(b, _)| b).collect()
 }
 
-/// Remove and return beliefs that should be **hidden** from LLM prompts.
+/// Filter stale low-confidence beliefs out of the **in-memory prompt vector**.
 ///
-/// Criteria (DESIGN.md §8.3): posterior < 0.3 AND retrieval_count == 0
-/// AND last_updated older than 30 days from `now`.
+/// Criteria (DESIGN.md §8.3): posterior < 0.3 AND last_updated older than
+/// 30 days from `now`.
 ///
 /// **Mutates** the input vec by retaining only non-pruned beliefs.
-/// Returns the removed (pruned) beliefs for audit/ archival.
-pub fn prune_beliefs(beliefs: &mut Vec<Belief>, now: DateTime<Utc>) -> Vec<Belief> {
+/// Returns the removed (pruned) beliefs for audit.
+///
+/// This is a prompt-rendering filter only (T147): the pruned beliefs stay on
+/// disk untouched and are not archived anywhere. It does NOT implement a
+/// store-level prune — the M2/M4 tier split is a read-side decision made by
+/// the caller ([`crate::belief::Belief::reliability`] + `should_promote`).
+pub fn prune_stale_from_prompt(beliefs: &mut Vec<Belief>, now: DateTime<Utc>) -> Vec<Belief> {
     let cutoff = now - Duration::days(30);
     let mut pruned = Vec::new();
     let mut retained = Vec::new();
@@ -385,7 +367,7 @@ pub fn prune_beliefs(beliefs: &mut Vec<Belief>, now: DateTime<Utc>) -> Vec<Belie
                 belief_id = %b.id,
                 posterior = b.posterior,
                 last_updated = %b.last_updated,
-                "prune_beliefs: removing stale low-confidence belief"
+                "prune_stale_from_prompt: removing stale low-confidence belief from prompt"
             );
             pruned.push(b);
         } else {
@@ -398,7 +380,7 @@ pub fn prune_beliefs(beliefs: &mut Vec<Belief>, now: DateTime<Utc>) -> Vec<Belie
     tracing::debug!(
         pruned = pruned.len(),
         retained = beliefs.len(),
-        "prune_beliefs: completed pruning cycle"
+        "prune_stale_from_prompt: completed prompt-filter cycle"
     );
 
     pruned
@@ -619,68 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_frequent_entities() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tracker.json");
-        let mut tracker = ReinforcementTracker::new(path);
-
-        for _ in 0..5 {
-            tracker.record_retrieval("frequent").unwrap();
-        }
-        tracker.record_retrieval("rare").unwrap();
-
-        let frequent = tracker.get_frequent_entities(3);
-        assert!(frequent.contains(&"frequent".to_string()));
-        assert!(!frequent.contains(&"rare".to_string()));
-    }
-
-    #[test]
-    fn test_get_stale_episodes() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tracker.json");
-
-        // Manually write a file with an old date.
-        let old_date = Utc::now().date_naive() - Duration::days(100);
-        let file = ReinforcementFile {
-            notions: HashMap::from([(
-                "stale-notion".to_string(),
-                ReinforcementEntry {
-                    hit_count: 3,
-                    last_accessed: old_date,
-                },
-            )]),
-        };
-        let json = serde_json::to_string_pretty(&file).unwrap();
-        fs::write(&path, json).unwrap();
-
-        let tracker = ReinforcementTracker::new(path);
-        let stale = tracker.get_stale_episodes(90);
-        assert!(stale.contains(&"stale-notion".to_string()));
-    }
-
-    #[test]
-    fn test_get_stale_episodes_excludes_recent() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tracker.json");
-        let mut tracker = ReinforcementTracker::new(path);
-
-        tracker.record_retrieval("fresh").unwrap();
-        let stale = tracker.get_stale_episodes(90);
-        assert!(stale.is_empty());
-    }
-
-    #[test]
-    fn test_get_frequent_entities_empty_when_below_threshold() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tracker.json");
-        let mut tracker = ReinforcementTracker::new(path);
-
-        tracker.record_retrieval("low-count").unwrap();
-        let frequent = tracker.get_frequent_entities(5);
-        assert!(frequent.is_empty());
-    }
-
-    #[test]
     fn test_format_scorecard_contains_all_fields() {
         let score = PriorityScore {
             belief_id: "b1".into(),
@@ -766,10 +686,10 @@ mod tests {
         assert_eq!(reinforced[1].id, "b2");
     }
 
-    // ── prune_beliefs ────────────────────────────────────────────
+    // ── prune_stale_from_prompt ────────────────────────────────────
 
     #[test]
-    fn test_prune_beliefs_removes_old_low_confidence() {
+    fn test_prune_stale_from_prompt_removes_old_low_confidence() {
         let mut b1 = make_belief("b1", 0.1);
         b1.last_updated = Utc::now() - Duration::days(40);
         let b2 = make_belief("b2", 0.8);
@@ -778,7 +698,7 @@ mod tests {
 
         let mut beliefs = vec![b1.clone(), b2.clone(), b3.clone()];
         let now = Utc::now();
-        let pruned = prune_beliefs(&mut beliefs, now);
+        let pruned = prune_stale_from_prompt(&mut beliefs, now);
 
         assert_eq!(pruned.len(), 2);
         let pruned_ids: Vec<_> = pruned.iter().map(|b| b.id.as_str()).collect();
@@ -789,33 +709,33 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_beliefs_keeps_recent_low_confidence() {
+    fn test_prune_stale_from_prompt_keeps_recent_low_confidence() {
         let mut b1 = make_belief("b1", 0.1);
         b1.last_updated = Utc::now() - Duration::days(10);
 
         let mut beliefs = vec![b1.clone()];
-        let pruned = prune_beliefs(&mut beliefs, Utc::now());
+        let pruned = prune_stale_from_prompt(&mut beliefs, Utc::now());
 
         assert!(pruned.is_empty());
         assert_eq!(beliefs.len(), 1);
     }
 
     #[test]
-    fn test_prune_beliefs_keeps_high_confidence_old() {
+    fn test_prune_stale_from_prompt_keeps_high_confidence_old() {
         let mut b1 = make_belief("b1", 0.8);
         b1.last_updated = Utc::now() - Duration::days(100);
 
         let mut beliefs = vec![b1.clone()];
-        let pruned = prune_beliefs(&mut beliefs, Utc::now());
+        let pruned = prune_stale_from_prompt(&mut beliefs, Utc::now());
 
         assert!(pruned.is_empty());
         assert_eq!(beliefs.len(), 1);
     }
 
     #[test]
-    fn test_prune_beliefs_empty_input() {
+    fn test_prune_stale_from_prompt_empty_input() {
         let mut beliefs = Vec::new();
-        let pruned = prune_beliefs(&mut beliefs, Utc::now());
+        let pruned = prune_stale_from_prompt(&mut beliefs, Utc::now());
         assert!(pruned.is_empty());
         assert!(beliefs.is_empty());
     }

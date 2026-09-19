@@ -23,7 +23,7 @@ use zen_vault::distill::{
     CycleOutcome, GapKind, GapRecord, LoopBudget, LoopCycleReport, SourceIngester,
 };
 use zen_vault::graph_router::{DocExtractor, is_routable_extension};
-use zen_vault::{DistillationPipeline, Reindexer};
+use zen_vault::{CommunitySummaryReport, DistillationPipeline, Reindexer};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::promotion_worker::{PromotionTarget, PromotionWorker};
@@ -341,6 +341,20 @@ impl ZenLoopWorker {
             if ctx.preserves_raw() {
                 for name in &staged {
                     let host_file = ctx.host_path.join(name);
+                    // T158: stat-and-skip above the ingest ceiling — never
+                    // read a multi-GB file into memory for raw preservation.
+                    let ceiling = loop_cfg.max_ingest_bytes_or_default();
+                    if let Ok(meta) = std::fs::metadata(&host_file)
+                        && meta.len() > ceiling
+                    {
+                        warn!(
+                            file = %host_file.display(),
+                            size = meta.len(),
+                            ceiling,
+                            "loop: host file exceeds ingest size ceiling — raw copy skipped"
+                        );
+                        continue;
+                    }
                     match std::fs::read_to_string(&host_file) {
                         Ok(content) => {
                             if let Err(e) = doc_extractor.ensure_raw_copy(
@@ -569,6 +583,66 @@ impl ZenLoopWorker {
                 "loop: commitment gap scan found overdue commitments"
             );
             gaps.extend(commitment_gaps);
+        }
+    }
+
+    /// T141 part B (Stage 4b): community detection + summarization.
+    ///
+    /// Runs after graph verify (Stage 4) and before reindex (Stage 5) so the
+    /// new pages are indexed in the same cycle. The partition step reuses
+    /// `NotionsRepo::compute_communities` (the shared valid-edge snapshot),
+    /// persists via `replace_communities`, and writes one wiki page per
+    /// community at/above `[agentic.loop] community_min_size`. Fail-open:
+    /// any failure warns and the cycle continues. Emits one
+    /// `loop.communities.computed` audit line per successful run.
+    async fn run_community_stage(
+        &self,
+        db: &zen_repo::SqliteClient,
+        wiki_dir: &Path,
+        logs_dir: &Path,
+        loop_cfg: &LoopConfig,
+        cycle_id: &str,
+        computed_at: &str,
+    ) -> CommunitySummaryReport {
+        let resolution = loop_cfg.community_resolution_or_default();
+        let min_size = loop_cfg.community_min_size_or_default();
+        match zen_vault::communities::run_community_summarization(
+            db,
+            wiki_dir,
+            resolution,
+            min_size,
+            computed_at,
+        )
+        .await
+        {
+            Ok(summary) => {
+                let audit = serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "kind": "loop.communities.computed",
+                    "cycle_id": cycle_id,
+                    "algorithm": "louvain",
+                    "resolution": resolution,
+                    "min_size": min_size,
+                    "communities": summary.communities_persisted,
+                    "pages_written": summary.pages_written,
+                });
+                if let Err(e) = append_jsonl_line(&logs_dir.join("audit.jsonl"), &audit) {
+                    warn!(error = %e, "loop: community audit line failed (non-fatal)");
+                }
+                if summary.pages_written > 0 {
+                    info!(
+                        communities = summary.communities_persisted,
+                        pages_written = summary.pages_written,
+                        resolution,
+                        "loop: community summarization complete"
+                    );
+                }
+                summary
+            }
+            Err(e) => {
+                warn!(error = %e, "loop: community summarization failed (cycle continues)");
+                CommunitySummaryReport::default()
+            }
         }
     }
 
@@ -804,6 +878,10 @@ fn requeue_pending(paths: &ZenPaths, logs_dir: &Path) -> usize {
 fn stage_host_dir(ctx: &HostSourceContext, loop_cfg: &LoopConfig, inbox: &Path) -> Vec<String> {
     let staging = inbox.join("_incoming").join(&ctx.host_hash);
     let promoted_dir = staging.join("promoted");
+    let quarantined_dir = staging.join("quarantined");
+    // T158: whole-file ingest ceiling — files above it are stat-and-skipped
+    // (never copied into staging, never read into memory) and quarantined.
+    let ceiling = loop_cfg.max_ingest_bytes_or_default();
     let mut staged = Vec::new();
     let Ok(entries) = std::fs::read_dir(&ctx.host_path) else {
         return staged;
@@ -823,7 +901,28 @@ fn stage_host_dir(ctx: &HostSourceContext, loop_cfg: &LoopConfig, inbox: &Path) 
         if loop_cfg.is_extension_skipped(ext) {
             continue;
         }
-        if staging.join(name).exists() || promoted_dir.join(name).exists() {
+        if staging.join(name).exists()
+            || promoted_dir.join(name).exists()
+            || quarantined_dir.join(name).exists()
+        {
+            continue;
+        }
+        // T158: stat-and-skip above the ceiling; the quarantine marker is the
+        // sweep's seen-set entry so the file is not re-warned every cycle.
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.len() > ceiling
+        {
+            std::fs::create_dir_all(&quarantined_dir).ok();
+            let marker = quarantined_dir.join(name);
+            if !marker.exists() {
+                std::fs::write(&marker, b"").ok();
+            }
+            warn!(
+                file = %path.display(),
+                size = meta.len(),
+                ceiling,
+                "loop: host file exceeds ingest size ceiling — quarantined"
+            );
             continue;
         }
         std::fs::create_dir_all(&staging).ok();
@@ -880,10 +979,17 @@ fn resolve_model_tier(router: &DefaultRouter, host: &HostSourceContext) -> &'sta
 
 /// Persist reverify-rejected hypotheses as negative-space records under
 /// `wiki/wisdom/rejected/` (FR-040) so the loop never re-proposes falsified
-/// claims. Best-effort: a record failure is logged, never fails the cycle.
-fn record_rejected_hypotheses(paths: &ZenPaths, rejected: &[zen_memory::RejectedHypothesis]) {
+/// claims, and record each rejection in the discovery tree (T140) so a
+/// future replay scorer can evaluate the stepping-stone policy. Best-effort:
+/// a record failure is logged, never fails the cycle.
+fn record_rejected_hypotheses(
+    paths: &ZenPaths,
+    tree_path: &Path,
+    tree: &mut Vec<zen_vault::distill::discovery_tree::DiscoveryNode>,
+    rejected: &[(String, zen_memory::RejectedHypothesis)],
+) {
     let reflections_dir = paths.wiki().join("wisdom").join("reflections");
-    for r in rejected {
+    for (slug, r) in rejected {
         match r.record(paths) {
             Ok(path) => info!(
                 path = %path.display(),
@@ -896,6 +1002,23 @@ fn record_rejected_hypotheses(paths: &ZenPaths, rejected: &[zen_memory::Rejected
         match zen_vault::distill::reflection::record_reflection(&reflections_dir, r) {
             Ok(path) => debug!(path = %path.display(), "loop: rejection reflection recorded"),
             Err(e) => warn!(error = %e, "loop: rejection reflection failed (non-fatal)"),
+        }
+        // T140: the falsified attempt becomes stepping-stone material —
+        // record it parented to its latest prior attempt.
+        let parent_id =
+            zen_vault::distill::discovery_tree::DiscoveryTree::latest_for_slug(tree, slug)
+                .map(|n| n.id.clone());
+        let node = zen_vault::distill::discovery_tree::DiscoveryNode::rejection(
+            slug,
+            parent_id,
+            r.falsifier.clone(),
+            Vec::new(),
+        );
+        if let Err(e) = zen_vault::distill::discovery_tree::DiscoveryTree::append(tree_path, &node)
+        {
+            warn!(error = %e, "loop: discovery-tree rejection record failed (non-fatal)");
+        } else {
+            tree.push(node);
         }
     }
 }
@@ -1223,6 +1346,27 @@ impl ZenWorker for ZenLoopWorker {
             Err(e) => warn!(error = %e, "loop: page lint failed (cycle continues)"),
         }
 
+        // ── Stage 4b: community detection + summarization (T141 part B) ──
+        // Louvain over the open-edge projection (shared valid-edge snapshot),
+        // persisted via replace_communities; communities at/above the
+        // configured minimum become wiki pages under wiki/communities/.
+        // Runs after verify and before reindex so the new pages are indexed
+        // in the same cycle. Fail-open: any failure warns, cycle continues.
+        if let Some(db) = db.as_ref() {
+            let summary = self
+                .run_community_stage(
+                    db,
+                    &paths.wiki(),
+                    &logs_dir,
+                    loop_cfg,
+                    &cycle_id,
+                    &ctx.now.to_rfc3339(),
+                )
+                .await;
+            report.communities_persisted = summary.communities_persisted;
+            report.community_pages_written = summary.pages_written;
+        }
+
         // T017: inbox-empty guarantee — leftover notes retry next cycles,
         // quarantined after max_attempts (FR-006/FR-010).
         {
@@ -1294,6 +1438,14 @@ impl ZenWorker for ZenLoopWorker {
         // HypothesisSlug records at wiki/wisdom/hypotheses/. Idempotent
         // per slug (save merges evidence and keeps the higher status), so
         // repeated cycles converge instead of duplicating.
+        //
+        // T140: the discovery tree is loaded once per cycle and appended at
+        // every decision point (5b incubation + incumbent baseline, 5c
+        // refinement/reverify, rejections) so parent links resolve within
+        // the cycle. Fail-open: a write failure is logged, never fails the
+        // cycle.
+        let tree_path = zen_vault::distill::discovery_tree::discovery_tree_path(&paths.logs());
+        let mut tree = zen_vault::distill::discovery_tree::DiscoveryTree::load(&tree_path);
         {
             let hypotheses_dir = paths.vault().join("wiki/wisdom/hypotheses");
             let rejected_dir = paths.vault().join("wiki/wisdom/rejected");
@@ -1309,6 +1461,35 @@ impl ZenWorker for ZenLoopWorker {
                 }
             }
             report.hypotheses_generated = slugs.len();
+
+            // T140: one incubation node per generated hypothesis (gap-driven
+            // policy, outcome pending, root of its subtree).
+            for slug in &slugs {
+                let node = zen_vault::distill::discovery_tree::DiscoveryNode::incubation(
+                    &slug.slug,
+                    slug.evidence_refs.clone(),
+                );
+                if let Err(e) =
+                    zen_vault::distill::discovery_tree::DiscoveryTree::append(&tree_path, &node)
+                {
+                    warn!(error = %e, "loop: discovery-tree incubation record failed (non-fatal)");
+                } else {
+                    tree.push(node);
+                }
+            }
+            // T140: the per-cycle incumbent baseline candidate — recorded
+            // alongside exploration so a future replay scorer can include the
+            // incumbent policy in its candidate set (never-worse guarantee).
+            if !slugs.is_empty() {
+                let incumbent = zen_vault::distill::discovery_tree::DiscoveryNode::incumbent();
+                if let Err(e) = zen_vault::distill::discovery_tree::DiscoveryTree::append(
+                    &tree_path, &incumbent,
+                ) {
+                    warn!(error = %e, "loop: discovery-tree incumbent record failed (non-fatal)");
+                } else {
+                    tree.push(incumbent);
+                }
+            }
 
             // AlphaEvolve/DGM archive: re-classify the current hypothesis set
             // (evidence × gap-domain × freshness) so parent selection can
@@ -1391,6 +1572,35 @@ impl ZenWorker for ZenLoopWorker {
             report.refinement_fetch_prompts = fetch_prompts.len();
             report.refinement_user_questions = user_questions.len();
 
+            // T140: one refinement node per unresolved hypothesis re-queued
+            // by the illumination-ordered curriculum, parented to its latest
+            // prior attempt (incubation or earlier refinement).
+            for slug in &slugs {
+                if matches!(
+                    slug.status,
+                    zen_vault::distill::HypothesisStatus::Hypothesis
+                        | zen_vault::distill::HypothesisStatus::Exploring
+                ) {
+                    let parent_id =
+                        zen_vault::distill::discovery_tree::DiscoveryTree::latest_for_slug(
+                            &tree, &slug.slug,
+                        )
+                        .map(|n| n.id.clone());
+                    let node = zen_vault::distill::discovery_tree::DiscoveryNode::refinement(
+                        &slug.slug,
+                        parent_id,
+                        slug.evidence_refs.clone(),
+                    );
+                    if let Err(e) =
+                        zen_vault::distill::discovery_tree::DiscoveryTree::append(&tree_path, &node)
+                    {
+                        warn!(error = %e, "loop: discovery-tree refinement record failed (non-fatal)");
+                    } else {
+                        tree.push(node);
+                    }
+                }
+            }
+
             let queue = serde_json::json!({
                 "cycle_id": report.cycle_id,
                 "generated_at": chrono::Utc::now().to_rfc3339(),
@@ -1418,11 +1628,35 @@ impl ZenWorker for ZenLoopWorker {
                 chrono::Utc::now(),
                 chrono::Duration::days(loop_cfg.reverify_older_than_days_or_default() as i64),
             ) {
-                Ok((validated, reverified, rejected)) => {
-                    report.hypotheses_validated = validated;
-                    report.hypotheses_reverified = reverified;
-                    report.hypotheses_rejected = rejected.len();
-                    record_rejected_hypotheses(&paths, &rejected);
+                Ok(outcome) => {
+                    report.hypotheses_validated = outcome.validated_slugs.len();
+                    report.hypotheses_reverified = outcome.transition_count;
+                    report.hypotheses_rejected = outcome.rejected.len();
+                    // T140: one reverify node per validated transition (the
+                    // incumbent pipeline acting), parented to the latest
+                    // prior attempt for the hypothesis.
+                    for slug in &outcome.validated_slugs {
+                        let parent_id =
+                            zen_vault::distill::discovery_tree::DiscoveryTree::latest_for_slug(
+                                &tree, slug,
+                            )
+                            .map(|n| n.id.clone());
+                        let node = zen_vault::distill::discovery_tree::DiscoveryNode::reverify(
+                            slug,
+                            parent_id,
+                            zen_vault::distill::discovery_tree::Outcome::Validated,
+                            None,
+                            Vec::new(),
+                        );
+                        if let Err(e) = zen_vault::distill::discovery_tree::DiscoveryTree::append(
+                            &tree_path, &node,
+                        ) {
+                            warn!(error = %e, "loop: discovery-tree reverify record failed (non-fatal)");
+                        } else {
+                            tree.push(node);
+                        }
+                    }
+                    record_rejected_hypotheses(&paths, &tree_path, &mut tree, &outcome.rejected);
                 }
                 Err(e) => warn!(error = %e, "loop: hypothesis reverify failed (non-fatal)"),
             }
@@ -1773,16 +2007,34 @@ mod tests {
         f.set_times(std::fs::FileTimes::new().set_modified(old_time))
             .unwrap();
 
-        let (_, _, rejected) = zen_vault::distill::reverify_with_rejections(
+        let outcome = zen_vault::distill::reverify_with_rejections(
             &hypo_dir,
             &wiki_dir,
             chrono::Utc::now(),
             chrono::Duration::days(7),
         )
         .unwrap();
+        let rejected = outcome.rejected;
         assert_eq!(rejected.len(), 1);
 
-        record_rejected_hypotheses(&paths, &rejected);
+        let tree_path = zen_vault::distill::discovery_tree::discovery_tree_path(&paths.logs());
+        let mut tree = zen_vault::distill::discovery_tree::DiscoveryTree::load(&tree_path);
+        record_rejected_hypotheses(&paths, &tree_path, &mut tree, &rejected);
+
+        // T140: the rejection is recorded in the discovery tree, parented to
+        // the hypothesis' incubation attempt.
+        let nodes = zen_vault::distill::discovery_tree::DiscoveryTree::load(&tree_path);
+        assert_eq!(nodes.len(), 1, "exactly one discovery-tree rejection node");
+        assert_eq!(
+            nodes[0].node_kind,
+            zen_vault::distill::discovery_tree::NodeKind::Rejection
+        );
+        assert_eq!(nodes[0].hypothesis_slug, "loop-reject-entity");
+        assert_eq!(
+            nodes[0].outcome,
+            zen_vault::distill::discovery_tree::Outcome::Rejected
+        );
+        assert!(nodes[0].falsifier.is_some());
 
         let rejected_dir = paths.wiki().join("wisdom").join("rejected");
         let entries: Vec<_> = std::fs::read_dir(&rejected_dir).unwrap().collect();
@@ -2093,6 +2345,66 @@ mod tests {
         assert!(
             !backoff.contains_key(&host_dir),
             "successful staging must clear the backoff entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn community_stage_failure_does_not_fail_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&db_path).await.unwrap();
+
+        // Seed a 4-member clique so a community above the default minimum
+        // exists — the failure must come from the page-write side.
+        let repo = zen_repo::NotionsRepo::new(&client);
+        let now = chrono::Utc::now().to_rfc3339();
+        for (i, name) in ["Rust", "Cargo", "Tokio", "Axum"].iter().enumerate() {
+            repo.upsert_entity(&format!("n{i}"), name, "concept", &now, &now)
+                .await
+                .unwrap();
+        }
+        for (i, j) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
+            repo.insert_relationship(&zen_repo::InsertRelationshipRequest {
+                id: &format!("e{i}-{j}"),
+                source_id: &format!("n{i}"),
+                target_id: &format!("n{j}"),
+                rel_type: "related_to",
+                confidence: 1.0,
+                source_note_ids: None,
+                created_at: &now,
+                description: None,
+                valid_from: None,
+                valid_until: None,
+                weight: Some(1.0),
+            })
+            .await
+            .unwrap();
+        }
+
+        // wiki_dir is a FILE, so AtomicWikiWriter's create_dir_all fails —
+        // the stage must warn and return an empty report, never abort.
+        let wiki_file = tmp.path().join("wiki");
+        std::fs::write(&wiki_file, "not a directory").unwrap();
+        let logs_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let config = ZenConfig::default();
+        let worker = ZenLoopWorker::new();
+        let report = worker
+            .run_community_stage(
+                &client,
+                &wiki_file,
+                &logs_dir,
+                &config.agentic.loop_cfg,
+                "cycle-failopen-001",
+                &now,
+            )
+            .await;
+
+        assert_eq!(
+            report,
+            CommunitySummaryReport::default(),
+            "a stage failure must degrade to an empty report, not abort the cycle"
         );
     }
 }

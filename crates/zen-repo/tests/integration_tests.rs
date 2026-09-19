@@ -2032,12 +2032,31 @@ async fn test_wikilink_edge_insertion() {
 #[test]
 fn test_normalize_alias_collapses_case_unicode_and_suffix_variants() {
     // SC-008: `rust-lang` / `Rust` / `rust.js` must resolve to one canonical
-    // alias. `rust-lang` is covered by the "-lang" suffix rule.
-    for variant in ["rust-lang", "Rust", "rust.js", "  Rust  "] {
+    // alias. `rust-lang` and `Rust Lang` are covered by the `-lang` / ` lang`
+    // suffix rules; `.go`/`.java`/`.rb` by the extension rules (T145).
+    for variant in [
+        "rust-lang",
+        "Rust",
+        "rust.js",
+        "  Rust  ",
+        "Rust Lang",
+        "main.go",
+        "App.java",
+        "script.rb",
+    ] {
+        let expected = if variant.ends_with(".go") {
+            "main"
+        } else if variant.ends_with(".java") {
+            "app"
+        } else if variant.ends_with(".rb") {
+            "script"
+        } else {
+            "rust"
+        };
         assert_eq!(
             normalize_alias(variant),
-            "rust",
-            "variant {variant:?} must canonicalize to `rust`"
+            expected,
+            "variant {variant:?} must canonicalize to `{expected}`"
         );
     }
 

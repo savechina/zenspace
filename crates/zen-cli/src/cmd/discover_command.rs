@@ -14,7 +14,7 @@ use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
     CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate, aggregate_orchestration,
-    load_reports, run_arena,
+    analyze, load_reports, run_arena,
 };
 
 #[derive(Subcommand)]
@@ -129,11 +129,16 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
             let metrics = aggregate(&history);
             let orchestration = aggregate_orchestration(&paths.logs())
                 .map_err(|e| ZenError::Message(format!("orchestration stats I/O error: {e}")))?;
+            let calibration = analyze(&paths.logs())
+                .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
+            let replay = zen_vault::distill::score_from_log(&paths.logs());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "rsi_health": metrics,
                     "orchestration": orchestration,
+                    "calibration": calibration,
+                    "replay": replay,
                 }))
                 .map_err(|e| ZenError::Message(e.to_string()))?
             );

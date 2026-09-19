@@ -47,24 +47,14 @@ impl ZenWorker for EvidenceGatherer {
         let start = std::time::Instant::now();
         let paths = ZenPaths::detect()?;
 
-        let beliefs_dir = match paths.workspace_root() {
-            Some(root) => root.join("memories").join("beliefs"),
-            None => {
-                debug!("no workspace root configured, skipping evidence gathering");
-                return Ok(WorkerReport {
-                    worker_id: self.id().to_string(),
-                    success: true,
-                    fact_count: 0,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    llm_cost_usd: 0.0,
-                });
-            }
-        };
-
-        let beliefs = Belief::load_all(&beliefs_dir)
-            .with_context(|| format!("failed to load beliefs from: {}", beliefs_dir.display()))?;
-
-        let weak_beliefs: Vec<&Belief> = beliefs.iter().filter(|b| b.evidence_count < 3).collect();
+        // T131: scan the real belief surfaces — the durable-wisdom surface
+        // under the vault plus the demoted-beliefs working tier (T132). Both
+        // are global (vault + memories), so no workspace root is required.
+        let surfaces = [
+            paths.vault().join("wiki/wisdom/beliefs"),
+            paths.memory().join("demoted-beliefs"),
+        ];
+        let weak_beliefs = scan_weak_beliefs(&surfaces);
 
         if weak_beliefs.is_empty() {
             debug!("no beliefs with low evidence count found");
@@ -77,10 +67,7 @@ impl ZenWorker for EvidenceGatherer {
             });
         }
 
-        let suggestions_dir = match paths.workspace_root() {
-            Some(root) => root.join("memories").join("research-suggestions"),
-            None => unreachable!("already checked above"),
-        };
+        let suggestions_dir = paths.memory().join("research-suggestions");
         fs::create_dir_all(&suggestions_dir).with_context(|| {
             format!(
                 "failed to create research-suggestions dir: {}",
@@ -91,7 +78,8 @@ impl ZenWorker for EvidenceGatherer {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let output_path = suggestions_dir.join(format!("{today}.md"));
 
-        let content = format_research_suggestions(&weak_beliefs, chrono::Utc::now());
+        let weak_refs: Vec<&Belief> = weak_beliefs.iter().collect();
+        let content = format_research_suggestions(&weak_refs, chrono::Utc::now());
         fs::write(&output_path, &content).with_context(|| {
             format!(
                 "failed to write research suggestions: {}",
@@ -100,7 +88,7 @@ impl ZenWorker for EvidenceGatherer {
         })?;
 
         info!(
-            count = weak_beliefs.len(),
+            count = weak_refs.len(),
             path = %output_path.display(),
             "research suggestions generated"
         );
@@ -108,11 +96,29 @@ impl ZenWorker for EvidenceGatherer {
         Ok(WorkerReport {
             worker_id: self.id().to_string(),
             success: true,
-            fact_count: weak_beliefs.len(),
+            fact_count: weak_refs.len(),
             duration_ms: start.elapsed().as_millis() as u64,
             llm_cost_usd: 0.0,
         })
     }
+}
+
+/// Collect beliefs with `evidence_count < 3` across the given surfaces.
+/// A missing surface is not an error — `Belief::load_all` returns empty for
+/// a non-directory, and a read failure on one surface degrades to skipping
+/// that surface so the other surfaces still contribute.
+fn scan_weak_beliefs(surfaces: &[std::path::PathBuf]) -> Vec<Belief> {
+    let mut beliefs = Vec::new();
+    for dir in surfaces {
+        match Belief::load_all(dir) {
+            Ok(mut loaded) => beliefs.append(&mut loaded),
+            Err(e) => {
+                debug!(dir = %dir.display(), error = %e, "failed to load beliefs, skipping surface");
+            }
+        }
+    }
+    beliefs.retain(|b| b.evidence_count < 3);
+    beliefs
 }
 
 fn format_research_suggestions(beliefs: &[&Belief], now: chrono::DateTime<chrono::Utc>) -> String {
@@ -240,5 +246,77 @@ mod tests {
         let worker = EvidenceGatherer::new();
         assert_eq!(worker.id(), "evidence-gatherer");
         assert_eq!(worker.schedule(), "0 0 6 * * 1");
+    }
+
+    #[test]
+    fn scan_weak_beliefs_finds_low_evidence_on_real_surfaces() {
+        let dir = tempdir().unwrap();
+        // Real surface layout (T131): vault/wiki/wisdom/beliefs (durable
+        // wisdom) + memories/demoted-beliefs (T132 working tier).
+        let wisdom = dir.path().join("vault/wiki/wisdom/beliefs");
+        let demoted = dir.path().join("memories/demoted-beliefs");
+        fs::create_dir_all(&wisdom).unwrap();
+        fs::create_dir_all(&demoted).unwrap();
+
+        write_belief_file(&wisdom, "weak-belief", "poorly supported", 1);
+        write_belief_file(&wisdom, "strong-belief", "well supported", 5);
+        write_belief_file(&demoted, "demoted-weak", "demoted and weak", 0);
+
+        let weak = scan_weak_beliefs(&[wisdom, demoted]);
+        let props: Vec<&str> = weak.iter().map(|b| b.proposition.as_str()).collect();
+        assert!(props.contains(&"poorly supported"));
+        assert!(props.contains(&"demoted and weak"));
+        assert!(
+            !props.contains(&"well supported"),
+            "well-evidenced belief must not be suggested"
+        );
+    }
+
+    #[test]
+    fn scan_weak_beliefs_missing_surfaces_ok() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("vault/wiki/wisdom/beliefs");
+        let weak = scan_weak_beliefs(&[missing]);
+        assert!(weak.is_empty(), "missing surfaces yield no suggestions");
+    }
+
+    #[tokio::test]
+    async fn execute_fires_suggestion_for_weak_belief_on_real_surface() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let wisdom = home.join("vault/wiki/wisdom/beliefs");
+        fs::create_dir_all(&wisdom).unwrap();
+        write_belief_file(&wisdom, "weak-belief", "poorly supported", 1);
+        write_belief_file(&wisdom, "strong-belief", "well supported", 5);
+
+        let saved = std::env::var("ZEN_HOME").ok();
+        unsafe { std::env::set_var("ZEN_HOME", &home) };
+        let worker = EvidenceGatherer::new();
+        let report = worker
+            .execute(&WorkerContext::new(chrono::Utc::now()))
+            .await
+            .unwrap();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("ZEN_HOME", v) },
+            None => unsafe { std::env::remove_var("ZEN_HOME") },
+        }
+
+        assert_eq!(
+            report.fact_count, 1,
+            "only the weak belief is suggested, got {}",
+            report.fact_count
+        );
+        let suggestions_dir = home.join("memories/research-suggestions");
+        let entries: Vec<_> = fs::read_dir(&suggestions_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1, "one suggestion file written");
+        let content = fs::read_to_string(&entries[0]).unwrap();
+        assert!(content.contains("poorly supported"));
+        assert!(
+            !content.contains("well supported"),
+            "well-evidenced belief must not appear in suggestions"
+        );
     }
 }

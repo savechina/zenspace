@@ -113,6 +113,11 @@ impl SkillHitRouter {
     }
 
     /// Attach a semantic scorer; without one the router stays purely lexical.
+    ///
+    /// DORMANT (T075/T134): embedding work must stay off the per-turn routing
+    /// path, so no production call site wires a scorer — this is test-only.
+    /// Activation requires a non-per-turn call site (session start or skill
+    /// discovery); see the `skill_embedding` module docs.
     #[must_use]
     pub fn with_scorer(mut self, scorer: Arc<dyn SkillScorer>) -> Self {
         self.scorer = Some(scorer);

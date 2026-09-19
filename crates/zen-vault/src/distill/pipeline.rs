@@ -354,14 +354,19 @@ fn archive_processed_notes(
             ));
         }
 
-        let raw = match std::fs::read(&source) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        let bytes = match std::fs::read(&source) {
+            Ok(bytes) => bytes,
             Err(e) => {
                 tracing::warn!(source = %source.display(), error = %e, "Failed to read note for archive");
                 continue;
             }
         };
-        let checksum = ChangeDetector::compute_checksum(&raw);
+        // T158: hash the RAW bytes, not the lossy-converted text — two
+        // distinct files whose invalid-UTF-8 sequences lossy-convert to the
+        // same string must not share a checksum (or a distinct new note would
+        // be deleted as "already archived" by the FR-011 skip).
+        let checksum = ChangeDetector::compute_checksum_bytes(&bytes);
+        let raw = String::from_utf8_lossy(&bytes).to_string();
         let provenance = append_provenance(
             &raw,
             &[
@@ -772,55 +777,113 @@ impl DistillationPipeline {
         // after the commit that made those writes durable, so a crash or a CAS
         // rollback cannot leave a note recorded as archived while its outputs
         // were deleted — the same note would then be skipped and silently lost.
-        if let Some(db) = db
-            && let Ok(recorded) = NotionsRepo::new(db).load_note_stages().await
-        {
-            let completed: HashSet<(String, String)> = recorded
-                .into_iter()
-                .filter(|row| row.last_completed_stage == STAGE_ARCHIVED)
-                .map(|row| (row.file_path, row.content_hash))
-                .collect();
-            if !completed.is_empty() {
-                let mut skipped: Vec<PathBuf> = Vec::new();
-                notes.retain(|note| match note.file_path.as_ref() {
-                    Some(path) => {
-                        // Hash the file's bytes, matching the hash recorded at
-                        // archive time (which covers the whole file). Hashing
-                        // `note.content` here would compare frontmatter-stripped
-                        // text against full-file bytes and never match.
-                        let hash = match std::fs::read(path) {
-                            Ok(bytes) => {
-                                ChangeDetector::compute_checksum(&String::from_utf8_lossy(&bytes))
+        if let Some(db) = db {
+            // T162: prune stale projection rows — paths gone from the vault,
+            // older than the age cap — so the table cannot grow forever.
+            if let Ok(pruned) = NotionsRepo::new(db).prune_note_stages(30).await
+                && pruned > 0
+            {
+                info!(pruned, "FR-011: pruned stale note_stages rows");
+            }
+            // FR-011: durable per-note identity. Skip any note whose exact
+            // content already reached the terminal stage. The projection is
+            // written only after the commit that made those writes durable, so
+            // a crash or a CAS rollback cannot leave a note recorded as
+            // archived while its outputs were deleted — the same note would
+            // then be skipped and silently lost.
+            if let Ok(recorded) = NotionsRepo::new(db).load_note_stages(STAGE_ARCHIVED).await {
+                let completed: HashSet<(String, String)> = recorded
+                    .into_iter()
+                    .map(|row| (row.file_path, row.content_hash))
+                    .collect();
+                if !completed.is_empty() {
+                    let mut skipped: Vec<PathBuf> = Vec::new();
+                    let mut oversized: Vec<PathBuf> = Vec::new();
+                    let ceiling = zen_core::config::load_config()
+                        .map(|cfg| cfg.agentic.loop_cfg.max_ingest_bytes_or_default())
+                        .unwrap_or(64 * 1024 * 1024);
+                    notes.retain(|note| match note.file_path.as_ref() {
+                        Some(path) => {
+                            // T158: stat-and-skip above the ingest ceiling —
+                            // never read a multi-GB file into memory just to
+                            // hash it; quarantine it instead.
+                            let meta = match std::fs::metadata(path) {
+                                Ok(m) => m,
+                                Err(_) => return true,
+                            };
+                            if meta.len() > ceiling {
+                                oversized.push(path.clone());
+                                false
+                            } else {
+                                // Hash the file's raw bytes, matching the hash
+                                // recorded at archive time (which covers the
+                                // whole file). Hashing `note.content` here
+                                // would compare frontmatter-stripped text
+                                // against full-file bytes and never match.
+                                let hash = match std::fs::read(path) {
+                                    Ok(bytes) => ChangeDetector::compute_checksum_bytes(&bytes),
+                                    Err(_) => return true,
+                                };
+                                if completed.contains(&(path.display().to_string(), hash)) {
+                                    skipped.push(path.clone());
+                                    false
+                                } else {
+                                    true
+                                }
                             }
-                            Err(_) => return true,
-                        };
-                        if completed.contains(&(path.display().to_string(), hash)) {
-                            skipped.push(path.clone());
-                            false
+                        }
+                        None => true,
+                    });
+                    // T158: quarantine oversized inbox files (FR-010
+                    // convention) so load_notes never re-reads them on a later
+                    // cycle — leaving them would break FR-006's empty-inbox
+                    // guarantee and re-OOM every cycle.
+                    if !oversized.is_empty() {
+                        let quarantine_dir = archive_dir.join("quarantine");
+                        if let Err(e) = std::fs::create_dir_all(&quarantine_dir) {
+                            warn!(
+                                error = %e,
+                                "FR-011: could not create quarantine dir for oversized notes"
+                            );
                         } else {
-                            true
+                            for path in &oversized {
+                                let dest =
+                                    quarantine_dir.join(path.file_name().unwrap_or_default());
+                                match std::fs::rename(path, &dest) {
+                                    Ok(()) => warn!(
+                                        path = %path.display(),
+                                        dest = %dest.display(),
+                                        "FR-011: oversized note quarantined (above ingest ceiling)"
+                                    ),
+                                    Err(e) => warn!(
+                                        path = %path.display(),
+                                        error = %e,
+                                        "FR-011: could not quarantine oversized note"
+                                    ),
+                                }
+                            }
                         }
                     }
-                    None => true,
-                });
-                // The content is already durable in the archive, so the inbox
-                // copy is a duplicate. Remove it rather than leaving it: an
-                // inbox that never drains would break FR-006's empty-inbox
-                // guarantee and re-skip the same file every cycle.
-                for path in &skipped {
-                    if let Err(e) = std::fs::remove_file(path) {
-                        warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "FR-011: could not remove an already-archived inbox duplicate"
+                    // The content is already durable in the archive, so the
+                    // inbox copy is a duplicate. Remove it rather than leaving
+                    // it: an inbox that never drains would break FR-006's
+                    // empty-inbox guarantee and re-skip the same file every
+                    // cycle.
+                    for path in &skipped {
+                        if let Err(e) = std::fs::remove_file(path) {
+                            warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "FR-011: could not remove an already-archived inbox duplicate"
+                            );
+                        }
+                    }
+                    if !skipped.is_empty() {
+                        info!(
+                            skipped = skipped.len(),
+                            "FR-011: note already archived for this content — duplicate removed"
                         );
                     }
-                }
-                if !skipped.is_empty() {
-                    info!(
-                        skipped = skipped.len(),
-                        "FR-011: note already archived for this content — duplicate removed"
-                    );
                 }
             }
         }

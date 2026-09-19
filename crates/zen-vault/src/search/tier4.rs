@@ -11,8 +11,7 @@ use crate::tools::{
     result_schema_array,
 };
 use zen_repo::{
-    ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionsRepo, PageRankResult,
-    ShortestPathResult, SqliteClient,
+    GraphSearchResult, InsertRelationshipRequest, NotionsRepo, PageRankResult, SqliteClient,
 };
 
 /// PageRank damping factor (standard value; 20 power iterations is far beyond
@@ -66,8 +65,7 @@ pub struct SubgraphEdge {
 /// whole neighborhood is handed to the Agent for cross-document synthesis.
 ///
 /// Tier-5/service wiring lands in a later wave; this type plus
-/// [`Tier4Search::subgraph_synthesis`] and [`Tier4Search::synthesize_context`]
-/// are the delivery surface.
+/// [`Tier4Search::subgraph_synthesis`] are the delivery surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubgraphContext {
     /// Center entity name the subgraph was extracted around.
@@ -222,19 +220,6 @@ impl Tier4Search {
         Ok(())
     }
 
-    pub async fn shortest_path(
-        &self,
-        client: &SqliteClient,
-        src_name: &str,
-        dst_name: &str,
-        max_depth: u32,
-    ) -> Result<Option<ShortestPathResult>> {
-        NotionsRepo::new(client)
-            .shortest_path(src_name, dst_name, max_depth)
-            .await
-            .map_err(Into::into)
-    }
-
     pub async fn pagerank(
         &self,
         client: &SqliteClient,
@@ -243,16 +228,6 @@ impl Tier4Search {
     ) -> Result<Vec<PageRankResult>> {
         NotionsRepo::new(client)
             .pagerank(iterations, damping)
-            .await
-            .map_err(Into::into)
-    }
-
-    pub async fn connected_components(
-        &self,
-        client: &SqliteClient,
-    ) -> Result<Vec<ComponentResult>> {
-        NotionsRepo::new(client)
-            .connected_components()
             .await
             .map_err(Into::into)
     }
@@ -400,19 +375,6 @@ impl Tier4Search {
             nodes,
             edges,
         })
-    }
-
-    /// Thin wrapper over [`Self::subgraph_synthesis`]: build the N-hop
-    /// subgraph and return [`SubgraphContext::render`] output ready for LLM
-    /// prompt injection. Tier-5/service wiring lands in a later wave.
-    pub async fn synthesize_context(
-        client: &SqliteClient,
-        center: &str,
-        hops: u32,
-    ) -> Result<String> {
-        Ok(Self::subgraph_synthesis(client, center, hops)
-            .await?
-            .render())
     }
 }
 
@@ -830,30 +792,5 @@ mod tests {
             .await
             .unwrap();
         assert!(ctx0.nodes.is_empty() && ctx0.edges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn synthesize_context_returns_rendered_block() {
-        let (_dir, client) = setup_test_db().await;
-        let tier4 = Tier4Search;
-        tier4
-            .insert_entity(&client, "e1", "Alice", "person")
-            .await
-            .unwrap();
-        tier4
-            .insert_entity(&client, "e2", "Bob", "person")
-            .await
-            .unwrap();
-        let now = chrono::Utc::now().to_rfc3339();
-        tier4
-            .insert_relationship(&client, "r1", "e1", "e2", "knows", 1.0, None, &now)
-            .await
-            .unwrap();
-
-        let text = Tier4Search::synthesize_context(&client, "Alice", 2)
-            .await
-            .unwrap();
-        assert!(text.starts_with("## Subgraph: Alice"));
-        assert!(text.contains("- Alice -> Bob (knows)"));
     }
 }

@@ -210,6 +210,11 @@ impl Tool for ShellExecTool {
         #[cfg(unix)]
         cmd.process_group(0);
 
+        // T165: kill the child if the turn is cancelled and this future is
+        // dropped — with its own process group an orphan is unreachable by the
+        // parent's signals.
+        cmd.kill_on_drop(true);
+
         tracing::debug!(tool = NAME, binary, ?argv, ?cwd, timeout_ms, "spawning");
 
         let mut child = cmd

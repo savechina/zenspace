@@ -672,6 +672,28 @@ pub fn run_arena(
         Ok(staged) => report.staged_losses = staged,
         Err(e) => tracing::warn!(error = %e, "arena loss staging failed (non-fatal)"),
     }
+    // T140: record each staged loss in the discovery tree (policy
+    // arena-loss), parented to the latest incumbent baseline node so a
+    // future replay scorer can evaluate the challenger against the
+    // incumbent. Fail-open: a write failure is logged, never fails the gate.
+    let tree_path = super::discovery_tree::discovery_tree_path(logs_dir);
+    let tree = super::discovery_tree::DiscoveryTree::load(&tree_path);
+    let incumbent_id = super::discovery_tree::DiscoveryTree::latest_for_slug(
+        &tree,
+        super::discovery_tree::INCUMBENT_SLUG,
+    )
+    .map(|n| n.id.clone());
+    let report_ref = format!("logs/{ARENA_REPORT_PREFIX}{cycle_id}.json");
+    for slug in &report.staged_losses {
+        let node = super::discovery_tree::DiscoveryNode::arena_loss(
+            slug,
+            incumbent_id.clone(),
+            vec![report_ref.clone()],
+        );
+        if let Err(e) = super::discovery_tree::DiscoveryTree::append(&tree_path, &node) {
+            tracing::warn!(error = %e, "arena loss discovery-tree record failed (non-fatal)");
+        }
+    }
     fs::create_dir_all(logs_dir)
         .with_context(|| format!("create logs dir: {}", logs_dir.display()))?;
     fs::write(

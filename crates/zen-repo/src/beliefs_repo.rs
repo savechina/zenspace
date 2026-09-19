@@ -1,3 +1,14 @@
+//! Belief-node projection into `state.db`.
+//!
+//! **Dormant by design (T144 decision, 2026-09-19).** The markdown surface
+//! (`wiki/wisdom/beliefs/*.md`) is canonical: it is the only belief store with a
+//! production writer (`MemoryCurator`) and the only one read back into prompts.
+//! This table has no production writer — only tests call [`BeliefsRepo::upsert`] —
+//! and is kept as the documented DB projection so a future reader does not have to
+//! re-investigate the missing writer. Mirroring the markdown surface here would
+//! create a second writer for the same data and contradict the T051
+//! single-writer decision.
+
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{BeliefNodeRow, UpsertBeliefNodeRequest};
 

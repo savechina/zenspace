@@ -125,13 +125,21 @@ pub fn increment_corrections(reward_dir: &Path, card_id: &str) -> Result<(), Str
     })
 }
 
-/// Compute a card_id from a note path (filename stem, filesystem-safe).
+/// Compute a card_id from a note path (full relative path, filesystem-safe).
+///
+/// Keys by the full path — not the filename stem — so `report.md` under
+/// different directories never share one sidecar record. Path separators
+/// are flattened to `_` so the id stays a single filename.
 pub fn card_id_from_path(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown")
-        .to_string()
+    let p = std::path::Path::new(path);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+    match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            let dir = parent.to_string_lossy().replace(['/', '\\'], "_");
+            format!("{dir}_{stem}")
+        }
+        _ => stem.to_string(),
+    }
 }
 
 fn sidecar_path(reward_dir: &Path, card_id: &str) -> PathBuf {
@@ -201,9 +209,20 @@ mod tests {
     }
 
     #[test]
-    fn card_id_from_path_extracts_stem() {
-        assert_eq!(card_id_from_path("vault/wiki/notions/rust.md"), "rust");
-        assert_eq!(card_id_from_path("/a/b/c/my-card.md"), "my-card");
+    fn card_id_from_path_keys_by_full_relative_path() {
+        // Distinct directories must never share a sidecar record (T160).
+        assert_eq!(
+            card_id_from_path("vault/wiki/notions/rust.md"),
+            "vault_wiki_notions_rust"
+        );
+        assert_eq!(
+            card_id_from_path("memories/journal/report.md"),
+            "memories_journal_report"
+        );
+        assert_eq!(
+            card_id_from_path("memories/archive/report.md"),
+            "memories_archive_report"
+        );
         assert_eq!(card_id_from_path("no-ext"), "no-ext");
     }
 

@@ -5,8 +5,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{
-    ComponentResult, GraphSearchResult, InsertRelationshipRequest, NoteStageRow, NotionRow,
-    PageRankResult, RelationRow, ShortestPathResult,
+    Community, CommunityMember, ComponentResult, GraphSearchResult, InsertRelationshipRequest,
+    NoteStageRow, NotionRow, PageRankResult, RelationRow, ShortestPathResult,
 };
 
 /// Canonical alias normalization (FR-022). Applied on both write
@@ -25,6 +25,7 @@ pub fn normalize_alias(raw: &str) -> String {
         ".rs",
         ".py",
         "-lang",
+        " lang",
         " language",
         ".ts",
         ".go",
@@ -942,6 +943,171 @@ impl<'a> NotionsRepo<'a> {
         Ok(results)
     }
 
+    /// Deterministic Louvain communities over the undirected weighted projection
+    /// of currently-open relationship edges (T141).
+    ///
+    /// Reuses [`Self::load_graph_core`] — the same valid-edge snapshot shared by
+    /// [`Self::pagerank`] and [`Self::personalized_pagerank`] — so the
+    /// bi-temporal semantics (`t_invalid IS NULL`, `valid_until` empty) cannot
+    /// drift between traversals. Edge weight = number of edges in either
+    /// direction between the pair. Isolated notions (no open edges) are not part
+    /// of the projection and do not appear in the output.
+    ///
+    /// `resolution` (γ) trades granularity for cohesion; the default is 1.0.
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the graph cannot be loaded.
+    pub async fn compute_communities(&self, resolution: f64) -> Result<Vec<Community>> {
+        let core = self.load_graph_core().await?;
+
+        // Undirected weighted projection: each open edge contributes 1 to the
+        // weight between its endpoints, in both directions.
+        let mut adjacency: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for (tgt_idx, srcs) in core.inbound.iter().enumerate() {
+            for &src_idx in srcs {
+                let sn = &core.name_by_idx[src_idx];
+                let tn = &core.name_by_idx[tgt_idx];
+                if sn == tn {
+                    continue;
+                }
+                *adjacency
+                    .entry(sn.clone())
+                    .or_default()
+                    .entry(tn.clone())
+                    .or_insert(0.0) += 1.0;
+                *adjacency
+                    .entry(tn.clone())
+                    .or_default()
+                    .entry(sn.clone())
+                    .or_insert(0.0) += 1.0;
+            }
+        }
+
+        Ok(crate::communities::louvain_communities(
+            &adjacency, resolution,
+        ))
+    }
+
+    /// Persist a community run, replacing any previous rows for the same
+    /// (algorithm, resolution) so the tables cannot grow monotonically with each
+    /// cycle (T141).
+    ///
+    /// The delete and inserts run in one transaction; members are written with
+    /// their node weight (weighted degree in the projected graph).
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the transaction fails.
+    pub async fn replace_communities(
+        &self,
+        algorithm: &str,
+        resolution: f64,
+        communities: &[Community],
+        computed_at: &str,
+    ) -> Result<()> {
+        let algorithm = algorithm.to_string();
+        let computed_at = computed_at.to_string();
+        let communities: Vec<Community> = communities.to_vec();
+
+        self.client
+            .writer()
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "DELETE FROM notion_community_members WHERE community_id IN \
+                     (SELECT id FROM notion_communities WHERE algorithm = ?1 AND resolution = ?2)",
+                    rusqlite::params![algorithm, resolution],
+                )?;
+                tx.execute(
+                    "DELETE FROM notion_communities WHERE algorithm = ?1 AND resolution = ?2",
+                    rusqlite::params![algorithm, resolution],
+                )?;
+                for c in &communities {
+                    // Scope the id by algorithm+resolution: the members table
+                    // is keyed by community_id alone, so ids must be globally
+                    // unique across coexisting runs (resolution is data).
+                    let id = format!("{algorithm}:{resolution}:{}", c.id);
+                    tx.execute(
+                        "INSERT INTO notion_communities \
+                         (id, algorithm, resolution, computed_at, label, size) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            id,
+                            algorithm,
+                            resolution,
+                            computed_at,
+                            c.label,
+                            c.members.len() as i64
+                        ],
+                    )?;
+                    for m in &c.members {
+                        tx.execute(
+                            "INSERT INTO notion_community_members \
+                             (community_id, entity_name, weight) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![id, m.entity_name, m.weight],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)
+    }
+
+    /// Load all persisted communities with their members, ordered by
+    /// (algorithm, resolution, id) then member name (T141).
+    ///
+    /// # Errors
+    /// Returns [`SqliteError`] if the query fails.
+    pub async fn load_communities(&self) -> Result<Vec<Community>> {
+        let pool = self.client.pool();
+        let rows = sqlx::query(
+            "SELECT c.id, c.label, m.entity_name, m.weight \
+             FROM notion_communities c \
+             LEFT JOIN notion_community_members m ON m.community_id = c.id \
+             ORDER BY c.algorithm, c.resolution, c.id, m.entity_name",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let mut communities: Vec<Community> = Vec::new();
+        let mut current: Option<Community> = None;
+        for row in &rows {
+            let id: String = row.get("id");
+            let label: String = row.get("label");
+            let entity_name: Option<String> = row.get("entity_name");
+            let weight: Option<f64> = row.get("weight");
+
+            match &mut current {
+                Some(c) if c.id == id => {
+                    if let (Some(name), Some(w)) = (entity_name, weight) {
+                        c.members.push(CommunityMember {
+                            entity_name: name,
+                            weight: w,
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(c) = current.take() {
+                        communities.push(c);
+                    }
+                    let mut members = Vec::new();
+                    if let (Some(name), Some(w)) = (entity_name, weight) {
+                        members.push(CommunityMember {
+                            entity_name: name,
+                            weight: w,
+                        });
+                    }
+                    current = Some(Community { id, label, members });
+                }
+            }
+        }
+        if let Some(c) = current.take() {
+            communities.push(c);
+        }
+        Ok(communities)
+    }
+
     pub async fn apply_confidence_decay(&self, half_life_days: f64) -> Result<usize> {
         let rows = sqlx::query(
             "SELECT id, confidence, COALESCE(last_accessed_at, created_at) as ref_date \
@@ -1031,14 +1197,20 @@ impl<'a> NotionsRepo<'a> {
         Ok(())
     }
 
-    /// Every recorded note stage, for re-deriving cycle state from the durable
-    /// projection instead of trusting in-memory bookkeeping (FR-011).
-    pub async fn load_note_stages(&self) -> Result<Vec<NoteStageRow>> {
+    /// Every recorded note stage for the given terminal stage, for re-deriving
+    /// cycle state from the durable projection instead of trusting in-memory
+    /// bookkeeping (FR-011). Filtered by `last_completed_stage` so the
+    /// per-cycle lookup never scans rows for stages the pipeline does not use
+    /// (T162).
+    pub async fn load_note_stages(&self, stage: &str) -> Result<Vec<NoteStageRow>> {
         let pool = self.client.pool();
-        let rows =
-            sqlx::query("SELECT file_path, content_hash, last_completed_stage FROM note_stages")
-                .fetch_all(pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT file_path, content_hash, last_completed_stage FROM note_stages \
+             WHERE last_completed_stage = ?1",
+        )
+        .bind(stage)
+        .fetch_all(pool)
+        .await?;
         Ok(rows
             .iter()
             .map(|row| NoteStageRow {
@@ -1047,6 +1219,42 @@ impl<'a> NotionsRepo<'a> {
                 last_completed_stage: row.get("last_completed_stage"),
             })
             .collect())
+    }
+
+    /// Prune `note_stages` rows whose recorded path no longer exists on disk,
+    /// capped by age so the table cannot grow forever (T162).
+    ///
+    /// A row is removed only when BOTH conditions hold: its `stage_updated_at`
+    /// is older than `max_age_days` AND the `file_path` no longer exists in
+    /// the vault (the note was archived and its inbox copy removed). Rows for
+    /// paths that still exist — or rows younger than the cap — are kept, so a
+    /// temporarily absent path is never pruned.
+    pub async fn prune_note_stages(&self, max_age_days: i64) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(max_age_days)).to_rfc3339();
+        let pool = self.client.pool();
+        let rows = sqlx::query("SELECT file_path FROM note_stages WHERE stage_updated_at < ?1")
+            .bind(&cutoff)
+            .fetch_all(pool)
+            .await?;
+        let mut to_delete: Vec<String> = Vec::new();
+        for row in rows {
+            let file_path: String = row.get("file_path");
+            if !std::path::Path::new(&file_path).exists() {
+                to_delete.push(file_path);
+            }
+        }
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+        // The candidate set is bounded by the age cap, so per-path deletes are
+        // cheap and keep the SQL static (no dynamic IN clause).
+        for path in &to_delete {
+            sqlx::query("DELETE FROM note_stages WHERE file_path = ?1")
+                .bind(path)
+                .execute(pool)
+                .await?;
+        }
+        Ok(to_delete.len())
     }
 }
 

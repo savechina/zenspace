@@ -1,11 +1,13 @@
 pub mod adversarial;
 pub mod archive;
-pub mod chat_import;
 pub mod checkpoint;
 pub mod contradiction;
 pub mod convert;
 pub mod correlation;
+pub mod decision_audit;
 pub mod discover_metrics;
+pub mod discovery_replay;
+pub mod discovery_tree;
 pub mod hypothesis;
 pub mod merge;
 pub mod notion_extraction;
@@ -26,13 +28,21 @@ pub use adversarial::{
     ContestantVerdict, EvalCase, INCUMBENT, NaiveBaseline, PhaseScore, ZenDistill, corpus,
     judge_case, report_path, run_arena,
 };
-pub use chat_import::ChatImporter;
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
 pub use correlation::{Opportunity, correlate};
+pub use decision_audit::{
+    CONFIDENCE_DRIFT_TOLERANCE, CalibrationReport, DATASET_FILE, DRIFT_WINDOW_DAYS,
+    DecisionAuditError, DecisionRecord, ECE_BINS, KindCalibration, KindDrift, LABELS_FILE,
+    LabelEntry, RUNG_MIX_DRIFT_TOLERANCE, RungCalibration, analyze, compute, extract_dataset,
+    load_dataset, load_labels,
+};
 pub use discover_metrics::{
-    DiscoverMetrics, DiscoverMetricsError, METRICS_FILE_NAME, REPORT_FILE_PREFIX, aggregate,
-    load_reports, write_metrics,
+    DiscoverMetrics, DiscoverMetricsError, REPORT_FILE_PREFIX, aggregate, load_reports,
+};
+pub use discovery_replay::{PolicyRecord, ReplayReport, score, score_from_log};
+pub use discovery_tree::{
+    DiscoveryNode, DiscoveryTree, INCUMBENT_SLUG, NodeKind, Outcome, Policy, discovery_tree_path,
 };
 pub use hypothesis::{
     build_exploration_prompt, build_refinement_queue, build_refinement_queue_prioritized,
@@ -59,15 +69,13 @@ pub use reward_sidecar::{
 pub use source_ingest::SourceIngester;
 pub use stages::LlmDistillStage;
 pub use tool_call_log::{
-    ToolCallAggregate, aggregate_all_sessions, aggregate_tool_calls, append_tool_call,
-    prune_expired_sessions,
+    ToolCallAggregate, aggregate_all_sessions, append_tool_call, prune_expired_sessions,
 };
 pub use transaction::TransactionScope;
 pub use types::{
     Belief, Commitment, CommitmentLifecycle, CycleOutcome, Decision, GapKind, GapRecord,
-    GraphPlaceholder, HypothesisSlug, HypothesisStatus, JobState, LoopBudget, LoopCycleReport,
-    MemoryReward, PlaceholderStatus, ProcessingJob, SelfModelItem, SelfModelLayer, ToolCall,
-    TypedSignalKind, VerificationNode,
+    GraphPlaceholder, HypothesisSlug, HypothesisStatus, LoopBudget, LoopCycleReport, MemoryReward,
+    PlaceholderStatus, SelfModelItem, SelfModelLayer, ToolCall, TypedSignalKind, VerificationNode,
 };
 pub use wiki_compile::WikiCompiler;
 

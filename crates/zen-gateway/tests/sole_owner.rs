@@ -13,6 +13,8 @@
 //!
 //! ERRORS: any timeout panic pinpoints which V1 guarantee broke.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -199,6 +201,10 @@ async fn two_clients_cross_visibility_and_sole_owner() {
         status["scheduler"], false,
         "default daemon does not host scheduler"
     );
+    assert_eq!(
+        status["scheduler_pending"], false,
+        "default daemon is not waiting for the scheduler lease"
+    );
 
     // Sole-owner: second service open refuses (process claim), and a
     // second bind on the live socket refuses (atomic bind claim).
@@ -219,9 +225,15 @@ async fn two_clients_cross_visibility_and_sole_owner() {
     }
     assert!(!socket.exists(), "socket file removed after shutdown");
 
-    // Phase 2: scheduler_hosted=true — explicit zen serve start.
+    // Phase 2: scheduler_hosted=true — explicit zen serve start. The
+    // live/waiting flags mirror serve_command's real wiring: scheduler_live
+    // true once the lease is acquired, scheduler_waiting false.
+    let scheduler_live = Arc::new(AtomicBool::new(true));
+    let scheduler_waiting = Arc::new(AtomicBool::new(false));
     let config_scheduler = GatewayDaemonConfig {
         scheduler_hosted: true,
+        scheduler_live: Some(scheduler_live.clone()),
+        scheduler_waiting: Some(scheduler_waiting.clone()),
         ..daemon_config(tmp.path())
     };
     let socket_sched = config_scheduler.socket_path.clone();
@@ -235,7 +247,28 @@ async fn two_clients_cross_visibility_and_sole_owner() {
         status_sched["scheduler"], true,
         "explicit zen serve start reports scheduler hosted"
     );
+    assert_eq!(
+        status_sched["scheduler_pending"], false,
+        "explicit daemon with no lease contention is not pending"
+    );
     assert_eq!(status_sched["protocolVersion"], SERVER_PROTOCOL_VERSION);
+
+    // Flip the waiting flag on the LIVE server: an explicit daemon that
+    // lost the lease race to a TUI reports scheduler_pending so the TUI
+    // can yield its in-app scheduler.
+    scheduler_waiting.store(true, std::sync::atomic::Ordering::Relaxed);
+    let status_waiting = rpc(&client_sched, 12, "health/status", json!({}))
+        .await
+        .expect("waiting-status ok");
+    assert_eq!(
+        status_waiting["scheduler_pending"], true,
+        "waiting daemon reports scheduler_pending so the TUI can yield"
+    );
+    assert_eq!(
+        status_waiting["scheduler"], true,
+        "scheduler stays hosted while waiting for the lease"
+    );
+
     let _ = rpc(&client_sched, 11, "shutdown", json!({})).await;
     let finished_sched = tokio::time::timeout(Duration::from_secs(15), server_sched).await;
     match finished_sched {

@@ -1,3 +1,11 @@
+//! Self-model node projection into `state.db` (SOUL.md / identity).
+//!
+//! **Dormant by design (T144 decision, 2026-09-19).** The markdown identity
+//! surface is canonical and is the only one with a production writer/reader; this
+//! table has no production writer (only tests call
+//! [`SelfModelRepo::upsert_self_node`](SelfModelRepo)). Kept as the documented DB
+//! projection so a future reader does not re-investigate the missing writer.
+
 use sqlx::Row;
 
 use crate::client::{Result, SqliteClient, SqliteError};

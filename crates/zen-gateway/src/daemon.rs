@@ -258,6 +258,12 @@ pub struct GatewayDaemonConfig {
     /// `scheduler_hosted` on `health/status` so the flag never claims a
     /// scheduler that is not actually running.
     pub scheduler_live: Option<Arc<AtomicBool>>,
+    /// Whether this gateway intends to host a scheduler but is still
+    /// waiting for the cross-process scheduler lease (a TUI holds it).
+    /// Surfaces on `health/status.scheduler_pending` so the TUI can
+    /// detect an explicit daemon waiting to take over and yield its
+    /// in-app scheduler. Default `false` — implicit daemons never set it.
+    pub scheduler_waiting: Option<Arc<AtomicBool>>,
 }
 
 impl Default for GatewayDaemonConfig {
@@ -276,6 +282,7 @@ impl Default for GatewayDaemonConfig {
             turn_executor: None,
             scheduler_hosted: false,
             scheduler_live: None,
+            scheduler_waiting: None,
         }
     }
 }
@@ -316,6 +323,7 @@ pub struct GatewayService {
     shutdown_tx: watch::Sender<bool>,
     scheduler_hosted: bool,
     scheduler_live: Option<Arc<AtomicBool>>,
+    scheduler_waiting: Option<Arc<AtomicBool>>,
     _claim: SoleOwnerClaim,
 }
 
@@ -468,6 +476,7 @@ impl GatewayService {
             shutdown_tx,
             scheduler_hosted: config.scheduler_hosted,
             scheduler_live: config.scheduler_live.clone(),
+            scheduler_waiting: config.scheduler_waiting.clone(),
             _claim: claim,
         })
     }
@@ -488,6 +497,16 @@ impl GatewayService {
             .as_ref()
             .map(|flag| flag.load(Ordering::Relaxed))
             .unwrap_or(self.scheduler_hosted)
+    }
+
+    /// Returns whether this gateway intends to host a scheduler but is
+    /// still waiting for the cross-process scheduler lease (a TUI holds
+    /// it). Surfaces as `health/status.scheduler_pending`.
+    pub fn is_scheduler_waiting(&self) -> bool {
+        self.scheduler_waiting
+            .as_ref()
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     /// Builds the hosted-turn executor exactly as `zen chat` does
@@ -751,6 +770,7 @@ impl GatewayService {
             "activeTurns": self.hosting.turns.active_count(),
             "replay": self.replay_counters.snapshot(),
             "scheduler": self.is_scheduler_hosted(),
+            "scheduler_pending": self.is_scheduler_waiting(),
         });
         if self.mode == GatewayMode::Embedded {
             snapshot["mode"] = serde_json::json!("embedded");

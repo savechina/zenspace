@@ -638,12 +638,17 @@ async fn run_uds_foreground(
     // scheduler that is still waiting out a TUI-held lease, so the flag
     // flips only after the daemon actually acquires the lease.
     let scheduler_live = Arc::new(AtomicBool::new(false));
+    // T154: while the daemon waits for the lease, `scheduler_pending`
+    // tells the TUI "an explicit daemon intends to host" so it can yield
+    // its in-app scheduler instead of starving the Full profile forever.
+    let scheduler_waiting = Arc::new(AtomicBool::new(true));
     let config = GatewayDaemonConfig {
         http: http_cfg,
         qqbot: qqbot_cfg,
         idle_exit,
         scheduler_hosted: scheduler_enabled(),
         scheduler_live: Some(scheduler_live.clone()),
+        scheduler_waiting: Some(scheduler_waiting.clone()),
         ..GatewayDaemonConfig::default()
     };
     let socket = config.socket_path.display().to_string();
@@ -657,15 +662,30 @@ async fn run_uds_foreground(
             // `_lease` must stay alive for the scheduler's lifetime —
             // dropping it releases the mutual exclusion.
             let _lease = loop {
-                match ZenPaths::detect()
-                    .ok()
-                    .and_then(|paths| zen_agents::scheduler::SchedulerLease::try_acquire(&paths))
-                {
-                    Some(lease) => break lease,
-                    None => tokio::time::sleep(Duration::from_secs(30)).await,
+                let acquired = match ZenPaths::detect() {
+                    Ok(paths) => zen_agents::scheduler::SchedulerLease::try_acquire(&paths),
+                    Err(e) => Err(zen_agents::scheduler::LeaseError::OpenFailed(
+                        std::io::Error::other(e.to_string()),
+                    )),
+                };
+                match acquired {
+                    Ok(lease) => break lease,
+                    Err(zen_agents::scheduler::LeaseError::Contention) => {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    Err(zen_agents::scheduler::LeaseError::OpenFailed(e)) => {
+                        // T164: a real filesystem problem, not coexistence —
+                        // surface loudly instead of spinning silently.
+                        tracing::error!(
+                            error = %e,
+                            "scheduler: lease lock file could not be opened; retrying in 30s"
+                        );
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
                 }
             };
             scheduler_live.store(true, std::sync::atomic::Ordering::Relaxed);
+            scheduler_waiting.store(false, std::sync::atomic::Ordering::Relaxed);
             let scheduler = zen_agents::scheduler::create_configured_scheduler(&cron);
             scheduler.run().await;
         });

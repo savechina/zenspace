@@ -671,32 +671,6 @@ impl Task {
     }
 }
 
-pub struct SemanticEntropy;
-
-impl SemanticEntropy {
-    pub fn calculate(text: &str) -> f64 {
-        if text.is_empty() {
-            return 0.0;
-        }
-        let freq = Self::char_frequency(text);
-        let len = text.len() as f64;
-        freq.values()
-            .map(|&c| {
-                let p = c as f64 / len;
-                if p > 0.0 { -p * p.log2() } else { 0.0 }
-            })
-            .sum()
-    }
-
-    fn char_frequency(text: &str) -> HashMap<char, usize> {
-        let mut freq = HashMap::new();
-        for c in text.chars() {
-            *freq.entry(c).or_insert(0) += 1;
-        }
-        freq
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SessionContext, RetrievedNote, Message (FR-076, FR-081)
 // ---------------------------------------------------------------------------
@@ -898,24 +872,6 @@ impl SessionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_empty_text_has_zero_entropy() {
-        let entropy = SemanticEntropy::calculate("");
-        assert_eq!(entropy, 0.0);
-    }
-
-    #[test]
-    fn test_uniform_text_has_high_entropy() {
-        let entropy = SemanticEntropy::calculate("abcdefghij");
-        assert!(entropy > 3.0);
-    }
-
-    #[test]
-    fn test_repeated_text_has_low_entropy() {
-        let entropy = SemanticEntropy::calculate("aaaaaaaaaa");
-        assert!(entropy < 1.0);
-    }
 
     #[test]
     fn test_task_classification_code_low_entropy() {

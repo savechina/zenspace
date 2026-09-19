@@ -1,7 +1,4 @@
 use anyhow::Result;
-use rig_core::Embed;
-use rig_sqlite::{Column, ColumnValue, SqliteVectorStoreTable};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::debug;
 use zen_repo::{
@@ -18,51 +15,9 @@ use crate::tools::{
 // Tier 3 search: sqlite-vec KNN cosine similarity + rig-sqlite integration
 // ---------------------------------------------------------------------------
 
-#[derive(Embed, Clone, Debug, Serialize, Deserialize)]
-pub struct KnowledgeDocument {
-    pub id: String,
-    #[embed]
-    pub content: String,
-    pub source: String,
-    pub sensitivity: String,
-}
-
-impl SqliteVectorStoreTable for KnowledgeDocument {
-    fn name() -> &'static str {
-        "knowledge_docs"
-    }
-    fn schema() -> Vec<Column> {
-        vec![
-            Column::new("id", "TEXT PRIMARY KEY"),
-            Column::new("content", "TEXT"),
-            Column::new("source", "TEXT"),
-            Column::new("sensitivity", "TEXT"),
-        ]
-    }
-    fn id(&self) -> String {
-        self.id.clone()
-    }
-    fn column_values(&self) -> Vec<(&'static str, Box<dyn ColumnValue>)> {
-        vec![
-            ("id", Box::new(self.id.clone())),
-            ("content", Box::new(self.content.clone())),
-            ("source", Box::new(self.source.clone())),
-            ("sensitivity", Box::new(self.sensitivity.clone())),
-        ]
-    }
-}
-
 pub struct Tier3Search;
 
 impl Tier3Search {
-    pub fn knowledge_doc_schema_name() -> &'static str {
-        KnowledgeDocument::name()
-    }
-
-    pub fn knowledge_doc_schema_columns() -> usize {
-        KnowledgeDocument::schema().len()
-    }
-
     pub async fn search(
         &self,
         client: &SqliteClient,
@@ -237,20 +192,5 @@ mod tests {
 
         let result = tier3.insert_embedding(&client, "note-x", &[]).await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_knowledge_document_schema() {
-        let doc = KnowledgeDocument {
-            id: "test-1".to_string(),
-            content: "Test content".to_string(),
-            source: "test".to_string(),
-            sensitivity: "private".to_string(),
-        };
-
-        assert_eq!(KnowledgeDocument::name(), "knowledge_docs");
-        let schema = KnowledgeDocument::schema();
-        assert_eq!(schema.len(), 4);
-        assert_eq!(doc.id(), "test-1");
     }
 }

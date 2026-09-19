@@ -58,7 +58,18 @@ impl ChangeDetector {
     ///
     /// Prefer [`compute_file_checksum`] for on-disk files.
     pub fn compute_checksum(content: &str) -> String {
-        let hash = Sha256::digest(content.as_bytes());
+        Self::compute_checksum_bytes(content.as_bytes())
+    }
+
+    /// Compute a SHA-256 hex string over raw bytes (T158).
+    ///
+    /// Hashing raw bytes (rather than a `from_utf8_lossy`-converted string)
+    /// keeps the dedup/archive comparison collision-free: two distinct files
+    /// whose invalid-UTF-8 sequences lossy-convert to the same text must not
+    /// hash equal, or a distinct new note would be deleted as "already
+    /// archived".
+    pub fn compute_checksum_bytes(bytes: &[u8]) -> String {
+        let hash = Sha256::digest(bytes);
         hash.iter().map(|b| format!("{:02x}", b)).collect()
     }
 
@@ -72,5 +83,31 @@ impl ChangeDetector {
             info!("Change detected: checksums differ");
         }
         needs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_bytes_hash_distinguishes_lossy_collisions() {
+        // Two distinct byte sequences that `from_utf8_lossy` maps to the SAME
+        // text: raw `\xff\xfe` and the literal U+FFFD replacement chars both
+        // lossy-convert to "\u{FFFD}\u{FFFD}". Hashing the lossy text would
+        // collide (a distinct new note deleted as "already archived"); hashing
+        // raw bytes must not.
+        let raw_invalid = b"\xff\xfe";
+        let literal_replacement = "\u{FFFD}\u{FFFD}".as_bytes();
+        assert_eq!(
+            String::from_utf8_lossy(raw_invalid),
+            String::from_utf8_lossy(literal_replacement),
+            "precondition: the two inputs lossy-convert identically"
+        );
+        assert_ne!(
+            ChangeDetector::compute_checksum_bytes(raw_invalid),
+            ChangeDetector::compute_checksum_bytes(literal_replacement),
+            "raw-byte hashing must not collide on lossy-equal inputs"
+        );
     }
 }

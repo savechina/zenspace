@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 use zen_core::notion_graph::{NotionGraphProvider, SimpleNotion};
 use zen_core::paths::ZenPaths;
 
+use crate::correction::CorrectionError;
 use crate::quality_gate::{MemoryGrade, grade_session_signal};
 
 // ─── ExtractedSignals — Typed signals from session conversations ─────────
@@ -982,23 +983,36 @@ fn md5_hex(input: &str) -> String {
 
 // ─── FR-035: Correction recurrence scan ────────────────────────────────
 
+/// Scan verified corrections within `window_days` for recurrence and record
+/// the evidence on the corrections themselves (FR-035).
+///
+/// A correction "recurred" when a newer correction with the same `error_ref`
+/// exists — the same error was recorded again after the fix. The recurrence
+/// count is recomputed from the evidence each scan (idempotent) and persisted
+/// when it differs from what is on disk, which also bootstraps corrections
+/// created before this scan (they start at `recurrence_count = 0` /
+/// `last_recurrence_at = None` — the chicken-and-egg that made
+/// `Correction::save` unreachable).
+///
+/// Returns `(scanned, high_recurrence)` where `high_recurrence` counts
+/// corrections whose `recurrence_rate = recurrence_count / days_since_verified`
+/// exceeds 0.5. A `load_all` failure is surfaced as an error — never silently
+/// reported as a clean `(0, 0)` scan, so the caller cannot mistake a read
+/// failure for a clean scan and delete the loss-aversion boost marker.
 pub fn scan_correction_recurrence(
     corrections_dir: &std::path::Path,
     window_days: i64,
-) -> (usize, usize) {
+) -> Result<(usize, usize), CorrectionError> {
     use crate::correction::Correction;
 
-    let corrections = match Correction::load_all(corrections_dir) {
-        Ok(c) => c,
-        Err(_) => return (0, 0),
-    };
+    let corrections = Correction::load_all(corrections_dir)?;
 
     let now = Utc::now();
     let window_start = now - chrono::Duration::days(window_days);
     let mut scanned = 0usize;
     let mut high_recurrence = 0usize;
 
-    for mut correction in corrections {
+    for correction in &corrections {
         if !correction.is_verified() {
             continue;
         }
@@ -1007,26 +1021,42 @@ pub fn scan_correction_recurrence(
         }
         scanned += 1;
 
+        // Recurrence evidence: newer corrections with the same error_ref.
+        // A newer same-ref correction is necessarily within the window
+        // because it is newer than a within-window correction.
+        let recurrences: Vec<&Correction> = corrections
+            .iter()
+            .filter(|other| {
+                other.error_ref == correction.error_ref && other.created_at > correction.created_at
+            })
+            .collect();
+        let recurrence_count = recurrences.len() as u64;
+        let last_recurrence_at = recurrences.iter().map(|o| o.created_at).max();
+
         let verified_at = correction.verified_at.unwrap_or(correction.created_at);
         let days_since_verified = (now - verified_at).num_days().max(1) as f64;
-        let recurrence_rate = correction.recurrence_count as f64 / days_since_verified;
+        let recurrence_rate = recurrence_count as f64 / days_since_verified;
 
         if recurrence_rate > 0.5 {
             high_recurrence += 1;
         }
 
-        if correction.recurrence_count > 0 || correction.last_recurrence_at.is_none() {
-            continue;
-        }
-
-        correction.last_recurrence_at = Some(now);
-        let dir = corrections_dir;
-        if let Err(e) = correction.save(dir) {
-            warn!(error = %e, correction_id = %correction.id, "failed to update correction recurrence");
+        // Persist the recorded recurrence when it differs from disk. This is
+        // the writer for `recurrence_count`/`last_recurrence_at` and the
+        // bootstrap that makes `correction.save` reachable.
+        if recurrence_count != correction.recurrence_count
+            || last_recurrence_at != correction.last_recurrence_at
+        {
+            let mut updated = correction.clone();
+            updated.recurrence_count = recurrence_count;
+            updated.last_recurrence_at = last_recurrence_at;
+            if let Err(e) = updated.save(corrections_dir) {
+                warn!(error = %e, correction_id = %correction.id, "failed to update correction recurrence");
+            }
         }
     }
 
-    (scanned, high_recurrence)
+    Ok((scanned, high_recurrence))
 }
 
 #[cfg(test)]
@@ -1301,5 +1331,105 @@ mod tests {
         assert!(memory_nudge_due(20));
         assert!(!memory_nudge_due(21));
         assert!(!memory_nudge_text().is_empty());
+    }
+
+    #[test]
+    fn test_scan_correction_recurrence_records_recurrence() {
+        use crate::correction::Correction;
+        use crate::decision::CostBreakdown;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let corrections_dir = dir.path().join("corrections");
+
+        // Two verified corrections for the same error: the older one recurred.
+        let mut older = Correction::new("auth-reset", "fix 1", CostBreakdown::default());
+        older.id = "correction-auth-reset-older".to_string();
+        older.verified_at = Some(Utc::now() - chrono::Duration::days(10));
+        older.created_at = Utc::now() - chrono::Duration::days(10);
+        older.save(&corrections_dir).unwrap();
+
+        let mut newer = Correction::new("auth-reset", "fix 2", CostBreakdown::default());
+        newer.id = "correction-auth-reset-newer".to_string();
+        newer.verified_at = Some(Utc::now() - chrono::Duration::days(2));
+        newer.created_at = Utc::now() - chrono::Duration::days(2);
+        newer.save(&corrections_dir).unwrap();
+
+        let (scanned, high) = scan_correction_recurrence(&corrections_dir, 30).unwrap();
+        assert_eq!(scanned, 2);
+        // older: 1 recurrence / 10 days = 0.1 → not high; newer: 0 → not high.
+        assert_eq!(high, 0);
+
+        // The older correction was persisted with the recorded recurrence.
+        let loaded = Correction::load_all(&corrections_dir).unwrap();
+        let older_loaded = loaded
+            .iter()
+            .find(|c| c.id == "correction-auth-reset-older")
+            .unwrap();
+        assert_eq!(older_loaded.recurrence_count, 1);
+        assert!(
+            older_loaded.last_recurrence_at.is_some(),
+            "last_recurrence_at recorded on the recurring correction"
+        );
+    }
+
+    #[test]
+    fn test_scan_correction_recurrence_high_rate_boost() {
+        use crate::correction::Correction;
+        use crate::decision::CostBreakdown;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let corrections_dir = dir.path().join("corrections");
+
+        // Three verified corrections for the same error, one per day.
+        let mut a = Correction::new("x", "fix a", CostBreakdown::default());
+        a.id = "correction-x-a".to_string();
+        a.verified_at = Some(Utc::now() - chrono::Duration::days(3));
+        a.created_at = Utc::now() - chrono::Duration::days(3);
+        a.save(&corrections_dir).unwrap();
+
+        let mut b = Correction::new("x", "fix b", CostBreakdown::default());
+        b.id = "correction-x-b".to_string();
+        b.verified_at = Some(Utc::now() - chrono::Duration::days(2));
+        b.created_at = Utc::now() - chrono::Duration::days(2);
+        b.save(&corrections_dir).unwrap();
+
+        let mut c = Correction::new("x", "fix c", CostBreakdown::default());
+        c.id = "correction-x-c".to_string();
+        c.verified_at = Some(Utc::now() - chrono::Duration::days(1));
+        c.created_at = Utc::now() - chrono::Duration::days(1);
+        c.save(&corrections_dir).unwrap();
+
+        let (scanned, high) = scan_correction_recurrence(&corrections_dir, 30).unwrap();
+        assert_eq!(scanned, 3);
+        // a: 2 recurrences / 3 days = 0.67 → high; b: 1 / 2 = 0.5 → not high.
+        assert_eq!(high, 1, "a recurred twice in 3 days → rate 0.67 > 0.5");
+
+        let loaded = Correction::load_all(&corrections_dir).unwrap();
+        let a_loaded = loaded.iter().find(|c| c.id == "correction-x-a").unwrap();
+        assert_eq!(a_loaded.recurrence_count, 2);
+        assert!(a_loaded.last_recurrence_at.is_some());
+    }
+
+    #[test]
+    fn test_scan_correction_recurrence_surfaces_load_error() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let corrections_dir = dir.path().join("corrections");
+        std::fs::create_dir_all(&corrections_dir).unwrap();
+
+        // Deny read on the directory so `load_all`'s read_dir fails. Root
+        // bypasses permission bits, so skip when the owner is root.
+        let owner_uid = std::fs::metadata(&corrections_dir).unwrap().uid();
+        if owner_uid == 0 {
+            return;
+        }
+        std::fs::set_permissions(&corrections_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = scan_correction_recurrence(&corrections_dir, 30);
+        assert!(
+            result.is_err(),
+            "load_all error must be surfaced, not silently returned as (0,0)"
+        );
     }
 }

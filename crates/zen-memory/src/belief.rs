@@ -49,6 +49,12 @@ pub struct Belief {
     /// When the belief was last retrieved/injected into a prompt.
     /// Used for decay calculations. None if never retrieved.
     pub last_retrieved: Option<DateTime<Utc>>,
+    /// When the posterior confidence half-life decay was last applied.
+    /// Anchors incremental decay so repeated per-cycle applications compose
+    /// to the same result as one application over the total elapsed time.
+    /// None if decay has never been applied (falls back to `last_updated`).
+    #[serde(default)]
+    pub last_decayed_at: Option<DateTime<Utc>>,
     /// Evidence log entries (appended on each update call).
     pub evidence: Vec<EvidenceEntry>,
 }
@@ -140,6 +146,23 @@ impl ResearchMethod {
     }
 }
 
+// ─── Tier-gate constants (T130) ────────────────────────────────────────
+
+/// Provenance weight assigned to a belief with **no supporting evidence**.
+///
+/// Deliberately below the weakest real source (`AnonymousInternet` = 0.2):
+/// a confidently-phrased claim with no provenance must never pass the
+/// durable-wisdom gate.
+pub const UNPROVEN_PROVENANCE_WEIGHT: f64 = 0.1;
+
+/// Minimum reliability for a belief to surface as durable wisdom (FR-021).
+///
+/// Matches FR-021's posterior promotion threshold (0.9). A belief must be
+/// both promotable ([`Belief::should_promote`]) and provenance-capped
+/// reliable ([`Belief::reliability`] `>= DURABLE_WISDOM_RELIABILITY`) to
+/// leave the M2 working tier on the read side.
+pub const DURABLE_WISDOM_RELIABILITY: f64 = 0.9;
+
 // ─── Belief methods ────────────────────────────────────────────────────
 
 impl Belief {
@@ -156,6 +179,7 @@ impl Belief {
             created_at: now,
             last_updated: now,
             last_retrieved: None,
+            last_decayed_at: None,
             evidence: Vec::new(),
         }
     }
@@ -171,29 +195,6 @@ impl Belief {
             source_weight,
             source_type: source,
             research_method: None,
-            note,
-        });
-        self.evidence_count += 1;
-        self.last_updated = Utc::now();
-    }
-
-    /// Apply Bayesian update with binary evidence and a research method.
-    pub fn update_with_method(
-        &mut self,
-        supports: bool,
-        source: SourceType,
-        method: ResearchMethod,
-        note: Option<String>,
-    ) {
-        let source_weight = source.default_weight();
-        self.bayesian_update_weighted(supports, source_weight);
-
-        self.evidence.push(EvidenceEntry {
-            timestamp: Utc::now(),
-            supports,
-            source_weight,
-            source_type: source,
-            research_method: Some(method),
             note,
         });
         self.evidence_count += 1;
@@ -236,8 +237,10 @@ impl Belief {
     /// Decay model (FR-025) has two independent mechanisms:
     /// - **Evidence weight decay** (this method): unretrieved ≥ 90 days → `weight × 0.95`.
     /// - **Posterior confidence half-life**
-    ///   ([`Belief::apply_confidence_half_life`]): `posterior × 0.5^(days_since_last_updated / 30)`
-    ///   — beliefs not refreshed by new evidence drift back toward uncertainty.
+    ///   ([`Belief::apply_confidence_half_life`]): `posterior × 0.5^(days_since_anchor / 30)`
+    ///   where the anchor is the later of `last_updated` and `last_decayed_at` —
+    ///   beliefs not refreshed by new evidence drift back toward uncertainty,
+    ///   and repeated per-cycle applications compose idempotently.
     ///
     /// [`apply_decay_all`] applies both; fine-grained callers may invoke each separately.
     pub fn apply_decay(&mut self, now: DateTime<Utc>) -> bool {
@@ -254,14 +257,23 @@ impl Belief {
     /// Apply the 30-day posterior confidence half-life (FR-025).
     ///
     /// Multiplies `posterior` by `0.5^(elapsed_days / half_life_days)`, where
-    /// `elapsed_days` is measured from `last_updated` to `now`. Stale beliefs —
-    /// those not refreshed by new evidence — drift back toward uncertainty
-    /// without any contradicting evidence. The result is clamped at the 0.01
-    /// floor to preserve the documented posterior range (0.01–0.99);
-    /// `last_updated` is NOT modified (decay is not evidence).
+    /// `elapsed_days` is measured from the decay anchor to `now`. The anchor is
+    /// `last_decayed_at` when set (the last time decay was applied), otherwise
+    /// `last_updated`. Stale beliefs — those not refreshed by new evidence —
+    /// drift back toward uncertainty without any contradicting evidence. The
+    /// result is clamped at the 0.01 floor to preserve the documented posterior
+    /// range (0.01–0.99); `last_updated` is NOT modified (decay is not evidence).
+    ///
+    /// Idempotency: exponential decay is multiplicative over successive windows,
+    /// so applying the factor incrementally from an advanced anchor equals one
+    /// application over the total elapsed time. Each call that changes the
+    /// posterior advances `last_decayed_at` to `now`, so repeated per-cycle
+    /// calls (e.g. every 5 minutes) never re-apply the full elapsed-since-
+    /// `last_updated` factor — the pre-fix bug compounded to the 0.01 floor in
+    /// ~7 cycles for any belief ≥30 days stale.
     ///
     /// # Parameters
-    /// - `now`: current wall-clock time; elapsed time is `now - last_updated`
+    /// - `now`: current wall-clock time; elapsed time is `now - anchor`
     ///   (fractional days, so sub-day precision is preserved).
     /// - `half_life_days`: days after which the posterior halves (spec: 30.0).
     ///
@@ -275,7 +287,11 @@ impl Belief {
     /// assert!(b.apply_confidence_half_life(Utc::now(), 30.0)); // posterior halved
     /// ```
     pub fn apply_confidence_half_life(&mut self, now: DateTime<Utc>, half_life_days: f64) -> bool {
-        let elapsed_days = (now - self.last_updated).num_seconds() as f64 / 86_400.0;
+        let anchor = self
+            .last_decayed_at
+            .unwrap_or(self.last_updated)
+            .max(self.last_updated);
+        let elapsed_days = (now - anchor).num_seconds() as f64 / 86_400.0;
         if elapsed_days <= 0.0 {
             return false;
         }
@@ -285,6 +301,7 @@ impl Belief {
             return false;
         }
         self.posterior = new_posterior;
+        self.last_decayed_at = Some(now);
         true
     }
 
@@ -300,15 +317,64 @@ impl Belief {
         self.posterior < 0.2
     }
 
-    /// Should correction workflow trigger?
-    /// Rule: was posterior > 0.7 in a prior evidence entry, now < 0.3.
-    pub fn should_correct(&self) -> bool {
-        if self.posterior >= 0.3 {
-            return false;
+    /// Provenance-capped reliability: `min(provenance, content)` (T130).
+    ///
+    /// `provenance` is the weakest supporting evidence source's
+    /// [`SourceType::default_weight`]; `content` is the current posterior.
+    /// A belief with no supporting evidence is treated as unproven
+    /// ([`UNPROVEN_PROVENANCE_WEIGHT`]) rather than 1.0, so a confidently-
+    /// phrased claim with no provenance cannot pass the durable-wisdom gate.
+    ///
+    /// This is the read-side gate for the M2 working tier → M4 durable wisdom
+    /// split: `should_promote() && reliability() >= DURABLE_WISDOM_RELIABILITY`.
+    pub fn reliability(&self) -> f64 {
+        let mut weakest = f64::INFINITY;
+        for e in &self.evidence {
+            if e.supports {
+                weakest = weakest.min(e.source_type.default_weight());
+            }
         }
-        // Check if any prior state had posterior > 0.7
-        // We approximate by checking if evidence_count > 2 (had prior support)
-        self.evidence_count > 2
+        let provenance = if weakest.is_finite() {
+            weakest
+        } else {
+            UNPROVEN_PROVENANCE_WEIGHT
+        };
+        provenance.min(self.posterior)
+    }
+
+    /// Noisy-OR candidate probability for the M2 working tier (T130, BeliefMem).
+    ///
+    /// Independent supporting observations combine as `1 - Π(1 - w_i)` over
+    /// the belief's **supporting** evidence entries, where `w_i` is that
+    /// entry's source weight ([`SourceType::default_weight`]). Contradicting
+    /// evidence contributes nothing (it is not support). A belief with no
+    /// supporting evidence has candidate probability `0.0` — a candidate with
+    /// no independent support is not a candidate. The result is clamped to
+    /// `[0, 1]`.
+    ///
+    /// This is deliberately a *candidate* measure for the working tier, not a
+    /// promotion criterion: independent weak signals should accumulate (two
+    /// anonymous-source observations supporting the same proposition are
+    /// stronger together than either alone), which a plain posterior average
+    /// cannot express.
+    ///
+    /// **Independent-evidence assumption**: the formula treats each supporting
+    /// observation as an independent witness for the proposition. When the
+    /// same underlying fact is re-observed through multiple entries, the
+    /// probability over-counts. This is exactly why the *formula* is
+    /// implementable without calibration while the *threshold* is not — the
+    /// formula's output is a well-defined function of the evidence log, but
+    /// deciding what value of it means "candidate worth surfacing" requires a
+    /// calibrated decision layer (V13 增补 A / T173), not a hand-picked
+    /// constant.
+    pub fn noisy_or_candidate(&self) -> f64 {
+        let mut no_support = 1.0;
+        for e in &self.evidence {
+            if e.supports {
+                no_support *= 1.0 - e.source_type.default_weight();
+            }
+        }
+        (1.0 - no_support).clamp(0.0, 1.0)
     }
 
     /// Priority score for attention allocation.
@@ -341,6 +407,9 @@ impl Belief {
         ));
         if let Some(lr) = self.last_retrieved {
             md.push_str(&format!("last_retrieved: {}\n", lr.to_rfc3339()));
+        }
+        if let Some(ld) = self.last_decayed_at {
+            md.push_str(&format!("last_decayed_at: {}\n", ld.to_rfc3339()));
         }
         md.push_str("---\n\n");
         md.push_str(&format!("# Belief: {}\n\n", self.proposition));
@@ -452,6 +521,10 @@ impl Belief {
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
+        let last_decayed_at = parse_field(&fm, "last_decayed_at")
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
 
         Ok(Belief {
             id,
@@ -463,6 +536,7 @@ impl Belief {
             created_at,
             last_updated,
             last_retrieved,
+            last_decayed_at,
             evidence: Vec::new(),
         })
     }
@@ -696,6 +770,83 @@ mod tests {
     }
 
     #[test]
+    fn test_confidence_half_life_composes_idempotently_across_cycles() {
+        // T153 regression: repeated per-cycle application must equal one
+        // application over the total elapsed time (no compounding to the floor).
+        let now = Utc::now();
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.posterior = 0.8;
+        b.last_updated = now - Duration::days(30);
+
+        // Single application over the total elapsed time (30 days + 6×5 min).
+        let mut single = b.clone();
+        let total = Duration::days(30) + Duration::minutes(30);
+        assert!(single.apply_confidence_half_life(b.last_updated + total, 30.0));
+
+        // 7 successive per-cycle applications, 5 minutes apart.
+        let mut incremental = b.clone();
+        let mut t = b.last_updated + Duration::days(30);
+        for _ in 0..7 {
+            assert!(incremental.apply_confidence_half_life(t, 30.0));
+            t += Duration::minutes(5);
+        }
+
+        assert!(
+            (incremental.posterior - single.posterior).abs() < 1e-9,
+            "incremental {} != single {}",
+            incremental.posterior,
+            single.posterior
+        );
+        assert!(
+            incremental.posterior > 0.01,
+            "must not collapse to the 0.01 floor, got {}",
+            incremental.posterior
+        );
+    }
+
+    #[test]
+    fn test_confidence_half_life_reanchors_on_new_evidence() {
+        let now = Utc::now();
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.posterior = 0.8;
+        b.last_updated = now - Duration::days(30);
+
+        // First decay measures from last_updated (30 days stale).
+        assert!(b.apply_confidence_half_life(now, 30.0));
+        let after_first = b.posterior;
+
+        // New evidence re-anchors: update() sets last_updated to a fresh time.
+        b.update(true, SourceType::SelfObservation, None);
+        let after_update = b.posterior;
+        assert!(after_update > after_first);
+
+        // Next decay must measure from the new last_updated, not the old anchor.
+        let next = b.last_updated + Duration::days(30);
+        assert!(b.apply_confidence_half_life(next, 30.0));
+        assert!(
+            (b.posterior - after_update * 0.5).abs() < 1e-9,
+            "expected half-life from new evidence time, got {}",
+            b.posterior
+        );
+    }
+
+    #[test]
+    fn test_last_decayed_at_markdown_round_trip_and_backward_compat() {
+        // Round trip: to_markdown → from_markdown preserves last_decayed_at.
+        let mut b = Belief::new("rt".into(), "prop".into(), "domain".into());
+        b.last_decayed_at = Some(Utc::now() - Duration::days(1));
+        let md = b.to_markdown();
+        assert!(md.contains("last_decayed_at:"));
+        let parsed = Belief::from_markdown(&md).unwrap();
+        assert_eq!(parsed.last_decayed_at, b.last_decayed_at);
+
+        // Backward compat: frontmatter without the field parses to None.
+        let legacy = "---\nid: legacy\nproposition: \"legacy\"\nposterior: 0.5000\nevidence_count: 0\nweight: 1.0000\ndomain: test\ncreated_at: 2026-01-01T00:00:00Z\nlast_updated: 2026-01-01T00:00:00Z\n---\n\n# Belief: legacy\n";
+        let parsed_legacy = Belief::from_markdown(legacy).unwrap();
+        assert_eq!(parsed_legacy.last_decayed_at, None);
+    }
+
+    #[test]
     fn test_apply_decay_all_applies_both_mechanisms() {
         // Half-life only: never retrieved (no weight decay) but stale evidence.
         let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
@@ -745,6 +896,125 @@ mod tests {
             "expected demote, posterior={}",
             b.posterior
         );
+    }
+
+    #[test]
+    fn test_reliability_capped_by_weakest_supporting_source() {
+        // SelfObservation (1.0) + AnonymousInternet (0.2) → weakest is 0.2.
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::SelfObservation, None);
+        b.update(true, SourceType::AnonymousInternet, None);
+        assert!(
+            (b.reliability() - 0.2).abs() < 1e-9,
+            "expected reliability 0.2, got {}",
+            b.reliability()
+        );
+    }
+
+    #[test]
+    fn test_reliability_no_evidence_is_unproven() {
+        // A confidently-phrased belief with no provenance must not pass.
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.posterior = 0.99;
+        assert_eq!(b.reliability(), UNPROVEN_PROVENANCE_WEIGHT);
+        assert!(
+            b.reliability() < DURABLE_WISDOM_RELIABILITY,
+            "unproven belief must not pass the durable-wisdom gate"
+        );
+    }
+
+    #[test]
+    fn test_reliability_self_observation_passes_gate() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::SelfObservation, None);
+        b.posterior = 0.95;
+        assert!(
+            b.reliability() >= DURABLE_WISDOM_RELIABILITY,
+            "self-observed high-posterior belief should pass, got {}",
+            b.reliability()
+        );
+    }
+
+    #[test]
+    fn test_reliability_ignores_contradicting_evidence() {
+        // Contradicting evidence contributes no provenance → unproven, so
+        // reliability is capped at the unproven weight (and the collapsed
+        // posterior below it).
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(false, SourceType::SelfObservation, None);
+        assert!(
+            b.reliability() < DURABLE_WISDOM_RELIABILITY,
+            "contradiction-only belief must not pass, got {}",
+            b.reliability()
+        );
+        assert_eq!(b.reliability(), b.posterior.min(UNPROVEN_PROVENANCE_WEIGHT));
+    }
+
+    #[test]
+    fn test_reliability_anonymous_internet_never_passes_gate() {
+        // Even a high posterior cannot lift reliability above the weakest
+        // supporting source (AnonymousInternet = 0.2).
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        for _ in 0..6 {
+            b.update(true, SourceType::AnonymousInternet, None);
+        }
+        assert!(
+            b.posterior > 0.9,
+            "posterior should be high, got {}",
+            b.posterior
+        );
+        assert!(
+            b.reliability() < DURABLE_WISDOM_RELIABILITY,
+            "anonymous-internet-only belief must not pass, got {}",
+            b.reliability()
+        );
+    }
+
+    #[test]
+    fn test_noisy_or_two_weak_signals_beat_either_alone() {
+        // Two AnonymousInternet (0.2) supports: 1 - (0.8 × 0.8) = 0.36 > 0.2.
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::AnonymousInternet, None);
+        let single = b.noisy_or_candidate();
+        b.update(true, SourceType::AnonymousInternet, None);
+        let combined = b.noisy_or_candidate();
+        assert!(
+            combined > single,
+            "two weak signals must beat one: {combined} <= {single}"
+        );
+        assert!(
+            (combined - 0.36).abs() < 1e-9,
+            "expected 0.36, got {combined}"
+        );
+    }
+
+    #[test]
+    fn test_noisy_or_single_anonymous_internet_stays_low() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::AnonymousInternet, None);
+        assert!(
+            (b.noisy_or_candidate() - 0.2).abs() < 1e-9,
+            "expected 0.2, got {}",
+            b.noisy_or_candidate()
+        );
+    }
+
+    #[test]
+    fn test_noisy_or_no_supporting_evidence_is_zero() {
+        // Contradicting evidence is not support → 0.0.
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(false, SourceType::SelfObservation, None);
+        assert_eq!(b.noisy_or_candidate(), 0.0);
+        // No evidence at all → 0.0.
+        let b2 = Belief::new("test".into(), "prop".into(), "domain".into());
+        assert_eq!(b2.noisy_or_candidate(), 0.0);
+    }
+
+    #[test]
+    fn test_noisy_or_single_self_observation_is_one() {
+        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
+        b.update(true, SourceType::SelfObservation, None);
+        assert_eq!(b.noisy_or_candidate(), 1.0);
     }
 
     #[test]
@@ -834,29 +1104,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_correct_requires_prior_support() {
-        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
-        // Add 3 contradicting evidences: posterior < 0.3, evidence_count = 3
-        for _ in 0..3 {
-            b.update(false, SourceType::SelfObservation, None);
-        }
-        // posterior should be very low, evidence_count = 3 > 2
-        assert!(b.posterior < 0.3);
-        assert!(
-            b.should_correct(),
-            "expected correction with 3 contradictions"
-        );
-
-        // Only 1 contradiction: evidence_count = 1, should NOT correct
-        let mut b2 = Belief::new("test2".into(), "prop2".into(), "domain".into());
-        b2.update(false, SourceType::SelfObservation, None);
-        assert!(
-            !b2.should_correct(),
-            "should not correct with evidence_count=1"
-        );
-    }
-
-    #[test]
     fn test_from_markdown_invalid_content() {
         let result = Belief::from_markdown("not a frontmatter file");
         assert!(result.is_err());
@@ -891,43 +1138,10 @@ mod tests {
     }
 
     #[test]
-    fn test_evidence_entry_with_research_method() {
-        let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
-        b.update_with_method(
-            true,
-            SourceType::SelfObservation,
-            ResearchMethod::Observation,
-            Some("direct observation".into()),
-        );
-        assert_eq!(b.evidence.len(), 1);
-        assert_eq!(
-            b.evidence[0].research_method,
-            Some(ResearchMethod::Observation)
-        );
-        assert_eq!(b.evidence[0].note.as_deref(), Some("direct observation"));
-    }
-
-    #[test]
     fn test_evidence_entry_without_research_method() {
         let mut b = Belief::new("test".into(), "prop".into(), "domain".into());
         b.update(true, SourceType::SelfObservation, None);
         assert_eq!(b.evidence.len(), 1);
         assert_eq!(b.evidence[0].research_method, None);
-    }
-
-    #[test]
-    fn test_markdown_includes_research_method() {
-        let mut b = Belief::new("md-test".into(), "test prop".into(), "arch".into());
-        b.update_with_method(
-            true,
-            SourceType::SelfObservation,
-            ResearchMethod::QaSearch,
-            None,
-        );
-        let md = b.to_markdown();
-        assert!(
-            md.contains("[qa_search]"),
-            "expected research method in markdown"
-        );
     }
 }

@@ -101,6 +101,24 @@ pub struct ComponentResult {
     pub component_size: i64,
 }
 
+/// A community detected by the partitioner (T141).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Community {
+    /// Stable deterministic id (`c0`, `c1`, ...) assigned in emission order.
+    pub id: String,
+    /// Human-readable label: the highest-weight member (ties → smallest name).
+    pub label: String,
+    /// Members with their node weight (weighted degree in the projected graph).
+    pub members: Vec<CommunityMember>,
+}
+
+/// One member of a community (T141).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommunityMember {
+    pub entity_name: String,
+    pub weight: f64,
+}
+
 /// One row of the durable per-note processing projection (FR-011).
 ///
 /// Keyed by `(file_path, content_hash)`: the same note with different content is

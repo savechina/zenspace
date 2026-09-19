@@ -35,23 +35,6 @@ impl TierSelector {
         }
         2
     }
-
-    /// Auto-select tier considering available data sources.
-    ///
-    /// Falls back to lower tiers if higher-tier data sources are unavailable:
-    /// - Tier 5 falls back to Tier 2 (LLM not a data source, always available)
-    /// - Tier 4 falls back to Tier 2 if `has_graph` is false
-    /// - Tier 3 falls back to Tier 2 if `has_embeddings` is false
-    /// - Tiers 1 and 2 are always available
-    pub fn auto_select(query: &str, has_embeddings: bool, has_graph: bool) -> u8 {
-        let preferred = Self::select_tier(query);
-
-        match preferred {
-            3 if !has_embeddings => 2,
-            4 if !has_graph => 2,
-            _ => preferred,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -85,28 +68,6 @@ mod tests {
         assert_eq!(TierSelector::select_tier("Similar: embeddings"), 3);
         assert_eq!(TierSelector::select_tier("GRAPH: notions"), 4);
         assert_eq!(TierSelector::select_tier("Explain: the code"), 5);
-    }
-
-    #[test]
-    fn test_auto_select_with_all_sources() {
-        assert_eq!(TierSelector::auto_select("rust", true, true), 1);
-        assert_eq!(TierSelector::auto_select("rust lang", true, true), 2);
-        assert_eq!(TierSelector::auto_select("similar: x", true, true), 3);
-        assert_eq!(TierSelector::auto_select("graph: x", true, true), 4);
-        assert_eq!(TierSelector::auto_select("summarize: x", true, true), 5);
-    }
-
-    #[test]
-    fn test_auto_select_falls_back_without_sources() {
-        assert_eq!(TierSelector::auto_select("similar: x", false, true), 2);
-        assert_eq!(TierSelector::auto_select("graph: x", true, false), 2);
-        assert_eq!(TierSelector::auto_select("similar: x", false, false), 2);
-        assert_eq!(TierSelector::auto_select("graph: x", false, false), 2);
-    }
-
-    #[test]
-    fn test_auto_select_ignores_fallback_for_tier5() {
-        assert_eq!(TierSelector::auto_select("summarize: x", false, false), 5);
     }
 
     #[test]

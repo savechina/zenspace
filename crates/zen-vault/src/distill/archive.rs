@@ -7,6 +7,7 @@
 //! archive.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -142,15 +143,19 @@ pub struct ArchiveEntry {
     pub status: String,
 }
 
-/// The archive itself (file-backed JSON; corrupt input degrades to empty).
+/// The archive itself (file-backed JSON; corrupt input is quarantined aside
+/// and degrades to empty so a bad write can never block a loop cycle).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Archive {
     pub entries: Vec<ArchiveEntry>,
 }
 
 impl Archive {
-    /// Read the archive; a missing or corrupt file yields an empty archive so
-    /// a bad write can never block a loop cycle.
+    /// Read the archive; a missing file yields an empty archive, and a
+    /// corrupt/unparseable file is moved aside as
+    /// `<name>.corrupt-<ts>` (preserving the bad bytes for diagnosis) before
+    /// an empty archive is returned — a truncated write must never silently
+    /// revert illumination ordering (the I10 closure) to input order.
     pub fn load(path: &Path) -> Self {
         let Ok(raw) = std::fs::read_to_string(path) else {
             return Self::default();
@@ -158,19 +163,30 @@ impl Archive {
         match serde_json::from_str(&raw) {
             Ok(archive) => archive,
             Err(e) => {
-                warn!(error = %e, path = %path.display(), "archive corrupt — starting empty");
+                warn!(error = %e, path = %path.display(), "archive corrupt — quarantining and starting empty");
+                quarantine_corrupt(path);
                 Self::default()
             }
         }
     }
 
+    /// Persist the archive atomically (tmp + fsync + rename, mirroring the
+    /// reward sidecar discipline) so a reader never observes a half-written
+    /// file and a crash cannot truncate the archive in place.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create archive dir {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self).context("serialize archive")?;
-        std::fs::write(path, json).with_context(|| format!("write {}", path.display()))?;
+        let tmp = path.with_extension("json.tmp");
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("create tmp {}", tmp.display()))?;
+        file.write_all(json.as_bytes())
+            .and_then(|_| file.sync_all())
+            .with_context(|| format!("write+fsync tmp {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
 
@@ -240,45 +256,6 @@ impl Archive {
             .map(|(_, index)| hypotheses[index].clone())
             .collect()
     }
-
-    /// Pick up to `n` parent slugs, round-robining across occupied cells so
-    /// selection pressure rewards diversity as well as raw score
-    /// (MAP-elites illumination). Deterministic: cells and members are
-    /// ordered by key/slug.
-    pub fn select_parents(&self, n: usize) -> Vec<String> {
-        let mut cells: BTreeMap<String, Vec<&ArchiveEntry>> = BTreeMap::new();
-        for entry in &self.entries {
-            cells.entry(entry.cell.key()).or_default().push(entry);
-        }
-        for members in cells.values_mut() {
-            members.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.slug.cmp(&b.slug))
-            });
-        }
-
-        let mut out = Vec::new();
-        let mut round = 0usize;
-        while out.len() < n {
-            let mut progressed = false;
-            for members in cells.values() {
-                if let Some(entry) = members.get(round) {
-                    out.push(entry.slug.clone());
-                    progressed = true;
-                    if out.len() == n {
-                        break;
-                    }
-                }
-            }
-            if !progressed {
-                break;
-            }
-            round += 1;
-        }
-        out
-    }
 }
 
 /// Parse rejected-hypothesis records from `wiki/wisdom/rejected/*.md`.
@@ -330,21 +307,24 @@ pub fn is_revisiting(h: &HypothesisSlug, rejected: &[RejectedHypothesis]) -> boo
     })
 }
 
-/// DGM stepping stones: rejected material eligible to seed new hypotheses,
-/// optionally filtered to one gap kind (matched via the recorded claim text).
-pub fn sample_stepping_stones(
-    rejected_dir: &Path,
-    kind: Option<GapKind>,
-    limit: usize,
-) -> Vec<RejectedHypothesis> {
-    let mut stones = load_rejected(rejected_dir);
-    if let Some(kind) = kind
-        && let Some(gt) = gap_type(kind)
-    {
-        stones.retain(|r| r.claim.contains(gt));
+/// Move a corrupt archive aside as `<name>.corrupt-<ts>` so the bad bytes are
+/// preserved for diagnosis instead of being silently overwritten by the next
+/// save. Best-effort: a failed quarantine is logged, never fatal.
+fn quarantine_corrupt(path: &Path) {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "archive.json".to_string());
+    let dest = path.with_file_name(format!("{name}.corrupt-{ts}"));
+    match std::fs::rename(path, &dest) {
+        Ok(()) => warn!(path = %dest.display(), "corrupt archive quarantined"),
+        Err(e) => warn!(
+            error = %e,
+            path = %path.display(),
+            "failed to quarantine corrupt archive"
+        ),
     }
-    stones.truncate(limit);
-    stones
 }
 
 /// Default archive location under the logs directory.
@@ -505,76 +485,51 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_archive_loads_empty() {
+    fn corrupt_archive_is_quarantined_and_loads_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("archive.json");
         std::fs::write(&path, "{not json").unwrap();
         assert!(Archive::load(&path).entries.is_empty());
-    }
-
-    #[test]
-    fn select_parents_round_robins_across_cells() {
-        let archive = Archive {
-            entries: vec![
-                ArchiveEntry {
-                    slug: "solid-structural".to_string(),
-                    cell: ArchiveCell {
-                        evidence: EvidenceAxis::Solid,
-                        kind: KindAxis::Structural,
-                        freshness: FreshnessAxis::Fresh,
-                    },
-                    score: 0.9,
-                    status: "exploring".to_string(),
-                },
-                ArchiveEntry {
-                    slug: "thin-judgment".to_string(),
-                    cell: ArchiveCell {
-                        evidence: EvidenceAxis::Thin,
-                        kind: KindAxis::Judgment,
-                        freshness: FreshnessAxis::Fresh,
-                    },
-                    score: 0.5,
-                    status: "exploring".to_string(),
-                },
-                ArchiveEntry {
-                    slug: "solid-structural-2".to_string(),
-                    cell: ArchiveCell {
-                        evidence: EvidenceAxis::Solid,
-                        kind: KindAxis::Structural,
-                        freshness: FreshnessAxis::Fresh,
-                    },
-                    score: 0.8,
-                    status: "exploring".to_string(),
-                },
-            ],
-        };
-        let parents = archive.select_parents(3);
+        // The corrupt bytes are moved aside, not left in place to be silently
+        // overwritten by the next save.
+        assert!(!path.exists(), "corrupt archive must be moved aside");
+        let quarantined: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("archive.json.corrupt-"))
+            .collect();
         assert_eq!(
-            parents[0], "solid-structural",
-            "best score in first cell leads"
+            quarantined.len(),
+            1,
+            "exactly one quarantine file expected, got {quarantined:?}"
         );
-        assert_eq!(parents[1], "thin-judgment", "second cell illuminated next");
-        assert_eq!(parents[2], "solid-structural-2", "then the second member");
     }
 
     #[test]
-    fn stepping_stones_filter_by_gap_kind() {
+    fn save_is_atomic_and_leaves_no_tmp_residue() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join("orphan-foo.md"),
-            "---\nclaim: \"Gap 'orphan' detected: Foo\"\nfalsifier: \"missing wiki page for entity 'foo'\"\nbecause: \"reverify\"\nexpiry: \"2026-01-01\"\n---\n\n# Rejected\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("stale-bar.md"),
-            "---\nclaim: \"Gap 'stale_ingest' detected: bar\"\nfalsifier: \"untouched > 2 cycles\"\nbecause: \"reverify\"\nexpiry: \"2026-01-01\"\n---\n\n# Rejected\n",
-        )
-        .unwrap();
-
-        let all = sample_stepping_stones(dir.path(), None, 10);
-        assert_eq!(all.len(), 2);
-        let orphans = sample_stepping_stones(dir.path(), Some(GapKind::OrphanEntity), 10);
-        assert_eq!(orphans.len(), 1);
-        assert!(orphans[0].claim.contains("orphan"));
+        let path = dir.path().join("archive.json");
+        let archive = Archive {
+            entries: vec![ArchiveEntry {
+                slug: "a".to_string(),
+                cell: ArchiveCell {
+                    evidence: EvidenceAxis::None,
+                    kind: KindAxis::Structural,
+                    freshness: FreshnessAxis::Fresh,
+                },
+                score: 0.5,
+                status: "exploring".to_string(),
+            }],
+        };
+        archive.save(&path).unwrap();
+        assert!(path.exists());
+        assert!(
+            !dir.path().join("archive.json.tmp").exists(),
+            "tmp file must be renamed away"
+        );
+        let loaded = Archive::load(&path);
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].slug, "a");
     }
 }

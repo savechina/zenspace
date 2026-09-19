@@ -3,8 +3,8 @@
 //! [`aggregate`] folds per-cycle [`LoopCycleReport`]s into a single
 //! [`DiscoverMetrics`] snapshot: hypothesis velocity plus promotion, rejection,
 //! and precipitation rates. The module is path-agnostic — callers pass the
-//! ZenPaths-resolved logs dir to [`load_reports`] / [`write_metrics`];
-//! no `~/.zen` / `.zentest` literals live here.
+//! ZenPaths-resolved logs dir to [`load_reports`]; no `~/.zen` / `.zentest`
+//! literals live here.
 //!
 //! # Rate definitions
 //!
@@ -116,9 +116,6 @@ pub fn aggregate(reports: &[LoopCycleReport]) -> DiscoverMetrics {
 /// Per-cycle snapshot filename prefix read by [`load_reports`].
 pub const REPORT_FILE_PREFIX: &str = "loop-report-";
 
-/// Metrics snapshot filename written by [`write_metrics`].
-pub const METRICS_FILE_NAME: &str = "discover-metrics.json";
-
 /// How many most-recent cycle reports [`load_reports`] returns.
 ///
 /// One report is written per discover cycle (daily), each embedding the
@@ -183,28 +180,6 @@ pub fn load_reports(dir: &Path) -> Result<Vec<LoopCycleReport>, DiscoverMetricsE
         }
     }
     Ok(reports)
-}
-
-/// Write `metrics` as pretty JSON to `dir/discover-metrics.json`.
-///
-/// Creates `dir` (and parents) when missing. Returns the written path.
-///
-/// # Arguments
-///
-/// * `dir` — Caller-resolved logs dir (e.g. from ZenPaths).
-/// * `metrics` — Snapshot to persist.
-///
-/// # Errors
-///
-/// Returns [`DiscoverMetricsError`] on I/O or JSON failure.
-pub fn write_metrics(
-    dir: &Path,
-    metrics: &DiscoverMetrics,
-) -> Result<PathBuf, DiscoverMetricsError> {
-    fs::create_dir_all(dir)?;
-    let path = dir.join(METRICS_FILE_NAME);
-    fs::write(&path, serde_json::to_string_pretty(metrics)?)?;
-    Ok(path)
 }
 
 #[cfg(test)]
@@ -276,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn write_load_roundtrip_preserves_values() {
+    fn load_and_aggregate_preserves_values() {
         let dir = tempfile::tempdir().unwrap();
         let reports = [report(4, 2, 1, 3), report(2, 2, 0, 1)];
         for (i, r) in reports.iter().enumerate() {
@@ -290,10 +265,5 @@ mod tests {
         let m = aggregate(&loaded);
         assert_eq!(m.window_cycles, 2);
         assert!((m.promotion_rate - 4.0 / 6.0).abs() < 1e-9);
-        let written = write_metrics(dir.path(), &m).unwrap();
-        assert_eq!(written.file_name().unwrap(), METRICS_FILE_NAME);
-        let back: DiscoverMetrics =
-            serde_json::from_str(&fs::read_to_string(&written).unwrap()).unwrap();
-        assert!((back.promotion_rate - m.promotion_rate).abs() < 1e-12);
     }
 }

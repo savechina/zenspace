@@ -516,6 +516,19 @@ pub struct LoopConfig {
     pub max_steps: Option<u32>,
     /// Per-cycle token budget (FR-032 LoopBudget). Default 8000.
     pub max_tokens: Option<u32>,
+    /// Whole-file ingest size ceiling in bytes (T158). Files above this are
+    /// stat-and-skipped (never read into memory) and quarantined, so a
+    /// multi-GB `*.txt` in a watched host dir cannot OOM the daemon.
+    /// Default 64 MiB; clamped to 1 MiB..=1 GiB.
+    pub max_ingest_bytes: Option<u64>,
+    /// Louvain resolution γ for community detection (T141). γ < 1 favors
+    /// larger communities, γ > 1 favors smaller ones. Default 1.0; clamped
+    /// to 0.1..=5.0 so a typo can neither merge everything nor atomize it.
+    pub community_resolution: Option<f64>,
+    /// Minimum community size for the summarization surface (T141 part B):
+    /// communities at or below this size are skipped entirely (small pairs
+    /// are noise and would flood the vault). Default 3; clamped to 2..=50.
+    pub community_min_size: Option<u32>,
 }
 
 impl LoopConfig {
@@ -549,6 +562,29 @@ impl LoopConfig {
     /// Per-cycle token budget. Default 8000; clamped to 1..=1_000_000.
     pub fn max_tokens_or_default(&self) -> u32 {
         self.max_tokens.unwrap_or(8_000).clamp(1, 1_000_000)
+    }
+
+    /// Whole-file ingest size ceiling in bytes (T158). Default 64 MiB;
+    /// clamped to 1 MiB..=1 GiB so a typo can neither disable the guard
+    /// (0/tiny) nor make it unbounded (huge).
+    pub fn max_ingest_bytes_or_default(&self) -> u64 {
+        self.max_ingest_bytes
+            .unwrap_or(64 * 1024 * 1024)
+            .clamp(1024 * 1024, 1024 * 1024 * 1024)
+    }
+
+    /// Louvain resolution γ (T141). Default 1.0; clamped to 0.1..=5.0 so a
+    /// typo can neither merge the whole graph into one community nor atomize
+    /// it into singletons.
+    pub fn community_resolution_or_default(&self) -> f64 {
+        self.community_resolution.unwrap_or(1.0).clamp(0.1, 5.0)
+    }
+
+    /// Minimum community size for the summarization surface (T141 part B).
+    /// Default 3; clamped to 2..=50 so a typo can neither write every pair
+    /// as a page nor suppress all pages.
+    pub fn community_min_size_or_default(&self) -> u32 {
+        self.community_min_size.unwrap_or(3).clamp(2, 50)
     }
 
     pub fn min_free_bytes_or_default(&self) -> u64 {
@@ -1790,6 +1826,9 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
         host_stage_timeout_secs: ov.host_stage_timeout_secs.or(base.host_stage_timeout_secs),
         max_steps: ov.max_steps.or(base.max_steps),
         max_tokens: ov.max_tokens.or(base.max_tokens),
+        max_ingest_bytes: ov.max_ingest_bytes.or(base.max_ingest_bytes),
+        community_resolution: ov.community_resolution.or(base.community_resolution),
+        community_min_size: ov.community_min_size.or(base.community_min_size),
     }
 }
 
@@ -2155,6 +2194,23 @@ fn apply_loop_env(cfg: &mut LoopConfig) {
         && v > 0
     {
         cfg.max_tokens = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_LOOP_MAX_INGEST_BYTES")
+        && let Ok(n) = v.parse::<u64>()
+        && n > 0
+    {
+        cfg.max_ingest_bytes = Some(n);
+    }
+    if let Some(v) = env_str("ZEN_LOOP_COMMUNITY_RESOLUTION")
+        && let Ok(f) = v.parse::<f64>()
+        && f > 0.0
+    {
+        cfg.community_resolution = Some(f);
+    }
+    if let Some(v) = env_u32("ZEN_LOOP_COMMUNITY_MIN_SIZE")
+        && v > 0
+    {
+        cfg.community_min_size = Some(v);
     }
 }
 
@@ -2739,6 +2795,104 @@ provider = "anthropic"
         assert_eq!(cfg.agentic.tool_loop.max_rounds_or_default(), 16);
 
         unsafe { std::env::remove_var("ZEN_TOOL_MAX_ROUNDS") };
+    }
+
+    #[test]
+    fn loop_max_ingest_bytes_clamped_to_1mib_1gib() {
+        for (raw, expected) in [
+            (0, 1024 * 1024),
+            (1024, 1024 * 1024),
+            (1024 * 1024, 1024 * 1024),
+            (64 * 1024 * 1024, 64 * 1024 * 1024),
+            (1024 * 1024 * 1024, 1024 * 1024 * 1024),
+            (8u64 * 1024 * 1024 * 1024, 1024 * 1024 * 1024),
+        ] {
+            let toml_str = format!("[agentic.loop]\nmax_ingest_bytes = {raw}\n");
+            let config: ZenConfig = toml::from_str(&toml_str).unwrap();
+            assert_eq!(
+                config.agentic.loop_cfg.max_ingest_bytes_or_default(),
+                expected,
+                "raw: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_max_ingest_bytes_env_override_respected_and_clamped() {
+        // SAFETY: test-only env mutation; ZEN_LOOP_MAX_INGEST_BYTES is read by
+        // no sibling test in this binary and is removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_LOOP_MAX_INGEST_BYTES", "2097152") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.loop_cfg.max_ingest_bytes_or_default(),
+            2 * 1024 * 1024
+        );
+
+        unsafe { std::env::set_var("ZEN_LOOP_MAX_INGEST_BYTES", "999999999999") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.loop_cfg.max_ingest_bytes_or_default(),
+            1024 * 1024 * 1024
+        );
+
+        unsafe { std::env::remove_var("ZEN_LOOP_MAX_INGEST_BYTES") };
+    }
+
+    #[test]
+    fn loop_community_resolution_clamped_to_01_50() {
+        for (raw, expected) in [
+            (0.0, 0.1),
+            (0.05, 0.1),
+            (0.1, 0.1),
+            (1.0, 1.0),
+            (5.0, 5.0),
+            (10.0, 5.0),
+        ] {
+            let toml_str = format!("[agentic.loop]\ncommunity_resolution = {raw}\n");
+            let config: ZenConfig = toml::from_str(&toml_str).unwrap();
+            assert_eq!(
+                config.agentic.loop_cfg.community_resolution_or_default(),
+                expected,
+                "raw: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_community_min_size_clamped_to_2_50() {
+        for (raw, expected) in [(0, 2), (1, 2), (2, 2), (3, 3), (50, 50), (100, 50)] {
+            let toml_str = format!("[agentic.loop]\ncommunity_min_size = {raw}\n");
+            let config: ZenConfig = toml::from_str(&toml_str).unwrap();
+            assert_eq!(
+                config.agentic.loop_cfg.community_min_size_or_default(),
+                expected,
+                "raw: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_community_env_overrides_respected_and_clamped() {
+        // SAFETY: test-only env mutation; both vars are read by no sibling
+        // test in this binary and are removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_LOOP_COMMUNITY_RESOLUTION", "2.5") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.loop_cfg.community_resolution_or_default(), 2.5);
+
+        unsafe { std::env::set_var("ZEN_LOOP_COMMUNITY_RESOLUTION", "99") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.loop_cfg.community_resolution_or_default(), 5.0);
+
+        unsafe { std::env::set_var("ZEN_LOOP_COMMUNITY_MIN_SIZE", "7") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.loop_cfg.community_min_size_or_default(), 7);
+
+        unsafe { std::env::set_var("ZEN_LOOP_COMMUNITY_MIN_SIZE", "999") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.loop_cfg.community_min_size_or_default(), 50);
+
+        unsafe { std::env::remove_var("ZEN_LOOP_COMMUNITY_RESOLUTION") };
+        unsafe { std::env::remove_var("ZEN_LOOP_COMMUNITY_MIN_SIZE") };
     }
 
     #[test]

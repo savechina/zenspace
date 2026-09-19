@@ -22,6 +22,11 @@ use zen_core::paths::ZenPaths;
 /// delay is real).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Poll cadence for the daemon-arrival watcher (T154): an explicit
+/// `zen serve start` daemon waiting on the lease is detected within one
+/// interval, then the in-app scheduler shuts down and releases the lease.
+const YIELD_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Pure coexistence decision (unit-testable).
 ///
 /// - `config_enabled == false` → never spawn (kill switch)
@@ -29,6 +34,22 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// - otherwise (no daemon / implicit daemon / unknown) → spawn
 fn should_spawn_in_app_scheduler(config_enabled: bool, daemon_scheduler: Option<bool>) -> bool {
     config_enabled && daemon_scheduler != Some(true)
+}
+
+/// Pure yield decision (unit-testable): the TUI yields its in-app
+/// scheduler when an explicit daemon intends to host one
+/// (`scheduler_pending: true`) or already hosts one (`scheduler: true`).
+/// Only an explicit daemon (`scheduler_hosted`) sets `scheduler_pending`,
+/// so implicit daemons never cause a yield.
+fn should_yield(health: &serde_json::Value) -> bool {
+    health
+        .get("scheduler_pending")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || health
+            .get("scheduler")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// Read `scheduler` from a health/status snapshot. Absent field
@@ -39,6 +60,47 @@ fn scheduler_flag(snapshot: &serde_json::Value) -> Option<bool> {
         .get("scheduler")
         .and_then(serde_json::Value::as_bool)
         .or(Some(false))
+}
+
+/// Watches for an explicit daemon that wants the scheduler lease and
+/// signals the in-app scheduler to shut down when one appears (T154).
+///
+/// Polls `health/status` every [`YIELD_POLL_INTERVAL`]; on
+/// `scheduler_pending: true` (daemon waiting for the lease) or
+/// `scheduler: true` (daemon already hosting), flips the watch and
+/// returns. The caller then awaits the scheduler task and drops the
+/// lease so the daemon's Full profile can take over.
+fn spawn_yield_watcher(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(YIELD_POLL_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // consume the immediate first tick
+        loop {
+            tick.tick().await;
+            let Some(surface) = super::prewarm::resolve_client().await else {
+                continue;
+            };
+            match surface.health_status().await {
+                Ok(snapshot) if should_yield(&snapshot) => {
+                    tracing::info!(
+                        scheduler_pending = snapshot
+                            .get("scheduler_pending")
+                            .and_then(serde_json::Value::as_bool),
+                        scheduler = snapshot
+                            .get("scheduler")
+                            .and_then(serde_json::Value::as_bool),
+                        "tui scheduler: explicit daemon wants the scheduler lease, handing off"
+                    );
+                    shutdown_tx.send_replace(true);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(error = %e, "tui scheduler: yield probe failed"),
+            }
+        }
+    })
 }
 
 /// Entry point for both TUI paths (inline + fullscreen). Kill switch is
@@ -79,14 +141,29 @@ pub(crate) fn spawn(config: &ZenConfig) {
         // has not yet surfaced `scheduler: true`) may already hold the
         // lease. Fail closed here — learning resumes in the next TUI
         // session once the current holder exits.
-        let lease = match ZenPaths::detect()
-            .ok()
-            .and_then(|paths| zen_agents::scheduler::SchedulerLease::try_acquire(&paths))
-        {
-            Some(lease) => lease,
-            None => {
-                tracing::info!(
-                    "tui scheduler: lease held by another scheduler host, skipping in-app spawn"
+        let lease = match ZenPaths::detect() {
+            Ok(paths) => match zen_agents::scheduler::SchedulerLease::try_acquire(&paths) {
+                Ok(lease) => lease,
+                Err(zen_agents::scheduler::LeaseError::Contention) => {
+                    tracing::info!(
+                        "tui scheduler: lease held by another scheduler host, skipping in-app spawn"
+                    );
+                    return;
+                }
+                Err(zen_agents::scheduler::LeaseError::OpenFailed(e)) => {
+                    // T164: a real filesystem problem, not coexistence —
+                    // warn and skip rather than pretend another host owns it.
+                    tracing::warn!(
+                        error = %e,
+                        "tui scheduler: lease lock file could not be opened, skipping in-app spawn"
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "tui scheduler: cannot resolve paths, skipping in-app spawn"
                 );
                 return;
             }
@@ -99,8 +176,18 @@ pub(crate) fn spawn(config: &ZenConfig) {
             &cron,
             zen_agents::scheduler::SchedulerProfile::InApp,
         );
-        scheduler.run().await;
+        // T154: an explicit `zen serve start` daemon appearing mid-session
+        // signals `scheduler_pending` (or `scheduler` once it acquires the
+        // lease); the watcher flips the watch, we stop the in-app scheduler
+        // BEFORE dropping the lease so the daemon's Full profile takes over
+        // without double-firing cron workers.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let scheduler_task = tokio::spawn(scheduler.run_with_shutdown(shutdown_rx));
+        let watcher = spawn_yield_watcher(shutdown_tx);
+        let _ = scheduler_task.await;
+        watcher.abort();
         drop(lease);
+        tracing::info!("tui scheduler: in-app scheduler stopped, lease released");
     });
 }
 
@@ -137,5 +224,37 @@ mod tests {
             super::scheduler_flag(&serde_json::json!({"scheduler": false})),
             Some(false)
         );
+    }
+
+    #[test]
+    fn yield_on_pending_or_hosted() {
+        assert!(super::should_yield(
+            &serde_json::json!({"scheduler_pending": true})
+        ));
+        assert!(super::should_yield(&serde_json::json!({"scheduler": true})));
+        assert!(super::should_yield(&serde_json::json!({
+            "scheduler_pending": true,
+            "scheduler": false
+        })));
+        assert!(super::should_yield(&serde_json::json!({
+            "scheduler_pending": true,
+            "scheduler": true
+        })));
+    }
+
+    #[test]
+    fn no_yield_for_implicit_or_absent_daemon() {
+        assert!(!super::should_yield(&serde_json::json!({})));
+        assert!(!super::should_yield(
+            &serde_json::json!({"scheduler": false})
+        ));
+        assert!(!super::should_yield(&serde_json::json!({
+            "scheduler_pending": false,
+            "scheduler": false
+        })));
+        // Non-bool junk must not panic or yield.
+        assert!(!super::should_yield(
+            &serde_json::json!({"scheduler_pending": "yes"})
+        ));
     }
 }

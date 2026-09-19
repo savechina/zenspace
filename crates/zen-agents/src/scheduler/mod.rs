@@ -29,7 +29,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 pub mod lease;
-pub use lease::SchedulerLease;
+pub use lease::{LeaseError, SchedulerLease};
 pub use workers::*;
 use zen_core::config::{
     CronConfig, default_daily_log_schedule, default_night_dream_schedule,
@@ -233,17 +233,49 @@ impl ZenScheduler {
     /// Run the event loop. Checks all workers against their schedules
     /// at the configured tick interval. Runs indefinitely.
     pub async fn run(self) {
+        // Thin wrapper: a watch whose sender stays alive and never fires,
+        // so `run_with_shutdown`'s `changed()` never resolves with a
+        // sender-dropped error and the loop runs forever.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let _never_fires = tx;
+        self.run_with_shutdown(rx).await
+    }
+
+    /// Run the event loop until the shutdown watch flips to `true`.
+    ///
+    /// The loop `select!`s between one tick+sleep and the shutdown
+    /// signal, so a signal lands within one tick interval. Handles both
+    /// the `changed()` transition and the already-true case (the signal
+    /// may have fired before the loop started).
+    pub async fn run_with_shutdown(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         info!(
             tick_interval_ms = self.tick_interval.as_millis() as u64,
             workers = self.workers.len(),
             "scheduler: starting event loop"
         );
-
-        loop {
-            let now = Utc::now();
-            self.tick(now).await;
-            sleep(self.tick_interval).await;
+        if *shutdown.borrow() {
+            info!("scheduler: shutdown already signalled, not starting event loop");
+            return;
         }
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        info!("scheduler: shutdown signal received, stopping event loop");
+                        break;
+                    }
+                }
+                _ = self.tick_and_sleep() => {}
+            }
+        }
+    }
+
+    /// One tick followed by the tick-interval sleep (the select arm of
+    /// [`Self::run_with_shutdown`]).
+    async fn tick_and_sleep(&self) {
+        let now = Utc::now();
+        self.tick(now).await;
+        sleep(self.tick_interval).await;
     }
 
     /// Run a single tick: check all workers and fire matching ones.
@@ -832,6 +864,33 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "in-window tick (08:59:50, 10s to cron) must fire after an out-of-window tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_shutdown_exits_on_signal() {
+        let scheduler = ZenScheduler::new();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(scheduler.run_with_shutdown(rx));
+        // Let the loop start, then signal.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(
+            result.is_ok(),
+            "run_with_shutdown must exit on signal, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_shutdown_exits_when_already_signalled() {
+        let scheduler = ZenScheduler::new();
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let task = tokio::spawn(scheduler.run_with_shutdown(rx));
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert!(
+            result.is_ok(),
+            "run_with_shutdown must exit when already signalled, got {result:?}"
         );
     }
 

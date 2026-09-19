@@ -73,17 +73,32 @@ impl SourceIngester {
     /// Map of `host_hash` → number of files promoted (for per-source audit).
     ///
     /// # Errors
-    /// Bubbles up directory reads and file moves; a failed file is skipped
-    /// warn-and-continue so one bad file never blocks the sweep.
+    /// Returns `Ok` even when individual files fail — every per-file failure
+    /// (write, ledger, rename, remove) is skipped warn-and-continue so one bad
+    /// file never blocks the sweep or discards the other sources' promoted
+    /// counts (T159). The only error path is an unreadable `_incoming` root,
+    /// which returns an empty map.
     pub fn promote_incoming(&self, inbox: &Path) -> Result<HashMap<String, usize>> {
         let mut promoted: HashMap<String, usize> = HashMap::new();
         let incoming_root = inbox.join("_incoming");
         if !incoming_root.is_dir() {
             return Ok(promoted);
         }
+        // T158: whole-file ingest ceiling — files above it are quarantined
+        // (marker under `_incoming/{hash}/quarantined/`) rather than read into
+        // memory, so a multi-GB staged file cannot OOM the daemon.
+        let ceiling = zen_core::config::load_config()
+            .map(|cfg| cfg.agentic.loop_cfg.max_ingest_bytes_or_default())
+            .unwrap_or(64 * 1024 * 1024);
 
-        for hash_dir in fs::read_dir(&incoming_root)? {
-            let hash_dir = hash_dir?;
+        let Ok(hash_dirs) = fs::read_dir(&incoming_root) else {
+            warn!(
+                path = %incoming_root.display(),
+                "promote: cannot read _incoming staging root — skipped"
+            );
+            return Ok(promoted);
+        };
+        for hash_dir in hash_dirs.flatten() {
             let hash_path = hash_dir.path();
             if !hash_path.is_dir() {
                 continue;
@@ -92,8 +107,15 @@ impl SourceIngester {
                 continue;
             };
             let promoted_dir = hash_path.join("promoted");
-            for entry in fs::read_dir(&hash_path)? {
-                let entry = entry?;
+            let quarantined_dir = hash_path.join("quarantined");
+            let Ok(entries) = fs::read_dir(&hash_path) else {
+                warn!(
+                    path = %hash_path.display(),
+                    "promote: cannot read staging dir — skipped"
+                );
+                continue;
+            };
+            for entry in entries.flatten() {
                 let staged = entry.path();
                 if !staged.is_file() {
                     continue;
@@ -119,14 +141,35 @@ impl SourceIngester {
                     format!("{host_hash}_{file_name}")
                 };
                 let dest = inbox.join(&dest_name);
-                if dest.exists() {
-                    // Previous promotion still awaiting distill — retry later.
+                let ledger_path = promoted_dir.join(file_name);
+                // T159: defer only when the promotion is COMMITTED (dest AND
+                // ledger both present — the note is awaiting distill). A dest
+                // without a ledger is an incomplete promotion from a prior
+                // partial write: re-promote it rather than stall forever.
+                if dest.exists() && ledger_path.exists() {
                     warn!(file = %dest_name, "incoming promotion target exists, deferring");
                     continue;
                 }
                 fs::create_dir_all(&promoted_dir).ok();
-                // Ledger record keeps the ORIGINAL staged name — the sweep's
-                // seen-set checks `_incoming/{hash}/promoted/{filename}`.
+                // T158: stat-and-skip above the ceiling; the quarantine marker
+                // is the sweep's seen-set entry so the file is not re-staged
+                // and re-warned every cycle.
+                if let Ok(meta) = fs::metadata(&staged)
+                    && meta.len() > ceiling
+                {
+                    fs::create_dir_all(&quarantined_dir).ok();
+                    let marker = quarantined_dir.join(file_name);
+                    if !marker.exists() {
+                        fs::write(&marker, b"").ok();
+                    }
+                    warn!(
+                        file = %file_name,
+                        size = meta.len(),
+                        ceiling,
+                        "promote: file exceeds ingest size ceiling — quarantined"
+                    );
+                    continue;
+                }
                 if is_txt {
                     // Read content; non-UTF-8 files are skipped (warn, no
                     // ledger entry, no move — consistent with skip semantics).
@@ -141,26 +184,54 @@ impl SourceIngester {
                             continue;
                         }
                     };
-                    fs::copy(&staged, promoted_dir.join(file_name))
-                        .with_context(|| format!("ledger record: {}", promoted_dir.display()))?;
-                    // Wrap in frontmatter so the distill inbox scan recognises
-                    // it as a note.  source traces back to the host hash for
-                    // provenance; sensitivity inherits the local-only default.
+                    // T159: durable destination FIRST, ledger after — a
+                    // partial write leaves dest-without-ledger, which the next
+                    // cycle re-promotes instead of stalling forever.
                     let now = Utc::now().to_rfc3339();
                     let id = uuid::Uuid::now_v7().to_string();
                     let md_content = format!(
                         "---\nid: \"{id}\"\ntags: [\"host-import\"]\nsource: \"host:{host_hash}\"\nsource_id: null\nsensitivity: private\ncreated_at: \"{now}\"\nupdated_at: \"{now}\"\ndomain: []\nproject: null\n---\n\n{content}"
                     );
-                    fs::write(&dest, md_content)
-                        .with_context(|| format!("write converted note: {}", dest.display()))?;
-                    fs::remove_file(&staged)
-                        .with_context(|| format!("remove staged txt: {}", staged.display()))?;
+                    if let Err(e) = fs::write(&dest, md_content) {
+                        warn!(
+                            file = %file_name,
+                            error = %e,
+                            "promote: write converted note failed — skipped"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = fs::copy(&staged, &ledger_path) {
+                        warn!(
+                            file = %file_name,
+                            error = %e,
+                            "promote: ledger record failed — skipped (will retry)"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = fs::remove_file(&staged) {
+                        warn!(
+                            file = %file_name,
+                            error = %e,
+                            "promote: remove staged txt failed — promotion committed"
+                        );
+                    }
                 } else {
-                    fs::copy(&staged, promoted_dir.join(file_name))
-                        .with_context(|| format!("ledger record: {}", promoted_dir.display()))?;
-                    fs::rename(&staged, &dest).with_context(|| {
-                        format!("promote {} -> {}", staged.display(), dest.display())
-                    })?;
+                    // md: rename staged → dest FIRST (durable), then ledger.
+                    if let Err(e) = fs::rename(&staged, &dest) {
+                        warn!(
+                            file = %file_name,
+                            error = %e,
+                            "promote: rename failed — skipped"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = fs::copy(&dest, &ledger_path) {
+                        warn!(
+                            file = %file_name,
+                            error = %e,
+                            "promote: ledger record failed — promotion committed"
+                        );
+                    }
                 }
                 *promoted.entry(host_hash.to_string()).or_insert(0) += 1;
             }
@@ -261,6 +332,10 @@ mod tests {
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("note.md"), "v2").unwrap();
         fs::write(inbox.join("ef987654_note.md"), "v1 still pending distill").unwrap();
+        // A COMMITTED promotion awaiting distill has both dest AND ledger —
+        // only then does the promote defer (T159).
+        fs::create_dir_all(staging.join("promoted")).unwrap();
+        fs::write(staging.join("promoted").join("note.md"), "v1").unwrap();
 
         let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
         assert!(promoted.is_empty());
@@ -279,6 +354,9 @@ mod tests {
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("note.txt"), "v2 text").unwrap();
         fs::write(inbox.join("cafe0001_note.md"), "v1 still pending").unwrap();
+        // Committed promotion awaiting distill: dest AND ledger both present.
+        fs::create_dir_all(staging.join("promoted")).unwrap();
+        fs::write(staging.join("promoted").join("note.txt"), "v1 text").unwrap();
 
         let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
         assert!(promoted.is_empty());
@@ -306,5 +384,55 @@ mod tests {
         let inbox = dir.path().join("inbox");
         let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
         assert!(promoted.is_empty());
+    }
+
+    #[test]
+    fn promote_incoming_skips_and_quarantines_oversized_files() {
+        // SAFETY: test-only env mutation; ZEN_LOOP_MAX_INGEST_BYTES is read by
+        // no sibling test in this binary and is removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_LOOP_MAX_INGEST_BYTES", "1024") };
+        zen_core::config::invalidate_config_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("ab12cd34");
+        fs::create_dir_all(&staging).unwrap();
+        // 2 MiB > the clamped 1 MiB minimum ceiling — must be stat-and-skipped
+        // (never read into memory) and quarantined with a marker the sweep's
+        // seen-set honours, not promoted.
+        let big = staging.join("huge.txt");
+        fs::write(&big, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert!(promoted.is_empty());
+        assert!(!inbox.join("ab12cd34_huge.md").exists());
+        assert!(staging.join("huge.txt").is_file());
+        assert!(staging.join("quarantined").join("huge.txt").exists());
+
+        unsafe { std::env::remove_var("ZEN_LOOP_MAX_INGEST_BYTES") };
+        zen_core::config::invalidate_config_cache();
+    }
+
+    #[test]
+    fn promote_incoming_recovers_partial_write_dest_without_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("ab12cd34");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("note.txt"), "fresh content").unwrap();
+        // Simulate a prior partial write: dest exists (stale/partial) but the
+        // ledger record is absent — the promotion was never committed. The
+        // next cycle must re-promote, never stall.
+        fs::write(inbox.join("ab12cd34_note.md"), "partial garbage").unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert_eq!(promoted.get("ab12cd34"), Some(&1));
+        let md = fs::read_to_string(inbox.join("ab12cd34_note.md")).unwrap();
+        assert!(md.contains("fresh content"), "dest must be re-promoted");
+        assert!(!md.contains("partial garbage"));
+        assert!(
+            staging.join("promoted").join("note.txt").exists(),
+            "ledger must now be present"
+        );
+        assert!(!staging.join("note.txt").exists(), "staged file consumed");
     }
 }

@@ -8,8 +8,9 @@ use anyhow::Result;
 use rig_agent::agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome};
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::{
-    ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
+    ToolDispatchHook, ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
+use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_core::completion::{AssistantContent, Usage, message::ToolCall as NativeToolCall};
 use rig_core::message::Message;
 use tracing::{debug, info, instrument, warn};
@@ -47,6 +48,11 @@ const TOOL_PREVIEW_CHARS: usize = 100;
 /// — working memory holds 4±1 chunks, so the merged context keeps at most 5
 /// items: the injected skill prompt plus the 4 best prior entries).
 const M1_TOP_K: usize = 5;
+
+/// Cap for the wake-up brief (`logs/wake-up-<date>.md`). The brief lives in
+/// the agent-writable logs dir, so it gets the same size cap as the T093
+/// identity files before M1 insertion.
+const WAKE_UP_BRIEF_MAX_BYTES: u64 = 256 * 1024;
 
 /// Orchestrator manages agent lifecycle, registry, and execution flow.
 ///
@@ -164,9 +170,96 @@ const CORRECTION_MARKERS: &[&str] = &[
     "correction:",
 ];
 
+/// Clause delimiters that end the leading user clause for correction
+/// detection (T161). Sentence boundaries only — commas keep the marker in
+/// the leading clause ("不对，应该是 300" stays a correction).
+const CLAUSE_DELIMITERS: &[char] = &['.', '!', '?', '。', '！', '？', '\n', ';', '；'];
+
+/// A marker counts as a correction only when it appears in the leading user
+/// clause AND its match starts within the first half of that clause. A
+/// mid-text mention ("explain why the previous answer was wrong") is not a
+/// correction and must not poison every note in context (T161).
 fn is_user_correction(query: &str) -> bool {
-    let lower = query.to_lowercase();
-    CORRECTION_MARKERS.iter().any(|m| lower.contains(m))
+    let leading = query
+        .split(|c: char| CLAUSE_DELIMITERS.contains(&c))
+        .next()
+        .unwrap_or(query);
+    let half = leading.chars().count() / 2;
+    let lower = leading.to_lowercase();
+    CORRECTION_MARKERS.iter().any(|m| {
+        lower
+            .find(m)
+            .is_some_and(|byte_pos| lower[..byte_pos].chars().count() < half)
+    })
+}
+
+/// FR-036: classify a tool dispatch result as a failure by inspecting the
+/// structured output, not the serialized text. Tools signal errors
+/// structurally — `fs.*`/`delegate.*` return `Ok(json!({ "error": ... }))`
+/// — which the old `starts_with("Error")` check on the serialized JSON
+/// never matched, so the <70% broken-tool flag could not fire (T157).
+fn tool_output_is_error(output: &serde_json::Value) -> bool {
+    match output {
+        serde_json::Value::Object(map) => match map.get("error") {
+            Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+            Some(serde_json::Value::Null) => false,
+            Some(_) => true,
+            None => false,
+        },
+        serde_json::Value::String(s) => s.starts_with("Error") || s.starts_with("error"),
+        _ => false,
+    }
+}
+
+/// FR-036: dispatch invocations one at a time through the hook pipeline,
+/// timing each dispatch individually so per-tool latency is the real
+/// measured dispatch time — not the batch total divided by the result
+/// count (T157). A hook terminate aborts the remaining batch exactly like
+/// the batch dispatcher.
+async fn dispatch_timed(
+    tools: &ToolRegistry,
+    invocations: &[ToolInvocation],
+    hooks: &[&dyn ToolDispatchHook],
+) -> Result<(Vec<ToolInvocationResult>, Vec<u64>), KernelError> {
+    let mut results = Vec::with_capacity(invocations.len());
+    let mut latencies = Vec::with_capacity(invocations.len());
+    for invocation in invocations {
+        let start = Instant::now();
+        let mut batch =
+            dispatch_tool_invocations_with_hooks(tools, std::slice::from_ref(invocation), hooks)
+                .await?;
+        latencies.push(start.elapsed().as_millis() as u64);
+        if let Some(result) = batch.pop() {
+            results.push(result);
+        }
+    }
+    Ok((results, latencies))
+}
+
+/// FR-034: derive a citation fingerprint from a note's body — the first
+/// non-boilerplate line after YAML frontmatter and headings. Boilerplate
+/// echoes (skill headers, frontmatter) never match because they are
+/// excluded from the fingerprint (T161).
+fn citation_fingerprint(content: &str) -> Option<String> {
+    let mut lines = content.lines();
+    let mut in_frontmatter = lines.next().is_some_and(|l| l.trim() == "---");
+    for line in lines {
+        let trimmed = line.trim();
+        if in_frontmatter {
+            if trimmed == "---" {
+                in_frontmatter = false;
+            }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("```") {
+            continue;
+        }
+        let fingerprint = trimmed.to_lowercase();
+        if fingerprint.chars().count() >= 20 {
+            return Some(fingerprint);
+        }
+    }
+    None
 }
 
 /// FR-034 reward sidecar bookkeeping for one turn: `access_count` for every
@@ -190,6 +283,9 @@ fn increment_reward_for_query(paths: &ZenPaths, knowledge: &[RetrievedNote], use
 
 /// FR-040: surface the nightly 3-line wake-up brief in M1 context once per
 /// date. Idempotent within a session because the note path carries the date.
+/// The brief is agent-writable (`~/.zen/logs/`), so it gets the same hygiene
+/// as the other prompt reads: a 256 KiB size cap (mirroring the T093
+/// identity-file cap) and the [`InputSanitizer`] before M1 insertion.
 fn inject_wake_up_brief(paths: &ZenPaths, session: &mut SessionContext) -> bool {
     let date = chrono::Utc::now()
         .date_naive()
@@ -199,9 +295,18 @@ fn inject_wake_up_brief(paths: &ZenPaths, session: &mut SessionContext) -> bool 
     if session.knowledge.iter().any(|n| n.path == rel) {
         return false;
     }
-    let Ok(content) = fs::read_to_string(paths.logs().join(format!("wake-up-{date}.md"))) else {
+    let brief_path = paths.logs().join(format!("wake-up-{date}.md"));
+    let Ok(metadata) = fs::metadata(&brief_path) else {
         return false;
     };
+    if metadata.len() > WAKE_UP_BRIEF_MAX_BYTES {
+        warn!(path = ?brief_path, bytes = metadata.len(), "wake-up brief exceeds size cap, rejected");
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(&brief_path) else {
+        return false;
+    };
+    let content = InputSanitizer::new().strip_dangerous_patterns(&content);
     let content = content.trim();
     if content.is_empty() {
         return false;
@@ -394,6 +499,8 @@ impl AgentOrchestrator {
     /// (no turn-level entropy estimate yet), so blast radius is HIGH only
     /// via `Confidential` session metadata.
     fn turn_review_task(query: &str, sensitivity: Sensitivity) -> zen_core::types::Task {
+        // semantic_entropy is a placeholder (0.0) until T169's calibrated
+        // complexity classifier feeds real values into the P8 routing tiers.
         let mut task = zen_core::types::Task::new(query, 0.0, zen_core::types::TaskType::Text);
         task.metadata
             .insert("sensitivity".to_string(), sensitivity.to_string());
@@ -692,9 +799,15 @@ impl AgentOrchestrator {
                 .with_preferences(profile.llm_preferences.clone());
 
         // FR-034: reward sidecar bookkeeping for this turn (access, plus
-        // corrections when the user is correcting prior output).
+        // corrections when the user is correcting prior output). The sidecar
+        // increments are blocking flock+fsync cycles — run them off the async
+        // body via spawn_blocking (T160).
         if let Ok(paths) = ZenPaths::detect() {
-            increment_reward_for_query(&paths, &context.session.knowledge, user_query);
+            let knowledge = context.session.knowledge.clone();
+            let user_query = user_query.to_string();
+            tokio::task::spawn_blocking(move || {
+                increment_reward_for_query(&paths, &knowledge, &user_query);
+            });
         }
 
         let estimated_tokens = user_query.len() / 4 + 512;
@@ -900,105 +1013,102 @@ impl AgentOrchestrator {
                     }
 
                     let hooks = self.wiring.dispatch_hooks();
-                    let dispatch_start = Instant::now();
-                    match dispatch_tool_invocations_with_hooks(
-                        zen_agent.generic.tools(),
-                        &invocations,
-                        &hooks,
-                    )
-                    .await
-                    {
-                        Ok(mut results) => {
-                            let dispatch_duration = dispatch_start.elapsed().as_millis() as u64;
-                            for result in &mut results {
-                                let screened = Self::screen_tool_output(&result.output);
-                                if screened != result.output {
-                                    warn!(
-                                        tool = %result.invocation.name,
-                                        "tool output contained screened patterns"
-                                    );
-                                    result.output = screened;
-                                }
+                    let (mut results, latencies) =
+                        match dispatch_timed(zen_agent.generic.tools(), &invocations, &hooks).await
+                        {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                warn!(error = %e, "tool dispatch terminated by sandbox hook");
+                                tool_calls.push(ToolCall {
+                                    tool_name: "<dispatch>".to_string(),
+                                    arguments: String::new(),
+                                    result: format!("blocked by sandbox: {e}"),
+                                });
+                                let err_msg = format!("blocked by sandbox: {e}");
+                                let results: Vec<rig_core::message::UserContent> = calls
+                                    .iter()
+                                    .map(|c| {
+                                        use rig_core::message::ToolResultContent;
+                                        rig_core::message::UserContent::tool_result(
+                                            c.tool_call.id.clone(),
+                                            c.tool_call.function.name.clone(),
+                                            vec![ToolResultContent::text(err_msg.clone())],
+                                        )
+                                    })
+                                    .collect();
+                                run.tool_results(results)?;
+                                continue;
                             }
-                            for result in &results {
-                                if let Some(tc) = tool_calls.iter_mut().rev().find(|t| {
-                                    t.tool_name == result.invocation.name && t.result.is_empty()
-                                }) {
-                                    tc.result = result.output.to_string();
-                                }
-
-                                // FR-036: append RLVR ToolCall record to tool_calls.jsonl
-                                let output_str = result.output.to_string();
-                                let is_err = output_str.starts_with("Error")
-                                    || output_str.starts_with("error");
-                                let rlvr_record = zen_vault::distill::types::ToolCall {
-                                    tool: result.invocation.name.clone(),
-                                    success: !is_err,
-                                    latency_ms: dispatch_duration / results.len().max(1) as u64,
-                                    error_category: if is_err {
-                                        Some("ToolError".to_string())
-                                    } else {
-                                        None
-                                    },
-                                    recorded_at: chrono::Utc::now(),
-                                };
-                                let paths = match ZenPaths::detect() {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        debug!(error = %e, "FR-036 ZenPaths detect failed");
-                                        continue;
-                                    }
-                                };
-                                if let Err(e) = zen_vault::distill::append_tool_call(
-                                    &paths.sessions(),
-                                    &session.session_id.to_string(),
-                                    &rlvr_record,
-                                ) {
-                                    debug!(error = %e, "FR-036 tool call log append failed");
-                                }
-                            }
-                            let tool_results: Vec<rig_core::message::UserContent> = results
-                                .iter()
-                                .enumerate()
-                                .map(|(i, r)| {
-                                    use rig_core::message::ToolResultContent;
-                                    let call = calls
-                                        .get(i)
-                                        .map(|c| c.tool_call.id.as_str().to_string())
-                                        .unwrap_or_default();
-                                    rig_core::message::UserContent::tool_result(
-                                        call,
-                                        r.invocation.name.to_string(),
-                                        vec![ToolResultContent::text(
-                                            serde_json::to_string(&r.output).unwrap_or_default(),
-                                        )],
-                                    )
-                                })
-                                .collect();
-                            run.tool_results(tool_results)?;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "tool dispatch terminated by sandbox hook");
-                            tool_calls.push(ToolCall {
-                                tool_name: "<dispatch>".to_string(),
-                                arguments: String::new(),
-                                result: format!("blocked by sandbox: {e}"),
-                            });
-                            let err_msg = format!("blocked by sandbox: {e}");
-                            let results: Vec<rig_core::message::UserContent> = calls
-                                .iter()
-                                .map(|c| {
-                                    use rig_core::message::ToolResultContent;
-                                    rig_core::message::UserContent::tool_result(
-                                        c.tool_call.id.clone(),
-                                        c.tool_call.function.name.clone(),
-                                        vec![ToolResultContent::text(err_msg.clone())],
-                                    )
-                                })
-                                .collect();
-                            run.tool_results(results)?;
+                        };
+                    for result in &mut results {
+                        let screened = Self::screen_tool_output(&result.output);
+                        if screened != result.output {
+                            warn!(
+                                tool = %result.invocation.name,
+                                "tool output contained screened patterns"
+                            );
+                            result.output = screened;
                         }
                     }
+                    // FR-036: ZenPaths::detect() hoisted once per turn (T160),
+                    // not once per tool result.
+                    let paths = match ZenPaths::detect() {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            debug!(error = %e, "FR-036 ZenPaths detect failed");
+                            None
+                        }
+                    };
+                    for (result, latency_ms) in results.iter().zip(&latencies) {
+                        if let Some(tc) = tool_calls
+                            .iter_mut()
+                            .rev()
+                            .find(|t| t.tool_name == result.invocation.name && t.result.is_empty())
+                        {
+                            tc.result = result.output.to_string();
+                        }
+                        if let Some(paths) = &paths {
+                            // FR-036: append RLVR ToolCall record to tool_calls.jsonl
+                            let is_err = tool_output_is_error(&result.output);
+                            let rlvr_record = zen_vault::distill::types::ToolCall {
+                                tool: result.invocation.name.clone(),
+                                success: !is_err,
+                                latency_ms: *latency_ms,
+                                error_category: if is_err {
+                                    Some("ToolError".to_string())
+                                } else {
+                                    None
+                                },
+                                recorded_at: chrono::Utc::now(),
+                            };
+                            if let Err(e) = zen_vault::distill::append_tool_call(
+                                &paths.sessions(),
+                                &session.session_id.to_string(),
+                                &rlvr_record,
+                            ) {
+                                debug!(error = %e, "FR-036 tool call log append failed");
+                            }
+                        }
+                    }
+                    let tool_results: Vec<rig_core::message::UserContent> = results
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            use rig_core::message::ToolResultContent;
+                            let call = calls
+                                .get(i)
+                                .map(|c| c.tool_call.id.as_str().to_string())
+                                .unwrap_or_default();
+                            rig_core::message::UserContent::tool_result(
+                                call,
+                                r.invocation.name.to_string(),
+                                vec![ToolResultContent::text(
+                                    serde_json::to_string(&r.output).unwrap_or_default(),
+                                )],
+                            )
+                        })
+                        .collect();
+                    run.tool_results(tool_results)?;
                 }
                 AgentRunStep::Done(response) => {
                     final_response = response.output;
@@ -1007,23 +1117,33 @@ impl AgentOrchestrator {
             }
         }
 
-        // FR-034: increment downstream_citations when retrieved content appears in response
+        // FR-034: increment downstream_citations when retrieved content appears in
+        // response. Detection uses a body fingerprint (T161) so boilerplate echoes
+        // (skill headers, frontmatter) never count; the blocking sidecar writes
+        // run off the async body via spawn_blocking (T160).
         if let Ok(paths) = ZenPaths::detect() {
             let reward_dir = paths.memory().join(".reward");
             let response_lower = final_response.to_lowercase();
-            for note in &context.session.knowledge {
-                let snippet = note
-                    .content
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
-                    .to_lowercase();
-                if snippet.len() > 20 && response_lower.contains(&snippet) {
-                    let card_id = zen_vault::distill::card_id_from_path(&note.path);
-                    if let Err(e) = zen_vault::distill::increment_citations(&reward_dir, &card_id) {
-                        debug!(error = %e, card_id, "FR-034 reward citation increment failed");
+            let cited: Vec<String> = context
+                .session
+                .knowledge
+                .iter()
+                .filter(|note| {
+                    citation_fingerprint(&note.content)
+                        .is_some_and(|fp| response_lower.contains(&fp))
+                })
+                .map(|note| zen_vault::distill::card_id_from_path(&note.path))
+                .collect();
+            if !cited.is_empty() {
+                tokio::task::spawn_blocking(move || {
+                    for card_id in cited {
+                        if let Err(e) =
+                            zen_vault::distill::increment_citations(&reward_dir, &card_id)
+                        {
+                            debug!(error = %e, card_id, "FR-034 reward citation increment failed");
+                        }
                     }
-                }
+                });
             }
         }
 
@@ -1366,9 +1486,15 @@ impl AgentOrchestrator {
         self.propagate_sensitivity(session.sensitivity_policy);
 
         // FR-034: reward sidecar bookkeeping for this turn (access, plus
-        // corrections when the user is correcting prior output).
+        // corrections when the user is correcting prior output). The sidecar
+        // increments are blocking flock+fsync cycles — run them off the async
+        // body via spawn_blocking (T160).
         if let Ok(paths) = ZenPaths::detect() {
-            increment_reward_for_query(&paths, &session.knowledge, user_query);
+            let knowledge = session.knowledge.clone();
+            let user_query = user_query.to_string();
+            tokio::task::spawn_blocking(move || {
+                increment_reward_for_query(&paths, &knowledge, &user_query);
+            });
         }
 
         let tool_names: BTreeSet<String> = zen_agent
@@ -1552,113 +1678,110 @@ impl AgentOrchestrator {
                         });
                     }
 
-                    let dispatch_started = Instant::now();
                     let hooks = self.wiring.dispatch_hooks();
-                    match dispatch_tool_invocations_with_hooks(
-                        zen_agent.generic.tools(),
-                        &invocations,
-                        &hooks,
-                    )
-                    .await
-                    {
-                        Ok(mut results) => {
-                            let duration_ms = dispatch_started.elapsed().as_millis();
-                            for result in &mut results {
-                                let screened = Self::screen_tool_output(&result.output);
-                                if screened != result.output {
-                                    warn!(
-                                        tool = %result.invocation.name,
-                                        "tool output contained screened patterns"
-                                    );
-                                    result.output = screened;
-                                }
+                    let (mut results, latencies) =
+                        match dispatch_timed(zen_agent.generic.tools(), &invocations, &hooks).await
+                        {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                warn!(error = %e, "tool dispatch terminated by sandbox hook");
+                                tool_calls.push(ToolCall {
+                                    tool_name: "<dispatch>".to_string(),
+                                    arguments: String::new(),
+                                    result: format!("blocked by sandbox: {e}"),
+                                });
+                                callback(&format!("❌ tool dispatch blocked: {e}\n"));
+                                let err_msg = format!("blocked by sandbox: {e}");
+                                let results: Vec<rig_core::message::UserContent> = calls
+                                    .iter()
+                                    .map(|c| {
+                                        use rig_core::message::ToolResultContent;
+                                        rig_core::message::UserContent::tool_result(
+                                            c.tool_call.id.clone(),
+                                            c.tool_call.function.name.clone(),
+                                            vec![ToolResultContent::text(err_msg.clone())],
+                                        )
+                                    })
+                                    .collect();
+                                run.tool_results(results)?;
+                                continue;
                             }
-                            for result in &results {
-                                if let Some(tc) = tool_calls.iter_mut().rev().find(|t| {
-                                    t.tool_name == result.invocation.name && t.result.is_empty()
-                                }) {
-                                    tc.result = result.output.to_string();
-                                }
-                                callback(&Self::tool_done_line(result, duration_ms));
-
-                                // FR-036: append RLVR ToolCall record to tool_calls.jsonl
-                                let output_str = result.output.to_string();
-                                let is_err = output_str.starts_with("Error")
-                                    || output_str.starts_with("error");
-                                let rlvr_record = zen_vault::distill::types::ToolCall {
-                                    tool: result.invocation.name.clone(),
-                                    success: !is_err,
-                                    latency_ms: duration_ms as u64 / results.len().max(1) as u64,
-                                    error_category: if is_err {
-                                        Some("ToolError".to_string())
-                                    } else {
-                                        None
-                                    },
-                                    recorded_at: chrono::Utc::now(),
-                                };
-                                let paths = match ZenPaths::detect() {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        debug!(error = %e, "FR-036 ZenPaths detect failed");
-                                        continue;
-                                    }
-                                };
-                                if let Err(e) = zen_vault::distill::append_tool_call(
-                                    &paths.sessions(),
-                                    &session.session_id.to_string(),
-                                    &rlvr_record,
-                                ) {
-                                    debug!(error = %e, "FR-036 tool call log append failed");
-                                }
-                            }
-                            let assistant_text =
-                                append_native_tool_calls_fenced(final_response.clone(), &[]);
-                            interaction_turns.push(("assistant", assistant_text));
-                            let results_json = Self::results_to_prompt(&results);
-                            interaction_turns.push(("tool", results_json));
-                            let tool_results: Vec<rig_core::message::UserContent> = results
-                                .iter()
-                                .enumerate()
-                                .map(|(i, r)| {
-                                    use rig_core::message::ToolResultContent;
-                                    let call = calls
-                                        .get(i)
-                                        .map(|c| c.tool_call.id.as_str().to_string())
-                                        .unwrap_or_default();
-                                    rig_core::message::UserContent::tool_result(
-                                        call,
-                                        r.invocation.name.to_string(),
-                                        vec![ToolResultContent::text(
-                                            serde_json::to_string(&r.output).unwrap_or_default(),
-                                        )],
-                                    )
-                                })
-                                .collect();
-                            run.tool_results(tool_results)?;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "tool dispatch terminated by sandbox hook");
-                            tool_calls.push(ToolCall {
-                                tool_name: "<dispatch>".to_string(),
-                                arguments: String::new(),
-                                result: format!("blocked by sandbox: {e}"),
-                            });
-                            callback(&format!("❌ tool dispatch blocked: {e}\n"));
-                            let err_msg = format!("blocked by sandbox: {e}");
-                            let results: Vec<rig_core::message::UserContent> = calls
-                                .iter()
-                                .map(|c| {
-                                    use rig_core::message::ToolResultContent;
-                                    rig_core::message::UserContent::tool_result(
-                                        c.tool_call.id.clone(),
-                                        c.tool_call.function.name.clone(),
-                                        vec![ToolResultContent::text(err_msg.clone())],
-                                    )
-                                })
-                                .collect();
-                            run.tool_results(results)?;
+                        };
+                    for result in &mut results {
+                        let screened = Self::screen_tool_output(&result.output);
+                        if screened != result.output {
+                            warn!(
+                                tool = %result.invocation.name,
+                                "tool output contained screened patterns"
+                            );
+                            result.output = screened;
                         }
                     }
+                    // FR-036: ZenPaths::detect() hoisted once per turn (T160),
+                    // not once per tool result.
+                    let paths = match ZenPaths::detect() {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            debug!(error = %e, "FR-036 ZenPaths detect failed");
+                            None
+                        }
+                    };
+                    for (result, latency_ms) in results.iter().zip(&latencies) {
+                        if let Some(tc) = tool_calls
+                            .iter_mut()
+                            .rev()
+                            .find(|t| t.tool_name == result.invocation.name && t.result.is_empty())
+                        {
+                            tc.result = result.output.to_string();
+                        }
+                        callback(&Self::tool_done_line(result, *latency_ms as u128));
+                        if let Some(paths) = &paths {
+                            // FR-036: append RLVR ToolCall record to tool_calls.jsonl
+                            let is_err = tool_output_is_error(&result.output);
+                            let rlvr_record = zen_vault::distill::types::ToolCall {
+                                tool: result.invocation.name.clone(),
+                                success: !is_err,
+                                latency_ms: *latency_ms,
+                                error_category: if is_err {
+                                    Some("ToolError".to_string())
+                                } else {
+                                    None
+                                },
+                                recorded_at: chrono::Utc::now(),
+                            };
+                            if let Err(e) = zen_vault::distill::append_tool_call(
+                                &paths.sessions(),
+                                &session.session_id.to_string(),
+                                &rlvr_record,
+                            ) {
+                                debug!(error = %e, "FR-036 tool call log append failed");
+                            }
+                        }
+                    }
+                    let assistant_text =
+                        append_native_tool_calls_fenced(final_response.clone(), &[]);
+                    interaction_turns.push(("assistant", assistant_text));
+                    let results_json = Self::results_to_prompt(&results);
+                    interaction_turns.push(("tool", results_json));
+                    let tool_results: Vec<rig_core::message::UserContent> = results
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            use rig_core::message::ToolResultContent;
+                            let call = calls
+                                .get(i)
+                                .map(|c| c.tool_call.id.as_str().to_string())
+                                .unwrap_or_default();
+                            rig_core::message::UserContent::tool_result(
+                                call,
+                                r.invocation.name.to_string(),
+                                vec![ToolResultContent::text(
+                                    serde_json::to_string(&r.output).unwrap_or_default(),
+                                )],
+                            )
+                        })
+                        .collect();
+                    run.tool_results(tool_results)?;
                 }
                 AgentRunStep::Done(response) => {
                     final_response = response.output;
@@ -2430,6 +2553,69 @@ mod tests {
     }
 
     #[test]
+    fn correction_markers_require_leading_clause() {
+        // A marker in a later clause is not a correction (T161).
+        assert!(!is_user_correction(
+            "Please fix the previous answer. It was wrong."
+        ));
+        assert!(!is_user_correction("请总结一下。之前的说法不对。"));
+        // A marker in the leading clause still counts.
+        assert!(is_user_correction("不对。请重新计算。"));
+    }
+
+    #[test]
+    fn correction_markers_ignore_mid_text_mentions() {
+        // Merely mentioning "wrong"/"不对" mid-text must not count (T161).
+        assert!(!is_user_correction(
+            "explain why the previous answer was wrong"
+        ));
+        assert!(!is_user_correction("请解释一下为什么这个说法不对"));
+    }
+
+    #[test]
+    fn tool_output_is_error_detects_structured_errors() {
+        // fs.*/delegate.* return Ok(json!({ "error": ... })) — the old
+        // starts_with("Error") check on the serialized JSON missed these.
+        assert!(tool_output_is_error(
+            &serde_json::json!({"error": "file not found"})
+        ));
+        assert!(tool_output_is_error(
+            &serde_json::json!({"error": {"code": 42}})
+        ));
+        assert!(tool_output_is_error(
+            &serde_json::json!({"error": ["boom"]})
+        ));
+        assert!(!tool_output_is_error(&serde_json::json!({"error": ""})));
+        assert!(!tool_output_is_error(&serde_json::json!({"error": null})));
+        assert!(!tool_output_is_error(&serde_json::json!({"ok": true})));
+        // Plain-text errors still classify as failures.
+        assert!(tool_output_is_error(&serde_json::json!(
+            "Error: no such file"
+        )));
+        assert!(!tool_output_is_error(&serde_json::json!("all good")));
+    }
+
+    #[test]
+    fn citation_fingerprint_skips_boilerplate() {
+        // Frontmatter + heading echo must not count as a citation (T161).
+        let note = "---\ntype: concept\n---\n# Rust Ownership\n\nRust's ownership system ensures memory safety at compile time.\n";
+        let fp = citation_fingerprint(note).expect("body fingerprint");
+        assert_eq!(
+            fp,
+            "rust's ownership system ensures memory safety at compile time."
+        );
+        assert!(!fp.contains("type: concept"));
+        assert!(!fp.contains("# rust ownership"));
+    }
+
+    #[test]
+    fn citation_fingerprint_rejects_boilerplate_only() {
+        // A note with only frontmatter/headings has no citable body.
+        let note = "---\ntype: concept\n---\n# Rust Ownership\n";
+        assert!(citation_fingerprint(note).is_none());
+    }
+
+    #[test]
     fn reward_bookkeeping_counts_corrections_only_on_correction_turns() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let paths = ZenPaths::for_testing(dir.path().to_path_buf());
@@ -2503,5 +2689,59 @@ mod tests {
         let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
         assert!(!inject_wake_up_brief(&paths, &mut session));
         assert!(session.knowledge.is_empty());
+    }
+
+    #[test]
+    fn wake_up_brief_oversized_is_rejected_not_injected_raw() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let date = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let brief_path = paths.logs().join(format!("wake-up-{date}.md"));
+        std::fs::create_dir_all(paths.logs()).expect("logs dir");
+        std::fs::write(
+            &brief_path,
+            "x".repeat(WAKE_UP_BRIEF_MAX_BYTES as usize + 1),
+        )
+        .expect("write oversized brief");
+
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        assert!(
+            !inject_wake_up_brief(&paths, &mut session),
+            "brief over the 256 KiB cap must not enter M1"
+        );
+        assert!(session.knowledge.is_empty());
+    }
+
+    #[test]
+    fn wake_up_brief_booby_trapped_is_sanitized_not_injected_raw() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let date = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        zen_memory::write_wake_up_brief(
+            &paths,
+            &date,
+            &[
+                "Focus: <script>alert(1)</script>".to_string(),
+                "Watch: eval(alert)".to_string(),
+                "Next: sudo passwd root".to_string(),
+            ],
+        )
+        .expect("brief written");
+
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        assert!(inject_wake_up_brief(&paths, &mut session));
+        let content = &session.knowledge[0].content;
+        assert!(!content.contains("<script>"), "html injection stripped");
+        assert!(!content.contains("eval("), "code execution stripped");
+        assert!(
+            !content.contains("sudo passwd"),
+            "privilege escalation stripped"
+        );
     }
 }

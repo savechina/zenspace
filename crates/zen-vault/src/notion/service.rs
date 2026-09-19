@@ -15,22 +15,6 @@ use crate::tindy::compute_embeddings_for_text;
 use super::notion::{Notion, NotionKind};
 use super::relationship::{RelationKind, Relationship};
 
-/// Normalize an notion name for canonical matching.
-/// Rules: lowercase, trim, strip common suffixes (.js, .rs, .py, -lang, " language").
-use unicode_normalization::UnicodeNormalization;
-
-fn normalize_notion_name(name: &str) -> String {
-    let nfc: String = name.nfc().collect();
-    let mut s = nfc.trim().to_lowercase();
-    for suffix in [".js", ".rs", ".py", ".ts", "-lang", " lang", " language"] {
-        if s.ends_with(suffix) {
-            s = s[..s.len() - suffix.len()].trim_end().to_string();
-            break;
-        }
-    }
-    s
-}
-
 /// Convert a `RelationRow` string to a `RelationKind` enum.
 fn relation_type_from_str(s: &str) -> RelationKind {
     match s {
@@ -189,7 +173,7 @@ impl NotionService {
     pub async fn upsert_entity(&self, client: &SqliteClient, notion: &Notion) -> Result<()> {
         let repo = NotionsRepo::new(client);
 
-        let canonical_name = normalize_notion_name(&notion.name);
+        let canonical_name = zen_repo::normalize_alias(&notion.name);
         let type_str = notion.kind.to_string();
         let created_at = notion.created_at.to_rfc3339();
         let last_updated = chrono::Utc::now().to_rfc3339();
@@ -511,7 +495,9 @@ impl NotionService {
         let goal_entities = self.load_all_entities(client).await?;
         let goal_id = goal_entities
             .iter()
-            .find(|e| e.name == normalize_notion_name(serves_goal) && e.kind == NotionKind::Goal)
+            .find(|e| {
+                e.name == zen_repo::normalize_alias(serves_goal) && e.kind == NotionKind::Goal
+            })
             .map(|e| e.id.clone());
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -530,7 +516,7 @@ impl NotionService {
         // Create ServesGoal relationship from this path to the goal
         if let Some(goal) = goal_entities
             .iter()
-            .find(|e| e.name == normalize_notion_name(serves_goal))
+            .find(|e| e.name == zen_repo::normalize_alias(serves_goal))
         {
             let rel =
                 Relationship::new(id, goal.id.clone(), RelationKind::ServesGoal, "path-model");
@@ -629,26 +615,38 @@ mod tests {
     use crate::notion::notion::parse_kind;
     use tempfile::tempdir;
 
+    /// FR-022 / T145: entity names must canonicalize exactly as the shared normalizer does (SC-008).
     #[test]
-    fn test_normalize_notion_name() {
-        assert_eq!(normalize_notion_name("Rust"), "rust");
-        assert_eq!(normalize_notion_name("Rust Lang"), "rust");
-        assert_eq!(normalize_notion_name("JavaScript.js"), "javascript");
-        assert_eq!(normalize_notion_name("  Python  "), "python");
-        assert_eq!(normalize_notion_name("TypeScript.ts"), "typescript");
-        assert_eq!(normalize_notion_name("Go-lang"), "go");
-        assert_eq!(normalize_notion_name("C Language"), "c");
-        assert_eq!(normalize_notion_name("rust language"), "rust");
+    fn entity_path_uses_canonical_normalizer() {
+        for (input, expected) in [
+            ("Rust", "rust"),
+            ("Rust Lang", "rust"),
+            ("JavaScript.js", "javascript"),
+            ("  Python  ", "python"),
+            ("TypeScript.ts", "typescript"),
+            ("Go-lang", "go"),
+            ("C Language", "c"),
+            ("rust language", "rust"),
+            ("main.go", "main"),
+            ("App.java", "app"),
+            ("script.rb", "script"),
+        ] {
+            assert_eq!(
+                zen_repo::normalize_alias(input),
+                expected,
+                "canonical normalizer disagreed for {input:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_normalize_notion_name_nfc() {
+    fn canonical_normalizer_is_nfc_correct() {
         // Combining accent (U+0301) vs precomposed (U+00E9) → same NFC output
         let combining = "cafe\u{0301}";
         let precomposed = "caf\u{00E9}";
         assert_eq!(
-            normalize_notion_name(combining),
-            normalize_notion_name(precomposed)
+            zen_repo::normalize_alias(combining),
+            zen_repo::normalize_alias(precomposed)
         );
     }
 
