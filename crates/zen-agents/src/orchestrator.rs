@@ -689,7 +689,14 @@ impl AgentOrchestrator {
                 });
                 let judge =
                     crate::review::DeAnchoredJudge::new(frontier, local, escalate_threshold);
-                judge.judge(&task, &deliverable).await
+                let judged = judge.judge(&task, &deliverable).await;
+                // T170/T173: record the review decision so the escalation
+                // threshold has a calibration sample and the frontier-call
+                // baseline is derivable from real traffic.
+                if let Ok(paths) = ZenPaths::detect() {
+                    crate::review::record_decision(&paths, &judged);
+                }
+                judged.verdict
             })
         })
     }

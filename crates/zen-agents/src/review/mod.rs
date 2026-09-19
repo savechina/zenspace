@@ -17,4 +17,7 @@ pub use pipeline::{
 
 // T170: de-anchored judge + calibrated escalation cascade
 pub mod deanchored;
-pub use deanchored::{DeAnchoredJudge, JudgeModel, LocalJudgement, RouterJudgeModel};
+pub use deanchored::{
+    DeAnchoredJudge, JudgeModel, JudgeTrace, JudgedVerdict, LocalJudgement, RouterJudgeModel,
+    record_decision,
+};

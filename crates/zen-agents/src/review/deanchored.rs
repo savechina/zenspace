@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
+use zen_core::paths::ZenPaths;
 use zen_core::types::{Sensitivity, Task};
 use zen_provider::{DefaultRouter, TaskRequirements};
 
@@ -103,6 +104,31 @@ pub struct LocalJudgement {
     pub confidence: f32,
 }
 
+/// What the cascade decided, and which rung produced it.
+///
+/// `local_*` record the local phase's own verdict whenever it ran, *including*
+/// when the case escalated. That is deliberate: calibrating the escalation
+/// threshold needs the local judge's confidence paired with whether its
+/// verdict was right, which is exactly the sample the escalated cases carry.
+#[derive(Debug, Clone)]
+pub struct JudgeTrace {
+    /// True when the frontier judge was consulted.
+    pub escalated: bool,
+    /// Rung that produced the final verdict: `"L1"` (local) or `"L2"` (frontier).
+    pub final_rung: &'static str,
+    /// The local phase's confidence, when the local phase ran.
+    pub local_confidence: Option<f32>,
+    /// The local phase's own verdict, when the local phase ran.
+    pub local_approved: Option<bool>,
+}
+
+/// A verdict plus the trace of how it was reached.
+#[derive(Debug, Clone)]
+pub struct JudgedVerdict {
+    pub verdict: SemanticVerdict,
+    pub trace: JudgeTrace,
+}
+
 /// The de-anchored judge cascade.
 pub struct DeAnchoredJudge {
     frontier: Arc<dyn JudgeModel>,
@@ -152,29 +178,61 @@ impl DeAnchoredJudge {
     /// With no calibrated τ this is exactly the pre-T170 frontier call. With
     /// one, a local verdict at or above τ is final and the frontier is never
     /// consulted.
-    pub async fn judge(&self, task: &Task, deliverable: &str) -> SemanticVerdict {
+    pub async fn judge(&self, task: &Task, deliverable: &str) -> JudgedVerdict {
         let Some(threshold) = self.escalate_below else {
-            return self.frontier_verdict(task, deliverable).await;
+            return JudgedVerdict {
+                verdict: self.frontier_verdict(task, deliverable).await,
+                trace: JudgeTrace {
+                    escalated: true,
+                    final_rung: "L2",
+                    local_confidence: None,
+                    local_approved: None,
+                },
+            };
         };
         match self.local_judgement(task, deliverable).await {
-            Ok(local) if local.confidence >= threshold => SemanticVerdict {
-                approved: local.approved,
-                note: format!(
-                    "de-anchored local judge (confidence {:.2} >= {threshold:.2}): {}",
-                    local.confidence, local.note
-                ),
-                confidence: Some(local.confidence),
+            Ok(local) if local.confidence >= threshold => JudgedVerdict {
+                verdict: SemanticVerdict {
+                    approved: local.approved,
+                    note: format!(
+                        "de-anchored local judge (confidence {:.2} >= {threshold:.2}): {}",
+                        local.confidence, local.note
+                    ),
+                    confidence: Some(local.confidence),
+                },
+                trace: JudgeTrace {
+                    escalated: false,
+                    final_rung: "L1",
+                    local_confidence: Some(local.confidence),
+                    local_approved: Some(local.approved),
+                },
             },
             Ok(local) => {
                 debug!(
                     confidence = local.confidence,
                     threshold, "local judge below the calibrated threshold; escalating"
                 );
-                self.frontier_verdict(task, deliverable).await
+                JudgedVerdict {
+                    verdict: self.frontier_verdict(task, deliverable).await,
+                    trace: JudgeTrace {
+                        escalated: true,
+                        final_rung: "L2",
+                        local_confidence: Some(local.confidence),
+                        local_approved: Some(local.approved),
+                    },
+                }
             }
             Err(error) => {
                 warn!(%error, "local judge unavailable; escalating to the frontier judge");
-                self.frontier_verdict(task, deliverable).await
+                JudgedVerdict {
+                    verdict: self.frontier_verdict(task, deliverable).await,
+                    trace: JudgeTrace {
+                        escalated: true,
+                        final_rung: "L2",
+                        local_confidence: None,
+                        local_approved: None,
+                    },
+                }
             }
         }
     }
@@ -193,6 +251,40 @@ impl DeAnchoredJudge {
             }
         }
     }
+}
+
+/// Record one `loop.decision` line for a review verdict.
+///
+/// Two consumers depend on this line and neither could exist without it:
+/// the `review` calibration sample (kind `"review"`, rung `"L1"`, carrying the
+/// local judge's confidence so `review_escalate` can be calibrated), and the
+/// V13-A.3 frontier-call baseline, which reads the `escalated` field. The
+/// `decision_audit` extractor reads `decision_kind`/`rung`/`confidence`/
+/// `choice`, so those names are a cross-crate contract.
+pub fn record_decision(paths: &ZenPaths, judged: &JudgedVerdict) {
+    let trace = &judged.trace;
+    let entry = serde_json::json!({
+        "kind": "loop.decision",
+        "decision": "review",
+        "decision_kind": "review",
+        // The local rung is the calibratable one: its confidence is what τ
+        // gates on. Emitting the *final* rung would leave escalated cases
+        // invisible to calibration, and those are the informative ones.
+        "rung": if trace.local_confidence.is_some() { "L1" } else { "L2" },
+        "final_rung": trace.final_rung,
+        "escalated": trace.escalated,
+        "confidence": trace.local_confidence.map(crate::decision::audit_score),
+        "choice": match trace.local_approved {
+            Some(true) => "approved",
+            Some(false) => "vetoed",
+            None => match judged.verdict.approved {
+                true => "approved",
+                false => "vetoed",
+            },
+        },
+        "approved": judged.verdict.approved,
+    });
+    crate::decision::append_decision_audit(paths, &entry);
 }
 
 /// The judge's own answer to the task. **Contains no part of the draft** —
@@ -386,9 +478,12 @@ mod tests {
 
         let verdict = judge.judge(&task(), "a draft").await;
 
-        assert!(!verdict.approved, "the local verdict decides");
-        assert_eq!(verdict.confidence, Some(0.95));
-        assert!(verdict.note.contains("unsupported claim"));
+        assert!(!verdict.verdict.approved, "the local verdict decides");
+        assert_eq!(verdict.verdict.confidence, Some(0.95));
+        assert!(verdict.verdict.note.contains("unsupported claim"));
+        assert!(!verdict.trace.escalated);
+        assert_eq!(verdict.trace.final_rung, "L1");
+        assert_eq!(verdict.trace.local_confidence, Some(0.95));
         assert!(
             frontier.prompts().is_empty(),
             "a confident local verdict must not pay for the frontier call"
@@ -403,8 +498,16 @@ mod tests {
 
         let verdict = judge.judge(&task(), "a draft").await;
 
-        assert!(!verdict.approved, "the frontier verdict decides");
-        assert_eq!(verdict.confidence, None);
+        assert!(!verdict.verdict.approved, "the frontier verdict decides");
+        assert_eq!(verdict.verdict.confidence, None);
+        assert!(verdict.trace.escalated);
+        assert_eq!(verdict.trace.final_rung, "L2");
+        assert_eq!(
+            verdict.trace.local_confidence,
+            Some(0.4),
+            "the local verdict is recorded even when it escalated — these are the \
+             samples the escalation threshold is calibrated from"
+        );
         assert_eq!(frontier.prompts().len(), 1);
     }
 
@@ -417,8 +520,13 @@ mod tests {
 
         let verdict = judge.judge(&task(), "a draft").await;
 
-        assert!(verdict.approved);
-        assert_eq!(verdict.confidence, None);
+        assert!(verdict.verdict.approved);
+        assert_eq!(verdict.verdict.confidence, None);
+        assert!(verdict.trace.escalated);
+        assert_eq!(
+            verdict.trace.local_confidence, None,
+            "no τ ⇒ the local phase did not run at all"
+        );
         assert_eq!(frontier.prompts().len(), 1, "frontier still runs once");
         assert!(
             local.prompts().is_empty(),
@@ -434,9 +542,10 @@ mod tests {
         let verdict = judge.judge(&task(), "a draft").await;
 
         assert!(
-            verdict.approved,
+            verdict.verdict.approved,
             "a broken local judge must not block delivery"
         );
+        assert!(verdict.trace.escalated);
         assert_eq!(frontier.prompts().len(), 1);
     }
 
@@ -448,12 +557,48 @@ mod tests {
 
         let verdict = judge.judge(&task(), "a draft").await;
 
-        assert!(verdict.approved);
+        assert!(verdict.verdict.approved);
+        assert!(verdict.trace.escalated);
         assert_eq!(
             frontier.prompts().len(),
             1,
             "an unreadable score must escalate, never pass as confident"
         );
+    }
+
+    fn test_paths() -> ZenPaths {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        ZenPaths::for_testing(root)
+    }
+
+    #[tokio::test]
+    async fn review_decision_line_carries_the_calibration_sample() {
+        // Two consumers depend on this line: `review_escalate` calibration
+        // (kind=review, rung=L1, confidence) and the frontier-call baseline
+        // (escalated). If these field names drift, both silently go dark.
+        let paths = test_paths();
+        let local = ScriptedModel::new(&["mine", "APPROVED\nCONFIDENCE: 0.6"]);
+        let frontier = ScriptedModel::new(&["APPROVED"]);
+        let judge = DeAnchoredJudge::new(frontier, Some(local), Some(0.9));
+
+        let judged = judge.judge(&task(), "a draft").await;
+        record_decision(&paths, &judged);
+
+        let audit = std::fs::read_to_string(paths.logs().join("audit.jsonl")).expect("audit file");
+        let entry: serde_json::Value =
+            serde_json::from_str(audit.lines().next().expect("one line")).expect("json");
+
+        assert_eq!(entry["kind"], "loop.decision");
+        assert_eq!(entry["decision_kind"], "review");
+        assert_eq!(
+            entry["rung"], "L1",
+            "the local rung is emitted so escalated cases stay calibratable"
+        );
+        assert_eq!(entry["escalated"], true, "0.6 < 0.9, so it escalated");
+        assert_eq!(entry["confidence"], 0.6);
+        assert_eq!(entry["choice"], "approved");
     }
 
     #[test]

@@ -722,11 +722,15 @@ pub fn record_ladder_decision(paths: &ZenPaths, session_id: &str, decision: &Lad
     let entry = serde_json::json!({
         "kind": "loop.decision",
         "decision": "intent",
+        // `decision_kind` is what decision_audit::record_from_line reads; the
+        // ladder's L1 sample is selectable as (kind = "intent", rung = "L1")
+        // only because this field is present.
+        "decision_kind": "intent",
         "session_id": session_id,
         "rung": trace.rung,
         "gate": trace.gate,
         "gate_fired": trace.gate.is_some_and(|gate| trace.confidence >= gate),
-        "confidence": trace.confidence,
+        "confidence": audit_score(trace.confidence),
         "latency_ms": trace.latency_ms,
         "choice": decision.intent.category.as_str(),
         "agent": decision.intent.agent,
@@ -942,7 +946,7 @@ pub async fn run_intent_shadow(
             "production_choice": production.category.as_str(),
             "l1_rung": outcome.rung.as_str(),
             "l1_choice": outcome.choice.as_str(),
-            "l1_confidence": outcome.confidence,
+            "l1_confidence": audit_score(outcome.confidence),
             "agree": outcome.choice == production.category,
             "l1_latency_ms": latency_ms,
         }),
@@ -973,9 +977,19 @@ fn default_l1_router() -> &'static EmbeddingIntentRouter<Arc<dyn TextEmbedder>> 
     ROUTER.get_or_init(|| EmbeddingIntentRouter::new(Arc::new(VaultTextEmbedder)))
 }
 
+/// Round a score for audit emission.
+///
+/// A bare f32 widened to f64 serializes as 0.6000000238418579, which makes the
+/// human-audited log unreadable and disagrees with the rounded value the
+/// calibration artefact stores. Four decimals is more than a confidence gate
+/// can distinguish.
+pub(crate) fn audit_score(value: f32) -> f64 {
+    (f64::from(value) * 10_000.0).round() / 10_000.0
+}
+
 /// Append one `loop.decision` line to `<logs>/audit.jsonl` — same file and
 /// style as the `loop.turn.review` line (additive; existing fields untouched).
-fn append_decision_audit(paths: &ZenPaths, entry: &serde_json::Value) {
+pub(crate) fn append_decision_audit(paths: &ZenPaths, entry: &serde_json::Value) {
     let log_path = paths.logs().join("audit.jsonl");
     if let Some(parent) = log_path.parent()
         && std::fs::create_dir_all(parent).is_ok()
