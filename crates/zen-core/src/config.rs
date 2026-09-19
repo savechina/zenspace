@@ -694,6 +694,13 @@ pub struct ReviewConfig {
     /// LLM semantic-review stage for HIGH blast-radius tasks
     /// (absent → true).
     pub llm_review_high_blast: Option<bool>,
+    /// T170: calibrated escalation threshold for the de-anchored judge
+    /// cascade. Absent (the default, and the only state until labels exist)
+    /// means the local judge phase is skipped entirely and the frontier
+    /// reviewer runs as it did before T170. Setting it activates the cascade:
+    /// a local verdict at or above this confidence is final and the frontier
+    /// call is skipped. Valid range 0.0..=1.0; out-of-range is ignored.
+    pub escalate_threshold: Option<f32>,
 }
 
 impl ReviewConfig {
@@ -717,6 +724,25 @@ impl ReviewConfig {
     /// tasks (default true).
     pub fn llm_review_high_blast_or_default(&self) -> bool {
         self.llm_review_high_blast.unwrap_or(true)
+    }
+
+    /// The configured escalation threshold, or `None` when unset/out-of-range.
+    ///
+    /// `None` is load-bearing: it means "no calibrated operating point", so
+    /// the local judge phase does not run and the pre-T170 frontier-only path
+    /// is preserved exactly.
+    pub fn escalate_threshold(&self) -> Option<f32> {
+        match self.escalate_threshold {
+            Some(value) if (0.0..=1.0).contains(&value) => Some(value),
+            Some(value) => {
+                tracing::warn!(
+                    value,
+                    "[agentic.review] escalate_threshold outside 0.0..=1.0; ignoring (local judge phase stays off)"
+                );
+                None
+            }
+            None => None,
+        }
     }
 }
 
@@ -1858,6 +1884,7 @@ fn merge_review(base: ReviewConfig, ov: ReviewConfig) -> ReviewConfig {
         max_momus_retries: ov.max_momus_retries.or(base.max_momus_retries),
         max_hermes_revisions: ov.max_hermes_revisions.or(base.max_hermes_revisions),
         llm_review_high_blast: ov.llm_review_high_blast.or(base.llm_review_high_blast),
+        escalate_threshold: ov.escalate_threshold.or(base.escalate_threshold),
     }
 }
 
@@ -2181,6 +2208,15 @@ fn apply_review_env(cfg: &mut ReviewConfig) {
     }
     if let Some(v) = env_bool("ZEN_REVIEW_LLM_HIGH_BLAST") {
         cfg.llm_review_high_blast = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_REVIEW_ESCALATE_THRESHOLD") {
+        match v.trim().parse::<f32>() {
+            Ok(parsed) => cfg.escalate_threshold = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_REVIEW_ESCALATE_THRESHOLD is not a number; ignoring (local judge phase stays off)"
+            ),
+        }
     }
 }
 

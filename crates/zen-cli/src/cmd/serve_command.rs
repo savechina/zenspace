@@ -140,8 +140,10 @@ pub(crate) fn scheduler_enabled() -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(target_os = "macos")]
 const LAUNCHD_LABEL: &str = "dev.zen.serve";
 
+#[cfg(target_os = "macos")]
 pub(crate) fn render_plist(zen_bin: &Path, logs_dir: &Path) -> String {
     let out_log = logs_dir.join("serve.out.log");
     let err_log = logs_dir.join("serve.err.log");
@@ -190,6 +192,7 @@ pub(crate) fn render_plist(zen_bin: &Path, logs_dir: &Path) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn plist_path() -> Result<PathBuf, ZenError> {
     let home =
         std::env::var("HOME").map_err(|e| ZenError::Service(format!("HOME not set: {e}")))?;
@@ -199,6 +202,7 @@ fn plist_path() -> Result<PathBuf, ZenError> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
+#[cfg(target_os = "macos")]
 fn gui_domain() -> Result<String, ZenError> {
     let out = std::process::Command::new("id")
         .arg("-u")
@@ -213,99 +217,93 @@ fn gui_domain() -> Result<String, ZenError> {
     Ok(format!("gui/{uid}"))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn install_launchd() -> Result<(), ZenError> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Err(ZenError::Service(
-            "launchd persistence is macOS-only".to_string(),
-        ));
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let zen_bin = std::env::current_exe()
-            .map_err(|e| ZenError::Service(format!("cannot find zen binary: {e}")))?;
-        let paths = ZenPaths::detect()?;
-        let logs_dir = paths.logs();
-        std::fs::create_dir_all(&logs_dir)
-            .map_err(|e| ZenError::Service(format!("create logs dir: {e}")))?;
-
-        let plist = render_plist(&zen_bin, &logs_dir);
-        let dest = plist_path()?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ZenError::Service(format!("create LaunchAgents dir: {e}")))?;
-        }
-        std::fs::write(&dest, &plist)
-            .map_err(|e| ZenError::Service(format!("write plist: {e}")))?;
-
-        let domain = gui_domain()?;
-
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("{}/{}", domain, LAUNCHD_LABEL)])
-            .output();
-
-        let output = std::process::Command::new("launchctl")
-            .args(["bootstrap", &domain, dest.to_str().unwrap_or("")])
-            .output()
-            .map_err(|e| ZenError::Service(format!("launchctl bootstrap: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("Load failed") || stderr.contains("already loaded") {
-                println!("{} LaunchAgent reloaded", "✅".green());
-            } else {
-                return Err(ZenError::Service(format!(
-                    "launchctl bootstrap failed: {}",
-                    stderr.trim()
-                )));
-            }
-        } else {
-            println!("{} LaunchAgent installed", "✅".green());
-        }
-        println!("  Label:  {}", LAUNCHD_LABEL);
-        println!("  Plist:  {}", dest.display());
-        println!("  Binary: {}", zen_bin.display());
-        Ok(())
-    }
+    Err(ZenError::Service(
+        "launchd persistence is macOS-only".to_string(),
+    ))
 }
 
-fn uninstall_launchd() -> Result<(), ZenError> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Err(ZenError::Service(
-            "launchd persistence is macOS-only".to_string(),
-        ));
+#[cfg(target_os = "macos")]
+fn install_launchd() -> Result<(), ZenError> {
+    let zen_bin = std::env::current_exe()
+        .map_err(|e| ZenError::Service(format!("cannot find zen binary: {e}")))?;
+    let paths = ZenPaths::detect()?;
+    let logs_dir = paths.logs();
+    std::fs::create_dir_all(&logs_dir)
+        .map_err(|e| ZenError::Service(format!("create logs dir: {e}")))?;
+
+    let plist = render_plist(&zen_bin, &logs_dir);
+    let dest = plist_path()?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ZenError::Service(format!("create LaunchAgents dir: {e}")))?;
     }
+    std::fs::write(&dest, &plist).map_err(|e| ZenError::Service(format!("write plist: {e}")))?;
 
-    #[cfg(target_os = "macos")]
-    {
-        let domain = gui_domain()?;
+    let domain = gui_domain()?;
 
-        let output = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("{}/{}", domain, LAUNCHD_LABEL)])
-            .output()
-            .map_err(|e| ZenError::Service(format!("launchctl bootout: {e}")))?;
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{}/{}", domain, LAUNCHD_LABEL)])
+        .output();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("Could not find specified service") {
-                println!("{} LaunchAgent not loaded (no-op)", "ℹ️".blue());
-            } else {
-                eprintln!("{} bootout warning: {}", "⚠️".yellow(), stderr.trim());
-            }
+    let output = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, dest.to_str().unwrap_or("")])
+        .output()
+        .map_err(|e| ZenError::Service(format!("launchctl bootstrap: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Load failed") || stderr.contains("already loaded") {
+            println!("{} LaunchAgent reloaded", "✅".green());
         } else {
-            println!("{} LaunchAgent unloaded", "✅".green());
+            return Err(ZenError::Service(format!(
+                "launchctl bootstrap failed: {}",
+                stderr.trim()
+            )));
         }
-
-        let dest = plist_path()?;
-        if dest.exists() {
-            std::fs::remove_file(&dest)
-                .map_err(|e| ZenError::Service(format!("remove plist: {e}")))?;
-            println!("  Removed: {}", dest.display());
-        }
-        Ok(())
+    } else {
+        println!("{} LaunchAgent installed", "✅".green());
     }
+    println!("  Label:  {}", LAUNCHD_LABEL);
+    println!("  Plist:  {}", dest.display());
+    println!("  Binary: {}", zen_bin.display());
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn uninstall_launchd() -> Result<(), ZenError> {
+    Err(ZenError::Service(
+        "launchd persistence is macOS-only".to_string(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launchd() -> Result<(), ZenError> {
+    let domain = gui_domain()?;
+
+    let output = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{}/{}", domain, LAUNCHD_LABEL)])
+        .output()
+        .map_err(|e| ZenError::Service(format!("launchctl bootout: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Could not find specified service") {
+            println!("{} LaunchAgent not loaded (no-op)", "ℹ️".blue());
+        } else {
+            eprintln!("{} bootout warning: {}", "⚠️".yellow(), stderr.trim());
+        }
+    } else {
+        println!("{} LaunchAgent unloaded", "✅".green());
+    }
+
+    let dest = plist_path()?;
+    if dest.exists() {
+        std::fs::remove_file(&dest).map_err(|e| ZenError::Service(format!("remove plist: {e}")))?;
+        println!("  Removed: {}", dest.display());
+    }
+    Ok(())
 }
 
 pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> {
@@ -948,6 +946,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn render_plist_contains_required_keys() {
         let plist = render_plist(
             Path::new("/usr/local/bin/zen"),
@@ -965,6 +964,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn render_plist_has_environment_variables() {
         let plist = render_plist(Path::new("/opt/homebrew/bin/zen"), Path::new("/tmp/logs"));
         assert!(plist.contains("HOME"));
@@ -973,6 +973,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn gui_domain_returns_valid_format() {
         let result = gui_domain();
         assert!(result.is_ok(), "gui_domain failed: {:?}", result.err());

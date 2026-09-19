@@ -14,3 +14,7 @@ pub mod pipeline;
 pub use pipeline::{
     BlastRadius, PipelineResult, QualityPipeline, SemanticReviewer, SemanticVerdict,
 };
+
+// T170: de-anchored judge + calibrated escalation cascade
+pub mod deanchored;
+pub use deanchored::{DeAnchoredJudge, JudgeModel, LocalJudgement, RouterJudgeModel};

@@ -615,67 +615,45 @@ impl AgentOrchestrator {
         }
     }
 
-    /// 006 US2 (D5): semantic reviewer for HIGH blast-radius turns — one
-    /// non-streaming LLM round over the draft. Fails open (heuristics
-    /// already passed) when routing or the model call errors.
+    /// 006 US2 (D5) / T170: semantic reviewer for HIGH blast-radius turns.
+    ///
+    /// The frontier judge is the pre-T170 single-call reviewer, preserved
+    /// byte-for-byte. A de-anchored local judge sits in front of it and
+    /// short-circuits it only when a calibrated escalation threshold exists
+    /// and the local verdict clears it — absent that threshold this is exactly
+    /// the old one-call behaviour. Fails open at every hop (the heuristic
+    /// stages already passed) when routing or a model call errors.
     fn review_pipeline(router: &DefaultRouter) -> QualityPipeline {
         let review_router = router.clone();
+        // Resolved once at construction: the calibrated operating point is
+        // read from config/the T173 artefact, which a restart picks up.
+        let escalate_threshold = crate::decision::resolve_review_escalate_threshold();
         QualityPipeline::new().with_semantic_reviewer(move |task, _plan, deliverable| {
             let router = review_router.clone();
-            let prompt = format!(
-                "You are a delivery reviewer. Decide whether the draft answer is complete, correct, and safe to deliver.\nTask: {}\nDraft answer (truncated):\n{}\n\nRespond with exactly one line starting with \"APPROVED\" or \"REJECTED: <reason>\".",
-                task.user_input,
-                deliverable.chars().take(4000).collect::<String>()
-            );
             let sensitivity =
                 zen_core::review::ReviewContext::from_task_with_metadata(task, 0).sensitivity;
+            let task = task.clone();
+            let deliverable = deliverable.to_string();
             Box::pin(async move {
-                let requirements = zen_provider::TaskRequirements {
-                    max_tokens: Some(512),
+                let frontier = Arc::new(crate::review::RouterJudgeModel::new(
+                    &router,
                     sensitivity,
-                    preferred_model: None,
-                    budget_limit: None,
-                };
-                use zen_provider::LlmRouter as _;
-                // spawn_blocking guard (same hazard as intent::llm_classify):
-                // route()/call() are sync and OllamaProvider constructs a
-                // nested tokio Runtime inside them — Runtime::new panics when
-                // invoked on an async worker thread. Run the call on a
-                // blocking thread so the Confidential+local path fails open
-                // (Err arm below) instead of panicking the turn.
-                let reply = tokio::task::spawn_blocking(move || {
-                    router
-                        .route(&requirements)
-                        .and_then(|provider| router.call(provider, &prompt))
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    Err(zen_provider::LlmError::ProviderUnavailable {
-                        provider: "semantic-reviewer".to_string(),
-                        reason: format!("review task join failed: {e}"),
-                    })
+                    512,
+                ));
+                // The local hop is local-only: Sensitivity::Private is the
+                // router's local-enforcement path, so this rung cannot reach a
+                // cloud provider.
+                let local_available = zen_provider::is_local_llm_available(&router);
+                let local = local_available.then(|| {
+                    Arc::new(crate::review::RouterJudgeModel::new(
+                        &router,
+                        zen_core::types::Sensitivity::Private,
+                        512,
+                    )) as Arc<dyn crate::review::JudgeModel>
                 });
-                match reply {
-                    Ok(reply) => {
-                        let trimmed = reply.trim();
-                        if trimmed.to_uppercase().starts_with("APPROVED") {
-                            crate::review::SemanticVerdict::approve(trimmed.to_string())
-                        } else {
-                            let note = trimmed
-                                .strip_prefix("REJECTED:")
-                                .unwrap_or(trimmed)
-                                .trim()
-                                .to_string();
-                            crate::review::SemanticVerdict::reject(note)
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "semantic reviewer unavailable; failing open");
-                        crate::review::SemanticVerdict::approve(
-                            "reviewer unavailable; heuristic stages passed",
-                        )
-                    }
-                }
+                let judge =
+                    crate::review::DeAnchoredJudge::new(frontier, local, escalate_threshold);
+                judge.judge(&task, &deliverable).await
             })
         })
     }

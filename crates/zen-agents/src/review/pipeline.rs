@@ -28,11 +28,16 @@ pub fn classify_blast_radius(task: &Task) -> BlastRadius {
     }
 }
 
-/// Verdict of the LLM semantic-review stage (T092).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Verdict of the LLM semantic-review stage (T092; extended by T170).
+///
+/// `confidence` is the reviewer's own score when it can report one. `None`
+/// means "no calibrated score available", which the escalation cascade reads
+/// as *escalate* — an unscoreable verdict must never be treated as confident.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SemanticVerdict {
     pub approved: bool,
     pub note: String,
+    pub confidence: Option<f32>,
 }
 
 impl SemanticVerdict {
@@ -40,6 +45,7 @@ impl SemanticVerdict {
         Self {
             approved: true,
             note: note.into(),
+            confidence: None,
         }
     }
 
@@ -47,6 +53,7 @@ impl SemanticVerdict {
         Self {
             approved: false,
             note: note.into(),
+            confidence: None,
         }
     }
 }
@@ -503,6 +510,7 @@ mod tests {
             max_momus_retries: Some(0),
             max_hermes_revisions: Some(1),
             llm_review_high_blast: Some(false),
+            escalate_threshold: None,
         };
         let invoked = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&invoked);

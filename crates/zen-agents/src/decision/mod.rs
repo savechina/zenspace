@@ -638,6 +638,22 @@ fn resolve_intent_threshold(paths: Option<&ZenPaths>) -> Option<f32> {
     })
 }
 
+/// Resolve the review escalation threshold (T170) — config override first,
+/// then the calibration artefact at the detected `ZEN_HOME`.
+///
+/// `None` keeps the de-anchored local judge phase off, which preserves the
+/// pre-T170 frontier-only review path exactly.
+pub fn resolve_review_escalate_threshold() -> Option<f32> {
+    let configured = zen_core::config::load_config()
+        .ok()
+        .and_then(|config| config.agentic.review.escalate_threshold());
+    configured.or_else(|| {
+        ZenPaths::detect()
+            .ok()
+            .and_then(|paths| DecisionThresholds::load(&thresholds_path(&paths)).review_escalate)
+    })
+}
+
 /// Run one rung, returning its verdict only when it clears the calibrated
 /// threshold. A rung that abstains, is below τ, or errors simply yields
 /// `None` — the ladder falls through; a turn is never failed by L1.
