@@ -171,7 +171,11 @@ impl IntentCategory {
     /// Category-derived default handler when the LLM path routes the turn
     /// (001 A.3 sub-agent column: Query→search-agent, Action→note-agent,
     /// System/Conversation→orchestrator; zen's registry equivalents).
-    fn default_agent(&self) -> &'static str {
+    ///
+    /// Since T169 this is only the *fallback* — a resolved signal wins over it
+    /// (see [`agent_for_signal`]), which is what makes all 13 registered
+    /// agents reachable from every ladder rung.
+    pub(crate) fn default_agent(&self) -> &'static str {
         match self {
             Self::Query => "Explore",
             Self::Action => "Hephaestus",
@@ -212,9 +216,14 @@ impl Acl {
 }
 
 /// Where the verdict came from — audit provenance for the degrade ladder
-/// (Llm → Keyword → Fallback).
+/// (L1 → Llm → Keyword → Fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntentSource {
+    /// L1 — calibrated decision layer (embedding router over the seed intent
+    /// table, or the constrained local classifier). Only reachable when a
+    /// calibrated threshold is supplied (T169); absent one, the ladder never
+    /// produces this source and the pre-T169 behaviour is preserved.
+    L1,
     Llm,
     Keyword,
     Fallback,
@@ -238,6 +247,11 @@ pub enum LlmOutcome {
     /// LLM attempt skipped by the fail-fast availability gate (no provider
     /// configured) — zero timeout burn.
     Skipped,
+    /// LLM attempt not made because the L1 rung already resolved the decision
+    /// above the calibrated threshold (T169) — zero LLM cost. This is the
+    /// outcome the ladder's fast path is meant to produce; its share of
+    /// `loop.turn.review` lines is the V13-A.3 "<10% LLM-intent rate" baseline.
+    L1Resolved,
 }
 
 impl LlmOutcome {
@@ -249,6 +263,7 @@ impl LlmOutcome {
             Self::Unavailable => "unavailable",
             Self::Error => "error",
             Self::Skipped => "skipped",
+            Self::L1Resolved => "l1_resolved",
         }
     }
 }
@@ -295,11 +310,30 @@ impl Intent {
         }
     }
 
-    fn from_category(category: IntentCategory, confidence: f32, source: IntentSource) -> Self {
+    /// Build an intent from a ladder rung's verdict.
+    ///
+    /// A resolved signal decides the agent ([`agent_for_signal`]); the
+    /// category default is only the fallback, which is what makes all 13
+    /// registered agents reachable from every rung (T169). An unresolvable
+    /// signal is still recorded verbatim — it is audit provenance — but does
+    /// not change the agent.
+    pub(crate) fn from_ladder(
+        category: IntentCategory,
+        signal: Option<&str>,
+        confidence: f32,
+        source: IntentSource,
+    ) -> Self {
+        let agent = signal
+            .and_then(agent_for_signal)
+            .unwrap_or_else(|| category.default_agent());
+        let signal_name = match signal {
+            Some(value) => value.to_string(),
+            None => category.as_str().to_lowercase(),
+        };
         Self {
             category,
-            agent: category.default_agent().to_string(),
-            signal: category.as_str().to_lowercase(),
+            agent: agent.to_string(),
+            signal: signal_name,
             acl: Acl::from_category(category),
             confidence,
             source,
@@ -330,7 +364,7 @@ pub(crate) fn keyword_route(query: &str) -> Option<Intent> {
 
 /// Signal → category heuristic for the keyword path: signals that mutate
 /// state map to `Action`, analytical ones to `Query`.
-fn keyword_signal_category(signal: &str) -> (IntentCategory, f32) {
+pub(crate) fn keyword_signal_category(signal: &str) -> (IntentCategory, f32) {
     let category = match signal {
         "coder" | "format-convert" | "batch-automation" | "consolidate-pipeline" => {
             IntentCategory::Action
@@ -338,6 +372,33 @@ fn keyword_signal_category(signal: &str) -> (IntentCategory, f32) {
         _ => IntentCategory::Query,
     };
     (category, 0.8)
+}
+
+/// Resolve a concrete agent from an `INTENT_SIGNALS` signal name.
+///
+/// T169: this is what dissolves the expressiveness inversion. Before it, the
+/// LLM path reached only the 3 category-default agents (`default_agent`)
+/// while the keyword path reached all 12 signals, so a confidently-classified
+/// Query/Action turn could never land on a specialist. Every rung's verdict
+/// now carries an optional signal and a resolved signal wins over the
+/// category default, making all 13 registered agents reachable from every
+/// rung. Unknown/absent signals return `None` and the caller falls back.
+pub(crate) fn agent_for_signal(signal: &str) -> Option<&'static str> {
+    INTENT_SIGNALS
+        .iter()
+        .find(|(_, sig, _)| *sig == signal)
+        .map(|(agent, _, _)| *agent)
+}
+
+/// The selectable signal names, comma-separated — used to state the LLM
+/// rung's signal vocabulary in its prompt so the model can pick a specialist
+/// rather than only a category.
+pub(crate) fn signal_vocabulary() -> String {
+    INTENT_SIGNALS
+        .iter()
+        .map(|(_, signal, _)| *signal)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Classify one user turn: LLM first, keyword fast path on LLM failure,
@@ -375,12 +436,12 @@ pub async fn classify(
 /// to the keyword fast path, then to the Conversation fallback on a
 /// keyword miss.
 fn resolve_intent(
-    verdict: Result<Option<(IntentCategory, f32)>, String>,
+    verdict: Result<Option<(IntentCategory, f32, Option<String>)>, String>,
     query: &str,
 ) -> (Intent, LlmOutcome) {
     match verdict {
-        Ok(Some((category, confidence))) => (
-            Intent::from_category(category, confidence, IntentSource::Llm),
+        Ok(Some((category, confidence, signal))) => (
+            Intent::from_ladder(category, signal.as_deref(), confidence, IntentSource::Llm),
             LlmOutcome::Ok,
         ),
         Ok(None) => {
@@ -419,14 +480,23 @@ fn passes_confidence_gate(confidence: f32) -> bool {
     confidence >= CONFIDENCE_GATE
 }
 
-/// One non-streaming-equivalent LLM round over the streaming path (async
-/// safe — no nested runtime). Returns `Ok(None)` when the reply parsed but
-/// the confidence gate rejected it; `Err` degrades to the keyword path.
-async fn llm_classify(
+/// One typed classification round over the streaming path (async safe — no
+/// nested runtime): one LLM turn returning a **validated**
+/// `(category, confidence, signal)`.
+///
+/// No confidence gate is applied here. [`llm_classify`] layers the L2 verbal
+/// gate on top, while the L1 classifier rung consumes the raw score and lets
+/// the ladder's calibrated threshold decide — one contract implementation,
+/// two gates over it (no forked call path).
+///
+/// The typed contract is enforced by parse-and-validate, **not** by
+/// constrained decoding: the provider layer exposes no grammar/`format`
+/// passthrough, so a malformed reply is rejected here and the caller retries.
+pub(crate) async fn classify_typed(
     router: &DefaultRouter,
     query: &str,
     sensitivity: Sensitivity,
-) -> Result<Option<(IntentCategory, f32)>, String> {
+) -> Result<Option<(IntentCategory, f32, Option<String>)>, String> {
     let requirements = TaskRequirements {
         max_tokens: Some(128),
         sensitivity,
@@ -442,10 +512,12 @@ async fn llm_classify(
         .map_err(|e| format!("classify route join: {e}"))?
         .map_err(|e| format!("route: {e}"))?;
     let prompt = format!(
-        "Classify the user's request into exactly one category.\n\
+        "Classify the user's request into exactly one category and, when one clearly applies, one routing signal.\n\
          Categories: \"Query\" (search or read knowledge), \"Action\" (create, modify, or execute something), \"System\" (manage configuration or services), \"Conversation\" (chat, help, or clarification).\n\
+         Signals: {}\n\
          User request: {query}\n\
-         Respond with ONLY a JSON object: {{\"category\": \"<Category>\", \"confidence\": <0.0-1.0>}}"
+         Respond with ONLY a JSON object: {{\"category\": \"<Category>\", \"confidence\": <0.0-1.0>, \"signal\": \"<signal-or-omit>\"}}",
+        signal_vocabulary()
     );
     let reply = tokio::time::timeout(CLASSIFY_TIMEOUT, async {
         let mut stream = router
@@ -463,17 +535,33 @@ async fn llm_classify(
     .await
     .map_err(|_| "classification timed out".to_string())??;
 
-    let (category, confidence) = parse_classification(&reply)
+    let (category, confidence, signal) = parse_classification(&reply)
         .ok_or_else(|| format!("unparsable classification reply: {reply}"))?;
-    if !passes_confidence_gate(confidence) {
-        return Ok(None);
-    }
-    Ok(Some((category, confidence)))
+    Ok(Some((category, confidence, signal)))
 }
 
-/// Parse `{"category": "...", "confidence": 0.xx}` out of a possibly noisy
-/// reply (fences, prose). Pure — unit-tested below.
-fn parse_classification(reply: &str) -> Option<(IntentCategory, f32)> {
+/// L2's call: [`classify_typed`] plus the 001 A.3 verbal-confidence gate
+/// (exactly [`CONFIDENCE_GATE`] passes). `Ok(None)` means "parsed but below
+/// the gate"; `Err` degrades to the keyword fast path.
+async fn llm_classify(
+    router: &DefaultRouter,
+    query: &str,
+    sensitivity: Sensitivity,
+) -> Result<Option<(IntentCategory, f32, Option<String>)>, String> {
+    match classify_typed(router, query, sensitivity).await? {
+        Some((_, confidence, _)) if !passes_confidence_gate(confidence) => Ok(None),
+        other => Ok(other),
+    }
+}
+
+/// Parse `{"category": "...", "confidence": 0.xx, "signal": "..."}` out of a
+/// possibly noisy reply (fences, prose). Pure — unit-tested below.
+///
+/// `signal` is optional (a model that omits it degrades to the category
+/// default, i.e. pre-T169 behaviour) and is **only accepted when it names a
+/// real `INTENT_SIGNALS` signal** — a hallucinated signal can never route to
+/// an agent, it is simply dropped.
+fn parse_classification(reply: &str) -> Option<(IntentCategory, f32, Option<String>)> {
     let start = reply.find('{')?;
     let end = reply.rfind('}')?;
     if end < start {
@@ -482,7 +570,13 @@ fn parse_classification(reply: &str) -> Option<(IntentCategory, f32)> {
     let value: serde_json::Value = serde_json::from_str(&reply[start..=end]).ok()?;
     let category = IntentCategory::parse(value.get("category")?.as_str()?)?;
     let confidence = value.get("confidence")?.as_f64()? as f32;
-    Some((category, confidence.clamp(0.0, 1.0)))
+    let signal = value
+        .get("signal")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|signal| agent_for_signal(signal).is_some())
+        .map(str::to_string);
+    Some((category, confidence.clamp(0.0, 1.0), signal))
 }
 
 #[cfg(test)]
@@ -492,16 +586,16 @@ mod tests {
     #[test]
     fn parse_classification_accepts_clean_fenced_and_noisy_replies() {
         let clean = parse_classification(r#"{"category": "Query", "confidence": 0.92}"#);
-        assert_eq!(clean, Some((IntentCategory::Query, 0.92)));
+        assert_eq!(clean, Some((IntentCategory::Query, 0.92, None)));
 
         let fenced =
             parse_classification("```json\n{\"category\": \"action\", \"confidence\": 0.7}\n```");
-        assert_eq!(fenced, Some((IntentCategory::Action, 0.7)));
+        assert_eq!(fenced, Some((IntentCategory::Action, 0.7, None)));
 
         let noisy = parse_classification(
             "Sure! Here is the classification: {\"category\": \"System\", \"confidence\": 1.5} hope that helps",
         );
-        assert_eq!(noisy, Some((IntentCategory::System, 1.0)));
+        assert_eq!(noisy, Some((IntentCategory::System, 1.0, None)));
     }
 
     #[test]
@@ -513,6 +607,117 @@ mod tests {
         );
         assert_eq!(parse_classification("{\"confidence\": 0.9}"), None);
         assert_eq!(parse_classification("{\"category\": \"Query\"}"), None);
+    }
+
+    #[test]
+    fn parse_classification_accepts_known_signal_and_drops_hallucinated_ones() {
+        let known = parse_classification(
+            r#"{"category": "Query", "confidence": 0.9, "signal": "deep-analysis"}"#,
+        );
+        assert_eq!(
+            known,
+            Some((
+                IntentCategory::Query,
+                0.9,
+                Some("deep-analysis".to_string())
+            ))
+        );
+
+        let hallucinated = parse_classification(
+            r#"{"category": "Query", "confidence": 0.9, "signal": "chief-vibes-officer"}"#,
+        );
+        assert_eq!(
+            hallucinated,
+            Some((IntentCategory::Query, 0.9, None)),
+            "an unknown signal can never route to an agent"
+        );
+    }
+
+    #[test]
+    fn every_signal_resolves_to_a_distinct_registered_agent() {
+        let mut agents = std::collections::BTreeSet::new();
+        for (_, signal, _) in INTENT_SIGNALS {
+            let agent = agent_for_signal(signal).expect("every table signal resolves");
+            agents.insert(agent);
+        }
+        assert_eq!(
+            agents.len(),
+            INTENT_SIGNALS.len(),
+            "signal→agent mapping must be injective"
+        );
+        assert_eq!(agent_for_signal("nope"), None);
+    }
+
+    #[test]
+    fn llm_signal_wins_over_category_default_for_agent_selection() {
+        let with_signal = Intent::from_ladder(
+            IntentCategory::Query,
+            Some("review-quality"),
+            0.9,
+            IntentSource::Llm,
+        );
+        assert_eq!(
+            with_signal.agent, "Momus",
+            "a resolved signal beats the Query default (Explore)"
+        );
+        assert_eq!(with_signal.signal, "review-quality");
+        assert_eq!(with_signal.category, IntentCategory::Query);
+
+        let without_signal =
+            Intent::from_ladder(IntentCategory::Query, None, 0.9, IntentSource::Llm);
+        assert_eq!(without_signal.agent, "Explore");
+        assert_eq!(without_signal.signal, "query");
+
+        let unresolvable = Intent::from_ladder(
+            IntentCategory::Action,
+            Some("not-a-signal"),
+            0.9,
+            IntentSource::Llm,
+        );
+        assert_eq!(unresolvable.agent, "Hephaestus");
+        assert_eq!(
+            unresolvable.signal, "not-a-signal",
+            "recorded verbatim for audit, but does not route"
+        );
+    }
+
+    #[test]
+    fn all_thirteen_agents_are_reachable_from_signals() {
+        // The registry's 13 agents: Sisyphus arrives via the category default
+        // (System/Conversation), the other 12 via INTENT_SIGNALS.
+        let mut reachable: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (_, signal, _) in INTENT_SIGNALS {
+            reachable.insert(agent_for_signal(signal).expect("resolves"));
+        }
+        for category in [
+            IntentCategory::Query,
+            IntentCategory::Action,
+            IntentCategory::System,
+            IntentCategory::Conversation,
+        ] {
+            reachable.insert(category.default_agent());
+        }
+        for expected in [
+            "Sisyphus",
+            "Hephaestus",
+            "Explore",
+            "Oracle",
+            "Librarian",
+            "Hermes",
+            "Momus",
+            "Prometheus",
+            "Metis",
+            "Atlas",
+            "Junior",
+            "Zeus",
+            "Argus",
+        ] {
+            assert!(
+                reachable.contains(expected),
+                "{expected} must be reachable from some rung"
+            );
+        }
+        assert_eq!(reachable.len(), 13, "exactly the 13 registered agents");
     }
 
     #[test]
@@ -567,7 +772,8 @@ mod tests {
     }
     #[test]
     fn resolve_intent_accepts_confident_llm_verdict() {
-        let (intent, outcome) = resolve_intent(Ok(Some((IntentCategory::Action, 0.9))), "anything");
+        let (intent, outcome) =
+            resolve_intent(Ok(Some((IntentCategory::Action, 0.9, None))), "anything");
         assert_eq!(intent.source, IntentSource::Llm);
         assert_eq!(intent.category, IntentCategory::Action);
         assert_eq!(intent.acl, Acl::Write);
@@ -696,5 +902,6 @@ mod tests {
         assert_eq!(LlmOutcome::Unavailable.as_str(), "unavailable");
         assert_eq!(LlmOutcome::Error.as_str(), "error");
         assert_eq!(LlmOutcome::Skipped.as_str(), "skipped");
+        assert_eq!(LlmOutcome::L1Resolved.as_str(), "l1_resolved");
     }
 }

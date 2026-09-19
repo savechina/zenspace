@@ -822,29 +822,64 @@ impl OrchestratorConfig {
     }
 }
 
-/// Intent classification configuration — TOML `[agentic.intent]` (T168).
+/// Intent classification configuration — TOML `[agentic.intent]` (T168/T169).
 ///
 /// Scope logic (Constitution XV):
-/// - Functionality: gates the L1 shadow observation at the intent decision
-///   point — the embedding router runs after the production decision and
-///   records a `loop.decision` audit line; it never affects routing.
-/// - User impact: enabling it starts accumulating calibration data (L1 vs
-///   production disagreements are the highest-information samples for T173).
-/// - Default: false — per-turn cost is unchanged until the user opts in.
-/// - Interaction: `ZEN_INTENT_SHADOW_EMBEDDING` env var overrides any config
-///   layer (5th layer).
+/// - Functionality: `shadow_embedding` gates the L1 observation at the intent
+///   decision point (the embedding router runs after the production decision
+///   and records a `loop.decision` audit line; it never affects routing).
+///   `l1_threshold` is the calibrated operating point that lets the L1 rung
+///   *gate* the decision (T169) — the ladder tries L1 first and only falls
+///   through to the LLM when L1's confidence is below it.
+/// - User impact: shadow mode starts accumulating calibration data (L1 vs
+///   production disagreements are the highest-information samples for T173);
+///   setting `l1_threshold` activates the fast path that avoids the LLM
+///   classification call on confidently-L1 turns.
+/// - Default: `shadow_embedding = false` (per-turn cost unchanged until
+///   opt-in) and `l1_threshold = absent`. **An absent threshold means the
+///   L1 rung never gates** — the ladder behaves exactly as it did before
+///   T169. This is deliberate (V13-A.3): no τ is ever invented here; it is
+///   supplied by calibration (T173's harness writes
+///   `<ZEN_HOME>/logs/decision-audit/thresholds.json`) or explicitly by the
+///   user via this key.
+/// - Interaction: `ZEN_INTENT_SHADOW_EMBEDDING` / `ZEN_INTENT_L1_THRESHOLD`
+///   env vars override any config layer (5th layer). The config value wins
+///   over the calibration artefact when both are present, so a user can pin
+///   or override a calibrated operating point.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct IntentConfig {
     /// Run the L1 embedding rung in shadow (observation-only) after each
     /// intent classification. Default false.
     pub shadow_embedding: Option<bool>,
+    /// Calibrated confidence threshold for the L1 gate. Absent ⇒ the L1 rung
+    /// never gates and the pre-T169 behaviour is preserved exactly. Valid
+    /// range 0.0..=1.0; out-of-range values warn and are ignored.
+    pub l1_threshold: Option<f32>,
 }
 
 impl IntentConfig {
     /// Effective shadow-embedding flag (default false).
     pub fn shadow_embedding_or_default(&self) -> bool {
         self.shadow_embedding.unwrap_or(false)
+    }
+
+    /// The configured L1 gate, or `None` when unset/out-of-range.
+    ///
+    /// `None` is the load-bearing signal: it means "no calibrated operating
+    /// point", so every L1 gate stays closed.
+    pub fn l1_threshold(&self) -> Option<f32> {
+        match self.l1_threshold {
+            Some(value) if (0.0..=1.0).contains(&value) => Some(value),
+            Some(value) => {
+                tracing::warn!(
+                    value,
+                    "[agentic.intent] l1_threshold outside 0.0..=1.0; ignoring (L1 gate stays closed)"
+                );
+                None
+            }
+            None => None,
+        }
     }
 }
 
@@ -1798,6 +1833,7 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
         },
         intent: IntentConfig {
             shadow_embedding: ov.intent.shadow_embedding.or(base.intent.shadow_embedding),
+            l1_threshold: ov.intent.l1_threshold.or(base.intent.l1_threshold),
         },
     }
 }
@@ -2178,6 +2214,15 @@ fn apply_orchestrator_env(cfg: &mut OrchestratorConfig) {
 fn apply_intent_env(cfg: &mut IntentConfig) {
     if let Some(v) = env_bool("ZEN_INTENT_SHADOW_EMBEDDING") {
         cfg.shadow_embedding = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_INTENT_L1_THRESHOLD") {
+        match v.trim().parse::<f32>() {
+            Ok(parsed) => cfg.l1_threshold = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_INTENT_L1_THRESHOLD is not a number; ignoring (L1 gate stays closed)"
+            ),
+        }
     }
 }
 

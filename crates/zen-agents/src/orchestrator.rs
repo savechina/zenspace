@@ -779,30 +779,44 @@ impl AgentOrchestrator {
     ) -> Result<AgentExecution> {
         let start = Instant::now();
         self.ensure_delegate_tool();
-        if let Ok(paths) = ZenPaths::detect() {
-            inject_wake_up_brief(&paths, session);
+        let paths = ZenPaths::detect().ok();
+        if let Some(paths) = paths.as_ref() {
+            inject_wake_up_brief(paths, session);
         }
         self.inject_skill_hits(session, user_query);
-        let (intent, llm_telemetry) = intent::classify(
+        // T169: the three-tier ladder. Without a calibrated threshold this is
+        // the pre-T169 `intent::classify` path byte-for-byte.
+        let ladder = crate::decision::classify_intent(
+            paths.as_ref(),
             self.executor.router(),
             user_query,
             session.sensitivity_policy,
+            None,
         )
         .await;
+        if let Some(paths) = paths.as_ref() {
+            crate::decision::record_ladder_decision(
+                paths,
+                &session.session_id.to_string(),
+                &ladder,
+            );
+        }
         // T168: L1 shadow observation — records the L1 embedding rung's
         // verdict alongside the production decision; never affects routing.
         if shadow_embedding_enabled()
-            && let Ok(paths) = ZenPaths::detect()
+            && let Some(paths) = paths.as_ref()
         {
             crate::decision::run_intent_shadow(
-                &paths,
+                paths,
                 &session.session_id.to_string(),
                 user_query,
-                &intent,
+                &ladder.intent,
                 None,
             )
             .await;
         }
+        let intent = ladder.intent;
+        let llm_telemetry = ladder.telemetry;
         let agent_name = intent.agent.clone();
         info!(
             agent = agent_name,
@@ -1486,30 +1500,44 @@ impl AgentOrchestrator {
     ) -> Result<String> {
         let _start = Instant::now();
         self.ensure_delegate_tool();
-        if let Ok(paths) = ZenPaths::detect() {
-            inject_wake_up_brief(&paths, session);
+        let paths = ZenPaths::detect().ok();
+        if let Some(paths) = paths.as_ref() {
+            inject_wake_up_brief(paths, session);
         }
         self.inject_skill_hits(session, user_query);
-        let (intent, llm_telemetry) = intent::classify(
+        // T169: the three-tier ladder. Without a calibrated threshold this is
+        // the pre-T169 `intent::classify` path byte-for-byte.
+        let ladder = crate::decision::classify_intent(
+            paths.as_ref(),
             self.executor.router(),
             user_query,
             session.sensitivity_policy,
+            None,
         )
         .await;
+        if let Some(paths) = paths.as_ref() {
+            crate::decision::record_ladder_decision(
+                paths,
+                &session.session_id.to_string(),
+                &ladder,
+            );
+        }
         // T168: L1 shadow observation — records the L1 embedding rung's
         // verdict alongside the production decision; never affects routing.
         if shadow_embedding_enabled()
-            && let Ok(paths) = ZenPaths::detect()
+            && let Some(paths) = paths.as_ref()
         {
             crate::decision::run_intent_shadow(
-                &paths,
+                paths,
                 &session.session_id.to_string(),
                 user_query,
-                &intent,
+                &ladder.intent,
                 None,
             )
             .await;
         }
+        let intent = ladder.intent;
+        let llm_telemetry = ladder.telemetry;
         let agent_name = intent.agent.clone();
         info!(
             agent = agent_name,
