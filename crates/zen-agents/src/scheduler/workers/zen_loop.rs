@@ -714,9 +714,37 @@ fn inbox_listing(inbox: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Append one `loop.note.archived` audit line per archived note (FR-018).
+///
+/// The archive move is the mutation that relocates a user file, and
+/// `(source, dest, checksum)` is exactly what after-the-fact review or an undo
+/// needs — the cycle-level line cannot answer "where did this note go". Page
+/// body writes are covered by the per-cycle git commit plus the CAS snapshot's
+/// tracked paths, and quarantines by their own gap record, so they are not
+/// duplicated here. Audit failures are logged and never fail the cycle.
+fn record_note_mutations(
+    logs_dir: &Path,
+    cycle_id: &str,
+    migrated: &[(PathBuf, PathBuf)],
+    identities: &[(String, String)],
+) {
+    let audit_path = logs_dir.join("audit.jsonl");
+    for ((source, dest), (_, checksum)) in migrated.iter().zip(identities.iter()) {
+        let record = serde_json::json!({
+            "kind": "loop.note.archived",
+            "cycle_id": cycle_id,
+            "source": source.display().to_string(),
+            "dest": dest.display().to_string(),
+            "checksum": checksum,
+        });
+        if let Err(e) = append_jsonl_line(&audit_path, &record) {
+            warn!(error = %e, "loop: per-note archive audit append failed");
+        }
+    }
+}
+
 /// Move budget-deferred notes from `vault/archive/pending/` back into the
 /// inbox so the next cycle processes them. Returns how many were re-queued.
-///
 /// The pipeline defers over-budget notes to the pending pool (T033/FR-032);
 /// that pool is only a staging area, so without this the notes would never
 /// re-enter the pipeline. A note whose move fails stays in the pool and is
@@ -1039,6 +1067,12 @@ impl ZenWorker for ZenLoopWorker {
                 report.cas_rolled_back = outcome.cas_rolled_back;
                 report.cas_drifted = outcome.cas_drifted;
                 gaps.extend(outcome.gaps);
+                record_note_mutations(
+                    &logs_dir,
+                    &cycle_id,
+                    &outcome.report.migrated_files,
+                    &outcome.report.archived_identities,
+                );
             }
             Err(e) => {
                 report.outcome = Some(CycleOutcome::Failed);
@@ -1635,6 +1669,60 @@ mod tests {
     fn worker_with_schedule_override() {
         let worker = ZenLoopWorker::new().with_schedule("0 */10 * * * *");
         assert_eq!(worker.schedule(), "0 */10 * * * *");
+    }
+
+    #[test]
+    fn archived_notes_produce_one_reversible_audit_record_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        let migrated = vec![
+            (
+                PathBuf::from("/vault/inbox/a.md"),
+                PathBuf::from("/vault/archive/2026-09/a.md"),
+            ),
+            (
+                PathBuf::from("/vault/inbox/b.md"),
+                PathBuf::from("/vault/archive/2026-09/b.md"),
+            ),
+        ];
+        let identities = vec![
+            ("/vault/inbox/a.md".to_string(), "hash-a".to_string()),
+            ("/vault/inbox/b.md".to_string(), "hash-b".to_string()),
+        ];
+
+        record_note_mutations(&logs, "cycle-1", &migrated, &identities);
+
+        let audit = std::fs::read_to_string(logs.join("audit.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit line must be JSON"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one record per archived note: {audit}");
+
+        // The record must carry the source -> dest move plus the checksum, which
+        // is what makes the archive reversible after the fact (FR-018).
+        assert_eq!(lines[0]["kind"], "loop.note.archived");
+        assert_eq!(lines[0]["cycle_id"], "cycle-1");
+        assert_eq!(lines[0]["source"], "/vault/inbox/a.md");
+        assert_eq!(lines[0]["dest"], "/vault/archive/2026-09/a.md");
+        assert_eq!(lines[0]["checksum"], "hash-a");
+        assert_eq!(lines[1]["source"], "/vault/inbox/b.md");
+    }
+
+    #[test]
+    fn note_mutation_audit_is_a_noop_without_archives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        record_note_mutations(&logs, "cycle-1", &[], &[]);
+
+        assert!(
+            !logs.join("audit.jsonl").exists(),
+            "an empty cycle must not leave a stray audit file"
+        );
     }
 
     #[test]
