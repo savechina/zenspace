@@ -461,6 +461,8 @@ pub struct AgenticConfig {
     pub intent: IntentConfig,
     /// Binary-classifier thresholds — TOML `[agentic.classifiers]` (T171).
     pub classifiers: ClassifierConfig,
+    /// Decision-audit content policy — TOML `[agentic.audit]` (T173/T175).
+    pub audit: AuditConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -961,6 +963,64 @@ fn validated_threshold(value: Option<f32>, key: &str) -> Option<f32> {
             None
         }
         None => None,
+    }
+}
+
+/// Upper bound on a decision excerpt, regardless of configuration.
+pub const AUDIT_EXCERPT_MAX: usize = 500;
+
+/// Decision-audit content policy — TOML `[agentic.audit]`.
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: controls whether the decision audit lines carry a bounded
+///   excerpt of the user's input. Without one, a recorded decision cannot be
+///   adjudicated by a human, so `labels.jsonl` can never be filled and the
+///   calibrated thresholds can never open.
+/// - User impact: **enabling this writes (bounded) user input into a local log
+///   file** (`<ZEN_HOME>/logs/audit.jsonl`). That is a privacy decision, so it
+///   is off unless the user turns it on. When on, the excerpt is clamped to
+///   [`AUDIT_EXCERPT_MAX`] characters, truncated on a character boundary, and
+///   has its newlines flattened to spaces so it can never forge a second
+///   JSONL line.
+/// - Default: 0 = off. Nothing about the input is written unless explicitly
+///   configured.
+/// - Interaction: `ZEN_AUDIT_DECISION_EXCERPT_CHARS` overrides any config
+///   layer; values above the cap are clamped, not trusted.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct AuditConfig {
+    /// Characters of user input to record on a decision audit line. 0 = off.
+    pub decision_excerpt_chars: Option<usize>,
+}
+
+impl AuditConfig {
+    /// Effective excerpt length: 0 (off) unless configured, clamped to
+    /// `0..=AUDIT_EXCERPT_MAX`.
+    pub fn decision_excerpt_chars_or_default(&self) -> usize {
+        self.decision_excerpt_chars
+            .unwrap_or(0)
+            .min(AUDIT_EXCERPT_MAX)
+    }
+
+    /// Build the single-line, char-boundary-truncated excerpt of `input`, or
+    /// `None` when the feature is off (0).
+    ///
+    /// Newlines and carriage returns are replaced with spaces so one excerpt
+    /// can never forge a second JSONL line; truncation happens on a character
+    /// boundary so a UTF-8 codepoint is never split. The result is at most
+    /// [`AUDIT_EXCERPT_MAX`] characters — the configured value is clamped,
+    /// never trusted.
+    pub fn excerpt(&self, input: &str) -> Option<String> {
+        let limit = self.decision_excerpt_chars_or_default();
+        if limit == 0 {
+            return None;
+        }
+        let flattened: String = input
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        let excerpt: String = flattened.chars().take(limit).collect();
+        Some(excerpt.trim().to_string())
     }
 }
 
@@ -1926,6 +1986,12 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
                 .citation_threshold
                 .or(base.classifiers.citation_threshold),
         },
+        audit: AuditConfig {
+            decision_excerpt_chars: ov
+                .audit
+                .decision_excerpt_chars
+                .or(base.audit.decision_excerpt_chars),
+        },
     }
 }
 
@@ -2249,6 +2315,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_orchestrator_env(&mut config.agentic.orchestrator);
     apply_intent_env(&mut config.agentic.intent);
     apply_classifier_env(&mut config.agentic.classifiers);
+    apply_audit_env(&mut config.agentic.audit);
     apply_skills_env(&mut config.skills.auto_route);
     config
 }
@@ -2310,6 +2377,18 @@ fn apply_delegate_env(cfg: &mut DelegateConfig) {
 fn apply_orchestrator_env(cfg: &mut OrchestratorConfig) {
     if let Some(v) = env_str("ZEN_ORCHESTRATOR_SURFACE") {
         cfg.surface = Some(v);
+    }
+}
+
+fn apply_audit_env(cfg: &mut AuditConfig) {
+    if let Some(v) = env_str("ZEN_AUDIT_DECISION_EXCERPT_CHARS") {
+        match v.trim().parse::<usize>() {
+            Ok(parsed) => cfg.decision_excerpt_chars = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_AUDIT_DECISION_EXCERPT_CHARS is not a number; ignoring (excerpt stays off)"
+            ),
+        }
     }
 }
 
@@ -3344,5 +3423,75 @@ mod host_source_tests {
             PathBuf::from(format!("{home}/Work"))
         );
         assert_eq!(expand_home_path("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn audit_excerpt_off_by_default() {
+        let cfg = AuditConfig::default();
+        assert_eq!(cfg.decision_excerpt_chars_or_default(), 0);
+        assert!(cfg.excerpt("anything at all").is_none());
+    }
+
+    #[test]
+    fn audit_excerpt_clamp_rejects_above_500() {
+        let cfg = AuditConfig {
+            decision_excerpt_chars: Some(10_000),
+        };
+        assert_eq!(cfg.decision_excerpt_chars_or_default(), AUDIT_EXCERPT_MAX);
+        let excerpt = cfg.excerpt("x".repeat(10_000).as_str()).expect("excerpt");
+        assert_eq!(excerpt.chars().count(), AUDIT_EXCERPT_MAX);
+    }
+
+    #[test]
+    fn audit_excerpt_truncates_on_char_boundary() {
+        // 600 CJK chars = 1800 UTF-8 bytes; a byte-wise cut would split a
+        // codepoint. The excerpt must be exactly the clamp, all valid chars.
+        let cfg = AuditConfig {
+            decision_excerpt_chars: Some(AUDIT_EXCERPT_MAX),
+        };
+        let input = "你".repeat(600);
+        let excerpt = cfg.excerpt(&input).expect("excerpt");
+        assert_eq!(excerpt.chars().count(), AUDIT_EXCERPT_MAX);
+        assert!(excerpt.chars().all(|c| c == '你'));
+    }
+
+    #[test]
+    fn audit_excerpt_flattens_newlines() {
+        let cfg = AuditConfig {
+            decision_excerpt_chars: Some(100),
+        };
+        let excerpt = cfg
+            .excerpt("line one\nline two\r\nline three")
+            .expect("excerpt");
+        assert!(!excerpt.contains('\n'));
+        assert!(!excerpt.contains('\r'));
+        assert_eq!(excerpt, "line one line two  line three");
+    }
+
+    #[test]
+    fn audit_env_override_respected_and_clamped() {
+        // SAFETY: test-only env mutation; ZEN_AUDIT_DECISION_EXCERPT_CHARS is
+        // read by no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_AUDIT_DECISION_EXCERPT_CHARS", "200") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.audit.decision_excerpt_chars_or_default(), 200);
+
+        unsafe { std::env::set_var("ZEN_AUDIT_DECISION_EXCERPT_CHARS", "9999") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.audit.decision_excerpt_chars_or_default(),
+            AUDIT_EXCERPT_MAX,
+            "an env value above the cap is clamped, not trusted"
+        );
+
+        unsafe { std::env::set_var("ZEN_AUDIT_DECISION_EXCERPT_CHARS", "not-a-number") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.audit.decision_excerpt_chars_or_default(),
+            0,
+            "an unparsable env value leaves the excerpt off"
+        );
+
+        unsafe { std::env::remove_var("ZEN_AUDIT_DECISION_EXCERPT_CHARS") };
     }
 }

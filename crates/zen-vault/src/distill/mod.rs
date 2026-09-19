@@ -40,11 +40,12 @@ pub use correlation::{Opportunity, correlate};
 pub use decision_audit::{
     CONFIDENCE_DRIFT_TOLERANCE, CalibratedThreshold, CalibrationReport, CalibrationTarget,
     DATASET_FILE, DECISION_AUDIT_DIR, DRIFT_WINDOW_DAYS, DecisionAuditError, DecisionRecord,
-    ECE_BINS, FieldCalibration, KindCalibration, KindDrift, LABELS_FILE, LabelEntry,
-    MIN_ACCEPTED_COVERAGE, MIN_ACCEPTED_PRECISION, MIN_LABELS_FOR_CALIBRATION, MIN_PRECISION_LIFT,
-    RUNG_MIX_DRIFT_TOLERANCE, RungCalibration, THRESHOLD_SCALE, THRESHOLD_SOURCES, THRESHOLDS_FILE,
-    ThresholdOutcome, ThresholdPoint, ThresholdSource, analyze, calibrate, calibrate_field,
-    compute, extract_dataset, load_dataset, load_labels, select_threshold, thresholds_path,
+    ECE_BINS, FieldCalibration, KindCalibration, KindDrift, KindLabelStatus, LABELS_FILE,
+    LabelEntry, LabelStatus, MIN_ACCEPTED_COVERAGE, MIN_ACCEPTED_PRECISION,
+    MIN_LABELS_FOR_CALIBRATION, MIN_PRECISION_LIFT, RUNG_MIX_DRIFT_TOLERANCE, RungCalibration,
+    THRESHOLD_SCALE, THRESHOLD_SOURCES, THRESHOLDS_FILE, ThresholdOutcome, ThresholdPoint,
+    ThresholdSource, analyze, append_label, calibrate, calibrate_field, compute, extract_dataset,
+    label_status, load_dataset, load_labels, select_threshold, thresholds_path, unlabeled,
     write_thresholds,
 };
 pub use discover_metrics::{

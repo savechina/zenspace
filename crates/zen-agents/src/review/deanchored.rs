@@ -261,9 +261,9 @@ impl DeAnchoredJudge {
 /// V13-A.3 frontier-call baseline, which reads the `escalated` field. The
 /// `decision_audit` extractor reads `decision_kind`/`rung`/`confidence`/
 /// `choice`, so those names are a cross-crate contract.
-pub fn record_decision(paths: &ZenPaths, judged: &JudgedVerdict) {
+pub fn record_decision(paths: &ZenPaths, judged: &JudgedVerdict, input: &str) {
     let trace = &judged.trace;
-    let entry = serde_json::json!({
+    let mut entry = serde_json::json!({
         "kind": "loop.decision",
         "decision": "review",
         "decision_kind": "review",
@@ -284,6 +284,12 @@ pub fn record_decision(paths: &ZenPaths, judged: &JudgedVerdict) {
         },
         "approved": judged.verdict.approved,
     });
+    // Present only when the user opted in ([agentic.audit]
+    // decision_excerpt_chars); absent otherwise, so nothing about the input
+    // is recorded by default.
+    if let Some(excerpt) = crate::decision::decision_excerpt(input) {
+        entry["input_excerpt"] = serde_json::Value::String(excerpt);
+    }
     crate::decision::append_decision_audit(paths, &entry);
 }
 
@@ -584,7 +590,7 @@ mod tests {
         let judge = DeAnchoredJudge::new(frontier, Some(local), Some(0.9));
 
         let judged = judge.judge(&task(), "a draft").await;
-        record_decision(&paths, &judged);
+        record_decision(&paths, &judged, "explain tokio cancellation");
 
         let audit = std::fs::read_to_string(paths.logs().join("audit.jsonl")).expect("audit file");
         let entry: serde_json::Value =
@@ -599,6 +605,10 @@ mod tests {
         assert_eq!(entry["escalated"], true, "0.6 < 0.9, so it escalated");
         assert_eq!(entry["confidence"], 0.6);
         assert_eq!(entry["choice"], "approved");
+        assert!(
+            entry.get("input_excerpt").is_none(),
+            "the excerpt is OFF by default: no input_excerpt field when [agentic.audit] decision_excerpt_chars is unset"
+        );
     }
 
     #[test]

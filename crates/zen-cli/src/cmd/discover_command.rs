@@ -14,8 +14,9 @@ use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
     CalibrationTarget, CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate,
-    aggregate_orchestration, analyze, calibrate, compute_baselines, evaluate, latest_report,
-    load_dataset, load_reports, not_evaluated, run_arena, save_report, write_thresholds,
+    aggregate_orchestration, analyze, append_label, calibrate, compute_baselines, evaluate,
+    label_status, latest_report, load_dataset, load_reports, not_evaluated, run_arena, save_report,
+    unlabeled, write_thresholds,
 };
 
 #[derive(Subcommand)]
@@ -69,6 +70,36 @@ pub enum DiscoverCommands {
         /// decision gates, so it is never implicit.
         #[arg(long)]
         write: bool,
+    },
+    /// Adjudicate decision-audit records (T173 label supply)
+    Label {
+        #[command(subcommand)]
+        command: LabelCommands,
+    },
+}
+
+/// Labeling workflow subcommands — the human half of the T173 calibration
+/// harness. Labels are appended to `logs/decision-audit/labels.jsonl`; a
+/// later entry for the same id supersedes an earlier one (last wins).
+#[derive(Subcommand)]
+pub enum LabelCommands {
+    /// Show labeling progress (total / labeled / per-kind)
+    Status,
+    /// Show the next unlabeled records for adjudication
+    Next {
+        /// Only records of this kind (e.g. `intent`)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Maximum number of records to show (default 10)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Append a ground-truth label for a record id
+    Set {
+        /// Record id (from `zen discover label next`)
+        id: String,
+        /// Ground-truth label (e.g. the correct intent category)
+        label: String,
     },
 }
 
@@ -180,6 +211,63 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 );
             }
         }
+        DiscoverCommands::Label { command } => match command {
+            LabelCommands::Status => {
+                let records = load_dataset(&paths.logs())
+                    .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
+                let status = label_status(&records);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status)
+                        .map_err(|e| ZenError::Message(e.to_string()))?
+                );
+            }
+            LabelCommands::Next { kind, limit } => {
+                let records = load_dataset(&paths.logs())
+                    .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
+                let next = unlabeled(&records, kind.as_deref(), *limit);
+                if next.is_empty() {
+                    println!("{}", "no unlabeled records".dimmed());
+                    return Ok(());
+                }
+                for record in next {
+                    println!(
+                        "{} kind={} rung={} confidence={} decision={} ts={}",
+                        record.id.cyan().bold(),
+                        record.kind,
+                        record.rung,
+                        record
+                            .confidence
+                            .map(|c| format!("{c:.4}"))
+                            .unwrap_or_else(|| "—".to_string()),
+                        record.decision.as_deref().unwrap_or("—"),
+                        record.timestamp.as_deref().unwrap_or("—"),
+                    );
+                    match &record.input_excerpt {
+                        Some(excerpt) => println!("  input: {excerpt}"),
+                        None => println!(
+                            "  {}",
+                            "no input excerpt recorded — set [agentic.audit] decision_excerpt_chars > 0 (default 0 = off) to capture one"
+                                .yellow()
+                        ),
+                    }
+                }
+            }
+            LabelCommands::Set { id, label } => {
+                let path = append_label(&paths.logs(), id, label)
+                    .map_err(|e| ZenError::Message(format!("label append error: {e}")))?;
+                let records = load_dataset(&paths.logs())
+                    .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
+                let status = label_status(&records);
+                println!(
+                    "{} {id} → {label} ({}/{})",
+                    "labeled".green().bold(),
+                    status.labeled,
+                    status.total,
+                );
+                println!("  {}", path.display().to_string().dimmed());
+            }
+        },
         DiscoverCommands::Report => {
             let history = load_reports(&paths.logs())
                 .map_err(|e| ZenError::Message(format!("discover metrics I/O error: {e}")))?;

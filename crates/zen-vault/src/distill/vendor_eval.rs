@@ -890,6 +890,7 @@ mod tests {
             confidence,
             decision: decision.map(str::to_string),
             label: label.map(str::to_string),
+            input_excerpt: None,
         }
     }
 

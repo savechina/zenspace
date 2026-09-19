@@ -987,6 +987,20 @@ pub(crate) fn audit_score(value: f32) -> f64 {
     (f64::from(value) * 10_000.0).round() / 10_000.0
 }
 
+/// The configured decision excerpt, or `None` when the user has not opted in.
+///
+/// `[agentic.audit] decision_excerpt_chars` defaults to 0 = off, because this
+/// writes (bounded) user input into a local log file — a privacy decision that
+/// belongs to the user, never a silent default. Convenience wrapper that loads
+/// the config once; the clamping, character-boundary truncation and newline
+/// flattening live in [`zen_core::config::AuditConfig::excerpt`] so those
+/// rules have exactly one implementation.
+pub fn decision_excerpt(input: &str) -> Option<String> {
+    zen_core::config::load_config()
+        .ok()
+        .and_then(|config| config.agentic.audit.excerpt(input))
+}
+
 /// Append one `loop.decision` line to `<logs>/audit.jsonl` — same file and
 /// style as the `loop.turn.review` line (additive; existing fields untouched).
 pub(crate) fn append_decision_audit(paths: &ZenPaths, entry: &serde_json::Value) {

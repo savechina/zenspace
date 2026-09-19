@@ -122,6 +122,12 @@ pub struct DecisionRecord {
     /// Ground-truth label, merged from `labels.jsonl` when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Bounded excerpt of the user input that led to this decision, present
+    /// only when the user opted in (`[agentic.audit] decision_excerpt_chars`).
+    /// Without it a human cannot adjudicate the decision, which is what the
+    /// labeling workflow surfaces rather than hides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_excerpt: Option<String>,
 }
 
 /// One ground-truth label entry from `labels.jsonl`.
@@ -638,6 +644,7 @@ fn record_from_line(line: &str) -> Option<DecisionRecord> {
             confidence: read_field_f64(line, "intent_confidence"),
             decision: read_field_str(line, "intent_category"),
             label: None,
+            input_excerpt: read_field_str(line, "input_excerpt"),
         })
     } else if line.contains("\"kind\":\"loop.decision\"") {
         // T168 will emit these (`rung`, `latency_ms`, `confidence`); support
@@ -651,6 +658,7 @@ fn record_from_line(line: &str) -> Option<DecisionRecord> {
             confidence: read_field_f64(line, "confidence"),
             decision: read_field_str(line, "choice"),
             label: None,
+            input_excerpt: read_field_str(line, "input_excerpt"),
         })
     } else {
         None
@@ -1125,6 +1133,102 @@ pub fn write_thresholds(
     Ok(path)
 }
 
+// ---------------------------------------------------------------------------
+// Labeling workflow (the human half of label supply)
+// ---------------------------------------------------------------------------
+
+/// Per-kind label progress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KindLabelStatus {
+    pub kind: String,
+    pub total: usize,
+    pub labeled: usize,
+}
+
+/// Overall label progress across the dataset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelStatus {
+    pub total: usize,
+    pub labeled: usize,
+    pub per_kind: Vec<KindLabelStatus>,
+}
+
+impl LabelStatus {
+    /// Remaining records still needing adjudication.
+    pub fn remaining(&self) -> usize {
+        self.total.saturating_sub(self.labeled)
+    }
+}
+
+/// Label progress over the dataset.
+pub fn label_status(records: &[DecisionRecord]) -> LabelStatus {
+    let mut kinds: Vec<KindLabelStatus> = Vec::new();
+    let mut labeled = 0usize;
+    for record in records {
+        if record.label.is_some() {
+            labeled += 1;
+        }
+        match kinds.iter_mut().find(|entry| entry.kind == record.kind) {
+            Some(entry) => {
+                entry.total += 1;
+                if record.label.is_some() {
+                    entry.labeled += 1;
+                }
+            }
+            None => kinds.push(KindLabelStatus {
+                kind: record.kind.clone(),
+                total: 1,
+                labeled: usize::from(record.label.is_some()),
+            }),
+        }
+    }
+    kinds.sort_by(|a, b| a.kind.cmp(&b.kind));
+    LabelStatus {
+        total: records.len(),
+        labeled,
+        per_kind: kinds,
+    }
+}
+
+/// The next unlabeled records, optionally filtered to one kind.
+pub fn unlabeled<'a>(
+    records: &'a [DecisionRecord],
+    kind: Option<&str>,
+    limit: usize,
+) -> Vec<&'a DecisionRecord> {
+    records
+        .iter()
+        .filter(|record| record.label.is_none())
+        .filter(|record| kind.is_none_or(|wanted| record.kind == wanted))
+        .take(limit)
+        .collect()
+}
+
+/// Append one adjudication to `<logs>/decision-audit/labels.jsonl`.
+///
+/// The file is an append-only log, not a map: [`load_labels`] folds it into a
+/// map, so a later entry for the same id supersedes an earlier one (last
+/// wins). That makes re-labeling a record a plain append rather than a rewrite
+/// — and it means a mis-label can be corrected without losing the history of
+/// what was adjudicated before.
+pub fn append_label(logs_dir: &Path, id: &str, label: &str) -> Result<PathBuf, DecisionAuditError> {
+    let dir = logs_dir.join(DECISION_AUDIT_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(LABELS_FILE);
+    let entry = LabelEntry {
+        id: id.to_string(),
+        label: label.to_string(),
+    };
+    let mut line = serde_json::to_string(&entry)?;
+    line.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,6 +1269,7 @@ mod tests {
             confidence,
             decision: decision.map(str::to_string),
             label: label.map(str::to_string),
+            input_excerpt: None,
         }
     }
 
@@ -1177,6 +1282,7 @@ mod tests {
             confidence: Some(confidence),
             decision: None,
             label: None,
+            input_excerpt: None,
         }
     }
 
@@ -1605,5 +1711,95 @@ mod tests {
             written.get("correction_l1").is_none(),
             "a refusal must never be persisted as a number"
         );
+    }
+    // ---- labeling workflow ----
+
+    #[test]
+    fn append_label_creates_the_file_and_last_entry_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path();
+
+        let path = append_label(logs, "rec-1", "Query").expect("append");
+        assert!(path.exists(), "the labels file is created on first append");
+
+        append_label(logs, "rec-1", "Action").expect("append");
+        append_label(logs, "rec-2", "System").expect("append");
+
+        let labels = load_labels(logs).expect("load");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(
+            labels.get("rec-1").map(String::as_str),
+            Some("Action"),
+            "a later entry supersedes an earlier one (re-labeling is an append)"
+        );
+        assert_eq!(labels.get("rec-2").map(String::as_str), Some("System"));
+    }
+
+    #[test]
+    fn label_status_counts_per_kind_including_the_zero_case() {
+        let records = vec![
+            record(
+                "s1",
+                "intent",
+                "L1",
+                Some(0.9),
+                Some("Query"),
+                Some("Query"),
+            ),
+            record("s2", "intent", "L1", Some(0.4), Some("Query"), None),
+            record("s3", "review", "L1", Some(0.8), Some("approved"), None),
+        ];
+        let status = label_status(&records);
+
+        assert_eq!(status.total, 3);
+        assert_eq!(status.labeled, 1);
+        assert_eq!(status.remaining(), 2);
+
+        let intent = status
+            .per_kind
+            .iter()
+            .find(|entry| entry.kind == "intent")
+            .expect("intent");
+        assert_eq!((intent.total, intent.labeled), (2, 1));
+        let review = status
+            .per_kind
+            .iter()
+            .find(|entry| entry.kind == "review")
+            .expect("review");
+        assert_eq!((review.total, review.labeled), (1, 0));
+
+        let empty = label_status(&[]);
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.labeled, 0);
+        assert!(empty.per_kind.is_empty());
+    }
+
+    #[test]
+    fn unlabeled_filters_by_kind_and_respects_the_limit() {
+        let records = vec![
+            record("u1", "intent", "L1", Some(0.9), Some("Query"), None),
+            record(
+                "u2",
+                "intent",
+                "L1",
+                Some(0.8),
+                Some("Query"),
+                Some("Query"),
+            ),
+            record("u3", "intent", "L1", Some(0.7), Some("Query"), None),
+            record("u4", "review", "L1", Some(0.6), Some("approved"), None),
+        ];
+
+        let all = unlabeled(&records, None, 10);
+        assert_eq!(all.len(), 3, "the already-labeled record is excluded");
+
+        let intent = unlabeled(&records, Some("intent"), 10);
+        assert_eq!(intent.len(), 2);
+
+        let limited = unlabeled(&records, None, 2);
+        assert_eq!(limited.len(), 2);
+
+        let none = unlabeled(&records, Some("citation"), 10);
+        assert!(none.is_empty());
     }
 }

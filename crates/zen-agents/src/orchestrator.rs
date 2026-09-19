@@ -615,12 +615,13 @@ impl AgentOrchestrator {
         paths: &ZenPaths,
         session_id: &str,
         agent: &str,
-        intent: &intent::Intent,
-        llm_telemetry: &intent::LlmTelemetry,
+        classification: (&intent::Intent, &intent::LlmTelemetry),
         review: &crate::review::PipelineResult,
         feedback_rounds: u8,
+        user_query: &str,
     ) {
-        let entry = serde_json::json!({
+        let (intent, llm_telemetry) = classification;
+        let mut entry = serde_json::json!({
             "kind": "loop.turn.review",
             "session_id": session_id,
             "agent": agent,
@@ -636,6 +637,12 @@ impl AgentOrchestrator {
             "feedback_rounds": feedback_rounds,
             "failed_attempts": review.failed_attempts,
         });
+        // Present only when the user opted in ([agentic.audit]
+        // decision_excerpt_chars); absent otherwise, so nothing about the
+        // input is recorded by default.
+        if let Some(excerpt) = crate::decision::decision_excerpt(user_query) {
+            entry["input_excerpt"] = serde_json::Value::String(excerpt);
+        }
         let log_path = paths.logs().join("audit.jsonl");
         if let Some(parent) = log_path.parent()
             && fs::create_dir_all(parent).is_ok()
@@ -694,7 +701,7 @@ impl AgentOrchestrator {
                 // threshold has a calibration sample and the frontier-call
                 // baseline is derivable from real traffic.
                 if let Ok(paths) = ZenPaths::detect() {
-                    crate::review::record_decision(&paths, &judged);
+                    crate::review::record_decision(&paths, &judged, &task.user_input);
                 }
                 judged.verdict
             })
@@ -1286,10 +1293,10 @@ impl AgentOrchestrator {
                 &paths,
                 &session.session_id.to_string(),
                 &agent_name,
-                &intent,
-                &llm_telemetry,
+                (&intent, &llm_telemetry),
                 &review,
                 feedback_rounds,
+                user_query,
             );
         }
 
@@ -1968,10 +1975,10 @@ impl AgentOrchestrator {
                 &paths,
                 &session.session_id.to_string(),
                 &agent_name,
-                &intent,
-                &llm_telemetry,
+                (&intent, &llm_telemetry),
                 &review,
                 0,
+                user_query,
             );
         }
 
@@ -2866,6 +2873,48 @@ mod tests {
         assert!(
             !content.contains("sudo passwd"),
             "privilege escalation stripped"
+        );
+    }
+
+    #[test]
+    fn turn_review_audit_omits_input_excerpt_by_default() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let intent = intent::Intent {
+            category: intent::IntentCategory::Query,
+            agent: "Explore".to_string(),
+            signal: "q".to_string(),
+            acl: intent::Acl::ReadOnly,
+            confidence: 0.9,
+            source: intent::IntentSource::Llm,
+        };
+        let telemetry = intent::LlmTelemetry {
+            outcome: intent::LlmOutcome::Ok,
+            elapsed_ms: 100,
+        };
+        let review = crate::review::PipelineResult {
+            plan_approved: true,
+            review_notes: String::new(),
+            delivery_ready: true,
+            athena_shield: None,
+            failed_attempts: Vec::new(),
+        };
+        AgentOrchestrator::append_turn_review_audit(
+            &paths,
+            "s1",
+            "Sisyphus",
+            (&intent, &telemetry),
+            &review,
+            0,
+            "user input that must not be recorded by default",
+        );
+        let audit = fs::read_to_string(paths.logs().join("audit.jsonl")).expect("audit file");
+        let entry: serde_json::Value =
+            serde_json::from_str(audit.lines().next().expect("one line")).expect("json");
+        assert_eq!(entry["kind"], "loop.turn.review");
+        assert!(
+            entry.get("input_excerpt").is_none(),
+            "the excerpt is OFF by default: no input_excerpt field when [agentic.audit] decision_excerpt_chars is unset"
         );
     }
 }
