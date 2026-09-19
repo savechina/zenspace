@@ -152,8 +152,10 @@ pub enum GapKind {
     UnresolvedRelationship,
     /// Malformed note moved to quarantine.
     QuarantinedNote,
-    /// Reserved for LLM distillation failures (not yet emitted; LLM stage
-    /// lands with T046).
+    /// LLM/distillation capability failure. Emitted by the adversarial arena
+    /// for every case the incumbent loses; such losses construct the
+    /// hypothesis directly because the gap-driven generator filters this kind
+    /// as ineligible.
     LlmFailure,
     /// Normalized alias collision per DESIGN §7.3 (FR-022).
     DuplicateEntityAlias,

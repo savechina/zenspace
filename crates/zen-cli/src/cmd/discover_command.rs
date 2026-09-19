@@ -185,7 +185,9 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
             let cycle_id = cycle
                 .clone()
                 .unwrap_or_else(|| format!("arena-{}", chrono::Utc::now().format("%Y%m%d")));
-            let report = run_arena(&contestants, &paths.logs(), &cycle_id).map_err(map_err)?;
+            let hypotheses_dir = paths.vault().join("wiki/wisdom/hypotheses");
+            let report = run_arena(&contestants, &paths.logs(), &cycle_id, &hypotheses_dir)
+                .map_err(map_err)?;
             for case in &report.cases {
                 let mark = if case.winner == zen_vault::distill::INCUMBENT {
                     "✓".green()
@@ -195,8 +197,10 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 println!("{mark} {:22} winner: {}", case.case_id, case.winner.bold());
             }
             println!(
-                "zen-distill {}/{} cases (regression gate; losses recorded in the report only)",
-                report.zen_wins, report.total_cases,
+                "zen-distill {}/{} cases (regression gate; loss hypotheses staged: {})",
+                report.zen_wins,
+                report.total_cases,
+                report.staged_losses.len(),
             );
         }
     }

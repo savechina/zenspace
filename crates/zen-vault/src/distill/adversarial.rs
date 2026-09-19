@@ -5,8 +5,10 @@
 //! fights [`NaiveBaseline`] (same structure minus normalization and
 //! dedup) and any external agent CLI via [`CliContestant`]. Cases the
 //! incumbent loses become [`HypothesisSlug`]s (kind `LlmFailure`, status
-//! `Exploring`) saved to the hypotheses dir — the 4am promotion worker
-//! stages them, closing the self-improve loop.
+//! `Exploring`) saved to the hypotheses dir. The loop's stage 5c refinement
+//! pass (`build_refinement_queue` → `reverify_with_rejections`) consumes them
+//! from there; a regression that survives reverification reaches `Validated`
+//! and is then staged for promotion, closing the self-improve loop.
 //!
 //! Judge metrics are fully mechanical (no LLM): determinism, coverage
 //! (v2: correlate groups covered, so dedup is rewarded),
@@ -40,6 +42,11 @@ pub const INCUMBENT: &str = "zen-distill";
 
 /// Arena report filename: `logs/adversarial-<cycle>.json`.
 pub const ARENA_REPORT_PREFIX: &str = "adversarial-";
+
+/// Confidence assigned to an arena-loss hypothesis. A loss is mechanical
+/// evidence of a capability gap rather than an inferred guess, and 0.7 clears
+/// the 0.6 floor that `hypothesis::generate_from_gaps` uses for `Exploring`.
+pub const LOSS_HYPOTHESIS_CONFIDENCE: f64 = 0.7;
 
 /// One fixed testcase: gaps plus ground-truth ranges.
 #[derive(Debug, Clone)]
@@ -299,6 +306,11 @@ pub struct AdversarialReport {
     pub zen_wins: usize,
     /// Total cases run.
     pub total_cases: usize,
+    /// Slugs of the loss hypotheses staged by this run (empty when the
+    /// incumbent took every case). Additive: reports written before I8 decode
+    /// with an empty list.
+    #[serde(default)]
+    pub staged_losses: Vec<String>,
 }
 
 fn in_range(value: usize, range: (usize, usize)) -> f64 {
@@ -545,13 +557,101 @@ pub fn corpus() -> Vec<EvalCase> {
     ]
 }
 
-/// Run the full corpus across contestants, persist the report, and judge
-/// mechanically. Pure regression gate (PD-06): losses are recorded in the
-/// report only — nothing is staged back into the hypothesis pipeline.
+/// Names the losing case, who took it, and where the incumbent scored worst —
+/// the guidance the next exploration pass reads.
+fn loss_guidance(case: &CaseResult) -> String {
+    let incumbent = case.verdicts.iter().find(|v| v.contestant == INCUMBENT);
+    let challenger = case
+        .verdicts
+        .iter()
+        .filter(|v| v.contestant != INCUMBENT)
+        .max_by(|a, b| a.total.total_cmp(&b.total));
+    match (incumbent, challenger) {
+        (Some(zen), Some(other)) => format!(
+            "Arena case '{}' was won by '{}' (total {:.3} vs incumbent {:.3}). \
+             Incumbent phase scores — correlate {:.3}, hypothesize {:.3}. Identify \
+             which metric the winner improved and change correlate/hypothesize to \
+             raise it, then re-run `zen discover arena` and confirm case '{}' \
+             returns to '{}'.",
+            case.case_id,
+            other.contestant,
+            other.total,
+            zen.total,
+            zen.correlate.correlate_total(),
+            zen.hypothesize.hypothesize_total(),
+            case.case_id,
+            INCUMBENT
+        ),
+        _ => format!(
+            "Arena case '{}' was lost by '{}' to '{}'. Investigate the divergence and \
+             re-run `zen discover arena` to confirm the case returns to '{}'.",
+            case.case_id, INCUMBENT, case.winner, INCUMBENT
+        ),
+    }
+}
+
+/// Build the improvement hypothesis for a case the incumbent lost.
+///
+/// Constructed directly rather than via
+/// [`super::hypothesis::generate_from_gaps`] because `GapKind::LlmFailure` is
+/// deliberately ineligible for gap-driven generation, while an arena loss is
+/// explicit mechanical evidence of a capability regression and must stay
+/// actionable. The report path rides in `evidence_refs` so
+/// `build_refinement_queue` emits a re-read prompt for it, and the slug is
+/// derived from the case id so repeated losses converge on one hypothesis.
+pub fn loss_hypothesis(case: &CaseResult, cycle_id: &str) -> HypothesisSlug {
+    HypothesisSlug {
+        slug: format!("arena-loss-{}", case.case_id),
+        hypothesis: format!(
+            "Arena regression: incumbent '{}' lost case '{}' to '{}'",
+            INCUMBENT, case.case_id, case.winner
+        ),
+        gap_kind: GapKind::LlmFailure,
+        confidence: LOSS_HYPOTHESIS_CONFIDENCE,
+        status: HypothesisStatus::Exploring,
+        exploration_prompt: Some(loss_guidance(case)),
+        evidence_refs: vec![format!("logs/{ARENA_REPORT_PREFIX}{cycle_id}.json")],
+        created_from: cycle_id.to_string(),
+    }
+}
+
+/// Persist one hypothesis per lost case into `hypotheses_dir`, returning the
+/// staged slugs. `hypothesis::save` merges per slug and keeps the higher
+/// status, so a repeatedly-losing case converges on one hypothesis and a
+/// hypothesis already resolved (rejected or validated) is never resurrected.
+/// A save failure is logged and skipped rather than failing the gate.
+pub fn stage_losses(report: &AdversarialReport, hypotheses_dir: &Path) -> Result<Vec<String>> {
+    let mut staged = Vec::new();
+    for case in report.cases.iter().filter(|case| case.winner != INCUMBENT) {
+        let hypothesis = loss_hypothesis(case, &report.cycle_id);
+        match super::hypothesis::save(&hypothesis, hypotheses_dir) {
+            Ok(path) => {
+                tracing::info!(
+                    slug = %hypothesis.slug,
+                    path = %path.display(),
+                    "arena loss staged as improvement hypothesis"
+                );
+                staged.push(hypothesis.slug);
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                slug = %hypothesis.slug,
+                "arena loss hypothesis save failed (non-fatal)"
+            ),
+        }
+    }
+    Ok(staged)
+}
+
+/// Run the full corpus across contestants, judge mechanically, persist the
+/// report, and stage every lost case as an improvement hypothesis in
+/// `hypotheses_dir` (PD-06 regression gate). Staged slugs are recorded on the
+/// report; staging failures are logged and never abort the gate.
 pub fn run_arena(
     contestants: &[&dyn Contestant],
     logs_dir: &Path,
     cycle_id: &str,
+    hypotheses_dir: &Path,
 ) -> Result<AdversarialReport> {
     let mut cases = Vec::new();
     for case in corpus() {
@@ -561,12 +661,17 @@ pub fn run_arena(
         .iter()
         .filter(|result| result.winner == INCUMBENT)
         .count();
-    let report = AdversarialReport {
+    let mut report = AdversarialReport {
         cycle_id: cycle_id.to_string(),
         zen_wins,
         total_cases: cases.len(),
         cases,
+        staged_losses: Vec::new(),
     };
+    match stage_losses(&report, hypotheses_dir) {
+        Ok(staged) => report.staged_losses = staged,
+        Err(e) => tracing::warn!(error = %e, "arena loss staging failed (non-fatal)"),
+    }
     fs::create_dir_all(logs_dir)
         .with_context(|| format!("create logs dir: {}", logs_dir.display()))?;
     fs::write(
@@ -579,6 +684,7 @@ pub fn run_arena(
         cycle = %cycle_id,
         zen_wins,
         total = report.total_cases,
+        staged = report.staged_losses.len(),
         "arena regression gate complete"
     );
     Ok(report)
@@ -691,12 +797,171 @@ mod tests {
     }
 
     #[test]
-    fn run_arena_persists_report() {
+    fn run_arena_persists_report_and_stages_losses() {
         let dir = TempDir::new().unwrap();
         let logs = dir.path().join("logs");
-        let report = run_arena(&contestants(), &logs, "test-cycle").unwrap();
+        let hypotheses = dir.path().join("hypotheses");
+        let report = run_arena(&contestants(), &logs, "test-cycle", &hypotheses).unwrap();
         assert_eq!(report.total_cases, corpus().len());
         assert!(report_path(&logs, "test-cycle").is_file());
+        assert_eq!(
+            report.staged_losses.len(),
+            report.total_cases - report.zen_wins,
+            "every lost case must stage exactly one hypothesis"
+        );
+    }
+
+    fn losing_case() -> CaseResult {
+        CaseResult {
+            case_id: "alias-collapse".to_string(),
+            winner: "naive-baseline".to_string(),
+            verdicts: vec![
+                ContestantVerdict {
+                    contestant: INCUMBENT.to_string(),
+                    correlate: PhaseScore {
+                        determinism: 1.0,
+                        coverage: 0.5,
+                        isolation: 1.0,
+                        parsimony: 1.0,
+                        ..PhaseScore::default()
+                    },
+                    hypothesize: PhaseScore {
+                        determinism: 1.0,
+                        coverage: 0.5,
+                        ..PhaseScore::default()
+                    },
+                    total: 0.75,
+                },
+                ContestantVerdict {
+                    contestant: "naive-baseline".to_string(),
+                    correlate: PhaseScore {
+                        determinism: 1.0,
+                        coverage: 1.0,
+                        isolation: 1.0,
+                        parsimony: 1.0,
+                        ..PhaseScore::default()
+                    },
+                    hypothesize: PhaseScore {
+                        determinism: 1.0,
+                        coverage: 1.0,
+                        ..PhaseScore::default()
+                    },
+                    total: 1.0,
+                },
+            ],
+        }
+    }
+
+    fn report_with(cases: Vec<CaseResult>) -> AdversarialReport {
+        let zen_wins = cases.iter().filter(|case| case.winner == INCUMBENT).count();
+        AdversarialReport {
+            cycle_id: "c1".to_string(),
+            total_cases: cases.len(),
+            zen_wins,
+            cases,
+            staged_losses: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lost_case_becomes_actionable_hypothesis() {
+        let hypothesis = loss_hypothesis(&losing_case(), "c1");
+        assert_eq!(hypothesis.slug, "arena-loss-alias-collapse");
+        assert_eq!(hypothesis.gap_kind, GapKind::LlmFailure);
+        assert_eq!(hypothesis.status, HypothesisStatus::Exploring);
+        assert!(
+            hypothesis.confidence >= 0.6,
+            "must clear the Exploring floor"
+        );
+        assert!(hypothesis.hypothesis.contains("alias-collapse"));
+        assert!(hypothesis.hypothesis.contains("naive-baseline"));
+
+        let prompt = hypothesis.exploration_prompt.expect("prompt is set");
+        assert!(
+            prompt.contains("naive-baseline"),
+            "names the winner: {prompt}"
+        );
+        assert!(
+            prompt.contains("correlate"),
+            "names the weak phase: {prompt}"
+        );
+        assert_eq!(
+            hypothesis.evidence_refs,
+            vec!["logs/adversarial-c1.json".to_string()],
+            "report path is the re-readable evidence"
+        );
+    }
+
+    #[test]
+    fn staged_loss_reaches_the_refinement_queue() {
+        let dir = TempDir::new().unwrap();
+        let hypotheses = dir.path().join("hypotheses");
+        let staged = stage_losses(&report_with(vec![losing_case()]), &hypotheses).unwrap();
+
+        assert_eq!(staged, vec!["arena-loss-alias-collapse".to_string()]);
+        assert!(hypotheses.join("arena-loss-alias-collapse.md").is_file());
+
+        let loaded = crate::distill::hypothesis::load_all(&hypotheses).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].status, HypothesisStatus::Exploring);
+
+        // Non-empty evidence_refs is what turns the hypothesis into an
+        // actionable re-read prompt instead of a bare user question.
+        let (external, questions) = crate::distill::hypothesis::build_refinement_queue(&loaded);
+        assert_eq!(
+            external.len(),
+            1,
+            "loss must enter the external-fetch queue"
+        );
+        assert_eq!(questions.len(), 1);
+        assert!(external[0].contains("arena-loss-alias-collapse"));
+    }
+
+    #[test]
+    fn staged_loss_is_idempotent_and_never_resurrected() {
+        let dir = TempDir::new().unwrap();
+        let hypotheses = dir.path().join("hypotheses");
+        let report = report_with(vec![losing_case()]);
+
+        stage_losses(&report, &hypotheses).unwrap();
+        stage_losses(&report, &hypotheses).unwrap();
+        assert_eq!(
+            crate::distill::hypothesis::load_all(&hypotheses)
+                .unwrap()
+                .len(),
+            1,
+            "repeated losses converge on one hypothesis"
+        );
+
+        let mut resolved = loss_hypothesis(&losing_case(), "c1");
+        resolved.status = HypothesisStatus::Rejected;
+        crate::distill::hypothesis::save(&resolved, &hypotheses).unwrap();
+        stage_losses(&report, &hypotheses).unwrap();
+
+        let loaded = crate::distill::hypothesis::load_all(&hypotheses).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].status,
+            HypothesisStatus::Rejected,
+            "save keeps the higher status, so a resolved loss is not reopened"
+        );
+    }
+
+    #[test]
+    fn winning_report_stages_nothing() {
+        let dir = TempDir::new().unwrap();
+        let hypotheses = dir.path().join("hypotheses");
+        let mut case = losing_case();
+        case.winner = INCUMBENT.to_string();
+
+        let staged = stage_losses(&report_with(vec![case]), &hypotheses).unwrap();
+        assert!(staged.is_empty());
+        assert!(
+            !hypotheses.exists()
+                || crate::distill::hypothesis::load_all(&hypotheses)
+                    .unwrap()
+                    .is_empty()
+        );
     }
 
     #[test]
