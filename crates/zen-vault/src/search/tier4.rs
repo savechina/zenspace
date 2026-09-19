@@ -186,11 +186,9 @@ impl Tier4Search {
 
         repo.insert_entity(id, name, kind, &now).await?;
 
-        // Register normalized alias for notion deduplication.
-        use unicode_normalization::UnicodeNormalization;
-        let normalized: String = name.nfc().collect();
-        let normalized = normalized.trim().to_lowercase();
-        repo.insert_alias(&normalized, id).await?;
+        // `insert_alias` applies the canonical FR-022 normalization (NFC, trim,
+        // lowercase, one-suffix strip) itself, so the raw name is passed here.
+        repo.insert_alias(name, id).await?;
 
         Ok(())
     }

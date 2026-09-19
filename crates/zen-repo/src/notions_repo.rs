@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlx::Row;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{
@@ -8,8 +9,16 @@ use crate::types::{
     RelationRow, ShortestPathResult,
 };
 
+/// Canonical alias normalization (FR-022). Applied on both write
+/// (`insert_alias`) and read (`resolve_alias`), so it is the single place that
+/// decides whether two spellings of an entity are the same entity.
+///
+/// NFC comes first: a decomposed `e` + combining accent and a precomposed `é`
+/// are different byte sequences but the same name, and without normalization
+/// they would produce two aliases for one entity.
 pub fn normalize_alias(raw: &str) -> String {
-    let mut s = raw.trim().to_lowercase();
+    let nfc: String = raw.nfc().collect();
+    let mut s = nfc.trim().to_lowercase();
 
     for suffix in &[
         ".js",

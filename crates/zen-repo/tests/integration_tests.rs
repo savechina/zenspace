@@ -2,8 +2,8 @@ use tempfile::tempdir;
 
 use zen_repo::{
     IndexNoteRequest, InsertNoteEmbeddingRequest, InsertNotionEmbeddingRequest,
-    InsertRelationshipRequest, SelfNodeRow, SqliteClient, UpsertBeliefNodeRequest,
-    UpsertGoalNodeRequest, UpsertPathNodeRequest,
+    InsertRelationshipRequest, NotionsRepo, SelfNodeRow, SqliteClient, UpsertBeliefNodeRequest,
+    UpsertGoalNodeRequest, UpsertPathNodeRequest, normalize_alias,
 };
 
 // ---------------------------------------------------------------------------
@@ -2023,4 +2023,51 @@ async fn test_wikilink_edge_insertion() {
     assert_eq!(tokio_rels.len(), 1);
     assert_eq!(tokio_rels[0].target_notion_id, "e-rust");
     assert_eq!(tokio_rels[0].relation_type, "Wikilinks");
+}
+
+// ===========================================================================
+// FR-022 alias normalization (T124)
+// ===========================================================================
+
+#[test]
+fn test_normalize_alias_collapses_case_unicode_and_suffix_variants() {
+    // SC-008: `rust-lang` / `Rust` / `rust.js` must resolve to one canonical
+    // alias. `rust-lang` is covered by the "-lang" suffix rule.
+    for variant in ["rust-lang", "Rust", "rust.js", "  Rust  "] {
+        assert_eq!(
+            normalize_alias(variant),
+            "rust",
+            "variant {variant:?} must canonicalize to `rust`"
+        );
+    }
+
+    // NFC runs before the suffix/lowercase rules, so a decomposed name and its
+    // precomposed form are one alias rather than two entities.
+    let decomposed = "Cafe\u{0301}.rs";
+    let precomposed = "Café.rs";
+    assert_eq!(
+        normalize_alias(decomposed),
+        normalize_alias(precomposed),
+        "decomposed and precomposed spellings must be identical after NFC"
+    );
+    assert_eq!(normalize_alias(precomposed), "café");
+}
+
+#[tokio::test]
+async fn test_alias_lookup_is_unicode_normalized_end_to_end() {
+    let (client, _dir) = make_client().await;
+    let repo = NotionsRepo::new(&client);
+    let now = chrono::Utc::now().to_rfc3339();
+    repo.insert_entity("n-cafe", "Café", "concept", &now)
+        .await
+        .unwrap();
+
+    // Write the decomposed form, read back with the precomposed form.
+    repo.insert_alias("Cafe\u{0301}", "n-cafe").await.unwrap();
+    let resolved = repo.resolve_alias("Café").await.unwrap();
+    assert_eq!(
+        resolved.as_deref(),
+        Some("n-cafe"),
+        "a precomposed lookup must find an alias stored in decomposed form"
+    );
 }

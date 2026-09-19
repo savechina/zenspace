@@ -91,6 +91,22 @@ fn skill_precipitation_two_successes_confirm_then_skill_md_exists() {
     assert!(content.contains("description:"), "frontmatter: {content}");
     assert!(content.contains("triggers: ["), "frontmatter: {content}");
 
+    // FR-040: the rendered SKILL.md carries a Gotchas section, and a pitfall
+    // recorded in the evidence (the seeded context mentions an error) appears
+    // there rather than only under Evidence.
+    assert!(
+        content.contains("## Gotchas"),
+        "FR-040: SKILL.md must carry a Gotchas section: {content}"
+    );
+    let gotchas = content
+        .split("## Gotchas")
+        .nth(1)
+        .expect("Gotchas section body");
+    assert!(
+        gotchas.contains("error"),
+        "a recorded pitfall must be listed under Gotchas: {gotchas}"
+    );
+
     // A second confirm without a pending draft fails cleanly.
     let confirm_again = test.zen(&["skill", "confirm", "rust-build-fix"]);
     assert!(

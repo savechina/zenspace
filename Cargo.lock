@@ -10615,6 +10615,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tokio-rusqlite",
+ "unicode-normalization",
  "uuid",
  "zen-core",
 ]

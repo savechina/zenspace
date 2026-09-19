@@ -37,6 +37,19 @@ pub const SUCCESS_QUALITY_RATING: u8 = 7;
 /// Marker inside a record's summaries signalling a user correction.
 pub const CORRECTION_MARKER: &str = "corrected";
 
+/// Markers that flag an observation as a recorded pitfall, so the rendered
+/// SKILL.md can carry a Gotchas section (FR-040). Deliberately narrow: a false
+/// positive files a clean success under Gotchas, which misleads the next run
+/// more than an explicitly-empty section does.
+const GOTCHA_MARKERS: &[&str] = &[
+    CORRECTION_MARKER,
+    "error",
+    "failed",
+    "retry",
+    "avoid",
+    "mistake",
+];
+
 /// Pending-confirm queue file in the logs dir (worker surface channel).
 pub const DRAFT_QUEUE_FILE: &str = "skill-confirmations.json";
 
@@ -348,7 +361,36 @@ fn render_skill_md(draft: &SkillDraft) -> String {
             md.push_str(&format!("- {obs}\n"));
         }
     }
+
+    // FR-040: the auto-proposed SKILL.md carries a Gotchas section. It is
+    // always present so the section is part of the skill contract; when the
+    // evidence holds no correction or failure, that is stated rather than
+    // left blank, so a reader can tell "none recorded" from "not rendered".
+    md.push_str("## Gotchas\n\n");
+    match gotchas_from(&draft.observations) {
+        found if found.is_empty() => md.push_str(&format!(
+            "None recorded — distilled from {} clean observation(s).\n",
+            draft.observations.len()
+        )),
+        found => {
+            for gotcha in found {
+                md.push_str(&format!("- {gotcha}\n"));
+            }
+        }
+    }
     md
+}
+
+/// Observations that record a pitfall rather than a clean success, matched
+/// case-insensitively against [`GOTCHA_MARKERS`].
+fn gotchas_from(observations: &[String]) -> Vec<&String> {
+    observations
+        .iter()
+        .filter(|observation| {
+            let lowered = observation.to_lowercase();
+            GOTCHA_MARKERS.iter().any(|marker| lowered.contains(marker))
+        })
+        .collect()
 }
 
 pub(crate) fn append_audit(logs_dir: &Path, event: serde_json::Value) -> Result<()> {
