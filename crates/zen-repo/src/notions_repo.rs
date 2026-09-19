@@ -5,8 +5,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{
-    ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionRow, PageRankResult,
-    RelationRow, ShortestPathResult,
+    ComponentResult, GraphSearchResult, InsertRelationshipRequest, NoteStageRow, NotionRow,
+    PageRankResult, RelationRow, ShortestPathResult,
 };
 
 /// Canonical alias normalization (FR-022). Applied on both write
@@ -1002,6 +1002,51 @@ impl<'a> NotionsRepo<'a> {
         damping: f64,
     ) -> Result<Vec<PageRankResult>> {
         self.pagerank(iterations, damping).await
+    }
+
+    /// Record the last stage a note reached, keyed by its identity
+    /// `(file_path, content_hash)` (FR-011). Upserts, so a note re-entering the
+    /// pipeline with the same content refreshes its stage rather than
+    /// duplicating a row.
+    pub async fn record_note_stage(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+        stage: &str,
+        now: &str,
+    ) -> Result<()> {
+        let pool = self.client.pool();
+        sqlx::query(
+            "INSERT INTO note_stages (file_path, content_hash, last_completed_stage, stage_updated_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(file_path, content_hash) \
+             DO UPDATE SET last_completed_stage = ?3, stage_updated_at = ?4",
+        )
+        .bind(file_path)
+        .bind(content_hash)
+        .bind(stage)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every recorded note stage, for re-deriving cycle state from the durable
+    /// projection instead of trusting in-memory bookkeeping (FR-011).
+    pub async fn load_note_stages(&self) -> Result<Vec<NoteStageRow>> {
+        let pool = self.client.pool();
+        let rows =
+            sqlx::query("SELECT file_path, content_hash, last_completed_stage FROM note_stages")
+                .fetch_all(pool)
+                .await?;
+        Ok(rows
+            .iter()
+            .map(|row| NoteStageRow {
+                file_path: row.get("file_path"),
+                content_hash: row.get("content_hash"),
+                last_completed_stage: row.get("last_completed_stage"),
+            })
+            .collect())
     }
 }
 

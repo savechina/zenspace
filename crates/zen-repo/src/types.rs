@@ -101,6 +101,17 @@ pub struct ComponentResult {
     pub component_size: i64,
 }
 
+/// One row of the durable per-note processing projection (FR-011).
+///
+/// Keyed by `(file_path, content_hash)`: the same note with different content is
+/// a different identity and starts with no recorded stage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteStageRow {
+    pub file_path: String,
+    pub content_hash: String,
+    pub last_completed_stage: String,
+}
+
 #[derive(FromRow, Clone)]
 pub struct SelfNodeRow {
     pub id: String,

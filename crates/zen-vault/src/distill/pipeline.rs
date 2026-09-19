@@ -9,6 +9,7 @@ use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::Skill;
 use rig_compose::workflow::Workflow;
 use tracing::{info, warn};
+use zen_repo::{NotionsRepo, SqliteClient};
 
 use super::checkpoint::Checkpoint;
 use super::checkpoint::CheckpointManager;
@@ -26,6 +27,11 @@ use crate::notion::service::NotionService;
 
 use crate::note::{Note, parse_frontmatter};
 use crate::tindy::checksum::ChangeDetector;
+
+/// Terminal stage recorded for a note whose output is archived and durable
+/// (FR-011). Notes carrying this stage for the same content are not
+/// reprocessed.
+pub const STAGE_ARCHIVED: &str = "archived";
 use crate::wiki::WikiPage;
 
 /// Summary of a single distillation pipeline run.
@@ -48,6 +54,10 @@ pub struct DistillationReport {
     pub contradictions_found: usize,
     /// Raw notes archived to `vault/archive/<yyyy-mm>/` (T005; was wiki-moves).
     pub migrated_files: Vec<(PathBuf, PathBuf)>,
+    /// Identity `(source path, original content hash)` of every note archived
+    /// this cycle, used to write the durable FR-011 projection after the commit
+    /// that makes those archives durable.
+    pub archived_identities: Vec<(String, String)>,
 }
 
 /// Return type from `run_scoped` carrying the distillation report plus
@@ -294,13 +304,24 @@ pub fn append_provenance(raw: &str, pairs: &[(&str, String)]) -> String {
 /// as rollback insurance; `run_scoped` removes it after a clean conditional
 /// commit. Replaces the old wiki-tree move: raw notes leave the inbox but
 /// never enter the wiki domain dirs; the inbox is empty after a Completed cycle.
+/// A note archived by [`archive_processed_notes`].
+///
+/// `checksum` is taken from the ORIGINAL source content before archiving: the
+/// archived copy gains provenance frontmatter, so hashing the destination would
+/// never match the inbox file's hash and the FR-011 projection would be useless.
+struct ArchivedNote {
+    source: PathBuf,
+    dest: PathBuf,
+    checksum: String,
+}
+
 fn archive_processed_notes(
     notes: &[Note],
     archive_dir: &Path,
     cycle_id: &str,
     track: &TransactionScope,
     defer_source_removal: bool,
-) -> Vec<(PathBuf, PathBuf)> {
+) -> Vec<ArchivedNote> {
     let mut archived = Vec::new();
 
     for note in notes {
@@ -348,7 +369,7 @@ fn archive_processed_notes(
                 ("archived_at", now.to_rfc3339()),
                 ("cycle_id", cycle_id.to_string()),
                 ("original_created_at", note.created_at.to_rfc3339()),
-                ("checksum", checksum),
+                ("checksum", checksum.clone()),
                 ("merged_into", String::new()),
             ],
         );
@@ -368,7 +389,11 @@ fn archive_processed_notes(
                     dest = %dest.display(),
                     "Archived processed inbox note"
                 );
-                archived.push((source, dest));
+                archived.push(ArchivedNote {
+                    source,
+                    dest,
+                    checksum,
+                });
             }
             Err(e) => {
                 tracing::warn!(
@@ -381,6 +406,34 @@ fn archive_processed_notes(
     }
 
     archived
+}
+
+/// Persist the terminal stage for each note archived this cycle (FR-011).
+///
+/// Called only after a successful commit, so the projection never claims a note
+/// reached a stage whose outputs were rolled back. A no-op without a database
+/// (the pipeline can run DB-less) or when nothing was archived.
+async fn record_archived_stages(db: Option<&SqliteClient>, identities: &[(String, String)]) {
+    let Some(db) = db else {
+        return;
+    };
+    if identities.is_empty() {
+        return;
+    }
+    let repo = NotionsRepo::new(db);
+    let now = chrono::Utc::now().to_rfc3339();
+    for (file_path, content_hash) in identities {
+        if let Err(e) = repo
+            .record_note_stage(file_path, content_hash, STAGE_ARCHIVED, &now)
+            .await
+        {
+            warn!(
+                file_path = %file_path,
+                error = %e,
+                "FR-011: recording the archived stage failed (note may be reprocessed)"
+            );
+        }
+    }
 }
 
 /// Orchestrates the full distillation pipeline: budget gate, normalize,
@@ -651,6 +704,10 @@ impl DistillationPipeline {
                     true
                 };
                 if committed {
+                    // FR-011: with the archives now durable, record the terminal
+                    // stage. Both the CAS and non-CAS commit paths land here, so
+                    // the projection is written whichever commit path ran.
+                    record_archived_stages(db, &outcome.report.archived_identities).await;
                     checkpoints.write_checkpoint(&Checkpoint {
                         status: "completed".to_string(),
                         started_at: chrono::Utc::now().to_rfc3339(),
@@ -705,6 +762,64 @@ impl DistillationPipeline {
                     info!(
                         skipped = before - notes.len(),
                         "FR-012 skip_extensions filtered notes"
+                    );
+                }
+            }
+        }
+
+        // FR-011: durable per-note identity. Skip any note whose exact content
+        // already reached the terminal stage. The projection is written only
+        // after the commit that made those writes durable, so a crash or a CAS
+        // rollback cannot leave a note recorded as archived while its outputs
+        // were deleted — the same note would then be skipped and silently lost.
+        if let Some(db) = db
+            && let Ok(recorded) = NotionsRepo::new(db).load_note_stages().await
+        {
+            let completed: HashSet<(String, String)> = recorded
+                .into_iter()
+                .filter(|row| row.last_completed_stage == STAGE_ARCHIVED)
+                .map(|row| (row.file_path, row.content_hash))
+                .collect();
+            if !completed.is_empty() {
+                let mut skipped: Vec<PathBuf> = Vec::new();
+                notes.retain(|note| match note.file_path.as_ref() {
+                    Some(path) => {
+                        // Hash the file's bytes, matching the hash recorded at
+                        // archive time (which covers the whole file). Hashing
+                        // `note.content` here would compare frontmatter-stripped
+                        // text against full-file bytes and never match.
+                        let hash = match std::fs::read(path) {
+                            Ok(bytes) => {
+                                ChangeDetector::compute_checksum(&String::from_utf8_lossy(&bytes))
+                            }
+                            Err(_) => return true,
+                        };
+                        if completed.contains(&(path.display().to_string(), hash)) {
+                            skipped.push(path.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    None => true,
+                });
+                // The content is already durable in the archive, so the inbox
+                // copy is a duplicate. Remove it rather than leaving it: an
+                // inbox that never drains would break FR-006's empty-inbox
+                // guarantee and re-skip the same file every cycle.
+                for path in &skipped {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "FR-011: could not remove an already-archived inbox duplicate"
+                        );
+                    }
+                }
+                if !skipped.is_empty() {
+                    info!(
+                        skipped = skipped.len(),
+                        "FR-011: note already archived for this content — duplicate removed"
                     );
                 }
             }
@@ -983,7 +1098,7 @@ impl DistillationPipeline {
         // FR-032: under CAS the inbox sources stay in place as rollback
         // insurance; run_scoped removes them only after a clean commit.
         let deferred_sources = if defer_source_removal {
-            archived.iter().map(|(src, _)| src.clone()).collect()
+            archived.iter().map(|a| a.source.clone()).collect()
         } else {
             Vec::new()
         };
@@ -1014,7 +1129,14 @@ impl DistillationPipeline {
                 merged_count,
                 wiki_pages_created,
                 contradictions_found,
-                migrated_files: archived,
+                archived_identities: archived
+                    .iter()
+                    .map(|a| (a.source.display().to_string(), a.checksum.clone()))
+                    .collect(),
+                migrated_files: archived
+                    .iter()
+                    .map(|a| (a.source.clone(), a.dest.clone()))
+                    .collect(),
             },
             verifications,
             pending_count: pending_notes.len(),
@@ -1403,6 +1525,7 @@ impl Workflow for DistillationPipeline {
                 wiki_pages_created: 0,
                 contradictions_found: 0,
                 migrated_files: Vec::new(),
+                archived_identities: Vec::new(),
             });
         }
 
@@ -1512,7 +1635,7 @@ impl Workflow for DistillationPipeline {
             0
         };
 
-        let migrated = if !dry_run {
+        let (migrated, archived_identities) = if !dry_run {
             let archive_dir = wiki_dir
                 .parent()
                 .map(|p| p.join("archive"))
@@ -1524,9 +1647,18 @@ impl Workflow for DistillationPipeline {
             let archived = archive_processed_notes(&notes, &archive_dir, &cycle_id, &txn, false);
             txn.commit()
                 .map_err(|e| KernelError::ToolFailed(e.to_string()))?;
-            archived
+            (
+                archived
+                    .iter()
+                    .map(|a| (a.source.clone(), a.dest.clone()))
+                    .collect(),
+                archived
+                    .iter()
+                    .map(|a| (a.source.display().to_string(), a.checksum.clone()))
+                    .collect(),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         Ok(DistillationReport {
@@ -1537,6 +1669,7 @@ impl Workflow for DistillationPipeline {
             wiki_pages_created,
             contradictions_found,
             migrated_files: migrated,
+            archived_identities,
         })
     }
 }
@@ -1615,6 +1748,90 @@ updated_at: "2026-05-23T15:00:00+00:00"
         pipeline
             .run_scoped(inbox, wiki, &archive, &logs, None, None)
             .await
+    }
+
+    /// FR-011: the durable per-note projection stops a note whose exact content
+    /// already reached the terminal stage from being processed twice — the
+    /// crash-recovery guarantee the inbox's own file presence cannot give when a
+    /// cycle was interrupted between its writes and its cleanup.
+    #[tokio::test]
+    async fn test_archived_note_is_not_reprocessed_for_the_same_content() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir(&wiki_dir).unwrap();
+        let archive_dir = tmp.path().join("archive");
+        let logs_dir = tmp.path().join("logs");
+        let db = zen_repo::SqliteClient::open(&tmp.path().join("state.db"))
+            .await
+            .unwrap();
+
+        let pipeline = DistillationPipeline::new();
+        let note = create_test_note("note-1", RUST_NOTE);
+
+        // Cycle 1: processed and archived, with its identity recorded.
+        fs::write(inbox_dir.join("note1.md"), &note).unwrap();
+        let first = pipeline
+            .run_scoped(
+                &inbox_dir,
+                &wiki_dir,
+                &archive_dir,
+                &logs_dir,
+                Some(&db),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.report.notes_processed, 1);
+        assert_eq!(first.report.archived_identities.len(), 1);
+
+        // Cycle 2: the identical note reappears (what a crash after the writes
+        // but before the cleanup leaves behind) — it must be skipped AND the
+        // inbox must still drain.
+        fs::write(inbox_dir.join("note1.md"), &note).unwrap();
+        let second = pipeline
+            .run_scoped(
+                &inbox_dir,
+                &wiki_dir,
+                &archive_dir,
+                &logs_dir,
+                Some(&db),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.report.notes_processed, 0,
+            "content already archived must not be processed twice"
+        );
+        assert_eq!(
+            fs::read_dir(&inbox_dir).unwrap().count(),
+            0,
+            "the duplicate must be removed so the inbox drains (FR-006)"
+        );
+
+        // New content is a new identity and is processed again.
+        fs::write(
+            inbox_dir.join("note1.md"),
+            create_test_note("note-1", "# Rust\n\nDifferent content now.\n"),
+        )
+        .unwrap();
+        let third = pipeline
+            .run_scoped(
+                &inbox_dir,
+                &wiki_dir,
+                &archive_dir,
+                &logs_dir,
+                Some(&db),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            third.report.notes_processed, 1,
+            "changed content is a distinct identity and must be processed"
+        );
     }
 
     #[tokio::test]
@@ -1781,6 +1998,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
             wiki_pages_created: 2,
             contradictions_found: 1,
             migrated_files: Vec::new(),
+            archived_identities: Vec::new(),
         };
         let debug_str = format!("{:?}", report);
         assert!(debug_str.contains("notes_processed"));
@@ -1797,6 +2015,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
             wiki_pages_created: 0,
             contradictions_found: 0,
             migrated_files: Vec::new(),
+            archived_identities: Vec::new(),
         };
         let cloned = report.clone();
         assert_eq!(report.notes_processed, cloned.notes_processed);
@@ -1910,7 +2129,11 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let archived = archive_processed_notes(&notes, &archive_dir, "cycle-1", &txn, false);
 
         assert_eq!(archived.len(), 1);
-        let (src, dst) = &archived[0];
+        let ArchivedNote {
+            source: src,
+            dest: dst,
+            ..
+        } = &archived[0];
         assert_eq!(src, &source);
         assert!(
             dst.starts_with(&archive_dir),
@@ -2001,7 +2224,7 @@ updated_at: "2026-05-23T15:00:00+00:00"
         let archived = archive_processed_notes(&notes, &archive_dir, "cycle-3", &txn, false);
 
         assert_eq!(archived.len(), 1);
-        let (_, dst) = &archived[0];
+        let dst = &archived[0].dest;
         assert!(month_dir.join("duplicate.md").exists());
         let dst_name = dst.file_name().unwrap().to_string_lossy();
         assert!(
