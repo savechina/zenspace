@@ -480,8 +480,62 @@ fn passes_confidence_gate(confidence: f32) -> bool {
     confidence >= CONFIDENCE_GATE
 }
 
-/// One typed classification round over the streaming path (async safe — no
-/// nested runtime): one LLM turn returning a **validated**
+/// One prompt → one model reply over the streaming path (async safe — no
+/// nested runtime). Callers own prompt construction and output parsing, so
+/// every typed contract in the crate (intent classification, the T171 binary
+/// classifiers) shares one plumbing implementation instead of forking it.
+pub(crate) async fn complete_prompt(
+    router: &DefaultRouter,
+    prompt: &str,
+    sensitivity: Sensitivity,
+    max_tokens: u32,
+) -> Result<String, String> {
+    let requirements = TaskRequirements {
+        max_tokens: Some(max_tokens),
+        sensitivity,
+        preferred_model: None,
+        budget_limit: None,
+    };
+    // `route()` is a sync trait method whose sensitivity enforcement may run
+    // a blocking provider health check (nested `Runtime::new` inside
+    // OllamaProvider) — panic-safe only off the async runtime.
+    let route_router = router.clone();
+    let provider = tokio::task::spawn_blocking(move || route_router.route(&requirements))
+        .await
+        .map_err(|e| format!("classify route join: {e}"))?
+        .map_err(|e| format!("route: {e}"))?;
+    let prompt = prompt.to_string();
+    tokio::time::timeout(CLASSIFY_TIMEOUT, async {
+        let mut stream = router
+            .call_stream(provider, &prompt)
+            .map_err(|e| format!("stream: {e}"))?;
+        let mut reply = String::new();
+        while let Some(token) = stream.token_rx.recv().await {
+            reply.push_str(&token);
+        }
+        if let Ok(Err(e)) = stream.done_rx.await {
+            return Err(e);
+        }
+        Ok(reply)
+    })
+    .await
+    .map_err(|_| "classification timed out".to_string())?
+}
+
+/// The category+signal classification prompt. Pure, so the contract it states
+/// is testable without a provider.
+pub(crate) fn classification_prompt(query: &str) -> String {
+    format!(
+        "Classify the user's request into exactly one category and, when one clearly applies, one routing signal.\n\
+         Categories: \"Query\" (search or read knowledge), \"Action\" (create, modify, or execute something), \"System\" (manage configuration or services), \"Conversation\" (chat, help, or clarification).\n\
+         Signals: {}\n\
+         User request: {query}\n\
+         Respond with ONLY a JSON object: {{\"category\": \"<Category>\", \"confidence\": <0.0-1.0>, \"signal\": \"<signal-or-omit>\"}}",
+        signal_vocabulary()
+    )
+}
+
+/// One typed classification round: one model reply parsed and validated into
 /// `(category, confidence, signal)`.
 ///
 /// No confidence gate is applied here. [`llm_classify`] layers the L2 verbal
@@ -497,47 +551,10 @@ pub(crate) async fn classify_typed(
     query: &str,
     sensitivity: Sensitivity,
 ) -> Result<Option<(IntentCategory, f32, Option<String>)>, String> {
-    let requirements = TaskRequirements {
-        max_tokens: Some(128),
-        sensitivity,
-        preferred_model: None,
-        budget_limit: None,
-    };
-    // `route()` is a sync trait method whose sensitivity enforcement may run
-    // a blocking provider health check (nested `Runtime::new` inside
-    // OllamaProvider) — panic-safe only off the async runtime.
-    let route_router = router.clone();
-    let provider = tokio::task::spawn_blocking(move || route_router.route(&requirements))
-        .await
-        .map_err(|e| format!("classify route join: {e}"))?
-        .map_err(|e| format!("route: {e}"))?;
-    let prompt = format!(
-        "Classify the user's request into exactly one category and, when one clearly applies, one routing signal.\n\
-         Categories: \"Query\" (search or read knowledge), \"Action\" (create, modify, or execute something), \"System\" (manage configuration or services), \"Conversation\" (chat, help, or clarification).\n\
-         Signals: {}\n\
-         User request: {query}\n\
-         Respond with ONLY a JSON object: {{\"category\": \"<Category>\", \"confidence\": <0.0-1.0>, \"signal\": \"<signal-or-omit>\"}}",
-        signal_vocabulary()
-    );
-    let reply = tokio::time::timeout(CLASSIFY_TIMEOUT, async {
-        let mut stream = router
-            .call_stream(provider, &prompt)
-            .map_err(|e| format!("stream: {e}"))?;
-        let mut reply = String::new();
-        while let Some(token) = stream.token_rx.recv().await {
-            reply.push_str(&token);
-        }
-        if let Ok(Err(e)) = stream.done_rx.await {
-            return Err(e);
-        }
-        Ok(reply)
-    })
-    .await
-    .map_err(|_| "classification timed out".to_string())??;
-
-    let (category, confidence, signal) = parse_classification(&reply)
-        .ok_or_else(|| format!("unparsable classification reply: {reply}"))?;
-    Ok(Some((category, confidence, signal)))
+    let reply = complete_prompt(router, &classification_prompt(query), sensitivity, 128).await?;
+    parse_classification(&reply)
+        .map(Some)
+        .ok_or_else(|| format!("unparsable classification reply: {reply}"))
 }
 
 /// L2's call: [`classify_typed`] plus the 001 A.3 verbal-confidence gate

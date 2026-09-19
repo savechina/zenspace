@@ -43,8 +43,9 @@ pub use agent_profile::{
 };
 pub use context::AgentContext;
 pub use decision::{
-    DecisionError, DecisionFn, DecisionOutcome, DecisionRung, EmbeddingIntentRouter, KeywordRung,
-    LlmRung, TextEmbedder, VaultTextEmbedder,
+    BinaryDecision, DecisionError, DecisionFn, DecisionOutcome, DecisionRung, DecisionThresholds,
+    EmbeddingIntentRouter, KeywordRung, LlmRung, LocalBinaryClassifier, LocalClassifierRung,
+    TextEmbedder, VaultTextEmbedder, classify_binary, resolve_binary_threshold,
 };
 pub use execution::{AgentExecution, ExecutionMetadata, ToolCall};
 pub use executor::{AgentExecutor, ErrorCategory, RetryPolicy};

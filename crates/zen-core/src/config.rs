@@ -459,6 +459,8 @@ pub struct AgenticConfig {
     pub orchestrator: OrchestratorConfig,
     /// Intent classification tuning — TOML `[agentic.intent]` (T168).
     pub intent: IntentConfig,
+    /// Binary-classifier thresholds — TOML `[agentic.classifiers]` (T171).
+    pub classifiers: ClassifierConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -906,6 +908,59 @@ impl IntentConfig {
             }
             None => None,
         }
+    }
+}
+
+/// Binary-classifier thresholds — TOML `[agentic.classifiers]` (T171).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: calibrated operating points for the two T171 binary
+///   classifiers — "is this user turn correcting prior output?" and "does
+///   this response cite this note?" — which supersede T161's substring and
+///   fingerprint heuristics once a threshold exists.
+/// - User impact: setting either activates the local classifier for that
+///   decision; a confident verdict then drives FR-034 reward bookkeeping
+///   instead of the substring rule.
+/// - Default: both absent. **Absent means the T161 heuristic stays
+///   authoritative** — no threshold is invented (V13-A.3); values come from
+///   calibration (T173's `logs/decision-audit/thresholds.json`) or this
+///   explicit override. Valid range 0.0..=1.0; out-of-range is ignored.
+/// - Interaction: `ZEN_CLASSIFIER_CORRECTION_THRESHOLD` /
+///   `ZEN_CLASSIFIER_CITATION_THRESHOLD` override any config layer; the
+///   config value wins over the calibration artefact.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ClassifierConfig {
+    /// Gate for the is-this-a-correction classifier. Absent ⇒ T161's
+    /// CORRECTION_MARKERS leading-clause rule decides.
+    pub correction_threshold: Option<f32>,
+    /// Gate for the does-this-cite classifier. Absent ⇒ T161's body-fingerprint
+    /// containment rule decides.
+    pub citation_threshold: Option<f32>,
+}
+
+impl ClassifierConfig {
+    /// The configured correction gate, or `None` when unset/out-of-range.
+    pub fn correction_threshold(&self) -> Option<f32> {
+        validated_threshold(self.correction_threshold, "correction_threshold")
+    }
+
+    /// The configured citation gate, or `None` when unset/out-of-range.
+    pub fn citation_threshold(&self) -> Option<f32> {
+        validated_threshold(self.citation_threshold, "citation_threshold")
+    }
+}
+
+/// A classifier threshold is usable only inside `0.0..=1.0`; anything else
+/// warns and leaves the gate closed rather than silently mis-gating.
+fn validated_threshold(value: Option<f32>, key: &str) -> Option<f32> {
+    match value {
+        Some(value) if (0.0..=1.0).contains(&value) => Some(value),
+        Some(value) => {
+            tracing::warn!(key, value, "threshold outside 0.0..=1.0; gate stays closed");
+            None
+        }
+        None => None,
     }
 }
 
@@ -1861,6 +1916,16 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
             shadow_embedding: ov.intent.shadow_embedding.or(base.intent.shadow_embedding),
             l1_threshold: ov.intent.l1_threshold.or(base.intent.l1_threshold),
         },
+        classifiers: ClassifierConfig {
+            correction_threshold: ov
+                .classifiers
+                .correction_threshold
+                .or(base.classifiers.correction_threshold),
+            citation_threshold: ov
+                .classifiers
+                .citation_threshold
+                .or(base.classifiers.citation_threshold),
+        },
     }
 }
 
@@ -2183,6 +2248,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_delegate_env(&mut config.agentic.delegate);
     apply_orchestrator_env(&mut config.agentic.orchestrator);
     apply_intent_env(&mut config.agentic.intent);
+    apply_classifier_env(&mut config.agentic.classifiers);
     apply_skills_env(&mut config.skills.auto_route);
     config
 }
@@ -2244,6 +2310,27 @@ fn apply_delegate_env(cfg: &mut DelegateConfig) {
 fn apply_orchestrator_env(cfg: &mut OrchestratorConfig) {
     if let Some(v) = env_str("ZEN_ORCHESTRATOR_SURFACE") {
         cfg.surface = Some(v);
+    }
+}
+
+fn apply_classifier_env(cfg: &mut ClassifierConfig) {
+    if let Some(v) = env_str("ZEN_CLASSIFIER_CORRECTION_THRESHOLD") {
+        match v.trim().parse::<f32>() {
+            Ok(parsed) => cfg.correction_threshold = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_CLASSIFIER_CORRECTION_THRESHOLD is not a number; ignoring (heuristic decides)"
+            ),
+        }
+    }
+    if let Some(v) = env_str("ZEN_CLASSIFIER_CITATION_THRESHOLD") {
+        match v.trim().parse::<f32>() {
+            Ok(parsed) => cfg.citation_threshold = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_CLASSIFIER_CITATION_THRESHOLD is not a number; ignoring (heuristic decides)"
+            ),
+        }
     }
 }
 

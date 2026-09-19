@@ -208,6 +208,43 @@ fn is_user_correction(query: &str) -> bool {
     })
 }
 
+/// FR-034 (T171): resolve whether this turn corrects prior output.
+///
+/// With a calibrated threshold the local binary classifier decides; absent
+/// one — or when the classifier is below τ, abstains, or fails — T161's
+/// leading-clause heuristic decides, exactly as before.
+async fn resolve_user_correction(router: &DefaultRouter, user_query: &str) -> bool {
+    let threshold =
+        crate::decision::resolve_binary_threshold(crate::decision::BinaryDecision::Correction);
+    if threshold.is_none() {
+        return is_user_correction(user_query);
+    }
+    let classifier = crate::decision::LocalBinaryClassifier::new(
+        router,
+        crate::decision::BinaryDecision::Correction,
+    );
+    crate::decision::classify_binary(
+        threshold,
+        is_user_correction(user_query),
+        &classifier,
+        user_query,
+    )
+    .await
+}
+
+/// Upper bound on notes sent to the citation classifier per turn (T171).
+/// The classifier is a local model call per candidate, so the cost is bounded
+/// explicitly rather than scaling with the retrieved set.
+const CITATION_CLASSIFIER_MAX_NOTES: usize = 8;
+
+/// Compose the citation classifier's input: the note's body fingerprint plus
+/// the response, each labelled so the prompt's CONTENT/RESPONSE contract holds.
+fn citation_classifier_input(note_content: &str, response: &str) -> String {
+    let fingerprint = citation_fingerprint(note_content).unwrap_or_default();
+    let trimmed: String = response.chars().take(2000).collect();
+    format!("CONTENT:\n{fingerprint}\nRESPONSE:\n{trimmed}")
+}
+
 /// FR-036: classify a tool dispatch result as a failure by inspecting the
 /// structured output, not the serialized text. Tools signal errors
 /// structurally — `fs.*`/`delegate.*` return `Ok(json!({ "error": ... }))`
@@ -280,9 +317,8 @@ fn citation_fingerprint(content: &str) -> Option<String> {
 /// FR-034 reward sidecar bookkeeping for one turn: `access_count` for every
 /// memory in context, plus `correction_count` when the turn corrects prior
 /// output while those memories were in context.
-fn increment_reward_for_query(paths: &ZenPaths, knowledge: &[RetrievedNote], user_query: &str) {
+fn increment_reward_for_query(paths: &ZenPaths, knowledge: &[RetrievedNote], correction: bool) {
     let reward_dir = paths.memory().join(".reward");
-    let correction = is_user_correction(user_query);
     for note in knowledge {
         let card_id = zen_vault::distill::card_id_from_path(&note.path);
         if let Err(e) = zen_vault::distill::increment_access(&reward_dir, &card_id) {
@@ -825,9 +861,9 @@ impl AgentOrchestrator {
         // body via spawn_blocking (T160).
         if let Ok(paths) = ZenPaths::detect() {
             let knowledge = context.session.knowledge.clone();
-            let user_query = user_query.to_string();
+            let correction = resolve_user_correction(self.executor.router(), user_query).await;
             tokio::task::spawn_blocking(move || {
-                increment_reward_for_query(&paths, &knowledge, &user_query);
+                increment_reward_for_query(&paths, &knowledge, correction);
             });
         }
 
@@ -1145,16 +1181,48 @@ impl AgentOrchestrator {
         if let Ok(paths) = ZenPaths::detect() {
             let reward_dir = paths.memory().join(".reward");
             let response_lower = final_response.to_lowercase();
-            let cited: Vec<String> = context
-                .session
-                .knowledge
-                .iter()
-                .filter(|note| {
-                    citation_fingerprint(&note.content)
-                        .is_some_and(|fp| response_lower.contains(&fp))
-                })
-                .map(|note| zen_vault::distill::card_id_from_path(&note.path))
-                .collect();
+            let citation_threshold = crate::decision::resolve_binary_threshold(
+                crate::decision::BinaryDecision::Citation,
+            );
+            let cited: Vec<String> = if citation_threshold.is_some() {
+                let classifier = crate::decision::LocalBinaryClassifier::new(
+                    self.executor.router(),
+                    crate::decision::BinaryDecision::Citation,
+                );
+                let mut cited = Vec::new();
+                for note in context
+                    .session
+                    .knowledge
+                    .iter()
+                    .take(CITATION_CLASSIFIER_MAX_NOTES)
+                {
+                    let heuristic = citation_fingerprint(&note.content)
+                        .is_some_and(|fp| response_lower.contains(&fp));
+                    let input = citation_classifier_input(&note.content, &final_response);
+                    if crate::decision::classify_binary(
+                        citation_threshold,
+                        heuristic,
+                        &classifier,
+                        &input,
+                    )
+                    .await
+                    {
+                        cited.push(zen_vault::distill::card_id_from_path(&note.path));
+                    }
+                }
+                cited
+            } else {
+                context
+                    .session
+                    .knowledge
+                    .iter()
+                    .filter(|note| {
+                        citation_fingerprint(&note.content)
+                            .is_some_and(|fp| response_lower.contains(&fp))
+                    })
+                    .map(|note| zen_vault::distill::card_id_from_path(&note.path))
+                    .collect()
+            };
             if !cited.is_empty() {
                 tokio::task::spawn_blocking(move || {
                     for card_id in cited {
@@ -1540,9 +1608,9 @@ impl AgentOrchestrator {
         // body via spawn_blocking (T160).
         if let Ok(paths) = ZenPaths::detect() {
             let knowledge = session.knowledge.clone();
-            let user_query = user_query.to_string();
+            let correction = resolve_user_correction(self.executor.router(), user_query).await;
             tokio::task::spawn_blocking(move || {
-                increment_reward_for_query(&paths, &knowledge, &user_query);
+                increment_reward_for_query(&paths, &knowledge, correction);
             });
         }
 
@@ -2677,12 +2745,12 @@ mod tests {
         }];
         let card_id = zen_vault::distill::card_id_from_path(&knowledge[0].path);
 
-        increment_reward_for_query(&paths, &knowledge, "summarize this");
+        increment_reward_for_query(&paths, &knowledge, is_user_correction("summarize this"));
         let after_access = zen_vault::distill::read_reward(&reward_dir, &card_id);
         assert_eq!(after_access.access_count, 1);
         assert_eq!(after_access.correction_count, 0);
 
-        increment_reward_for_query(&paths, &knowledge, "不对，这个说法错了");
+        increment_reward_for_query(&paths, &knowledge, is_user_correction("不对，这个说法错了"));
         let after_correction = zen_vault::distill::read_reward(&reward_dir, &card_id);
         assert_eq!(after_correction.access_count, 2);
         assert_eq!(

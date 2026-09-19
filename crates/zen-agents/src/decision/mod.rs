@@ -735,6 +735,183 @@ pub fn record_ladder_decision(paths: &ZenPaths, session_id: &str, decision: &Lad
     append_decision_audit(paths, &entry);
 }
 
+/// A binary decision the L1 classifier serves (T171).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryDecision {
+    /// Is this user turn correcting the assistant's prior output? Replaces
+    /// the T161 `CORRECTION_MARKERS` substring rule (FR-034 anti-poisoning).
+    Correction,
+    /// Does this response actually use/cite this retrieved note? Replaces the
+    /// T161 body-fingerprint containment rule (FR-034 `downstream_citations`).
+    Citation,
+}
+
+impl BinaryDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Correction => "correction",
+            Self::Citation => "citation",
+        }
+    }
+}
+
+/// The binary classifier's prompt. Pure, so the contract it states is
+/// testable without a provider. `input` is composed by the caller (for
+/// [`BinaryDecision::Citation`] it carries the labelled CONTENT/RESPONSE
+/// sections).
+pub fn binary_prompt(decision: BinaryDecision, input: &str) -> String {
+    let instruction = match decision {
+        BinaryDecision::Correction => {
+            "Decide whether the user's message is CORRECTING the assistant's previous output \
+             (pointing out an error, contradiction, or wrong fact), as opposed to asking a new \
+             question, giving a new instruction, or chatting. A question that merely mentions an \
+             error - for example \"explain why the previous answer was wrong\" - is NOT a correction."
+        }
+        BinaryDecision::Citation => {
+            "The input below carries a CONTENT section and a RESPONSE section. Decide whether the \
+             RESPONSE actually uses or cites the CONTENT. Merely echoing a heading, a frontmatter \
+             field, or a title is NOT a citation."
+        }
+    };
+    format!(
+        "{instruction}\nInput:\n{input}\nRespond with ONLY a JSON object: {{\"answer\": true|false, \"confidence\": <0.0-1.0>}}"
+    )
+}
+
+/// Parse the binary classifier's typed reply. Accepts a JSON boolean or the
+/// strings `true/false`/`yes/no`; anything else is unparsable (the caller
+/// retries, then fails open to the heuristic).
+pub fn parse_binary(reply: &str) -> Option<(bool, f32)> {
+    let start = reply.find('{')?;
+    let end = reply.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&reply[start..=end]).ok()?;
+    let answer = match value.get("answer")? {
+        serde_json::Value::Bool(answer) => *answer,
+        serde_json::Value::String(raw) => match raw.trim().to_lowercase().as_str() {
+            "true" | "yes" | "y" => true,
+            "false" | "no" | "n" => false,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let confidence = value.get("confidence")?.as_f64()? as f32;
+    Some((answer, confidence.clamp(0.0, 1.0)))
+}
+
+/// L1 rung: the local binary classifier.
+///
+/// Same locality contract as [`LocalClassifierRung`] — abstains when no local
+/// model is reachable, otherwise routes through local-mode sensitivity
+/// enforcement, so it cannot reach a cloud provider. Typed contract enforced
+/// by parse-and-validate with one retry.
+pub struct LocalBinaryClassifier {
+    router: DefaultRouter,
+    decision: BinaryDecision,
+}
+
+impl LocalBinaryClassifier {
+    pub fn new(router: &DefaultRouter, decision: BinaryDecision) -> Self {
+        Self {
+            router: router.clone(),
+            decision,
+        }
+    }
+}
+
+#[async_trait]
+impl DecisionFn<bool> for LocalBinaryClassifier {
+    async fn decide(&self, input: &str) -> Result<Option<DecisionOutcome<bool>>, DecisionError> {
+        if !zen_provider::is_local_llm_available(&self.router) {
+            return Ok(None);
+        }
+        let mut last_error = String::new();
+        for _ in 0..CLASSIFIER_RETRIES {
+            let reply = crate::intent::complete_prompt(
+                &self.router,
+                &binary_prompt(self.decision, input),
+                Sensitivity::Private,
+                64,
+            )
+            .await;
+            match reply {
+                Ok(reply) => match parse_binary(&reply) {
+                    Some((answer, confidence)) => {
+                        return Ok(Some(DecisionOutcome {
+                            rung: DecisionRung::L1,
+                            choice: answer,
+                            confidence,
+                            signal: None,
+                        }));
+                    }
+                    None => last_error = format!("unparsable binary reply: {reply}"),
+                },
+                Err(error) => last_error = error,
+            }
+        }
+        Err(DecisionError::ClassifierUnavailable(last_error))
+    }
+}
+
+/// Apply the calibrated gate to a binary decision (T171).
+///
+/// `heuristic` is T161's L0 verdict and stays authoritative whenever no τ is
+/// calibrated: the substring/fingerprint rules are not retired until a
+/// classifier can be measured against labeled contradictions, and that is
+/// what V13-A.3's "no invented threshold" rule requires. With τ, a confident
+/// classifier verdict wins; below τ, on abstain, or on error the heuristic
+/// decides — so a broken classifier never silently rewrites the reward
+/// bookkeeping.
+pub async fn classify_binary(
+    threshold: Option<f32>,
+    heuristic: bool,
+    l1: &dyn DecisionFn<bool>,
+    input: &str,
+) -> bool {
+    let Some(threshold) = threshold else {
+        return heuristic;
+    };
+    match l1.decide(input).await {
+        Ok(Some(outcome)) if outcome.confidence >= threshold => outcome.choice,
+        Ok(Some(outcome)) => {
+            tracing::debug!(
+                decision = outcome.rung.as_str(),
+                confidence = outcome.confidence,
+                threshold,
+                "binary classifier below the calibrated threshold; heuristic decides"
+            );
+            heuristic
+        }
+        Ok(None) => heuristic,
+        Err(error) => {
+            warn!(%error, "binary classifier unavailable; heuristic decides");
+            heuristic
+        }
+    }
+}
+
+/// Resolve a binary decision's threshold — config override first, then the
+/// calibration artefact. `None` keeps T161's heuristic authoritative.
+pub fn resolve_binary_threshold(decision: BinaryDecision) -> Option<f32> {
+    let configured = zen_core::config::load_config()
+        .ok()
+        .and_then(|config| match decision {
+            BinaryDecision::Correction => config.agentic.classifiers.correction_threshold(),
+            BinaryDecision::Citation => config.agentic.classifiers.citation_threshold(),
+        });
+    configured.or_else(|| {
+        ZenPaths::detect().ok().and_then(|paths| {
+            let thresholds = DecisionThresholds::load(&thresholds_path(&paths));
+            match decision {
+                BinaryDecision::Correction => thresholds.correction_l1,
+                BinaryDecision::Citation => thresholds.citation_l1,
+            }
+        })
+    })
+}
+
 /// T168: shadow-mode L1 observation at the intent decision point. Runs the
 /// L1 rung after the production decision and appends a `loop.decision` audit
 /// line. Never affects the production decision — the caller returns the
@@ -1273,5 +1450,129 @@ mod tests {
             "Hephaestus",
             "an unknown signal must fall back, not route"
         );
+    }
+
+    /// Binary rung returning a fixed verdict (T171 tests).
+    struct FixedBoolRung {
+        outcome: Option<DecisionOutcome<bool>>,
+    }
+
+    #[async_trait]
+    impl DecisionFn<bool> for FixedBoolRung {
+        async fn decide(
+            &self,
+            _input: &str,
+        ) -> Result<Option<DecisionOutcome<bool>>, DecisionError> {
+            Ok(self.outcome.clone())
+        }
+    }
+
+    struct BrokenBoolRung;
+
+    #[async_trait]
+    impl DecisionFn<bool> for BrokenBoolRung {
+        async fn decide(
+            &self,
+            _input: &str,
+        ) -> Result<Option<DecisionOutcome<bool>>, DecisionError> {
+            Err(DecisionError::ClassifierUnavailable("offline".to_string()))
+        }
+    }
+
+    fn bool_outcome(choice: bool, confidence: f32) -> DecisionOutcome<bool> {
+        DecisionOutcome {
+            rung: DecisionRung::L1,
+            choice,
+            confidence,
+            signal: None,
+        }
+    }
+
+    #[test]
+    fn parse_binary_accepts_bool_yes_no_and_rejects_garbage() {
+        assert_eq!(
+            parse_binary(r#"{"answer": true, "confidence": 0.9}"#),
+            Some((true, 0.9))
+        );
+        assert_eq!(
+            parse_binary(r#"{"answer": "NO", "confidence": 1.5}"#),
+            Some((false, 1.0)),
+            "string answers and clamped confidence are accepted"
+        );
+        assert_eq!(
+            parse_binary("preamble {\"answer\": false, \"confidence\": 0.7} trailing"),
+            Some((false, 0.7))
+        );
+        assert_eq!(parse_binary("no json"), None);
+        assert_eq!(
+            parse_binary(r#"{"answer": "maybe", "confidence": 0.9}"#),
+            None
+        );
+        assert_eq!(parse_binary(r#"{"answer": true}"#), None, "score required");
+    }
+
+    #[test]
+    fn binary_prompt_states_the_anti_echo_rule() {
+        let citation = binary_prompt(BinaryDecision::Citation, "CONTENT:\nx\nRESPONSE:\ny");
+        assert!(citation.contains("NOT a citation"), "echo must not count");
+        assert!(citation.contains("CONTENT"));
+        assert!(citation.contains("RESPONSE"));
+        assert!(citation.contains("\"answer\""));
+        assert!(citation.contains("\"confidence\""));
+
+        let correction = binary_prompt(BinaryDecision::Correction, "that is wrong");
+        assert!(correction.contains("NOT a correction"));
+        assert!(correction.contains("that is wrong"));
+    }
+
+    #[tokio::test]
+    async fn binary_gate_without_threshold_never_calls_the_classifier() {
+        // T161 stays authoritative: the classifier must not even run.
+        let rung = FixedBoolRung {
+            outcome: Some(bool_outcome(false, 1.0)),
+        };
+        let verdict = classify_binary(None, true, &rung, "任何东西").await;
+        assert!(verdict, "the heuristic decides when no τ is calibrated");
+    }
+
+    #[tokio::test]
+    async fn binary_gate_uses_a_confident_classifier_verdict() {
+        let rung = FixedBoolRung {
+            outcome: Some(bool_outcome(true, 0.95)),
+        };
+        assert!(classify_binary(Some(0.8), false, &rung, "任何东西").await);
+
+        let rejecting = FixedBoolRung {
+            outcome: Some(bool_outcome(false, 0.95)),
+        };
+        assert!(
+            !classify_binary(Some(0.8), true, &rejecting, "任何东西").await,
+            "the classifier overrides a heuristic false positive"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_gate_falls_back_to_the_heuristic_below_threshold_or_on_failure() {
+        let timid = FixedBoolRung {
+            outcome: Some(bool_outcome(true, 0.3)),
+        };
+        assert!(
+            !classify_binary(Some(0.8), false, &timid, "任何东西").await,
+            "below τ the heuristic decides"
+        );
+
+        let abstaining = FixedBoolRung { outcome: None };
+        assert!(classify_binary(Some(0.8), true, &abstaining, "任何东西").await);
+
+        assert!(
+            !classify_binary(Some(0.8), false, &BrokenBoolRung, "任何东西").await,
+            "a broken classifier must not rewrite reward bookkeeping"
+        );
+    }
+
+    #[test]
+    fn binary_decision_as_str_roundtrips() {
+        assert_eq!(BinaryDecision::Correction.as_str(), "correction");
+        assert_eq!(BinaryDecision::Citation.as_str(), "citation");
     }
 }
