@@ -54,7 +54,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -738,6 +738,393 @@ impl std::fmt::Display for CalibrationReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Threshold calibration (T173 → T168-T171): labels in, operating points out
+// ---------------------------------------------------------------------------
+
+/// Subdirectory holding the label interface and the calibration artefact.
+pub const DECISION_AUDIT_DIR: &str = "decision-audit";
+
+/// Calibrated operating points consumed by the decision gates. This is the
+/// filename `zen-agents::decision::DecisionThresholds::load` reads.
+pub const THRESHOLDS_FILE: &str = "thresholds.json";
+
+/// Minimum labeled records before ANY operating point may be emitted. Below
+/// this the calibration refuses rather than fitting noise — a threshold chosen
+/// from a handful of labels is worse than a closed gate.
+pub const MIN_LABELS_FOR_CALIBRATION: usize = 100;
+
+/// Minimum precision on the accepted set for a candidate threshold.
+pub const MIN_ACCEPTED_PRECISION: f64 = 0.95;
+
+/// Minimum share of labeled records a candidate threshold must accept, so a
+/// "perfect" threshold that accepts nothing cannot masquerade as calibrated.
+pub const MIN_ACCEPTED_COVERAGE: f64 = 0.10;
+
+/// Minimum precision improvement over the base rate required to conclude that
+/// confidence carries any signal at all. V13-A.3's "never gate on verbalized
+/// confidence alone" (arXiv 2601.07767) is enforced here: a confidence that
+/// does not separate correct from incorrect decisions yields NO threshold,
+/// however high its numbers look.
+pub const MIN_PRECISION_LIFT: f64 = 0.05;
+
+/// Rounding scale used when persisting a threshold (4 decimals).
+pub const THRESHOLD_SCALE: f64 = 10_000.0;
+
+/// The objective a calibrated operating point must satisfy.
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationTarget {
+    pub min_precision: f64,
+    pub min_coverage: f64,
+    pub min_labels: usize,
+    pub min_precision_lift: f64,
+}
+
+impl Default for CalibrationTarget {
+    fn default() -> Self {
+        Self {
+            min_precision: MIN_ACCEPTED_PRECISION,
+            min_coverage: MIN_ACCEPTED_COVERAGE,
+            min_labels: MIN_LABELS_FOR_CALIBRATION,
+            min_precision_lift: MIN_PRECISION_LIFT,
+        }
+    }
+}
+
+/// One candidate operating point: accepting every decision at or above
+/// `threshold` yields this precision and coverage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdPoint {
+    pub threshold: f32,
+    pub precision: f64,
+    pub coverage: f64,
+    pub accepted: usize,
+}
+
+/// A selected, defensible operating point with its risk audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibratedThreshold {
+    /// Threshold field name in `thresholds.json` (e.g. `"intent_l1"`).
+    pub field: String,
+    /// Source decision kind the sample came from.
+    pub kind: String,
+    /// Source rung the sample came from.
+    pub rung: String,
+    pub threshold: f32,
+    pub precision: f64,
+    pub coverage: f64,
+    /// Precision of the gate being *closed* (accept everything) — the
+    /// baseline the lift is measured against.
+    pub base_rate: f64,
+    pub precision_lift: f64,
+    /// ECE over the accepted set at the selected threshold.
+    pub ece: Option<f64>,
+    pub labeled: usize,
+    pub accepted: usize,
+}
+
+/// Why a threshold was — or was not — selected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ThresholdOutcome {
+    /// A defensible operating point was selected.
+    Selected(CalibratedThreshold),
+    /// Not enough labeled records.
+    InsufficientLabels { labeled: usize, required: usize },
+    /// Confidence does not separate correct from incorrect decisions, so no
+    /// gate may be derived from it (V13-A.3).
+    UninformativeConfidence {
+        base_rate: f64,
+        best_precision: f64,
+        required_lift: f64,
+    },
+    /// No candidate met both the precision target and the coverage floor.
+    CannotMeetTarget {
+        best: Option<ThresholdPoint>,
+        required_precision: f64,
+        required_coverage: f64,
+    },
+}
+
+impl ThresholdOutcome {
+    /// The selected operating point, if any.
+    pub fn selected(&self) -> Option<&CalibratedThreshold> {
+        match self {
+            Self::Selected(threshold) => Some(threshold),
+            _ => None,
+        }
+    }
+
+    /// Short machine-readable state name.
+    pub fn state(&self) -> &'static str {
+        match self {
+            Self::Selected(_) => "selected",
+            Self::InsufficientLabels { .. } => "insufficient_labels",
+            Self::UninformativeConfidence { .. } => "uninformative_confidence",
+            Self::CannotMeetTarget { .. } => "cannot_meet_target",
+        }
+    }
+}
+
+/// Which `(kind, rung)` sample calibrates which threshold field.
+///
+/// The rung filter is load-bearing: an `intent` record produced by the LLM or
+/// keyword rung carries a *different* confidence than the L1 rung's, so
+/// calibrating `intent_l1` from it would fit the wrong signal entirely.
+#[derive(Debug, Clone, Copy)]
+pub struct ThresholdSource {
+    pub field: &'static str,
+    pub kind: &'static str,
+    pub rung: &'static str,
+}
+
+/// The four gates the ladder exposes, each with its calibration sample.
+pub const THRESHOLD_SOURCES: &[ThresholdSource] = &[
+    ThresholdSource {
+        field: "intent_l1",
+        kind: "intent",
+        rung: "L1",
+    },
+    ThresholdSource {
+        field: "correction_l1",
+        kind: "correction",
+        rung: "L1",
+    },
+    ThresholdSource {
+        field: "citation_l1",
+        kind: "citation",
+        rung: "L1",
+    },
+    ThresholdSource {
+        field: "review_escalate",
+        kind: "review",
+        rung: "L1",
+    },
+];
+
+/// Calibration outcome for one threshold field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldCalibration {
+    pub field: String,
+    pub kind: String,
+    pub rung: String,
+    /// Labeled records in this field's sample.
+    pub labeled: usize,
+    pub outcome: ThresholdOutcome,
+}
+
+impl FieldCalibration {
+    pub fn state(&self) -> &'static str {
+        self.outcome.state()
+    }
+}
+
+/// Select an operating point from `(confidence, correct)` pairs.
+///
+/// The objective is the Trust-or-Escalate one: among thresholds meeting the
+/// precision target, prefer the one that accepts the most decisions. A
+/// threshold below which the gate would accept a wrong decision is a
+/// mis-accept, so precision-on-accepted is the quantity that matters — not
+/// aggregate accuracy.
+pub fn select_threshold(pairs: &[(f64, bool)], target: CalibrationTarget) -> ThresholdOutcome {
+    let labeled = pairs.len();
+    if labeled < target.min_labels {
+        return ThresholdOutcome::InsufficientLabels {
+            labeled,
+            required: target.min_labels,
+        };
+    }
+
+    let correct = pairs.iter().filter(|(_, correct)| *correct).count();
+    let base_rate = correct as f64 / labeled as f64;
+
+    let mut candidates: Vec<f32> = pairs
+        .iter()
+        .map(|(confidence, _)| *confidence as f32)
+        .collect();
+    candidates.sort_by(|a, b| a.total_cmp(b));
+    candidates.dedup();
+
+    let mut points: Vec<ThresholdPoint> = Vec::new();
+    for threshold in candidates {
+        let accepted: Vec<&(f64, bool)> = pairs
+            .iter()
+            .filter(|(confidence, _)| *confidence as f32 >= threshold)
+            .collect();
+        if accepted.is_empty() {
+            continue;
+        }
+        let accepted_correct = accepted.iter().filter(|(_, correct)| *correct).count();
+        points.push(ThresholdPoint {
+            threshold,
+            precision: accepted_correct as f64 / accepted.len() as f64,
+            coverage: accepted.len() as f64 / labeled as f64,
+            accepted: accepted.len(),
+        });
+    }
+
+    let best_precision = points
+        .iter()
+        .map(|point| point.precision)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !best_precision.is_finite() || best_precision - base_rate < target.min_precision_lift {
+        return ThresholdOutcome::UninformativeConfidence {
+            base_rate,
+            best_precision: if best_precision.is_finite() {
+                best_precision
+            } else {
+                0.0
+            },
+            required_lift: target.min_precision_lift,
+        };
+    }
+
+    let eligible: Vec<&ThresholdPoint> = points
+        .iter()
+        .filter(|point| {
+            point.precision >= target.min_precision && point.coverage >= target.min_coverage
+        })
+        .collect();
+
+    let Some(chosen) = eligible
+        .iter()
+        .copied()
+        // Max coverage; ties resolved by the lowest threshold (iteration order
+        // is ascending, so strict `>` keeps the first/most-accepting point),
+        // which keeps selection deterministic.
+        .fold(None::<&ThresholdPoint>, |best, point| match best {
+            Some(current) if current.coverage >= point.coverage => Some(current),
+            _ => Some(point),
+        })
+    else {
+        let best = points
+            .iter()
+            .max_by(|a, b| a.precision.total_cmp(&b.precision))
+            .cloned();
+        return ThresholdOutcome::CannotMeetTarget {
+            best,
+            required_precision: target.min_precision,
+            required_coverage: target.min_coverage,
+        };
+    };
+
+    let accepted_pairs: Vec<(f64, bool)> = pairs
+        .iter()
+        .filter(|(confidence, _)| *confidence as f32 >= chosen.threshold)
+        .copied()
+        .collect();
+
+    ThresholdOutcome::Selected(CalibratedThreshold {
+        field: String::new(),
+        kind: String::new(),
+        rung: String::new(),
+        threshold: chosen.threshold,
+        precision: chosen.precision,
+        coverage: chosen.coverage,
+        base_rate,
+        precision_lift: chosen.precision - base_rate,
+        ece: Some(ece(&accepted_pairs)),
+        labeled,
+        accepted: chosen.accepted,
+    })
+}
+
+/// Calibrate one threshold field from its `(kind, rung)` sample.
+pub fn calibrate_field(
+    records: &[DecisionRecord],
+    source: &ThresholdSource,
+    target: CalibrationTarget,
+) -> FieldCalibration {
+    let pairs: Vec<(f64, bool)> = records
+        .iter()
+        .filter(|record| record.kind == source.kind && record.rung == source.rung)
+        .filter_map(|record| {
+            let confidence = record.confidence?;
+            let correct = is_correct(record)?;
+            Some((confidence, correct))
+        })
+        .collect();
+
+    let labeled = pairs.len();
+    let outcome = select_threshold(&pairs, target);
+    let outcome = match outcome {
+        ThresholdOutcome::Selected(mut selected) => {
+            selected.field = source.field.to_string();
+            selected.kind = source.kind.to_string();
+            selected.rung = source.rung.to_string();
+            ThresholdOutcome::Selected(selected)
+        }
+        other => other,
+    };
+
+    FieldCalibration {
+        field: source.field.to_string(),
+        kind: source.kind.to_string(),
+        rung: source.rung.to_string(),
+        labeled,
+        outcome,
+    }
+}
+
+/// Calibrate every threshold field the ladder exposes.
+pub fn calibrate(records: &[DecisionRecord], target: CalibrationTarget) -> Vec<FieldCalibration> {
+    THRESHOLD_SOURCES
+        .iter()
+        .map(|source| calibrate_field(records, source, target))
+        .collect()
+}
+
+/// Path of the calibration artefact under `<logs>/decision-audit/`.
+pub fn thresholds_path(logs_dir: &Path) -> PathBuf {
+    logs_dir.join(DECISION_AUDIT_DIR).join(THRESHOLDS_FILE)
+}
+
+/// Merge-write selected operating points into the calibration artefact.
+///
+/// Merge semantics are deliberate: a field that produced no defensible
+/// threshold this run keeps its previous value, so recalibrating one gate can
+/// never silently close (or open) an unrelated one. The write is atomic
+/// (tmp + rename), matching the repo's artefact-write discipline.
+///
+/// Only [`ThresholdOutcome::Selected`] fields are written — a refusal is never
+/// persisted as a number.
+pub fn write_thresholds(
+    logs_dir: &Path,
+    calibrations: &[FieldCalibration],
+) -> Result<PathBuf, DecisionAuditError> {
+    let path = thresholds_path(logs_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut root: serde_json::Map<String, serde_json::Value> = match std::fs::read_to_string(&path)
+    {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        Err(_) => serde_json::Map::new(),
+    };
+
+    for calibration in calibrations {
+        if let Some(selected) = calibration.outcome.selected() {
+            // Persist to 4 decimals. `serde_json::Value` stores numbers as f64,
+            // so an f32 0.95 would otherwise be written as 0.949999988079071 —
+            // more precision than a confidence gate needs, and unreadable to
+            // the human who has to audit the artefact.
+            let rounded =
+                (f64::from(selected.threshold) * THRESHOLD_SCALE).round() / THRESHOLD_SCALE;
+            root.insert(calibration.field.clone(), serde_json::json!(rounded));
+        }
+    }
+
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body.as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,5 +1431,179 @@ mod tests {
         assert_eq!(back.kinds[0].rungs[0].ece, report.kinds[0].rungs[0].ece);
         // Display renders the section header.
         assert!(report.to_string().contains("[calibration]"));
+    }
+    // ---- threshold calibration (T173 -> T168-T171) ----
+
+    /// Labeled record whose label equals its decision — i.e. a correct
+    /// decision, which is what a calibration sample grades against.
+    fn calibration_record(
+        kind: &str,
+        rung: &str,
+        confidence: f64,
+        decision: &str,
+    ) -> DecisionRecord {
+        record(
+            &format!("{kind}-{rung}-{confidence}-{decision}"),
+            kind,
+            rung,
+            Some(confidence),
+            Some(decision),
+            Some(decision),
+        )
+    }
+
+    /// Confidence that separates correct from incorrect decisions is the
+    /// precondition for any gate at all.
+    fn informative_pairs() -> Vec<(f64, bool)> {
+        let mut pairs: Vec<(f64, bool)> = (0..80).map(|_| (0.95, true)).collect();
+        pairs.extend((0..5).map(|_| (0.30, true)));
+        pairs.extend((0..15).map(|_| (0.30, false)));
+        pairs
+    }
+
+    #[test]
+    fn calibration_refuses_below_the_minimum_sample() {
+        let pairs: Vec<(f64, bool)> = (0..10).map(|_| (0.99, true)).collect();
+        let outcome = select_threshold(&pairs, CalibrationTarget::default());
+        assert_eq!(outcome.state(), "insufficient_labels");
+        assert!(outcome.selected().is_none());
+    }
+
+    #[test]
+    fn calibration_selects_the_widest_accepting_threshold_meeting_precision() {
+        let outcome = select_threshold(&informative_pairs(), CalibrationTarget::default());
+        let selected = outcome.selected().expect("a defensible threshold");
+
+        assert_eq!(selected.threshold, 0.95);
+        assert_eq!(selected.precision, 1.0);
+        assert!((selected.coverage - 0.8).abs() < 1e-9);
+        assert!(selected.precision_lift >= MIN_PRECISION_LIFT);
+        assert!(selected.ece.is_some());
+    }
+
+    #[test]
+    fn calibration_refuses_uninformative_confidence() {
+        // Correctness is independent of confidence: half the confident
+        // decisions are right, half the unconfident ones too. A gate derived
+        // from this would be a coin flip wearing a number (V13-A.3 /
+        // arXiv 2601.07767).
+        let mut pairs: Vec<(f64, bool)> = (0..50).map(|i| (0.9, i % 2 == 0)).collect();
+        pairs.extend((0..50).map(|i| (0.2, i % 2 == 0)));
+
+        let outcome = select_threshold(&pairs, CalibrationTarget::default());
+        assert_eq!(outcome.state(), "uninformative_confidence");
+        assert!(outcome.selected().is_none());
+    }
+
+    #[test]
+    fn calibration_refuses_a_perfect_gate_that_accepts_almost_nothing() {
+        // The 0.99 candidate is perfectly precise but covers 2.5% of the
+        // sample, below the coverage floor: high precision bought by refusing
+        // to decide is not calibration.
+        let mut pairs: Vec<(f64, bool)> = (0..5).map(|_| (0.99, true)).collect();
+        pairs.extend((0..100).map(|_| (0.20, true)));
+        pairs.extend((0..95).map(|_| (0.20, false)));
+
+        let outcome = select_threshold(&pairs, CalibrationTarget::default());
+        assert_eq!(outcome.state(), "cannot_meet_target");
+        assert!(outcome.selected().is_none());
+    }
+
+    #[test]
+    fn calibrate_field_filters_to_its_own_kind_and_rung() {
+        let source = ThresholdSource {
+            field: "intent_l1",
+            kind: "intent",
+            rung: "L1",
+        };
+        // The 80 confident decisions are correct; the 20 timid ones are wrong.
+        // Label != decision there, which is what makes the confidence signal
+        // measurable at all.
+        let mut records: Vec<DecisionRecord> = (0..MIN_LABELS_FOR_CALIBRATION)
+            .map(|i| {
+                let (confidence, correct) = if i < 80 { (0.95, true) } else { (0.30, false) };
+                record(
+                    &format!("intent-L1-{i}"),
+                    "intent",
+                    "L1",
+                    Some(confidence),
+                    Some("Query"),
+                    Some(if correct { "Query" } else { "Action" }),
+                )
+            })
+            .collect();
+        // A different rung and a different kind must not contaminate the sample.
+        records.push(calibration_record("intent", "llm", 0.99, "Query"));
+        records.push(calibration_record("correction", "L1", 0.99, "yes"));
+
+        let calibration = calibrate_field(&records, &source, CalibrationTarget::default());
+        assert_eq!(calibration.field, "intent_l1");
+        assert_eq!(calibration.labeled, MIN_LABELS_FOR_CALIBRATION);
+        let selected = calibration.outcome.selected().expect("selected");
+        assert_eq!(selected.kind, "intent");
+        assert_eq!(selected.rung, "L1");
+        assert_eq!(selected.threshold, 0.95);
+    }
+
+    #[test]
+    fn calibrate_field_reports_insufficient_when_the_sample_is_absent() {
+        let records = vec![calibration_record("intent", "llm", 0.9, "Query")];
+        let calibration = calibrate(&records, CalibrationTarget::default());
+        assert_eq!(calibration.len(), THRESHOLD_SOURCES.len());
+        assert!(
+            calibration
+                .iter()
+                .all(|field| field.state() == "insufficient_labels"),
+            "every gate must report insufficient rather than a number"
+        );
+    }
+
+    #[test]
+    fn write_thresholds_merges_and_never_persists_a_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path();
+
+        // Pre-existing artefact: an unrelated gate plus a stale value for one
+        // we are about to recalibrate.
+        let dir_path = logs.join(DECISION_AUDIT_DIR);
+        std::fs::create_dir_all(&dir_path).expect("mkdir");
+        std::fs::write(
+            thresholds_path(logs),
+            r#"{"citation_l1": 0.42, "review_escalate": 0.11}"#,
+        )
+        .expect("seed");
+
+        let records: Vec<DecisionRecord> = (0..MIN_LABELS_FOR_CALIBRATION)
+            .map(|i| {
+                let (confidence, correct) = if i < 80 { (0.95, true) } else { (0.30, false) };
+                record(
+                    &format!("intent-L1-{i}"),
+                    "intent",
+                    "L1",
+                    Some(confidence),
+                    Some("Query"),
+                    Some(if correct { "Query" } else { "Action" }),
+                )
+            })
+            .collect();
+        let calibrations = calibrate(&records, CalibrationTarget::default());
+
+        let path = write_thresholds(logs, &calibrations).expect("write");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("json");
+
+        assert_eq!(
+            written["intent_l1"], 0.95,
+            "the calibrated field is written"
+        );
+        assert_eq!(
+            written["citation_l1"], 0.42,
+            "an unrecalibrated field keeps its previous value"
+        );
+        assert_eq!(written["review_escalate"], 0.11);
+        assert!(
+            written.get("correction_l1").is_none(),
+            "a refusal must never be persisted as a number"
+        );
     }
 }

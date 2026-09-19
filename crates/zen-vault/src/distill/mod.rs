@@ -1,5 +1,6 @@
 pub mod adversarial;
 pub mod archive;
+pub mod baselines;
 pub mod checkpoint;
 pub mod contradiction;
 pub mod convert;
@@ -29,14 +30,22 @@ pub use adversarial::{
     ContestantVerdict, EvalCase, INCUMBENT, NaiveBaseline, PhaseScore, ZenDistill, corpus,
     judge_case, report_path, run_arena,
 };
+pub use baselines::{
+    Baseline, Baselines, MIN_SAMPLE, RoutingDistribution, ShadowAgreement,
+    compute as compute_baselines,
+};
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
 pub use correlation::{Opportunity, correlate};
 pub use decision_audit::{
-    CONFIDENCE_DRIFT_TOLERANCE, CalibrationReport, DATASET_FILE, DRIFT_WINDOW_DAYS,
-    DecisionAuditError, DecisionRecord, ECE_BINS, KindCalibration, KindDrift, LABELS_FILE,
-    LabelEntry, RUNG_MIX_DRIFT_TOLERANCE, RungCalibration, analyze, compute, extract_dataset,
-    load_dataset, load_labels,
+    CONFIDENCE_DRIFT_TOLERANCE, CalibratedThreshold, CalibrationReport, CalibrationTarget,
+    DATASET_FILE, DECISION_AUDIT_DIR, DRIFT_WINDOW_DAYS, DecisionAuditError, DecisionRecord,
+    ECE_BINS, FieldCalibration, KindCalibration, KindDrift, LABELS_FILE, LabelEntry,
+    MIN_ACCEPTED_COVERAGE, MIN_ACCEPTED_PRECISION, MIN_LABELS_FOR_CALIBRATION, MIN_PRECISION_LIFT,
+    RUNG_MIX_DRIFT_TOLERANCE, RungCalibration, THRESHOLD_SCALE, THRESHOLD_SOURCES, THRESHOLDS_FILE,
+    ThresholdOutcome, ThresholdPoint, ThresholdSource, analyze, calibrate, calibrate_field,
+    compute, extract_dataset, load_dataset, load_labels, select_threshold, thresholds_path,
+    write_thresholds,
 };
 pub use discover_metrics::{
     DiscoverMetrics, DiscoverMetricsError, REPORT_FILE_PREFIX, aggregate, load_reports,

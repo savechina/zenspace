@@ -13,8 +13,9 @@ use zen_agents::scheduler::{PromotionWorker, WorkerContext, ZenLoopWorker, ZenWo
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
-    CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate, aggregate_orchestration,
-    analyze, evaluate, latest_report, load_reports, not_evaluated, run_arena, save_report,
+    CalibrationTarget, CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate,
+    aggregate_orchestration, analyze, calibrate, compute_baselines, evaluate, latest_report,
+    load_dataset, load_reports, not_evaluated, run_arena, save_report, write_thresholds,
 };
 
 #[derive(Subcommand)]
@@ -60,6 +61,14 @@ pub enum DiscoverCommands {
         /// Bounded concurrency for the latency-under-load measurement (default 4, clamp 1..=8)
         #[arg(long, default_value_t = 4)]
         max_concurrent: usize,
+    },
+    /// Derive calibration thresholds from labeled decisions (T173 → T168-T171)
+    Calibrate {
+        /// Write the selected operating points to logs/decision-audit/thresholds.json.
+        /// Without this flag the calibration is reported only — writing OPENS the
+        /// decision gates, so it is never implicit.
+        #[arg(long)]
+        write: bool,
     },
 }
 
@@ -135,6 +144,42 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 )));
             }
         }
+        DiscoverCommands::Calibrate { write } => {
+            let records = load_dataset(&paths.logs())
+                .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
+            let target = CalibrationTarget::default();
+            let calibrations = calibrate(&records, target);
+
+            if *write {
+                let written = write_thresholds(&paths.logs(), &calibrations)
+                    .map_err(|e| ZenError::Message(format!("threshold write error: {e}")))?;
+                println!("{} {}", "thresholds:".green().bold(), written.display());
+            }
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "labeled_records": records.iter().filter(|r| r.label.is_some()).count(),
+                    "target": {
+                        "min_precision": target.min_precision,
+                        "min_coverage": target.min_coverage,
+                        "min_labels": target.min_labels,
+                        "min_precision_lift": target.min_precision_lift,
+                    },
+                    "fields": calibrations,
+                    "written": *write,
+                }))
+                .map_err(|e| ZenError::Message(e.to_string()))?
+            );
+
+            if !*write {
+                println!(
+                    "{}",
+                    "report-only: pass --write to persist the selected operating points (this OPENS the decision gates)"
+                        .dimmed()
+                );
+            }
+        }
         DiscoverCommands::Report => {
             let history = load_reports(&paths.logs())
                 .map_err(|e| ZenError::Message(format!("discover metrics I/O error: {e}")))?;
@@ -144,6 +189,11 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
             let calibration = analyze(&paths.logs())
                 .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
             let replay = zen_vault::distill::score_from_log(&paths.logs());
+            let baselines = compute_baselines(&paths.logs());
+            let threshold_fields = {
+                let records = load_dataset(&paths.logs()).unwrap_or_default();
+                calibrate(&records, CalibrationTarget::default())
+            };
             let vendor_eval = latest_report(&paths.logs())
                 .map_err(|e| ZenError::Message(format!("vendor eval I/O error: {e}")))?
                 .unwrap_or_else(|| {
@@ -160,6 +210,8 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     "rsi_health": metrics,
                     "orchestration": orchestration,
                     "calibration": calibration,
+                    "thresholds": threshold_fields,
+                    "baselines": baselines,
                     "replay": replay,
                     "vendor_eval": vendor_eval,
                 }))
