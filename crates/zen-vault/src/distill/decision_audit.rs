@@ -440,7 +440,11 @@ fn calibration_for_rung(rung: &str, records: &[&DecisionRecord]) -> RungCalibrat
 /// Records are binned into [`ECE_BINS`] equal-width bins over `[0, 1]`;
 /// ECE = Σ_b (n_b / N) · |acc_b − conf_b|. Perfectly calibrated ≈ 0;
 /// systematically overconfident > 0.
-fn ece(pairs: &[(f64, bool)]) -> f64 {
+///
+/// `pub(crate)` so the T174 vendor-eval gate (`distill::vendor_eval`)
+/// reuses the same calculation over the candidate's outputs instead of
+/// duplicating it (Constitution XI — reuse over novelty).
+pub(crate) fn ece(pairs: &[(f64, bool)]) -> f64 {
     let mut bins = vec![(0usize, 0.0f64, 0usize); ECE_BINS];
     for (confidence, correct) in pairs {
         let idx = ((confidence * ECE_BINS as f64).floor() as usize).min(ECE_BINS - 1);

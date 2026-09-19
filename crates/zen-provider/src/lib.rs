@@ -13,7 +13,8 @@ pub use model_meta::{
 };
 pub use router::{
     DefaultLlmRetryClassifier, DefaultRouter, LlmConfig, LlmError, LlmRetryClassifier, LlmRouter,
-    LlmRouterExt, MockProvider, Provider, TaskRequirements, is_local_llm_available,
+    LlmRouterExt, MockProvider, Provider, ProviderInstance, TaskRequirements,
+    is_local_llm_available,
 };
 pub use stream::StreamResponse;
 pub use zen_core::types::ComplexityLevel;

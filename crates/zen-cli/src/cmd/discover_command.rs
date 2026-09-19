@@ -14,7 +14,7 @@ use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
     CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate, aggregate_orchestration,
-    analyze, load_reports, run_arena,
+    analyze, evaluate, latest_report, load_reports, not_evaluated, run_arena, save_report,
 };
 
 #[derive(Subcommand)]
@@ -48,6 +48,18 @@ pub enum DiscoverCommands {
         /// Dump the shared corpus gaps as JSON to <path> (for external runners) and exit
         #[arg(long)]
         dump_corpus: Option<String>,
+    },
+    /// Evaluate a candidate System-1 model against zen's decision workloads (T174 gate)
+    VendorEval {
+        /// Candidate model name (a local Ollama model today; the vendor model when early access lands)
+        #[arg(long)]
+        model: String,
+        /// Provider name in config (default: ollama — local-first)
+        #[arg(long, default_value = "ollama")]
+        provider: String,
+        /// Bounded concurrency for the latency-under-load measurement (default 4, clamp 1..=8)
+        #[arg(long, default_value_t = 4)]
+        max_concurrent: usize,
     },
 }
 
@@ -132,6 +144,16 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
             let calibration = analyze(&paths.logs())
                 .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
             let replay = zen_vault::distill::score_from_log(&paths.logs());
+            let vendor_eval = latest_report(&paths.logs())
+                .map_err(|e| ZenError::Message(format!("vendor eval I/O error: {e}")))?
+                .unwrap_or_else(|| {
+                    not_evaluated(
+                        "unknown".to_string(),
+                        "unknown".to_string(),
+                        "no vendor evaluation has been run — run `zen discover vendor-eval --model <name>`"
+                            .to_string(),
+                    )
+                });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -139,6 +161,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     "orchestration": orchestration,
                     "calibration": calibration,
                     "replay": replay,
+                    "vendor_eval": vendor_eval,
                 }))
                 .map_err(|e| ZenError::Message(e.to_string()))?
             );
@@ -207,6 +230,25 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 report.total_cases,
                 report.staged_losses.len(),
             );
+        }
+        DiscoverCommands::VendorEval {
+            model,
+            provider,
+            max_concurrent,
+        } => {
+            let config = zen_core::config::load_config()
+                .map_err(|e| ZenError::Message(format!("config load error: {e}")))?;
+            let report = evaluate(config, &paths.logs(), provider, model, *max_concurrent)
+                .await
+                .map_err(|e| ZenError::Message(format!("vendor eval error: {e}")))?;
+            let saved = save_report(&paths.logs(), &report)
+                .map_err(|e| ZenError::Message(format!("vendor eval save error: {e}")))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| ZenError::Message(e.to_string()))?
+            );
+            println!("saved to {}", saved.display());
         }
     }
     Ok(())

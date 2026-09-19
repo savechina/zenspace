@@ -21,6 +21,7 @@ pub mod stages;
 pub mod tool_call_log;
 pub mod transaction;
 pub mod types;
+pub mod vendor_eval;
 pub mod wiki_compile;
 
 pub use adversarial::{
@@ -76,6 +77,14 @@ pub use types::{
     Belief, Commitment, CommitmentLifecycle, CycleOutcome, Decision, GapKind, GapRecord,
     GraphPlaceholder, HypothesisSlug, HypothesisStatus, LoopBudget, LoopCycleReport, MemoryReward,
     PlaceholderStatus, SelfModelItem, SelfModelLayer, ToolCall, TypedSignalKind, VerificationNode,
+};
+pub use vendor_eval::{
+    AggregateVerdict, AxisVerdict, CARDINALITY_CAP, CalibrationAxis, CandidateCaller,
+    CandidateOutput, CardinalityAxis, DEFAULT_MAX_CONCURRENT, EvalState, LatencyAxis,
+    LocalFirstAxis, MAX_CONCURRENT_CLAMP, RouterCandidateCaller, VendorEvalError, VendorEvalReport,
+    WorkloadEval, WorkloadKind, WorkloadState, build_prompt, cardinality_for, evaluate,
+    evaluate_with_caller, latest_report, local_first_for, not_evaluated, parse_candidate_output,
+    save_report,
 };
 pub use wiki_compile::WikiCompiler;
 
