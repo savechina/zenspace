@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use serde_json::Value;
 use tracing::debug;
 
+use super::SearchResult;
 use crate::tools::{
     SharedSqliteClient, ZenTool, ZenToolError, ZenToolResult, args_schema_entity,
     result_schema_array,
@@ -12,6 +14,32 @@ use zen_repo::{
     ComponentResult, GraphSearchResult, InsertRelationshipRequest, NotionsRepo, PageRankResult,
     ShortestPathResult, SqliteClient,
 };
+
+/// PageRank damping factor (standard value; 20 power iterations is far beyond
+/// convergence for a personal knowledge graph's entity count).
+const PPR_DAMPING: f64 = 0.85;
+const PPR_ITERATIONS: usize = 20;
+
+/// Upper bound on query terms tried as entity seeds, so a long query costs a
+/// bounded number of lookups.
+const MAX_SEEDS: usize = 6;
+
+/// Query terms worth trying as entity seeds: alphanumeric runs of 3+ chars,
+/// lowercased (matching the `COLLATE NOCASE` lookup), in first-seen order and
+/// deduplicated so the seed set is deterministic.
+fn query_seed_candidates(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in query.split(|c: char| !c.is_alphanumeric()) {
+        if token.chars().count() < 3 {
+            continue;
+        }
+        let lowered = token.to_lowercase();
+        if !out.contains(&lowered) {
+            out.push(lowered);
+        }
+    }
+    out
+}
 
 /// A node in an extracted N-hop subgraph (FR-031 Sub-graph Synthesis RAG).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +259,59 @@ impl Tier4Search {
             .map_err(Into::into)
     }
 
+    /// Rank entities by query relevance with personalized PageRank seeded from
+    /// the query's own entities (HippoRAG).
+    ///
+    /// [`Self::search`] needs an exact entity name as its seed, so a
+    /// natural-language query reaches the graph only when it happens to name
+    /// one. Here query terms are resolved through entity names and aliases
+    /// first, and the graph is ranked *relative to those seeds* instead of
+    /// globally. Seeds themselves are excluded from the output (they are
+    /// already known to the caller); an empty seed set yields an empty result
+    /// so the other retrieval tiers are unaffected.
+    pub async fn seeded_ranking(
+        &self,
+        client: &SqliteClient,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let repo = NotionsRepo::new(client);
+        let mut seeds: Vec<String> = Vec::new();
+        for token in query_seed_candidates(query).into_iter().take(MAX_SEEDS) {
+            let resolved = match repo.find_entity_by_name(&token).await {
+                Ok(Some(row)) => Some(row.name),
+                Ok(None) => match repo.resolve_alias(&token).await {
+                    Ok(Some(id)) => repo.notion_name(&id).await.ok().flatten(),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            if let Some(name) = resolved
+                && !seeds.contains(&name)
+            {
+                seeds.push(name);
+            }
+        }
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let seeded_by = seeds.join(", ");
+        let ranked = repo
+            .personalized_pagerank(&seeds, PPR_ITERATIONS, PPR_DAMPING, 1.0 - PPR_DAMPING)
+            .await?;
+        Ok(ranked
+            .into_iter()
+            .filter(|row| !seeds.contains(&row.notion))
+            .take(limit)
+            .map(|row| SearchResult {
+                file: PathBuf::from(format!("@{}", row.notion)),
+                line: 0,
+                content: format!("related to {seeded_by} (ppr {:.3})", row.score),
+            })
+            .collect())
+    }
+
     /// Build the N-hop subgraph centered on `center` (FR-031 Sub-graph
     /// Synthesis RAG).
     ///
@@ -420,6 +501,97 @@ mod tests {
         let tier4 = Tier4Search;
         let results = tier4.search(&client, "test", 3).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seeded_ranking_reaches_related_entities_from_a_natural_query() {
+        let (_dir, client) = setup_test_db().await;
+        let tier4 = Tier4Search;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (id, name) in [("e1", "Alice"), ("e2", "Bob"), ("e3", "Charly")] {
+            tier4
+                .insert_entity(&client, id, name, "person")
+                .await
+                .unwrap();
+        }
+        tier4
+            .insert_relationship(&client, "r1", "e1", "e2", "knows", 0.9, None, &now)
+            .await
+            .unwrap();
+        tier4
+            .insert_relationship(&client, "r2", "e2", "e3", "knows", 0.9, None, &now)
+            .await
+            .unwrap();
+
+        // A query naming one entity reaches the entities around it, which the
+        // exact-name BFS seed of `search` could not do for a bare phrase.
+        let results = tier4
+            .seeded_ranking(&client, "what do I know about Alice", 10)
+            .await
+            .unwrap();
+        let notions: Vec<&str> = results.iter().filter_map(|r| r.file.to_str()).collect();
+        assert!(
+            notions.contains(&"@Bob"),
+            "seed-relative ranking must surface the neighbour: {notions:?}"
+        );
+        assert!(
+            !notions.contains(&"@Alice"),
+            "the seed itself is excluded (already known): {notions:?}"
+        );
+        assert!(results[0].content.contains("related to Alice"));
+    }
+
+    #[tokio::test]
+    async fn seeded_ranking_resolves_aliases() {
+        let (_dir, client) = setup_test_db().await;
+        let tier4 = Tier4Search;
+        let now = chrono::Utc::now().to_rfc3339();
+        tier4
+            .insert_entity(&client, "e1", "Alice", "person")
+            .await
+            .unwrap();
+        tier4
+            .insert_entity(&client, "e2", "Bob", "person")
+            .await
+            .unwrap();
+        tier4
+            .insert_relationship(&client, "r1", "e1", "e2", "knows", 0.9, None, &now)
+            .await
+            .unwrap();
+        NotionsRepo::new(&client)
+            .insert_alias("ally", "e1")
+            .await
+            .unwrap();
+
+        let results = tier4
+            .seeded_ranking(&client, "ally update", 10)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|r| r.file.to_str() == Some("@Bob")),
+            "alias-resolved seed must rank its neighbours"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_ranking_is_empty_without_a_resolvable_seed() {
+        let (_dir, client) = setup_test_db().await;
+        let tier4 = Tier4Search;
+        tier4
+            .insert_entity(&client, "e1", "Alice", "person")
+            .await
+            .unwrap();
+
+        // No term resolves ⇒ empty, so fusion simply omits the list.
+        let results = tier4
+            .seeded_ranking(&client, "zzz nothing here matches", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+
+        // Terms shorter than the seed minimum are ignored entirely.
+        let short = tier4.seeded_ranking(&client, "ab cd", 10).await.unwrap();
+        assert!(short.is_empty());
     }
 
     #[tokio::test]

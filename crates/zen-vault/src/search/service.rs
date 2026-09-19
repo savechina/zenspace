@@ -25,10 +25,13 @@ const DEFAULT_SEARCH_LIMIT: usize = 20;
 
 /// Per-tier RRF weights for fused auto-search. FTS5 and vec0 are independent
 /// retrieval signals (lexical vs semantic) and share full trust; graph
-/// traversal is directional/relation-driven, hence the lower weight.
+/// traversal is directional/relation-driven, hence the lower weight. PageRank
+/// seeding is graph-derived too, but query-relevance ranked rather than
+/// path-determined, so it sits between the two.
 const TIER2_WEIGHT: f64 = 1.0;
 const TIER3_WEIGHT: f64 = 1.0;
 const TIER4_WEIGHT: f64 = 0.8;
+const PPR_WEIGHT: f64 = 0.9;
 
 impl SearchService {
     pub fn new(router: DefaultRouter) -> Self {
@@ -68,7 +71,7 @@ impl SearchService {
             }
         };
 
-        let (fts, semantic, graph) = tokio::join!(
+        let (fts, semantic, graph, ppr) = tokio::join!(
             self.tier2.search_in_dir(client, query, base_dir, limit),
             async {
                 match &embedding {
@@ -77,6 +80,7 @@ impl SearchService {
                 }
             },
             self.tier4.search(client, query, 3),
+            self.tier4.seeded_ranking(client, query, limit),
         );
 
         let mut lists = Vec::new();
@@ -111,6 +115,15 @@ impl SearchService {
                 results: rows.into_iter().map(graph_to_search).collect(),
             }),
             Err(e) => warn!(error = %e, "tier4 (graph) failed during fusion"),
+        }
+        match ppr {
+            Ok(rows) if !rows.is_empty() => lists.push(RankedList {
+                source: "ppr",
+                weight: PPR_WEIGHT,
+                results: rows,
+            }),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "tier4 (ppr seeding) failed during fusion"),
         }
 
         let fused = reciprocal_rank_fusion(&lists, RRF_K, limit);
