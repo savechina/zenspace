@@ -224,6 +224,7 @@ async fn resolve_user_correction(router: &DefaultRouter, user_query: &str) -> bo
         crate::decision::BinaryDecision::Correction,
     );
     crate::decision::classify_binary(
+        crate::decision::BinaryDecision::Correction,
         threshold,
         is_user_correction(user_query),
         &classifier,
@@ -1214,6 +1215,7 @@ impl AgentOrchestrator {
                         .is_some_and(|fp| response_lower.contains(&fp));
                     let input = citation_classifier_input(&note.content, &final_response);
                     if crate::decision::classify_binary(
+                        crate::decision::BinaryDecision::Citation,
                         citation_threshold,
                         heuristic,
                         &classifier,

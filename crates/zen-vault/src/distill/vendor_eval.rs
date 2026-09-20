@@ -621,7 +621,7 @@ pub fn save_report(dir: &Path, report: &VendorEvalReport) -> Result<PathBuf, Ven
         Utc::now().format("%Y%m%d-%H%M%S")
     );
     let path = eval_dir.join(format!("{slug}.json"));
-    fs::write(&path, serde_json::to_string_pretty(report)?)?;
+    zen_core::atomic_file::write_atomic(&path, serde_json::to_string_pretty(report)?.as_bytes())?;
     Ok(path)
 }
 

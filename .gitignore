@@ -45,3 +45,6 @@ docs/book/
 .sisyphus/
 .fastembed_cache
 logs/
+
+# Runtime lock artifacts (migration/scheduler/gateway locks are state, not source)
+*.migrate.lock

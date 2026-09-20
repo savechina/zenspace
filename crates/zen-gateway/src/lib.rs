@@ -57,8 +57,8 @@ pub mod server;
 pub mod transport;
 
 pub use daemon::{
-    GatewayDaemonConfig, GatewayService, HttpConfig, is_pid_alive, pid_record_alive, read_pid,
-    read_pid_record, remove_pid, write_pid, write_pid_for,
+    GatewayDaemonConfig, GatewayService, HttpConfig, StartupLock, is_pid_alive, pid_record_alive,
+    read_pid, read_pid_record, remove_pid, startup_lock_path, write_pid, write_pid_for,
 };
 pub use mcp_server::McpServer;
 

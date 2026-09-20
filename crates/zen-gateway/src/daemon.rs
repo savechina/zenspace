@@ -119,6 +119,55 @@ pub fn write_pid<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
     write_pid_for(path, process::id())
 }
 
+/// Cross-process startup lock: serializes the socket's
+/// exists → probe → remove-stale → bind sequence, which is NOT atomic on its
+/// own (two processes can both decide a socket is stale, both unlink, and the
+/// second unlink then removes the first's freshly-bound socket).
+///
+/// Held for the daemon's whole lifetime: the kernel releases it when the
+/// process exits, so a SIGKILLed or crashed daemon never leaves the system
+/// refusing to start, and "one daemon per ZEN_HOME" becomes kernel-enforced
+/// rather than inferred from socket-file state.
+#[derive(Debug)]
+pub struct StartupLock {
+    _file: std::fs::File,
+}
+
+/// Lock file path for a given socket: the startup lock lives beside it, so
+/// one `ZEN_HOME` yields exactly one lock regardless of socket overrides.
+pub fn startup_lock_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_file_name("gateway.lock")
+}
+
+impl StartupLock {
+    /// Try to take the startup lock at `path`, failing fast when another
+    /// daemon holds it. Non-blocking by design: a start that loses should
+    /// report that clearly, not queue behind a running daemon.
+    pub fn acquire(path: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("create lock dir {}: {e}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("open startup lock {}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "another zen serve is starting or running (startup lock {} is held) — \
+                 run 'zen serve status' to inspect it",
+                path.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(anyhow::anyhow!("lock startup lock {}: {e}", path.display()))
+            }
+        }
+    }
+}
+
 /// Read and parse a pid file (JSON record preferred, legacy bare pid).
 pub fn read_pid_record<P: AsRef<Path>>(path: P) -> std::io::Result<PidRecord> {
     let content = std::fs::read_to_string(&path)?;
@@ -220,6 +269,11 @@ pub struct GatewayDaemonConfig {
     pub db_path: Option<PathBuf>,
     /// Audit JSONL sink override (default `<global logs>/audit.jsonl`).
     pub audit_path: Option<PathBuf>,
+    /// Pid file this daemon owns. `None` (implicit spawns) writes none; an
+    /// explicit `zen serve start` passes it so the daemon itself records the
+    /// pid *after* it wins the startup lock and binds — the CLI can then
+    /// verify identity (and stop clobbering a running daemon's record).
+    pub pid_path: Option<PathBuf>,
     /// Agent-loop sandbox mode override (`ZEN_SANDBOX_MODE` env fallback).
     /// `ask` enables interactive Q3 approval routing for hosted turns.
     pub sandbox_mode: Option<zen_core::sandbox::SandboxMode>,
@@ -273,6 +327,7 @@ impl Default for GatewayDaemonConfig {
             mode: GatewayMode::Standalone,
             memory_path: None,
             db_path: None,
+            pid_path: None,
             audit_path: None,
             sandbox_mode: None,
             drain_window: std::time::Duration::from_secs(10),
@@ -1042,10 +1097,13 @@ impl GatewayService {
         _external_tx: watch::Sender<bool>,
         mut external_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        // Bind FIRST: the atomic socket bind is the single-instance
-        // arbiter (embedded mode races two surfaces here — the loser
-        // never touches the store lock; its readiness poll lands on the
-        // winner).
+        // Serialize the whole socket hand-off BEFORE touching the socket:
+        // the exists → probe → remove-stale → bind sequence is not atomic, so
+        // two concurrent starts can otherwise both unlink and both bind (the
+        // second unlink removing the first's live socket, leaving the winner
+        // unreachable). The lock also turns the loser's start into a clear
+        // refusal instead of an opaque socket error.
+        let _startup_lock = StartupLock::acquire(&startup_lock_path(&config.socket_path))?;
         let listener = uds::bind_socket(&config.socket_path).await?;
         let service = match GatewayService::open(&config).await {
             Ok(mut s) => {
@@ -1058,6 +1116,15 @@ impl GatewayService {
                 return Err(e);
             }
         };
+        // Ownership of the pid file transfers to the process that actually
+        // won the socket + store: the CLI used to write it before spawning,
+        // which clobbered a running daemon's record and let a second
+        // `serve start` report success with its own dead child's pid.
+        if let Some(pid_path) = &config.pid_path
+            && let Err(e) = write_pid_for(pid_path, process::id())
+        {
+            tracing::warn!(error = %e, path = %pid_path.display(), "pid file write failed");
+        }
         let mut shutdown_rx = service.shutdown_tx.subscribe();
         tracing::info!(
             socket = %config.socket_path.display(),
