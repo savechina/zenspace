@@ -172,6 +172,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **002 SPEC-level GAN review amendment** (2026-09-21,
+  `docs/specs/002-agentic-tui/`): full-stack adversarial review of the
+  inline-TUI spec (5 research passes + Oracle discriminator; cross-spec seam
+  audit vs 001/003/004/005, storage/config compatibility audit, 2024-2026
+  frontier HCI research, 40-pattern competitor scan):
+  - spec.md synced to shipped behavior: FR-009/SC-005/US3 now mandate the
+    Codex-parity popup semantics (arrows stay+wrap, Enter executes selected,
+    Esc keeps text) — the boundary-eject design is retired.
+  - New FR-017…FR-025: keymap surface table, thinking display (privacy
+    rationale, Leaky Thoughts EMNLP'25), tool-intermediate rendering, paste
+    handling, panic-safe terminal-state restore (P0), toast slot,
+    gateway-state banner, approval popup + input pause, session-resume
+    rendering.
+  - New NFR-007…NFR-010: <50 ms/block insert budget (replaces the
+    width×10k probe render), ≤20 ms input latency (advisory until harness),
+    >200 ms stall instrumentation (advisory), data integrity & compatibility
+    (atomic session-meta/config writes, single-writer pid, no-CWD history
+    fallback, serde additive policy).
+  - Normative References added: 004 contract-02/04 + 005 streaming.md are the
+    seam authorities; 002 owns rendering only (single-ownership).
+  - ADR-001 Accepted (Option A: scroll-during-streaming tradeoff accepted +
+    documented; bounded 256-block deferred queue). TODOS.md summary +
+    decision log synced. codex-rs mechanics adoption checklist appended to
+    codex-inline-design.md.
+  - Phase 9 remediation tasks T074–T085: P0 = merge main's 2026-09-20
+    hardening, panic hook, atomic write_meta/config, bounded insert probe;
+    P1 = seam rendering, viewport ADR-006, fail-loud history; P2 =
+    measurement harnesses, app.rs decomposition, curated competitor UX
+    (fuzzy-slash excluded per D9; steer/queue referred to 005/006).
+
 - **TUI slash popup: borderless dropdown below input** (ADR-003, 2026-09-15):
   inline mode slash popup now renders as a borderless bare-row dropdown
   directly below the input box (Codex-style), with `▸ ` selector prefix
@@ -205,7 +235,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     aliases/descriptions, max 8 rows, and dynamic height that shrinks to the
     filtered match count (min 1 for the "no matches" row). ADR-003 marked
     Superseded accordingly.
- (2026-09-17,
+- **TUI inline-mode open-TODO sweep + multiline slash commands** (2026-09-17,
   TODOS D2/D4/D10/UX4/UX5 + review follow-up):
   - Scrollback insert errors no longer kill the REPL (D2): the in-loop and
     startup `insert_scrollback_queue` call sites log the error and defer the
