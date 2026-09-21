@@ -63,6 +63,10 @@ pub enum PendingCallKind {
 
 const MAX_HISTORY: usize = 100;
 
+/// FR-016: maximum number of scrollback blocks held in the deferred queue
+/// (reading mode). Overflow flushes oldest entries first (ADR-001 Option A).
+pub(crate) const DEFERRED_QUEUE_CAP: usize = 256;
+
 /// Deterministic markdown payload for the echo test seam (`ZEN_TEST_ECHO_LLM=1`,
 /// test-design.md §3 L3). Exercises reasoning (`<think>`), heading, paragraph
 /// (committed block), code fence (FR-012 highlight), list, link, and a trailing
@@ -392,7 +396,7 @@ pub struct App {
     pub toast_queue: VecDeque<String>,
     pub current_toast: Option<(String, Instant)>,
     conversation_store: Option<ConversationStore>,
-    history_store: HistoryStore,
+    history_store: Option<HistoryStore>,
     pub turn_started_at: Option<Instant>,
     pub tool_call_count: u32,
     pub current_response_tokens: usize,
@@ -489,13 +493,15 @@ impl App {
             toast_queue: VecDeque::new(),
             current_toast: None,
             conversation_store: None,
-            history_store: HistoryStore::open(config.history.max_bytes.map(|b| b as u64))
-                .unwrap_or_else(|_| {
-                    HistoryStore::with_path(
-                        std::path::PathBuf::from("history.jsonl"),
-                        Some(1_048_576),
-                    )
-                }),
+            history_store: match HistoryStore::open(config.history.max_bytes.map(|b| b as u64)) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    // NFR-010: history MUST NOT fall back to CWD. Fail-loud: toast
+                    // at startup, run without persistence.
+                    tracing::warn!(error = %e, "history store unavailable; running without persistence");
+                    None
+                }
+            },
             turn_started_at: None,
             tool_call_count: 0,
             current_response_tokens: 0,
@@ -770,7 +776,9 @@ impl App {
     }
 
     fn load_command_history(&mut self) {
-        if let Ok(entries) = self.history_store.load_recent(MAX_HISTORY) {
+        if let Some(store) = &self.history_store
+            && let Ok(entries) = store.load_recent(MAX_HISTORY)
+        {
             self.command_history = entries;
         }
     }
@@ -807,6 +815,11 @@ impl App {
         self.inline_mode
     }
 
+    /// NFR-010: check if the history store is available (for startup toast).
+    pub fn has_history_store(&self) -> bool {
+        self.history_store.is_some()
+    }
+
     /// T062: leave reading mode and move deferred blocks back into the
     /// flush queue (order preserved). `inline_tick` performs the insert.
     pub fn exit_reading_mode(&mut self) {
@@ -815,6 +828,20 @@ impl App {
             self.scrollback_queue
                 .extend(self.deferred_scrollback.drain(..));
         }
+    }
+
+    /// FR-016: push a scrollback entry into the deferred queue, flushing
+    /// the oldest entries when the cap is reached. Used by ALL defer sites
+    /// in inline.rs so overflow handling is centralized.
+    pub(crate) fn defer_scrollback(&mut self, entry: ScrollbackEntry) -> VecDeque<ScrollbackEntry> {
+        self.deferred_scrollback.push_back(entry);
+        let mut overflow = VecDeque::new();
+        while self.deferred_scrollback.len() > DEFERRED_QUEUE_CAP {
+            if let Some(oldest) = self.deferred_scrollback.pop_front() {
+                overflow.push_back(oldest);
+            }
+        }
+        overflow
     }
 
     pub fn enqueue_scrollback(&mut self, lines: Vec<Line<'static>>) {
@@ -945,7 +972,9 @@ impl App {
         // W1: clear draft and position so next Up starts fresh.
         self.history_position = None;
         self.history_draft = None;
-        self.persist_history(cmd);
+        if self.history_store.is_some() {
+            self.persist_history(cmd);
+        }
     }
 
     /// Persist a submitted command to the history file OFF the event loop
@@ -954,7 +983,9 @@ impl App {
     /// blocking pool when a tokio runtime is present, else writes inline
     /// (headless tests without a runtime context).
     fn persist_history(&self, cmd: &str) {
-        let store = self.history_store.clone();
+        let Some(store) = self.history_store.clone() else {
+            return;
+        };
         let session_id = self.session_id.clone();
         let cmd = cmd.to_string();
         let append = move || {
@@ -2464,6 +2495,12 @@ pub fn run_app(
     config: &'static zen_core::config::ZenConfig,
 ) -> Result<()> {
     let mut app = App::new(config);
+    // NFR-010: fail-loud — show a visible toast if history persistence is unavailable.
+    if app.history_store.is_none() {
+        app.show_toast(
+            "history unavailable: could not open history file — running without persistence",
+        );
+    }
     if std::env::var("NO_COLOR").is_ok() {
         app.theme = theme_no_color();
     } else if let Some(theme) = config.tui_theme() {

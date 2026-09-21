@@ -21,9 +21,11 @@ use super::inline_handler::InlineKeyAction;
 use super::theme::auto_select as theme_auto_select;
 use super::theme::no_color as theme_no_color;
 
-/// Height (rows) of the bottom inline viewport. Kept fixed; the tail region
-/// inside it is dynamic (2–4 rows, see `inline_ui::dynamic_tail_height`).
-pub(crate) const INLINE_VIEWPORT_ROWS: u16 = 8;
+/// Height (rows) of the bottom inline viewport. FIXED at 12 rows (ADR-006).
+/// Budget: tail (2–4) + popup (≤6) + input (3) + toast (0–1) + footer (1) = 12.
+/// The tail region is dynamic; the outer height must NOT change at streaming time
+/// (ratatui Inline height is construction-fixed; recreation reopens T038 drift).
+pub(crate) const INLINE_VIEWPORT_ROWS: u16 = 12;
 
 const STREAMING_RENDER_INTERVAL_MS: u128 = 33;
 const POLL_INTERVAL_ACTIVE_MS: u64 = 16;
@@ -150,6 +152,12 @@ pub fn run_inline(config: &'static zen_core::config::ZenConfig) -> Result<()> {
 /// startup sequence against `TestBackend` (test-design.md Layer 2, S1/S6).
 pub(crate) fn prepare_inline_app(config: &'static zen_core::config::ZenConfig) -> App {
     let mut app = App::new(config);
+    // NFR-010: fail-loud — show a visible toast if history persistence is unavailable.
+    if !app.has_history_store() {
+        app.show_toast(
+            "history unavailable: could not open history file — running without persistence",
+        );
+    }
     app.inline_mode = true;
     apply_inline_theme(&mut app, config, std::env::var("NO_COLOR").is_ok());
     app.enqueue_welcome_banner();
@@ -366,17 +374,54 @@ pub(crate) fn inline_tick<B: Backend>(
         if app.reading_mode {
             // T062: the user is reading scrollback — inserting now would jump
             // the view. Hold committed blocks in order; the live tail still
-            // shows the newest content.
-            app.deferred_scrollback
-                .extend(app.scrollback_queue.drain(..));
+            // shows the newest content. FR-016: bounded at DEFERRED_QUEUE_CAP;
+            // overflow flushes oldest first.
+            while let Some(entry) = app.scrollback_queue.pop_front() {
+                let mut overflow = app.defer_scrollback(entry);
+                // Overflow entries are flushed immediately via the insert path
+                // (view jump accepted per ADR-001 Option A). On failure the
+                // failed entry AND the un-flushed remainder go back to the
+                // FRONT in original order — never dropped, never reordered
+                // (FR-016 "flushed in order"); the next tick retries.
+                while let Some(o) = overflow.pop_front() {
+                    if let Err(e2) =
+                        super::scrollback_inserter::insert_lines(terminal, &o.lines, o.wrap)
+                    {
+                        tracing::error!(error = %e2, "deferred overflow insert failed; re-deferring in order");
+                        app.deferred_scrollback.push_front(o);
+                        while let Some(r) = overflow.pop_back() {
+                            app.deferred_scrollback.push_front(r);
+                        }
+                        break;
+                    }
+                }
+            }
         } else if let Err(e) =
             super::scrollback_inserter::insert_scrollback_queue(terminal, &mut app.scrollback_queue)
         {
             // D2: a terminal I/O hiccup must not kill the REPL -- defer the
             // blocks so they retry on the next flush / reading-mode exit.
             tracing::error!(error = %e, "scrollback insert failed; deferring blocks");
-            app.deferred_scrollback
-                .extend(app.scrollback_queue.drain(..));
+            while let Some(entry) = app.scrollback_queue.pop_front() {
+                app.deferred_scrollback.push_back(entry);
+            }
+            // FR-016: cap the deferred queue after bulk insertion. Overflow is
+            // flushed oldest-first through the insert path — NEVER dropped
+            // (silent content loss). If the flush itself fails (the terminal
+            // is already erroring), stop trimming and leave the queue over
+            // cap; the next tick retries.
+            while app.deferred_scrollback.len() > super::app::DEFERRED_QUEUE_CAP {
+                let Some(oldest) = app.deferred_scrollback.pop_front() else {
+                    break;
+                };
+                if let Err(e2) =
+                    super::scrollback_inserter::insert_lines(terminal, &oldest.lines, oldest.wrap)
+                {
+                    tracing::error!(error = %e2, "deferred overflow flush failed; keeping entry (queue temporarily over cap)");
+                    app.deferred_scrollback.push_front(oldest);
+                    break;
+                }
+            }
         }
         state.dirty = true;
     }
@@ -419,8 +464,26 @@ fn run_inline_session(
     {
         // D2: same contract as the in-loop flush -- never kill the session.
         tracing::error!(error = %e, "scrollback insert failed; deferring blocks");
-        app.deferred_scrollback
-            .extend(app.scrollback_queue.drain(..));
+        while let Some(entry) = app.scrollback_queue.pop_front() {
+            app.deferred_scrollback.push_back(entry);
+        }
+        // FR-016: cap the deferred queue after bulk insertion. Overflow is
+        // flushed oldest-first through the insert path — NEVER dropped
+        // (silent content loss). If the flush itself fails (the terminal is
+        // already erroring), stop trimming and leave the queue over cap; the
+        // next flush retries.
+        while app.deferred_scrollback.len() > super::app::DEFERRED_QUEUE_CAP {
+            let Some(oldest) = app.deferred_scrollback.pop_front() else {
+                break;
+            };
+            if let Err(e2) =
+                super::scrollback_inserter::insert_lines(terminal, &oldest.lines, oldest.wrap)
+            {
+                tracing::error!(error = %e2, "deferred overflow flush failed; keeping entry (queue temporarily over cap)");
+                app.deferred_scrollback.push_front(oldest);
+                break;
+            }
+        }
     }
 
     let mut state = InlineLoopState::new();
