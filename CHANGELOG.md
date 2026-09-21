@@ -219,6 +219,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delimiter) are unwrapped so tui-markdown renders native tables. Scoped to
   whole-content fences only; inline fences unaffected.
 
+### Changed
+
+- **TUI app.rs decomposition (T083)** (2026-09-22): the 2811-LOC god object
+  split into `chat.rs` (582 — turn producer/poll/resume drain),
+  `commands.rs` (625 — slash dispatch + execute_* + gateway daemon
+  lifecycle), `sessions.rs` (400 — session CRUD + resume); app.rs retains
+  types/struct/cache/toasts/selection/history at 1133 LOC. Pure code
+  movement (sibling `impl App` blocks, pub(crate) field bumps), zero
+  behavior change. File-level `#![allow(dead_code)]` REMOVED: ten dead
+  items grep-verified zero-caller and deleted; three targeted allows kept
+  with live-seam justification. Triplicated output-cache staleness
+  predicate unified into `output_cache_is_stale()`. Gates: 302/302 lib,
+  PTY 18/18, clippy/fmt clean.
+
 ### Fixed
 
 - **TUI Phase 9 P1 — gateway-seam rendering (T079, FR-023/024/025)**
