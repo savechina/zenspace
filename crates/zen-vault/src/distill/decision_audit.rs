@@ -72,6 +72,20 @@ pub enum DecisionAuditError {
     /// JSON serialization/deserialization error.
     #[error("decision audit JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// `label set` referenced a record id that does not exist in the dataset —
+    /// an orphan label can never join a record, so it is rejected at the door
+    /// rather than silently poisoning `labels.jsonl`.
+    #[error("unknown record id: {id}")]
+    UnknownRecordId { id: String },
+    /// The label is not in the decision kind's vocabulary. A typo'd label
+    /// exact-compares false against every decision (`is_correct`), permanently
+    /// scoring real judgments as errors.
+    #[error("invalid label {label:?} for kind {kind:?}; valid: {valid:?}")]
+    InvalidLabel {
+        kind: String,
+        label: String,
+        valid: &'static [&'static str],
+    },
 }
 
 /// ECE bin count (equal-width over `[0, 1]`).
@@ -137,6 +151,41 @@ pub struct LabelEntry {
     pub id: String,
     /// Ground-truth label for the decision (e.g. the correct intent category).
     pub label: String,
+    /// RFC3339 time the label was adjudicated. Absent on entries written
+    /// before the field existed; `labels.jsonl` is append-only, so old lines
+    /// are never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<String>,
+}
+
+/// Canonical label vocabulary per decision kind. MIRRORS the emitters in
+/// zen-agents — intent: `IntentCategory::as_str` (intent.rs), review: the
+/// approved/vetoed verdicts (review/deanchored.rs), correction/citation: the
+/// binary yes/no verdicts (decision/mod.rs). `is_correct` exact-compares the
+/// label against the recorded decision, so a label outside the vocabulary can
+/// never be correct: it is rejected here instead of silently scoring every
+/// adjudication as an error. Unknown kinds (future emitters) pass through
+/// trimmed, matching the harness's fail-open posture.
+pub fn valid_labels(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "intent" => Some(&["Query", "Action", "System", "Conversation"]),
+        "review" => Some(&["approved", "vetoed"]),
+        "correction" | "citation" => Some(&["yes", "no"]),
+        _ => None,
+    }
+}
+
+/// Case-insensitive canonicalization of a user-supplied label onto the kind's
+/// vocabulary; `None` when it matches no entry.
+fn canonical_label(kind: &str, label: &str) -> Option<String> {
+    let trimmed = label.trim();
+    match valid_labels(kind) {
+        Some(valid) => valid
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(trimmed))
+            .map(|canonical| (*canonical).to_string()),
+        None => Some(trimmed.to_string()),
+    }
 }
 
 /// Per-rung calibration metrics over labeled records.
@@ -786,6 +835,10 @@ pub struct CalibrationTarget {
     pub min_coverage: f64,
     pub min_labels: usize,
     pub min_precision_lift: f64,
+    /// Miscoverage level of the risk certificate: each gate's threshold
+    /// carries "with probability ≥ 1−δ over the labeled sample, the accepted
+    /// set's true error rate ≤ 1−min_precision".
+    pub delta: f64,
 }
 
 impl Default for CalibrationTarget {
@@ -795,8 +848,74 @@ impl Default for CalibrationTarget {
             min_coverage: MIN_ACCEPTED_COVERAGE,
             min_labels: MIN_LABELS_FOR_CALIBRATION,
             min_precision_lift: MIN_PRECISION_LIFT,
+            delta: CALIBRATION_DELTA,
         }
     }
+}
+
+/// Certificate miscoverage level (1 − δ = 95%).
+pub const CALIBRATION_DELTA: f64 = 0.05;
+
+/// Candidate thresholds, pre-fixed and data-independent. HUNDREDTHS keep the
+/// f32 construction deterministic (`h as f32 / 100.0` — no decimal-literal or
+/// double-rounding ambiguity between calibration and runtime).
+///
+/// K is deliberately small: the certificate is Bonferroni-corrected at γ =
+/// δ/K per grid point (CIC, arXiv:2607.04430 Thm 3.3; LTT,
+/// arXiv:2110.01052), and a zero-error accepted set only certifies at
+/// n_accepted ≥ ln(γ)/ln(0.95) ≈ 99 for K=8 — at K=101 that demand rises to
+/// 149 and no 100-label pool could ever certify. A finer grid unlocks at
+/// larger labeled counts; K must stay pre-declared, not data-derived.
+pub const THRESHOLD_GRID_HUNDREDTHS: &[u32] = &[0, 15, 30, 45, 55, 65, 80, 90];
+
+/// Grid size K used by the Bonferroni correction.
+pub fn threshold_grid_size() -> usize {
+    THRESHOLD_GRID_HUNDREDTHS.len()
+}
+
+/// ln(n choose k) via a multiplicative loop — exact enough for n in the
+/// thousands (no `lgamma` in std, no new dependency for one call site).
+fn ln_choose(n: usize, k: usize) -> f64 {
+    let k = k.min(n - k);
+    let mut total = 0.0_f64;
+    for i in 0..k {
+        total += ((n - k + 1 + i) as f64).ln() - ((i + 1) as f64).ln();
+    }
+    total
+}
+
+/// One-sided Clopper–Pearson upper bound on the error rate: the smallest p
+/// whose binomial CDF P(X ≤ k; n, p) still exceeds γ. Exact by construction
+/// (bisection on the CDF; the Wilson bound it replaces was demonstrably
+/// anticonservative at small accepted sets — it certified a 52-sample
+/// zero-error tail whose true error could exceed α with probability 6.7% > δ).
+///
+/// The k = 0 case has the closed form 1 − γ^(1/n); k ≥ n has no upper bound
+/// below 1.
+pub fn cp_upper_bound(k: usize, n: usize, gamma: f64) -> f64 {
+    if n == 0 || k >= n {
+        return 1.0;
+    }
+    if k == 0 {
+        return 1.0 - gamma.powf(1.0 / n as f64);
+    }
+    let cdf = |p: f64| -> f64 {
+        (0..=k)
+            .map(|i| (ln_choose(n, i) + i as f64 * p.ln() + (n - i) as f64 * (1.0 - p).ln()).exp())
+            .sum()
+    };
+    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        // The binomial CDF decreases in p; the bound is where it crosses γ
+        // from above, so a mid still above γ pushes the search upward.
+        if cdf(mid) > gamma {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// One candidate operating point: accepting every decision at or above
@@ -829,6 +948,20 @@ pub struct CalibratedThreshold {
     pub ece: Option<f64>,
     pub labeled: usize,
     pub accepted: usize,
+    /// Clopper–Pearson upper bound on the accepted set's true error rate at
+    /// the Bonferroni level γ = δ / K — the certificate that makes the
+    /// threshold defensible rather than merely in-sample-good.
+    #[serde(default)]
+    pub risk_bound: f64,
+    /// Certificate miscoverage level the `risk_bound` holds with.
+    #[serde(default)]
+    pub delta: f64,
+    /// Size K of the pre-fixed grid the bound was Bonferroni-corrected over.
+    #[serde(default)]
+    pub grid_size: usize,
+    /// Errors observed inside the accepted set.
+    #[serde(default)]
+    pub errors: usize,
 }
 
 /// Why a threshold was — or was not — selected.
@@ -929,11 +1062,24 @@ impl FieldCalibration {
 
 /// Select an operating point from `(confidence, correct)` pairs.
 ///
-/// The objective is the Trust-or-Escalate one: among thresholds meeting the
-/// precision target, prefer the one that accepts the most decisions. A
-/// threshold below which the gate would accept a wrong decision is a
-/// mis-accept, so precision-on-accepted is the quantity that matters — not
-/// aggregate accuracy.
+/// The objective is the Trust-or-Escalate one: among thresholds whose
+/// **certified** error rate meets the precision target, take the most
+/// accepting one. Certification is a Clopper–Pearson upper bound on the
+/// accepted set's true error rate at the Bonferroni level γ = δ/K over the
+/// pre-fixed grid (CIC, arXiv:2607.04430, Thm 3.3; LTT, arXiv:2110.01052) —
+/// under Bonferroni every grid point is simultaneously certified on one
+/// event of probability ≥ 1−δ, so ANY selection rule over certified points
+/// (coverage floors, max-coverage preference) inherits the guarantee and
+/// cannot break it. This replaces the former in-sample rule, whose reported
+/// precision was an optimistic point estimate of exactly the quantity the
+/// gate bets on; a stop-at-first-rejection scan was considered and rejected
+/// because Bauer's fixed-sequence theorem licenses stopping at the first
+/// NON-rejection only (rejections form a prefix), not the first rejection.
+///
+/// Honest consequence, recorded rather than hidden: with the lift guard
+/// requiring ≥ `min_precision_lift` base errors and the exact bound requiring
+/// a near-zero-error accepted set of ≈99+, no 100-label pool can satisfy
+/// both — certification realistically begins around 120 labels.
 pub fn select_threshold(pairs: &[(f64, bool)], target: CalibrationTarget) -> ThresholdOutcome {
     let labeled = pairs.len();
     if labeled < target.min_labels {
@@ -946,30 +1092,30 @@ pub fn select_threshold(pairs: &[(f64, bool)], target: CalibrationTarget) -> Thr
     let correct = pairs.iter().filter(|(_, correct)| *correct).count();
     let base_rate = correct as f64 / labeled as f64;
 
-    let mut candidates: Vec<f32> = pairs
+    let grid: Vec<f32> = THRESHOLD_GRID_HUNDREDTHS
         .iter()
-        .map(|(confidence, _)| *confidence as f32)
+        .map(|hundredths| *hundredths as f32 / 100.0)
         .collect();
-    candidates.sort_by(|a, b| a.total_cmp(b));
-    candidates.dedup();
 
-    let mut points: Vec<ThresholdPoint> = Vec::new();
-    for threshold in candidates {
-        let accepted: Vec<&(f64, bool)> = pairs
-            .iter()
-            .filter(|(confidence, _)| *confidence as f32 >= threshold)
-            .collect();
-        if accepted.is_empty() {
-            continue;
-        }
-        let accepted_correct = accepted.iter().filter(|(_, correct)| *correct).count();
-        points.push(ThresholdPoint {
-            threshold,
-            precision: accepted_correct as f64 / accepted.len() as f64,
-            coverage: accepted.len() as f64 / labeled as f64,
-            accepted: accepted.len(),
-        });
-    }
+    let points: Vec<ThresholdPoint> = grid
+        .iter()
+        .filter_map(|threshold| {
+            let accepted: Vec<&(f64, bool)> = pairs
+                .iter()
+                .filter(|(confidence, _)| *confidence as f32 >= *threshold)
+                .collect();
+            if accepted.is_empty() {
+                return None;
+            }
+            let accepted_correct = accepted.iter().filter(|(_, correct)| *correct).count();
+            Some(ThresholdPoint {
+                threshold: *threshold,
+                precision: accepted_correct as f64 / accepted.len() as f64,
+                coverage: accepted.len() as f64 / labeled as f64,
+                accepted: accepted.len(),
+            })
+        })
+        .collect();
 
     let best_precision = points
         .iter()
@@ -987,24 +1133,22 @@ pub fn select_threshold(pairs: &[(f64, bool)], target: CalibrationTarget) -> Thr
         };
     }
 
-    let eligible: Vec<&ThresholdPoint> = points
+    let gamma = target.delta / threshold_grid_size() as f64;
+    let risk_alpha = 1.0 - target.min_precision;
+    let chosen = grid
         .iter()
-        .filter(|point| {
-            point.precision >= target.min_precision && point.coverage >= target.min_coverage
-        })
-        .collect();
+        .zip(points.iter())
+        .find_map(|(threshold, point)| {
+            let errors = pairs
+                .iter()
+                .filter(|(confidence, correct)| *confidence as f32 >= *threshold && !*correct)
+                .count();
+            let feasible = cp_upper_bound(errors, point.accepted, gamma) <= risk_alpha
+                && point.coverage >= target.min_coverage;
+            feasible.then_some((errors, point))
+        });
 
-    let Some(chosen) = eligible
-        .iter()
-        .copied()
-        // Max coverage; ties resolved by the lowest threshold (iteration order
-        // is ascending, so strict `>` keeps the first/most-accepting point),
-        // which keeps selection deterministic.
-        .fold(None::<&ThresholdPoint>, |best, point| match best {
-            Some(current) if current.coverage >= point.coverage => Some(current),
-            _ => Some(point),
-        })
-    else {
+    let Some((errors, chosen)) = chosen else {
         let best = points
             .iter()
             .max_by(|a, b| a.precision.total_cmp(&b.precision))
@@ -1034,6 +1178,10 @@ pub fn select_threshold(pairs: &[(f64, bool)], target: CalibrationTarget) -> Thr
         ece: Some(ece(&accepted_pairs)),
         labeled,
         accepted: chosen.accepted,
+        risk_bound: cp_upper_bound(errors, chosen.accepted, gamma),
+        delta: target.delta,
+        grid_size: threshold_grid_size(),
+        errors,
     })
 }
 
@@ -1123,6 +1271,26 @@ pub fn write_thresholds(
             let rounded =
                 (f64::from(selected.threshold) * THRESHOLD_SCALE).round() / THRESHOLD_SCALE;
             root.insert(calibration.field.clone(), serde_json::json!(rounded));
+            // The certificate travels WITH the value: a merged-forward
+            // threshold must never masquerade under fresh-looking metadata.
+            // Unknown keys are ignored by `DecisionThresholds::load`, so the
+            // additive `_meta` block cannot affect the gates.
+            let meta = root
+                .entry("_meta".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(fields) = meta.as_object_mut() {
+                fields.insert(
+                    calibration.field.clone(),
+                    serde_json::json!({
+                        "risk_bound": (selected.risk_bound * THRESHOLD_SCALE).round() / THRESHOLD_SCALE,
+                        "delta": selected.delta,
+                        "grid_size": selected.grid_size,
+                        "errors": selected.errors,
+                        "accepted": selected.accepted,
+                        "labeled": selected.labeled,
+                    }),
+                );
+            }
         }
     }
 
@@ -1211,13 +1379,35 @@ pub fn unlabeled<'a>(
 /// wins). That makes re-labeling a record a plain append rather than a rewrite
 /// — and it means a mis-label can be corrected without losing the history of
 /// what was adjudicated before.
+/// Append one adjudication to `labels.jsonl`.
+///
+/// Validates before writing: the id must exist in the dataset (an orphan
+/// label can never join a record and only pollutes the file), and the label
+/// must canonicalize onto the kind's vocabulary (see [`valid_labels`]) — a
+/// typo would otherwise exact-compare false against every decision forever.
+/// The entry carries the adjudication time; the file is append-only, so
+/// re-labeling the same id is a later line that supersedes by last-wins.
 pub fn append_label(logs_dir: &Path, id: &str, label: &str) -> Result<PathBuf, DecisionAuditError> {
+    let records = load_dataset(logs_dir)?;
+    let kind = records
+        .iter()
+        .find(|record| record.id == id)
+        .map(|record| record.kind.clone())
+        .ok_or_else(|| DecisionAuditError::UnknownRecordId { id: id.to_string() })?;
+    let valid = valid_labels(&kind);
+    let canonical =
+        canonical_label(&kind, label).ok_or_else(|| DecisionAuditError::InvalidLabel {
+            kind: kind.clone(),
+            label: label.to_string(),
+            valid: valid.unwrap_or(&[]),
+        })?;
     let dir = logs_dir.join(DECISION_AUDIT_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(LABELS_FILE);
     let entry = LabelEntry {
         id: id.to_string(),
-        label: label.to_string(),
+        label: canonical,
+        recorded_at: Some(chrono::Utc::now().to_rfc3339()),
     };
     let mut line = serde_json::to_string(&entry)?;
     line.push('\n');
@@ -1559,11 +1749,14 @@ mod tests {
     }
 
     /// Confidence that separates correct from incorrect decisions is the
-    /// precondition for any gate at all.
+    /// precondition for any gate at all. Shaped so BOTH guards pass: the 7
+    /// errors give the lift guard its signal, and the 113-error-free
+    /// high-confidence block satisfies the exact bound (n_accepted ≥ 99 at
+    /// γ = δ/8). The former 80/20 shape passed the in-sample rule but no
+    /// longer certifies — see `certification_needs_the_exact_bound`.
     fn informative_pairs() -> Vec<(f64, bool)> {
-        let mut pairs: Vec<(f64, bool)> = (0..80).map(|_| (0.95, true)).collect();
-        pairs.extend((0..5).map(|_| (0.30, true)));
-        pairs.extend((0..15).map(|_| (0.30, false)));
+        let mut pairs: Vec<(f64, bool)> = (0..113).map(|_| (0.95, true)).collect();
+        pairs.extend((0..7).map(|_| (0.10, false)));
         pairs
     }
 
@@ -1580,11 +1773,57 @@ mod tests {
         let outcome = select_threshold(&informative_pairs(), CalibrationTarget::default());
         let selected = outcome.selected().expect("a defensible threshold");
 
-        assert_eq!(selected.threshold, 0.95);
+        // The first CERTIFIED grid point ascending: τ=0.15 admits the 113
+        // error-free decisions (n_acc = 113 ≥ 99, k = 0), so CP(0, 113, 1/160)
+        // = 1 − e^(ln(1/160)/113) ≈ 0.0439 ≤ 0.05. τ=0.00 would admit the 7
+        // errors too and cannot certify; the threshold is a GRID value now.
+        assert_eq!(selected.threshold, 0.15);
         assert_eq!(selected.precision, 1.0);
-        assert!((selected.coverage - 0.8).abs() < 1e-9);
+        assert!((selected.coverage - 113.0 / 120.0).abs() < 1e-9);
         assert!(selected.precision_lift >= MIN_PRECISION_LIFT);
         assert!(selected.ece.is_some());
+        assert!(
+            selected.risk_bound > 0.0 && selected.risk_bound <= 1.0 - MIN_ACCEPTED_PRECISION,
+            "risk_bound {:.4} must be a true ≤5% certificate",
+            selected.risk_bound
+        );
+        assert!((selected.risk_bound - 0.0439).abs() < 1e-3);
+        assert_eq!(selected.delta, CALIBRATION_DELTA);
+        assert_eq!(selected.grid_size, threshold_grid_size());
+        assert_eq!(selected.errors, 0);
+    }
+
+    #[test]
+    fn certification_needs_the_exact_bound_not_point_precision() {
+        // 80 confident-correct + 20 timid-wrong: the OLD in-sample rule
+        // selected 0.95 here on empirical precision 1.0. The exact bound
+        // refuses — 80 zero-error accepts cannot support a ≤5% error-rate
+        // certificate at γ = δ/8 (CP(0, 80) ≈ 0.0615 > 0.05) — so the honest
+        // answer is a refusal, not the old optimistic number.
+        let mut pairs: Vec<(f64, bool)> = (0..80).map(|_| (0.95, true)).collect();
+        pairs.extend((0..20).map(|_| (0.30, false)));
+
+        let outcome = select_threshold(&pairs, CalibrationTarget::default());
+        assert_eq!(outcome.state(), "cannot_meet_target");
+        assert!(outcome.selected().is_none());
+    }
+
+    #[test]
+    fn cp_upper_bound_matches_the_exact_values() {
+        // k = 0 closed form: 1 − γ^(1/n).
+        assert!((cp_upper_bound(0, 100, 0.05) - 0.0295).abs() < 1e-3);
+        // One error among 100 stays under 5% at full δ…
+        assert!(cp_upper_bound(1, 100, 0.05) > 0.046);
+        assert!(cp_upper_bound(1, 100, 0.05) < 0.049);
+        // …two errors do not.
+        assert!(cp_upper_bound(2, 100, 0.05) > 0.05);
+        // Small accepted sets are structurally uncertifiable — the property
+        // the approximate Wilson bound violated (it certified n = 52).
+        assert!(cp_upper_bound(0, 5, 0.05) > 0.40);
+        assert!(cp_upper_bound(0, 52, 0.00625) > 0.05);
+        // Degenerate cases.
+        assert_eq!(cp_upper_bound(0, 0, 0.05), 1.0);
+        assert_eq!(cp_upper_bound(3, 3, 0.05), 1.0);
     }
 
     #[test]
@@ -1622,12 +1861,12 @@ mod tests {
             kind: "intent",
             rung: "L1",
         };
-        // The 80 confident decisions are correct; the 20 timid ones are wrong.
-        // Label != decision there, which is what makes the confidence signal
-        // measurable at all.
-        let mut records: Vec<DecisionRecord> = (0..MIN_LABELS_FOR_CALIBRATION)
+        // The 113 confident decisions are correct; the 7 timid ones are wrong
+        // (label != decision) — enough errors for the lift guard, few enough
+        // for the exact bound to certify the 113-clean high-confidence block.
+        let mut records: Vec<DecisionRecord> = (0..120)
             .map(|i| {
-                let (confidence, correct) = if i < 80 { (0.95, true) } else { (0.30, false) };
+                let (confidence, correct) = if i < 113 { (0.95, true) } else { (0.10, false) };
                 record(
                     &format!("intent-L1-{i}"),
                     "intent",
@@ -1644,11 +1883,11 @@ mod tests {
 
         let calibration = calibrate_field(&records, &source, CalibrationTarget::default());
         assert_eq!(calibration.field, "intent_l1");
-        assert_eq!(calibration.labeled, MIN_LABELS_FOR_CALIBRATION);
+        assert_eq!(calibration.labeled, 120);
         let selected = calibration.outcome.selected().expect("selected");
         assert_eq!(selected.kind, "intent");
         assert_eq!(selected.rung, "L1");
-        assert_eq!(selected.threshold, 0.95);
+        assert_eq!(selected.threshold, 0.15);
     }
 
     #[test]
@@ -1679,9 +1918,9 @@ mod tests {
         )
         .expect("seed");
 
-        let records: Vec<DecisionRecord> = (0..MIN_LABELS_FOR_CALIBRATION)
+        let records: Vec<DecisionRecord> = (0..120)
             .map(|i| {
-                let (confidence, correct) = if i < 80 { (0.95, true) } else { (0.30, false) };
+                let (confidence, correct) = if i < 113 { (0.95, true) } else { (0.10, false) };
                 record(
                     &format!("intent-L1-{i}"),
                     "intent",
@@ -1699,8 +1938,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("json");
 
         assert_eq!(
-            written["intent_l1"], 0.95,
-            "the calibrated field is written"
+            written["intent_l1"], 0.15,
+            "the calibrated field is written as its grid value"
         );
         assert_eq!(
             written["citation_l1"], 0.42,
@@ -1711,28 +1950,107 @@ mod tests {
             written.get("correction_l1").is_none(),
             "a refusal must never be persisted as a number"
         );
+        let meta = &written["_meta"]["intent_l1"];
+        assert!(
+            meta["risk_bound"].as_f64().expect("bound") <= 1.0 - MIN_ACCEPTED_PRECISION,
+            "the certificate travels with the value"
+        );
+        assert_eq!(meta["grid_size"], threshold_grid_size());
+        assert_eq!(meta["errors"], 0);
     }
     // ---- labeling workflow ----
+
+    /// Seed a dataset the append tests can validate against: one intent
+    /// record and one review record, written in the DecisionRecord shape
+    /// `load_dataset` parses, under fixed ids.
+    fn seed_dataset_for_labels(dir: &Path) {
+        let dir_path = dir.join(DECISION_AUDIT_DIR);
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let lines = concat!(
+            r#"{"id":"rec-intent","kind":"intent","rung":"L1","confidence":0.91,"decision":"Query"}"#,
+            "\n",
+            r#"{"id":"rec-review","kind":"review","rung":"L1","confidence":0.8,"decision":"approved"}"#,
+            "\n",
+        );
+        std::fs::write(dir_path.join("dataset.jsonl"), lines).unwrap();
+        let dataset = load_dataset(dir).unwrap();
+        assert_eq!(dataset.len(), 2, "seed dataset must parse");
+    }
 
     #[test]
     fn append_label_creates_the_file_and_last_entry_wins() {
         let dir = tempfile::tempdir().expect("tempdir");
         let logs = dir.path();
+        seed_dataset_for_labels(logs);
 
-        let path = append_label(logs, "rec-1", "Query").expect("append");
+        let path = append_label(logs, "rec-intent", "query").expect("append");
         assert!(path.exists(), "the labels file is created on first append");
+        assert_eq!(
+            load_labels(logs)
+                .unwrap()
+                .get("rec-intent")
+                .map(String::as_str),
+            Some("Query"),
+            "a case-variant label canonicalizes onto the decision vocabulary"
+        );
 
-        append_label(logs, "rec-1", "Action").expect("append");
-        append_label(logs, "rec-2", "System").expect("append");
+        append_label(logs, "rec-intent", "Action").expect("append");
+        append_label(logs, "rec-review", "approved").expect("append");
 
         let labels = load_labels(logs).expect("load");
         assert_eq!(labels.len(), 2);
         assert_eq!(
-            labels.get("rec-1").map(String::as_str),
+            labels.get("rec-intent").map(String::as_str),
             Some("Action"),
             "a later entry supersedes an earlier one (re-labeling is an append)"
         );
-        assert_eq!(labels.get("rec-2").map(String::as_str), Some("System"));
+        assert_eq!(
+            labels.get("rec-review").map(String::as_str),
+            Some("approved")
+        );
+
+        let raw = fs::read_to_string(logs.join("decision-audit").join("labels.jsonl")).unwrap();
+        assert!(
+            raw.lines().all(|line| line.contains("\"recorded_at\"")),
+            "every new entry records its adjudication time"
+        );
+    }
+
+    #[test]
+    fn append_label_rejects_unknown_ids_and_invalid_labels() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path();
+        seed_dataset_for_labels(logs);
+
+        let unknown = append_label(logs, "no-such-record", "Query");
+        assert!(
+            matches!(unknown, Err(DecisionAuditError::UnknownRecordId { .. })),
+            "an orphan label can never join a record; it is rejected at the door"
+        );
+
+        let typo = append_label(logs, "rec-intent", "Querry");
+        assert!(
+            matches!(typo, Err(DecisionAuditError::InvalidLabel { .. })),
+            "a typo'd label exact-compares false against every decision; rejected"
+        );
+
+        let labels_path = logs.join("decision-audit").join("labels.jsonl");
+        assert!(
+            !labels_path.exists(),
+            "a rejected write must leave no entry behind"
+        );
+    }
+
+    #[test]
+    fn label_vocabularies_mirror_the_emitters() {
+        assert_eq!(
+            valid_labels("intent"),
+            Some(&["Query", "Action", "System", "Conversation"][..])
+        );
+        assert_eq!(valid_labels("review"), Some(&["approved", "vetoed"][..]));
+        assert_eq!(valid_labels("correction"), Some(&["yes", "no"][..]));
+        assert_eq!(valid_labels("citation"), Some(&["yes", "no"][..]));
+        assert_eq!(valid_labels("future-kind"), None);
     }
 
     #[test]

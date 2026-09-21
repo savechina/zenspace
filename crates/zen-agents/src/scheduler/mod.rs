@@ -146,8 +146,9 @@ impl Drop for InFlightGuard<'_> {
 pub struct ZenScheduler {
     workers: HashMap<String, RegisteredWorker>,
     tick_interval: Duration,
-    /// Cumulative LLM cost per worker (USD), reset monthly.
-    worker_costs: Arc<RwLock<HashMap<String, f64>>>,
+    /// Cumulative LLM cost per worker (USD) for the current month, optionally
+    /// persisted to a sidecar file (see [`ZenScheduler::with_cost_ledger`]).
+    worker_costs: Arc<RwLock<WorkerCostLedger>>,
     /// Monthly cost cap per worker (USD). Workers exceeding this are skipped.
     cost_cap_usd: f64,
     /// Timezone cron wall-clock fields are evaluated against (E11).
@@ -155,15 +156,131 @@ pub struct ZenScheduler {
     tz: chrono_tz::Tz,
 }
 
+/// `"YYYY-MM"` (UTC) month key the cost cap window is scoped to.
+fn month_key(now: DateTime<Utc>) -> String {
+    now.format("%Y-%m").to_string()
+}
+
+/// Per-worker monthly LLM cost totals backing the `[cron] llm_cost_cap_usd`
+/// cap check.
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: holds the cumulative USD cost per worker for one calendar
+///   month and (when `path` is set) mirrors it to a small JSON sidecar so the
+///   cap survives daemon restarts within the month.
+/// - User impact: a worker whose monthly total reaches the cap is skipped on
+///   every subsequent tick (with the existing warn line) until the month rolls
+///   over; without persistence a restart used to reset every total to 0, so
+///   the cap could never trip on a frequently-restarted daemon.
+/// - Default: in-memory only (`path: None`), month = construction month.
+/// - Interaction: rollover is lazy — a month mismatch at check or accumulate
+///   time resets the totals; a missing/corrupt sidecar fails open to empty
+///   (loud warn on corrupt), matching the plugin `state.json` precedent.
+#[derive(Debug)]
+struct WorkerCostLedger {
+    month: String,
+    costs: HashMap<String, f64>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl WorkerCostLedger {
+    fn in_memory(month: String) -> Self {
+        Self {
+            month,
+            costs: HashMap::new(),
+            path: None,
+        }
+    }
+}
+
+/// On-disk shape of the cost ledger sidecar (`path` itself is not persisted).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CostLedgerFile {
+    month: String,
+    costs: HashMap<String, f64>,
+}
+
+/// Load persisted monthly totals for `month`. Missing file, unreadable file,
+/// corrupt JSON, or a month mismatch all yield an empty map (fail-open; the
+/// cap simply starts accruing from zero). Corrupt content warns loudly.
+fn load_cost_ledger(path: &std::path::Path, month: &str) -> HashMap<String, f64> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(_) => return HashMap::new(),
+    };
+    match serde_json::from_str::<CostLedgerFile>(&raw) {
+        Ok(file) if file.month == month => file.costs,
+        Ok(_) => HashMap::new(),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "scheduler: cost ledger corrupt — starting from zero (cap accrues fresh)");
+            HashMap::new()
+        }
+    }
+}
+
+/// Persist monthly totals atomically (tmp → fsync → rename). A write failure
+/// is returned to the caller, which warns — in-memory totals stay correct for
+/// the process lifetime either way.
+fn save_cost_ledger(
+    path: &std::path::Path,
+    month: &str,
+    costs: &HashMap<String, f64>,
+) -> std::io::Result<()> {
+    let file = CostLedgerFile {
+        month: month.to_string(),
+        costs: costs.clone(),
+    };
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    zen_core::atomic_file::write_atomic(path, json.as_bytes())
+}
+
 impl ZenScheduler {
     pub fn new() -> Self {
         Self {
             workers: HashMap::new(),
             tick_interval: Duration::from_secs(DEFAULT_TICK_INTERVAL_SECONDS),
-            worker_costs: Arc::new(RwLock::new(HashMap::new())),
+            worker_costs: Arc::new(RwLock::new(WorkerCostLedger::in_memory(month_key(
+                Utc::now(),
+            )))),
             cost_cap_usd: 10.0,
             tz: chrono_tz::UTC,
         }
+    }
+
+    /// Persist per-worker monthly cost totals to `path` (and reseed from it),
+    /// so the `[cron] llm_cost_cap_usd` cap survives restarts within a month.
+    ///
+    /// A file whose `month` differs from the current UTC month (or that is
+    /// missing/corrupt) seeds nothing — the monthly window resets by design.
+    pub fn with_cost_ledger(self, path: std::path::PathBuf) -> Self {
+        let month = month_key(Utc::now());
+        let costs = load_cost_ledger(&path, &month);
+        *self.worker_costs.write().unwrap() = WorkerCostLedger {
+            month,
+            costs,
+            path: Some(path),
+        };
+        self
+    }
+
+    /// The cost-cap check the tick loop runs before firing a worker: returns
+    /// the worker's cumulative cost for `now`'s month when it is at or above
+    /// the cap, `None` otherwise (including a month rollover — a new month
+    /// starts every worker at zero).
+    fn cost_cap_exceeded(&self, worker_id: &str, now: DateTime<Utc>) -> Option<f64> {
+        let ledger = self.worker_costs.read().unwrap();
+        if ledger.month != month_key(now) {
+            return None;
+        }
+        ledger
+            .costs
+            .get(worker_id)
+            .copied()
+            .filter(|&cost| cost >= self.cost_cap_usd)
     }
 
     /// Evaluate cron schedules in `tz` (E11): worker wall-clock fields
@@ -334,22 +451,18 @@ impl ZenScheduler {
         }
 
         for (id, worker, ctx, in_flight) in to_fire {
-            {
-                let costs = self.worker_costs.read().unwrap();
-                if let Some(&cost) = costs.get(&id)
-                    && cost >= self.cost_cap_usd
-                {
-                    warn!(
-                        worker = %id,
-                        cost = cost,
-                        cap = self.cost_cap_usd,
-                        "scheduler: skipping worker (monthly LLM cost cap exceeded)"
-                    );
-                    continue;
-                }
+            if let Some(cost) = self.cost_cap_exceeded(&id, now) {
+                warn!(
+                    worker = %id,
+                    cost = cost,
+                    cap = self.cost_cap_usd,
+                    "scheduler: skipping worker (monthly LLM cost cap exceeded)"
+                );
+                continue;
             }
             let cost_cap = self.cost_cap_usd;
             let costs = Arc::clone(&self.worker_costs);
+            let month = month_key(now);
             tokio::spawn(async move {
                 // F5: always clear the in-flight flag, success or failure.
                 let _clear = InFlightGuard(&in_flight);
@@ -364,8 +477,12 @@ impl ZenScheduler {
                             "scheduler: worker completed"
                         );
                         if report.llm_cost_usd > 0.0 {
-                            let mut costs_guard = costs.write().unwrap();
-                            let entry = costs_guard.entry(report.worker_id.clone()).or_insert(0.0);
+                            let mut ledger = costs.write().unwrap();
+                            if ledger.month != month {
+                                ledger.month = month;
+                                ledger.costs.clear();
+                            }
+                            let entry = ledger.costs.entry(report.worker_id.clone()).or_insert(0.0);
                             *entry += report.llm_cost_usd;
                             if *entry >= cost_cap {
                                 warn!(
@@ -373,6 +490,16 @@ impl ZenScheduler {
                                     cumulative_cost = *entry,
                                     cap = cost_cap,
                                     "scheduler: worker hit monthly cost cap, will skip next runs"
+                                );
+                            }
+                            if let Some(path) = ledger.path.clone()
+                                && let Err(e) =
+                                    save_cost_ledger(&path, &ledger.month, &ledger.costs)
+                            {
+                                warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "scheduler: cost ledger persist failed (in-memory totals kept)"
                                 );
                             }
                         }
@@ -615,6 +742,13 @@ pub fn create_configured_scheduler_with(
     profile: SchedulerProfile,
 ) -> ZenScheduler {
     let mut scheduler = ZenScheduler::new().with_timezone(config.timezone_or_default());
+
+    // The monthly cost cap only means something across restarts: persist the
+    // per-worker totals beside the other loop sidecars. Fail-open — an
+    // unresolvable ZEN_HOME degrades to the previous in-memory-only accrual.
+    if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+        scheduler = scheduler.with_cost_ledger(paths.logs().join("worker-costs.json"));
+    }
 
     let dl_schedule = config
         .daily_log_schedule()
@@ -864,6 +998,160 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "in-window tick (08:59:50, 10s to cron) must fire after an out-of-window tick"
+        );
+    }
+
+    /// Worker whose reported cost comes from the real metering path:
+    /// metered `ModelMetadata` pricing ($1/M in, $2/M out) × usage
+    /// (5M in + 3M out) = $11 ≥ the $10 default cap.
+    struct CostWorker(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl CostWorker {
+        fn metered_cost_usd() -> f64 {
+            let meta = zen_provider::ModelMetadata {
+                name: "metered".to_string(),
+                provider: "openai".to_string(),
+                context_window: 0,
+                input_cost_per_million: 1.0,
+                output_cost_per_million: 2.0,
+                capabilities: Vec::new(),
+                is_local: false,
+            };
+            zen_provider::usage_to_cost_usd(&meta, 5_000_000, 3_000_000)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ZenWorker for CostWorker {
+        fn id(&self) -> &'static str {
+            "cost"
+        }
+        fn description(&self) -> &'static str {
+            "reports metered LLM cost"
+        }
+        fn schedule(&self) -> &'static str {
+            "*/1 * * * * *"
+        }
+        async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(WorkerReport {
+                worker_id: "cost".to_string(),
+                success: true,
+                fact_count: 0,
+                duration_ms: 0,
+                llm_cost_usd: Self::metered_cost_usd(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn metered_llm_cost_trips_cap_and_skips_subsequent_fires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        assert!(
+            (CostWorker::metered_cost_usd() - 11.0).abs() < 1e-9,
+            "metering must derive $11 from usage × pricing"
+        );
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut sched = ZenScheduler::new();
+        sched.register(CostWorker(Arc::clone(&counter))).unwrap();
+
+        let now = Utc::now();
+        sched.tick(now).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "first fire runs under an empty ledger"
+        );
+        assert_eq!(
+            sched.cost_cap_exceeded("cost", now),
+            Some(11.0),
+            "accumulated metered cost must be at/above the $10 cap"
+        );
+
+        sched.tick(now).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the real tick-time cap check must skip the worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_ledger_persists_monthly_totals_and_reseeds_the_cap_check() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("worker-costs.json");
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut first = ZenScheduler::new().with_cost_ledger(ledger.clone());
+        first.register(CostWorker(Arc::clone(&counter))).unwrap();
+        let now = Utc::now();
+        first.tick(now).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let raw = std::fs::read_to_string(&ledger).expect("sidecar persisted");
+        let file: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(file["month"], month_key(now));
+        assert!(file["costs"]["cost"].as_f64().unwrap() >= 10.0);
+
+        let counter2 = Arc::new(AtomicUsize::new(0));
+        let mut restarted = ZenScheduler::new().with_cost_ledger(ledger);
+        restarted
+            .register(CostWorker(Arc::clone(&counter2)))
+            .unwrap();
+        restarted.tick(Utc::now()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter2.load(Ordering::SeqCst),
+            0,
+            "a restart within the month must reseed the cap from the sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_month_ledger_does_not_trip_the_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("worker-costs.json");
+        std::fs::write(&ledger, r#"{"month":"2020-01","costs":{"cost":999.0}}"#).unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut sched = ZenScheduler::new().with_cost_ledger(ledger);
+        sched.register(CostWorker(Arc::clone(&counter))).unwrap();
+        sched.tick(Utc::now()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a previous month's spend must not block the current month"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_cost_ledger_fails_open() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("worker-costs.json");
+        std::fs::write(&ledger, "not json {{{").unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut sched = ZenScheduler::new().with_cost_ledger(ledger);
+        assert!(sched.cost_cap_exceeded("cost", Utc::now()).is_none());
+        sched.register(CostWorker(Arc::clone(&counter))).unwrap();
+        sched.tick(Utc::now()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a corrupt sidecar degrades to fresh in-memory accrual"
         );
     }
 

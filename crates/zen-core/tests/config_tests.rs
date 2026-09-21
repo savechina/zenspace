@@ -606,3 +606,28 @@ fn agents_tools_default_constructs_empty() {
     let config = ZenConfig::default();
     assert!(config.agents_tools.is_empty());
 }
+
+#[test]
+fn t183_stray_whatsapp_telegram_sections_are_inertly_ignored() {
+    let config: ZenConfig = toml::from_str(
+        r#"
+[channels.whatsapp]
+phone_number_id = "123"
+access_token = "secret"
+
+[channels.telegram]
+bot_token = "456:abc"
+
+[channels.qqbot]
+app_id = "qq-1"
+client_secret = "qq-secret"
+"#,
+    )
+    .expect("stray [channels.whatsapp]/[channels.telegram] sections must parse (no deny_unknown_fields)");
+    assert!(config.channels.qqbot.is_some(), "qqbot still parsed");
+    assert_eq!(
+        config.channels.qqbot.as_ref().unwrap().app_id,
+        "qq-1",
+        "real channel config unaffected by stray sections"
+    );
+}

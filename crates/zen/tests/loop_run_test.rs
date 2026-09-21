@@ -113,7 +113,16 @@ fn loop_gaps_empty_state_and_json_flag() {
         gaps.stdout(),
         gaps.stderr()
     );
-    assert!(gaps.stdout().trim().starts_with('['), "JSON array expected");
+    // T187 contract: gaps --json wraps {"gaps": [...], "user_questions": [...]}
+    let v: serde_json::Value = serde_json::from_str(&gaps.stdout()).expect("valid gaps json");
+    assert!(
+        v.get("gaps").and_then(|g| g.as_array()).is_some(),
+        "gaps array expected"
+    );
+    assert!(
+        v.get("user_questions").and_then(|q| q.as_array()).is_some(),
+        "user_questions array expected"
+    );
 }
 
 #[test]

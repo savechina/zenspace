@@ -14,11 +14,13 @@ pub mod merge;
 pub mod notion_extraction;
 pub mod orchestration_stats;
 pub mod pipeline;
+pub mod placeholders_store;
 pub mod recovery;
 pub mod reflection;
 pub mod reward_sidecar;
 pub mod source_ingest;
 pub mod stages;
+pub mod success_criteria;
 pub mod tool_call_log;
 pub mod transaction;
 pub mod types;
@@ -30,10 +32,7 @@ pub use adversarial::{
     ContestantVerdict, EvalCase, INCUMBENT, NaiveBaseline, PhaseScore, ZenDistill, corpus,
     judge_case, report_path, run_arena,
 };
-pub use baselines::{
-    Baseline, Baselines, MIN_SAMPLE, RoutingDistribution, ShadowAgreement,
-    compute as compute_baselines,
-};
+pub use baselines::compute as compute_baselines;
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
 pub use correlation::{Opportunity, correlate};
@@ -72,6 +71,10 @@ pub use pipeline::{
     DistillationPipeline, DistillationPipelineInput, DistillationReport, ScopedRunOutcome,
     prune_context,
 };
+pub use placeholders_store::{
+    PLACEHOLDERS_FILE, PLACEHOLDERS_LOCK, merge_placeholders, merge_save_placeholders,
+    registry_path,
+};
 pub use recovery::RecoveryManager;
 pub use reward_sidecar::{
     card_id_from_path, increment_access, increment_citations, increment_corrections, read_reward,
@@ -79,6 +82,7 @@ pub use reward_sidecar::{
 };
 pub use source_ingest::SourceIngester;
 pub use stages::LlmDistillStage;
+pub use success_criteria::{FirstAttemptSuccess, compute_first_attempt_success};
 pub use tool_call_log::{
     ToolCallAggregate, aggregate_all_sessions, append_tool_call, prune_expired_sessions,
 };
@@ -88,14 +92,7 @@ pub use types::{
     GraphPlaceholder, HypothesisSlug, HypothesisStatus, LoopBudget, LoopCycleReport, MemoryReward,
     PlaceholderStatus, SelfModelItem, SelfModelLayer, ToolCall, TypedSignalKind, VerificationNode,
 };
-pub use vendor_eval::{
-    AggregateVerdict, AxisVerdict, CARDINALITY_CAP, CalibrationAxis, CandidateCaller,
-    CandidateOutput, CardinalityAxis, DEFAULT_MAX_CONCURRENT, EvalState, LatencyAxis,
-    LocalFirstAxis, MAX_CONCURRENT_CLAMP, RouterCandidateCaller, VendorEvalError, VendorEvalReport,
-    WorkloadEval, WorkloadKind, WorkloadState, build_prompt, cardinality_for, evaluate,
-    evaluate_with_caller, latest_report, local_first_for, not_evaluated, parse_candidate_output,
-    save_report,
-};
+pub use vendor_eval::{evaluate, latest_report, not_evaluated, save_report};
 pub use wiki_compile::WikiCompiler;
 
 pub struct Distill;

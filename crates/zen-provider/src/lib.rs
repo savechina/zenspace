@@ -9,11 +9,11 @@ pub use embedding::{
     OllamaEmbeddingProvider, OpenAiEmbeddingProvider,
 };
 pub use model_meta::{
-    ModelMetadata, ModelRouter, ModelStats, PromptHookTelemetry, PromptTelemetry,
+    ModelMetadata, ModelRouter, ModelStats, PromptHookTelemetry, PromptTelemetry, usage_to_cost_usd,
 };
 pub use router::{
     DefaultLlmRetryClassifier, DefaultRouter, LlmConfig, LlmError, LlmRetryClassifier, LlmRouter,
-    LlmRouterExt, MockProvider, Provider, ProviderInstance, TaskRequirements,
+    LlmRouterExt, MeteredCompletion, MockProvider, Provider, ProviderInstance, TaskRequirements,
     is_local_llm_available,
 };
 pub use stream::StreamResponse;

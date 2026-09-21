@@ -14,9 +14,9 @@ use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
     CalibrationTarget, CliContestant, Contestant, NaiveBaseline, ZenDistill, aggregate,
-    aggregate_orchestration, analyze, append_label, calibrate, compute_baselines, evaluate,
-    label_status, latest_report, load_dataset, load_reports, not_evaluated, run_arena, save_report,
-    unlabeled, write_thresholds,
+    aggregate_orchestration, analyze, append_label, calibrate, compute_baselines,
+    compute_first_attempt_success, evaluate, label_status, latest_report, load_dataset,
+    load_labels, load_reports, not_evaluated, run_arena, save_report, unlabeled, write_thresholds,
 };
 
 #[derive(Subcommand)]
@@ -196,6 +196,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                         "min_coverage": target.min_coverage,
                         "min_labels": target.min_labels,
                         "min_precision_lift": target.min_precision_lift,
+                        "delta": target.delta,
                     },
                     "fields": calibrations,
                     "written": *write,
@@ -259,8 +260,12 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 let records = load_dataset(&paths.logs())
                     .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
                 let status = label_status(&records);
+                let stored = load_labels(&paths.logs())
+                    .ok()
+                    .and_then(|labels| labels.get(id).cloned())
+                    .unwrap_or_else(|| label.clone());
                 println!(
-                    "{} {id} → {label} ({}/{})",
+                    "{} {id} → {stored} ({}/{})",
                     "labeled".green().bold(),
                     status.labeled,
                     status.total,
@@ -278,6 +283,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 .map_err(|e| ZenError::Message(format!("decision audit error: {e}")))?;
             let replay = zen_vault::distill::score_from_log(&paths.logs());
             let baselines = compute_baselines(&paths.logs());
+            let first_attempt_success = compute_first_attempt_success(&paths.logs());
             let threshold_fields = {
                 let records = load_dataset(&paths.logs()).unwrap_or_default();
                 calibrate(&records, CalibrationTarget::default())
@@ -292,6 +298,10 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                             .to_string(),
                     )
                 });
+            let success_criteria = serde_json::json!({
+                "first_attempt_success": serde_json::to_value(&first_attempt_success)
+                    .map_err(|e| ZenError::Message(e.to_string()))?,
+            });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -300,11 +310,29 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     "calibration": calibration,
                     "thresholds": threshold_fields,
                     "baselines": baselines,
+                    "success_criteria": success_criteria,
                     "replay": replay,
                     "vendor_eval": vendor_eval,
                 }))
                 .map_err(|e| ZenError::Message(e.to_string()))?
             );
+            match first_attempt_success.first_attempt_success_pct {
+                Some(pct) => println!(
+                    "{} {:.1}% (n={})",
+                    "first-attempt success:".green().bold(),
+                    pct,
+                    first_attempt_success.n
+                ),
+                None => println!(
+                    "{} n={} (need {}) — percentage withheld, sample below the reporting minimum",
+                    "first-attempt success:".yellow().bold(),
+                    first_attempt_success.n,
+                    first_attempt_success
+                        .insufficient
+                        .map(|ins| ins.required)
+                        .unwrap_or(0),
+                ),
+            }
         }
         DiscoverCommands::Arena {
             external,

@@ -1,3 +1,4 @@
+use crate::model_meta::ModelMetadata;
 use crate::providers::{
     AnthropicProvider, CohereProvider, GeminiProvider, MistralProvider, OllamaProvider,
     OpenAIProvider,
@@ -201,6 +202,36 @@ pub struct TaskRequirements {
 }
 
 // ---------------------------------------------------------------------------
+// MeteredCompletion — usage-metered completion result
+// ---------------------------------------------------------------------------
+
+/// Result of [`DefaultRouter::complete_metered`]: the completion text plus the
+/// usage and USD cost derived from the resolved provider's pricing.
+#[derive(Debug, Clone)]
+pub struct MeteredCompletion {
+    /// Completion text (identical to what [`LlmRouterExt::complete`] returns).
+    pub text: String,
+    /// Config provider name the call was routed to (e.g. `"ollama"`).
+    pub provider: String,
+    /// Model name reported by the resolved provider instance.
+    pub model: String,
+    /// Estimated input tokens (`bytes / 4` heuristic — see `complete_metered`).
+    pub input_tokens: u64,
+    /// Estimated output tokens (`bytes / 4` heuristic — see `complete_metered`).
+    pub output_tokens: u64,
+    /// USD cost from [`usage_to_cost_usd`](crate::model_meta::usage_to_cost_usd);
+    /// exactly 0.0 for local providers and unmetered (unpriced) cloud ones.
+    pub cost_usd: f64,
+}
+
+/// Token-count estimate from byte length: `bytes / 4` — the same heuristic
+/// [`PromptHookTelemetry::record`](crate::model_meta::PromptHookTelemetry::record)
+/// uses, kept in one place so cost accounting and telemetry never diverge.
+fn estimate_tokens(text: &str) -> u64 {
+    (text.len() as u64) / 4
+}
+
+// ---------------------------------------------------------------------------
 // LlmRouter trait
 // ---------------------------------------------------------------------------
 
@@ -238,6 +269,54 @@ pub trait LlmRouter: std::fmt::Debug + Send + Sync {
 // LlmRouterExt — convenience wrapper (matches spec task/request/sensitivity API)
 // ---------------------------------------------------------------------------
 
+/// Map a routing failure to the canonical [`ZenError`] (shared by
+/// [`LlmRouterExt::complete`] and [`DefaultRouter::complete_metered`] so both
+/// paths surface identical errors).
+fn route_zen_error(task: &str, e: LlmError) -> ZenError {
+    warn!(task, error = %e, "LlmRouter route failed");
+    ZenError::Agentic(
+        zen_core::errors::AgenticError::LlmRoutingFailed {
+            provider: "unknown".into(),
+            reason: e.to_string(),
+        },
+        zen_core::errors::ErrorCategory::SystemError,
+    )
+}
+
+/// Map a call failure to the canonical [`ZenError`] (shared by
+/// [`LlmRouterExt::complete`] and [`DefaultRouter::complete_metered`]).
+fn call_zen_error(task: &str, provider: &Provider, e: LlmError) -> ZenError {
+    warn!(
+        task,
+        provider = %provider,
+        error = %e,
+        "LlmRouter call failed"
+    );
+    match &e {
+        LlmError::ProviderUnavailable { provider, reason } => ZenError::Agentic(
+            zen_core::errors::AgenticError::LlmProviderUnavailable {
+                provider: provider.clone(),
+                reason: reason.clone(),
+            },
+            zen_core::errors::ErrorCategory::SystemError,
+        ),
+        LlmError::Routing { reason } => ZenError::Agentic(
+            zen_core::errors::AgenticError::LlmRoutingFailed {
+                provider: provider.to_string(),
+                reason: reason.clone(),
+            },
+            zen_core::errors::ErrorCategory::SystemError,
+        ),
+        LlmError::Call { reason } => ZenError::Agentic(
+            zen_core::errors::AgenticError::LlmProviderUnavailable {
+                provider: provider.to_string(),
+                reason: format!("call failed: {reason}"),
+            },
+            zen_core::errors::ErrorCategory::SystemError,
+        ),
+    }
+}
+
 /// Extension trait so callers that already have `(task, request, sensitivity)`
 /// can still use the router without manually constructing [`TaskRequirements`].
 pub trait LlmRouterExt: LlmRouter {
@@ -255,48 +334,12 @@ pub trait LlmRouterExt: LlmRouter {
             budget_limit: None,
         };
 
-        let provider = self.route(&requirements).map_err(|e| {
-            warn!(task, error = %e, "LlmRouter route failed");
-            ZenError::Agentic(
-                zen_core::errors::AgenticError::LlmRoutingFailed {
-                    provider: "unknown".into(),
-                    reason: e.to_string(),
-                },
-                zen_core::errors::ErrorCategory::SystemError,
-            )
-        })?;
+        let provider = self
+            .route(&requirements)
+            .map_err(|e| route_zen_error(task, e))?;
 
-        self.call(provider.clone(), request).map_err(|e| {
-            warn!(
-                task,
-                provider = %provider,
-                error = %e,
-                "LlmRouter call failed"
-            );
-            match &e {
-                LlmError::ProviderUnavailable { provider, reason } => ZenError::Agentic(
-                    zen_core::errors::AgenticError::LlmProviderUnavailable {
-                        provider: provider.clone(),
-                        reason: reason.clone(),
-                    },
-                    zen_core::errors::ErrorCategory::SystemError,
-                ),
-                LlmError::Routing { reason } => ZenError::Agentic(
-                    zen_core::errors::AgenticError::LlmRoutingFailed {
-                        provider: provider.to_string(),
-                        reason: reason.clone(),
-                    },
-                    zen_core::errors::ErrorCategory::SystemError,
-                ),
-                LlmError::Call { reason } => ZenError::Agentic(
-                    zen_core::errors::AgenticError::LlmProviderUnavailable {
-                        provider: provider.to_string(),
-                        reason: format!("call failed: {reason}"),
-                    },
-                    zen_core::errors::ErrorCategory::SystemError,
-                ),
-            }
-        })
+        self.call(provider.clone(), request)
+            .map_err(|e| call_zen_error(task, &provider, e))
     }
 }
 
@@ -798,6 +841,105 @@ impl DefaultRouter {
         self.config.default_provider.as_deref().unwrap_or("ollama")
     }
 
+    /// Build the cost-relevant [`ModelMetadata`] for a configured provider.
+    ///
+    /// Pricing comes from the optional `[providers.<name>]
+    /// input_cost_per_million` / `output_cost_per_million` config keys
+    /// (absent → 0.0, i.e. unmetered — pricing is never assumed).
+    /// `is_local` is set for `type = "ollama"` providers, which
+    /// [`usage_to_cost_usd`](crate::model_meta::usage_to_cost_usd) treats as a
+    /// structural zero cost. `context_window`/`capabilities` are not
+    /// resolvable from config and stay empty — only pricing and locality are
+    /// meaningful on the returned value.
+    pub fn model_metadata(&self, provider_name: &str, model: &str) -> ModelMetadata {
+        let cfg = self.config.providers.get(provider_name);
+        let provider_type = cfg
+            .and_then(|c| c.provider_type.as_deref())
+            .unwrap_or("openai-compatible");
+        ModelMetadata {
+            name: model.to_string(),
+            provider: provider_name.to_string(),
+            context_window: 0,
+            input_cost_per_million: cfg.and_then(|c| c.input_cost_per_million).unwrap_or(0.0),
+            output_cost_per_million: cfg.and_then(|c| c.output_cost_per_million).unwrap_or(0.0),
+            capabilities: Vec::new(),
+            is_local: provider_type == "ollama",
+        }
+    }
+
+    /// Completion with usage metering for cost accounting (the metered sibling
+    /// of [`LlmRouterExt::complete`]).
+    ///
+    /// Routes and calls exactly like `complete` (same requirements, same error
+    /// mapping), then derives the USD cost of the call via
+    /// [`usage_to_cost_usd`](crate::model_meta::usage_to_cost_usd) from the
+    /// resolved provider's configured pricing and the token usage.
+    ///
+    /// Token usage is ESTIMATED as `bytes / 4` — the same heuristic
+    /// [`PromptHookTelemetry::record`](crate::model_meta::PromptHookTelemetry::record)
+    /// already uses — because the provider `complete()` implementations return
+    /// only text (the usage the provider reports is discarded inside them).
+    /// Provider-reported usage is the accuracy follow-up; the estimate keeps
+    /// the cost cap directionally real today.
+    ///
+    /// A non-local provider with no configured pricing meters as 0.0 and logs
+    /// a warning naming the config keys — the cap then cannot trip for that
+    /// provider, which is surfaced rather than silently fabricated.
+    pub fn complete_metered(
+        &self,
+        task: &str,
+        request: &str,
+        sensitivity: Sensitivity,
+    ) -> Result<MeteredCompletion, ZenError> {
+        let requirements = TaskRequirements {
+            max_tokens: None,
+            sensitivity,
+            preferred_model: None,
+            budget_limit: None,
+        };
+        let provider = self
+            .route(&requirements)
+            .map_err(|e| route_zen_error(task, e))?;
+        let provider_name = match &provider {
+            Provider::Unknown(name) => name.clone(),
+            _ => provider.to_string(),
+        };
+        let text = self
+            .call(provider.clone(), request)
+            .map_err(|e| call_zen_error(task, &provider, e))?;
+
+        let model = if provider_name == "mock" {
+            "mock".to_string()
+        } else {
+            self.provider_instance(&provider_name)
+                .map(|instance| instance.model_name().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+        let metadata = self.model_metadata(&provider_name, &model);
+        let input_tokens = estimate_tokens(request);
+        let output_tokens = estimate_tokens(&text);
+        if !metadata.is_local
+            && metadata.input_cost_per_million == 0.0
+            && metadata.output_cost_per_million == 0.0
+        {
+            warn!(
+                task,
+                provider = %provider_name,
+                model = %model,
+                "LLM cost unmetered: set input_cost_per_million/output_cost_per_million under [providers.{provider_name}] so the worker cost cap can see this spend"
+            );
+        }
+        let cost_usd = crate::model_meta::usage_to_cost_usd(&metadata, input_tokens, output_tokens);
+        Ok(MeteredCompletion {
+            text,
+            provider: provider_name,
+            model,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        })
+    }
+
     /// Resolve effective [`ModelOptions`] for a provider by looking up its
     /// model catalog entry and optionally applying a variant.
     /// Returns `None` if the provider has no model catalog or the selected
@@ -1024,7 +1166,7 @@ impl LlmRouter for DefaultRouter {
         let provider = Self::resolve_provider(&self.config, task_ctx).ok_or_else(|| {
             LlmError::ProviderUnavailable {
                 provider: "none".into(),
-                reason: "No provider configured; set [agentic.llm] in config.toml".into(),
+                reason: "No provider configured; set default_provider and a [providers.<name>] section in config.toml (or run `zen provider`)".into(),
             }
         })?;
         self.enforce_sensitivity(provider, requirements.sensitivity)

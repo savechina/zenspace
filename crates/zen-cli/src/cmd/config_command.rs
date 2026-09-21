@@ -59,21 +59,6 @@ pub fn execute_command(operation: &ConfigCommands) -> Result<(), ZenError> {
                     println!("    allowed_users  = {:?}", bot.allowed_users);
                 }
             }
-            if let Some(ref wa) = config.channels.whatsapp {
-                println!("  WhatsApp:");
-                println!("    phone_number_id = {}", wa.phone_number_id.cyan());
-                println!("    access_token    = {}", "[set]".cyan());
-                if !wa.allowed_users.is_empty() {
-                    println!("    allowed_users   = {:?}", wa.allowed_users);
-                }
-            }
-            if let Some(ref tg) = config.channels.telegram {
-                println!("  Telegram:");
-                println!("    bot_token      = {}", "[set]".cyan());
-                if !tg.allowed_users.is_empty() {
-                    println!("    allowed_users  = {:?}", tg.allowed_users);
-                }
-            }
             println!("\n{}", "─── Cron ───".bright_white());
             println!(
                 "  consolidation_time = {}",

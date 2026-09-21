@@ -202,14 +202,14 @@ pub struct WasmSandboxConfig {
 }
 
 /// IM channel configuration — supports multiple platforms.
+///
+/// T183: `whatsapp`/`telegram` were removed — no channel implementation ever
+/// consumed them (phantom config). `[channels.whatsapp]` / `[channels.telegram]`
+/// sections in config.toml are inertly ignored (no `deny_unknown_fields`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ChannelsConfig {
     #[serde(default)]
     pub qqbot: Option<QqBotChannelConfig>,
-    #[serde(default)]
-    pub whatsapp: Option<WhatsAppChannelConfig>,
-    #[serde(default)]
-    pub telegram: Option<TelegramChannelConfig>,
 }
 
 /// QQ Bot channel configuration.
@@ -232,25 +232,6 @@ pub struct QqBotChannelConfig {
     /// Interaction: independent of the WS gateway/intent knobs.
     #[serde(default)]
     pub outbox_drain_interval_secs: Option<u64>,
-}
-
-/// WhatsApp channel configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct WhatsAppChannelConfig {
-    pub phone_number_id: String,
-    pub access_token: String,
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
-}
-
-/// Telegram channel configuration.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TelegramChannelConfig {
-    pub bot_token: String,
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
-    #[serde(default)]
-    pub home_chat_id: Option<String>,
 }
 
 /// Provider definition — connection settings defined once, referenced by name.
@@ -295,6 +276,27 @@ pub struct ProviderConfig {
     /// (backward compatible).
     #[serde(default)]
     pub models: HashMap<String, ModelEntry>,
+    /// USD price per 1M input tokens for this provider's default model.
+    ///
+    /// Scope logic (Constitution XV):
+    /// - Functionality: enables real LLM cost accounting for the scheduler's
+    ///   per-worker monthly cost cap (`[cron] llm_cost_cap_usd`); consumed by
+    ///   `DefaultRouter::complete_metered` via `ModelMetadata` pricing.
+    /// - User impact: when set, worker LLM calls accumulate real USD cost and
+    ///   the cap can trip; when absent on a cloud provider, cost meters as
+    ///   0.0 with a warning (the cap cannot trip for that provider).
+    /// - Default: `None` (pricing unknown — never assumed).
+    /// - Interaction: local providers (`type = "ollama"`) always cost 0.0
+    ///   regardless of these fields; `output_cost_per_million` is the pair.
+    #[serde(default)]
+    pub input_cost_per_million: Option<f64>,
+    /// USD price per 1M output tokens for this provider's default model.
+    ///
+    /// Scope logic: mirror of `input_cost_per_million` (same functionality,
+    /// user impact, default, and interaction); both fields are independent —
+    /// setting only one meters the other at 0.0.
+    #[serde(default)]
+    pub output_cost_per_million: Option<f64>,
 }
 
 /// Fallback step for sequential fallback chain.
@@ -2092,6 +2094,11 @@ fn merge_providers(
                     .or(existing.embedding_model.clone());
                 existing.wire_api = v.wire_api.clone().or(existing.wire_api.clone());
                 existing.models = merge_models(existing.models.clone(), v.models.clone());
+                existing.input_cost_per_million =
+                    v.input_cost_per_million.or(existing.input_cost_per_million);
+                existing.output_cost_per_million = v
+                    .output_cost_per_million
+                    .or(existing.output_cost_per_million);
             })
             .or_insert(v);
     }
@@ -2142,8 +2149,6 @@ fn merge_features(base: FeatureConfig, ov: FeatureConfig) -> FeatureConfig {
 fn merge_channels(base: ChannelsConfig, ov: ChannelsConfig) -> ChannelsConfig {
     ChannelsConfig {
         qqbot: merge_option(base.qqbot, ov.qqbot),
-        whatsapp: merge_option(base.whatsapp, ov.whatsapp),
-        telegram: merge_option(base.telegram, ov.telegram),
     }
 }
 
@@ -2624,40 +2629,6 @@ fn apply_channels_env(channels: &mut ChannelsConfig) {
         }
         if let Some(v) = client_secret {
             q.client_secret = v;
-        }
-    }
-
-    // WhatsApp env overrides
-    let phone_id = env_str("ZEN_WHATSAPP_PHONE_ID");
-    let access_token = env_str("ZEN_WHATSAPP_ACCESS_TOKEN");
-    if phone_id.is_some() || access_token.is_some() {
-        if channels.whatsapp.is_none() {
-            channels.whatsapp = Some(WhatsAppChannelConfig {
-                phone_number_id: String::new(),
-                access_token: String::new(),
-                allowed_users: Vec::new(),
-            });
-        }
-        let w = channels.whatsapp.as_mut().unwrap();
-        if let Some(v) = phone_id {
-            w.phone_number_id = v;
-        }
-        if let Some(v) = access_token {
-            w.access_token = v;
-        }
-    }
-
-    // Telegram env overrides
-    let bot_token = env_str("ZEN_TELEGRAM_BOT_TOKEN");
-    if let Some(v) = bot_token {
-        if let Some(ref mut tg) = channels.telegram {
-            tg.bot_token = v;
-        } else {
-            channels.telegram = Some(TelegramChannelConfig {
-                bot_token: v,
-                allowed_users: Vec::new(),
-                home_chat_id: None,
-            });
         }
     }
 }

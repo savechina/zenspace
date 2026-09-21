@@ -10,7 +10,7 @@ use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_memory::{Severity, VirtueDomain};
-use zen_provider::{DefaultRouter, LlmRouterExt};
+use zen_provider::DefaultRouter;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
@@ -177,6 +177,7 @@ impl ZenWorker for ReflectionWorker {
             }
         }
 
+        let mut llm_cost_usd = 0.0f64;
         if total_reflections > 0 {
             info!(
                 reflections = total_reflections,
@@ -184,13 +185,15 @@ impl ZenWorker for ReflectionWorker {
             );
 
             match synthesize_anti_patterns(&reflections_dir).await {
-                Ok(count) if count > 0 => {
-                    info!(
-                        anti_patterns = count,
-                        "anti-pattern candidates synthesized from reflections"
-                    );
+                Ok((count, cost)) => {
+                    llm_cost_usd += cost;
+                    if count > 0 {
+                        info!(
+                            anti_patterns = count,
+                            "anti-pattern candidates synthesized from reflections"
+                        );
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => {
                     warn!(error = %e, "LLM anti-pattern synthesis failed, skipping (graceful degradation)");
                 }
@@ -202,7 +205,7 @@ impl ZenWorker for ReflectionWorker {
             success: true,
             fact_count: total_reflections,
             duration_ms: start.elapsed().as_millis() as u64,
-            llm_cost_usd: 0.0,
+            llm_cost_usd,
         })
     }
 }
@@ -267,10 +270,15 @@ fn is_journaled(path: &Path) -> bool {
     JournalEntryState::migrate_from_frontmatter(path) && JournalEntryState::is_journaled(path)
 }
 
-async fn synthesize_anti_patterns(reflections_dir: &Path) -> Result<usize> {
+/// Returns `(anti_patterns_written, llm_cost_usd)`. The cost is the metered
+/// USD spend of the synthesis call (0.0 when no LLM ran). On `Err` after the
+/// LLM call (e.g. unparseable response) the spent cost is not recoverable
+/// from this shape and goes uncounted — a known undercount, deliberately
+/// accepted rather than complicating every early return.
+async fn synthesize_anti_patterns(reflections_dir: &Path) -> Result<(usize, f64)> {
     let reflections_text = load_all_reflections_text(reflections_dir);
     if reflections_text.is_empty() {
-        return Ok(0);
+        return Ok((0, 0.0));
     }
 
     let router = match load_config() {
@@ -282,7 +290,7 @@ async fn synthesize_anti_patterns(reflections_dir: &Path) -> Result<usize> {
     };
 
     let Some(router) = router else {
-        return Ok(0);
+        return Ok((0, 0.0));
     };
 
     let truncated = if reflections_text.len() > 6000 {
@@ -327,11 +335,13 @@ Rules:
 - Return empty array if no recurring patterns found"#
     );
 
-    let response = tokio::task::spawn_blocking(move || {
-        router.complete("anti_pattern_synthesis", &prompt, Sensitivity::Private)
+    let metered = tokio::task::spawn_blocking(move || {
+        router.complete_metered("anti_pattern_synthesis", &prompt, Sensitivity::Private)
     })
     .await
     .context("LLM anti-pattern synthesis task panicked")??;
+    let llm_cost_usd = metered.cost_usd;
+    let response = metered.text;
 
     let json_str = extract_json(&response);
     let parsed: Value = serde_json::from_str(json_str)
@@ -363,7 +373,7 @@ Rules:
         warn!(error = %e, "failed to update MEMORY.md Continue-Doing Ledger (non-fatal)");
     }
 
-    Ok(count)
+    Ok((count, llm_cost_usd))
 }
 
 /// Update MEMORY.md ## Stop-Doing Ledger section with latest anti-patterns.

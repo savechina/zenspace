@@ -9,7 +9,7 @@ use zen_core::config::load_config;
 use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
-use zen_provider::{DefaultRouter, LlmRouterExt};
+use zen_provider::DefaultRouter;
 use zen_vault::notion::{Notion, NotionKind, NotionService};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
@@ -138,6 +138,7 @@ impl ZenWorker for NotionExtractorWorker {
 
         let mut processed = 0usize;
         let mut total_entities = 0usize;
+        let mut llm_cost_usd = 0.0f64;
 
         for entry_path in &entries {
             if has_extracted_marker(entry_path) {
@@ -145,8 +146,9 @@ impl ZenWorker for NotionExtractorWorker {
             }
 
             match process_entry(entry_path, &svc, &client, &known, router.clone()).await {
-                Ok(count) => {
+                Ok((count, cost)) => {
                     total_entities += count;
+                    llm_cost_usd += cost;
                     processed += 1;
                     if count > 0 {
                         info!(path = %entry_path.display(), notions = count, "notions extracted from journal entry");
@@ -176,31 +178,36 @@ impl ZenWorker for NotionExtractorWorker {
             success: true,
             fact_count: total_entities,
             duration_ms: start.elapsed().as_millis() as u64,
-            llm_cost_usd: 0.0,
+            llm_cost_usd,
         })
     }
 }
 
+/// Returns `(entities_upserted, llm_cost_usd)`. The cost is metered even when
+/// the LLM returned no usable notions (the call was paid for); on `Err` from
+/// the call itself nothing was metered. A post-call parse failure loses the
+/// spent cost — same accepted undercount as `synthesize_anti_patterns`.
 async fn process_entry(
     entry_path: &std::path::Path,
     svc: &NotionService,
     client: &zen_vault::SqliteClient,
     known: &HashSet<String>,
     router: Option<DefaultRouter>,
-) -> Result<usize> {
+) -> Result<(usize, f64)> {
     let content = fs::read_to_string(entry_path)
         .with_context(|| format!("failed to read journal entry: {}", entry_path.display()))?;
 
     if content.len() < MIN_CONTENT_LEN {
-        return Ok(0);
+        return Ok((0, 0.0));
     }
 
     let facts = extract_facts_from_journal(&content);
     if facts.is_empty() {
         append_extracted_marker(entry_path, "keyword")?;
-        return Ok(0);
+        return Ok((0, 0.0));
     }
 
+    let mut llm_cost_usd = 0.0f64;
     let matched = if let Some(router) = router {
         let entry_path_clone = entry_path.to_path_buf();
         let content_clone = content.clone();
@@ -212,13 +219,15 @@ async fn process_entry(
         .context("LLM extraction task panicked")?;
 
         match llm_result {
-            Ok(llm_entities) if !llm_entities.is_empty() => {
+            Ok((llm_entities, cost)) if !llm_entities.is_empty() => {
+                llm_cost_usd += cost;
                 info!(path = %entry_path.display(), count = llm_entities.len(), "LLM notion extraction succeeded");
                 let count = upsert_entities(llm_entities, svc, client).await?;
                 append_extracted_marker(entry_path, "llm")?;
-                return Ok(count);
+                return Ok((count, llm_cost_usd));
             }
-            Ok(_) => {
+            Ok((_, cost)) => {
+                llm_cost_usd += cost;
                 debug!(path = %entry_path.display(), "LLM returned no notions, falling back to keyword");
             }
             Err(e) => {
@@ -232,7 +241,7 @@ async fn process_entry(
 
     if matched.is_empty() {
         append_extracted_marker(entry_path, "keyword")?;
-        return Ok(0);
+        return Ok((0, llm_cost_usd));
     }
 
     let mut upserted = 0usize;
@@ -248,7 +257,7 @@ async fn process_entry(
     }
 
     append_extracted_marker(entry_path, "keyword")?;
-    Ok(upserted)
+    Ok((upserted, llm_cost_usd))
 }
 
 fn extract_entities_via_llm(
@@ -256,7 +265,7 @@ fn extract_entities_via_llm(
     _journal_content: &str,
     facts: &[String],
     router: DefaultRouter,
-) -> Result<Vec<(String, NotionKind)>> {
+) -> Result<(Vec<(String, NotionKind)>, f64)> {
     let facts_text = facts
         .iter()
         .map(|f| format!("- {f}"))
@@ -284,7 +293,9 @@ Types: Technology, Concept, Person, Organization, Function, Module, Product, Eve
 Only include notions explicitly mentioned in the facts. If nothing meaningful, return empty array."#
     );
 
-    let response = router.complete("notion_extraction", &prompt, Sensitivity::Private)?;
+    let metered = router.complete_metered("notion_extraction", &prompt, Sensitivity::Private)?;
+    let llm_cost_usd = metered.cost_usd;
+    let response = metered.text;
 
     let json_str = if let Some(start) = response.find("```json") {
         let after = &response[start + 7..];
@@ -332,7 +343,7 @@ Only include notions explicitly mentioned in the facts. If nothing meaningful, r
         append_llm_entities_to_journal(entry_path, &notions)?;
     }
 
-    Ok(notions)
+    Ok((notions, llm_cost_usd))
 }
 
 async fn upsert_entities(

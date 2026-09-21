@@ -173,7 +173,7 @@ enum Commands {
         #[command(flatten)]
         args: SandboxArgs,
     },
-    /// Run system health checks (7 liveness probes)
+    /// Run system health checks (8 liveness probes)
     Doctor {
         /// Output as JSON
         #[arg(long)]
