@@ -97,3 +97,29 @@ Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias 
 **Why:** All are negative-path/concurrency/resume-edge lakes; the two CRITICAL contract bugs they guard (mixed-batch ordering, plan gate bypass) are already fixed + pinned, so these are hardening.
 **Context:** crates/zen-agents/src/{intent,plan_task,delegate_task}.rs, crates/zen-repo/src/workflow_repo.rs, crates/zen-agents/src/orchestrator.rs. Review session findings #6-#14.
 **Effort:** M (a day of test writing). **Priority:** P2. **Depends:** none.
+
+## Review (2026-09-20 /plan-eng-review — 005 spec docs)
+
+### Generated single-ledger for closure records (structural option, deferred)
+
+**What:** Replace hand-mirrored closure history across spec.md record sections + tasks.md + AGENTS.md Recent Changes with tasks.md as the single source and the other two generated/pointing at it.
+
+**Why:** The closure-status convention (spec.md, 2026-09-20) adds sync discipline but not dedup — each closure must be hand-written correctly in 3+ places or the docs rot (Phase 27 found an entire concurrency workstream unrecorded; T181 found the spec documenting deleted primitives).
+
+**Pros:** Eliminates the write-amplification root cause; one place to audit.
+**Cons:** Speckit tooling (specify/converge/implement) reads/writes spec.md+tasks.md directly and would need adapting; AGENTS.md is hand-curated for agents, not generated.
+**Context:** Accepted as D2-A (keep convention, record limitation) in the 2026-09-20 eng review after outside-voice tension #8. Trigger: the next verdict-rot incident OR speckit tooling gaining generation support. Start from spec.md's closure-convention blockquote.
+**Effort:** M. **Priority:** P3. **Depends on:** speckit tooling evolution; not before.
+
+### LLM cost reporting is zero everywhere — `llm_cost_cap_usd` cap cannot trip
+
+**What:** Convert worker LLM usage into cost (usage × `ModelMetadata.input_cost_per_million`) and report `llm_cost_usd` from workers; today every worker hardcodes 0.0 (dream.rs:153, session_journaler.rs et al.), so the scheduler's cap check (scheduler/mod.rs:338-346) is live-but-inert.
+
+**Why:** The config key is documented as functional in spec.md's Configuration Surface; a cap that cannot trip is documented-as-live phantom enforcement (outside-voice #2, 2026-09-20).
+
+**Pros:** The `[cron] llm_cost_cap_usd = 10.0` knob becomes real; runaway local/cloud spend gets a ceiling.
+**Cons:** Needs usage plumbing per worker call; local Ollama is free (cost 0 is *correct* for local) — only metered providers need it.
+**Context:** Spec annotation landed same day (config table marks it inert-until). Start at scheduler/mod.rs cap check + model_meta.rs pricing fields.
+**Effort:** S-M. **Priority:** P2. **Depends on:** none.
+
+**Completed:** 2026-09-20 (/speckit-implement batch 3): pricing config keys + metered completion path + WorkerCostLedger sidecar + cap-trip test. Remaining accuracy follow-up: provider usage tokens (currently bytes/4 estimate).
