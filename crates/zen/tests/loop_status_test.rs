@@ -56,8 +56,18 @@ fn status_and_gaps_json_under_2s() {
         t0.elapsed().as_secs_f64() < 2.0,
         "SC-005: gaps must respond <2s"
     );
-    let arr: serde_json::Value = serde_json::from_str(&gaps.stdout()).expect("valid gaps json");
-    assert!(arr.is_array(), "gaps --json must be array");
+    // T187 contract: gaps --json wraps {"gaps": [...], "user_questions": [...]}
+    let obj: serde_json::Value = serde_json::from_str(&gaps.stdout()).expect("valid gaps json");
+    assert!(
+        obj.get("gaps").and_then(|g| g.as_array()).is_some(),
+        "gaps --json must wrap a gaps array"
+    );
+    assert!(
+        obj.get("user_questions")
+            .and_then(|q| q.as_array())
+            .is_some(),
+        "gaps --json must wrap a user_questions array"
+    );
 }
 
 #[test]
@@ -69,7 +79,11 @@ fn gaps_kind_filter_and_vault_relative_paths() {
     let gaps = test.zen(&["wiki", "loop", "gaps", "--json"]);
     assert!(gaps.success());
     let arr: serde_json::Value = serde_json::from_str(&gaps.stdout()).unwrap();
-    let before = arr.as_array().map(|a| a.len()).unwrap_or(0);
+    let before = arr
+        .get("gaps")
+        .and_then(|g| g.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
 
     // Trigger a gap: orphan concept without entity via wiki page without notion
     seed_note(
@@ -83,12 +97,20 @@ fn gaps_kind_filter_and_vault_relative_paths() {
     let gaps = test.zen(&["wiki", "loop", "gaps", "--json"]);
     assert!(gaps.success());
     let arr: serde_json::Value = serde_json::from_str(&gaps.stdout()).unwrap();
-    let all = arr.as_array().cloned().unwrap_or_default();
+    let all = arr
+        .get("gaps")
+        .and_then(|g| g.as_array())
+        .cloned()
+        .unwrap_or_default();
     // Kind filter
     let filtered = test.zen(&["wiki", "loop", "gaps", "--kind", "OrphanEntity", "--json"]);
     assert!(filtered.success());
     let farr: serde_json::Value = serde_json::from_str(&filtered.stdout()).unwrap();
-    let filtered_arr = farr.as_array().cloned().unwrap_or_default();
+    let filtered_arr = farr
+        .get("gaps")
+        .and_then(|g| g.as_array())
+        .cloned()
+        .unwrap_or_default();
     assert!(filtered_arr.len() <= all.len());
     for v in &filtered_arr {
         assert_eq!(v.get("kind").and_then(|k| k.as_str()), Some("OrphanEntity"));

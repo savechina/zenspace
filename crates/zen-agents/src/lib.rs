@@ -42,11 +42,7 @@ pub use agent_profile::{
     Role,
 };
 pub use context::AgentContext;
-pub use decision::{
-    BinaryDecision, DecisionError, DecisionFn, DecisionOutcome, DecisionRung, DecisionThresholds,
-    EmbeddingIntentRouter, KeywordRung, LlmRung, LocalBinaryClassifier, LocalClassifierRung,
-    TextEmbedder, VaultTextEmbedder, classify_binary, resolve_binary_threshold,
-};
+pub use decision::{BinaryDecision, classify_binary, resolve_binary_threshold};
 pub use execution::{AgentExecution, ExecutionMetadata, ToolCall};
 pub use executor::{AgentExecutor, ErrorCategory, RetryPolicy};
 pub use observability::{emit_prompt_completed, emit_prompt_failed, emit_prompt_started};

@@ -10,6 +10,7 @@ pub mod morning_brief;
 pub mod notion_extractor_worker;
 pub mod promotion_worker;
 pub mod reflection;
+pub mod retention;
 pub mod session_journaler;
 pub mod subconscious;
 pub mod wiki_compiler;
@@ -31,6 +32,7 @@ pub use promotion_worker::{
     PromotionStatus, PromotionTarget, PromotionWorker, route_target,
 };
 pub use reflection::ReflectionWorker;
+pub use retention::{RETENTION_SCHEDULE, RetentionWorker};
 pub use session_journaler::SessionJournaler;
 pub use subconscious::SubconsciousWorker;
 pub use wiki_compiler::WikiCompilerWorker;

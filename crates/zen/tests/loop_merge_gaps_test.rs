@@ -62,7 +62,12 @@ fn gaps_json_lists_detected_kinds() {
     // No notes → no gaps expected; JSON array shape must hold.
     let gaps = test.zen(&["wiki", "loop", "gaps", "--json"]);
     assert!(gaps.success(), "gaps failed: {}", gaps.stderr());
-    assert!(gaps.stdout().trim().starts_with('['));
+    // T187 contract: gaps --json wraps {"gaps": [...], "user_questions": [...]}
+    let v: serde_json::Value = serde_json::from_str(&gaps.stdout()).expect("valid gaps json");
+    assert!(
+        v.get("gaps").and_then(|g| g.as_array()).is_some(),
+        "wrapped gaps array expected"
+    );
 
     seed_note(
         &test,

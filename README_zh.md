@@ -48,14 +48,17 @@
 # 安装（macOS）
 brew install savechina/tap/zenspace
 
-# 初始化
-zen workspace init
+# 首次运行 — 打开 TUI 并初始化 ~/.zen
+zen
 
-# 写笔记——Wiki 自动构建
-zen note create "Q3 规划" --tag project
+# 把笔记丢进管线 — 蒸馏循环自动提取、关联、归档
+mkdir -p ~/.zen/vault/inbox && $EDITOR ~/.zen/vault/inbox/q3-planning.md
 
-# 问你的知识图谱
-zen search run "Q3 规划"
+# 系统健康检查（8 项探针）
+zen doctor
+
+# 看看自动构建的 wiki
+zen wiki list
 ```
 
 [快速开始 →](https://savechina.github.io/zenspace/quickstart.html) | [安装 →](https://savechina.github.io/zenspace/installation.html)
@@ -68,7 +71,7 @@ zen search run "Q3 规划"
 |------|------|
 | [安装](https://savechina.github.io/zenspace/installation.html) | Homebrew、源码、二进制 |
 | [快速开始](https://savechina.github.io/zenspace/quickstart.html) | 5 分钟上手 |
-| [CLI 命令](https://savechina.github.io/zenspace/cli-commands.html) | 全部 29 条命令 |
+| [CLI 命令](https://savechina.github.io/zenspace/cli-commands.html) | 全部 20 条命令 |
 | [提供商与认证](https://savechina.github.io/zenspace/configuration/providers.html) | 9 种协议、API Key |
 | [Agent 路由](https://savechina.github.io/zenspace/configuration/agent-routing.html) | 按 Agent 分配模型 |
 | [系统架构](https://savechina.github.io/zenspace/architecture/overview.html) | 架构与数据流 |

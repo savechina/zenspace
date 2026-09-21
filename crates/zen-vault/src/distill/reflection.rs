@@ -43,7 +43,8 @@ pub fn record_reflection(
         rejection.because,
         next_attempt(&rejection.falsifier),
     );
-    std::fs::write(&target, content).with_context(|| format!("write {}", target.display()))?;
+    zen_core::atomic_file::write_atomic(&target, content.as_bytes())
+        .with_context(|| format!("write {}", target.display()))?;
     Ok(target)
 }
 

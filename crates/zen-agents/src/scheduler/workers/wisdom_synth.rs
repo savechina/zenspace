@@ -11,7 +11,7 @@ use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::Sensitivity;
 use zen_memory::belief::{Belief, SourceType};
-use zen_provider::{DefaultRouter, LlmRouterExt};
+use zen_provider::DefaultRouter;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
@@ -171,11 +171,13 @@ Respond with ONLY a JSON object:
 }}"#
         );
 
-        let response = tokio::task::spawn_blocking(move || {
-            router.complete("wisdom_synthesis", &prompt, Sensitivity::Private)
+        let metered = tokio::task::spawn_blocking(move || {
+            router.complete_metered("wisdom_synthesis", &prompt, Sensitivity::Private)
         })
         .await
         .context("LLM wisdom synthesis task panicked")??;
+        let llm_cost_usd = metered.cost_usd;
+        let response = metered.text;
 
         let json_str = if let Some(start) = response.find("```json") {
             let after = &response[start + 7..];
@@ -283,7 +285,7 @@ Respond with ONLY a JSON object:
             success: true,
             fact_count: total_updates_applied,
             duration_ms: start.elapsed().as_millis() as u64,
-            llm_cost_usd: 0.0,
+            llm_cost_usd,
         })
     }
 }

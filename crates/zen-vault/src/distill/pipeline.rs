@@ -15,6 +15,7 @@ use super::checkpoint::Checkpoint;
 use super::checkpoint::CheckpointManager;
 use super::contradiction::ContradictionDetector;
 use super::notion_extraction::NotionExtractor;
+use super::placeholders_store::merge_save_placeholders;
 use super::recovery::RecoveryManager;
 use super::stages::LlmDistillStage;
 use super::transaction::TransactionScope;
@@ -380,9 +381,10 @@ fn archive_processed_notes(
         );
 
         let write_result = if defer_source_removal {
-            std::fs::write(&dest, provenance)
+            zen_core::atomic_file::write_atomic(&dest, provenance.as_bytes())
         } else {
-            std::fs::write(&dest, provenance).and_then(|_| std::fs::remove_file(&source))
+            zen_core::atomic_file::write_atomic(&dest, provenance.as_bytes())
+                .and_then(|_| std::fs::remove_file(&source))
         };
         match write_result {
             Ok(()) => {
@@ -719,7 +721,9 @@ impl DistillationPipeline {
                         notes_count: outcome.report.notes_processed,
                     })?;
                 }
-                if registry_dirty && let Err(e) = registry.save(&placeholders_path) {
+                // T180: read-merge-write under the cross-process lock so a
+                // concurrent zen-loop declaration cannot be dropped.
+                if registry_dirty && let Err(e) = merge_save_placeholders(logs_dir, &registry) {
                     warn!(error = %e, "Failed to save placeholder registry");
                 }
                 Ok(outcome)
@@ -1433,7 +1437,7 @@ impl DistillationPipeline {
                         ("merged_into", target_stem.clone()),
                     ],
                 );
-                if std::fs::write(&archived, provenance).is_ok()
+                if zen_core::atomic_file::write_atomic(&archived, provenance.as_bytes()).is_ok()
                     && std::fs::remove_file(source).is_ok()
                 {
                     txn.track_path(&archived)?;
@@ -1461,7 +1465,7 @@ impl DistillationPipeline {
                         rewritten.replace(&format!("[[{stem}]]"), &format!("[[{target_stem}]]"));
                 }
                 if rewritten != content {
-                    std::fs::write(&page.path, &rewritten).ok();
+                    zen_core::atomic_file::write_atomic(&page.path, rewritten.as_bytes()).ok();
                     txn.track_path(&page.path)?;
                 }
             }
@@ -1477,7 +1481,7 @@ impl DistillationPipeline {
                     ("cycle_id", cycle_id.to_string()),
                 ],
             );
-            std::fs::write(&target_path, &target_content)?;
+            zen_core::atomic_file::write_atomic(&target_path, target_content.as_bytes())?;
             txn.track_path(&target_path)?;
             merged += 1;
         }

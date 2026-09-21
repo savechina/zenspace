@@ -83,7 +83,7 @@ fn load_attempts(logs_dir: &Path) -> HashMap<String, u8> {
 
 fn save_attempts(logs_dir: &Path, attempts: &HashMap<String, u8>) {
     if let Ok(json) = serde_json::to_string_pretty(attempts) {
-        std::fs::write(attempts_path(logs_dir), json).ok();
+        zen_core::atomic_file::write_atomic(&attempts_path(logs_dir), json.as_bytes()).ok();
     }
 }
 
@@ -796,6 +796,14 @@ fn inbox_listing(inbox: &Path) -> HashSet<String> {
 /// body writes are covered by the per-cycle git commit plus the CAS snapshot's
 /// tracked paths, and quarantines by their own gap record, so they are not
 /// duplicated here. Audit failures are logged and never fail the cycle.
+///
+/// SC-002 (T185): each line also carries `attempts` — the retry-ledger depth
+/// at completion (`loop-attempts.json` prior failed cycles + this successful
+/// one; a note absent from the ledger completes on its first attempt). The
+/// ledger is the only per-note attempt evidence and it is transient (entries
+/// are pruned on quarantine/mid-cycle edit), so the audit line is where the
+/// count becomes durable. Budget deferrals (pending-pool requeues) never
+/// increment the ledger, so a deferred note still archives at `attempts: 1`.
 fn record_note_mutations(
     logs_dir: &Path,
     cycle_id: &str,
@@ -803,13 +811,20 @@ fn record_note_mutations(
     identities: &[(String, String)],
 ) {
     let audit_path = logs_dir.join("audit.jsonl");
+    let prior_attempts = load_attempts(logs_dir);
     for ((source, dest), (_, checksum)) in migrated.iter().zip(identities.iter()) {
+        let attempts = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| u32::from(prior_attempts.get(name).copied().unwrap_or(0)) + 1)
+            .unwrap_or(1);
         let record = serde_json::json!({
             "kind": "loop.note.archived",
             "cycle_id": cycle_id,
             "source": source.display().to_string(),
             "dest": dest.display().to_string(),
             "checksum": checksum,
+            "attempts": attempts,
         });
         if let Err(e) = append_jsonl_line(&audit_path, &record) {
             warn!(error = %e, "loop: per-note archive audit append failed");
@@ -1511,9 +1526,12 @@ impl ZenWorker for ZenLoopWorker {
             // FR-031a: declare this cycle's slugs as placeholder page slots
             // (placeholders.json) so concurrent writers downgrade creates to
             // updates. Persistence is best-effort; a corrupt registry starts
-            // fresh rather than blocking the cycle.
+            // fresh rather than blocking the cycle. T180: the save is a
+            // flock-guarded read-merge-write so a concurrent distill-pipeline
+            // registry save cannot drop these declarations (or vice versa).
             if !slugs.is_empty() {
-                let registry_path = paths.logs().join("placeholders.json");
+                let logs_dir = paths.logs();
+                let registry_path = zen_vault::distill::registry_path(&logs_dir);
                 let mut registry = match zen_vault::graph_verify::PlaceholderRegistry::load(
                     &registry_path,
                 ) {
@@ -1526,8 +1544,8 @@ impl ZenWorker for ZenLoopWorker {
                 for slug in &slugs {
                     registry.declare(&slug.slug, "zen-loop");
                 }
-                if let Err(e) = registry.save(&registry_path) {
-                    warn!(error = %e, path = %registry_path.display(), "loop: placeholder registry save failed (non-fatal)");
+                if let Err(e) = zen_vault::distill::merge_save_placeholders(&logs_dir, &registry) {
+                    warn!(error = %e, path = %registry_path.display(), "loop: placeholder registry merge-save failed (non-fatal)");
                 }
             }
 
@@ -1612,7 +1630,7 @@ impl ZenWorker for ZenLoopWorker {
             match serde_json::to_string_pretty(&queue)
                 .context("serializing refinement queue")
                 .and_then(|json| {
-                    std::fs::write(&queue_path, json)
+                    zen_core::atomic_file::write_atomic(&queue_path, json.as_bytes())
                         .with_context(|| format!("write {}", queue_path.display()))
                 }) {
                 Ok(()) => {}
@@ -1858,7 +1876,7 @@ async fn persist_report_and_audit(
     if let Some(parent) = report_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(&report_path, json)
+    zen_core::atomic_file::write_atomic(&report_path, json.as_bytes())
         .with_context(|| format!("write cycle report: {}", report_path.display()))?;
 
     let gaps_file = gaps_path(logs_dir);
@@ -1910,6 +1928,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let logs = tmp.path().join("logs");
         std::fs::create_dir_all(&logs).unwrap();
+        // b.md failed 2 prior cycles — its archive line must carry attempts=3
+        // (SC-002: prior failed cycles + the successful one); a.md was never
+        // in the retry ledger, so it completes on its first attempt.
+        std::fs::write(logs.join("loop-attempts.json"), r#"{"b.md": 2}"#).unwrap();
 
         let migrated = vec![
             (
@@ -1943,6 +1965,14 @@ mod tests {
         assert_eq!(lines[0]["dest"], "/vault/archive/2026-09/a.md");
         assert_eq!(lines[0]["checksum"], "hash-a");
         assert_eq!(lines[1]["source"], "/vault/inbox/b.md");
+
+        // SC-002 (T185): the attempts field is what lets the discover-report
+        // aggregator distinguish first-attempt completions from retried ones.
+        assert_eq!(
+            lines[0]["attempts"], 1,
+            "absent from ledger → first attempt"
+        );
+        assert_eq!(lines[1]["attempts"], 3, "2 prior failures + this success");
     }
 
     #[test]

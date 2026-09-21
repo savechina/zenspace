@@ -239,10 +239,13 @@ mod tests {
 
     #[tokio::test]
     async fn tier2_tool_uses_injected_db_not_cwd() {
-        // CRITICAL regression test (review D7): the pre-D7 impl opened
-        // "./state.db" relative to the process CWD. A decoy state.db in the
-        // CWD (crate root during tests) must NOT be consulted — only the
-        // injected workspace DB.
+        // CRITICAL regression test (review D7, T186): the pre-D7 impl opened
+        // "./state.db" relative to the process CWD. This test must NEVER
+        // create a decoy db at a bare relative path — doing so leaked
+        // `state.db` + `state.db.migrate.lock` into the crate root (T186).
+        // Instead: sqlite *creates* a missing db file on open, so if the tool
+        // ever regressed to opening "./state.db" the file would materialize
+        // in the CWD and the post-invoke assertion catches it red-handed.
         let dir = tempdir().unwrap();
         let injected_db = dir.path().join("state.db");
         let client = SqliteClient::open(&injected_db).await.unwrap();
@@ -260,23 +263,15 @@ mod tests {
             .await
             .unwrap();
 
-        let decoy = std::path::PathBuf::from("state.db");
-        let decoy_existed = decoy.exists();
-        if !decoy_existed {
-            let decoy_client = SqliteClient::open(&decoy).await.unwrap();
-            tier2
-                .index_note(
-                    &decoy_client,
-                    "decoy",
-                    "decoy",
-                    "decoy keyword entanglement",
-                    "test",
-                    "decoy.md",
-                    "test",
-                )
-                .await
-                .unwrap();
-        }
+        // A pre-existing relative state.db in the crate root is itself the
+        // T186 leak this test guards against — fail loudly instead of testing
+        // around it.
+        let cwd_decoy = std::path::Path::new("state.db");
+        assert!(
+            !cwd_decoy.exists(),
+            "BUG: a relative state.db exists in the CWD (crate root) — \
+             some test opened a bare relative db path (T186 regression)"
+        );
 
         let tool = Tier2SearchTool::new(SharedSqliteClient::new(injected_db.clone()));
         let result = tool
@@ -292,11 +287,12 @@ mod tests {
             "results must come from the injected db, got: {results:?}"
         );
 
-        if !decoy_existed {
-            let _ = std::fs::remove_file(&decoy);
-            let _ = std::fs::remove_file("state.db-shm");
-            let _ = std::fs::remove_file("state.db-wal");
-        }
+        // The tool must not have opened (and thereby created) a CWD-relative db.
+        assert!(
+            !cwd_decoy.exists(),
+            "BUG: tier2_search created ./state.db in the CWD — it consulted \
+             a relative path instead of the injected db (D7/T186 regression)"
+        );
     }
 
     #[tokio::test]

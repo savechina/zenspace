@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use tempfile::TempDir;
 use zen_memory::memvid::ZenMemvidStore;
 use zen_memory::memvid_store::MemvidStore;
@@ -15,7 +13,9 @@ fn orchestrator_with_memory_has_store() {
 
 #[test]
 fn orchestrator_without_memory_is_stateless() {
-    let store = MemvidStore::open_or_create(&PathBuf::from("/tmp/nonexistent-test-stateless.mv2"));
+    // Isolation discipline (T186 class): fixed global paths are forbidden — tempdir gives the same fresh-path premise.
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = MemvidStore::open_or_create(&dir.path().join("stateless.mv2"));
 
     if let Ok(s) = store {
         let cards = s.entity_memories("no-session").unwrap_or_default();

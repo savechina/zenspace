@@ -214,7 +214,7 @@ impl SkillPrecipitator {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create skill dir: {}", parent.display()))?;
         }
-        fs::write(&path, render_skill_md(&draft))
+        zen_core::atomic_file::write_atomic(&path, render_skill_md(&draft).as_bytes())
             .with_context(|| format!("write SKILL.md: {}", path.display()))?;
         append_audit(
             &self.logs_dir,
@@ -252,7 +252,7 @@ impl SkillPrecipitator {
         fs::create_dir_all(&self.logs_dir)
             .with_context(|| format!("create logs dir: {}", self.logs_dir.display()))?;
         let json = serde_json::to_string_pretty(pending)?;
-        fs::write(self.queue_path(), json)
+        zen_core::atomic_file::write_atomic(self.queue_path().as_path(), json.as_bytes())
             .with_context(|| format!("write skill draft queue: {}", self.queue_path().display()))
     }
 }

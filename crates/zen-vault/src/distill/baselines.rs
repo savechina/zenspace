@@ -178,7 +178,7 @@ fn read_field_str(line: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-fn read_field_u64(line: &str, key: &str) -> Option<u64> {
+pub(super) fn read_field_u64(line: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\":");
     let start = line.find(&needle)?;
     let value_start = start + needle.len();

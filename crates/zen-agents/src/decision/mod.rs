@@ -868,7 +868,17 @@ impl DecisionFn<bool> for LocalBinaryClassifier {
 /// classifier verdict wins; below τ, on abstain, or on error the heuristic
 /// decides — so a broken classifier never silently rewrites the reward
 /// bookkeeping.
+///
+/// Every invocation appends a `loop.decision` audit line carrying
+/// `decision_kind` (`correction`/`citation`) — without an emitter these two
+/// gates could never accumulate calibration samples, however many decisions
+/// they served. Classifier observations carry `rung:"L1"` with their
+/// confidence (including below-τ observations: they are legitimate
+/// calibration samples for a future, lower τ); heuristic fallbacks carry
+/// `rung:"L0"` and no confidence (observability only). Audit failure never
+/// breaks the round — `append_decision_audit` is fail-open.
 pub async fn classify_binary(
+    decision: BinaryDecision,
     threshold: Option<f32>,
     heuristic: bool,
     l1: &dyn DecisionFn<bool>,
@@ -877,8 +887,17 @@ pub async fn classify_binary(
     let Some(threshold) = threshold else {
         return heuristic;
     };
-    match l1.decide(input).await {
-        Ok(Some(outcome)) if outcome.confidence >= threshold => outcome.choice,
+    let paths = ZenPaths::detect().ok();
+    let start = std::time::Instant::now();
+    let verdict = l1.decide(input).await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let (served, gate_fired, classifier) = match &verdict {
+        Ok(Some(outcome)) if outcome.confidence >= threshold => (
+            outcome.choice,
+            true,
+            Some((outcome.confidence, outcome.choice)),
+        ),
         Ok(Some(outcome)) => {
             tracing::debug!(
                 decision = outcome.rung.as_str(),
@@ -886,14 +905,66 @@ pub async fn classify_binary(
                 threshold,
                 "binary classifier below the calibrated threshold; heuristic decides"
             );
-            heuristic
+            (heuristic, false, Some((outcome.confidence, outcome.choice)))
         }
-        Ok(None) => heuristic,
+        Ok(None) => (heuristic, false, None),
         Err(error) => {
             warn!(%error, "binary classifier unavailable; heuristic decides");
-            heuristic
+            (heuristic, false, None)
         }
+    };
+    record_binary_decision(
+        paths.as_ref(),
+        decision,
+        threshold,
+        gate_fired,
+        classifier,
+        heuristic,
+        latency_ms,
+        input,
+    );
+    served
+}
+
+/// Append the binary decision's `loop.decision` audit line (fail-open via
+/// [`append_decision_audit`]). Key names match what
+/// `decision_audit::record_from_line` extracts: `decision_kind`, `rung`,
+/// `confidence`, `choice` — the exact keys whose absence once made L1 intent
+/// records permanently invisible to calibration.
+#[allow(clippy::too_many_arguments)]
+fn record_binary_decision(
+    paths: Option<&ZenPaths>,
+    decision: BinaryDecision,
+    gate: f32,
+    gate_fired: bool,
+    classifier: Option<(f32, bool)>,
+    heuristic: bool,
+    latency_ms: u64,
+    input: &str,
+) {
+    let Some(paths) = paths else {
+        return;
+    };
+    let mut entry = serde_json::json!({
+        "kind": "loop.decision",
+        "decision_kind": decision.as_str(),
+        "rung": if classifier.is_some() { "L1" } else { "L0" },
+        "gate": audit_score(gate),
+        "gate_fired": gate_fired,
+        "heuristic": heuristic,
+        "latency_ms": latency_ms,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Some((confidence, choice)) = classifier {
+        entry["confidence"] = serde_json::json!(audit_score(confidence));
+        entry["choice"] = serde_json::json!(if choice { "yes" } else { "no" });
+    } else {
+        entry["choice"] = serde_json::json!(if heuristic { "yes" } else { "no" });
     }
+    if let Some(excerpt) = decision_excerpt(input) {
+        entry["input_excerpt"] = serde_json::Value::String(excerpt);
+    }
+    append_decision_audit(paths, &entry);
 }
 
 /// Resolve a binary decision's threshold — config override first, then the
@@ -1559,7 +1630,8 @@ mod tests {
         let rung = FixedBoolRung {
             outcome: Some(bool_outcome(false, 1.0)),
         };
-        let verdict = classify_binary(None, true, &rung, "任何东西").await;
+        let verdict =
+            classify_binary(BinaryDecision::Correction, None, true, &rung, "任何东西").await;
         assert!(verdict, "the heuristic decides when no τ is calibrated");
     }
 
@@ -1568,13 +1640,29 @@ mod tests {
         let rung = FixedBoolRung {
             outcome: Some(bool_outcome(true, 0.95)),
         };
-        assert!(classify_binary(Some(0.8), false, &rung, "任何东西").await);
+        assert!(
+            classify_binary(
+                BinaryDecision::Correction,
+                Some(0.8),
+                false,
+                &rung,
+                "任何东西"
+            )
+            .await
+        );
 
         let rejecting = FixedBoolRung {
             outcome: Some(bool_outcome(false, 0.95)),
         };
         assert!(
-            !classify_binary(Some(0.8), true, &rejecting, "任何东西").await,
+            !classify_binary(
+                BinaryDecision::Correction,
+                Some(0.8),
+                true,
+                &rejecting,
+                "任何东西"
+            )
+            .await,
             "the classifier overrides a heuristic false positive"
         );
     }
@@ -1585,16 +1673,106 @@ mod tests {
             outcome: Some(bool_outcome(true, 0.3)),
         };
         assert!(
-            !classify_binary(Some(0.8), false, &timid, "任何东西").await,
+            !classify_binary(
+                BinaryDecision::Correction,
+                Some(0.8),
+                false,
+                &timid,
+                "任何东西"
+            )
+            .await,
             "below τ the heuristic decides"
         );
 
         let abstaining = FixedBoolRung { outcome: None };
-        assert!(classify_binary(Some(0.8), true, &abstaining, "任何东西").await);
+        assert!(
+            classify_binary(
+                BinaryDecision::Correction,
+                Some(0.8),
+                true,
+                &abstaining,
+                "任何东西"
+            )
+            .await
+        );
 
         assert!(
-            !classify_binary(Some(0.8), false, &BrokenBoolRung, "任何东西").await,
+            !classify_binary(
+                BinaryDecision::Correction,
+                Some(0.8),
+                false,
+                &BrokenBoolRung,
+                "任何东西"
+            )
+            .await,
             "a broken classifier must not rewrite reward bookkeeping"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_gate_emits_the_calibration_record() {
+        // Without a `loop.decision` emitter for these kinds, the correction
+        // and citation gates could never accumulate calibration samples —
+        // the same invisibility the missing `decision_kind` key once caused.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // nextest runs one process per test, and the test-support build
+        // resolves ZEN_HOME per call (T118), so the write lands here.
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+
+        let confident = FixedBoolRung {
+            outcome: Some(bool_outcome(true, 0.95)),
+        };
+        let served = classify_binary(
+            BinaryDecision::Correction,
+            Some(0.8),
+            false,
+            &confident,
+            "no, the summary is wrong — fix it",
+        )
+        .await;
+        assert!(served, "the confident classifier verdict wins");
+
+        let abstaining = FixedBoolRung { outcome: None };
+        let fallback = classify_binary(
+            BinaryDecision::Citation,
+            Some(0.8),
+            true,
+            &abstaining,
+            "CONTENT…\nRESPONSE…",
+        )
+        .await;
+        assert!(fallback, "the heuristic decides on abstain");
+
+        let audit =
+            std::fs::read_to_string(dir.path().join("logs").join("audit.jsonl")).expect("audit");
+        let lines: Vec<serde_json::Value> = audit
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|entry: &serde_json::Value| entry["kind"] == "loop.decision")
+            .collect();
+        assert_eq!(lines.len(), 2, "one record per binary decision");
+
+        let correction = lines
+            .iter()
+            .find(|entry| entry["decision_kind"] == "correction")
+            .expect("correction record present");
+        assert_eq!(correction["rung"], "L1");
+        assert_eq!(correction["choice"], "yes");
+        assert_eq!(correction["gate_fired"], true);
+        assert!(correction["confidence"].as_f64().expect("confidence") >= 0.9);
+
+        let citation = lines
+            .iter()
+            .find(|entry| entry["decision_kind"] == "citation")
+            .expect("citation record present");
+        assert_eq!(citation["rung"], "L0", "an abstaining rung is an L0 record");
+        assert_eq!(
+            citation["choice"], "yes",
+            "the heuristic verdict is recorded"
+        );
+        assert!(
+            citation.get("confidence").is_none(),
+            "no confidence without a classifier observation"
         );
     }
 

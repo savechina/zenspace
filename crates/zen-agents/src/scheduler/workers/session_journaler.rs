@@ -108,6 +108,7 @@ impl ZenWorker for SessionJournaler {
         let mut total_facts = 0usize;
         let mut skipped_short = 0usize;
         let mut total_files = 0usize;
+        let mut llm_cost_usd = 0.0f64;
 
         for jsonl_path in &jsonl_files {
             if has_journaled_marker(jsonl_path) {
@@ -118,14 +119,16 @@ impl ZenWorker for SessionJournaler {
             let session_id = extract_session_id(jsonl_path);
             match process_session(&paths, jsonl_path, &session_id, router.clone(), fresh_eyes).await
             {
-                Ok(0) => {
+                Ok((0, cost)) => {
+                    llm_cost_usd += cost;
                     skipped_short += 1;
                     debug!(
                         session_id = %session_id,
                         "session skipped (short conversation)"
                     );
                 }
-                Ok(facts) => {
+                Ok((facts, cost)) => {
+                    llm_cost_usd += cost;
                     total_facts += facts;
                     processed += 1;
                     info!(
@@ -174,18 +177,21 @@ impl ZenWorker for SessionJournaler {
             success: true,
             fact_count: total_facts,
             duration_ms: start.elapsed().as_millis() as u64,
-            llm_cost_usd: 0.0,
+            llm_cost_usd,
         })
     }
 }
 
+/// Returns `(signals_total, llm_cost_usd)`. The metered cost is counted even
+/// when the LLM returned no signals and the keyword fallback ran (the call
+/// was paid for); on `Err` from the call itself nothing was metered.
 async fn process_session(
     paths: &ZenPaths,
     jsonl_path: &std::path::Path,
     session_id: &str,
     router: Option<DefaultRouter>,
     fresh_eyes: bool,
-) -> Result<usize> {
+) -> Result<(usize, f64)> {
     let store = zen_memory::conversation::ConversationStore::with_file(
         jsonl_path.to_path_buf(),
         session_id,
@@ -198,7 +204,7 @@ async fn process_session(
         } else {
             debug!(session_id = %session_id, turns = turns.len(), "skipping short session");
         }
-        return Ok(0);
+        return Ok((0, 0.0));
     }
 
     let conversation_text = sig::build_conversation_text(&turns);
@@ -228,6 +234,7 @@ async fn process_session(
         sig::load_prompt_context(paths).await
     };
 
+    let mut llm_cost_usd = 0.0f64;
     let (mut signals, source) = if let Some(router) = router {
         match sig::extract_signals_via_llm(
             &conversation_text,
@@ -238,11 +245,13 @@ async fn process_session(
         )
         .await
         {
-            Ok(llm_signals) if !llm_signals.is_empty() => {
+            Ok((llm_signals, cost)) if !llm_signals.is_empty() => {
+                llm_cost_usd += cost;
                 info!(session_id = %session_id, total = llm_signals.total(), "LLM signal extraction succeeded");
                 (llm_signals, "llm")
             }
-            Ok(_) => {
+            Ok((_, cost)) => {
+                llm_cost_usd += cost;
                 debug!(session_id = %session_id, "LLM returned no signals, falling back to keyword");
                 (
                     sig::extract_signals_via_keyword(&conversation_text),
@@ -285,7 +294,7 @@ async fn process_session(
 
     append_journaled_marker(jsonl_path, source)?;
 
-    Ok(signals.total())
+    Ok((signals.total(), llm_cost_usd))
 }
 
 fn write_journal_entry(paths: &ZenPaths, session_id: &str, content: &str) -> Result<()> {

@@ -265,6 +265,18 @@ impl PlaceholderRegistry {
         Self::default()
     }
 
+    /// Borrow the slot map (crate-internal: merge-save in
+    /// [`crate::distill::placeholders_store`], T180).
+    pub(crate) fn slots(&self) -> &HashMap<String, GraphPlaceholder> {
+        &self.slots
+    }
+
+    /// Build a registry from a pre-merged slot map (crate-internal:
+    /// merge-save in [`crate::distill::placeholders_store`], T180).
+    pub(crate) fn from_slots(slots: HashMap<String, GraphPlaceholder>) -> Self {
+        Self { slots }
+    }
+
     /// Declare a target page slug during planning. Idempotent: the earliest
     /// declaration wins and a re-declare by any agent is a no-op, so the
     /// slot keeps its original owner.
@@ -347,7 +359,7 @@ impl PlaceholderRegistry {
     pub fn save(&self, path: &Path) -> Result<()> {
         let json =
             serde_json::to_string_pretty(self).context("serializing placeholder registry")?;
-        std::fs::write(path, json)
+        zen_core::atomic_file::write_atomic(path, json.as_bytes())
             .with_context(|| format!("writing placeholder registry {}", path.display()))
     }
 

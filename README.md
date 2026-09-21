@@ -52,14 +52,17 @@ brew install savechina/tap/zenspace
 sudo apt install bubblewrap  # Required for sandbox isolation
 cargo install zen
 
-# Initialize
-zen workspace init
+# First run — opens the TUI and initializes ~/.zen
+zen
 
-# Write a note — the wiki builds itself
-zen note create "Q3 Planning" --tag project
+# Drop a note into the pipeline — the distill loop extracts, links, and archives it
+mkdir -p ~/.zen/vault/inbox && $EDITOR ~/.zen/vault/inbox/q3-planning.md
 
-# Ask your knowledge graph
-zen search run "Q3 planning"
+# Check system health (8 probes)
+zen doctor
+
+# See the wiki that built itself
+zen wiki list
 ```
 
 [Quick Start Guide →](https://savechina.github.io/zenspace/quickstart.html) | [Installation →](https://savechina.github.io/zenspace/installation.html)
@@ -72,7 +75,7 @@ zen search run "Q3 planning"
 |---------|-------------|
 | [Installation](https://savechina.github.io/zenspace/installation.html) | Homebrew, source, binary (macOS & Linux) |
 | [Quick Start](https://savechina.github.io/zenspace/quickstart.html) | 5-minute walkthrough |
-| [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 29 commands |
+| [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 20 commands |
 | [Providers & Auth](https://savechina.github.io/zenspace/configuration/providers.html) | 9 protocol types, API keys |
 | [Agent Routing](https://savechina.github.io/zenspace/configuration/agent-routing.html) | Per-agent model assignment |
 | [System Overview](https://savechina.github.io/zenspace/architecture/overview.html) | Architecture & data flow |

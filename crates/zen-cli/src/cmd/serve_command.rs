@@ -11,8 +11,7 @@ use tracing::info;
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_gateway::{
-    HttpConfig, is_pid_alive, pid_record_alive, read_pid, read_pid_record, remove_pid, write_pid,
-    write_pid_for,
+    HttpConfig, is_pid_alive, pid_record_alive, read_pid, read_pid_record, remove_pid,
 };
 
 #[derive(Subcommand)]
@@ -99,6 +98,18 @@ async fn wait_exit(pid: u32, grace: Duration) -> bool {
 ///
 /// Never rejects startup: the daemon's socket bind is the single-instance
 /// arbiter (codex parity — probe/socket first, pid file advisory only).
+/// True when a gateway answers the socket handshake right now. Used to make
+/// `serve start` idempotent without touching the running daemon's pid file.
+async fn gateway_is_live() -> bool {
+    match zen_gateway::client::GatewayClient::connect(uds_socket_path()).await {
+        Ok(client) => client
+            .handshake("cli-start", "0.0", Default::default())
+            .await
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 fn clean_stale_pid(path: &Path) {
     let Ok(record) = read_pid_record(path) else {
         if path.exists() {
@@ -321,6 +332,21 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             let path = pid_path()?;
             clean_stale_pid(&path);
             ensure_pid_dir(&path);
+            // Probe BEFORE spawning: if a gateway is already serving, this
+            // start is a no-op and, critically, must not touch the pid file —
+            // the running daemon owns that record now.
+            if gateway_is_live().await {
+                match read_pid_record(&path)
+                    .ok()
+                    .filter(|r| pid_record_alive(r.pid, r.start.as_deref()))
+                    .map(|r| r.pid)
+                {
+                    Some(pid) => println!("{} Gateway already running (pid: {pid})", "✅".green()),
+                    None => println!("{} Gateway already running", "✅".green()),
+                }
+                println!("  Socket:   {}", uds_socket_path().display());
+                return Ok(());
+            }
             // `--http` now enables the loopback HTTP carrier alongside the
             // UDS daemon (T046: legacy HttpGateway retired); env opt-in
             // also honored per FR-019 config layering.
@@ -337,7 +363,6 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
                     }
                 })
             });
-            write_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
             if *foreground {
                 return run_uds_foreground(http_cfg, qqbot_cfg).await;
             }
@@ -643,6 +668,7 @@ async fn run_uds_foreground(
     let config = GatewayDaemonConfig {
         http: http_cfg,
         qqbot: qqbot_cfg,
+        pid_path: Some(pid_path()?),
         idle_exit,
         scheduler_hosted: scheduler_enabled(),
         scheduler_live: Some(scheduler_live.clone()),
@@ -817,6 +843,14 @@ async fn run_background(
     const READY_BUDGET: Duration = Duration::from_secs(10);
     let deadline = tokio::time::Instant::now() + READY_BUDGET;
     loop {
+        // Liveness FIRST: a child that lost the start race exits within
+        // milliseconds, and accepting a handshake before noticing would
+        // report success with a corpse's pid. The pid-file identity check
+        // below is what makes the handshake proof of OUR child rather than of
+        // some other daemon that happens to answer the shared socket.
+        if !is_pid_alive(child_pid) {
+            break;
+        }
         let ready = match zen_gateway::client::GatewayClient::connect(uds_socket_path()).await {
             Ok(client) => client
                 .handshake("cli-start", "0.0", Default::default())
@@ -825,22 +859,40 @@ async fn run_background(
             Err(_) => false,
         };
         if ready {
-            ensure_pid_dir(path);
-            write_pid_for(path, child_pid).map_err(|e| ZenError::Service(e.to_string()))?;
-            println!(
-                "{} Gateway started (background, pid: {})",
-                "✅".green(),
-                child_pid
-            );
-            if let Some(cfg) = &http_cfg {
-                println!("  HTTP:     http://{}:{}/health", cfg.bind_addr, cfg.port);
+            match read_pid_record(path) {
+                Ok(record) if record.pid == child_pid => {
+                    ensure_pid_dir(path);
+                    println!(
+                        "{} Gateway started (background, pid: {})",
+                        "✅".green(),
+                        child_pid
+                    );
+                    if let Some(cfg) = &http_cfg {
+                        println!("  HTTP:     http://{}:{}/health", cfg.bind_addr, cfg.port);
+                    }
+                    println!("  Socket:   {}", uds_socket_path().display());
+                    println!("  PID file: {}", path.display());
+                    println!("  Run 'zen serve stop' to stop");
+                    return Ok(());
+                }
+                Ok(record) if pid_record_alive(record.pid, record.start.as_deref()) => {
+                    // A different, live daemon owns the socket: our child lost
+                    // the race and exited. Report the truth and do not claim
+                    // (or clobber) the pid record.
+                    println!(
+                        "{} Gateway already running (pid: {}); this start attempt exited",
+                        "⚠️".yellow(),
+                        record.pid
+                    );
+                    return Ok(());
+                }
+                // Socket answers but the pid file is missing/stale: the daemon
+                // may still be finishing startup, so keep polling to the
+                // deadline rather than reporting a false verdict.
+                _ => {}
             }
-            println!("  Socket:   {}", uds_socket_path().display());
-            println!("  PID file: {}", path.display());
-            println!("  Run 'zen serve stop' to stop");
-            return Ok(());
         }
-        if !is_pid_alive(child_pid) || tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(READY_POLL).await;

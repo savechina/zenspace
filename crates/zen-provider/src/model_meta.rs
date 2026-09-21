@@ -31,6 +31,48 @@ impl ModelMetadata {
     }
 }
 
+/// Convert reported token usage into USD cost using a model's pricing.
+///
+/// # Parameters
+/// - `metadata` — the model's pricing (`input_cost_per_million` /
+///   `output_cost_per_million`, USD per 1M tokens) and locality flag.
+/// - `input_tokens` — prompt/input tokens consumed by the call(s).
+/// - `output_tokens` — completion/output tokens produced by the call(s).
+///
+/// # Returns
+/// The cost in USD: `in/1M × input_price + out/1M × output_price`, with
+/// negative prices clamped to 0 (a pricing typo must never produce a
+/// negative cost that cancels real spend).
+///
+/// # Local models
+/// `metadata.is_local == true` returns exactly `0.0` regardless of the
+/// pricing fields — local inference (e.g. Ollama) has no per-token cost, and
+/// the structural zero keeps the scheduler cost cap from ever tripping on a
+/// local-first deployment even if stale pricing is configured.
+///
+/// # Example
+/// ```
+/// use zen_provider::model_meta::{ModelMetadata, usage_to_cost_usd};
+/// let meta = ModelMetadata {
+///     name: "metered".into(),
+///     provider: "openai".into(),
+///     context_window: 0,
+///     input_cost_per_million: 1.0,
+///     output_cost_per_million: 2.0,
+///     capabilities: vec![],
+///     is_local: false,
+/// };
+/// assert!((usage_to_cost_usd(&meta, 500_000, 250_000) - 1.0).abs() < 1e-9);
+/// ```
+pub fn usage_to_cost_usd(metadata: &ModelMetadata, input_tokens: u64, output_tokens: u64) -> f64 {
+    if metadata.is_local {
+        return 0.0;
+    }
+    let input = (input_tokens as f64 / 1_000_000.0) * metadata.input_cost_per_million.max(0.0);
+    let output = (output_tokens as f64 / 1_000_000.0) * metadata.output_cost_per_million.max(0.0);
+    input + output
+}
+
 pub struct ModelRouter {
     models: Arc<RwLock<HashMap<String, String>>>,
     metadata: Arc<RwLock<HashMap<String, ModelMetadata>>>,
@@ -322,5 +364,52 @@ mod tests {
         let router = ModelRouter::new("default-model");
         let chosen = router.route_task(ComplexityLevel::Standard).await.unwrap();
         assert_eq!(chosen, "default-model");
+    }
+
+    fn metered_model(is_local: bool) -> ModelMetadata {
+        ModelMetadata {
+            name: "metered".to_string(),
+            provider: "openai".to_string(),
+            context_window: 0,
+            input_cost_per_million: 1.0,
+            output_cost_per_million: 2.0,
+            capabilities: vec![],
+            is_local,
+        }
+    }
+
+    #[test]
+    fn usage_cost_multiplies_tokens_by_pricing() {
+        let meta = metered_model(false);
+        let cost = usage_to_cost_usd(&meta, 500_000, 250_000);
+        assert!(
+            (cost - 1.0).abs() < 1e-9,
+            "0.5M×$1 + 0.25M×$2 = $1, got {cost}"
+        );
+        let full = usage_to_cost_usd(&meta, 1_000_000, 1_000_000);
+        assert!((full - 3.0).abs() < 1e-9);
+        assert_eq!(usage_to_cost_usd(&meta, 0, 0), 0.0);
+    }
+
+    #[test]
+    fn local_model_costs_zero_even_with_pricing_configured() {
+        let meta = metered_model(true);
+        assert_eq!(usage_to_cost_usd(&meta, 10_000_000, 10_000_000), 0.0);
+    }
+
+    #[test]
+    fn zero_or_negative_pricing_never_yields_negative_cost() {
+        let mut meta = metered_model(false);
+        meta.input_cost_per_million = 0.0;
+        meta.output_cost_per_million = 0.0;
+        assert_eq!(usage_to_cost_usd(&meta, 1_000_000, 1_000_000), 0.0);
+
+        meta.input_cost_per_million = -5.0;
+        meta.output_cost_per_million = 2.0;
+        let cost = usage_to_cost_usd(&meta, 1_000_000, 1_000_000);
+        assert!(
+            (cost - 2.0).abs() < 1e-9,
+            "negative price clamps to 0, got {cost}"
+        );
     }
 }

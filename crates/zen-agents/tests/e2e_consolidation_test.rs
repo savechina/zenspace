@@ -240,7 +240,10 @@ async fn test_e2e_m0_m2_m4_consolidation_pipeline() {
     // `ProviderUnavailable` for Private sensitivity → keyword fallback.
     fs::write(
         root.join("config.toml"),
-        "default_provider = \"mock\"\n\n[providers.mock]\nprovider_type = \"mock\"\n",
+        // `type` deliberately absent: with no provider_type the provider is
+        // unconstructible, so route() returns ProviderUnavailable and the
+        // keyword fallback path runs (the intent of this test).
+        "default_provider = \"mock\"\n\n[providers.mock]\n",
     )
     .unwrap();
 

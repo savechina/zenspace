@@ -1,7 +1,9 @@
 # =============================================================================
 # Zen — Default Agentic Configuration (embedded at compile-time)
 # =============================================================================
-# Overrides: ~/.zen/config.toml, .zen/config.toml, ZEN_* env vars
+# Overrides: ~/.zen/config.toml, ZEN_* env vars
+# Only keys ZenConfig actually parses are shipped in this file; unknown keys
+# elsewhere are silently ignored (no deny_unknown_fields, by design).
 
 # =============================================================================
 # Top-level defaults
@@ -226,8 +228,6 @@ fallbacks = [
     { provider = "openai", model = "gpt-4o" },
     { provider = "deepseek", model = "deepseek-v4-flash" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 # Planner Tier (L1)
 [agents.Prometheus]
@@ -236,8 +236,6 @@ model = "claude-sonnet-4-6"
 fallbacks = [
     { provider = "openai", model = "gpt-4o" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 [agents.Metis]
 provider = "deepseek"
@@ -246,8 +244,6 @@ fallbacks = [
     { provider = "openai", model = "gpt-4o-mini" },
     { provider = "ollama", model = "qwen3.6:35b-mlx" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "Medium"
 
 [agents.Momus]
 provider = "anthropic"
@@ -255,8 +251,6 @@ model = "claude-sonnet-4-6"
 fallbacks = [
     { provider = "openai", model = "gpt-4o" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 [agents.Zeus]
 provider = "anthropic"
@@ -264,8 +258,6 @@ model = "claude-sonnet-4-6"
 fallbacks = [
     { provider = "openai", model = "gpt-4o" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 # Specialist Tier (consulting only)
 [agents.Oracle]
@@ -274,8 +266,6 @@ model = "claude-sonnet-4-6"
 fallbacks = [
     { provider = "openai", model = "gpt-4o" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 [agents.Explore]
 provider = "anthropic"
@@ -283,8 +273,6 @@ model = "claude-haiku-4-5"
 fallbacks = [
     { provider = "openai", model = "gpt-4o-mini" }
 ]
-llm_preferences = "CloudOnly"
-max_sensitivity = "Low"
 
 [agents.Librarian]
 provider = "ollama"
@@ -292,8 +280,6 @@ model = "qwen3.6:35b-mlx"
 fallbacks = [
     { provider = "deepseek", model = "deepseek-v4-flash" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 [agents.Argus]
 provider = "deepseek"
@@ -302,8 +288,6 @@ fallbacks = [
     { provider = "openai", model = "gpt-4o-mini" },
     { provider = "ollama", model = "qwen3.6:35b-mlx" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "Medium"
 
 # Worker Tier (L2 - execution)
 [agents.Hephaestus]
@@ -313,8 +297,6 @@ fallbacks = [
     { provider = "openai", model = "gpt-4o" },
     { provider = "deepseek", model = "deepseek-v4-flash" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 [agents.Atlas]
 provider = "ollama"
@@ -322,15 +304,11 @@ model = "qwen3.6:35b-mlx"
 fallbacks = [
     { provider = "deepseek", model = "deepseek-v4-flash" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "Medium"
 
 [agents.Junior]
 provider = "ollama"
 model = "qwen3.6:35b-mlx"
 fallbacks = []
-llm_preferences = "Any"
-max_sensitivity = "Low"
 
 [agents.Hermes]
 provider = "deepseek"
@@ -339,8 +317,6 @@ fallbacks = [
     { provider = "openai", model = "gpt-4o-mini" },
     { provider = "ollama", model = "qwen3.6:35b-mlx" }
 ]
-llm_preferences = "Any"
-max_sensitivity = "High"
 
 # =============================================================================
 # Feature flags
@@ -351,14 +327,10 @@ multi_agent = true
 auto_research = true
 
 # =============================================================================
-# QQ Bot integration (FR-004)
+# QQ Bot integration (FR-004) — configured under [channels.qqbot] (app_id,
+# client_secret, allowed_users); env ZEN_QQBOT_APP_ID/ZEN_QQBOT_CLIENT_SECRET.
+# A legacy top-level [qqbot] section is inertly ignored.
 # =============================================================================
-
-# [qqbot]
-# app_id = ""
-# token_env = "QQBOT_TOKEN"
-# secret_env = "QQBOT_SECRET"
-# groups = []
 
 # =============================================================================
 # Cron scheduling
@@ -422,21 +394,14 @@ disclaimer_acknowledged = false
 # Sandbox Hardening (FR-036/037/038/041/045, v0.0.6)
 # =============================================================================
 
-[sandbox.rlimits]
-# Applied at ZenWiring construction (FR-038). Defaults: NPROC=50, NOFILE=256, CORE=0.
-# max_processes = 50
-# max_open_files = 256
-# max_core_size = 0
+# NOTE: rlimits and env-scrub are enforced by code constants (FR-038 NPROC=50/
+# NOFILE=256/CORE=0; FR-037 pattern scrub). No config keys are parsed for them —
+# do not add [sandbox.rlimits]/[sandbox.env_scrub] sections; they are ignored.
 
-[sandbox.env_scrub]
-# Secret-bearing env vars are stripped from child processes (shell.exec, MCP
-# stdio). Pattern-matched: *_API_KEY, *_TOKEN, *_SECRET, *_PASSWORD, *_CREDENTIAL.
-# extra_scrub = ["MY_EXTRA_SECRET_VAR"]
-# allowlist = ["PUBLICLY_SAFE_TOKEN"]
-
-[sandbox.network_policy]
-# Default denies link-local (169.254/16 incl. cloud metadata), loopback, and
-# RFC1918 ranges; allow_hosts exempts specific hosts (local providers).
+# NOT YET WIRED (T080): this section is NOT read — the egress policy currently
+# uses code defaults (deny link-local/loopback/RFC1918; hardcoded local-provider
+# allowlist). Kept here as the future surface; uncommenting has no effect today.
+# [sandbox.network_policy]
 # allow_hosts = ["localhost", "127.0.0.1"]
 # allow_private_ranges = false
 
@@ -453,13 +418,8 @@ disclaimer_acknowledged = false
 # Default false = the OS sandbox denies all network. Set true to opt out.
 # network_access = false
 
-[session]
-# Drain window for SIGINT/SIGTERM graceful shutdown (FR-041).
-drain_timeout_secs = 5
-
-[tools.fs_watcher]
-# Per-session watcher cap (FR-045).
-max_watchers = 8
+# NOTE: FR-041 drain window (5s) and FR-045 watcher cap (const 8) are code
+# constants — [session]/[tools.fs_watcher] sections are not parsed.
 
 # =============================================================================
 # Agentic tool loop — per-turn tool dispatch cap (005-agentic-loop, T050)

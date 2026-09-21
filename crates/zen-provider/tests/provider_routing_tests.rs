@@ -212,3 +212,98 @@ fn test_fallback_step_without_model() {
     assert!(step.model.is_none());
     assert_eq!(step.timeout_secs, Some(30));
 }
+
+// ============================================================================
+// Metered completion — cost accounting feeding the scheduler worker cost cap
+// ============================================================================
+
+fn metered_mock_config(with_pricing: bool) -> ZenConfig {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "mock".to_string(),
+        zen_core::config::ProviderConfig {
+            provider_type: Some("mock".into()),
+            input_cost_per_million: with_pricing.then_some(1.0),
+            output_cost_per_million: with_pricing.then_some(2.0),
+            ..Default::default()
+        },
+    );
+    ZenConfig {
+        default_provider: Some("mock".into()),
+        providers,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn metered_completion_reports_positive_cost_when_pricing_configured() {
+    use zen_core::types::Sensitivity;
+    let router = DefaultRouter::from_agentic(&metered_mock_config(true));
+    let prompt = "hello metered world";
+    let metered = router
+        .complete_metered("cost-test", prompt, Sensitivity::Public)
+        .expect("mock provider needs no network");
+
+    assert_eq!(metered.provider, "mock");
+    assert_eq!(metered.input_tokens, (prompt.len() as u64) / 4);
+    assert_eq!(metered.output_tokens, (metered.text.len() as u64) / 4);
+    let expected = zen_provider::usage_to_cost_usd(
+        &router.model_metadata("mock", "mock"),
+        metered.input_tokens,
+        metered.output_tokens,
+    );
+    assert!(metered.cost_usd > 0.0, "priced usage must meter above zero");
+    assert!(
+        (metered.cost_usd - expected).abs() < 1e-12,
+        "cost must equal usage × ModelMetadata pricing"
+    );
+}
+
+#[test]
+fn metered_completion_without_pricing_meters_zero_not_fabricated() {
+    use zen_core::types::Sensitivity;
+    let router = DefaultRouter::from_agentic(&metered_mock_config(false));
+    let metered = router
+        .complete_metered("cost-test", "hello", Sensitivity::Public)
+        .expect("mock provider needs no network");
+    assert!(metered.input_tokens > 0);
+    assert_eq!(
+        metered.cost_usd, 0.0,
+        "unknown pricing must meter as 0, never an invented number"
+    );
+}
+
+#[test]
+fn model_metadata_marks_ollama_local_and_reads_configured_pricing() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "ollama".to_string(),
+        zen_core::config::ProviderConfig {
+            provider_type: Some("ollama".into()),
+            default_model: Some("qwen3:8b".into()),
+            input_cost_per_million: Some(9.0),
+            output_cost_per_million: Some(9.0),
+            ..Default::default()
+        },
+    );
+    let config = ZenConfig {
+        default_provider: Some("ollama".into()),
+        providers,
+        ..Default::default()
+    };
+    let router = DefaultRouter::from_agentic(&config);
+
+    let local = router.model_metadata("ollama", "qwen3:8b");
+    assert!(local.is_local, "ollama must be structurally local");
+    assert_eq!(
+        zen_provider::usage_to_cost_usd(&local, 1_000_000, 1_000_000),
+        0.0,
+        "local inference costs zero even with stale pricing configured"
+    );
+
+    let priced = router.model_metadata("mock", "mock");
+    assert!(!priced.is_local);
+    let unpriced = router.model_metadata("absent-provider", "whatever");
+    assert_eq!(unpriced.input_cost_per_million, 0.0);
+    assert_eq!(unpriced.output_cost_per_million, 0.0);
+}

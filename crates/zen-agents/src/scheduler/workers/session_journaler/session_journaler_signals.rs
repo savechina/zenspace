@@ -23,7 +23,7 @@ use zen_memory::preference::{PREFERENCE_PRIOR, Preference, PreferencePredicate};
 use zen_memory::quality_gate::{
     DECISION_PRINCIPLES, EXTRACTION_GUARDRAILS, MemoryGrade, grade_session_signal,
 };
-use zen_provider::{DefaultRouter, LlmRouterExt};
+use zen_provider::DefaultRouter;
 use zen_vault::wiki::AtomicWikiWriter;
 
 // ─── Types ─────────────────────────────────────────────────────────────
@@ -317,13 +317,16 @@ fn scan_commitments(dir: &std::path::Path) -> Vec<CommitmentSummary> {
 
 // ─── LLM signal extraction ────────────────────────────────────────────
 
+/// Returns `(signals, llm_cost_usd)` — the metered USD spend of the
+/// extraction call (0.0 for local/unpriced providers per
+/// `DefaultRouter::complete_metered`).
 pub(crate) async fn extract_signals_via_llm(
     conversation_text: &str,
     prompt_context: &PromptContext,
     router: DefaultRouter,
     matched_anti_patterns: &[String],
     fresh_eyes: bool,
-) -> Result<ExtractedSignals> {
+) -> Result<(ExtractedSignals, f64)> {
     let truncated = if conversation_text.len() > 12000 {
         let end = conversation_text
             .char_indices()
@@ -411,11 +414,13 @@ Rules:
 - If nothing of value happened in any category, return all empty arrays"#
     );
 
-    let response = tokio::task::spawn_blocking(move || {
-        router.complete("signal_extraction", &prompt, Sensitivity::Private)
+    let metered = tokio::task::spawn_blocking(move || {
+        router.complete_metered("signal_extraction", &prompt, Sensitivity::Private)
     })
     .await
     .context("LLM signal extraction task panicked")??;
+    let llm_cost_usd = metered.cost_usd;
+    let response = metered.text;
 
     let json_str = if let Some(start) = response.find("```json") {
         let after = &response[start + 7..];
@@ -573,7 +578,7 @@ Rules:
         }
     }
 
-    Ok(signals)
+    Ok((signals, llm_cost_usd))
 }
 
 // ─── Keyword signal extraction (fallback) ──────────────────────────────

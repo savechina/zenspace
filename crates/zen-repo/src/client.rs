@@ -18,6 +18,12 @@ pub enum SqliteError {
 
     #[error("sqlite-vec extension not loaded: {0}")]
     VecExtensionMissing(String),
+
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("migration lock error: {0}")]
+    MigrationLock(String),
 }
 
 pub type Result<T> = std::result::Result<T, SqliteError>;
@@ -62,6 +68,16 @@ async fn setup_writer(db_path: &Path) -> Result<Connection> {
     Ok(writer)
 }
 
+/// Acquire the migration lock without blocking the async runtime: the wait
+/// loop is a blocking sleep, so it runs on the blocking pool. The returned
+/// guard must be held across `run_migrations`.
+async fn migration_guard(db_path: &Path) -> Result<std::fs::File> {
+    let owned = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_migration_lock(&owned))
+        .await
+        .map_err(|e| SqliteError::MigrationLock(format!("migration lock task: {e}")))?
+}
+
 async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     let migrations = sqlx::migrate!("./migrations");
 
@@ -104,11 +120,64 @@ pub struct SqliteClient {
     pool: SqlitePool,
 }
 
+/// How long a process waits for another process to finish migrating before
+/// giving up (250 ms x 120 = ~30 s).
+const MIGRATION_LOCK_ATTEMPTS: u32 = 120;
+const MIGRATION_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Lock file serializing migrations for one database.
+fn migration_lock_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".migrate.lock");
+    db_path.with_file_name(name)
+}
+
+/// Take the cross-process migration lock for `db_path`.
+///
+/// sqlx-sqlite's own `Migrator::lock` is a no-op, so two processes opening a
+/// fresh database at the same time both read the same pending migration set
+/// and both try to apply it — the loser's `open` fails. Holding this flock
+/// makes the second process wait, then find the migration already recorded.
+/// The lock is advisory and released by the kernel if the holder dies.
+fn acquire_migration_lock(db_path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path = migration_lock_path(db_path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    for attempt in 0..MIGRATION_LOCK_ATTEMPTS {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if attempt + 1 == MIGRATION_LOCK_ATTEMPTS {
+                    return Err(SqliteError::MigrationLock(format!(
+                        "timed out waiting for {}",
+                        path.display()
+                    )));
+                }
+                std::thread::sleep(MIGRATION_LOCK_RETRY);
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(SqliteError::MigrationLock(format!(
+                    "lock {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    unreachable!("loop returns on success, timeout and error")
+}
+
 impl SqliteClient {
     pub async fn open(db_path: &Path) -> Result<Self> {
         register_sqlite_vec();
         let writer = setup_writer(db_path).await?;
         let pool = connect_pool(db_path, false).await?;
+        let _migration_lock = migration_guard(db_path).await?;
         run_migrations(&pool).await?;
         Ok(Self { writer, pool })
     }
@@ -117,6 +186,7 @@ impl SqliteClient {
         register_sqlite_vec();
         let writer = setup_writer(db_path).await?;
         let pool = connect_pool(db_path, true).await?;
+        let _migration_lock = migration_guard(db_path).await?;
         run_migrations(&pool).await?;
         Ok(Self { writer, pool })
     }

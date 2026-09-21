@@ -63,19 +63,25 @@ pub enum LoopCommands {
     ///
     /// Scope logic:
     /// - Functionality: reads `loop-last-report.json` and counts gaps
-    ///   by kind from `loop-gaps.jsonl`; does not trigger a cycle.
+    ///   by kind from `loop-gaps.jsonl`; does not trigger a cycle. The
+    ///   wall time of that read path is measured (SC-005) and reported
+    ///   as `status_read_ms`.
     /// - User impact: shows enabled state, cron schedule, last cycle
     ///   outcome, and open gap counts per kind.
-    /// - Default: human-readable table output.
+    /// - Default: human-readable table output with a subtle
+    ///   `(read in Nms)` header suffix.
     /// - Interaction: --json outputs a single JSON object with
-    ///   `last_cycle`, `schedule`, `enabled`, and `open_gaps` fields.
+    ///   `last_cycle`, `schedule`, `enabled`, `open_gaps`, and
+    ///   `status_read_ms` fields.
     Status {
         /// Machine-readable status object.
         ///
         /// Scope logic:
         /// - Functionality: outputs a JSON object with last_cycle
         ///   (LoopCycleReport or null), schedule (cron string), enabled
-        ///   (bool), and open_gaps (map of kind to count).
+        ///   (bool), open_gaps (map of kind to count), and status_read_ms
+        ///   (wall time of the status read path in milliseconds, rounded
+        ///   up, always ≥ 1 — a measured quantity, never a claim).
         /// - User impact: suitable for scripting or monitoring dashboards.
         /// - Default: false (human-readable output).
         #[arg(long)]
@@ -87,9 +93,13 @@ pub enum LoopCommands {
     /// Scope logic:
     /// - Functionality: reads `loop-gaps.jsonl` and displays records in
     ///   reverse-chronological order; optional kind filter narrows results.
+    ///   Also surfaces pending user questions from the Discovery Loop's
+    ///   `refinement-queue.json` (T187) — count + list appended after the
+    ///   gap records in human output, `user_questions` key in JSON output.
     /// - User impact: shows gap kind, detail, and subject path for each
     ///   record; useful for diagnosing stale inbox files, quarantined
-    ///   notes, decision blocks, or belief lifecycle events.
+    ///   notes, decision blocks, or belief lifecycle events. Pending user
+    ///   questions are hypotheses awaiting human judgment.
     /// - Default: all gap kinds, human-readable format.
     Gaps {
         /// Filter by gap kind (e.g. orphan_entity).
@@ -107,13 +117,15 @@ pub enum LoopCommands {
         #[arg(long)]
         kind: Option<String>,
 
-        /// Machine-readable GapRecord array.
+        /// Machine-readable output.
         ///
         /// Scope logic:
-        /// - Functionality: outputs the filtered gap records as a JSON
-        ///   array instead of the human-readable `[kind] detail (path)`
-        ///   format.
-        /// - User impact: suitable for scripting or piping to jq.
+        /// - Functionality: outputs a JSON object
+        ///   `{"gaps": [<filtered GapRecord>...], "user_questions": [<string>...]}`
+        ///   instead of the human-readable `[kind] detail (path)` format
+        ///   (T187: the top level changed from a bare array to this object).
+        /// - User impact: suitable for scripting or piping to jq
+        ///   (`jq '.gaps'` for the legacy record array).
         /// - Default: false (human-readable output).
         #[arg(long)]
         json: bool,
@@ -188,7 +200,7 @@ async fn run_cycle(dry_run: bool, json: bool) -> Result<(), ZenError> {
         .await
         .map_err(|e| ZenError::Message(e.to_string()))?;
 
-    let cycle = read_last_report(&paths)?;
+    let cycle = read_last_report(&paths.logs())?;
     if json {
         let out = cycle.unwrap_or(LoopCycleReport {
             cycle_id: format!("trigger-{}", report.worker_id),
@@ -217,12 +229,52 @@ async fn run_cycle(dry_run: bool, json: bool) -> Result<(), ZenError> {
         );
     }
 
-    match read_last_report(&paths) {
+    match read_last_report(&paths.logs()) {
         Ok(Some(c)) if c.outcome == Some(CycleOutcome::Failed) => Err(ZenError::Message(
             c.last_error.unwrap_or_else(|| "cycle failed".into()),
         )),
         _ => Ok(()),
     }
+}
+
+/// The measured status-read snapshot (SC-005): everything `status` renders,
+/// plus the wall time the read path took.
+struct StatusSnapshot {
+    cycle: Option<LoopCycleReport>,
+    open_gaps: BTreeMap<String, u64>,
+    /// Wall time of the report+gaps reads in milliseconds, rounded up and
+    /// floored at 1 — an `Instant` delta is never negative and a completed
+    /// read is never 0ms of real time; reporting 0 would read as unmeasured.
+    status_read_ms: u128,
+}
+
+/// Read the loop status files under `<logs>` and measure the read path.
+///
+/// Pure over the directory (no config, no global paths) so it is testable
+/// against a tempdir; errors only propagate from a *corrupt* persisted
+/// report — absent files degrade to `None`/empty like the rest of the
+/// status surface.
+fn collect_status(logs: &std::path::Path) -> Result<StatusSnapshot, ZenError> {
+    let started = std::time::Instant::now();
+    let cycle = read_last_report(logs)?;
+    let open_gaps = count_open_gaps(&gaps_path_from(logs));
+    let status_read_ms = started.elapsed().as_micros().div_ceil(1000).max(1);
+    Ok(StatusSnapshot {
+        cycle,
+        open_gaps,
+        status_read_ms,
+    })
+}
+
+/// Assemble the `--json` status payload from a snapshot plus config values.
+fn status_payload(snapshot: &StatusSnapshot, schedule: &str, enabled: bool) -> serde_json::Value {
+    serde_json::json!({
+        "last_cycle": snapshot.cycle,
+        "schedule": schedule,
+        "enabled": enabled,
+        "open_gaps": snapshot.open_gaps,
+        "status_read_ms": snapshot.status_read_ms,
+    })
 }
 
 fn show_status(json: bool) -> Result<(), ZenError> {
@@ -231,16 +283,14 @@ fn show_status(json: bool) -> Result<(), ZenError> {
     let loop_cfg = &config.agentic.loop_cfg;
     let logs = paths.logs();
 
-    let cycle = read_last_report(&paths)?;
-    let open_gaps = count_open_gaps(&gaps_path_from(&logs));
+    let snapshot = collect_status(&logs)?;
 
     if json {
-        let payload = serde_json::json!({
-            "last_cycle": cycle,
-            "schedule": loop_cfg.interval_or_default(),
-            "enabled": loop_cfg.enabled_or_default(),
-            "open_gaps": open_gaps,
-        });
+        let payload = status_payload(
+            &snapshot,
+            loop_cfg.interval_or_default(),
+            loop_cfg.enabled_or_default(),
+        );
         println!(
             "{}",
             serde_json::to_string_pretty(&payload).map_err(|e| ZenError::Message(e.to_string()))?
@@ -248,10 +298,10 @@ fn show_status(json: bool) -> Result<(), ZenError> {
         return Ok(());
     }
 
-    println!("Zen loop status:");
+    println!("Zen loop status (read in {}ms):", snapshot.status_read_ms);
     println!("  Enabled:  {}", loop_cfg.enabled_or_default());
     println!("  Schedule: {}", loop_cfg.interval_or_default());
-    match cycle {
+    match snapshot.cycle {
         Some(c) => {
             println!(
                 "  Last cycle: {} ({})",
@@ -270,7 +320,7 @@ fn show_status(json: bool) -> Result<(), ZenError> {
         None => println!("  Last cycle: none yet"),
     }
     println!("  Open gaps by kind:");
-    for (kind, count) in &open_gaps {
+    for (kind, count) in &snapshot.open_gaps {
         println!("    {kind}: {count}");
     }
     Ok(())
@@ -291,32 +341,73 @@ fn show_gaps(kind: Option<&str>, json: bool) -> Result<(), ZenError> {
         });
     }
 
+    let user_questions = read_pending_user_questions(&paths.logs());
+
     if json {
+        let payload = serde_json::json!({
+            "gaps": records,
+            "user_questions": user_questions,
+        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&records).map_err(|e| ZenError::Message(e.to_string()))?
+            serde_json::to_string_pretty(&payload).map_err(|e| ZenError::Message(e.to_string()))?
         );
         return Ok(());
     }
 
     if records.is_empty() {
         println!("No gaps detected.");
-        return Ok(());
+    } else {
+        for r in records {
+            let k = r.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
+            let detail = r.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+            let path = r.get("subject_path").and_then(|p| p.as_str()).unwrap_or("");
+            println!(
+                "[{k}] {detail}{}",
+                if path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({path})")
+                }
+            );
+        }
     }
-    for r in records {
-        let k = r.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
-        let detail = r.get("detail").and_then(|d| d.as_str()).unwrap_or("");
-        let path = r.get("subject_path").and_then(|p| p.as_str()).unwrap_or("");
-        println!(
-            "[{k}] {detail}{}",
-            if path.is_empty() {
-                String::new()
-            } else {
-                format!(" ({path})")
-            }
-        );
+
+    println!("\nPending user questions ({}):", user_questions.len());
+    for q in &user_questions {
+        println!("  - {q}");
     }
     Ok(())
+}
+
+/// Read pending user questions from the Discovery Loop refinement queue
+/// (`<logs>/refinement-queue.json`, `user_questions` key — T187).
+///
+/// # Parameters
+/// - `logs` — resolved logs directory (e.g. `ZenPaths::logs()`).
+///
+/// # Returns
+/// The `user_questions` string array written by the zen-loop stage-5c
+/// refinement pass; empty when the file is absent, unreadable, corrupt, or
+/// lacks the key (fail-open — the writer is explicitly non-fatal, so the
+/// reader must never turn a bad queue into a CLI error).
+fn read_pending_user_questions(logs: &std::path::Path) -> Vec<String> {
+    let path = logs.join("refinement-queue.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .get("user_questions")
+        .and_then(|q| q.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|q| q.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn set_enabled(enable: bool) -> Result<(), ZenError> {
@@ -390,8 +481,8 @@ fn gaps_path_from(logs: &std::path::Path) -> std::path::PathBuf {
     gaps_path(logs)
 }
 
-fn read_last_report(paths: &ZenPaths) -> Result<Option<LoopCycleReport>, ZenError> {
-    let path = last_report_path(&paths.logs());
+fn read_last_report(logs: &std::path::Path) -> Result<Option<LoopCycleReport>, ZenError> {
+    let path = last_report_path(logs);
     if !path.exists() {
         return Ok(None);
     }
@@ -415,4 +506,100 @@ fn count_open_gaps(gaps_file: &std::path::Path) -> BTreeMap<String, u64> {
         }
     }
     counts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t187_pending_user_questions_are_read_from_refinement_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("refinement-queue.json"),
+            r#"{
+                "cycle_id": "c-1",
+                "generated_at": "2026-09-20T00:00:00Z",
+                "occupied_cells": 2,
+                "fetch_prompts": ["Re-read evidence files [raw/foo.md]"],
+                "user_questions": [
+                    "Is hypothesis 'orphan-foo' still relevant? Current status: Exploring. Detail: ...",
+                    "Is hypothesis 'duplicate-bar' still relevant? Current status: Hypothesis. Detail: ..."
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let questions = read_pending_user_questions(&logs);
+        assert_eq!(questions.len(), 2);
+        assert!(questions[0].contains("orphan-foo"));
+        assert!(questions[1].contains("duplicate-bar"));
+    }
+
+    #[test]
+    fn sc005_status_read_ms_is_measured_and_present_in_json_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            last_report_path(&logs),
+            r#"{"cycle_id":"c-42","notes_processed":3,"archived_count":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            gaps_path(&logs),
+            "{\"kind\":\"orphan_entity\",\"detail\":\"a\"}\n\
+             {\"kind\":\"orphan_entity\",\"detail\":\"b\"}\n\
+             {\"kind\":\"quarantined_note\",\"detail\":\"c\"}\n",
+        )
+        .unwrap();
+
+        let snapshot = collect_status(&logs).expect("status read must succeed");
+        assert!(
+            snapshot.status_read_ms >= 1,
+            "a completed read must report ≥1ms, got {}",
+            snapshot.status_read_ms
+        );
+        assert_eq!(snapshot.cycle.as_ref().unwrap().cycle_id, "c-42");
+        assert_eq!(snapshot.open_gaps["orphan_entity"], 2);
+        assert_eq!(snapshot.open_gaps["quarantined_note"], 1);
+
+        let payload = status_payload(&snapshot, "0 */5 * * * *", true);
+        assert!(
+            payload["status_read_ms"].as_u64().unwrap() >= 1,
+            "JSON payload must carry the measured field: {payload}"
+        );
+        assert_eq!(payload["last_cycle"]["cycle_id"], "c-42");
+        assert_eq!(payload["schedule"], "0 */5 * * * *");
+        assert_eq!(payload["enabled"], true);
+        assert_eq!(payload["open_gaps"]["orphan_entity"], 2);
+    }
+
+    #[test]
+    fn sc005_status_read_degrades_to_empty_without_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = collect_status(dir.path()).expect("absent files are not an error");
+        assert!(snapshot.cycle.is_none());
+        assert!(snapshot.open_gaps.is_empty());
+        assert!(snapshot.status_read_ms >= 1);
+        let payload = status_payload(&snapshot, "* * * * *", false);
+        assert!(payload.get("status_read_ms").is_some());
+        assert!(payload["last_cycle"].is_null());
+    }
+
+    #[test]
+    fn t187_missing_or_corrupt_queue_yields_no_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_pending_user_questions(dir.path()).is_empty());
+
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("refinement-queue.json"), "not json").unwrap();
+        assert!(read_pending_user_questions(&logs).is_empty());
+
+        std::fs::write(logs.join("refinement-queue.json"), r#"{"cycle_id":"c"}"#).unwrap();
+        assert!(read_pending_user_questions(&logs).is_empty());
+    }
 }
