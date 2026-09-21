@@ -221,6 +221,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TUI Phase 9 P1 — fixed viewport, fail-loud history, bounded defer queue**
+  (2026-09-21, T080/T081):
+  - T080 (ADR-006): the inline viewport height is now ONE fixed 12 rows
+    (was 8) — budget: tail 2–4 + popup ≤6 + input 3 + toast 0–1 + footer 1.
+    No streaming-time Terminal recreation (ratatui Inline height is
+    construction-fixed; recreation reopens the T038 anchor-drift class).
+    ADR-006 authored; T038/D6 closed. Layout invariant tests: worst case
+    (popup + toast + banner) never clips input/footer.
+  - T081 (NFR-010): the history store CWD fallback (`./history.jsonl`) is
+    REMOVED — `HistoryStore` is now `Option`; on open failure the app logs,
+    shows a startup toast ("history unavailable … running without
+    persistence"), and runs on. Inline and fullscreen paths both toast.
+  - T081 (FR-016): the reading-mode deferred scrollback queue is bounded
+    (`DEFERRED_QUEUE_CAP` = 256). Overflow flushes oldest-first through the
+    real insert path (view jump accepted, ADR-001 Option A) and NEVER drops
+    or reorders content: a failed flush keeps the entries (queue temporarily
+    over cap, retried next tick). Footer shows `| ⏸ N deferred` while
+    blocks are held.
+  - Gates: clippy clean; zen-cli 269/269; PTY 16/16.
+
 - **TUI Phase 9 P0 remediation — T074–T077 landed + 005 hardening merged**
   (2026-09-21, spec `002-agentic-tui` Phase 9):
   - T074/T076 crash-atomic writes (NFR-010): `zen-core::atomic_file`
