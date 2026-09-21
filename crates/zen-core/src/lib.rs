@@ -1,3 +1,4 @@
+pub mod atomic_file;
 pub mod audit;
 pub mod config;
 pub mod constants;

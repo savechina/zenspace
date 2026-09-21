@@ -95,6 +95,15 @@ impl fmt::Display for SessionStatus {
 ///   - `context/demoted` — context items evicted from the active window
 ///     by `ContextPack` (archived per T050 so `.mv2` is never the sole copy)
 ///   - future: `tool/call`, `session/status`, etc.
+///
+/// **Additive-variant policy (NFR-010)**: new variants MUST be additive —
+/// an older reader that does not know a variant skips the line instead of
+/// hard-failing (the load path in `zen-memory::conversation::load` ignores
+/// unparseable lines), so a newer writer never breaks an older reader.
+/// `#[serde(other)]` is deliberately NOT used: it is unsupported for
+/// adjacently-tagged enums (`tag` + `content`), and restructuring the enum
+/// would break the frozen `.jsonl` wire format. Forward compatibility rides
+/// on the skip-unknown-lines load path instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum SessionEvent {
@@ -168,11 +177,17 @@ impl SessionEvent {
 
     /// Write a `session/meta` event as the first line of a `.jsonl` file.
     /// If the file already exists, the meta line is overwritten (line 1).
+    ///
+    /// Persists via `atomic_file::write_atomic` (tmp + fsync + rename,
+    /// NFR-010): a crash mid-write can never truncate the session file —
+    /// readers see either the old bytes or the new bytes, never a torn mix.
+    /// The line-rewrite logic is unchanged: line 0 is replaced, all other
+    /// lines are preserved byte-for-byte.
     pub fn write_meta(path: &std::path::Path, notion: &Session) -> Result<()> {
         let meta_line = serde_json::to_string(&SessionEvent::Meta(notion.clone()))
             .context("failed to serialize session/meta event")?;
 
-        if path.exists() {
+        let new_content = if path.exists() {
             // Overwrite first line only, preserve conversation events
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read: {}", path.display()))?;
@@ -182,17 +197,13 @@ impl SessionEvent {
             } else {
                 lines[0] = &meta_line;
             }
-            let new_content = lines.join("\n") + "\n";
-            std::fs::write(path, new_content)
-                .with_context(|| format!("failed to write: {}", path.display()))?;
+            lines.join("\n") + "\n"
         } else {
             // New file — write meta event
-            let mut file = std::fs::File::create(path)
-                .with_context(|| format!("failed to create: {}", path.display()))?;
-            use std::io::Write;
-            writeln!(file, "{}", meta_line)
-                .with_context(|| format!("failed to write meta event: {}", path.display()))?;
-        }
+            format!("{}\n", meta_line)
+        };
+        crate::atomic_file::write_atomic(path, new_content.as_bytes())
+            .with_context(|| format!("failed to write: {}", path.display()))?;
         Ok(())
     }
 }

@@ -1675,6 +1675,17 @@ Use /thinking to show/hide thinking process."#;
         if self.pending_calls.is_empty() {
             self.is_streaming = false;
             while let Some(queued) = self.message_queue.pop_front() {
+                // Inline-mode user echo for QUEUED messages: the immediate
+                // dispatch path in `handle_command` renders `> <query>` into
+                // scrollback, but this deferred path skipped it, so a message
+                // typed while the previous turn was finishing silently
+                // vanished from the transcript (exposed by T077's faster
+                // scrollback inserts shrinking the streaming→queued window;
+                // e13 follow-up regression).
+                if self.is_inline_mode() {
+                    let user_lines = self.render_user_lines_for_scrollback(&queued);
+                    self.enqueue_scrollback(user_lines);
+                }
                 self.current_query = queued.clone();
                 self.start_async_chat(&queued);
                 if !self.pending_calls.is_empty() {
@@ -2274,9 +2285,10 @@ Use /thinking to show/hide thinking process."#;
             .global_root()
             .join("daemon.pid");
 
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_path)
-            && let Ok(pid) = pid_str.trim().parse::<u32>()
-        {
+        // Read through the shared zen-gateway parser: the daemon writes a
+        // JSON record, and `read_pid` understands both that and the legacy
+        // bare-pid format.
+        if let Ok(pid) = zen_gateway::read_pid(&pid_path) {
             #[cfg(unix)]
             {
                 if unsafe { libc::kill(pid as i32, 0) == 0 } {
@@ -2314,10 +2326,13 @@ Use /thinking to show/hide thinking process."#;
             }
         }
 
-        if let Some(parent) = pid_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(&pid_path, child_pid.to_string()).ok();
+        // Single-writer invariant (NFR-010): the daemon.pid record is owned
+        // by the spawned child — `zen serve start --foreground` writes its
+        // own JSON record `{"pid": N, "start": ...}` via `write_pid`
+        // (tmp+rename, atomic) before entering the foreground loop. The TUI
+        // must NOT write a bare pid here: a non-atomic write ~500ms after
+        // spawn would clobber the child's record with a different format
+        // (bare pid vs JSON) and race it. The child is the single writer.
 
         let config = zen_gateway::HttpConfig::default();
         Ok(format!(
@@ -2336,8 +2351,7 @@ Use /thinking to show/hide thinking process."#;
             return Ok("Gateway not running (no PID file)".to_string());
         }
 
-        let pid_str = std::fs::read_to_string(&pid_path).map_err(|e| e.to_string())?;
-        let pid = pid_str.trim().parse::<u32>().map_err(|e| e.to_string())?;
+        let pid = zen_gateway::read_pid(&pid_path).map_err(|e| e.to_string())?;
 
         #[cfg(unix)]
         {
@@ -2370,8 +2384,7 @@ Use /thinking to show/hide thinking process."#;
             return Ok("Gateway not running".to_string());
         }
 
-        let pid_str = std::fs::read_to_string(&pid_path).map_err(|e| e.to_string())?;
-        let pid = pid_str.trim().parse::<u32>().map_err(|e| e.to_string())?;
+        let pid = zen_gateway::read_pid(&pid_path).map_err(|e| e.to_string())?;
 
         #[cfg(unix)]
         {

@@ -2865,7 +2865,9 @@ pub fn save_model_selection(provider: &str, model: &str) -> Result<(), ZenError>
         output.push_str(&format!("default_model = \"{model}\"\n"));
     }
 
-    std::fs::write(&config_path, output).map_err(|e| {
+    // NFR-010: atomic persist (tmp + fsync + rename) — a crash mid-write
+    // must never leave a truncated config.toml that parses as corrupt.
+    crate::atomic_file::write_atomic(&config_path, output.as_bytes()).map_err(|e| {
         ZenError::Config(ConfigError::ParseError {
             path: config_path.display().to_string(),
             reason: e.to_string(),
@@ -3493,5 +3495,58 @@ mod host_source_tests {
         );
 
         unsafe { std::env::remove_var("ZEN_AUDIT_DECISION_EXCERPT_CHARS") };
+    }
+
+    #[test]
+    fn save_model_selection_preserves_unrelated_lines_and_comments() {
+        // Test seam: in test builds user_root() reads ZEN_HOME fresh per
+        // call, so pointing it at a tempdir keeps the real ~/.zen untouched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        let config_path = home.join("config.toml");
+        std::fs::create_dir_all(home).expect("create home");
+        std::fs::write(
+            &config_path,
+            "# my comment\nprovider = \"ollama\"\n\n# keep me\ndefault_provider = \"old\"\ndefault_model = \"old-model\"\nother_key = 42\n",
+        )
+        .expect("seed config");
+
+        let prev = std::env::var("ZEN_HOME").ok();
+        // SAFETY: single-threaded test; std::env::set_var is process-global.
+        unsafe { std::env::set_var("ZEN_HOME", home) };
+        let result = save_model_selection("openai", "gpt-4o");
+        match prev {
+            Some(v) => unsafe { std::env::set_var("ZEN_HOME", v) },
+            None => unsafe { std::env::remove_var("ZEN_HOME") },
+        }
+        result.expect("save_model_selection");
+
+        let content = std::fs::read_to_string(&config_path).expect("read back");
+        assert!(content.contains("# my comment"), "comment preserved");
+        assert!(
+            content.contains("provider = \"ollama\""),
+            "unrelated line preserved"
+        );
+        assert!(content.contains("# keep me"), "second comment preserved");
+        assert!(
+            content.contains("default_provider = \"openai\""),
+            "provider replaced"
+        );
+        assert!(
+            content.contains("default_model = \"gpt-4o\""),
+            "model replaced"
+        );
+        assert!(
+            content.contains("other_key = 42"),
+            "unrelated key preserved"
+        );
+        assert!(
+            !content.contains("default_provider = \"old\""),
+            "old provider gone"
+        );
+        assert!(
+            !content.contains("default_model = \"old-model\""),
+            "old model gone"
+        );
     }
 }

@@ -46,7 +46,35 @@ impl Tui {
             bin.exists(),
             "debug binary missing — run `cargo build -p zen`: {bin:?}"
         );
+        Self::spawn_cmd(CommandBuilder::new(&bin), extra_env, config_toml)
+    }
 
+    /// Spawn `zen` inside an interactive shell (`sh -c 'zen; echo ZEN-EXITED;
+    /// exec sh'`) so a test can prove the terminal is usable AFTER zen exits:
+    /// the shell keeps running in the same pty and the terminal driver echoes
+    /// typed input back (termios ECHO) — the e16 panic-restore acceptance
+    /// (FR-021/SC-010). Verified empirically that macOS `/bin/sh` does NOT
+    /// reset termios on interactive startup, so a leftover raw mode is NOT
+    /// masked: the echoed input line only appears when zen restored cooked
+    /// mode.
+    fn spawn_in_shell(extra_env: &[(&str, &str)]) -> Self {
+        let bin =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/zen");
+        assert!(
+            bin.exists(),
+            "debug binary missing — run `cargo build -p zen`: {bin:?}"
+        );
+        let shell_cmd = format!("{}; echo ZEN-EXITED; exec sh", bin.display());
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", shell_cmd.as_str()]);
+        Self::spawn_cmd(cmd, extra_env, None)
+    }
+
+    fn spawn_cmd(
+        mut cmd: CommandBuilder,
+        extra_env: &[(&str, &str)],
+        config_toml: Option<&str>,
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -56,7 +84,6 @@ impl Tui {
                 pixel_height: 0,
             })
             .expect("openpty");
-        let mut cmd = CommandBuilder::new(&bin);
         cmd.env("TERM", "xterm-256color");
         // Isolation: the child must not touch the developer's real ~/.zen
         // (logs, db, sessions) — and in sandboxed test environments the real
@@ -86,20 +113,41 @@ impl Tui {
                 if n == 0 {
                     break;
                 }
-                if let Ok(mut p) = feed.lock() {
-                    p.process(&buf[..n]);
-                }
-                // Real terminals answer cursor-position queries (DSR). The
-                // inline viewport anchors via `get_cursor_position`, so the
-                // emulated terminal MUST reply or ratatui times out.
-                if buf[..n].windows(4).any(|w| w == b"\x1b[6n")
-                    && let Ok(p) = feed.lock()
+                // Real terminals answer cursor-position queries (DSR) IN
+                // STREAM: the reply reflects the parser state at the moment
+                // the `ESC[6n` is processed, before any LATER bytes in the
+                // stream. ratatui's inline viewport re-derives its anchor
+                // from the reply, so a snapshot taken after processing the
+                // whole read() chunk corrupts the anchor whenever the child
+                // emits `scroll + DSR + more` in one burst (exact duplicate-
+                // viewport corruption; masks/breaks e13 depending on how
+                // fast scrollback insertion runs). Split the chunk at each
+                // DSR, process + reply incrementally.
                 {
-                    let (row, col) = p.screen().cursor_position();
-                    let reply = format!("\x1b[{};{}R", row + 1, col + 1);
-                    if let Ok(mut w) = reply_writer.lock() {
-                        let _ = w.write_all(reply.as_bytes());
-                        let _ = w.flush();
+                    let mut p = feed.lock().expect("parser");
+                    let mut rest: &[u8] = &buf[..n];
+                    loop {
+                        match rest.windows(4).position(|w| w == b"\x1b[6n") {
+                            Some(i) => {
+                                let (before, after) = rest.split_at(i + 4);
+                                p.process(before);
+                                let (row, col) = p.screen().cursor_position();
+                                let reply = format!("\x1b[{};{}R", row + 1, col + 1);
+                                drop(p);
+                                if let Ok(mut w) = reply_writer.lock() {
+                                    let _ = w.write_all(reply.as_bytes());
+                                    let _ = w.flush();
+                                }
+                                p = feed.lock().expect("parser");
+                                rest = after;
+                            }
+                            None => {
+                                if !rest.is_empty() {
+                                    p.process(rest);
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -470,4 +518,29 @@ fn e15_inline_slash_popup_arrow_select_and_enter_executes() {
         status.success(),
         "slash-popup Enter should execute the selected /exit and quit, got {status}"
     );
+}
+
+/// E16 (FR-021/SC-010): a panic inside the inline session must leave the
+/// terminal usable — cooked mode, echo, bracketed paste, and keyboard flags
+/// restored. The `ZEN_TEST_PANIC_ON_FIRST_KEY` seam panics on the first key
+/// event; zen is spawned inside a shell (`sh -c 'zen; echo ZEN-EXITED;
+/// exec sh'`) so the SAME pty still has a live process afterwards. Writing
+/// `echo STILL-ALIVE` must be echoed back by the terminal driver — the
+/// echoed input line only appears when termios ECHO is on (cooked mode),
+/// which is exactly what the panic path must restore.
+#[test]
+#[ignore]
+fn e16_panic_leaves_terminal_usable() {
+    let mut tui = Tui::spawn_in_shell(&[("ZEN_TEST_PANIC_ON_FIRST_KEY", "1")]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+    tui.send(b"x"); // first key event → deliberate panic
+    // The chained panic hook restores the terminal BEFORE the panic message
+    // prints; ZEN-EXITED proves zen fully exited and the shell continued.
+    tui.wait_for("ZEN-EXITED", "zen exited after panic");
+    // The shell is now reading from the same pty. In cooked mode the
+    // terminal driver echoes the typed line back — the echoed input is the
+    // proof that raw mode (ECHO off) was disabled by the panic path.
+    tui.send(b"echo STILL-ALIVE\r");
+    tui.wait_for("echo STILL-ALIVE", "shell echoed typed input after panic");
+    tui.wait_for("STILL-ALIVE", "shell executed the command after panic");
 }

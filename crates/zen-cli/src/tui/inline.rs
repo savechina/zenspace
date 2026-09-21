@@ -1,4 +1,7 @@
 use std::io;
+use std::panic::PanicHookInfo;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -26,6 +29,53 @@ const STREAMING_RENDER_INTERVAL_MS: u128 = 33;
 const POLL_INTERVAL_ACTIVE_MS: u64 = 16;
 const POLL_INTERVAL_IDLE_MS: u64 = 50;
 
+/// One-shot terminal restore (T075, FR-021/SC-010).
+///
+/// Shared between `run_inline`'s normal-path cleanup, its `Drop` impl, and
+/// the chained panic hook; the `AtomicBool` makes the restore idempotent so
+/// no exit path can double-pop the kitty flags or bracketed-paste mode.
+/// Every exit — `Ok`, `Err`, early `?`, and panic — lands here exactly once.
+struct TerminalRestoreGuard {
+    done: AtomicBool,
+}
+
+impl TerminalRestoreGuard {
+    fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+        }
+    }
+
+    /// Restore cooked mode, un-pushed terminal modes, and cursor visibility
+    /// exactly once.
+    ///
+    /// Returns the crossterm errors so the normal path can propagate them;
+    /// the panic/`Drop` path ignores the result — a panic hook or `Drop`
+    /// must never panic, and a restore failure must never mask the original
+    /// error/panic.
+    fn restore(&self) -> io::Result<()> {
+        if self.done.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
+        )?;
+        crossterm::terminal::disable_raw_mode()?;
+        // Cursor visible: a panic (or any aborted session) must never leave
+        // the user's shell without a cursor.
+        execute!(io::stdout(), crossterm::cursor::Show)?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 pub fn run_inline(config: &'static zen_core::config::ZenConfig) -> Result<()> {
     if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
         let _ = paths.ensure_identity_files();
@@ -44,6 +94,24 @@ pub fn run_inline(config: &'static zen_core::config::ZenConfig) -> Result<()> {
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         ),
     )?;
+
+    // T075 (FR-021/SC-010): a panic used to leave the user's shell broken —
+    // raw mode on, bracketed paste + kitty flags still pushed, typed input
+    // invisible. Chain a panic hook that restores the terminal FIRST (so the
+    // panic message itself prints in cooked mode) and then defers to the
+    // previous hook; unwinding afterwards drops the guard. The guard's
+    // `AtomicBool` deduplicates the two restore attempts.
+    let restore = Arc::new(TerminalRestoreGuard::new());
+    let prev_hook: Arc<dyn Fn(&PanicHookInfo<'_>) + Send + Sync> =
+        Arc::from(std::panic::take_hook());
+    {
+        let restore = Arc::clone(&restore);
+        let prev_hook = Arc::clone(&prev_hook);
+        std::panic::set_hook(Box::new(move |info| {
+            restore.restore().ok();
+            prev_hook(info);
+        }));
+    }
 
     let result = (|| {
         // Anchor the inline viewport to the bottom of the screen instead of the
@@ -64,12 +132,15 @@ pub fn run_inline(config: &'static zen_core::config::ZenConfig) -> Result<()> {
         run_inline_session(&mut terminal, app)
     })();
 
-    execute!(
-        io::stdout(),
-        DisableBracketedPaste,
-        PopKeyboardEnhancementFlags,
-    )?;
-    crossterm::terminal::disable_raw_mode()?;
+    // Normal exit: put the previous panic hook back so repeated run_inline
+    // calls (tests) don't keep chaining wrappers onto global panic state.
+    std::panic::set_hook(Box::new(move |info| prev_hook(info)));
+
+    // Exactly-once restore; on the normal path crossterm errors still
+    // propagate. If the panic hook already restored, this is a no-op.
+    let cleanup = restore.restore();
+    drop(restore); // no-op when restore() above already ran
+    cleanup?;
     result
 }
 
@@ -353,6 +424,10 @@ fn run_inline_session(
     }
 
     let mut state = InlineLoopState::new();
+    // T075 test seam (e16 PTY acceptance): deliberately panic on the first
+    // key event so the PTY test can prove the panic path restores the
+    // terminal. Same env-seam convention as `ZEN_TEST_ECHO_LLM` (app.rs).
+    let panic_on_first_key = std::env::var("ZEN_TEST_PANIC_ON_FIRST_KEY").as_deref() == Ok("1");
     loop {
         let poll_ms = if app.is_streaming {
             POLL_INTERVAL_ACTIVE_MS
@@ -364,6 +439,14 @@ fn run_inline_session(
         } else {
             None
         };
+        if panic_on_first_key
+            && matches!(
+                &event,
+                Some(Event::Key(key)) if key.kind == KeyEventKind::Press
+            )
+        {
+            panic!("T075 seam: deliberate panic on first key (ZEN_TEST_PANIC_ON_FIRST_KEY)");
+        }
         if inline_tick(&mut app, terminal, &mut state, event)? {
             break;
         }
@@ -683,12 +766,17 @@ mod tests {
     /// S8 (T058, guards T055): Submit must be fast on the event loop — the
     /// pending call and streaming state appear instantly while the heavy
     /// pipeline (orchestrator/knowledge/LLM) runs in background tasks.
-    /// The 1000ms gate tolerates load-sensitive scrollback insertion —
-    /// probe evidence shows `insert_scrollback_queue` costs 400-550ms under
-    /// parallel nextest/CI load while the rest of the tick stays in the
-    /// microsecond range — while still catching any second-scale synchronous
-    /// work: the pre-T055 behaviour blocked the loop for up to ~10s.
-    /// Subsequent submits return in single-digit milliseconds.
+    /// The 1000ms gate tolerates load-sensitive scrollback insertion — an
+    /// earlier probe attributed 400-550ms to `insert_scrollback_queue` under
+    /// parallel CI load, but T077 (NFR-007/SC-011) replaced the fixed
+    /// width × 10_000-cell probe buffer with a content-proportional bound
+    /// (see `scrollback_inserter::wrapped_height`), superseding that
+    /// evidence; insertion now measures in single-digit milliseconds on the
+    /// same fixtures. The gate VALUE is deliberately kept unchanged — it now
+    /// guards against second-scale synchronous work (the pre-T055 behaviour
+    /// blocked the loop for up to ~10s) without tightening a load-sensitive
+    /// bound into a flake. Subsequent submits return in single-digit
+    /// milliseconds.
     #[test]
     fn s8_submit_dispatch_is_instant() {
         let rt = tokio::runtime::Builder::new_multi_thread()

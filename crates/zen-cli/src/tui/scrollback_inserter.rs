@@ -100,6 +100,37 @@ pub fn insert_lines<B: Backend>(
     Ok(())
 }
 
+/// Hard ceiling for the wrapped-height probe buffer (rows). Kept only as a
+/// safety cap — the buffer is now sized to the content's wrapped height
+/// (NFR-007/SC-011), never this fixed value.
+const MAX_PROBE_ROWS: u16 = 10_000;
+
+/// Compute a conservative wrapped-height estimate for `text` at `width` —
+/// the number of rows ratatui's `Paragraph` would occupy after word
+/// wrapping. `Paragraph::line_count` (the library-native exact answer) is
+/// gated behind ratatui's unstable `rendered-line-info` feature, so this is
+/// a conservative bound instead: per line, `ceil(2L/(width-1)) + 1` rows
+/// where L is the line's unicode width. The factor 2 covers word-wrap waste
+/// (each overflow-terminated row pairs with the row that starts its
+/// overflowing word; the pair occupies ≥ width-1 cells, so rows ≤
+/// 2L/(width-1) + 1). Clamped to `[1, MAX_PROBE_ROWS]` so callers always
+/// get a renderable buffer height.
+fn wrapped_height(text: &Text, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let mut rows = 0usize;
+    for line in &text.lines {
+        let line_width = line.width();
+        if line_width == 0 {
+            rows += 1;
+        } else if width == 1 {
+            rows += line_width;
+        } else {
+            rows += (2 * line_width + (width - 2)) / (width - 1) + 1;
+        }
+    }
+    rows.clamp(1, MAX_PROBE_ROWS as usize) as u16
+}
+
 /// Measure the content bounds of `text` after wrapping to `width`.
 ///
 /// Returns `(first, last)` — the first (inclusive) and last (exclusive) rows
@@ -109,8 +140,13 @@ pub fn insert_lines<B: Backend>(
 /// content-less text returns `(0, 1)` so callers still insert a single blank
 /// line.
 fn measure_wrapped_bounds(text: &Text, width: u16) -> (u16, u16) {
-    let max_rows = 10_000u16;
-    let area = Rect::new(0, 0, width, max_rows);
+    // NFR-007/SC-011: the probe buffer is sized to the content's wrapped
+    // height (`wrapped_height`, a conservative content-proportional bound)
+    // instead of a fixed width × 10_000-cell allocation per committed block
+    // (~800k cells at 80 cols; self-measured 400-550ms under CI load).
+    // `MAX_PROBE_ROWS` remains only as a hard ceiling.
+    let height = wrapped_height(text, width);
+    let area = Rect::new(0, 0, width, height);
     let mut buf = ratatui::buffer::Buffer::empty(area);
     Paragraph::new(text.clone())
         .wrap(Wrap { trim: false })
@@ -215,6 +251,8 @@ fn truncate_span<'a>(span: &'a Span<'a>, max_width: usize) -> Span<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
     use ratatui::TerminalOptions;
     use ratatui::Viewport;
     use ratatui::backend::TestBackend;
@@ -423,6 +461,50 @@ mod tests {
         assert!(
             hist.iter().any(|r| r == "zen 的价值: ok"),
             "mixed-width row must keep exact adjacency: {hist:?}"
+        );
+    }
+
+    /// T077 perf guard (NFR-007/SC-011): a representative committed block
+    /// (100 lines × 80 cols) must measure + insert far below the old fixed
+    /// `width × 10_000`-cell probe cost (self-measured 400-550ms under load
+    /// at 80 cols). The 200ms test bound is deliberately GENEROUS for loaded
+    /// CI machines — the spec's 50ms target applies to reference hardware;
+    /// a tighter gate here would flake, not protect.
+    #[test]
+    fn perf_wrapped_bounds_is_content_proportional_and_fast() {
+        let text = Text::from(
+            (0..100)
+                .map(|i| {
+                    Line::from(format!(
+                        "line-{i:03} lorem ipsum dolor sit amet consectetur adipiscing elit sed do"
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // Probe height is content-proportional: 100 content lines must never
+        // approach the old 10_000-row probe buffer.
+        let probe = wrapped_height(&text, 80);
+        assert!(
+            probe < 500,
+            "probe height must be content-proportional, got {probe}"
+        );
+
+        let start = Instant::now();
+        let (first, last) = measure_wrapped_bounds(&text, 80);
+        let mut terminal = anchored_terminal(80, 24, 8);
+        insert_lines(&mut terminal, &text.lines, true).expect("insert");
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            (last - first) as usize,
+            100,
+            "every line is a content row at 80 cols (no wrap at 69 cells)"
+        );
+        assert_eq!(probe as usize, 300, "estimate: 3 rows per 69-cell line");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "measure+insert must stay well under the old 400-550ms probe cost, took {elapsed:?}"
         );
     }
 
