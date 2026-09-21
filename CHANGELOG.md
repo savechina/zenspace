@@ -221,6 +221,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TUI Phase 9 P0 remediation — T074–T077 landed + 005 hardening merged**
+  (2026-09-21, spec `002-agentic-tui` Phase 9):
+  - T074/T076 crash-atomic writes (NFR-010): `zen-core::atomic_file`
+    (tmp+fsync+rename) ported from main's 2026-09-20 hardening;
+    `SessionEvent::write_meta` and `save_model_selection` now persist
+    atomically — a crash mid-write can never leave a torn session `.jsonl`
+    or truncated `config.toml`. `SessionEvent` additive-variant policy
+    documented (skip-unknown-lines load path; `#[serde(other)]` impossible
+    for adjacently-tagged enums).
+  - T076 daemon.pid single-writer: the TUI no longer writes a bare pid
+    ~500ms after spawning the gateway child (clobbering its JSON record
+    with a different format); all readers go through `zen_gateway::read_pid`.
+  - T075 panic-safe terminal restore (FR-021/SC-010): idempotent
+    `TerminalRestoreGuard` shared by normal-path cleanup, `Drop`, and a
+    chained panic hook that restores cooked mode / bracketed paste / kitty
+    flags / cursor BEFORE the panic message prints. Acceptance: new e16 PTY
+    test spawns zen inside a shell-resident pty, panics via the
+    `ZEN_TEST_PANIC_ON_FIRST_KEY` seam, and proves the terminal driver
+    echoes typed input afterwards.
+  - T077 bounded scrollback probe (NFR-007/SC-011): `measure_wrapped_bounds`
+    sizes its probe buffer to the content's wrapped height (conservative
+    `ceil(2L/(w-1))+1` per line, clamped in usize before u16 cast,
+    `MAX_PROBE_ROWS=10_000` ceiling) instead of a fixed `width x 10_000`
+    cells (~800k cells, self-measured 400–550ms under CI load) — now
+    single-digit ms with byte-identical `(first, last)` output. S8 gate
+    value kept at 1000ms deliberately (load-sensitive; rationale documented
+    in the S8 comment).
+  - PTY harness fix: cursor-position (DSR `ESC[6n`) replies now split the
+    read() chunk and answer in-stream — a snapshot-after-whole-chunk reply
+    corrupted the inline viewport anchor when `scroll + DSR + more` arrived
+    in one burst. Inline queued-message echo added (deferred dispatch path
+    renders `> query` into scrollback like the immediate path).
+  - Merged `005-agentic-loop` (Phase 27 closeout + Phase 28 four-dimension
+    review + gateway multi-instance concurrency hardening: startup lock,
+    cross-process migration lock, placeholders merge-lock, LLM cost
+    ledger). 005 touches no `tui/` files; the two `atomic_file` copies
+    merged add/add identical.
+  - Gates: `bin/lint` clean; `bin/test` 2783 passed / 0 failed / 22
+    skipped; `bin/tui-pty-test` 16/16 (incl. e16).
+
 - **Slash popup Codex parity — dropdown visuals + keyboard selection**
   (2026-09-17, user-reported regression):
   - Arrow keys now move the popup selection and the selection PERSISTS
