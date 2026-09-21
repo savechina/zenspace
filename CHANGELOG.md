@@ -221,6 +221,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TUI Phase 9 P1 — gateway-seam rendering (T079, FR-023/024/025)**
+  (2026-09-22):
+  - FR-023 banner states: structured `GatewayBannerState` (Connecting /
+    Ok(v) / OfflineDegraded / Refused) replaces the ad-hoc status_hint
+    gateway strings — one mechanism, one-row banner slot in the fixed
+    12-row layout. Handshake refusals incl. version mismatch (-32001)
+    render the server-provided reason+recovery VERBATIM; dial-time
+    refusals are recorded in prewarm so the no-link path surfaces them
+    instead of flattening to "offline". Local-only commands keep working
+    while degraded (SC-013, PTY e18: banner <500ms + /help functional).
+  - FR-024 approval popup: bottom-pane per ADR-002 with full action
+    details (binary+args for shell.exec), input PAUSED while pending,
+    FIFO one-at-a-time, y/Y approve + n/N/Esc deny, client-side render
+    timeout closes with a notice (gateway -32011 watchdog stays
+    authoritative); the decision returns on the originating turn
+    (turn-affinity guards preserved). The client notification pump gained
+    an interactive sink — the policy-lambda path is unchanged for non-TUI
+    surfaces; no server or wire changes (PTY e17 round-trip).
+  - FR-025 resume rendering: replay events buffer per turn and commit
+    only on turn_completed (never a torn turn); seq/corrupt gaps surface
+    as a one-line notice, never silent; committed text flows through
+    enqueue_scrollback so reading-mode deferral applies exactly like live
+    inserts; -32004 renders the final response without re-execution;
+    gateway resume complements the local store path (offline unchanged);
+    spawn-safe headless (Handle::try_current + thread fallback).
+  - New modules: tui/banner.rs, tui/approval.rs, tui/resume.rs.
+  - Gates: zen-cli 302/302 (+33 tests), zen-gateway green, PTY 18/18
+    (e17/e18 new), clippy+fmt clean.
+
 - **TUI Phase 9 P1 — fixed viewport, fail-loud history, bounded defer queue**
   (2026-09-21, T080/T081):
   - T080 (ADR-006): the inline viewport height is now ONE fixed 12 rows
