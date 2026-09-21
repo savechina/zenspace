@@ -465,6 +465,8 @@ pub struct AgenticConfig {
     pub classifiers: ClassifierConfig,
     /// Decision-audit content policy — TOML `[agentic.audit]` (T173/T175).
     pub audit: AuditConfig,
+    /// Retention sweep gating — TOML `[agentic.retention]` (review D2).
+    pub retention: RetentionConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -1023,6 +1025,38 @@ impl AuditConfig {
             .collect();
         let excerpt: String = flattened.chars().take(limit).collect();
         Some(excerpt.trim().to_string())
+    }
+}
+
+/// Retention sweep configuration — TOML `[agentic.retention]` (review D2).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates the daily `RetentionWorker` sweep that bounds the
+///   append-only filesystem homes (JSONL log rotation, age-based deletes,
+///   keep-newest caps; quarantine is report-only). The policy values
+///   themselves are code-defined defaults — no per-directory overrides.
+/// - User impact: `enabled = false` stops every retention sweep (the homes
+///   grow unbounded again); `dry_run = true` computes and audits the full
+///   sweep report without mutating anything (safe preview).
+/// - Default: enabled=true, dry_run=false.
+/// - Interaction: env `ZEN_RETENTION_ENABLED` / `ZEN_RETENTION_DRY_RUN`
+///   (5th layer) override any config file layer.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Daily retention sweep fires when true (absent → true).
+    pub enabled: Option<bool>,
+    /// Compute + audit the sweep without mutating anything (absent → false).
+    pub dry_run: Option<bool>,
+}
+
+impl RetentionConfig {
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn dry_run_or_default(&self) -> bool {
+        self.dry_run.unwrap_or(false)
     }
 }
 
@@ -1994,6 +2028,10 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
                 .decision_excerpt_chars
                 .or(base.audit.decision_excerpt_chars),
         },
+        retention: RetentionConfig {
+            enabled: ov.retention.enabled.or(base.retention.enabled),
+            dry_run: ov.retention.dry_run.or(base.retention.dry_run),
+        },
     }
 }
 
@@ -2321,8 +2359,18 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_intent_env(&mut config.agentic.intent);
     apply_classifier_env(&mut config.agentic.classifiers);
     apply_audit_env(&mut config.agentic.audit);
+    apply_retention_env(&mut config.agentic.retention);
     apply_skills_env(&mut config.skills.auto_route);
     config
+}
+
+fn apply_retention_env(cfg: &mut RetentionConfig) {
+    if let Some(v) = env_bool("ZEN_RETENTION_ENABLED") {
+        cfg.enabled = Some(v);
+    }
+    if let Some(v) = env_bool("ZEN_RETENTION_DRY_RUN") {
+        cfg.dry_run = Some(v);
+    }
 }
 
 fn apply_tool_loop_env(cfg: &mut ToolLoopConfig) {
@@ -2722,7 +2770,7 @@ impl CronConfig {
     ///   expressions ("9am", "2-4h") against this zone instead of Utc
     /// - User impact: `CronConfig::default()` ships `Asia/Shanghai`, so the
     ///   historical Utc-only behavior is restored to what the defaults
-    ///   always claimed; `ZEN_CRON_TZ` overrides per standard 5-layer config
+    ///   always claimed; `ZEN_CRON_TIMEZONE` overrides per standard 5-layer config
     /// - Default: Utc when unset or unparsable — a typo must never silently
     ///   shift every schedule; the scheduler logs a warn on fallback
     /// - Interaction: only affects schedule matching; worker `ctx.now` stays

@@ -17,6 +17,7 @@ pub mod pipeline;
 pub mod placeholders_store;
 pub mod recovery;
 pub mod reflection;
+pub mod retention;
 pub mod reward_sidecar;
 pub mod source_ingest;
 pub mod stages;
@@ -76,6 +77,7 @@ pub use placeholders_store::{
     registry_path,
 };
 pub use recovery::RecoveryManager;
+pub use retention::{HomeReport, RetentionReport, apply_policies};
 pub use reward_sidecar::{
     card_id_from_path, increment_access, increment_citations, increment_corrections, read_reward,
     write_reward,

@@ -277,9 +277,10 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
             ref dry_run,
         } => {
             debug!("clean dry_run:{}", dry_run);
-            let op = operation
-                .as_ref()
-                .unwrap_or(&CleanupCommands::Trash { json: false });
+            let op = operation.as_ref().unwrap_or(&CleanupCommands::Trash {
+                json: false,
+                yes: false,
+            });
             cleanup_command::execute_command(op)?;
             Ok(())
         }
