@@ -272,6 +272,49 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         _ => {}
     }
 
+    // FR-024: approval popup swallows all keys except y/n/Esc
+    if app.approval.is_pending() {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some((request, _decision)) = app
+                    .approval
+                    .resolve_current(crate::tui::approval::ApprovalDecision::Approve)
+                {
+                    // Send approval response via channel if available
+                    if let Some(tx) = &app.approval_tx {
+                        let _ = tx.try_send(crate::tui::approval::ApprovalResponse {
+                            request_id: request.request_id,
+                            turn_id: request.turn_id,
+                            decision: crate::tui::approval::ApprovalDecision::Approve,
+                        });
+                    }
+                    app.show_toast(format!("Approved: {}", request.tool_name));
+                }
+                InlineKeyAction::Continue
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                if let Some((request, _decision)) = app
+                    .approval
+                    .resolve_current(crate::tui::approval::ApprovalDecision::Deny)
+                {
+                    if let Some(tx) = &app.approval_tx {
+                        let _ = tx.try_send(crate::tui::approval::ApprovalResponse {
+                            request_id: request.request_id,
+                            turn_id: request.turn_id,
+                            decision: crate::tui::approval::ApprovalDecision::Deny,
+                        });
+                    }
+                    app.show_toast(format!("Denied: {}", request.tool_name));
+                }
+                InlineKeyAction::Continue
+            }
+            _ => {
+                // All other keys are swallowed while approval is pending
+                InlineKeyAction::Continue
+            }
+        };
+    }
+
     if key.code == KeyCode::Esc {
         if app.slash_state.visible {
             app.slash_state.dismiss();

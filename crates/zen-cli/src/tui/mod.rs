@@ -1,4 +1,6 @@
 mod app;
+mod approval;
+mod banner;
 pub mod cell;
 mod clipboard;
 mod handler;
@@ -12,6 +14,7 @@ pub mod markdown;
 pub mod model_picker;
 mod prewarm;
 mod render;
+pub(crate) mod resume;
 mod scheduler_gate;
 pub mod scrollback_inserter;
 pub mod selection;

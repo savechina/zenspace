@@ -152,6 +152,37 @@ pub struct SurfaceClient {
     /// aborts the prior pump before installing its replacement, so
     /// reconnect cycles never leak blocked pump tasks.
     pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// FR-024: Interactive approval sink. When `Some`, Q3 approval requests
+    /// are routed to this channel instead of the policy-lambda. The TUI
+    /// sends decisions back via the response channel. The pump awaits
+    /// the decision (with a timeout) before responding to the server.
+    approval_sink: std::sync::Mutex<Option<ApprovalSink>>,
+}
+
+/// FR-024: Interactive approval sink for routing Q3 requests to the TUI.
+/// The pump sends the request, the TUI sends back a decision.
+struct ApprovalSink {
+    /// Channel to send approval requests to the TUI.
+    request_tx: tokio::sync::mpsc::Sender<ApprovalRequestPayload>,
+    /// Channel to receive decisions back from the TUI.
+    response_rx: tokio::sync::mpsc::Receiver<ApprovalResponsePayload>,
+}
+
+/// Approval request payload sent to the TUI.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequestPayload {
+    pub request_id: String,
+    pub turn_id: String,
+    pub tool_name: String,
+    pub invocation: serde_json::Value,
+    pub reason: String,
+}
+
+/// Approval response payload received from the TUI.
+#[derive(Debug, Clone)]
+pub struct ApprovalResponsePayload {
+    pub request_id: String,
+    pub decision: String, // "approve" or "deny"
 }
 
 impl SurfaceClient {
@@ -190,6 +221,7 @@ impl SurfaceClient {
             inner: tokio::sync::Mutex::new(None),
             link: std::sync::RwLock::new(GatewayLinkState::Connecting),
             approval_policy: std::sync::RwLock::new(None),
+            approval_sink: std::sync::Mutex::new(None),
             active_turns: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
@@ -277,6 +309,11 @@ impl SurfaceClient {
         };
         let active_turns = Arc::clone(&self.active_turns);
         let events_tx = self.events_tx.clone();
+        // FR-024: capture approval sink for interactive route
+        let mut approval_sink = {
+            let mut sink_guard = self.approval_sink.lock().expect("approval sink lock");
+            sink_guard.take() // Take ownership; pump owns it until redial
+        };
         let handle = tokio::spawn(async move {
             let mut client = client;
             loop {
@@ -302,19 +339,65 @@ impl SurfaceClient {
                             .and_then(|i| i.get("args"))
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
-                        let approve = !foreign_turn
-                            && policy_slot
-                                .as_ref()
-                                .is_some_and(|policy| policy(&name, &args));
-                        if foreign_turn {
+                        let turn_id = params["turnId"].as_str().unwrap_or("").to_string();
+                        let reason = params
+                            .get("reason")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        // FR-024: Route to interactive sink if available, else policy-lambda
+                        let decision = if foreign_turn {
                             tracing::warn!(
                                 %id,
                                 tool = %name,
                                 "denied approval routed for a turn not owned by this surface"
                             );
-                        }
+                            "deny".to_string()
+                        } else if let Some(ref mut sink) = approval_sink {
+                            // Interactive route: send request to TUI, await decision
+                            let request = ApprovalRequestPayload {
+                                request_id: id.clone(),
+                                turn_id: turn_id.clone(),
+                                tool_name: name.clone(),
+                                invocation: args.clone(),
+                                reason: reason.clone(),
+                            };
+                            match sink.request_tx.send(request).await {
+                                Ok(()) => {
+                                    // Await decision with timeout (120s matches gateway watchdog)
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(120),
+                                        sink.response_rx.recv(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(response)) => response.decision,
+                                        Ok(None) => {
+                                            tracing::warn!(%id, "approval sink closed; defaulting to deny");
+                                            "deny".to_string()
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!(%id, "approval interactive timeout; denying");
+                                            "deny".to_string()
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    tracing::warn!(%id, "approval sink send failed; defaulting to deny");
+                                    "deny".to_string()
+                                }
+                            }
+                        } else {
+                            // Policy-lambda route (non-TUI surfaces)
+                            let approve = policy_slot
+                                .as_ref()
+                                .is_some_and(|policy| policy(&name, &args));
+                            if approve { "approve" } else { "deny" }.to_string()
+                        };
+
+                        let approve = decision == "approve";
                         tracing::info!(%id, tool = %name, approve, "approval decided");
-                        let decision = if approve { "approve" } else { "deny" };
                         let _ = client
                             .respond(&id, serde_json::json!({ "decision": decision }))
                             .await;
@@ -598,6 +681,43 @@ impl SurfaceClient {
         count
     }
 
+    /// FR-025: Resume a session by requesting replay from the gateway.
+    /// Returns the replayed events or snapshot, or an error if the gateway
+    /// is offline or the session is not found.
+    ///
+    /// When the gateway returns `-32004 turn-already-completed`, the
+    /// response contains the final result which should be rendered without
+    /// re-execution.
+    pub async fn resume_session_rpc(
+        &self,
+        session_id: &str,
+        turn_id: Option<&str>,
+        last_seq: Option<u64>,
+    ) -> Result<SessionResumeResult, SurfaceError> {
+        let client = self.ensure_link().await?;
+        let mut params = serde_json::json!({ "sessionId": session_id });
+        if let Some(tid) = turn_id {
+            params["turnId"] = serde_json::json!(tid);
+        }
+        if let Some(seq) = last_seq {
+            params["lastSeq"] = serde_json::json!(seq);
+        }
+        match client.request("session/resume", params).await {
+            Ok(result) => Ok(SessionResumeResult::Replay(result)),
+            Err(e) if e.code == -32004 => {
+                // turn-already-completed: extract the final response
+                let response = e
+                    .data
+                    .unwrap_or_default()
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(SessionResumeResult::Completed(response))
+            }
+            Err(e) => Err(SurfaceError::Rpc(e)),
+        }
+    }
+
     /// One dial+send of `session/turn`; recovery layers on top of this.
     async fn hosted_turn_once(
         &self,
@@ -636,6 +756,15 @@ impl SurfaceClient {
                 })
             })
     }
+}
+
+/// Result of a session/resume RPC call (FR-025).
+#[derive(Debug)]
+pub enum SessionResumeResult {
+    /// Ring replay: events after lastSeq or snapshot beyond ring window.
+    Replay(serde_json::Value),
+    /// Turn already completed: final response, no re-execution.
+    Completed(serde_json::Value),
 }
 
 #[cfg(test)]
@@ -876,6 +1005,7 @@ mod tests {
             inner: tokio::sync::Mutex::new(None),
             link: std::sync::RwLock::new(GatewayLinkState::OfflineDegraded),
             approval_policy: std::sync::RwLock::new(None),
+            approval_sink: std::sync::Mutex::new(None),
             active_turns: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),

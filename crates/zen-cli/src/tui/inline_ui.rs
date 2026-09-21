@@ -26,8 +26,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     };
     let accent_fg = Style::default().fg(info_accent);
 
-    let any_picker =
-        app.slash_state.visible || app.session_picker.visible || app.model_picker.visible;
+    let any_picker = app.approval.is_pending()
+        || app.slash_state.visible
+        || app.session_picker.visible
+        || app.model_picker.visible;
 
     // Codex/Claude-style bottom popup: the picker grows upward from the input
     // row. Input + footer ALWAYS keep their full height — the popup is capped
@@ -63,12 +65,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         0
     };
 
+    // FR-023: banner slot takes 1 row when visible, 0 when hidden
+    let banner_height = app.gateway_banner.height();
+
     let constraints = [
         Constraint::Min(filler_min),
         Constraint::Length(tail_height),
         Constraint::Length(popup_height),
         Constraint::Length(INPUT_HEIGHT),
         Constraint::Length(toast_height),
+        Constraint::Length(banner_height),
         Constraint::Length(FOOTER_HEIGHT),
     ];
 
@@ -95,11 +101,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         chunk_idx += 1;
     }
 
+    let theme_ref = app.theme.as_ref();
+
     if popup_height > 0 {
         let popup_area = chunks[chunk_idx];
-        let theme_ref = app.theme.as_ref();
         chunk_idx += 1;
-        if app.slash_state.visible {
+        if app.approval.is_pending() {
+            render_approval_popup_inline(frame, &app.approval, popup_area, theme_ref);
+        } else if app.slash_state.visible {
             render_slash_popup_inline(
                 frame,
                 &app.slash_state,
@@ -125,14 +134,26 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let input_area = chunks[chunk_idx];
     frame.render_widget(app.input.textarea(), input_area);
 
+    // After input (chunk_idx=3), advance to toast (4), banner (5), footer (6)
+    chunk_idx += 1; // -> toast slot (4)
+
+    // Toast slot
     if let Some(msg) = toast {
-        // chunks layout: [filler, tail, popup, input, toast, footer]
-        let toast_area = chunks[4];
+        let toast_area = chunks[chunk_idx];
         let toast_line = Line::styled(msg, Style::default().fg(info_accent));
         frame.render_widget(Paragraph::new(toast_line), toast_area);
     }
+    chunk_idx += 1; // -> banner slot (5)
 
-    let footer_area = chunks[5];
+    // FR-023: gateway banner
+    if banner_height > 0 {
+        let banner_area = chunks[chunk_idx];
+        render_gateway_banner_inline(frame, &app.gateway_banner, banner_area, theme_ref);
+    }
+    chunk_idx += 1; // -> footer slot (6)
+
+    // Footer slot
+    let footer_area = chunks[chunk_idx];
 
     let footer_spans: Vec<Span<'static>> = if app.history_search.active {
         // W2: reverse-i-search footer -- replaces the normal status bar.
@@ -257,6 +278,85 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let footer_line = Line::from(footer_spans);
     let footer = Paragraph::new(footer_line).style(Style::default().bg(bg_color));
     frame.render_widget(footer, footer_area);
+}
+
+/// FR-023: Render the gateway status banner.
+fn render_gateway_banner_inline(
+    frame: &mut Frame,
+    state: &crate::tui::banner::GatewayBannerState,
+    area: ratatui::layout::Rect,
+    theme: &dyn crate::tui::theme::OutputTheme,
+) {
+    let text = state.text();
+    let style = match state {
+        crate::tui::banner::GatewayBannerState::Hidden => return,
+        crate::tui::banner::GatewayBannerState::Ok(_) => theme.text_muted(),
+        crate::tui::banner::GatewayBannerState::Connecting => {
+            Style::default().fg(theme.info_accent())
+        }
+        crate::tui::banner::GatewayBannerState::OfflineDegraded
+        | crate::tui::banner::GatewayBannerState::Refused { .. } => {
+            Style::default().fg(Color::Yellow)
+        }
+    };
+    let para = Paragraph::new(Line::from(Span::styled(text.to_string(), style)));
+    frame.render_widget(para, area);
+}
+
+/// FR-024: Render the approval popup in the popup slot.
+fn render_approval_popup_inline(
+    frame: &mut Frame,
+    state: &crate::tui::approval::ApprovalState,
+    area: ratatui::layout::Rect,
+    theme: &dyn crate::tui::theme::OutputTheme,
+) {
+    let request = match &state.current {
+        Some(r) => r,
+        None => return,
+    };
+
+    let header_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(8);
+
+    // Header line with queued count
+    let queued = state.pending_count();
+    let header = if queued > 0 {
+        format!("Approval Required ({queued} queued)")
+    } else {
+        "Approval Required".to_string()
+    };
+    lines.push(Line::from(Span::styled(header, header_style)));
+
+    // Tool name + reason
+    let tool_style = Style::default().fg(theme.info_accent());
+    lines.push(Line::from(vec![
+        Span::styled("Tool: ", theme.text_muted()),
+        Span::styled(request.tool_name.clone(), tool_style),
+    ]));
+    if !request.reason.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Reason: ", theme.text_muted()),
+            Span::styled(request.reason.clone(), Style::default()),
+        ]));
+    }
+
+    // Key hint
+    let hint_style = theme.text_muted();
+    lines.push(Line::from(vec![
+        Span::styled("y", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" = approve  ", hint_style),
+        Span::styled("n", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" = deny  ", hint_style),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" = deny", hint_style),
+    ]));
+
+    let popup = Paragraph::new(lines);
+    frame.render_widget(popup, area);
 }
 
 fn dynamic_tail_height(viewport_height: u16, popup_height: u16, filler_min: u16) -> u16 {
@@ -886,6 +986,141 @@ mod tests {
         assert!(
             !cwd_history.exists(),
             "history.jsonl must NOT be created in CWD (NFR-010 — CWD fallback removed)"
+        );
+    }
+
+    // ===== FR-023: Gateway banner rendering tests =====
+
+    #[test]
+    fn banner_hidden_zero_height() {
+        let mut app = test_app();
+        app.gateway_banner = crate::tui::banner::GatewayBannerState::Hidden;
+        let buf = draw_ui(60, 12, &mut app);
+        let footer = row_text(&buf, 11);
+        assert!(
+            footer.contains("Zen"),
+            "footer must be on last row: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn banner_visible_uses_one_row() {
+        let mut app = test_app();
+        app.gateway_banner = crate::tui::banner::GatewayBannerState::Connecting;
+        let buf = draw_ui(60, 12, &mut app);
+        let mut banner_found = false;
+        for y in 0..12u16 {
+            let row = row_text(&buf, y);
+            if row.contains("gateway") && row.contains("connecting") {
+                banner_found = true;
+                break;
+            }
+        }
+        assert!(banner_found, "banner must render connecting state");
+        let footer = row_text(&buf, 11);
+        assert!(
+            footer.contains("Zen"),
+            "footer must survive with banner: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn banner_offline_degraded_renders_verbatim() {
+        let mut app = test_app();
+        app.gateway_banner = crate::tui::banner::GatewayBannerState::OfflineDegraded;
+        let buf = draw_ui(60, 12, &mut app);
+        let mut banner_found = false;
+        for y in 0..12u16 {
+            let row = row_text(&buf, y);
+            if row.contains("gateway") && row.contains("offline") {
+                banner_found = true;
+                break;
+            }
+        }
+        assert!(banner_found, "banner must render offline state");
+    }
+
+    // ===== FR-024: Approval popup rendering tests =====
+
+    #[test]
+    fn approval_popup_renders_in_viewport() {
+        let mut app = test_app();
+        let request = crate::tui::approval::ApprovalRequest {
+            turn_id: "t1".to_string(),
+            request_id: "r1".to_string(),
+            tool_name: "shell.exec".to_string(),
+            invocation: serde_json::json!({"binary": "/bin/sh", "args": ["-c", "echo hi"]}),
+            reason: "test".to_string(),
+            received_at: std::time::Instant::now(),
+        };
+        app.approval.push(request);
+        let buf = draw_ui(60, 12, &mut app);
+        let mut popup_found = false;
+        for y in 0..12u16 {
+            let row = row_text(&buf, y);
+            if row.contains("Approval") || row.contains("shell.exec") {
+                popup_found = true;
+                break;
+            }
+        }
+        assert!(popup_found, "popup must render somewhere in viewport");
+        let footer = row_text(&buf, 11);
+        assert!(footer.contains("Zen"), "footer must survive: {footer:?}");
+    }
+
+    #[test]
+    fn approval_queue_shows_queued_count() {
+        let mut app = test_app();
+        let request1 = crate::tui::approval::ApprovalRequest {
+            turn_id: "t1".to_string(),
+            request_id: "r1".to_string(),
+            tool_name: "shell.exec".to_string(),
+            invocation: serde_json::json!({}),
+            reason: "".to_string(),
+            received_at: std::time::Instant::now(),
+        };
+        let request2 = crate::tui::approval::ApprovalRequest {
+            turn_id: "t2".to_string(),
+            request_id: "r2".to_string(),
+            tool_name: "fs.write".to_string(),
+            invocation: serde_json::json!({}),
+            reason: "".to_string(),
+            received_at: std::time::Instant::now(),
+        };
+        app.approval.push(request1);
+        app.approval.push(request2);
+        let buf = draw_ui(60, 12, &mut app);
+        let mut queued_found = false;
+        for y in 0..12u16 {
+            let row = row_text(&buf, y);
+            if row.contains("queued") {
+                queued_found = true;
+                break;
+            }
+        }
+        assert!(queued_found, "popup must show queued count");
+    }
+
+    #[test]
+    fn worst_case_banner_toast_popup_fits_12_rows() {
+        let mut app = test_app();
+        app.gateway_banner = crate::tui::banner::GatewayBannerState::Connecting;
+        app.show_toast("test toast".to_string());
+        let _ = app.get_active_toast();
+        let request = crate::tui::approval::ApprovalRequest {
+            turn_id: "t1".to_string(),
+            request_id: "r1".to_string(),
+            tool_name: "shell.exec".to_string(),
+            invocation: serde_json::json!({}),
+            reason: "".to_string(),
+            received_at: std::time::Instant::now(),
+        };
+        app.approval.push(request);
+        let buf = draw_ui(60, 12, &mut app);
+        let footer = row_text(&buf, 11);
+        assert!(
+            footer.contains("Zen"),
+            "footer must survive in worst case: {footer:?}"
         );
     }
 }

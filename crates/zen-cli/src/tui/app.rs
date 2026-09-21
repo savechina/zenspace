@@ -430,6 +430,18 @@ pub struct App {
     theme_generation: u64,
     pub loop_panel: crate::tui::loop_panel::LoopPanelState,
     pub history_search: HistorySearch,
+    /// FR-023: gateway lifecycle state rendered in the one-row banner slot.
+    /// Replaces ad-hoc status_hint strings for gateway state display.
+    pub gateway_banner: super::banner::GatewayBannerState,
+    /// FR-024: approval popup state. One-at-a-time FIFO, input paused while pending.
+    pub approval: super::approval::ApprovalState,
+    /// FR-024: channel for sending approval decisions back to the gateway pump.
+    pub approval_tx: Option<std::sync::mpsc::SyncSender<super::approval::ApprovalResponse>>,
+    /// FR-024: channel for receiving approval requests from the gateway pump.
+    pub approval_rx: Option<std::sync::mpsc::Receiver<super::approval::ApprovalRequest>>,
+    /// FR-025: channel for delivering gateway resume events to the TUI main thread.
+    pub resume_event_tx: Option<std::sync::mpsc::SyncSender<super::resume::ResumeMessage>>,
+    pub resume_event_rx: Option<std::sync::mpsc::Receiver<super::resume::ResumeMessage>>,
 }
 
 impl App {
@@ -519,8 +531,32 @@ impl App {
             history_search: HistorySearch::new(),
             loop_panel: crate::tui::loop_panel::LoopPanelState::default(),
             last_nudge_poll: None,
+            gateway_banner: super::banner::GatewayBannerState::default(),
+            approval: super::approval::ApprovalState::default(),
+            approval_tx: None,
+            approval_rx: None,
+            resume_event_tx: None,
+            resume_event_rx: None,
         };
         app.load_command_history();
+
+        // ZEN_TEST_APPROVAL_SEAM: test-only seam injecting a fake approval request
+        // at startup (FR-024 acceptance test). Production is unaffected.
+        if std::env::var("ZEN_TEST_APPROVAL_SEAM").is_ok() {
+            let request = super::approval::ApprovalRequest {
+                turn_id: "test-turn-1".to_string(),
+                request_id: "test-req-1".to_string(),
+                tool_name: "shell.exec".to_string(),
+                invocation: serde_json::json!({
+                    "binary": "/bin/sh",
+                    "args": ["-c", "echo hello"]
+                }),
+                reason: "test approval request".to_string(),
+                received_at: std::time::Instant::now(),
+            };
+            app.approval.push(request);
+        }
+
         app
     }
 
@@ -1285,7 +1321,7 @@ Use /thinking to show/hide thinking process."#;
         // knowledge/search plus the cheap local filename lookup, and a
         // dead link fails the turn with the degraded banner visible
         // (FR-011/012). Reconnect happens on the next turn.
-        self.status_hint = Some("gateway: connecting…".to_string());
+        self.gateway_banner = super::banner::GatewayBannerState::Connecting;
         let session = self
             .session
             .clone()
@@ -1300,13 +1336,16 @@ Use /thinking to show/hide thinking process."#;
                 None => super::prewarm::resolve_client().await,
             };
             let Some(surface) = surface else {
-                let _ = done_tx.send((
-                    Err(
+                // FR-023: a handshake refusal (e.g. version mismatch) recorded
+                // during dialing surfaces VERBATIM; otherwise generic offline.
+                let err = match super::prewarm::take_dial_refusal() {
+                    Some((reason, recovery)) => super::banner::refusal_marker(&reason, &recovery),
+                    None => {
                         "gateway: offline — memory & agent features degraded (retrying): no link"
-                            .into(),
-                    ),
-                    None,
-                ));
+                            .to_string()
+                    }
+                };
+                let _ = done_tx.send((Err(err), None));
                 return;
             };
 
@@ -1369,6 +1408,25 @@ Use /thinking to show/hide thinking process."#;
                         // Cancelled turn: send a sentinel so poll_llm_response
                         // handles it cleanly (no red error banner).
                         let _ = done_tx.send((Err("[[CANCELLED]]".into()), None));
+                    } else if let zen_gateway::client::SurfaceError::Rpc(rpc) = &e
+                        && rpc.code == -32001
+                    {
+                        // FR-023: handshake refusal incl. version mismatch —
+                        // carry the server-provided reason+recovery verbatim.
+                        let reason = rpc
+                            .data
+                            .as_ref()
+                            .and_then(|d| d.get("reason"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(rpc.message.as_str());
+                        let recovery = rpc
+                            .data
+                            .as_ref()
+                            .and_then(|d| d.get("recovery"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let _ = done_tx
+                            .send((Err(super::banner::refusal_marker(reason, recovery)), None));
                     } else {
                         let _ = done_tx
                             .send((Err(format!("{}: {e}", surface.link_state().banner())), None));
@@ -1465,6 +1523,9 @@ Use /thinking to show/hide thinking process."#;
     }
 
     pub fn poll_llm_response(&mut self) {
+        // FR-025: drain gateway resume events into scrollback
+        self.drain_resume_events();
+
         struct StreamResult {
             done_result: Option<(
                 Result<String, String>,
@@ -1634,10 +1695,9 @@ Use /thinking to show/hide thinking process."#;
                                 self.invalidate_output_cache();
                             }
                             self.current_response_tokens = response.len() / 4;
-                            self.status_hint = Some(format!(
-                                "gateway: ok (v{})",
-                                zen_gateway::protocol::SERVER_PROTOCOL_VERSION
-                            ));
+                            self.gateway_banner = super::banner::GatewayBannerState::Ok(
+                                zen_gateway::protocol::SERVER_PROTOCOL_VERSION.to_string(),
+                            );
                             self.auto_scroll = true;
                             self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {
@@ -1682,14 +1742,29 @@ Use /thinking to show/hide thinking process."#;
                                 self.enqueue_scrollback(vec![cancel_line]);
                                 self.status_hint = None;
                                 self.current_response_tokens = 0;
+                            } else if let Some((reason, recovery)) =
+                                super::banner::parse_refusal_marker(&e)
+                            {
+                                // FR-023: handshake refusal (incl. version
+                                // mismatch) — banner renders the server-provided
+                                // message VERBATIM; one mechanism, never
+                                // status_hint.
+                                self.gateway_banner =
+                                    super::banner::GatewayBannerState::Refused { reason, recovery };
+                                self.status_hint = None;
+                                self.stream_collector.clear();
+                                let text = self.gateway_banner.text();
+                                self.push_output(format!("[LLM] Error: {text}"), true);
                             } else {
                                 tracing::warn!(error = %e, "TUI chat: LLM response error");
-                                // FR-011/012: gateway-class failures keep the
-                                // degraded banner pinned in the status line.
-                                self.status_hint = e.starts_with("gateway: offline").then(|| {
-                                    "gateway: offline \u{2014} memory & agent features degraded (retrying)"
-                                        .to_string()
-                                });
+                                // FR-011/012 + FR-023: gateway-class failures pin
+                                // the degraded BANNER (single mechanism — the
+                                // status_hint duplicate was removed).
+                                if e.starts_with("gateway: offline") {
+                                    self.gateway_banner =
+                                        super::banner::GatewayBannerState::OfflineDegraded;
+                                }
+                                self.status_hint = None;
                                 self.stream_collector.clear();
                                 self.push_output(format!("[LLM] Error: {}", e), true);
                             }
@@ -2203,6 +2278,56 @@ Use /thinking to show/hide thinking process."#;
     pub fn resume_session(&mut self, session_id: &str) {
         use zen_memory::session::SessionManager;
         self.save_session_state();
+
+        // FR-025: When gateway is live, prefer/merge the gateway resume
+        // so in-flight-turn state is recovered. Offline falls back to local.
+        //
+        // Spawn safety (item C): resume_session is called from sync key handlers
+        // which may run outside a tokio runtime (headless tests). Use the
+        // try_current / std::thread fallback pattern from persist_history (:1016-1046).
+        let session_id_owned = session_id.to_string();
+        if let Some(surface) = super::prewarm::take_client() {
+            let surface = surface.clone();
+            let sid = session_id_owned.clone();
+
+            // Create the channel pair for resume events
+            let (tx, rx) = std::sync::mpsc::sync_channel(32);
+            self.resume_event_tx = Some(tx.clone());
+            self.resume_event_rx = Some(rx);
+
+            let producer = move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    Self::run_gateway_resume(surface, &sid, &tx).await;
+                });
+            };
+
+            // Inside a tokio runtime: spawn on blocking thread.
+            // Outside (headless tests): spawn a dedicated OS thread.
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    std::mem::drop(handle.spawn_blocking(producer));
+                }
+                Err(_) => {
+                    std::thread::Builder::new()
+                        .name("resume-producer".into())
+                        .spawn(producer)
+                        .ok();
+                }
+            }
+        }
+
+        // Merge/dedup rule (documented per FR-025):
+        // The local resume path renders archived turns synchronously and clears
+        // output first. Gateway replay COMPLEMENTS it: only turns the local
+        // store doesn't contain arrive via the channel. When local succeeds,
+        // gateway events for the same turns are deduplicated because the local
+        // store already rendered them. When gateway is offline, no producer is
+        // spawned and the local path handles everything.
+
         let manager = SessionManager::new();
         match manager.resume_session(session_id) {
             Ok(session) => {
@@ -2262,6 +2387,93 @@ Use /thinking to show/hide thinking process."#;
                 self.session_picker.dismiss();
             }
             Err(e) => self.push_output(format!("Resume error: {}", e), true),
+        }
+    }
+
+    /// FR-025: Gateway resume producer — runs on a dedicated thread, parses
+    /// replay events, buffers per turn, sends `ResumeMessage`s via channel.
+    async fn run_gateway_resume(
+        surface: std::sync::Arc<zen_gateway::client::SurfaceClient>,
+        session_id: &str,
+        tx: &std::sync::mpsc::SyncSender<super::resume::ResumeMessage>,
+    ) {
+        use zen_gateway::client::surface::SessionResumeResult;
+        match surface.resume_session_rpc(session_id, None, None).await {
+            Ok(SessionResumeResult::Replay(events)) => {
+                let (parsed, parse_skipped) = super::resume::ResumeProcessor::parse_events(&events);
+                tracing::info!(
+                    session_id = %session_id,
+                    event_count = parsed.len(),
+                    parse_skipped,
+                    "gateway resume: replayed events"
+                );
+                let mut proc = super::resume::ResumeProcessor::new();
+                for ev in &parsed {
+                    if let Some(msg) = proc.process_event(ev) {
+                        let _ = tx.send(msg);
+                    }
+                }
+                for msg in proc.flush() {
+                    let _ = tx.send(msg);
+                }
+                if parse_skipped > 0 {
+                    let _ = tx.send(super::resume::ResumeMessage::GapNotice {
+                        skipped_count: parse_skipped,
+                    });
+                }
+            }
+            Ok(SessionResumeResult::Completed(response)) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    "gateway resume: turn already completed (-32004)"
+                );
+                if let Some(text) = response.get("response").and_then(|r| r.as_str()) {
+                    let _ = tx.send(super::resume::ResumeMessage::CompletedResponse {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    "gateway resume failed; local path handles rendering"
+                );
+            }
+        }
+    }
+
+    /// FR-025: Drain resume events from the gateway channel and enqueue
+    /// to scrollback. Called from `poll_llm_response` on each tick.
+    fn drain_resume_events(&mut self) {
+        let Some(rx) = self.resume_event_rx.as_ref() else {
+            return;
+        };
+        // Clone receiver reference to avoid borrow conflict with enqueue_scrollback
+        let mut messages = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        // Process messages outside the borrow
+        for msg in messages.drain(..) {
+            match msg {
+                super::resume::ResumeMessage::TurnText { text, .. } => {
+                    let lines = super::resume::render_replay_turn(&text);
+                    if !lines.is_empty() {
+                        self.enqueue_scrollback(lines);
+                    }
+                }
+                super::resume::ResumeMessage::GapNotice { skipped_count } => {
+                    let lines = super::resume::render_gap_notice(skipped_count);
+                    self.enqueue_scrollback(lines);
+                }
+                super::resume::ResumeMessage::CompletedResponse { text } => {
+                    let lines = super::resume::render_completed_response(&text);
+                    if !lines.is_empty() {
+                        self.enqueue_scrollback(lines);
+                    }
+                }
+            }
         }
     }
 

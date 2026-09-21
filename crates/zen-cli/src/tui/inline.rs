@@ -459,6 +459,12 @@ fn run_inline_session(
     // first Enter does not pay the cold-start price on this thread.
     super::prewarm::spawn();
 
+    // ZEN_TEST_GATEWAY_OFFLINE: test-only seam forcing OfflineDegraded state
+    // at startup (FR-023/SC-013 acceptance test). Production is unaffected.
+    if std::env::var("ZEN_TEST_GATEWAY_OFFLINE").is_ok() {
+        app.gateway_banner = super::banner::GatewayBannerState::OfflineDegraded;
+    }
+
     if let Err(e) =
         super::scrollback_inserter::insert_scrollback_queue(terminal, &mut app.scrollback_queue)
     {

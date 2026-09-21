@@ -544,3 +544,51 @@ fn e16_panic_leaves_terminal_usable() {
     tui.wait_for("echo STILL-ALIVE", "shell echoed typed input after panic");
     tui.wait_for("STILL-ALIVE", "shell executed the command after panic");
 }
+
+/// E17 (FR-024/SC-013): approval popup roundtrip.
+/// Uses `ZEN_TEST_APPROVAL_SEAM=1` to inject a fake approval request at
+/// startup. Asserts:
+/// - popup renders with tool details (binary+args for shell.exec)
+/// - input is paused (typed chars do NOT reach composer)
+/// - `y` closes popup + records approve decision
+#[test]
+#[ignore]
+fn e17_approval_popup_roundtrip() {
+    let mut tui = Tui::spawn(&[("ZEN_TEST_APPROVAL_SEAM", "1")]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+    // The seam injects an approval request; wait for the popup hints line
+    // (FR-024: "y = approve  n = deny  Esc = deny" is always rendered)
+    tui.wait_for("approve", "approval popup visible (key hint)");
+    // Input should be paused — typed chars should NOT appear in composer
+    tui.send(b"should-not-appear");
+    std::thread::sleep(Duration::from_millis(300));
+    let screen = tui.screen();
+    assert!(
+        !screen.contains("should-not-appear"),
+        "input must be paused during approval: found typed text in screen"
+    );
+    // Press 'y' to approve
+    tui.send(b"y");
+    // After approval the popup hint line should disappear
+    std::thread::sleep(Duration::from_millis(500));
+    let screen = tui.screen();
+    assert!(
+        !screen.contains("approve"),
+        "popup must close after approval (hint line gone)"
+    );
+}
+
+/// E18 (FR-023/SC-013): degraded banner renders within 500ms of daemon loss
+/// and local-only commands remain functional while degraded.
+/// Uses `ZEN_TEST_GATEWAY_OFFLINE=1` to force OfflineDegraded at startup.
+#[test]
+#[ignore]
+fn e18_degraded_banner_renders_and_local_commands_work() {
+    let mut tui = Tui::spawn(&[("ZEN_TEST_GATEWAY_OFFLINE", "1")]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+    // The seam forces OfflineDegraded; wait for the banner
+    tui.wait_for("gateway: offline", "degraded banner visible");
+    // Local-only commands should still work
+    tui.send(b"/help\r");
+    tui.wait_for("Zen Agentic TUI - Commands", "/help works while degraded");
+}
