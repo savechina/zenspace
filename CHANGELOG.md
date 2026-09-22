@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stream-stall instrumentation + input-latency smoke (T082)** (2026-09-22):
+  NFR-008/009 measurement only (thresholds stay advisory). Inter-token
+  gaps >200 ms during a streaming turn append one `tui.stream.stall`
+  audit line per episode (on next-delta or turn end, never per tick),
+  surfaced as an additive `orchestration.stream_stalls` section in
+  `zen discover report` (episodes / max / median / per-100-turns). New
+  `#[ignore]` PTY smoke `input_latency_smoke` measures keystroke→echo
+  wall ms (7 ms observed) under a loose 2000 ms sanity bound.
+
 - **Agentic TUI — Codex-style inline stream mode** (spec `002-agentic-tui`,
   FR-001..FR-016; the 2026-08-16 implementation of the agent response
   display): `zen` with no subcommand now runs a bottom-anchored inline
