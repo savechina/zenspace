@@ -1,7 +1,10 @@
 use clap::Subcommand;
 use colored::Colorize;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// macOS-only usage (launchd helpers below) — un-gating breaks Linux CI under -D warnings.
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
