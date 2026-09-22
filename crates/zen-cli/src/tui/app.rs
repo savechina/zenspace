@@ -387,6 +387,9 @@ pub struct App {
     /// FR-025: channel for delivering gateway resume events to the TUI main thread.
     pub resume_event_tx: Option<std::sync::mpsc::SyncSender<super::resume::ResumeMessage>>,
     pub resume_event_rx: Option<std::sync::mpsc::Receiver<super::resume::ResumeMessage>>,
+    /// T082 (NFR-009): 1-based sequence of streaming turns in this TUI
+    /// process; identifies `tui.stream.stall` audit lines (`turn_id`).
+    pub(crate) stream_turn_seq: u64,
 }
 
 impl App {
@@ -466,6 +469,7 @@ impl App {
             history_search: HistorySearch::new(),
             loop_panel: crate::tui::loop_panel::LoopPanelState::default(),
             last_nudge_poll: None,
+            stream_turn_seq: 0,
             gateway_banner: super::banner::GatewayBannerState::default(),
             approval: super::approval::ApprovalState::default(),
             approval_tx: None,

@@ -33,6 +33,8 @@ pub struct StreamCollector {
     // BUG-1: Guard to ensure the thinking summary is committed exactly once.
     // Without this, each drain after think-close would re-push the ✓ line.
     thinking_summary_committed: bool,
+    // T082 (NFR-009): inter-token stall tracker for the current turn.
+    stall: super::stall::StallTracker,
 }
 
 /// Maximum reasoning lines kept in the pending tail viewport (header + N lines).
@@ -56,10 +58,14 @@ impl StreamCollector {
             reasoning_started_at: None,
             last_rendered_think_secs: None,
             thinking_summary_committed: false,
+            stall: super::stall::StallTracker::default(),
         }
     }
 
     pub fn push_delta(&mut self, delta: &str) {
+        // T082 (NFR-009): timestamp the delta arrival before any parsing —
+        // the inter-token gap is measured at the point text enters the TUI.
+        self.stall.note_delta();
         let (text, tool_events) = split_tool_intermediates(delta);
         if !tool_events.is_empty() {
             self.tool_blocks.extend(tool_events);
@@ -431,6 +437,20 @@ impl StreamCollector {
         self.last_rendered_think_secs = None;
         // BUG-1: reset the once-guard so next turn can commit its summary.
         self.thinking_summary_committed = false;
+        // T082: fresh stall tracking for the next turn.
+        self.stall.reset();
+    }
+
+    /// T082 (NFR-009): inter-token stall gaps measured so far this turn and
+    /// awaiting their `tui.stream.stall` audit line.
+    pub fn take_stall_gaps(&mut self) -> Vec<u64> {
+        self.stall.take_pending_gaps()
+    }
+
+    /// T082 (NFR-009): the turn ended — a trailing gap since the last delta
+    /// still counts as one final stall episode (measured once).
+    pub fn stall_turn_end(&mut self) {
+        self.stall.flush_turn_end_at(std::time::Instant::now());
     }
 
     pub fn is_empty(&self) -> bool {

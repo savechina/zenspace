@@ -30,6 +30,7 @@ impl App {
                 query: query.to_string(),
             }));
         self.is_streaming = true;
+        self.stream_turn_seq += 1;
         if self.pending_calls.len() == 1 {
             self.stream_collector.clear();
         }
@@ -368,8 +369,15 @@ impl App {
                     self.status_hint = None; // T056: model started speaking
                 }
                 self.current_response_tokens = self.stream_collector.buffer().len() / 4;
+                // T082 (NFR-009): stalls closed by a later delta emit once,
+                // here — never per tick.
+                self.emit_stream_stall_audits();
 
                 if let Some(done_result) = result.done_result {
+                    // T082: a trailing stall at turn end is the final episode
+                    // (flush BEFORE the collector resets on the completion path).
+                    self.stream_collector.stall_turn_end();
+                    self.emit_stream_stall_audits();
                     match done_result {
                         (Ok(response), returned_session) => {
                             if let Some(s) = returned_session {
@@ -543,6 +551,25 @@ impl App {
                     break;
                 }
             }
+        }
+    }
+
+    /// T082 (NFR-009): write pending `tui.stream.stall` audit lines — one
+    /// per stall episode, fire-and-forget. `turn_id` is this TUI process's
+    /// 1-based streaming-turn sequence; `session_id` is the TUI session uuid.
+    fn emit_stream_stall_audits(&mut self) {
+        let gaps = self.stream_collector.take_stall_gaps();
+        if gaps.is_empty() {
+            return;
+        }
+        let session_id = self
+            .session
+            .as_ref()
+            .map(|s| s.session_id.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let turn_id = format!("tui-{}", self.stream_turn_seq);
+        for gap in gaps {
+            super::stall::append_stall_audit(&session_id, &turn_id, gap);
         }
     }
 
