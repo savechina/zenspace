@@ -316,6 +316,21 @@ pub(crate) fn inline_tick<B: Backend>(
         }
     }
 
+    // T084(c): while streaming, repaint at the frame cadence even without new
+    // tokens so the footer `● working Ns` elapsed timer stays live. Shares the
+    // 33ms throttle above (no extra wakeups — the poll loop already ticks).
+    if app.is_streaming {
+        let tick_now = Instant::now();
+        if tick_now
+            .duration_since(state.last_streaming_render)
+            .as_millis()
+            >= STREAMING_RENDER_INTERVAL_MS
+        {
+            state.dirty = true;
+            state.last_streaming_render = tick_now;
+        }
+    }
+
     // W3: while reasoning is active, tick dirty at least once per second so
     // the `⏳ Thinking… (Ns)` elapsed timer repaints. The StreamCollector
     // renders the timer inside the tail lines — this just ensures the inline
@@ -349,13 +364,19 @@ pub(crate) fn inline_tick<B: Backend>(
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 match super::inline_handler::handle_key(key, app) {
                     InlineKeyAction::Submit => {
-                        let cmd = app.input.lines().join("\n");
+                        // T084(b): submit + history record the EXPANDED
+                        // text, never the pill.
+                        let cmd = app.expanded_input_text();
                         let cmd = cmd.trim().to_string();
                         if !cmd.is_empty() {
                             app.push_history(&cmd);
                         }
                         app.input.exit_mode();
                         app.input = App::create_input_textarea("");
+                        // T084(b/d): fresh query — drop pill mappings and
+                        // any dismissal with the old buffer.
+                        app.clear_paste_pills();
+                        app.dismissed_slash_token = None;
                         app.auto_scroll = true;
                         app.handle_command(&cmd);
                     }

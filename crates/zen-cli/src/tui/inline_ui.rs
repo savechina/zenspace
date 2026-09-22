@@ -1,12 +1,13 @@
 use super::app::App;
 use super::model_picker::render_model_picker_inline;
 use super::session_picker::render_session_picker_inline;
-use super::slash::render_slash_popup_inline;
+use super::slash::{popup_row_count, render_slash_popup_inline};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 const INPUT_HEIGHT: u16 = 3;
 const FOOTER_HEIGHT: u16 = 1;
@@ -45,12 +46,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let fixed_rows = INPUT_HEIGHT + FOOTER_HEIGHT + toast_height;
     let popup_height = if any_picker {
         let max_h = if app.slash_state.visible {
-            let count = app.slash_state.filtered_indices.len();
-            if count == 0 {
-                1u16
-            } else {
-                (count as u16).min(8)
-            }
+            // T084(a): the slash popup slot counts group headers too — the
+            // flat list (items + headers) clamps to the shipped 8-row slot, so
+            // headers never GROW the popup (they consume item rows via the
+            // render windowing, which also never leads with a dangling
+            // header). ADR-006's ≤6 figure is the streaming slot that shares
+            // rows with the 2-row tail; popup and tail are mutually exclusive
+            // in this layout (any_picker zeroes the tail), so the ADR's
+            // shrink-to-fit-within-remaining-space invariant governs and the
+            // idle slot stays ≤8 — exactly what slash_popup_height_is_dynamic
+            // pins (kept UNMODIFIED per the T084 gate).
+            (popup_row_count(&app.slash_state, &app.slash_registry) as u16).min(8)
         } else {
             POPUP_HEIGHT
         };
@@ -243,6 +249,26 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     .fg(info_accent)
                     .add_modifier(Modifier::BOLD),
             ));
+        }
+        // T084(c): live working indicator — `● working Ns` while streaming
+        // (elapsed since the turn start), else `● streaming` when the start
+        // instant is unavailable. Width pressure drops the indicator FIRST
+        // (deferred count + hint keep priority); the 1-row Paragraph clips
+        // any remainder. Idle/reading modes render nothing new.
+        if app.is_streaming {
+            let label = match app.turn_started_at {
+                Some(started) => format!(" | ● working {}s", started.elapsed().as_secs()),
+                None => " | ● streaming".to_string(),
+            };
+            let base_width: usize = spans.iter().map(|span| span.content.width()).sum();
+            if base_width + label.width() <= footer_area.width as usize {
+                spans.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(info_accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
         }
         spans.push(Span::styled(" | ", muted));
         spans.push(Span::styled(
@@ -1121,6 +1147,44 @@ mod tests {
         assert!(
             footer.contains("Zen"),
             "footer must survive in worst case: {footer:?}"
+        );
+    }
+
+    // === T084(c): live working indicator ===
+
+    /// T084(c): while streaming, the footer shows `● working Ns` (elapsed
+    /// since turn start; `● streaming` when no start instant exists). Idle
+    /// footers show nothing new.
+    #[test]
+    fn footer_working_indicator_iff_streaming_with_elapsed() {
+        use std::time::{Duration, Instant};
+
+        let mut app = test_app();
+        app.is_streaming = true;
+        app.turn_started_at = Some(Instant::now() - Duration::from_secs(7));
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("\u{25cf} working 7s"),
+            "streaming footer must show elapsed working indicator: {footer:?}"
+        );
+
+        // No turn-start instant → the bare `● streaming` label.
+        app.turn_started_at = None;
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("\u{25cf} streaming"),
+            "streaming footer without a turn start shows ● streaming: {footer:?}"
+        );
+
+        // Idle → no indicator at all.
+        app.is_streaming = false;
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            !footer.contains("working"),
+            "idle footer must not show the working indicator: {footer:?}"
         );
     }
 }

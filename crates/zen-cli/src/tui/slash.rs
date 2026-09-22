@@ -1,6 +1,7 @@
 use crate::tui::theme::OutputTheme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use std::collections::HashMap;
 
@@ -312,6 +313,114 @@ pub fn render_slash_popup_inline(
     render_slash_popup_inner(frame, state, popup_area, theme, registry, max_rows);
 }
 
+/// T084(a): slash-menu grouping. The registry stores no category field, so the
+/// group derives from the command name in registration order (General → Model
+/// → Knowledge → Session → System); unknown names fall into "Other".
+pub fn slash_group(name: &str) -> &'static str {
+    match name {
+        "help" | "exit" | "clear" | "thinking" | "tools" => "General",
+        "model" | "variant" => "Model",
+        "export" | "note" | "search" => "Knowledge",
+        "session" | "new" | "fork" | "rename" | "archive" => "Session",
+        "serve" | "config" | "distill" | "lint" => "System",
+        _ => "Other",
+    }
+}
+
+/// T084(d): dismissed-token memory (codex-rs `DismissedToken` mechanics at our
+/// scale: one Option on App, replaced on each Esc — occurrence-count fidelity
+/// is not required).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DismissedToken {
+    pub token: String,
+}
+
+/// T084(d): the current command token = input text from the leading `/` up to
+/// the first whitespace (`Some("")` for a bare `/`; None when the input does
+/// not start with `/`).
+pub fn slash_command_token(input: &str) -> Option<String> {
+    let stripped = input.trim_start().strip_prefix('/')?;
+    Some(stripped.split_whitespace().next().unwrap_or("").to_string())
+}
+
+/// T084(a): a popup row is either a group header or a command item. Headers
+/// scroll with the list (never sticky) and count toward the max-rows budget.
+enum PopupRow {
+    Header(&'static str),
+    Item { cmd_idx: usize, filtered_pos: usize },
+}
+
+/// T084(a): flat row list in filtered (registry) order, with a group header
+/// inserted on each group change — but only when the filtered list spans ≥2
+/// groups (a lone header is noise and would steal a row of ADR-006 budget).
+fn popup_rows(state: &SlashState, registry: &SlashCommandRegistry) -> Vec<PopupRow> {
+    let mut multi_group = false;
+    {
+        let mut seen: Option<&'static str> = None;
+        for &idx in &state.filtered_indices {
+            if let Some(cmd) = registry.all_commands().get(idx) {
+                let group = slash_group(&cmd.name);
+                match seen {
+                    None => seen = Some(group),
+                    Some(prev) if prev != group => {
+                        multi_group = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    let mut last_group = "";
+    for (pos, &idx) in state.filtered_indices.iter().enumerate() {
+        let Some(cmd) = registry.all_commands().get(idx) else {
+            continue;
+        };
+        let group = slash_group(&cmd.name);
+        if multi_group && group != last_group {
+            rows.push(PopupRow::Header(group));
+            last_group = group;
+        }
+        rows.push(PopupRow::Item {
+            cmd_idx: idx,
+            filtered_pos: pos,
+        });
+    }
+    rows
+}
+
+/// T084(a): flat popup row count (items + group headers) for the inline slot
+/// budget in `inline_ui.rs` — headers consume popup rows exactly like items
+/// (the list clamps to the slot; headers never scroll off independently).
+/// Minimum 1: the "no matches" empty-state row keeps its row.
+pub(crate) fn popup_row_count(state: &SlashState, registry: &SlashCommandRegistry) -> usize {
+    popup_rows(state, registry).len().max(1)
+}
+
+/// T084(a): `/name` (+ dim aliases) display field shared by width measurement
+/// and rendering so the description column aligns.
+fn slash_name_text(cmd: &SlashCommand, selected: bool) -> String {
+    // T084(f): the selected row carries the codex-rs `› ` glyph, replacing the
+    // previous 2-space inset (unselected rows keep the inset; `›` is U+203A,
+    // distinct from the U+25B8 glyph the old no-glyph test pins against).
+    let mut text = if selected {
+        format!("› /{}", cmd.name)
+    } else {
+        format!("  /{}", cmd.name)
+    };
+    if !cmd.aliases.is_empty() {
+        let alias_str = cmd
+            .aliases
+            .iter()
+            .map(|a| format!("/{a}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push_str(&format!(" ({alias_str})"));
+    }
+    text
+}
+
 fn render_slash_popup_inner(
     frame: &mut ratatui::Frame,
     state: &SlashState,
@@ -340,80 +449,130 @@ fn render_slash_popup_inner(
     }
 
     let total = state.filtered_indices.len();
-    let visible_count = total.min(max_rows);
-    let start = if state.selected >= max_rows {
-        state.selected - max_rows + 1
+    let rows = popup_rows(state, registry);
+    if rows.is_empty() {
+        return;
+    }
+    // Selection indexes filtered ITEMS, not rows: map to the row position so
+    // the sliding window keeps the selected item visible.
+    let sel_row = rows
+        .iter()
+        .position(
+            |row| matches!(row, PopupRow::Item { filtered_pos, .. } if *filtered_pos == state.selected),
+        )
+        .unwrap_or(0);
+    let mut start = if sel_row >= max_rows {
+        sel_row - max_rows + 1
     } else {
         0
     };
+    // T084(a): never lead the window with a group header — a header on the
+    // top row shows no command and would push an item out of the slot. The
+    // header re-enters the window once its group's first item is selected.
+    while start < rows.len() && matches!(rows[start], PopupRow::Header(_)) {
+        start += 1;
+    }
+    let end = (start + max_rows).min(rows.len());
+    let window = &rows[start..end];
     // UX5: scroll indicators
     let has_items_above = start > 0;
-    let has_items_below = start + visible_count < total;
+    let has_items_below = end < rows.len();
 
     let selected_style = Style::default()
         .fg(ratatui::style::Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let unselected_name_style = Style::default();
     let unselected_desc_style = theme.text_muted();
-    for (row, &cmd_idx) in state.filtered_indices[start..start + visible_count]
-        .iter()
-        .enumerate()
-    {
-        let cmd = &registry.all_commands()[cmd_idx];
-        let is_selected = row + start == state.selected;
+    let header_style = theme
+        .text_muted()
+        .add_modifier(Modifier::ITALIC)
+        .patch(row_bg);
 
+    // T084(a): aligned description column — measure the name field over the
+    // visible items, pad shorter names, truncate descriptions to fit.
+    let name_width = window
+        .iter()
+        .filter_map(|row| match row {
+            PopupRow::Item { cmd_idx, .. } => registry
+                .all_commands()
+                .get(*cmd_idx)
+                .map(|cmd| slash_name_text(cmd, true).width()),
+            PopupRow::Header(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let desc_avail = (popup_area.width as usize).saturating_sub(name_width + 2);
+
+    // T084(f): the match index rides the last ITEM row (footer-within-budget —
+    // ADR-006 forbids spending an extra row on it).
+    let last_item = window
+        .iter()
+        .rposition(|row| matches!(row, PopupRow::Item { .. }));
+    for (row, popup_row) in window.iter().enumerate() {
         let mut spans = Vec::new();
-        if is_selected {
-            // Codex: selected row — entire row Cyan + Bold
-            spans.push(Span::styled(
-                format!("  /{}", cmd.name),
-                selected_style.patch(row_bg),
-            ));
-            if !cmd.aliases.is_empty() {
-                let alias_str = cmd
-                    .aliases
-                    .iter()
-                    .map(|a| format!("/{}", a))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                spans.push(Span::styled(
-                    format!(" ({})", alias_str),
-                    selected_style.patch(row_bg),
-                ));
+        match popup_row {
+            PopupRow::Header(group) => {
+                spans.push(Span::styled(format!("  {group}"), header_style));
             }
-            spans.push(Span::styled(
-                format!("  {}", cmd.description),
-                selected_style.patch(row_bg),
-            ));
-        } else {
-            // Codex: unselected — name default, aliases+description dim
-            spans.push(Span::styled(
-                format!("  /{}", cmd.name),
-                unselected_name_style.patch(row_bg),
-            ));
-            if !cmd.aliases.is_empty() {
-                let alias_str = cmd
-                    .aliases
-                    .iter()
-                    .map(|a| format!("/{}", a))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                spans.push(Span::styled(
-                    format!(" ({})", alias_str),
-                    unselected_desc_style.patch(row_bg),
-                ));
+            PopupRow::Item {
+                cmd_idx,
+                filtered_pos,
+            } => {
+                let cmd = &registry.all_commands()[*cmd_idx];
+                let is_selected = *filtered_pos == state.selected;
+
+                let name_style = if is_selected {
+                    selected_style
+                } else {
+                    unselected_name_style
+                }
+                .patch(row_bg);
+                let alias_style = if is_selected {
+                    selected_style
+                } else {
+                    unselected_desc_style
+                }
+                .patch(row_bg);
+                let mut name_field = slash_name_text(cmd, is_selected);
+                // Split the alias suffix back off so unselected rows keep the
+                // old name-default / aliases-dim coloring.
+                let alias_at = name_field.find(" (").unwrap_or(name_field.len());
+                let alias_suffix = name_field.split_off(alias_at);
+                spans.push(Span::styled(name_field.clone(), name_style));
+                if !alias_suffix.is_empty() {
+                    spans.push(Span::styled(alias_suffix.clone(), alias_style));
+                }
+                let pad = name_width.saturating_sub(name_field.width() + alias_suffix.width());
+                if pad > 0 {
+                    spans.push(Span::styled(
+                        " ".repeat(pad),
+                        Style::default().patch(row_bg),
+                    ));
+                }
+                let desc: String = cmd.description.chars().take(desc_avail).collect();
+                let desc_style = if is_selected {
+                    selected_style
+                } else {
+                    unselected_desc_style
+                }
+                .patch(row_bg);
+                spans.push(Span::styled(format!("  {desc}"), desc_style));
+
+                // T084(f): match index on the last item row.
+                if Some(row) == last_item {
+                    spans.push(Span::styled(
+                        format!("  {}/{}", state.selected + 1, total),
+                        unselected_desc_style.patch(row_bg),
+                    ));
+                }
             }
-            spans.push(Span::styled(
-                format!("  {}", cmd.description),
-                unselected_desc_style.patch(row_bg),
-            ));
         }
 
         // UX5: append scroll indicator to first/last rendered row
         if row == 0 && has_items_above {
             spans.push(Span::styled("  ▲", unselected_desc_style.patch(row_bg)));
         }
-        let is_last_rendered = row + 1 == visible_count;
+        let is_last_rendered = row + 1 == window.len();
         if is_last_rendered && has_items_below {
             spans.push(Span::styled("  ▼", unselected_desc_style.patch(row_bg)));
         }
@@ -741,5 +900,145 @@ mod tests {
             !state.visible,
             "popup must hide when text precedes the slash"
         );
+    }
+
+    // === T084(a): grouping + description column ===
+
+    #[test]
+    fn t084_slash_groups_follow_registry_order_with_descriptions() {
+        let registry = create_default_registry();
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        let rows = popup_rows(&state, &registry);
+        let groups: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                PopupRow::Header(group) => Some(*group),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            vec!["General", "Model", "Knowledge", "Session", "System"],
+            "headers must follow registry first-appearance order"
+        );
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                PopupRow::Item { cmd_idx, .. } => registry
+                    .all_commands()
+                    .get(*cmd_idx)
+                    .map(|c| c.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<&str> = registry
+            .all_commands()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, expected, "items must keep registry order");
+    }
+
+    #[test]
+    fn t084_single_group_omits_header_row() {
+        let mut registry = SlashCommandRegistry::new();
+        for i in 0..12 {
+            registry.register(format!("cmd{i}"), vec![], format!("Command {i}"));
+        }
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        let rows = popup_rows(&state, &registry);
+        assert_eq!(rows.len(), 12, "no header rows for a single group");
+        assert!(
+            rows.iter().all(|row| matches!(row, PopupRow::Item { .. })),
+            "every row must be an item"
+        );
+    }
+
+    // === T084(f): `›` glyph + match index ===
+
+    #[test]
+    fn t084_selected_row_has_glyph_prefix_and_match_index() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let registry = create_default_registry();
+        let total = registry.all_commands().len();
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+
+        // Wide viewport (100 cols): the last window item row is already
+        // full-width at 60 cols, which would clip the match index — the
+        // index asserts need a viewport where the description column fits.
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 100, 8);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+        let help_row = (0..8)
+            .map(row_text)
+            .find(|row| row.contains("/help"))
+            .expect("help row must render");
+        assert!(
+            help_row.starts_with('\u{203a}'),
+            "selected row must carry the › glyph: {help_row:?}"
+        );
+        assert!(
+            help_row.contains("Show available commands"),
+            "description column must render: {help_row:?}"
+        );
+        let index = format!("1/{total}");
+        assert!(
+            (0..8).map(row_text).any(|row| row.contains(&index)),
+            "match index 1/{total} must render on the last item row"
+        );
+    }
+
+    // === T084(d): command-token extraction ===
+
+    #[test]
+    fn t084_slash_command_token_extraction() {
+        assert_eq!(slash_command_token("/exit"), Some("exit".to_string()));
+        assert_eq!(slash_command_token("/"), Some(String::new()));
+        assert_eq!(slash_command_token("/ex args here"), Some("ex".to_string()));
+        assert_eq!(slash_command_token("  /model x"), Some("model".to_string()));
+        assert_eq!(slash_command_token("hello"), None);
+        assert_eq!(slash_command_token(""), None);
+    }
+
+    // === T084(a): slot budget counts headers ===
+
+    #[test]
+    fn t084_popup_row_count_includes_headers_and_floors_at_one() {
+        // Registry order: Model → General(help) → System(serve): 3 items,
+        // 3 groups → 3 header rows (every group change opens one).
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("model".to_string(), vec![], "Model".to_string());
+        registry.register("help".to_string(), vec![], "Help".to_string());
+        registry.register("serve".to_string(), vec![], "Serve".to_string());
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        assert_eq!(
+            popup_row_count(&state, &registry),
+            6,
+            "headers must count toward the popup slot budget"
+        );
+        // No matches: the empty-state row still needs one row.
+        state.on_input_change("/zz", &registry);
+        assert_eq!(popup_row_count(&state, &registry), 1);
     }
 }

@@ -21,7 +21,7 @@ struct OutputCache {
 
 use std::sync::mpsc;
 use std::time::Instant;
-use tui_textarea::TextArea;
+use tui_textarea::{Input, Key, TextArea};
 use zen_core::types::SessionContext;
 
 use super::cell::{BannerCell, ErrorCell, OutputCell, PlainCell};
@@ -29,7 +29,7 @@ use super::history_search::HistorySearch;
 use super::model_picker::ModelPickerState;
 use super::selection::Selection;
 use super::session_picker::SessionPickerState;
-use super::slash::{SlashCommandRegistry, SlashState, create_default_registry};
+use super::slash::{DismissedToken, SlashCommandRegistry, SlashState, create_default_registry};
 use super::stream::StreamCollector;
 use super::theme::{
     OutputTheme, ZenTheme, auto_select as theme_auto_select, from_name as theme_from_name,
@@ -85,6 +85,32 @@ fn main() { println!("echo"); }
 pub(crate) const MAX_QUEUE_SIZE: usize = 10;
 const TOAST_DURATION_SECS: u64 = 3;
 const PASTE_MODE_SECS: u64 = 2;
+
+/// T084(b): large-paste collapse thresholds (FR-020 backlog). A bracketed paste
+/// with MORE than this many lines OR chars collapses to a `[Pasted N lines /
+/// M chars]` pill; smaller pastes insert verbatim.
+pub(crate) const PASTE_COLLAPSE_LINES: usize = 3;
+pub(crate) const PASTE_COLLAPSE_CHARS: usize = 200;
+
+/// T084(b): a collapsed large paste. DESIGN (fallback per the task text): the
+/// input buffer stores the human-readable pill text verbatim and this side map
+/// holds the full text; `expanded_input_text` restores it at submit. Chosen
+/// because tui_textarea owns its render path — true render-substitution would
+/// mean replacing the textarea widget with a custom paragraph + manual cursor,
+/// churning the whole input pipeline; the literal-token design leaves insert /
+/// cut / history / search byte-identical, with atomicity enforced at the key
+/// layer (Backspace/Delete/Left/Right interception) and expansion at submit.
+/// Pairing is positional (nth buffer occurrence ↔ nth vec entry, kept ordered
+/// at insert); wholesale input replacements must call `clear_paste_pills`
+/// (submit, history recall), and tokens absent from the buffer are ignored at
+/// expand. KNOWN LIMIT: cutting a pill across lines and re-pasting it elsewhere
+/// can mis-pair duplicate pills — same class as the codex-rs occurrence
+/// heuristic, accepted at our scale.
+#[derive(Debug, Clone)]
+pub struct PastePill {
+    pub display: String,
+    pub full_text: String,
+}
 const INPUT_HINT: &str = "Input (Enter=send, Shift+Enter=newline, Ctrl+R=search, Ctrl+D=exit)";
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -335,6 +361,11 @@ pub struct App {
     pub(crate) conversation_store: Option<ConversationStore>,
     pub(crate) history_store: Option<HistoryStore>,
     pub turn_started_at: Option<Instant>,
+    /// T084(b): full text behind each collapsed-paste pill in the input.
+    pub paste_pills: Vec<PastePill>,
+    /// T084(d): Esc-dismissed slash token (codex-rs `DismissedToken`
+    /// mechanics); while the input token equals this, the popup stays shut.
+    pub dismissed_slash_token: Option<DismissedToken>,
     pub tool_call_count: u32,
     pub current_response_tokens: usize,
     /// Whether the welcome splash banner is still showing. Set to `false` once
@@ -453,6 +484,8 @@ impl App {
                 }
             },
             turn_started_at: None,
+            paste_pills: Vec::new(),
+            dismissed_slash_token: None,
             tool_call_count: 0,
             current_response_tokens: 0,
             show_splash: true,
@@ -961,18 +994,223 @@ impl App {
         }
     }
 
+    // === T084(b): paste-collapse pills ===
+
+    /// T084(b): display text for a collapsed paste — the `[Pasted N lines /
+    /// M chars]` copy comes verbatim from the task text.
+    pub fn paste_pill_display(lines: usize, chars: usize) -> String {
+        format!("[Pasted {lines} lines / {chars} chars]")
+    }
+
+    /// T084(b): collapse hook for bracketed pastes. Pastes over threshold
+    /// collapse to a pill (full text recorded in `paste_pills`); smaller
+    /// pastes insert verbatim. Returns the text the caller inserts at cursor.
+    pub fn collapse_paste_for_insert(&mut self, pasted: &str) -> String {
+        let lines = pasted.lines().count();
+        let chars = pasted.chars().count();
+        if lines <= PASTE_COLLAPSE_LINES && chars <= PASTE_COLLAPSE_CHARS {
+            return pasted.to_string();
+        }
+        let display = Self::paste_pill_display(lines, chars);
+        let pill = PastePill {
+            display: display.clone(),
+            full_text: pasted.to_string(),
+        };
+        // Keep vec order == buffer occurrence order (positional pairing at
+        // expand/delete): count existing pill spans at or before the cursor.
+        let (crow, ccol) = self.input.cursor();
+        let idx = self
+            .paste_pill_spans()
+            .iter()
+            .filter(|span| span.0 < crow || (span.0 == crow && span.2 <= ccol))
+            .count()
+            .min(self.paste_pills.len());
+        self.paste_pills.insert(idx, pill);
+        display
+    }
+
+    /// T084(b): current input with every pill occurrence expanded back to its
+    /// full text (positional pairing; stale pills whose token no longer occurs
+    /// are skipped). Submit + history paths MUST use this, never the raw
+    /// buffer — history.jsonl records the EXPANDED text.
+    pub fn expanded_input_text(&self) -> String {
+        if self.paste_pills.is_empty() {
+            return self.input.lines().join("\n");
+        }
+        let mut text = self.input.lines().join("\n");
+        for pill in &self.paste_pills {
+            if let Some(pos) = text.find(pill.display.as_str()) {
+                text.replace_range(pos..pos + pill.display.len(), &pill.full_text);
+            }
+        }
+        text
+    }
+
+    /// T084(b): drop all pill mappings (wholesale input replacement sites:
+    /// submit reset, history recall).
+    pub fn clear_paste_pills(&mut self) {
+        self.paste_pills.clear();
+    }
+
+    /// T084(b): pill token spans as (line, char_start, char_end) in buffer
+    /// order. Cursor units are chars on both sides (tui-textarea clamps Jump
+    /// by `chars().count()`), so ASCII pill tokens align exactly.
+    pub(crate) fn paste_pill_spans(&self) -> Vec<(usize, usize, usize)> {
+        let mut spans = Vec::new();
+        for (li, line) in self.input.lines().iter().enumerate() {
+            let mut occupied: Vec<(usize, usize)> = Vec::new();
+            for pill in &self.paste_pills {
+                let token = pill.display.as_str();
+                if token.is_empty() {
+                    continue;
+                }
+                let mut from = 0;
+                while let Some(rel) = line[from..].find(token) {
+                    let byte_start = from + rel;
+                    let char_start = line[..byte_start].chars().count();
+                    let char_end = char_start + token.chars().count();
+                    if !occupied
+                        .iter()
+                        .any(|(a, b)| char_start < *b && *a < char_end)
+                    {
+                        occupied.push((char_start, char_end));
+                        spans.push((li, char_start, char_end));
+                    }
+                    from = byte_start + token.len().max(1);
+                }
+            }
+        }
+        spans.sort();
+        spans
+    }
+
+    /// T084(b): Backspace with the cursor at a pill's right edge deletes the
+    /// whole pill (positional pairing: the k-th occurrence drops the k-th
+    /// pill). Returns true when it consumed the key.
+    pub fn paste_backspace(&mut self) -> bool {
+        let (row, col) = self.input.cursor();
+        let spans = self.paste_pill_spans();
+        let found = spans
+            .iter()
+            .enumerate()
+            .find(|(_, span)| span.0 == row && span.2 == col);
+        let Some((k, _)) = found else {
+            return false;
+        };
+        let (_, cs, ce) = spans[k];
+        // Reuse the exact per-char Backspace path (ASCII token: one key per
+        // char) so deletion semantics match normal editing; the cursor lands
+        // at the pill's start.
+        for _ in cs..ce {
+            self.input.input(Input {
+                key: Key::Backspace,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+        }
+        if k < self.paste_pills.len() {
+            self.paste_pills.remove(k);
+        }
+        true
+    }
+
+    /// T084(b): Delete with the cursor at a pill's left edge deletes the whole
+    /// pill. Returns true when it consumed the key.
+    pub fn paste_delete_forward(&mut self) -> bool {
+        let (row, col) = self.input.cursor();
+        let spans = self.paste_pill_spans();
+        let found = spans
+            .iter()
+            .enumerate()
+            .find(|(_, span)| span.0 == row && span.1 == col);
+        let Some((k, _)) = found else {
+            return false;
+        };
+        let (_, cs, ce) = spans[k];
+        for _ in cs..ce {
+            self.input.input(Input {
+                key: Key::Delete,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+        }
+        if k < self.paste_pills.len() {
+            self.paste_pills.remove(k);
+        }
+        true
+    }
+
+    /// T084(b): Left/Right skip over a pill as one unit — when the move would
+    /// start at (Right) or end inside (Left) a pill span, jump across it.
+    /// Returns the Jump target, or None for a normal single-char move.
+    pub fn pill_jump_for_horizontal(&self, left: bool) -> Option<(u16, u16)> {
+        let (row, col) = self.input.cursor();
+        for (li, cs, ce) in self.paste_pill_spans() {
+            if li != row {
+                continue;
+            }
+            if left {
+                if col > cs && col <= ce {
+                    return Some((row as u16, cs as u16));
+                }
+            } else if col >= cs && col < ce {
+                return Some((row as u16, ce as u16));
+            }
+        }
+        None
+    }
+
+    // === T084(d): dismissed-token memory ===
+
+    /// T084(d): recompute slash visibility, then enforce dismissed-token
+    /// memory: while the input's current command token EQUALS the dismissed
+    /// token the popup stays suppressed (pure token equality — never cleared
+    /// on edit, so deleting back to the dismissed token keeps it closed, the
+    /// codex-rs mechanic). Any differing token (or none) re-arms normally.
+    /// Fresh-query sites (submit reset, history recall) clear the dismissal.
+    pub fn refresh_slash_popup(&mut self) {
+        let input = self.input.lines().join("\n");
+        self.slash_state
+            .on_input_change(&input, &self.slash_registry);
+        if self.slash_state.visible
+            && let Some(token) = super::slash::slash_command_token(&input)
+            && let Some(dismissed) = &self.dismissed_slash_token
+            && dismissed.token == token
+        {
+            self.slash_state.visible = false;
+        }
+    }
+
+    /// T084(d): Esc with the popup visible records the current command token
+    /// (replacing any previous dismissal) and hides the popup. Esc elsewhere
+    /// is untouched — callers keep gating on `slash_state.visible` as before.
+    pub fn dismiss_slash_popup(&mut self) {
+        if self.slash_state.visible
+            && let Some(token) = super::slash::slash_command_token(&self.input.lines().join("\n"))
+        {
+            self.dismissed_slash_token = Some(DismissedToken { token });
+        }
+        self.slash_state.dismiss();
+    }
+
     pub fn history_up(&mut self) {
         if self.command_history.is_empty() {
             return;
         }
         // W1: snapshot the user's unsent draft on first Up into history.
         if self.history_position.is_none() {
-            let draft = self.input.lines().join(
-                "
-",
-            );
+            // T084(b): stash the EXPANDED text so a pill-bearing draft
+            // restores its full content (pills are cleared below with the
+            // wholesale input replacement).
+            let draft = self.expanded_input_text();
             self.history_draft = Some(draft);
         }
+        // T084(b/d): history recall replaces the whole buffer — a fresh query
+        // surface, so pill mappings and any dismissal go with the old buffer.
+        self.clear_paste_pills();
+        self.dismissed_slash_token = None;
         let new_pos = match self.history_position {
             None => self.command_history.len() - 1,
             Some(0) => 0,
@@ -994,12 +1232,18 @@ impl App {
                 // W1: restore the user's draft instead of clearing.
                 let draft = self.history_draft.take().unwrap_or_default();
                 self.history_position = None;
+                // T084(b/d): wholesale replacement — see history_up.
+                self.clear_paste_pills();
+                self.dismissed_slash_token = None;
                 // BUG-2+L3: Use new_at_end to position cursor at end of restored draft.
                 self.input = Self::create_input_textarea_at_end(draft);
                 self.input.exit_mode();
             }
             Some(p) => {
                 self.history_position = Some(p + 1);
+                // T084(b/d): wholesale replacement — see history_up.
+                self.clear_paste_pills();
+                self.dismissed_slash_token = None;
                 self.input.enter_history_mode();
                 if let Some(entry) = self.command_history.get(p + 1) {
                     // BUG-2+L3: Use new_at_end to position cursor at end of recalled text.
@@ -1094,13 +1338,19 @@ pub fn run_app(
                 {
                     match crate::tui::handler::handle_key(key, &mut app) {
                         crate::tui::handler::KeyAction::Submit => {
-                            let cmd = app.input.lines().join("\n");
+                            // T084(b): submit + history record the EXPANDED
+                            // text, never the pill.
+                            let cmd = app.expanded_input_text();
                             let cmd = cmd.trim().to_string();
                             if !cmd.is_empty() {
                                 app.push_history(&cmd);
                             }
                             app.input.exit_mode();
                             app.input = App::create_input_textarea("");
+                            // T084(b/d): fresh query — drop pill mappings and
+                            // any dismissal with the old buffer.
+                            app.clear_paste_pills();
+                            app.dismissed_slash_token = None;
                             app.auto_scroll = true;
                             app.handle_command(&cmd);
                         }
@@ -1141,4 +1391,211 @@ pub fn run_app(
     // appears on its own line.
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod t084_tests {
+    //! T084(b)/(d): paste-collapse pill + dismissed-token memory, unit-level
+    //! (App state machines only — no terminal).
+
+    use super::*;
+
+    fn test_app() -> App {
+        let config: &'static zen_core::config::ZenConfig = Box::leak(Box::default());
+        App::new(config)
+    }
+
+    fn big_paste() -> String {
+        (1..=5)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn type_char(app: &mut App, c: char) {
+        app.input.input(Input {
+            key: Key::Char(c),
+            ctrl: false,
+            alt: false,
+            shift: false,
+        });
+    }
+
+    fn backspace(app: &mut App) {
+        app.input.input(Input {
+            key: Key::Backspace,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        });
+    }
+
+    // === T084(b): paste-collapse pills ===
+
+    /// Insertion threshold (FR-020): ≤3 lines AND ≤200 chars insert verbatim;
+    /// more lines OR more chars collapse to the `[Pasted N lines / M chars]`
+    /// pill (copy verbatim from the task text).
+    #[test]
+    fn t084_pill_threshold_small_verbatim_large_collapses() {
+        let mut app = test_app();
+        // Under both thresholds → verbatim, no pill.
+        let small = "a\nb\nc";
+        assert_eq!(app.collapse_paste_for_insert(small), small);
+        assert!(app.paste_pills.is_empty());
+
+        // 5 lines (> 3) → pill.
+        let full = big_paste();
+        let insert = app.collapse_paste_for_insert(&full);
+        assert_eq!(
+            insert,
+            App::paste_pill_display(5, full.chars().count()),
+            "pill display must be `[Pasted N lines / M chars]`"
+        );
+        assert!(insert.starts_with("[Pasted 5 lines / "));
+        assert_eq!(app.paste_pills.len(), 1);
+
+        // Char threshold alone also collapses (1 line, > 200 chars).
+        let long_line = "x".repeat(PASTE_COLLAPSE_CHARS + 1);
+        let insert = app.collapse_paste_for_insert(&long_line);
+        assert_eq!(insert, "[Pasted 1 lines / 201 chars]");
+        assert_eq!(app.paste_pills.len(), 2);
+    }
+
+    /// Backspace at a pill's right edge deletes the WHOLE pill (restoring
+    /// nothing); away from a pill it falls through to normal editing.
+    #[test]
+    fn t084_pill_backspace_deletes_whole_pill() {
+        let mut app = test_app();
+        let insert = app.collapse_paste_for_insert(&big_paste());
+        app.input.insert_str(&insert);
+        assert_eq!(app.input.cursor(), (0, insert.chars().count()));
+
+        assert!(app.paste_backspace(), "backspace at pill edge is consumed");
+        assert_eq!(
+            app.input.lines().join(
+                "
+"
+            ),
+            "",
+            "whole pill removed"
+        );
+        assert!(
+            app.paste_pills.is_empty(),
+            "pill mapping drops with the pill"
+        );
+
+        // No pill involved → normal single-char backspace.
+        app.input.insert_str("ab");
+        assert!(!app.paste_backspace(), "plain backspace must fall through");
+        backspace(&mut app);
+        assert_eq!(
+            app.input.lines().join(
+                "
+"
+            ),
+            "a"
+        );
+    }
+
+    /// Submit expansion: `expanded_input_text` restores every pill to its
+    /// full text, and the history (submit path) records the EXPANDED text —
+    /// never the pill (task: "History.jsonl records the EXPANDED text").
+    #[test]
+    fn t084_pill_expands_at_submit_and_history_stores_expanded_text() {
+        let mut app = test_app();
+        let full = big_paste();
+        app.input.insert_str("before ");
+        let insert = app.collapse_paste_for_insert(&full);
+        app.input.insert_str(&insert);
+        app.input.insert_str(" after");
+
+        // Buffer renders the pill; expansion restores full text.
+        assert!(
+            app.input
+                .lines()
+                .join(
+                    "
+"
+                )
+                .contains("[Pasted 5 lines /")
+        );
+        let expanded = app.expanded_input_text();
+        assert_eq!(expanded, format!("before {full} after"));
+
+        app.push_history(&app.expanded_input_text());
+        assert_eq!(
+            app.command_history.last().map(String::as_str),
+            Some(expanded.as_str()),
+            "history must store the expanded text"
+        );
+    }
+
+    /// Left/Right skip over a pill as one atomic unit.
+    #[test]
+    fn t084_pill_horizontal_movement_skips_atomically() {
+        let mut app = test_app();
+        let insert = app.collapse_paste_for_insert(&big_paste());
+        app.input.insert_str(&insert);
+        let end = insert.chars().count();
+        // Left from the right edge jumps to the pill start.
+        assert_eq!(app.pill_jump_for_horizontal(true), Some((0, 0)));
+        app.input
+            .textarea_mut()
+            .move_cursor(tui_textarea::CursorMove::Jump(0, 0));
+        // Right from the left edge jumps past the pill end.
+        assert_eq!(app.pill_jump_for_horizontal(false), Some((0, end as u16)));
+    }
+
+    // === T084(d): dismissed-token memory ===
+
+    /// Full codex-rs lifecycle: Esc→suppressed at the same token; an edit
+    /// that changes the token re-arms; deleting back to EXACTLY the
+    /// dismissed token keeps it closed; a new Esc replaces the old token.
+    #[test]
+    fn t084_dismissed_token_lifecycle() {
+        let mut app = test_app();
+        app.input = App::create_input_textarea_at_end("/mo");
+        app.refresh_slash_popup();
+        assert!(app.slash_state.visible);
+
+        app.dismiss_slash_popup();
+        assert_eq!(
+            app.dismissed_slash_token.as_ref().map(|d| d.token.as_str()),
+            Some("mo")
+        );
+        assert!(!app.slash_state.visible);
+        app.refresh_slash_popup();
+        assert!(!app.slash_state.visible, "same token must stay suppressed");
+
+        // Edit changes the token → popup re-arms.
+        type_char(&mut app, 'd');
+        app.refresh_slash_popup();
+        assert!(app.slash_state.visible, "changed token re-arms the popup");
+
+        // Deleting back to EXACTLY the dismissed token keeps it closed.
+        backspace(&mut app);
+        app.refresh_slash_popup();
+        assert!(
+            !app.slash_state.visible,
+            "delete-back-to-dismissed-token stays closed (codex mechanic)"
+        );
+
+        // A new Esc REPLACES the old token: at /mod the dismissal becomes
+        // "mod", so deleting back to "mo" now re-arms (old "mo" is gone).
+        type_char(&mut app, 'd');
+        app.refresh_slash_popup();
+        assert!(app.slash_state.visible);
+        app.dismiss_slash_popup();
+        assert_eq!(
+            app.dismissed_slash_token.as_ref().map(|d| d.token.as_str()),
+            Some("mod"),
+            "new Esc must replace the previous dismissal"
+        );
+        backspace(&mut app);
+        app.refresh_slash_popup();
+        assert!(
+            app.slash_state.visible,
+            "old dismissal token must be gone after replacement"
+        );
+    }
 }

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Curated competitor UX polish (T084)** (2026-09-22): six Munger-capped
+  inline-TUI affordances — slash popup gains registry-order group headers
+  + a dimmed description column; large bracketed pastes (>3 lines /
+  >200 chars) collapse into an atomic `[Pasted N lines / M chars]` pill
+  (expanded at submit/history); footer shows `● working Ns` while
+  streaming; Esc-dismissed slash popup stays closed until the command
+  token changes (codex-rs DismissedToken mechanics); Ctrl+J inserts a
+  newline (tmux/SSH-safe LF fallback); selected popup row carries the
+  `›` glyph + selected/total index. Popup slot stays ≤8 rows
+  (shrink-to-fit per ADR-006); no fuzzy matcher, no Ctrl+C change.
+
 - **Stream-stall instrumentation + input-latency smoke (T082)** (2026-09-22):
   NFR-008/009 measurement only (thresholds stay advisory). Inter-token
   gaps >200 ms during a streaming turn append one `tui.stream.stall`
