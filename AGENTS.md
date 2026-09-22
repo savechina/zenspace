@@ -465,7 +465,7 @@ When adding new CLI commands:
 - **Tests/main.rs**: Unusual pattern -- only declares modules, no `#[test]` functions
 - **Stale files**: `crates/zen-cli/src/cmd/workspace.rs`, `session.rs`, `config.rs`, `agent.rs`, `audit.rs` (no extension) are stale/unused
 - **FTS5 table**: Virtual table named `notes_fts` (not `fts_notes`); search queries use `notes_fts`
-- **No CI**: No `.github/workflows` yet (release automation incomplete)
+- **GitHub Actions CI exists**: `.github/workflows/rust.yml` (test gate on `ubuntu-22.04`, cargo nextest), `release.yml`, `docs.yml`. Linux-only failures are invisible to a macOS-local `bin/lint` — verify Linux pre-push via OrbStack (see Development commands).
 
 ## COMMANDS (CLI)
 
@@ -475,6 +475,8 @@ When adding new CLI commands:
 cargo build              # Build all crates
 cargo test               # Run integration tests
 bin/lint                 # fmt --check + clippy -D warnings
+orb run bash -c 'cd "$PWD" && CARGO_TARGET_DIR="$HOME/zen-linux-target" bin/lint'  # Linux lint gate in OrbStack VM (CI parity; arm64; isolates target dir from macOS)
+orb run bash -c 'cd "$PWD" && CARGO_TARGET_DIR="$HOME/zen-linux-target" cargo test -p <crate> --lib <filter>'  # Run tests under real Linux git/glibc
 cargo fmt --all          # Format
 bin/load-harness         # SC-004 load test: 100-note batch, isolated ZEN_HOME (ignored by default)
 bin/zentest              # Any zen command against ~/.zentest instead of ~/.zen
