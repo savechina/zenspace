@@ -160,6 +160,17 @@ pub(crate) fn prepare_inline_app(config: &'static zen_core::config::ZenConfig) -
     }
     app.inline_mode = true;
     apply_inline_theme(&mut app, config, std::env::var("NO_COLOR").is_ok());
+
+    // FR-024 production wiring: populate approval channels from the prewarm bridge.
+    // The bridge was constructed by prewarm::spawn() or prewarm::resolve_client()
+    // when the gateway surface was opened. We consume it once here — the TUI
+    // tick loop drains request_rx; the key handler sends on response_tx.
+    if let Some(bridge) = super::prewarm::take_approval_bridge() {
+        app.approval_rx = Some(bridge.request_rx);
+        app.approval_tx = Some(bridge.response_tx);
+        tracing::debug!("approval bridge installed from prewarm");
+    }
+
     app.enqueue_welcome_banner();
     app.push_output(
         "Zen REPL — type a message or /help for commands, Ctrl+D to exit".into(),
@@ -250,6 +261,34 @@ pub(crate) fn inline_tick<B: Backend>(
     let prev_buffer_len = app.stream_collector.buffer().len();
 
     app.poll_llm_response();
+
+    // FR-024 production wiring: drain approval requests from the gateway pump
+    // into the TUI's FIFO. UnboundedReceiver::try_recv is non-blocking and
+    // works from this sync crossterm poll loop. Approval requests can arrive
+    // while the user is IDLE (not just during LLM polling), so this must run
+    // every tick, not inside poll_llm_response.
+    if let Some(ref mut rx) = app.approval_rx {
+        while let Ok(payload) = rx.try_recv() {
+            let request = super::approval::ApprovalRequest {
+                turn_id: payload.turn_id,
+                request_id: payload.request_id,
+                tool_name: payload.tool_name,
+                invocation: payload.invocation,
+                reason: payload.reason,
+                received_at: std::time::Instant::now(),
+            };
+            tracing::debug!(tool = %request.tool_name, request_id = %request.request_id, "approval request drained from pump");
+            app.approval.push(request);
+            state.dirty = true;
+        }
+    }
+
+    // FR-024: check if the current approval popup has timed out (client-side
+    // rendering timeout, shorter than the gateway's 120s watchdog). The popup
+    // closes visually; the gateway pump's own timeout handles the server deny.
+    if app.approval.check_timeout().is_some() {
+        state.dirty = true;
+    }
 
     let tokens_pushed = app.stream_collector.buffer().len() > prev_buffer_len;
     let response_just_completed = !app.is_streaming && prev_streaming;
@@ -1132,6 +1171,142 @@ mod tests {
         assert!(
             app.scrollback_queue.is_empty(),
             "scrollback queue must be drained after insert or deferral"
+        );
+    }
+
+    // =========================================================================
+    // FR-024: approval drain and conversion tests
+    // =========================================================================
+
+    /// FR-024: inline_tick drains approval requests from the channel into the
+    /// ApprovalState FIFO. Payload fields map 1:1 to ApprovalRequest fields.
+    #[test]
+    fn approval_drain_pushes_into_fifo_order() {
+        let mut app = prepare_inline_app(test_config());
+        app.scrollback_queue.clear();
+
+        // Create an unbounded channel pair to simulate the pump→TUI bridge.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.approval_rx = Some(rx);
+
+        // Send three approval requests through the channel.
+        for i in 0..3 {
+            tx.send(zen_gateway::client::surface::ApprovalRequestPayload {
+                request_id: format!("req-{i}"),
+                turn_id: format!("turn-{i}"),
+                tool_name: format!("tool-{i}"),
+                invocation: serde_json::json!({"index": i}),
+                reason: format!("reason-{i}"),
+            })
+            .unwrap();
+        }
+        drop(tx); // Close the sender so no more requests arrive.
+
+        let mut terminal = anchored_terminal(80, 24);
+        let mut state = InlineLoopState::new();
+
+        // Tick — should drain all three requests into the FIFO.
+        let exit = inline_tick(&mut app, &mut terminal, &mut state, None).expect("tick");
+        assert!(!exit);
+
+        // All three should be in the approval state.
+        assert_eq!(app.approval.pending_count(), 3, "must drain all 3 requests");
+        assert_eq!(
+            app.approval.current.as_ref().unwrap().tool_name,
+            "tool-0",
+            "first request becomes current"
+        );
+        assert_eq!(app.approval.queue[0].tool_name, "tool-1", "second in queue");
+        assert_eq!(app.approval.queue[1].tool_name, "tool-2", "third in queue");
+
+        // Verify payload→request field mapping.
+        let current = app.approval.current.as_ref().unwrap();
+        assert_eq!(current.request_id, "req-0");
+        assert_eq!(current.turn_id, "turn-0");
+        assert_eq!(current.reason, "reason-0");
+        assert_eq!(current.invocation, serde_json::json!({"index": 0}));
+    }
+
+    /// FR-024: payload→ApprovalRequest conversion preserves all fields correctly.
+    #[test]
+    fn approval_payload_conversion_preserves_fields() {
+        let mut app = prepare_inline_app(test_config());
+        app.scrollback_queue.clear();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.approval_rx = Some(rx);
+
+        tx.send(zen_gateway::client::surface::ApprovalRequestPayload {
+            request_id: "my-req-id".into(),
+            turn_id: "my-turn-id".into(),
+            tool_name: "shell.exec".into(),
+            invocation: serde_json::json!({"binary": "/bin/sh", "args": ["-c", "echo"]}),
+            reason: "dangerous command".into(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut terminal = anchored_terminal(80, 24);
+        let mut state = InlineLoopState::new();
+        inline_tick(&mut app, &mut terminal, &mut state, None).expect("tick");
+
+        let req = app.approval.current.as_ref().unwrap();
+        assert_eq!(req.request_id, "my-req-id");
+        assert_eq!(req.turn_id, "my-turn-id");
+        assert_eq!(req.tool_name, "shell.exec");
+        assert_eq!(
+            req.invocation,
+            serde_json::json!({"binary": "/bin/sh", "args": ["-c", "echo"]})
+        );
+        assert_eq!(req.reason, "dangerous command");
+        // received_at should be recent (within last second)
+        assert!(req.received_at.elapsed().as_secs() < 2);
+    }
+
+    /// FR-024: approval timeout check is called each tick and closes
+    /// the popup when a request times out. dirty is consumed by the render
+    /// at the end of inline_tick, so we verify the approval was closed
+    /// (which only happens via check_timeout returning Some, which sets
+    /// dirty before the render consumes it).
+    #[test]
+    fn approval_timeout_marks_dirty() {
+        let mut app = prepare_inline_app(test_config());
+        app.scrollback_queue.clear();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.approval_rx = Some(rx);
+
+        // Send a request.
+        tx.send(zen_gateway::client::surface::ApprovalRequestPayload {
+            request_id: "req-1".into(),
+            turn_id: "turn-1".into(),
+            tool_name: "shell.exec".into(),
+            invocation: serde_json::json!({}),
+            reason: "test".into(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut terminal = anchored_terminal(80, 24);
+        let mut state = InlineLoopState::new();
+        inline_tick(&mut app, &mut terminal, &mut state, None).expect("tick");
+
+        // Request should be current.
+        assert!(app.approval.is_pending());
+
+        // Artificially backdate received_at to force a timeout.
+        {
+            let current = app.approval.current.as_mut().unwrap();
+            current.received_at = Instant::now() - Duration::from_secs(200);
+        }
+
+        // Tick again — check_timeout should fire and close the popup.
+        // dirty is set to true by check_timeout, then consumed by the
+        // render at the end of inline_tick (state.dirty = false).
+        inline_tick(&mut app, &mut terminal, &mut state, None).expect("tick");
+        assert!(
+            !app.approval.is_pending(),
+            "timed-out approval must be closed"
         );
     }
 }

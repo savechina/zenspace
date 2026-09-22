@@ -373,10 +373,17 @@ pub struct App {
     /// FR-024: approval popup state. One-at-a-time FIFO, input paused while pending.
     pub approval: super::approval::ApprovalState,
     /// FR-024: channel for sending approval decisions back to the gateway pump.
-    pub approval_tx: Option<std::sync::mpsc::SyncSender<super::approval::ApprovalResponse>>,
+    /// Uses tokio unbounded sender (sync non-blocking send) — approvals are
+    /// low-rate (server-serialized) and the TUI key handler is sync.
+    pub approval_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<zen_gateway::client::surface::ApprovalResponsePayload>,
+    >,
     /// FR-024: channel for receiving approval requests from the gateway pump.
-    #[allow(dead_code)] // live-seam: approval channel wiring
-    pub approval_rx: Option<std::sync::mpsc::Receiver<super::approval::ApprovalRequest>>,
+    /// Uses tokio unbounded receiver — drained via try_recv in `inline_tick`
+    /// (sync crossterm poll loop). Populated from `prewarm::take_approval_bridge()`.
+    pub approval_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<zen_gateway::client::surface::ApprovalRequestPayload>,
+    >,
     /// FR-025: channel for delivering gateway resume events to the TUI main thread.
     pub resume_event_tx: Option<std::sync::mpsc::SyncSender<super::resume::ResumeMessage>>,
     pub resume_event_rx: Option<std::sync::mpsc::Receiver<super::resume::ResumeMessage>>,

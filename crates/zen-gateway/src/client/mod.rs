@@ -47,7 +47,10 @@ use crate::transport::uds::UdsTransport;
 /// (tasks T022–T025).
 pub mod surface;
 
-pub use surface::{GatewayLinkState, SurfaceClient, SurfaceError, TURN_TIMEOUT};
+pub use surface::{
+    ApprovalBridgeEnds, ApprovalRequestPayload, ApprovalResponsePayload, ApprovalSink,
+    GatewayLinkState, SurfaceClient, SurfaceError, TURN_TIMEOUT,
+};
 
 /// Readiness window after spawning a daemon (codex app-server-daemon
 /// uses the same 10s budget: migrations and store open can legitimately

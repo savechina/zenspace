@@ -280,12 +280,12 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                     .approval
                     .resolve_current(crate::tui::approval::ApprovalDecision::Approve)
                 {
-                    // Send approval response via channel if available
+                    // FR-024 production wiring: send approval decision via the gateway
+                    // bridge channel. UnboundedSender::send is sync non-blocking.
                     if let Some(tx) = &app.approval_tx {
-                        let _ = tx.try_send(crate::tui::approval::ApprovalResponse {
+                        let _ = tx.send(zen_gateway::client::surface::ApprovalResponsePayload {
                             request_id: request.request_id,
-                            turn_id: request.turn_id,
-                            decision: crate::tui::approval::ApprovalDecision::Approve,
+                            decision: "approve".to_string(),
                         });
                     }
                     app.show_toast(format!("Approved: {}", request.tool_name));
@@ -297,11 +297,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                     .approval
                     .resolve_current(crate::tui::approval::ApprovalDecision::Deny)
                 {
+                    // FR-024 production wiring: send deny decision via gateway bridge.
                     if let Some(tx) = &app.approval_tx {
-                        let _ = tx.try_send(crate::tui::approval::ApprovalResponse {
+                        let _ = tx.send(zen_gateway::client::surface::ApprovalResponsePayload {
                             request_id: request.request_id,
-                            turn_id: request.turn_id,
-                            decision: crate::tui::approval::ApprovalDecision::Deny,
+                            decision: "deny".to_string(),
                         });
                     }
                     app.show_toast(format!("Denied: {}", request.tool_name));
