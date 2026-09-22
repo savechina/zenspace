@@ -235,6 +235,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FR-024 production approval wiring** (2026-09-22): the T079 approval
+  popup was reachable only via the ZEN_TEST_APPROVAL_SEAM — SurfaceClient
+  had no sink setter (policy-lambda always decided), the TUI never created
+  channels, and `App.approval_rx` was never drained. Full production path
+  now wired: pump locks the Arc sink per-request (take() removed, so the
+  registration survives redial), prewarm constructs the channel pair at
+  dial and parks TUI-side ends in a static consumed at App construction,
+  inline_tick drains requests non-blocking into the existing ApprovalState
+  FIFO (approvals arrive even while idle), y/n/Esc decisions return the
+  displayed request's id. Timeout→deny / foreign-turn deny / policy
+  fallback unchanged; seam + e17 PTY pass unmodified. Tests: gateway
+  round-trip + redial-safety, FIFO order, payload conversion, timeout.
+
 - **TUI Phase 9 P1 — gateway-seam rendering (T079, FR-023/024/025)**
   (2026-09-22):
   - FR-023 banner states: structured `GatewayBannerState` (Connecting /

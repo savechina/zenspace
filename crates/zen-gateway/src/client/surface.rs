@@ -156,16 +156,56 @@ pub struct SurfaceClient {
     /// are routed to this channel instead of the policy-lambda. The TUI
     /// sends decisions back via the response channel. The pump awaits
     /// the decision (with a timeout) before responding to the server.
-    approval_sink: std::sync::Mutex<Option<ApprovalSink>>,
+    /// FR-024: Arc-wrapped so the pump can clone it across redials without losing the sink.
+    /// Read per-request via `Arc::clone` + lock (approvals are server-serialized).
+    approval_sink: std::sync::Arc<std::sync::Mutex<Option<ApprovalSink>>>,
 }
 
 /// FR-024: Interactive approval sink for routing Q3 requests to the TUI.
 /// The pump sends the request, the TUI sends back a decision.
-struct ApprovalSink {
-    /// Channel to send approval requests to the TUI.
-    request_tx: tokio::sync::mpsc::Sender<ApprovalRequestPayload>,
-    /// Channel to receive decisions back from the TUI.
-    response_rx: tokio::sync::mpsc::Receiver<ApprovalResponsePayload>,
+///
+/// PURPOSE: Routes Q3 approval requests from the gateway notification pump to
+///   the TUI's interactive popup, and carries decisions back. The pump clones
+///   the `request_tx` and `Arc`-wraps the `response_rx` so the sink survives
+///   redials (the pump is aborted and re-spawned on reconnect; a `take()`-based
+///   sink would be lost).
+///
+/// USAGE: Constructed via [`SurfaceClient::approval_channel()`]. Installed on
+///   the [`SurfaceClient`] via [`SurfaceClient::set_approval_sink()`].
+///
+/// EXPECTED: One sink per TUI session; the pump reads it per-request via
+///   `Arc::clone`; unbounded channels (low-rate, server-serialized approvals).
+///
+/// ERRORS: send/recv failures deny the approval (fail-safe).
+#[derive(Clone)]
+pub struct ApprovalSink {
+    /// Channel to send approval requests to the TUI (unbounded: low-rate).
+    pub request_tx: tokio::sync::mpsc::UnboundedSender<ApprovalRequestPayload>,
+    /// Channel to receive decisions back from the TUI (unbounded).
+    /// Wrapped in Arc<Mutex<>> because tokio mpsc Receiver is not Clone;
+    /// the pump locks per-request (approvals are serialized by the server).
+    pub response_rx: std::sync::Arc<
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalResponsePayload>>,
+    >,
+}
+
+/// TUI-side ends of the approval channel pair (FR-024 production wiring).
+///
+/// PURPOSE: The receiving end of approval requests from the pump, and the
+///   sending end for decisions back. Created by [`SurfaceClient::approval_channel()`]
+///   and consumed once at TUI [`App`] construction.
+///
+/// USAGE: Stored in a module static by `prewarm`, taken once by the App.
+///
+/// EXPECTED: Exactly one consumer (the TUI tick loop) drains `request_rx`;
+///   the `response_tx` is used by the key handler to send decisions.
+///
+/// ERRORS: None — pure data type.
+pub struct ApprovalBridgeEnds {
+    /// Receive approval requests from the pump (try_recv in sync tick loop).
+    pub request_rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalRequestPayload>,
+    /// Send approval decisions back to the pump (sync non-blocking send).
+    pub response_tx: tokio::sync::mpsc::UnboundedSender<ApprovalResponsePayload>,
 }
 
 /// Approval request payload sent to the TUI.
@@ -221,7 +261,7 @@ impl SurfaceClient {
             inner: tokio::sync::Mutex::new(None),
             link: std::sync::RwLock::new(GatewayLinkState::Connecting),
             approval_policy: std::sync::RwLock::new(None),
-            approval_sink: std::sync::Mutex::new(None),
+            approval_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
             active_turns: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
@@ -236,6 +276,38 @@ impl SurfaceClient {
     /// pump. Without one, every approval is denied (fail-safe).
     pub fn set_approval_policy(&self, policy: ApprovalPolicy) {
         *self.approval_policy.write().expect("policy lock") = Some(policy);
+    }
+
+    /// FR-024 production wiring: install the interactive approval sink on this
+    /// surface. The notification pump reads the sink per-request via `Arc::clone`,
+    /// so setting it *after* open/dial returns is race-free for requests arriving
+    /// later (the pump loop has not yet reached the approval branch when the
+    /// first request can arrive — the handshake must complete first).
+    pub fn set_approval_sink(&self, sink: ApprovalSink) {
+        *self.approval_sink.lock().expect("approval sink lock") = Some(sink);
+    }
+
+    /// FR-024 production wiring: create a connected approval channel pair.
+    ///
+    /// Returns `(sink, bridge)` where:
+    /// - `sink` is installed on the [`SurfaceClient`] via [`Self::set_approval_sink()`]
+    /// - `bridge` contains the TUI-side ends (request_rx + response_tx)
+    ///
+    /// Uses unbounded tokio channels because approvals are low-rate
+    /// (server-serialized, one per tool invocation needing Q3) and the
+    /// pump is async while the TUI tick is sync (`try_recv`).
+    pub fn approval_channel() -> (ApprovalSink, ApprovalBridgeEnds) {
+        let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ApprovalSink {
+            request_tx: req_tx,
+            response_rx: std::sync::Arc::new(tokio::sync::Mutex::new(resp_rx)),
+        };
+        let bridge = ApprovalBridgeEnds {
+            request_rx: req_rx,
+            response_tx: resp_tx,
+        };
+        (sink, bridge)
     }
 
     /// Subscribes to demultiplexed `session/event` notifications.
@@ -309,11 +381,11 @@ impl SurfaceClient {
         };
         let active_turns = Arc::clone(&self.active_turns);
         let events_tx = self.events_tx.clone();
-        // FR-024: capture approval sink for interactive route
-        let mut approval_sink = {
-            let mut sink_guard = self.approval_sink.lock().expect("approval sink lock");
-            sink_guard.take() // Take ownership; pump owns it until redial
-        };
+        // FR-024: capture approval sink Arc for interactive route.
+        // Arc::clone (not take!) so the sink survives redials — the pump
+        // is aborted and re-spawned on reconnect; a take()-based sink would
+        // be lost. The pump reads the sink per-request via lock().
+        let approval_sink_arc = std::sync::Arc::clone(&self.approval_sink);
         let handle = tokio::spawn(async move {
             let mut client = client;
             loop {
@@ -346,7 +418,13 @@ impl SurfaceClient {
                             .unwrap_or("")
                             .to_string();
 
-                        // FR-024: Route to interactive sink if available, else policy-lambda
+                        // FR-024: Route to interactive sink if available, else policy-lambda.
+                        // The sink is read per-request via Arc lock (not take) so the
+                        // sink survives pump re-spawns on redial.
+                        //
+                        // SAFETY: We clone the request_tx and response_rx Arc out of
+                        // the MutexGuard BEFORE any .await, then drop the guard.
+                        // std::sync::MutexGuard is !Send and cannot cross await points.
                         let decision = if foreign_turn {
                             tracing::warn!(
                                 %id,
@@ -354,46 +432,61 @@ impl SurfaceClient {
                                 "denied approval routed for a turn not owned by this surface"
                             );
                             "deny".to_string()
-                        } else if let Some(ref mut sink) = approval_sink {
-                            // Interactive route: send request to TUI, await decision
-                            let request = ApprovalRequestPayload {
-                                request_id: id.clone(),
-                                turn_id: turn_id.clone(),
-                                tool_name: name.clone(),
-                                invocation: args.clone(),
-                                reason: reason.clone(),
+                        } else {
+                            // Clone the needed data out of the guard, then drop it
+                            // before any async work.
+                            let sink_data = {
+                                let sink_guard =
+                                    approval_sink_arc.lock().expect("approval sink lock");
+                                sink_guard.as_ref().map(|s| {
+                                    (s.request_tx.clone(), std::sync::Arc::clone(&s.response_rx))
+                                })
+                                // sink_guard dropped here — no MutexGuard across await
                             };
-                            match sink.request_tx.send(request).await {
-                                Ok(()) => {
-                                    // Await decision with timeout (120s matches gateway watchdog)
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(120),
-                                        sink.response_rx.recv(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(response)) => response.decision,
-                                        Ok(None) => {
-                                            tracing::warn!(%id, "approval sink closed; defaulting to deny");
-                                            "deny".to_string()
+
+                            match sink_data {
+                                Some((request_tx, response_rx)) => {
+                                    let request = ApprovalRequestPayload {
+                                        request_id: id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        tool_name: name.clone(),
+                                        invocation: args.clone(),
+                                        reason: reason.clone(),
+                                    };
+                                    match request_tx.send(request) {
+                                        Ok(()) => {
+                                            // Await decision with timeout (120s matches gateway watchdog)
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_secs(120),
+                                                response_rx.lock().await.recv(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(response)) => response.decision,
+                                                Ok(None) => {
+                                                    tracing::warn!(%id, "approval sink closed; defaulting to deny");
+                                                    "deny".to_string()
+                                                }
+                                                Err(_) => {
+                                                    tracing::warn!(%id, "approval interactive timeout; denying");
+                                                    "deny".to_string()
+                                                }
+                                            }
                                         }
                                         Err(_) => {
-                                            tracing::warn!(%id, "approval interactive timeout; denying");
+                                            tracing::warn!(%id, "approval sink send failed; defaulting to deny");
                                             "deny".to_string()
                                         }
                                     }
                                 }
-                                Err(_) => {
-                                    tracing::warn!(%id, "approval sink send failed; defaulting to deny");
-                                    "deny".to_string()
+                                None => {
+                                    // Policy-lambda route (non-TUI surfaces)
+                                    let approve = policy_slot
+                                        .as_ref()
+                                        .is_some_and(|policy| policy(&name, &args));
+                                    if approve { "approve" } else { "deny" }.to_string()
                                 }
                             }
-                        } else {
-                            // Policy-lambda route (non-TUI surfaces)
-                            let approve = policy_slot
-                                .as_ref()
-                                .is_some_and(|policy| policy(&name, &args));
-                            if approve { "approve" } else { "deny" }.to_string()
                         };
 
                         let approve = decision == "approve";
@@ -1005,7 +1098,7 @@ mod tests {
             inner: tokio::sync::Mutex::new(None),
             link: std::sync::RwLock::new(GatewayLinkState::OfflineDegraded),
             approval_policy: std::sync::RwLock::new(None),
-            approval_sink: std::sync::Mutex::new(None),
+            approval_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
             active_turns: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
@@ -1308,5 +1401,164 @@ mod tests {
         let c2 = surface.cancel_active_turns().await;
         assert_eq!(c1, 0);
         assert_eq!(c2, 0);
+    }
+
+    // =========================================================================
+    // FR-024: production sink wiring tests
+    // =========================================================================
+
+    /// FR-024 structural: the approval sink stored on the SurfaceClient is
+    /// accessible via the Arc from any clone (what the pump does at spawn).
+    /// This verifies the key property that makes redial-safe: the sink is
+    /// NOT taken by the pump — it's read per-request via Arc::clone + lock.
+    #[test]
+    fn approval_sink_is_arc_accessible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("arc_access.sock");
+
+        let surface = SurfaceClient {
+            socket_path: sock,
+            embedded: std::sync::RwLock::new(None),
+            client_name: "arc-test".to_string(),
+            client_version: "0.0".to_string(),
+            capabilities: Capabilities::default(),
+            inner: tokio::sync::Mutex::new(None),
+            link: std::sync::RwLock::new(GatewayLinkState::OfflineDegraded),
+            approval_policy: std::sync::RwLock::new(None),
+            approval_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            active_turns: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+            events_tx: tokio::sync::broadcast::channel(16).0,
+            pump: std::sync::Mutex::new(None),
+        };
+
+        // No sink initially.
+        assert!(surface.approval_sink.lock().unwrap().is_none());
+
+        // Install the sink.
+        let (sink, bridge) = SurfaceClient::approval_channel();
+        surface.set_approval_sink(sink);
+
+        // Verify installed.
+        assert!(surface.approval_sink.lock().unwrap().is_some());
+
+        // Simulate what spawn_notification_pump does: clone the Arc.
+        let pump_arc = std::sync::Arc::clone(&surface.approval_sink);
+
+        // The original must still have the sink.
+        assert!(
+            surface.approval_sink.lock().unwrap().is_some(),
+            "sink must survive Arc::clone (not take)"
+        );
+
+        // The pump's Arc also sees it.
+        assert!(
+            pump_arc.lock().unwrap().is_some(),
+            "pump Arc must see the same sink"
+        );
+
+        // Verify the sink's channels work through the Arc.
+        let mut bridge = bridge;
+        {
+            let guard = pump_arc.lock().unwrap();
+            let sink_ref = guard.as_ref().unwrap();
+            let req = ApprovalRequestPayload {
+                request_id: "test-req".into(),
+                turn_id: "test-turn".into(),
+                tool_name: "shell.exec".into(),
+                invocation: serde_json::json!({}),
+                reason: "test".into(),
+            };
+            sink_ref.request_tx.send(req).unwrap();
+        }
+
+        let received = bridge.request_rx.try_recv().unwrap();
+        assert_eq!(received.request_id, "test-req");
+    }
+    /// FR-024 redial safety: the approval sink is stored as Arc<Mutex<>> on
+    /// the SurfaceClient, not taken by the pump. After a redial, the new pump
+    /// clones the Arc and sees whatever was set. This test verifies the
+    /// structural property: set → clone → original still present.
+    #[test]
+    fn redial_preserves_approval_sink_arc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("redial_arc.sock");
+
+        // Build a SurfaceClient manually (no async needed for this test).
+        let surface = SurfaceClient {
+            socket_path: sock,
+            embedded: std::sync::RwLock::new(None),
+            client_name: "redial-test".to_string(),
+            client_version: "0.0".to_string(),
+            capabilities: Capabilities::default(),
+            inner: tokio::sync::Mutex::new(None),
+            link: std::sync::RwLock::new(GatewayLinkState::OfflineDegraded),
+            approval_policy: std::sync::RwLock::new(None),
+            approval_sink: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            active_turns: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+            events_tx: tokio::sync::broadcast::channel(16).0,
+            pump: std::sync::Mutex::new(None),
+        };
+
+        // Initially no sink.
+        assert!(
+            surface.approval_sink.lock().unwrap().is_none(),
+            "no sink initially"
+        );
+
+        // Install the sink.
+        let (sink, _bridge) = SurfaceClient::approval_channel();
+        surface.set_approval_sink(sink);
+
+        // Verify installed.
+        assert!(
+            surface.approval_sink.lock().unwrap().is_some(),
+            "sink must be installed after set"
+        );
+
+        // Simulate what spawn_notification_pump does: clone the Arc.
+        let _pump_arc = std::sync::Arc::clone(&surface.approval_sink);
+
+        // The original must still have the sink.
+        assert!(
+            surface.approval_sink.lock().unwrap().is_some(),
+            "sink must survive Arc::clone (not take)"
+        );
+
+        // The pump's Arc also sees it.
+        assert!(
+            _pump_arc.lock().unwrap().is_some(),
+            "pump Arc must see the same sink"
+        );
+    }
+
+    /// approval_channel() creates a connected pair: sending on request_tx
+    /// delivers to request_rx, and sending on response_tx delivers to response_rx.
+    #[tokio::test]
+    async fn approval_channel_round_trip() {
+        let (sink, mut bridge) = SurfaceClient::approval_channel();
+
+        let req = ApprovalRequestPayload {
+            request_id: "req-1".into(),
+            turn_id: "turn-1".into(),
+            tool_name: "shell.exec".into(),
+            invocation: serde_json::json!({"binary": "/bin/sh"}),
+            reason: "test".into(),
+        };
+        sink.request_tx.send(req.clone()).unwrap();
+        let received = bridge.request_rx.try_recv().unwrap();
+        assert_eq!(received.request_id, "req-1");
+        assert_eq!(received.tool_name, "shell.exec");
+
+        let resp = ApprovalResponsePayload {
+            request_id: "req-1".into(),
+            decision: "approve".into(),
+        };
+        bridge.response_tx.send(resp).unwrap();
+        let received = sink.response_rx.try_lock().unwrap().try_recv().unwrap();
+        assert_eq!(received.decision, "approve");
     }
 }

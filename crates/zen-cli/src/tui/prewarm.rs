@@ -14,12 +14,31 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use zen_gateway::client::SurfaceClient;
+use zen_gateway::client::surface::ApprovalBridgeEnds;
 
 /// FR-023: last handshake refusal (reason, recovery) seen during a dial —
 /// recorded so the turn producer can surface a version-mismatch verbatim
 /// when no link is available (the generic no-link path would otherwise
 /// flatten it into OfflineDegraded).
 static LAST_DIAL_REFUSAL: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// FR-024: TUI-side ends of the approval channel pair, constructed once at
+/// session start and consumed once by [`App`] construction. Follows the same
+/// `OnceLock`/`Mutex<Option<_>>` pattern as `LAST_DIAL_REFUSAL`.
+///
+/// PURPOSE: Bridges the gateway notification pump (tokio async) to the TUI
+///   tick loop (sync crossterm poll). The pump sends `ApprovalRequestPayload`
+///   on `request_rx`; the TUI drains via `try_recv` in `inline_tick`.
+///   Decisions go back on `response_tx`.
+///
+/// USAGE: Set by `spawn()`/`resolve_client()` after a successful open;
+///   consumed once by `take_approval_bridge()`.
+///
+/// EXPECTED: One bridge per TUI session; the pump reads the sink via
+///   `Arc::clone` + lock, so setting it after open is race-free.
+///
+/// ERRORS: None — pure data type.
+static APPROVAL_BRIDGE: Mutex<Option<ApprovalBridgeEnds>> = Mutex::new(None);
 
 fn record_dial_error(e: &zen_gateway::client::SurfaceError) {
     if let zen_gateway::client::SurfaceError::Rpc(rpc) = e
@@ -50,6 +69,13 @@ pub(crate) fn take_dial_refusal() -> Option<(String, String)> {
     LAST_DIAL_REFUSAL.lock().ok().and_then(|mut g| g.take())
 }
 
+/// Take (consume) the FR-024 approval bridge ends, if available.
+/// Called once at TUI [`App`] construction. The bridge is consumed (not cloned)
+/// so exactly one TUI drains the request channel.
+pub(crate) fn take_approval_bridge() -> Option<ApprovalBridgeEnds> {
+    APPROVAL_BRIDGE.lock().ok().and_then(|mut g| g.take())
+}
+
 /// Gateway surface warmed at session start (T024): connect-or-spawn the
 /// daemon before the first Enter instead of during it.
 static SURFACE: OnceLock<Arc<SurfaceClient>> = OnceLock::new();
@@ -65,10 +91,20 @@ pub(crate) fn spawn() {
     tokio::spawn(async move {
         match SurfaceClient::open_default("zen-tui", env!("CARGO_PKG_VERSION")).await {
             Ok(surface) => {
+                // FR-024: create the approval channel pair and install the sink.
+                // The pump reads the sink per-request via Arc::clone (not take),
+                // so setting it after open is race-free — the pump loop has not
+                // yet reached the approval branch when the first request can
+                // arrive (the handshake must complete first).
+                let (sink, bridge) = SurfaceClient::approval_channel();
+                surface.set_approval_sink(sink);
+                if let Ok(mut g) = APPROVAL_BRIDGE.lock() {
+                    *g = Some(bridge);
+                }
                 let surface = Arc::new(surface);
                 let _ = SURFACE.set(surface.clone());
                 let _ = tx.send(Some(surface));
-                tracing::debug!("prewarm: gateway surface ready");
+                tracing::debug!("prewarm: gateway surface ready (approval sink installed)");
             }
             Err(e) => {
                 record_dial_error(&e);
@@ -103,7 +139,15 @@ pub(crate) async fn resolve_client() -> Option<Arc<SurfaceClient>> {
         }
     }
     match SurfaceClient::open_default("zen-tui", env!("CARGO_PKG_VERSION")).await {
-        Ok(surface) => Some(Arc::new(surface)),
+        Ok(surface) => {
+            // FR-024: install approval sink on the directly-dialed surface too.
+            let (sink, bridge) = SurfaceClient::approval_channel();
+            surface.set_approval_sink(sink);
+            if let Ok(mut g) = APPROVAL_BRIDGE.lock() {
+                *g = Some(bridge);
+            }
+            Some(Arc::new(surface))
+        }
         Err(e) => {
             record_dial_error(&e);
             None
