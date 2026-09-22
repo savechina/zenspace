@@ -592,3 +592,41 @@ fn e18_degraded_banner_renders_and_local_commands_work() {
     tui.send(b"/help\r");
     tui.wait_for("Zen Agentic TUI - Commands", "/help works while degraded");
 }
+
+/// T082 (NFR-008): input-latency smoke — keystroke-to-echo wall time.
+///
+/// Sends one printable keystroke burst into the inline composer and
+/// poll-reads the PTY screen (5 ms resolution) until the characters are
+/// rendered, timing the wait. MEASUREMENT ONLY: the only assertion is a
+/// loose sanity bound (2000 ms — CI machines vary; this is a smoke, not a
+/// benchmark), and the measured milliseconds are PRINTed via the harness's
+/// output so a human can collect numbers over time toward the NFR-008
+/// target (≤20 ms on reference hardware, advisory until measured).
+#[test]
+#[ignore]
+fn input_latency_smoke() {
+    let mut tui = Tui::spawn(&[]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+    // Distinctive burst that cannot appear anywhere on the startup screen.
+    let needle = "zx81";
+    tui.send(needle.as_bytes());
+    let start = Instant::now();
+    loop {
+        if tui.screen().contains(needle) {
+            break;
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "keystroke echo exceeded the 2000 ms smoke bound (measured {} ms)",
+            elapsed.as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let latency_ms = start.elapsed().as_millis();
+    println!("input latency (keystroke→echo): {latency_ms} ms");
+    // Ctrl+D quits only on EMPTY input in inline mode (otherwise it is
+    // delete-char-forward) — clear the composer first (Ctrl+U), then exit.
+    tui.send(b"\x15\x04");
+    tui.wait_exit();
+}

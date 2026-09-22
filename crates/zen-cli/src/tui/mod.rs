@@ -23,6 +23,7 @@ pub mod selection;
 pub mod session_picker;
 mod sessions;
 pub mod slash;
+mod stall;
 pub mod stream;
 pub mod theme;
 mod ui;

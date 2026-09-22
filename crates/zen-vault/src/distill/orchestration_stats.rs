@@ -10,9 +10,15 @@
 //!   reason counts, depth distribution, target agent distribution
 //! - **plan.completed** — plan outcomes (ok/failed/skipped), avg duration,
 //!   delivery-not-ready rate
+//! - **stream.stalls** — TUI inter-token stall episodes (NFR-009, T082):
+//!   count, max/median gap, stalls per 100 turns
 //!
 //! Path-agnostic: callers pass the resolved logs dir. Corrupt lines are
 //! skipped; missing files produce zeroed sections (not an error).
+//!
+//! NOTE: the local-only `bin/orchestration-stats` awk script does not know
+//! the `stream.stalls` section — the Rust aggregator is the source of truth
+//! (T082 divergence, script deliberately not updated).
 
 use std::collections::HashMap;
 use std::fs;
@@ -94,7 +100,19 @@ pub struct PlanCompletedStats {
     pub delivery_not_ready_pct: f64,
 }
 
-/// Full orchestration telemetry snapshot — all four sections.
+/// Aggregated `[stream.stalls]` section (T082, NFR-009): TUI inter-token
+/// gaps >200 ms observed during streaming turns. `stalls_per_100_turns`
+/// uses the `loop.turn.review` line count as the turn denominator; raw
+/// counts stand alone when no turn lines exist.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamStallStats {
+    pub episodes: usize,
+    pub max_gap_ms: u64,
+    pub median_gap_ms: u64,
+    pub stalls_per_100_turns: f64,
+}
+
+/// Full orchestration telemetry snapshot — all five sections.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrchestrationStats {
     pub turn_review: TurnReviewStats,
@@ -102,6 +120,9 @@ pub struct OrchestrationStats {
     pub delegate_gates: DelegateGatesStats,
     pub plan_completed: PlanCompletedStats,
     pub liveness: LivenessStats,
+    /// T082 (NFR-009): additive — `default` keeps pre-T082 reports decodable.
+    #[serde(default)]
+    pub stream_stalls: StreamStallStats,
 }
 
 /// E8: Loop-cycle liveness telemetry.
@@ -192,6 +213,7 @@ pub fn aggregate_orchestration(dir: &Path) -> Result<OrchestrationStats, AuditEr
     let mut llm_latencies: Vec<u64> = Vec::new();
     let mut depth_counts: HashMap<String, usize> = HashMap::new();
     let mut target_counts: HashMap<String, usize> = HashMap::new();
+    let mut stall_gaps: Vec<u64> = Vec::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -222,6 +244,12 @@ pub fn aggregate_orchestration(dir: &Path) -> Result<OrchestrationStats, AuditEr
             }
             if let Some(fb) = read_field_u64(&line, "feedback_rounds") {
                 stats.turn_review.feedback_rounds_total += fb;
+            }
+        } else if line.contains("\"kind\":\"tui.stream.stall\"") {
+            // T082 (NFR-009): lines without a parsable gap_ms are malformed —
+            // ignored, never counted.
+            if let Some(gap) = read_field_u64(&line, "gap_ms") {
+                stall_gaps.push(gap);
             }
         } else if line.contains("\"kind\":\"gateway.turn.started\"") {
             stats.gateway.turns_started += 1;
@@ -318,6 +346,19 @@ pub fn aggregate_orchestration(dir: &Path) -> Result<OrchestrationStats, AuditEr
             stats.plan_completed.delivery_not_ready as f64 / stats.plan_completed.plans as f64
                 * 100.0;
     }
+
+    // T082 (NFR-009): stall-episode reduction. The turn denominator reuses
+    // the existing `loop.turn.review` count (the aggregator's only turn
+    // source); with zero turns the rate is 0.0 and raw counts stand alone.
+    stall_gaps.sort_unstable();
+    stats.stream_stalls.episodes = stall_gaps.len();
+    stats.stream_stalls.max_gap_ms = stall_gaps.last().copied().unwrap_or(0);
+    stats.stream_stalls.median_gap_ms = percentile(&stall_gaps, 0.5);
+    stats.stream_stalls.stalls_per_100_turns = if total_turns > 0 {
+        stall_gaps.len() as f64 / total_turns as f64 * 100.0
+    } else {
+        0.0
+    };
 
     // E8: aggregate liveness from loop-cycle report files
     let mut liveness = LivenessStats::default();
@@ -438,6 +479,15 @@ impl std::fmt::Display for OrchestrationStats {
             pc.avg_duration_ms,
             pc.delivery_not_ready,
             pc.delivery_not_ready_pct,
+        )?;
+
+        writeln!(f)?;
+
+        let ss = &self.stream_stalls;
+        writeln!(
+            f,
+            "[stream.stalls] episodes={}  gap_ms max={} median={}  per_100_turns={:.1}",
+            ss.episodes, ss.max_gap_ms, ss.median_gap_ms, ss.stalls_per_100_turns,
         )?;
 
         writeln!(f)?;
@@ -650,5 +700,86 @@ mod tests {
         assert!(display.contains("[gateway]"));
         assert!(display.contains("[delegate.gates]"));
         assert!(display.contains("[plan.completed]"));
+    }
+
+    #[test]
+    fn stream_stall_counts_with_turn_denominator() {
+        let dir = tmpdir();
+        write_audit(
+            dir.path(),
+            &[
+                r#"{"kind":"loop.turn.review","intent_category":"Query","intent_source":"Llm","delivery_ready":true,"plan_approved":true,"feedback_rounds":0,"intent_llm_outcome":"ok","intent_llm_ms":100}"#,
+                r#"{"kind":"loop.turn.review","intent_category":"Action","intent_source":"Keyword","delivery_ready":true,"plan_approved":true,"feedback_rounds":0,"intent_llm_outcome":"ok","intent_llm_ms":120}"#,
+                r#"{"kind":"tui.stream.stall","gap_ms":250,"turn_id":"tui-1","session_id":"s1","ts":"1758500000000"}"#,
+                r#"{"kind":"tui.stream.stall","gap_ms":900,"turn_id":"tui-2","session_id":"s1","ts":"1758500001000"}"#,
+                r#"{"kind":"tui.stream.stall","gap_ms":310,"turn_id":"tui-2","session_id":"s1","ts":"1758500002000"}"#,
+            ],
+        );
+        let stats = aggregate_orchestration(dir.path()).unwrap();
+        let stalls = &stats.stream_stalls;
+        assert_eq!(stalls.episodes, 3);
+        assert_eq!(stalls.max_gap_ms, 900);
+        assert_eq!(stalls.median_gap_ms, 310);
+        assert!((stalls.stalls_per_100_turns - 150.0).abs() < 0.001);
+        assert!(stats.to_string().contains("[stream.stalls]"));
+    }
+
+    #[test]
+    fn malformed_stall_lines_are_ignored() {
+        let dir = tmpdir();
+        write_audit(
+            dir.path(),
+            &[
+                r#"{"kind":"tui.stream.stall","turn_id":"tui-1"}"#, // no gap_ms
+                r#"{"kind":"tui.stream.stall","gap_ms":"not-a-number"}"#, // non-numeric
+                r#"{"kind":"tui.stream.stall","gap_ms":-5}"#,       // negative
+                "not json at all",                                  // corrupt line
+                r#"{"gap_ms":400,"kind":"tui.stream.stall"}"#,      // valid, field order free
+            ],
+        );
+        let stats = aggregate_orchestration(dir.path()).unwrap();
+        assert_eq!(stats.stream_stalls.episodes, 1);
+        assert_eq!(stats.stream_stalls.max_gap_ms, 400);
+    }
+
+    #[test]
+    fn stalls_without_turns_report_raw_counts() {
+        let dir = tmpdir();
+        write_audit(
+            dir.path(),
+            &[
+                r#"{"kind":"tui.stream.stall","gap_ms":500,"turn_id":"tui-1","session_id":"s1","ts":"0"}"#,
+            ],
+        );
+        let stats = aggregate_orchestration(dir.path()).unwrap();
+        assert_eq!(stats.stream_stalls.episodes, 1);
+        assert_eq!(stats.turn_review.turns, 0);
+        assert_eq!(stats.stream_stalls.stalls_per_100_turns, 0.0);
+    }
+
+    /// T082: additive serde field — a pre-T082 report JSON (no
+    /// `stream_stalls` key) must stay decodable, and a fresh snapshot
+    /// roundtrips losslessly.
+    #[test]
+    fn serde_default_roundtrip_with_legacy_reports() {
+        let legacy = r#"{"turn_review":{"turns":2,"delivery_not_ready":0,"delivery_not_ready_pct":0.0,"plan_vetoed":0,"feedback_rounds_total":0,"intent_categories":[],"intent_sources":[],"intent_llm_outcomes":[],"intent_llm_ms_p50":0,"intent_llm_ms_p95":0},"gateway":{"turns_started":0,"turns_completed":0},"delegate_gates":{"events":0,"batched":0,"batched_pct":0.0,"blocked_independent":0,"blocked_unbounded":0,"blocked_consumer":0,"blocked_not_worth":0,"depth_distribution":[],"target_distribution":[]},"plan_completed":{"plans":0,"tasks_ok":0,"tasks_failed":0,"tasks_skipped":0,"avg_duration_ms":0,"delivery_not_ready":0,"delivery_not_ready_pct":0.0},"liveness":{"last_cycle_timestamp":null,"last_cycle_duration_ms":null,"last_cycle_outcome":null,"total_cycles":0,"failed_cycles":0}}"#;
+        let decoded: OrchestrationStats = serde_json::from_str(legacy).expect("legacy decodes");
+        assert_eq!(decoded.stream_stalls.episodes, 0);
+
+        let stats = OrchestrationStats {
+            stream_stalls: StreamStallStats {
+                episodes: 2,
+                max_gap_ms: 900,
+                median_gap_ms: 250,
+                stalls_per_100_turns: 12.5,
+            },
+            ..OrchestrationStats::default()
+        };
+        let encoded = serde_json::to_string(&stats).unwrap();
+        let round: OrchestrationStats = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(round.stream_stalls.episodes, 2);
+        assert_eq!(round.stream_stalls.max_gap_ms, 900);
+        assert_eq!(round.stream_stalls.median_gap_ms, 250);
+        assert!((round.stream_stalls.stalls_per_100_turns - 12.5).abs() < f64::EPSILON);
     }
 }
