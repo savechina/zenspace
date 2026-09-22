@@ -270,6 +270,8 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                     app.input.select_all();
                     app.input.cut();
                     app.input.insert_str(&text);
+                    // T084(b): wholesale rewrite drops any pill tokens.
+                    app.clear_paste_pills();
                     app.slash_state.dismiss();
                 }
                 return KeyAction::Continue;
@@ -293,7 +295,9 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 return KeyAction::Continue;
             }
             if app.slash_state.visible {
-                app.slash_state.dismiss();
+                // T084(d): Esc records the dismissed token (popup stays shut
+                // while the token is unchanged).
+                app.dismiss_slash_popup();
                 return KeyAction::Continue;
             }
             return KeyAction::Continue;
@@ -328,6 +332,8 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                     app.input.select_all();
                     app.input.cut();
                     app.input.insert_str(&text);
+                    // T084(b): wholesale rewrite drops any pill tokens.
+                    app.clear_paste_pills();
                     app.slash_state.dismiss();
                 }
                 return KeyAction::Continue;
@@ -402,8 +408,8 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
 
     let input_after = app.input.lines().join("\n");
     if input_before != input_after {
-        app.slash_state
-            .on_input_change(&input_after, &app.slash_registry);
+        // T084(d): dismissal-aware refresh (pure token equality).
+        app.refresh_slash_popup();
         if app.input.effective_mode() == InputMode::History {
             app.input.exit_mode();
         }
@@ -414,9 +420,11 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
 
 pub fn handle_paste(pasted: &str, app: &mut super::app::App) {
     let pasted = pasted.replace('\r', "\n");
-    app.input.insert_str(pasted);
-    let input = app.input.lines().join("\n");
-    app.slash_state.on_input_change(&input, &app.slash_registry);
+    // T084(b): pastes over threshold collapse to a `[Pasted N lines / M
+    // chars]` pill (full text in the side map, expanded at submit).
+    let insert = app.collapse_paste_for_insert(&pasted);
+    app.input.insert_str(insert);
+    app.refresh_slash_popup();
     app.input.enter_paste_mode();
     app.refresh_input_border();
 }

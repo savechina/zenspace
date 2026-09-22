@@ -153,8 +153,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                 }
                 app.history_search.exit();
                 // Refresh slash state with the RESULTING textarea text.
-                let input = app.input.lines().join("\n");
-                app.slash_state.on_input_change(&input, &app.slash_registry);
+                // T084(d): dismissal-aware refresh (pure token equality).
+                app.refresh_slash_popup();
             }
             // Esc: CANCEL — restore draft, exit search
             (KeyCode::Esc, _) => {
@@ -252,9 +252,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
             // Ctrl+U: kill line to HEAD (Codex editor.kill_line_start)
             app.input.textarea_mut().delete_line_by_head();
-            let input_after = app.input.lines().join("\n");
-            app.slash_state
-                .on_input_change(&input_after, &app.slash_registry);
+            // T084(d): dismissal-aware refresh (pure token equality).
+            app.refresh_slash_popup();
             return InlineKeyAction::Continue;
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -264,9 +263,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                 return InlineKeyAction::Quit;
             }
             app.input.textarea_mut().delete_next_char();
-            let input_after = app.input.lines().join("\n");
-            app.slash_state
-                .on_input_change(&input_after, &app.slash_registry);
+            // T084(d): dismissal-aware refresh (pure token equality).
+            app.refresh_slash_popup();
             return InlineKeyAction::Continue;
         }
         _ => {}
@@ -317,7 +315,9 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
 
     if key.code == KeyCode::Esc {
         if app.slash_state.visible {
-            app.slash_state.dismiss();
+            // T084(d): Esc records the dismissed token (popup stays shut
+            // while the token is unchanged).
+            app.dismiss_slash_popup();
             return InlineKeyAction::Continue;
         }
         if app.is_streaming {
@@ -332,6 +332,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
             app.input.select_all();
             app.input.cut();
             app.input.insert_str(&text);
+            // T084(b): wholesale rewrite drops any pill tokens.
+            app.clear_paste_pills();
             app.slash_state.dismiss();
         }
         return InlineKeyAction::Continue;
@@ -357,8 +359,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                     shift: false,
                 });
             }
-            let input = app.input.lines().join("\n");
-            app.slash_state.on_input_change(&input, &app.slash_registry);
+            // T084(d): dismissal-aware refresh (pure token equality).
+            app.refresh_slash_popup();
         }
         return InlineKeyAction::Continue;
     }
@@ -382,8 +384,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                     shift: false,
                 });
             }
-            let input = app.input.lines().join("\n");
-            app.slash_state.on_input_change(&input, &app.slash_registry);
+            // T084(d): dismissal-aware refresh (pure token equality).
+            app.refresh_slash_popup();
         }
         return InlineKeyAction::Continue;
     }
@@ -405,7 +407,14 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         return InlineKeyAction::Continue;
     }
 
-    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT {
+    // T084(e): Ctrl+J (the LF byte — passes through tmux/SSH where
+    // Shift+Enter dies; Hermes convention) inserts a newline via the exact
+    // Shift+Enter path. Plain terminals may report Ctrl+J as Enter
+    // (indistinguishable) — those fall back to submit per FR-017.
+    // Inline-only (fullscreen untouched).
+    if (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT)
+        || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
         app.input.input(Input {
             key: Key::Enter,
             ctrl: false,
@@ -449,6 +458,41 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         return InlineKeyAction::Continue;
     }
 
+    // T084(b): paste-pill atomic editing — Backspace/Delete at a pill edge
+    // remove the whole pill; Left/Right skip over pills as one unit. Falls
+    // through to normal editing when no pill is involved.
+    match (key.code, key.modifiers) {
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            if app.paste_backspace() {
+                app.refresh_slash_popup();
+                return InlineKeyAction::Continue;
+            }
+        }
+        (KeyCode::Delete, KeyModifiers::NONE) => {
+            if app.paste_delete_forward() {
+                app.refresh_slash_popup();
+                return InlineKeyAction::Continue;
+            }
+        }
+        (KeyCode::Left, KeyModifiers::NONE) => {
+            if let Some((row, col)) = app.pill_jump_for_horizontal(true) {
+                app.input
+                    .textarea_mut()
+                    .move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                return InlineKeyAction::Continue;
+            }
+        }
+        (KeyCode::Right, KeyModifiers::NONE) => {
+            if let Some((row, col)) = app.pill_jump_for_horizontal(false) {
+                app.input
+                    .textarea_mut()
+                    .move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                return InlineKeyAction::Continue;
+            }
+        }
+        _ => {}
+    }
+
     let input_before = app.input.lines().join("\n");
     app.input.input(Input {
         key: match key.code {
@@ -469,8 +513,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
 
     let input_after = app.input.lines().join("\n");
     if input_before != input_after {
-        app.slash_state
-            .on_input_change(&input_after, &app.slash_registry);
+        // T084(d): dismissal-aware refresh (pure token equality).
+        app.refresh_slash_popup();
     }
 
     InlineKeyAction::Continue
@@ -963,5 +1007,53 @@ mod tests {
         assert_eq!(action, InlineKeyAction::Submit);
         // Buffer must still be exactly the original text (no extra newline inserted)
         assert_eq!(app.input.lines().join("\n"), "line1\nline2");
+    }
+
+    // === T084(e): Ctrl+J newline fallback ===
+
+    /// Ctrl+J (the LF byte; kitty-modern terminals deliver it as
+    /// Char('j')+CONTROL) inserts a newline exactly like Shift+Enter, and a
+    /// pending paste-pill mapping is undisturbed by the insert.
+    #[test]
+    fn t084_ctrl_j_inserts_newline_pill_map_undisturbed() {
+        let mut app = test_app();
+        for c in "abc".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let action = press(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(action, InlineKeyAction::Continue);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(
+            app.input.lines().join(
+                "
+"
+            ),
+            "abc\nd"
+        );
+
+        // Pill mapping survives the newline insert.
+        let full = (1..=5)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let insert = app.collapse_paste_for_insert(&full);
+        app.input.insert_str(&insert);
+        let pills_before = app.paste_pills.len();
+        assert_eq!(pills_before, 1);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.paste_pills.len(),
+            pills_before,
+            "pill map must be undisturbed"
+        );
+        assert!(
+            app.input
+                .lines()
+                .join(
+                    "
+"
+                )
+                .contains("[Pasted 5 lines /")
+        );
     }
 }
