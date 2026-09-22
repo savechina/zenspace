@@ -2096,6 +2096,27 @@ mod tests {
             return;
         }
 
+        // CI runners have no git identity, and Linux git refuses to
+        // auto-detect without an FQDN hostname — pin a repo-local one.
+        for (key, value) in [
+            ("user.name", "Zen Test"),
+            ("user.email", "zen-test@example.invalid"),
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&vault)
+                .args(["config", key, value])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                eprintln!("skip: git config unavailable");
+                return;
+            }
+        }
+
         std::fs::write(vault.join("log.md"), "# cycle log\n").unwrap();
 
         let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
