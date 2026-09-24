@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Diff-fence rendering + open-task closeout** (2026-09-24): diff/patch code
+  fences render explicit red/green deltas (dim-cyan hunk headers, dark-gray
+  file headers, unstyled context, NO_COLOR-safe) at the markdown fence
+  layer; PageUp/PageDown key capture pinned by test. Task audit closed T030
+  (absorbed by T056/T057 tool cards) and T068 (tmux smoke PASSED on tmux
+  3.7b); T026 fuzzy and T038 dynamic viewport stay deferred with recorded
+  rationale.
+
+- **Codex-parity slash popup refinements** (2026-09-24): after studying the
+  live codex v0.155.1 popup against its source (codex-rs command_popup.rs),
+  the slash menu adopts codex's selection grammar — full-width reversed bar
+  + bold name, selected description un-dims, matched filter characters
+  render bold, the description column is measured over all rows (stable
+  while scrolling), exact matches hoist above prefix matches, and the
+  sel/total index is dropped. Group headers and scroll arrows kept
+  deliberately.
+
 - **Curated competitor UX polish (T084)** (2026-09-22): six Munger-capped
   inline-TUI affordances — slash popup gains registry-order group headers
   + a dimmed description column; large bracketed pastes (>3 lines /
