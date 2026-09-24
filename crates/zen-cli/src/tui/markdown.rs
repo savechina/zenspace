@@ -77,13 +77,39 @@ fn render_code_fence_block(raw: &str) -> Option<Vec<Line<'static>>> {
         .fg(ratatui::style::Color::DarkGray)
         .add_modifier(ratatui::style::Modifier::BOLD);
     let mut lines = vec![Line::styled(format!("┌─ {}", lang), header_style)];
+    let lang_lower = lang.to_lowercase();
     if no_color {
         lines.extend(code.lines().map(|l| Line::raw(l.to_string())));
+    } else if matches!(lang_lower.as_str(), "diff" | "patch") {
+        // T031: diff blocks render as explicit red/green deltas instead of
+        // syntect's muted theme palette — the red/green IS the point.
+        lines.extend(code.lines().map(render_diff_line));
     } else {
         lines.extend(super::highlight::highlight_code(&code, &lang));
     }
     lines.push(Line::styled("└─", header_style));
     Some(lines)
+}
+
+/// T031: one unified-diff line → its conventional color. `+` additions
+/// green, `-` removals red, `@@` hunk headers dim cyan, `+++`/`---` file
+/// headers dark gray, context unstyled. Rendered at the fence layer (not
+/// syntect) so the colors are the explicit red/green the task pins rather
+/// than a highlight theme's approximation.
+fn render_diff_line(line: &str) -> Line<'static> {
+    use ratatui::style::{Color, Modifier, Style};
+    let style = if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().fg(Color::DarkGray)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    Line::styled(line.to_string(), style)
 }
 
 fn render_block_via_tui_markdown(raw: &str) -> Vec<Line<'static>> {
@@ -699,5 +725,76 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(text.contains("fn main"));
+    }
+
+    // === T031: diff fence red/green rendering ===
+
+    #[test]
+    fn t031_diff_fence_renders_red_green_lines() {
+        let md = concat!(
+            "```diff\n",
+            "+++ b/src/main.rs\n",
+            "--- a/src/main.rs\n",
+            "@@ -1,2 +1,2 @@\n",
+            "-old line\n",
+            "+new line\n",
+            " context\n",
+            "```"
+        );
+        let lines = render_markdown(md);
+        let line_starting = |prefix: &str| {
+            lines
+                .iter()
+                .find(|l| {
+                    l.spans
+                        .first()
+                        .is_some_and(|s| s.content.starts_with(prefix))
+                })
+                .unwrap_or_else(|| panic!("line starting with {prefix:?} must render"))
+        };
+        let fg = |line: &ratatui::text::Line| {
+            line.style
+                .fg
+                .or_else(|| line.spans.first().and_then(|s| s.style.fg))
+        };
+        assert_eq!(
+            fg(line_starting("+new")),
+            Some(ratatui::style::Color::Green)
+        );
+        assert_eq!(fg(line_starting("-old")), Some(ratatui::style::Color::Red));
+        assert_eq!(fg(line_starting("@@")), Some(ratatui::style::Color::Cyan));
+        assert_eq!(
+            fg(line_starting("+++")),
+            Some(ratatui::style::Color::DarkGray)
+        );
+        assert_eq!(
+            fg(line_starting("---")),
+            Some(ratatui::style::Color::DarkGray)
+        );
+        assert_eq!(fg(line_starting(" context")), None);
+    }
+
+    #[test]
+    fn t031_non_diff_fences_still_render_framed() {
+        let lines = render_markdown("```rust\nlet x = 1;\n```");
+        assert!(
+            lines.iter().any(|l| l
+                .spans
+                .first()
+                .is_some_and(|s| s.content.contains("┌─ rust"))),
+            "rust fence must keep the framed syntect path"
+        );
+        // syntect splits the body into many highlighted spans — flatten the
+        // line text before matching.
+        let line_text = |l: &ratatui::text::Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(
+            lines.iter().any(|l| line_text(l).contains("let x = 1;")),
+            "fence body must render"
+        );
     }
 }
