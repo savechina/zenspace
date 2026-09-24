@@ -1009,6 +1009,32 @@ mod tests {
         assert_eq!(app.input.lines().join("\n"), "line1\nline2");
     }
 
+    // === T025: PageUp/PageDown captured (raw mode owns every key) ===
+
+    /// PageUp arms T062 reading mode; PageDown/End exit it; a bare PageDown
+    /// outside reading mode is a captured no-op. The input buffer is never
+    /// corrupted by either key.
+    #[test]
+    fn t025_pageup_pagedown_captured_input_untouched() {
+        let mut app = test_app();
+        app.input.insert_str("draft");
+
+        let action = press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert!(!app.reading_mode);
+        assert_eq!(app.input.lines().join("\n"), "draft");
+
+        let action = press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert!(app.reading_mode, "PageUp must arm T062 reading mode");
+        assert_eq!(app.input.lines().join("\n"), "draft");
+
+        let action = press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert!(!app.reading_mode, "PageDown must exit reading mode");
+        assert_eq!(app.input.lines().join("\n"), "draft");
+    }
+
     // === T084(e): Ctrl+J newline fallback ===
 
     /// Ctrl+J (the LF byte; kitty-modern terminals deliver it as
