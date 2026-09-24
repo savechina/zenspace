@@ -559,22 +559,23 @@ async fn approval_routes_to_origin_only() {
     let _guard_a = broker.register("turnA".to_string(), handle_a, || {});
     let _guard_b = broker.register("turnB".to_string(), handle_b, || {});
 
-    // Both routing calls block until their own pipe answers them, so
-    // they run off-task while this task plays responder for each side.
+    // Turn-bound claims (SC-007, T103): exact-match pairing, deterministic
+    // under any thread scheduling. The legacy first-free `route` re-claims
+    // the just-released first route when spawn_blocking calls run
+    // back-to-back (2-core CI), sending both Q3s to one origin — the hang
+    // this test once hit; do not "simplify" back to `route`.
     let router_a = Arc::clone(&broker);
     let router_b = Arc::clone(&broker);
-    let routed_a =
-        tokio::task::spawn_blocking(move || router_a.route("fs.write".into(), json!({})));
-    let routed_b =
-        tokio::task::spawn_blocking(move || router_b.route("shell.exec".into(), json!({})));
+    let routed_a = tokio::task::spawn_blocking(move || {
+        router_a.route_for("turnA".into(), "fs.write".into(), json!({}))
+    });
+    let routed_b = tokio::task::spawn_blocking(move || {
+        router_b.route_for("turnB".into(), "shell.exec".into(), json!({}))
+    });
 
-    // Pipes are bound at REGISTER time (handle_a owns turnA), so the
-    // pipe↔turnId mapping is deterministic even though WHICH racing
-    // route() caller claims which turn is not — the broker pairs free
-    // routes to invocations 1:1 by claim order, and each decision flows
-    // back through the claimed route. The observable SC-007 contract is
-    // therefore: requests appear on their own origins, and the
-    // approve/deny pair resolves exactly one caller each.
+    // Pipes are bound at REGISTER time (handle_a owns turnA), and the
+    // exact-match claim routes each Q3 to its own origin unconditionally,
+    // so this task can play responder for each side in turn.
     let Frame::ServerRequest {
         params: params_a,
         method: method_a,
@@ -611,17 +612,15 @@ async fn approval_routes_to_origin_only() {
         .await
         .unwrap();
 
-    // Exactly one caller observed the approve and exactly one the deny;
-    // which physical router claimed which turn is intentionally left
-    // unobserved (claim-order race is part of the broker's design).
+    // Exact-match claims make the outcome deterministic: turnA's caller
+    // observed the approve, turnB's caller the deny.
     let routed_a = routed_a.await.unwrap();
     let routed_b = routed_b.await.unwrap();
     assert!(
-        routed_a != routed_b,
-        "approve/deny must resolve opposite callers (got a={routed_a}, b={routed_b})"
+        routed_a && !routed_b,
+        "approve must resolve turnA's caller and deny turnB's (got a={routed_a}, b={routed_b})"
     );
 }
-
 #[tokio::test]
 async fn doom_loop_guard_rejects_21st_submit_with_audit() {
     let dir = tempfile::tempdir().unwrap();
