@@ -44,13 +44,24 @@ impl SlashCommandRegistry {
             .and_then(|&idx| self.commands.get(idx))
     }
 
+    /// Codex-parity ranking (`bottom_pane/command_popup.rs::filtered`):
+    /// exact name matches hoist above prefix matches; each tier keeps
+    /// registration (presentation) order. Case-insensitive on the lowercase
+    /// command names; an empty filter keeps pure registration order.
     pub fn filter_indices(&self, prefix: &str) -> Vec<usize> {
-        self.commands
-            .iter()
-            .enumerate()
-            .filter(|(_, cmd)| cmd.name.starts_with(prefix))
-            .map(|(idx, _)| idx)
-            .collect()
+        let needle = prefix.to_lowercase();
+        let mut exact = Vec::new();
+        let mut prefixed = Vec::new();
+        for (idx, cmd) in self.commands.iter().enumerate() {
+            let name = cmd.name.to_lowercase();
+            if name == needle {
+                exact.push(idx);
+            } else if name.starts_with(&needle) {
+                prefixed.push(idx);
+            }
+        }
+        exact.extend(prefixed);
+        exact
     }
 
     #[allow(dead_code)]
@@ -448,7 +459,6 @@ fn render_slash_popup_inner(
         return;
     }
 
-    let total = state.filtered_indices.len();
     let rows = popup_rows(state, registry);
     if rows.is_empty() {
         return;
@@ -478,9 +488,12 @@ fn render_slash_popup_inner(
     let has_items_above = start > 0;
     let has_items_below = end < rows.len();
 
-    let selected_style = Style::default()
-        .fg(ratatui::style::Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    // Codex-parity selection (style/contrast.rs fallback): the selected row
+    // renders as a full-width REVERSED bar with a BOLD name; its description
+    // loses dim AND bold. Unselected rows keep muted descriptions with the
+    // matched filter substring bolded (command_popup rows_from_matches).
+    let selection_bar = Style::default().add_modifier(Modifier::REVERSED);
+    let selected_style = Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
     let unselected_name_style = Style::default();
     let unselected_desc_style = theme.text_muted();
     let header_style = theme
@@ -490,7 +503,10 @@ fn render_slash_popup_inner(
 
     // T084(a): aligned description column — measure the name field over the
     // visible items, pad shorter names, truncate descriptions to fit.
-    let name_width = window
+    // Codex-parity stable column (`ColumnWidthMode::AutoAllRows`): measure
+    // over ALL rows, not the visible window, so the description column never
+    // shifts while scrolling.
+    let name_width = rows
         .iter()
         .filter_map(|row| match row {
             PopupRow::Item { cmd_idx, .. } => registry
@@ -503,11 +519,7 @@ fn render_slash_popup_inner(
         .unwrap_or(0);
     let desc_avail = (popup_area.width as usize).saturating_sub(name_width + 2);
 
-    // T084(f): the match index rides the last ITEM row (footer-within-budget —
-    // ADR-006 forbids spending an extra row on it).
-    let last_item = window
-        .iter()
-        .rposition(|row| matches!(row, PopupRow::Item { .. }));
+    let mut is_selected_row = false;
     for (row, popup_row) in window.iter().enumerate() {
         let mut spans = Vec::new();
         match popup_row {
@@ -528,7 +540,9 @@ fn render_slash_popup_inner(
                 }
                 .patch(row_bg);
                 let alias_style = if is_selected {
-                    selected_style
+                    // codex: secondary text on the selected row keeps the bar
+                    // but loses bold and dim.
+                    selection_bar
                 } else {
                     unselected_desc_style
                 }
@@ -538,7 +552,29 @@ fn render_slash_popup_inner(
                 // old name-default / aliases-dim coloring.
                 let alias_at = name_field.find(" (").unwrap_or(name_field.len());
                 let alias_suffix = name_field.split_off(alias_at);
-                spans.push(Span::styled(name_field.clone(), name_style));
+                // Bold the matched filter substring (codex bolds match chars
+                // after the leading '/'): field = [glyph, ' ', '/', name…].
+                let field_chars: Vec<char> = name_field.chars().collect();
+                let match_len = state
+                    .filter
+                    .chars()
+                    .count()
+                    .min(field_chars.len().saturating_sub(3));
+                let head: String = field_chars[..3.min(field_chars.len())].iter().collect();
+                let matched: String = field_chars[3..3 + match_len].iter().collect();
+                let tail: String = field_chars[3 + match_len..].iter().collect();
+                spans.push(Span::styled(head, name_style));
+                if !matched.is_empty() {
+                    let match_style = if is_selected {
+                        selected_style
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    };
+                    spans.push(Span::styled(matched, match_style.patch(row_bg)));
+                }
+                if !tail.is_empty() {
+                    spans.push(Span::styled(tail, name_style));
+                }
                 if !alias_suffix.is_empty() {
                     spans.push(Span::styled(alias_suffix.clone(), alias_style));
                 }
@@ -551,20 +587,15 @@ fn render_slash_popup_inner(
                 }
                 let desc: String = cmd.description.chars().take(desc_avail).collect();
                 let desc_style = if is_selected {
-                    selected_style
+                    // codex apply_row_state_style: the selected description
+                    // keeps the bar but loses bold and dim.
+                    selection_bar
                 } else {
                     unselected_desc_style
                 }
                 .patch(row_bg);
                 spans.push(Span::styled(format!("  {desc}"), desc_style));
-
-                // T084(f): match index on the last item row.
-                if Some(row) == last_item {
-                    spans.push(Span::styled(
-                        format!("  {}/{}", state.selected + 1, total),
-                        unselected_desc_style.patch(row_bg),
-                    ));
-                }
+                is_selected_row = is_selected;
             }
         }
 
@@ -575,6 +606,16 @@ fn render_slash_popup_inner(
         let is_last_rendered = row + 1 == window.len();
         if is_last_rendered && has_items_below {
             spans.push(Span::styled("  ▼", unselected_desc_style.patch(row_bg)));
+        }
+        // Full-width selection bar (codex line-level selection style): pad
+        // the remainder of the row AFTER the scroll indicators, so an
+        // indicator on the selected row is never clipped by the fill.
+        if is_selected_row {
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            let fill = (popup_area.width as usize).saturating_sub(used);
+            if fill > 0 {
+                spans.push(Span::styled(" ".repeat(fill), selection_bar.patch(row_bg)));
+            }
         }
 
         let line = Line::from(spans);
@@ -956,21 +997,21 @@ mod tests {
         );
     }
 
-    // === T084(f): `›` glyph + match index ===
+    // === T084(f): `›` glyph (sel/total match index dropped for codex parity —
+    // codex communicates selection with the glyph + bar alone) ===
 
     #[test]
-    fn t084_selected_row_has_glyph_prefix_and_match_index() {
+    fn t084_selected_row_has_glyph_prefix_and_no_match_index() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let registry = create_default_registry();
-        let total = registry.all_commands().len();
         let mut state = SlashState::new();
         state.on_input_change("/", &registry);
 
         // Wide viewport (100 cols): the last window item row is already
-        // full-width at 60 cols, which would clip the match index — the
-        // index asserts need a viewport where the description column fits.
+        // full-width at 60 cols, which would clip the description — the
+        // asserts need a viewport where the description column fits.
         let backend = TestBackend::new(100, 8);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let popup_area = ratatui::layout::Rect::new(0, 0, 100, 8);
@@ -1001,10 +1042,119 @@ mod tests {
             help_row.contains("Show available commands"),
             "description column must render: {help_row:?}"
         );
-        let index = format!("1/{total}");
+        for y in 0..8 {
+            assert!(
+                !row_text(y).contains(&format!("1/{}", registry.all_commands().len())),
+                "sel/total match index must NOT render (dropped for codex parity)"
+            );
+        }
+    }
+
+    // === Codex-parity refinements (post-T084 popup study) ===
+
+    #[test]
+    fn t084_exact_match_hoists_above_prefix() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("mode".to_string(), vec![], "Mode".to_string());
+        registry.register("model".to_string(), vec![], "Model".to_string());
+        let mut state = SlashState::new();
+        state.on_input_change("/model", &registry);
+        assert_eq!(
+            state.selected_command(&registry),
+            Some("model"),
+            "exact match must hoist above the earlier-registered prefix match"
+        );
+    }
+
+    #[test]
+    fn t084_matched_filter_chars_render_bold_on_unselected_rows() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("help".to_string(), vec![], "Show help".to_string());
+        registry.register("hello".to_string(), vec![], "Say hello".to_string());
+        let mut state = SlashState::new();
+        state.on_input_change("/he", &registry);
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 80, 8);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+        // The /hello row (unselected): x3 is the first matched name char 'h'
+        // (x0-1 glyph inset, x2 the '/'). codex bolds matched chars. The row
+        // index is not fixed — a group header may occupy the first rows.
+        let hello_row = (0..8)
+            .find(|y| row_text(*y).contains("/hello"))
+            .expect("hello row must render");
+        let cell = buf.cell((3, hello_row)).expect("hello name cell");
         assert!(
-            (0..8).map(row_text).any(|row| row.contains(&index)),
-            "match index 1/{total} must render on the last item row"
+            cell.style().add_modifier.contains(Modifier::BOLD),
+            "matched filter chars must render bold: {:?}",
+            cell.style()
+        );
+    }
+
+    #[test]
+    fn t084_selected_row_renders_reversed_bar_with_unbold_undim_desc() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let registry = create_default_registry();
+        let mut state = SlashState::new();
+        state.on_input_change("/", &registry);
+        let backend = TestBackend::new(100, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let popup_area = ratatui::layout::Rect::new(0, 0, 100, 8);
+        let theme = crate::tui::theme::ZenTheme;
+        terminal
+            .draw(|frame| {
+                render_slash_popup_inline(frame, &state, popup_area, &theme, &registry);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String {
+            let mut s = String::new();
+            for x in 0..buf.area.width {
+                s.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            s.trim_end().to_string()
+        };
+        let selected_row = (0..8)
+            .find(|y| row_text(*y).starts_with('\u{203a}'))
+            .expect("selected row must carry the › glyph");
+        // The bar covers the row start...
+        let first = buf.cell((0, selected_row)).expect("first cell");
+        assert!(
+            first.style().add_modifier.contains(Modifier::REVERSED),
+            "selected row must render the reversed bar: {:?}",
+            first.style()
+        );
+        // ...and the description keeps the bar but loses bold and dim.
+        let desc_x = row_text(selected_row)
+            .find("Show available commands")
+            .expect("description must render on the selected row") as u16;
+        let desc = buf.cell((desc_x, selected_row)).expect("desc cell");
+        let st = desc.style();
+        assert!(
+            st.add_modifier.contains(Modifier::REVERSED),
+            "selected description must keep the bar: {st:?}"
+        );
+        assert!(
+            !st.add_modifier.contains(Modifier::BOLD) && !st.add_modifier.contains(Modifier::DIM),
+            "selected description must lose bold and dim: {st:?}"
         );
     }
 
