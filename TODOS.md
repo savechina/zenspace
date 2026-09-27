@@ -123,3 +123,18 @@ Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias 
 **Effort:** S-M. **Priority:** P2. **Depends on:** none.
 
 **Completed:** 2026-09-20 (/speckit-implement batch 3): pricing config keys + metered completion path + WorkerCostLedger sidecar + cap-trip test. Remaining accuracy follow-up: provider usage tokens (currently bytes/4 estimate).
+
+## Review (2026-09-27 /plan-eng-review — docs/src user guide)
+
+### User-guide consistency check in CI (docs-rot alarm)
+
+**What:** A test (or script wired into `.github/workflows/docs.yml`) asserting `docs/src/cli-commands.md` command tables match the live clap surface (renderable from the `Commands` enum in `crates/zen-cli/src/cli.rs` or `zen --help` output), and spot-asserting documented config keys exist as serde fields on the `zen-core` config structs. Fail CI on drift.
+
+**Why:** The user guide went stale three times — 29→20→23 command count, removed `note`/`search` commands still taught, phantom `llm_preferences`/`max_sensitivity` keys documented that never parsed in any revision. Every drift was silent: users got wrong instructions with no error anywhere. The 2026-09-27 audit (`8c50f62`) fixed the backlog by hand; nothing prevents the next one.
+
+**Pros:** Turns silent doc rot into a red CI job; gates the highest-traffic factual claims (command surface, config keys) with near-zero maintenance once written.
+
+**Cons:** Deliberate guide restructuring requires updating the test; covers tables/keys only, not prose claims.
+
+**Context:** Narrower sibling of the deferred single-ledger TODO above (D2-A covers spec closure records; this gates the user guide's factual tables). Start from the `Commands` enum variants (names render deterministically) and `ProviderConfig`/`AgentConfig`/`Agentic*Config` serde fields in `crates/zen-core/src/config.rs`. Trigger: any future CLI/config surface change lands.
+**Effort:** S-M. **Priority:** P2. **Depends on:** none.

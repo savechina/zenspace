@@ -58,9 +58,10 @@ Zen's CLI surface is intentionally small: the TUI plus 23 subcommands. Heavy cap
 
 | Command | Description |
 |---------|-------------|
-| `zen serve start` | Start gateway daemon (`--foreground`, `--http` for loopback HTTP carrier) |
+| `zen serve start` | Start gateway daemon (`--foreground`, `--http` for loopback HTTP carrier, `--mcp` for stdio MCP mode) |
 | `zen serve status` | Daemon health |
 | `zen serve stop` | Stop daemon |
+| `zen serve test` | Test MCP connectivity |
 | `zen serve install` / `uninstall` | Manage macOS launchd auto-start |
 | `zen doctor` | System health: 8 liveness probes (`--json` for scripts) |
 | `zen clean cache` | Clean caches (ungated) |

@@ -72,10 +72,11 @@ zenspace/
 │   │   ├── quickstart.md
 │   │   └── ...
 │   ├── theme/            # mdBook custom theme
-│   ├── book/             # Generated HTML output
-│   └── specs/            # Architecture specifications
+│   └── book/             # Generated HTML output
 └── bin/                  # Build/test/lint/release scripts
 ```
+
+> **Architecture specifications:** deep architecture/spec docs live in [AGENTS.md](https://github.com/savechina/zenspace/blob/main/AGENTS.md) (the dev-facing knowledge base). The former `docs/specs/` directory is no longer present on disk.
 
 ## Release
 

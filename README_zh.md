@@ -45,23 +45,13 @@
 ## 🚀 快速开始
 
 ```bash
-# 安装（macOS）
-brew install savechina/tap/zenspace
-
-# 首次运行 — 打开 TUI 并初始化 ~/.zen
-zen
-
-# 把笔记丢进管线 — 蒸馏循环自动提取、关联、归档
-mkdir -p ~/.zen/vault/inbox && $EDITOR ~/.zen/vault/inbox/q3-planning.md
-
-# 系统健康检查（8 项探针）
-zen doctor
-
-# 看看自动构建的 wiki
-zen wiki list
+brew install savechina/tap/zenspace   # Linux 亦可用 cargo install zen（需 bubblewrap）
+zen                                   # 首次运行 — 打开 TUI 并初始化 ~/.zen
+zen doctor                            # 系统健康检查（8 项探针）
+zen wiki list                         # 看看自动构建的 wiki
 ```
 
-[快速开始 →](https://savechina.github.io/zenspace/quickstart.html) | [安装 →](https://savechina.github.io/zenspace/installation.html)
+[完整指南 →](https://savechina.github.io/zenspace/quickstart.html)
 
 ---
 

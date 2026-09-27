@@ -45,27 +45,13 @@ Local-first by default. macOS Keychain for secrets. Sensitive data never touches
 ## 🚀 Quick Start
 
 ```bash
-# Install (macOS or Linux via Homebrew)
-brew install savechina/tap/zenspace
-
-# Install (Linux via cargo)
-sudo apt install bubblewrap  # Required for sandbox isolation
-cargo install zen
-
-# First run — opens the TUI and initializes ~/.zen
-zen
-
-# Drop a note into the pipeline — the distill loop extracts, links, and archives it
-mkdir -p ~/.zen/vault/inbox && $EDITOR ~/.zen/vault/inbox/q3-planning.md
-
-# Check system health (8 probes)
-zen doctor
-
-# See the wiki that built itself
-zen wiki list
+brew install savechina/tap/zenspace   # or: cargo install zen (needs bubblewrap on Linux)
+zen                                   # first run — opens the TUI, initializes ~/.zen
+zen doctor                            # 8 health probes
+zen wiki list                         # see the wiki that built itself
 ```
 
-[Quick Start Guide →](https://savechina.github.io/zenspace/quickstart.html) | [Installation →](https://savechina.github.io/zenspace/installation.html)
+[Full Quick Start Guide →](https://savechina.github.io/zenspace/quickstart.html)
 
 ---
 
@@ -75,7 +61,7 @@ zen wiki list
 |---------|-------------|
 | [Installation](https://savechina.github.io/zenspace/installation.html) | Homebrew, source, binary (macOS & Linux) |
 | [Quick Start](https://savechina.github.io/zenspace/quickstart.html) | 5-minute walkthrough |
-| [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 20 commands |
+| [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 23 commands |
 | [Providers & Auth](https://savechina.github.io/zenspace/configuration/providers.html) | 9 protocol types, API keys |
 | [Agent Routing](https://savechina.github.io/zenspace/configuration/agent-routing.html) | Per-agent model assignment |
 | [System Overview](https://savechina.github.io/zenspace/architecture/overview.html) | Architecture & data flow |
