@@ -107,7 +107,7 @@ See [AGENTS.md](https://github.com/savechina/zenspace/blob/main/AGENTS.md) for t
 1. **CLI-First** — Every feature via CLI subcommands
 2. **Robust Error Handling** — `thiserror` for types, `anyhow` for propagation
 3. **Observability** — Structured logging via `tracing`
-4. **Configuration** — `.env` via `dotenvy`, 5-layer config inheritance
+4. **Configuration** — `.env` via `dotenvy`, 4-layer global-only config inheritance
 5. **Template-Driven** — Embedded templates via `include_dir`
 6. **Code Quality** — Zero warnings, `unsafe` blocks justified
 7. **Single Responsibility** — 12 crates with clear boundaries

@@ -12,7 +12,7 @@ Zen is a **Rust CLI productivity suite** with agentic workspace architecture. It
                    │
 ┌──────────────────▼──────────────────────────┐
 │  zen-cli (library)                           │
-│  clap Parser (29 commands), TUI (ratatui)   │
+│  clap Parser (23 commands), TUI (ratatui)   │
 │  command dispatcher                          │
 └──┬────┬────┬────┬────┬────┬────┬────┬───────┘
    │    │    │    │    │    │    │    │
@@ -28,17 +28,17 @@ Zen is a **Rust CLI productivity suite** with agentic workspace architecture. It
 | Crate | Role | Key Modules |
 |-------|------|-------------|
 | **zen** | Binary entry (13-line main.rs) | `.env` loading, dispatches to `zen_cli::shell()` |
-| **zen-cli** | CLI library | 29 commands, TUI (ratatui), clap derive dispatch |
-| **zen-core** | Core infrastructure | 5-layer config, error taxonomy, path scoping, constants, secrets |
+| **zen-cli** | CLI library | 23 commands, TUI (ratatui), clap derive dispatch |
+| **zen-core** | Core infrastructure | 4-layer global-only config, error taxonomy, path scoping, constants, secrets |
 | **zen-service** | Business logic | Starter/wps/cleanup services |
 | **zen-repo** | Data layer | sqlx + rusqlite dual API, FTS5, vec0, graph schema |
 | **zen-vault** | Knowledge services | Note, Wiki, 5-tier search, consolidation, lint, ingest |
-| **zen-agents** | Agent system | 13 agents, 4 tiers, blackboard, QualityPipeline, registry |
+| **zen-agents** | Agent system | 13 agents, 4 tiers, plan-DAG executor, QualityPipeline, registry, scheduler workers |
 | **zen-provider** | LLM routing | 13 providers, 3 protocol types, DefaultRouter, auth resolution |
 | **zen-memory** | Identity context | SOUL.md, MEMORY.md loading and management |
 | **zen-auth** | Credential management | Keychain integration, SecretRef resolution |
-| **zen-plugin** | Extension system | WASM sandbox (wasmtime), MCP server |
-| **zen-gateway** | HTTP daemon | Axum-based HTTP server (placeholder) |
+| **zen-plugin** | Extension system | WASM sandbox (wasmtime), MCP client/server, agent tools |
+| **zen-gateway** | Sole-owner daemon | UDS JSON-RPC 2.0, hosted agent sessions, loopback HTTP carrier, MCP stdio, QQ bot channel |
 
 ## Key Architectural Patterns
 
@@ -46,13 +46,13 @@ Zen is a **Rust CLI productivity suite** with agentic workspace architecture. It
 
 The `zen` binary (13 lines in `crates/zen/src/main.rs`) loads `.env`, calls `zen_core::config::load_config()`, then delegates to `zen_cli::shell().await`. All logic lives in library crates.
 
-### 5-Layer Configuration
+### 4-Layer Configuration (global-only)
 
 ```
-Embedded defaults → ~/.zen/config.toml → .zen/config.toml → ZEN_* env vars
+Rust built-in defaults → embedded config.toml → ~/.zen/config.toml → ZEN_* env vars
 ```
 
-Each layer merges into the previous one — higher layers override only the keys they set.
+Each layer merges into the previous one — higher layers override only the keys they set. Configuration is global-only: the `.zen/` directory marks project context but is not a config layer.
 
 ### 4-Tier Agent Architecture
 
@@ -60,8 +60,8 @@ Each layer merges into the previous one — higher layers override only the keys
 Orchestrator (L0) → Planner (L1) → Specialist (L2) → Worker (L3)
 ```
 
-- **Orchestrator**: Session coordination, routing (ZenCoordinator)
-- **Planner**: Task decomposition, planning (AgentOrchestrator, Prometheus)
+- **Orchestrator**: Session coordination, intent routing (AgentOrchestrator, Sisyphus)
+- **Planner**: Task decomposition, plan-DAG execution (Prometheus)
 - **Specialist**: Domain expertise (search, consolidate, research)
 - **Worker**: Execution, tool calling (AgentExecutor)
 
@@ -94,20 +94,18 @@ Each tier adds depth: keyword search first, semantic when needed.
 ### Data Flow: Note Creation to Wiki
 
 ```
-zen note create → zen-vault (NoteService) → Markdown file in inbox/
-                                        → zen-repo (sqlx insert)
-                                        
-zen consolidate → zen-vault (ConsolidationPipeline)
-                → zen-provider (entity extraction)
-                → zen-repo (graph entities)
-                → zen-vault (WikiPage generation)
-                
-zen search run → zen-vault (SearchService)
-               → tier 1: ripgrep
-               → tier 2: FTS5 (notes_fts)
-               → tier 3: vec0 embeddings
-               → tier 4: entity graph
-               → tier 5: LLM semantic reranking
+note dropped into vault/inbox/ → ZenScheduler (zen_loop worker, every 5 min)
+    → zen-vault (DistillationPipeline: extract → normalize → compile → merge → archive)
+    → zen-provider (entity extraction)
+    → zen-repo (graph entities + FTS5 + embeddings)
+    → zen-vault (WikiPage generation, AtomicWikiWriter)
+
+search (TUI chat / agent tools) → zen-vault (SearchService)
+    → tier 1: ripgrep
+    → tier 2: FTS5 (notes_fts)
+    → tier 3: vec0 embeddings
+    → tier 4: entity graph (+ PPR seeded ranking)
+    → tier 5: LLM semantic reranking
 ```
 
 ---
