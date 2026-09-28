@@ -152,7 +152,7 @@ Plan: `~/.gstack/projects/zenspace/ceo-plans/2026-09-27-openkb-compile-hygiene.m
 **Pros:** Makes hand-edits durable; removes the "pipeline vs human" conflict class. **Cons:** Storage growth (needs the retention worker to prune iterations); one more read path in compile.
 
 **Context:** Implement AFTER Phase 2's mutation journal lands (shares the snapshot/journal infrastructure — building it first would duplicate). Start from `zen-vault/src/distill/pipeline.rs` compile-write path + `AtomicWikiWriter`.
-**Effort:** M (human ~3d / CC ~2-3h). **Priority:** P3. **Depends on:** Phase 2 mutation journal (④).
+**Effort:** M (human ~3d / CC ~2-3h). **Priority:** P3. **Depends on:** Phase 2 mutation journal (④) — **IMPLEMENTED per compile-hygiene Phase 4 [X] 2026-09-28: `crates/zen-vault/src/wiki/iterations.rs` (`PageIterations` capture at compile/merge/wikilink-rewrite overwrites into `vault/iterations/`, txn-tracked; `zen wiki rollback [--list][--to <millis>]` with reversible restore; retention age-delete @ 90d; `loop.page.iterations` audit line; commit `e8ef9e2`)**
 
 ### E7 — SKILL.md export for external agents
 
@@ -163,7 +163,7 @@ Plan: `~/.gstack/projects/zenspace/ceo-plans/2026-09-27-openkb-compile-hygiene.m
 **Pros:** Tiny surface (one rendered file + a `zen wiki export-skill` writer); makes the KB consumable outside zen. **Cons:** Personal-workflow preference — only valuable if the owner actually drives external agents at the vault.
 
 **Context:** Writer renders `wiki/index.md` summary + navigation conventions into the skill format; source of truth stays the vault. Start from `zen skill` command surface.
-**Effort:** S (human ~2h / CC ~1h). **Priority:** P3. **Depends on:** none.
+**Effort:** S (human ~2h / CC ~1h). **Priority:** P3. **Depends on:** none. — **IMPLEMENTED per compile-hygiene Phase 4 [X] 2026-09-28: `crates/zen-vault/src/wiki/skill_export.rs` + `zen wiki export-skill [--output][--json]` (Agent Skills spec-conformant: six portable frontmatter fields, `zen-wiki` identity = directory name, 240-entry index cap; default target `~/.zen/skills/zen-wiki/SKILL.md` discoverable by zen's own SkillLoader; commit `697daee`)**
 
 ### ⑥ scope note — PDF parsing (from same review)
 
