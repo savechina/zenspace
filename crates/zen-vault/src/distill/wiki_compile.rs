@@ -697,7 +697,7 @@ fn truncate_for_description(s: &str) -> String {
     }
 }
 
-fn slugify(title: &str) -> String {
+pub(crate) fn slugify(title: &str) -> String {
     let mut slug = String::with_capacity(title.len());
     let mut prev_dash = false;
 

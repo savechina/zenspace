@@ -617,6 +617,16 @@ impl DistillationPipeline {
         let txn = TransactionScope::new(&format!("distill-{cycle_id}"));
         txn.begin()?;
 
+        // Compile-hygiene E3: cycle-start cascade — strip source entries
+        // whose files left the vault, delete fully-orphaned machine pages,
+        // clean inbound links. Runs INSIDE the txn so CAS rollback and
+        // crash replay cover every mutation. Fail-open.
+        if wiki_dir.is_dir()
+            && let Err(e) = super::cascade::sweep_dead_sources(wiki_dir, &txn)
+        {
+            warn!(error = %e, "E3 cascade sweep failed — continuing (fail-open)");
+        }
+
         // FR-031b: consult the placeholder registry so page creates whose
         // slugs were reserved during Agent planning are recorded this cycle.
         // Missing file → empty registry; corrupt file → fresh (non-fatal).
@@ -673,6 +683,21 @@ impl DistillationPipeline {
         );
         match run.await {
             Ok(mut outcome) => {
+                // Compile-hygiene E3 archive hook: pages compiled this cycle
+                // cite the inbox path; re-point them at the durable archive
+                // dest so provenance survives the source's removal. Txn-
+                // tracked — a CAS rollback restores the old sources list
+                // together with the rolled-back archive dest. Fail-open.
+                for (from, dest) in &outcome.report.migrated_files {
+                    if let Err(e) = super::cascade::redirect_page_source(wiki_dir, from, dest, &txn)
+                    {
+                        warn!(
+                            source = %from.display(),
+                            error = %e,
+                            "E3 provenance redirect failed — next sweep will strip the dead entry"
+                        );
+                    }
+                }
                 // FR-032 (T033): self-write-aware OCC. The snapshot covers
                 // pre-existing wiki pages; this cycle's own rewrites (merges,
                 // link rewrites, regenerated index/log) are txn-tracked and

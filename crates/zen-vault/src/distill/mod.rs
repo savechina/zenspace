@@ -1,6 +1,7 @@
 pub mod adversarial;
 pub mod archive;
 pub mod baselines;
+pub mod cascade;
 pub mod checkpoint;
 pub mod contradiction;
 pub mod convert;
@@ -34,6 +35,7 @@ pub use adversarial::{
     judge_case, report_path, run_arena,
 };
 pub use baselines::compute as compute_baselines;
+pub use cascade::{CascadeReport, redirect_page_source, sweep_dead_sources};
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use contradiction::{Contradiction, ContradictionDetector};
 pub use correlation::{Opportunity, correlate};
