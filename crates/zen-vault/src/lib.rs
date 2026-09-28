@@ -43,7 +43,8 @@ pub use tindy::{
     needs_reindex, reindex_all, update_checksum,
 };
 pub use wiki::{
-    CapturedIteration, IterationVersion, PageIterations, WikiIndex, WikiLog, WikiPage,
-    WikiStructure,
+    CapturedIteration, IterationVersion, PageIterations, WIKI_SKILL_NAME, WikiIndex, WikiLog,
+    WikiPage, WikiSkillPage, WikiStructure, collect_skill_pages, render_wiki_skill_md,
+    skill_file_name,
 };
 pub use zen_repo::SqliteClient;

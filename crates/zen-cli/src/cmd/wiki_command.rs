@@ -52,6 +52,15 @@ pub enum WikiCommands {
         #[command(subcommand)]
         command: crate::cmd::loop_command::LoopCommands,
     },
+    /// Export the wiki as an Agent Skills SKILL.md for external agents (E7)
+    ExportSkill {
+        /// Output file (default: ~/.zen/skills/zen-wiki/SKILL.md)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Machine-readable summary (written path + page count)
+        #[arg(long)]
+        json: bool,
+    },
     /// Page-version iterations: list or restore a prior version (E5)
     Rollback {
         /// Page title, file stem, or wiki-relative path
@@ -252,6 +261,10 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             Ok(())
         }
         WikiCommands::Loop { command } => crate::cmd::loop_command::execute_command(command).await,
+        WikiCommands::ExportSkill { output, json } => {
+            debug!("export-skill: output={:?} json={}", output, json);
+            wiki_export_skill(output.as_deref(), *json)
+        }
         WikiCommands::Rollback { name, to, list } => {
             debug!("rollback: name={:?} to={:?} list={}", name, to, list);
             wiki_rollback(name.as_deref(), *to, *list)
@@ -436,5 +449,52 @@ fn wiki_rollback(name: Option<&str>, to: Option<i64>, list: bool) -> Result<(), 
         name.bold(),
         when,
     );
+    Ok(())
+}
+
+/// E7 SKILL.md export: render the wiki inventory into an Agent Skills
+/// file so external agents (Claude Code / Codex CLI / Gemini CLI) can
+/// read the KB with zero runtime setup. Default target
+/// `~/.zen/skills/zen-wiki/SKILL.md` — the directory name MUST equal the
+/// frontmatter `name` (Agent Skills spec), which also makes the exported
+/// skill discoverable by zen's own SkillLoader (FR-039 neutral plane).
+fn wiki_export_skill(output: Option<&std::path::Path>, json: bool) -> Result<(), ZenError> {
+    let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
+    let wiki_dir = paths.wiki();
+    let pages =
+        zen_vault::collect_skill_pages(&wiki_dir).map_err(|e| ZenError::Message(e.to_string()))?;
+    let rendered = zen_vault::render_wiki_skill_md(&pages);
+
+    let out_path = match output {
+        Some(p) => p.to_path_buf(),
+        None => paths
+            .skills()
+            .join(zen_vault::WIKI_SKILL_NAME)
+            .join(zen_vault::skill_file_name()),
+    };
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ZenError::Message(format!("create {}: {e}", parent.display())))?;
+    }
+    zen_core::atomic_file::write_atomic(&out_path, rendered.as_bytes())
+        .map_err(|e| ZenError::Message(format!("write {}: {e}", out_path.display())))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": out_path.display().to_string(),
+                "pages": pages.len(),
+            })
+        );
+    } else {
+        println!(
+            "{} Exported {} wiki page{} to {}",
+            "✅".green(),
+            pages.len(),
+            if pages.len() == 1 { "" } else { "s" },
+            out_path.display(),
+        );
+    }
     Ok(())
 }
