@@ -138,3 +138,33 @@ Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias 
 
 **Context:** Narrower sibling of the deferred single-ledger TODO above (D2-A covers spec closure records; this gates the user guide's factual tables). Start from the `Commands` enum variants (names render deterministically) and `ProviderConfig`/`AgentConfig`/`Agentic*Config` serde fields in `crates/zen-core/src/config.rs`. Trigger: any future CLI/config surface change lands.
 **Effort:** S-M. **Priority:** P2. **Depends on:** none.
+
+## Review (2026-09-27 /plan-ceo-review — OpenKB compile-hygiene program, deferred items)
+
+Plan: `~/.gstack/projects/zenspace/ceo-plans/2026-09-27-openkb-compile-hygiene.md` (9 accepted workstreams in 3 phases; the two below were explicitly deferred by owner decision).
+
+### E5 — Compiled-wiki page versioning + rollback (iteration-N)
+
+**What:** Before a recompile overwrites a wiki page, save the prior version to `iteration-N/` with a diff; add a rollback surface. Modeled on OpenKB's Skill Factory (`skill history`/`skill rollback`), which exists precisely because OpenKB's own wiki recompile overwrites manual edits (documented known gap).
+
+**Why:** zen's distill recompile has the same overwrite exposure — today only partially mitigated by the CAS VersionSnapshot (self-write-aware OCC), which protects against *external* drift, not against the pipeline itself clobbering a hand-tuned page.
+
+**Pros:** Makes hand-edits durable; removes the "pipeline vs human" conflict class. **Cons:** Storage growth (needs the retention worker to prune iterations); one more read path in compile.
+
+**Context:** Implement AFTER Phase 2's mutation journal lands (shares the snapshot/journal infrastructure — building it first would duplicate). Start from `zen-vault/src/distill/pipeline.rs` compile-write path + `AtomicWikiWriter`.
+**Effort:** M (human ~3d / CC ~2-3h). **Priority:** P3. **Depends on:** Phase 2 mutation journal (④).
+
+### E7 — SKILL.md export for external agents
+
+**What:** Generate a `SKILL.md`-style entry (Anthropic/Codex skill format) that points external agents (Claude Code, Codex CLI, Gemini CLI) at the compiled zen wiki — zero-runtime discovery, no MCP setup.
+
+**Why:** OpenKB ships this so any external agent can read its wiki with no extra machinery. zen already has the FR-039 neutral plane (`zen skill list --json`) but does not expose the wiki itself to foreign agents.
+
+**Pros:** Tiny surface (one rendered file + a `zen wiki export-skill` writer); makes the KB consumable outside zen. **Cons:** Personal-workflow preference — only valuable if the owner actually drives external agents at the vault.
+
+**Context:** Writer renders `wiki/index.md` summary + navigation conventions into the skill format; source of truth stays the vault. Start from `zen skill` command surface.
+**Effort:** S (human ~2h / CC ~1h). **Priority:** P3. **Depends on:** none.
+
+### ⑥ scope note — PDF parsing (from same review)
+
+`ingest_local_file` is plain `read_to_string` (crates/zen-vault/src/ingest/web.rs:42-44) — no PDF capability. Tree-index workstream ⑥ first phase covers markdown/long-text segmentation only; PDF parsing requires a new dependency (audit per Constitution XI before adding).
