@@ -1,8 +1,13 @@
+pub mod cache;
 pub mod embedding;
 pub mod model_meta;
 pub mod providers;
 mod router;
 pub mod stream;
+
+pub use cache::{
+    CacheSegments, CacheUsage, CachedCompletion, PromptCacheControl, PromptSegment, SegmentKind,
+};
 
 pub use embedding::{
     DefaultEmbeddingRouter, EmbeddingError, EmbeddingProvider, EmbeddingRouter,

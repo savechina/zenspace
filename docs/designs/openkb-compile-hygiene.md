@@ -41,7 +41,8 @@ OpenKB 的核心论点："传统 RAG 每次查询从零重发现知识；OpenKB 
 
 ## Test Strategy（每项随 PR 交付，bin/test 门禁）
 **评估门禁（2A 决策 2026-09-27 eng 评审）：②③ 属 LLM/prompt 变更 — 两 PR 必须附带 `zen discover arena` 蒸馏回归对比结果（vs baseline，无退化才合）。**
-**② arena 处置记录（2026-09-28）**：`zen discover arena` 实跑 = zen-distill 4/5（bare-singletons 负于 naive-baseline，既有败局 — arena 对抗方仅经 correlate/generate_from_gaps，从不进入本 PR 改动的 compile 路径；与干净 HEAD 的代码路径逐一比对确认零重叠）。arena 语料不覆盖 compile 的局限照实记录：② 的 compile 回归覆盖 = wiki_compile 单测 7 项 + wiki_compile 全套 39 项 + nextest 四 crate 1934 项全绿。① DONE (PR-1, 0ac2a8f)。② DONE (PR-2)。
+**② arena 处置记录（2026-09-28）**：`zen discover arena` 实跑 = zen-distill 4/5（bare-singletons 负于 naive-baseline，既有败局 — arena 对抗方仅经 correlate/generate_from_gaps，从不进入本 PR 改动的 compile 路径；与干净 HEAD 的代码路径逐一比对确认零重叠）。arena 语料不覆盖 compile 的局限照实记录：② 的 compile 回归覆盖 = wiki_compile 单测 7 项 + wiki_compile 全套 39 项 + nextest 四 crate 1934 项全绿。① DONE (PR-1, 0ac2a8f)。② DONE (PR-2, 61b98a6)。
+**③ DONE (PR-3)**：`zen-provider/src/cache.rs`（CacheSegments 分段构造器 system/doc…/summary/whitelist + PromptCacheControl trait 默认 no-op）+ AnthropicProvider raw `/v1/messages` 绕行 rig-core（cache_control 落在 last-doc/summary/whitelist 三处累积前缀检查点，usage 的 cache_creation/cache_read_input_tokens 透出 = 验收 3 可观测）。测试 8 项（构造顺序/扁平无标记/trait no-op/标记位置/请求体字段/非 anthropic 编译期缺席/usage 缺字段容忍）。**偏差记录**：`[agentic.cache] breakpoints` 配置键推迟到 T046（llm_distill 接线）时落地 — 无读者的键 = 幻影键反模式（T192 教训）；分段构造器的首个生产消费者即 T046。
 1: okf_missing_field 报告/旧页兼容测试; 2: 白名单构建(空 wiki/含 create)/ghost 剥离(NFC 变体)/审计行测试; 3: trait 默认 no-op + anthropic 标记位置 + 非 anthropic 剥离测试; 4: 崩溃回放测试（kill 点两类：写入中途 / 写入后 commit 前 — 后者全量回滚属正确事务语义需显式钉住；替代 test_recover_is_stub）; 5: grader 双指标 + NotEvaluated 降级测试; 6: 分段阈值/切页失败回退全文测试; E1: 重叠分析决策记录 + lint agent 输出测试; E2: sources 写入/LLM 覆写防护/级联清理测试; E3: 级联剥除/孤儿删除/链接清理测试。
 
 ## Config Surface（5-layer 惯例，全部 clamp + env）
