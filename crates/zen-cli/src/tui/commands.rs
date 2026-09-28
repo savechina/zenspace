@@ -624,6 +624,10 @@ Use /thinking to show/hide thinking process."#;
                         format!("  OKF missing fields: {}", result.okf_missing.len()),
                         false,
                     );
+                    self.push_output(
+                        format!("  Sources missing: {}", result.sources_missing.len()),
+                        false,
+                    );
                 }
                 Err(e) => self.push_output(format!("Lint error: {}", e), true),
             }

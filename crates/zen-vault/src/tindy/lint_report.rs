@@ -80,6 +80,16 @@ impl LintReportGenerator {
             report.push('\n');
         }
 
+        report.push_str("## Source Provenance\n\n");
+        if result.sources_missing.is_empty() {
+            report.push_str("All compiled pages carry their sources.\n\n");
+        } else {
+            for page in &result.sources_missing {
+                report.push_str(&format!("- {page}: no sources recorded\n"));
+            }
+            report.push('\n');
+        }
+
         fs::write(&report_path, report)?;
         Ok(report_path)
     }

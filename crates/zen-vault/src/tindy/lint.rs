@@ -23,6 +23,11 @@ pub struct LintResult {
     pub stale_claims: Vec<String>,
     pub knowledge_gaps: Vec<String>,
     pub okf_missing: Vec<OkfFinding>,
+    /// Machine-rendered pages lacking a non-empty `sources:` list
+    /// (compile-hygiene E2). The machine-rendered signature is
+    /// `created_at:` + `updated_at:` frontmatter; hand-written pages
+    /// carry neither key and are never reported.
+    pub sources_missing: Vec<String>,
 }
 
 /// Required OKF v0.1 frontmatter keys checked by the conformance rule.
@@ -72,6 +77,7 @@ impl Linter {
         if okf_enabled {
             result.okf_missing = scan_okf_conformance(wiki_dir);
         }
+        result.sources_missing = scan_sources_provenance(wiki_dir);
 
         info!(
             orphan = result.orphan_pages.len(),
@@ -79,6 +85,7 @@ impl Linter {
             stale = result.stale_claims.len(),
             gaps = result.knowledge_gaps.len(),
             okf_missing = result.okf_missing.len(),
+            sources_missing = result.sources_missing.len(),
             "lint complete via LearningLoop"
         );
 
@@ -133,6 +140,52 @@ fn scan_okf_conformance(wiki_dir: &Path) -> Vec<OkfFinding> {
     }
     findings.sort_by(|a, b| a.page.cmp(&b.page));
     findings
+}
+
+/// Compile-hygiene E2 provenance check: report machine-rendered pages
+/// (the `render_page` signature — `created_at:` + `updated_at:` keys)
+/// whose `sources:` list is absent or empty. Advisory only; hand-written
+/// pages carry neither signature key and are never reported.
+fn scan_sources_provenance(wiki_dir: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    let Ok(entries) = std::fs::read_dir(wiki_dir) else {
+        return missing;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            missing.extend(scan_sources_provenance(&path));
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if OKF_EXEMPT_STEMS.iter().any(|s| *s == stem) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let keys = frontmatter_keys(&content);
+        let machine_rendered = keys.contains_key("created_at") && keys.contains_key("updated_at");
+        let sources_present = keys
+            .get("sources")
+            .is_some_and(|v| !v.trim().is_empty() && v.trim() != "[]");
+        if machine_rendered && !sources_present {
+            missing.push(
+                path.strip_prefix(wiki_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+    missing.sort();
+    missing
 }
 
 /// Parse the YAML frontmatter block (if any) into a `key → raw value` map.
@@ -355,5 +408,71 @@ mod tests {
         let result = Linter::new().run(&wiki).expect("lint run");
         let pages: Vec<&str> = result.okf_missing.iter().map(|f| f.page.as_str()).collect();
         assert_eq!(pages, vec!["alpha.md", "zebra.md"]);
+    }
+
+    // ── Source provenance (compile-hygiene E2) ──────────────────
+
+    #[test]
+    fn e2_compiled_page_with_sources_not_reported() {
+        let (_tmp, wiki) = setup_test_wiki();
+        write_page(
+            &wiki,
+            "good",
+            "---\ntitle: \"good\"\ncreated_at: \"2026-01-01\"\nupdated_at: \"2026-01-02\"\nsources: [\"/vault/inbox/note.md\"]\n---\n\nBody.",
+        );
+
+        let result = Linter::new().run(&wiki).expect("lint run");
+        assert!(
+            !result.sources_missing.iter().any(|p| p == "good.md"),
+            "provenance-complete page flagged: {:?}",
+            result.sources_missing
+        );
+    }
+
+    #[test]
+    fn e2_machine_rendered_page_without_sources_reported() {
+        let (_tmp, wiki) = setup_test_wiki();
+        write_page(
+            &wiki,
+            "pre-e2",
+            "---\ntitle: \"pre-e2\"\ncreated_at: \"2026-01-01\"\nupdated_at: \"2026-01-02\"\n---\n\nLegacy body.",
+        );
+
+        let result = Linter::new().run(&wiki).expect("lint run");
+        assert!(
+            result.sources_missing.iter().any(|p| p == "pre-e2.md"),
+            "legacy compiled page must be reported: {:?}",
+            result.sources_missing
+        );
+    }
+
+    #[test]
+    fn e2_hand_written_page_is_never_reported() {
+        let (_tmp, wiki) = setup_test_wiki();
+        write_page(&wiki, "manual", "# My own note\n\nNo frontmatter at all.");
+
+        let result = Linter::new().run(&wiki).expect("lint run");
+        assert!(
+            !result.sources_missing.iter().any(|p| p == "manual.md"),
+            "hand-written page must never be reported: {:?}",
+            result.sources_missing
+        );
+    }
+
+    #[test]
+    fn e2_empty_sources_list_counts_as_missing() {
+        let (_tmp, wiki) = setup_test_wiki();
+        write_page(
+            &wiki,
+            "hollow",
+            "---\ntitle: \"hollow\"\ncreated_at: \"2026-01-01\"\nupdated_at: \"2026-01-02\"\nsources: []\n---\n\nBody.",
+        );
+
+        let result = Linter::new().run(&wiki).expect("lint run");
+        assert!(
+            result.sources_missing.iter().any(|p| p == "hollow.md"),
+            "empty sources list is not provenance: {:?}",
+            result.sources_missing
+        );
     }
 }

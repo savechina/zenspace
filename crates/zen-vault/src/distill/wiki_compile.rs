@@ -432,6 +432,13 @@ impl WikiCompiler {
             wikilinks,
             para: note.para.clone(),
             okf_type: note.okf_type.clone(),
+            // E2 provenance: the original source file. The archive hook
+            // redirects this to the durable archive dest in the same cycle.
+            sources: note
+                .file_path
+                .as_ref()
+                .map(|p| vec![p.to_string_lossy().to_string()])
+                .unwrap_or_default(),
             content,
         })
     }
@@ -474,6 +481,15 @@ impl WikiCompiler {
         }
         if let Some(ref okf_type) = page.okf_type {
             fm.push_str(&format!("\ntype: \"{}\"", okf_type));
+        }
+        if !page.sources.is_empty() {
+            let sources_str = page
+                .sources
+                .iter()
+                .map(|s| format!("\"{s}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            fm.push_str(&format!("\nsources: [{sources_str}]"));
         }
 
         fm.push_str(&format!(
@@ -1152,6 +1168,7 @@ mod tests {
             wikilinks: vec!["Link1".into()],
             para: None,
             okf_type: None,
+            sources: Vec::new(),
             content: "Body content".to_string(),
         };
 
@@ -1287,6 +1304,41 @@ mod tests {
         let pages = compiler.compile(&notes, dir.path()).unwrap();
         assert!(pages[0].wikilinks.is_empty());
         assert!(pages[0].content.contains("See Ghost now."));
+    }
+
+    #[test]
+    fn e2_rendered_page_carries_sources_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let source = inbox.join("provenanced.md");
+        std::fs::write(&source, "# Provenanced\n\nBody text.").unwrap();
+
+        let mut note = make_test_note("# Provenanced\n\nBody text.", vec![]);
+        note.file_path = Some(source.clone());
+
+        let compiler = WikiCompiler::new();
+        let (pages, _) = compiler
+            .compile_with_policy(
+                &[note],
+                dir.path().join("wiki").as_path(),
+                GhostlinkPolicy::Strip,
+            )
+            .unwrap();
+        assert_eq!(pages[0].sources, vec![source.to_string_lossy().to_string()]);
+
+        // A note without a file path carries no provenance — no sources key.
+        let anon = make_test_note("# Anonymous\n\nBody.", vec![]);
+        let (pages2, _) = compiler
+            .compile_with_policy(
+                &[anon],
+                dir.path().join("wiki2").as_path(),
+                GhostlinkPolicy::Strip,
+            )
+            .unwrap();
+        assert!(pages2[0].sources.is_empty());
+        let rendered = compiler.render_page(&pages2[0]);
+        assert!(!rendered.contains("sources:"));
     }
 
     #[test]

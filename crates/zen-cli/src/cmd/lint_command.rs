@@ -45,6 +45,7 @@ pub fn execute_command(cmd: &LintCommands) -> Result<(), ZenError> {
             println!("  Stale claims:       {}", result.stale_claims.len());
             println!("  Knowledge gaps:     {}", result.knowledge_gaps.len());
             println!("  OKF missing fields: {}", result.okf_missing.len());
+            println!("  Sources missing:    {}", result.sources_missing.len());
             println!("  Report saved to:    {}", report_path.display());
 
             Ok(())

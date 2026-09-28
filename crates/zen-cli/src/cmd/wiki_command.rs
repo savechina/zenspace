@@ -194,6 +194,7 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
                     finding.missing.join(", ")
                 );
             }
+            println!("  Sources missing:    {}", result.sources_missing.len());
             println!("  Report saved to:    {}", report_path.display());
 
             Ok(())
