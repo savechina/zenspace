@@ -1353,7 +1353,10 @@ impl ZenWorker for ZenLoopWorker {
                 Err(e) => warn!(error = %e, "loop: graph verify failed (cycle continues)"),
             }
         }
-        match zen_vault::Linter::new().run(&paths.wiki()) {
+        let okf_enabled = zen_core::config::load_config()
+            .map(|c| c.agentic.compile.okf_lint_or_default())
+            .unwrap_or(true);
+        match zen_vault::Linter::new().run_with_okf(&paths.wiki(), okf_enabled) {
             Ok(lint) => {
                 report.lint_orphan_pages = lint.orphan_pages.len();
                 report.lint_broken_wikilinks = lint.broken_wikilinks.len();

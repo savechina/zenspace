@@ -27,8 +27,11 @@ pub fn execute_command(cmd: &LintCommands) -> Result<(), ZenError> {
             let reports_dir = PathBuf::from("reports");
 
             let linter = Linter::new();
+            let okf_enabled = zen_core::config::load_config()
+                .map(|c| c.agentic.compile.okf_lint_or_default())
+                .unwrap_or(true);
             let result = linter
-                .run(&wiki_dir)
+                .run_with_okf(&wiki_dir, okf_enabled)
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 
             let generator = LintReportGenerator::new();
@@ -41,6 +44,7 @@ pub fn execute_command(cmd: &LintCommands) -> Result<(), ZenError> {
             println!("  Broken wikilinks:   {}", result.broken_wikilinks.len());
             println!("  Stale claims:       {}", result.stale_claims.len());
             println!("  Knowledge gaps:     {}", result.knowledge_gaps.len());
+            println!("  OKF missing fields: {}", result.okf_missing.len());
             println!("  Report saved to:    {}", report_path.display());
 
             Ok(())

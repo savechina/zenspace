@@ -169,8 +169,11 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             let reports_dir = PathBuf::from("reports");
 
             let linter = zen_vault::tindy::Linter::new();
+            let okf_enabled = zen_core::config::load_config()
+                .map(|c| c.agentic.compile.okf_lint_or_default())
+                .unwrap_or(true);
             let result = linter
-                .run(&wiki_dir)
+                .run_with_okf(&wiki_dir, okf_enabled)
                 .map_err(|e| ZenError::Message(e.to_string()))?;
 
             let generator = zen_vault::tindy::LintReportGenerator::new();
@@ -183,6 +186,14 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             println!("  Broken wikilinks:   {}", result.broken_wikilinks.len());
             println!("  Stale claims:       {}", result.stale_claims.len());
             println!("  Knowledge gaps:     {}", result.knowledge_gaps.len());
+            println!("  OKF missing fields: {}", result.okf_missing.len());
+            for finding in &result.okf_missing {
+                println!(
+                    "    - {}: missing {}",
+                    finding.page,
+                    finding.missing.join(", ")
+                );
+            }
             println!("  Report saved to:    {}", report_path.display());
 
             Ok(())

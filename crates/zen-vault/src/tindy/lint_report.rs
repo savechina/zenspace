@@ -66,6 +66,20 @@ impl LintReportGenerator {
             report.push('\n');
         }
 
+        report.push_str("## OKF Conformance\n\n");
+        if result.okf_missing.is_empty() {
+            report.push_str("All pages carry the required frontmatter.\n\n");
+        } else {
+            for finding in &result.okf_missing {
+                report.push_str(&format!(
+                    "- {}: missing {}\n",
+                    finding.page,
+                    finding.missing.join(", ")
+                ));
+            }
+            report.push('\n');
+        }
+
         fs::write(&report_path, report)?;
         Ok(report_path)
     }

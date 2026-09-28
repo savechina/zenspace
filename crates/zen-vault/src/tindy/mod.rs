@@ -10,6 +10,6 @@ pub use embeddings::{
     ComputeEmbeddings, EmbeddingResult, compute_embeddings, compute_embeddings_for_text,
 };
 pub use learning_loop::{GapType, KnowledgeGap, LearningLoop, LearningReport, ResearchTask};
-pub use lint::{LintResult, Linter};
+pub use lint::{LintResult, Linter, OkfFinding};
 pub use lint_report::LintReportGenerator;
 pub use reindex::{ReindexReport, Reindexer, reindex_all};

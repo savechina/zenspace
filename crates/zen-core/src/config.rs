@@ -467,6 +467,8 @@ pub struct AgenticConfig {
     pub audit: AuditConfig,
     /// Retention sweep gating — TOML `[agentic.retention]` (review D2).
     pub retention: RetentionConfig,
+    /// Wiki compile hygiene — TOML `[agentic.compile]` (compile-hygiene ①).
+    pub compile: CompileConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -1057,6 +1059,33 @@ impl RetentionConfig {
 
     pub fn dry_run_or_default(&self) -> bool {
         self.dry_run.unwrap_or(false)
+    }
+}
+
+/// Wiki compile hygiene — TOML `[agentic.compile]` (compile-hygiene ①).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates the OKF v0.1 conformance rule in `zen wiki lint`
+///   (pages missing a non-empty `type:` or `description:` frontmatter key
+///   are reported as findings; generated `index.md`/`log.md` are exempt).
+/// - User impact: `okf_lint = false` removes the OKF section from lint
+///   output entirely; findings are advisory either way — lint never fails
+///   a command, and legacy pages without frontmatter are reported, not
+///   treated as errors.
+/// - Default: `okf_lint = true` (absent section → enabled).
+/// - Interaction: env `ZEN_COMPILE_OKF_LINT` (5th layer) overrides any
+///   config file layer.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct CompileConfig {
+    /// OKF conformance lint fires when true (absent → true).
+    pub okf_lint: Option<bool>,
+}
+
+impl CompileConfig {
+    /// Effective OKF lint switch: config value, or enabled when absent.
+    pub fn okf_lint_or_default(&self) -> bool {
+        self.okf_lint.unwrap_or(true)
     }
 }
 
@@ -2032,6 +2061,9 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
             enabled: ov.retention.enabled.or(base.retention.enabled),
             dry_run: ov.retention.dry_run.or(base.retention.dry_run),
         },
+        compile: CompileConfig {
+            okf_lint: ov.compile.okf_lint.or(base.compile.okf_lint),
+        },
     }
 }
 
@@ -2360,6 +2392,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_classifier_env(&mut config.agentic.classifiers);
     apply_audit_env(&mut config.agentic.audit);
     apply_retention_env(&mut config.agentic.retention);
+    apply_compile_env(&mut config.agentic.compile);
     apply_skills_env(&mut config.skills.auto_route);
     config
 }
@@ -2370,6 +2403,12 @@ fn apply_retention_env(cfg: &mut RetentionConfig) {
     }
     if let Some(v) = env_bool("ZEN_RETENTION_DRY_RUN") {
         cfg.dry_run = Some(v);
+    }
+}
+
+fn apply_compile_env(cfg: &mut CompileConfig) {
+    if let Some(v) = env_bool("ZEN_COMPILE_OKF_LINT") {
+        cfg.okf_lint = Some(v);
     }
 }
 
@@ -3228,6 +3267,27 @@ provider = "anthropic"
 
         unsafe { std::env::remove_var("ZEN_LOOP_COMMUNITY_RESOLUTION") };
         unsafe { std::env::remove_var("ZEN_LOOP_COMMUNITY_MIN_SIZE") };
+    }
+
+    #[test]
+    fn compile_config_defaults_merge_and_env_override() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let absent = parse("");
+        assert!(absent.agentic.compile.okf_lint_or_default());
+
+        let merged = merge_configs(
+            parse("[agentic.compile]\nokf_lint = false\n"),
+            parse("[agentic.compile]\nokf_lint = true\n"),
+        )
+        .unwrap();
+        assert!(merged.agentic.compile.okf_lint_or_default());
+
+        // SAFETY: test-only env mutation; ZEN_COMPILE_OKF_LINT is read by no
+        // sibling test in this binary and is removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_COMPILE_OKF_LINT", "false") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(!cfg.agentic.compile.okf_lint_or_default());
+        unsafe { std::env::remove_var("ZEN_COMPILE_OKF_LINT") };
     }
 
     #[test]

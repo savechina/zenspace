@@ -606,7 +606,10 @@ Use /thinking to show/hide thinking process."#;
         use zen_core::paths::ZenPaths;
         use zen_vault::tindy::Linter;
         if let Ok(paths) = ZenPaths::detect() {
-            match Linter::new().run(&paths.wiki()) {
+            let okf_enabled = zen_core::config::load_config()
+                .map(|c| c.agentic.compile.okf_lint_or_default())
+                .unwrap_or(true);
+            match Linter::new().run_with_okf(&paths.wiki(), okf_enabled) {
                 Ok(result) => {
                     self.push_output("Lint complete:".into(), false);
                     self.push_output(
@@ -615,6 +618,10 @@ Use /thinking to show/hide thinking process."#;
                     );
                     self.push_output(
                         format!("  Broken wikilinks: {}", result.broken_wikilinks.len()),
+                        false,
+                    );
+                    self.push_output(
+                        format!("  OKF missing fields: {}", result.okf_missing.len()),
                         false,
                     );
                 }
