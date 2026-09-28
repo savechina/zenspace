@@ -591,6 +591,21 @@ impl DistillationPipeline {
             );
             recovery.recover()?;
         }
+        // Compile-hygiene ④: roll back partial writes left by a killed
+        // cycle BEFORE this cycle's txn.begin() — a stale `.txn-*.jsonl`
+        // at this point belongs to a dead process (1h age guard keeps a
+        // concurrently-running cycle's tracking file safe). Fail-open.
+        match recovery.replay_stale_transactions() {
+            Ok(report) if report.tracking_files > 0 => {
+                info!(
+                    tracking_files = report.tracking_files,
+                    files_removed = report.files_removed,
+                    "Crash replay rolled back interrupted cycle writes"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "Crash replay failed — continuing (fail-open)"),
+        }
         let cycle_id = uuid::Uuid::now_v7().to_string();
         let checkpoints = CheckpointManager::new(logs_dir);
         checkpoints.write_checkpoint(&Checkpoint {

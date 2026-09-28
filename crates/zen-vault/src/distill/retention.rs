@@ -106,6 +106,21 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 keep: 2,
             },
         },
+        // Compile-hygiene ④ backstop: crash replay consumes stale
+        // `.txn-*.jsonl` tracking files within an hour of every cycle
+        // start; this age-delete is the pathological-growth net for a
+        // vault whose cycles stopped running. Age-delete, not rotation —
+        // a rotated tracking file would fall outside the replay scan
+        // pattern, hiding a dead cycle's rollback from recovery.
+        Policy {
+            home: "logs/.txn-*",
+            root: logs.clone(),
+            action: Action::DeleteOlder {
+                pattern: Some(".txn-*.jsonl"),
+                days: 7,
+                recursive: false,
+            },
+        },
         Policy {
             home: "logs/discovery-tree.jsonl",
             root: logs.join("discovery-tree.jsonl"),

@@ -195,6 +195,36 @@ pub fn write_if_unchanged(
     Ok(WriteOutcome::Committed)
 }
 
+/// Shared rollback core: delete every tracked file that still exists, then
+/// remove the tracking file itself. Used by live rollback
+/// ([`TransactionScope::rollback`]) and by crash replay
+/// ([`super::recovery::RecoveryManager::replay_stale_transactions`]).
+/// Returns the number of tracked files actually deleted.
+pub(crate) fn rollback_tracking_file(tracking_file: &Path) -> Result<usize> {
+    if !tracking_file.exists() {
+        return Ok(0);
+    }
+
+    let content = fs::read_to_string(tracking_file)
+        .with_context(|| format!("read txn file: {}", tracking_file.display()))?;
+
+    let mut removed = 0usize;
+    for line in content.lines() {
+        let path = line.trim();
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            if let Err(e) = fs::remove_file(path) {
+                warn!(path, error = %e, "failed to rollback file");
+            } else {
+                removed += 1;
+            }
+        }
+    }
+
+    fs::remove_file(tracking_file).ok();
+    info!(removed, "Transaction rollback: {}", tracking_file.display());
+    Ok(removed)
+}
+
 /// Transactional scope for consolidation file-level operations.
 ///
 /// Tracks file paths written during a transaction so they can be
@@ -215,10 +245,15 @@ impl TransactionScope {
         let logs_dir = ZenPaths::detect()
             .map(|p| p.logs().to_path_buf())
             .unwrap_or_else(|_| PathBuf::from("."));
-        let tracking_file = logs_dir.join(format!(".txn-{name}.jsonl"));
+        Self::new_for_logs(&logs_dir, name)
+    }
+
+    /// Create a transaction scope with an explicit logs directory — the
+    /// seam tests and crash-replay use to avoid the global home.
+    pub fn new_for_logs(logs_dir: &Path, name: &str) -> Self {
         Self {
             name: name.to_string(),
-            tracking_file,
+            tracking_file: logs_dir.join(format!(".txn-{name}.jsonl")),
         }
     }
 
@@ -277,28 +312,7 @@ impl TransactionScope {
 
     /// Rollback the transaction by deleting all tracked files.
     pub fn rollback(&self) -> Result<()> {
-        if !self.tracking_file.exists() {
-            return Ok(());
-        }
-
-        let content = fs::read_to_string(&self.tracking_file)
-            .with_context(|| format!("read txn file: {}", self.tracking_file.display()))?;
-
-        let mut removed = 0usize;
-        for line in content.lines() {
-            let path = line.trim();
-            if !path.is_empty() && std::path::Path::new(path).exists() {
-                if let Err(e) = fs::remove_file(path) {
-                    warn!(path, error = %e, "failed to rollback file");
-                } else {
-                    removed += 1;
-                }
-            }
-        }
-
-        fs::remove_file(&self.tracking_file).ok();
-        info!(removed, "Transaction rollback: {}", self.name);
-        Ok(())
+        rollback_tracking_file(&self.tracking_file).map(|_| ())
     }
 
     /// Commit the transaction only if the snapshot is still current

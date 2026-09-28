@@ -363,3 +363,20 @@ fn report_serializes_per_home_shape() {
     assert_eq!(home["rotated"], 0);
     assert_eq!(home["bytes_freed"], 5);
 }
+
+#[test]
+fn stale_txn_tracking_files_age_out_but_fresh_ones_stay() {
+    let (_dir, paths) = setup();
+    let stale = paths.logs().join(".txn-distill-old.jsonl");
+    let fresh = paths.logs().join(".txn-distill-live.jsonl");
+    write_aged(&stale, "{\"dead\"}", Duration::days(8));
+    write_aged(&fresh, "{\"live\"}", Duration::days(1));
+
+    let report = apply_policies(&paths, &cfg(), now());
+    assert_eq!(report.homes["logs/.txn-*"].removed_files, 1);
+    assert!(!stale.exists(), "8-day-old tracking file must age out");
+    assert!(
+        fresh.exists(),
+        "a tracking file within the age window must stay (live-cycle guard)"
+    );
+}
