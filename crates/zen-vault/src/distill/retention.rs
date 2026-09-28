@@ -121,6 +121,17 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 recursive: false,
             },
         },
+        // Compile-hygiene E5 backstop: page-version iterations grow with
+        // every pipeline overwrite; 90 days matches the journal policy.
+        Policy {
+            home: "vault/iterations",
+            root: vault.join("iterations"),
+            action: Action::DeleteOlder {
+                pattern: None,
+                days: 90,
+                recursive: true,
+            },
+        },
         Policy {
             home: "logs/discovery-tree.jsonl",
             root: logs.join("discovery-tree.jsonl"),

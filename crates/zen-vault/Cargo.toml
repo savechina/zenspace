@@ -9,6 +9,8 @@ zen-core = { path = "../zen-core" }
 zen-memory = { path = "../zen-memory" }
 zen-repo = { path = "../zen-repo" }
 zen-provider = { path = "../zen-provider" }
+# E5 page-iteration diffs — same crate the fs.edit tool uses.
+diffy = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 rig-compose = { workspace = true }

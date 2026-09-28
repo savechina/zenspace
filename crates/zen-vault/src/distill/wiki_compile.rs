@@ -58,6 +58,18 @@ pub struct GhostlinkReport {
     pub warned: usize,
 }
 
+/// Per-run compile counters (compile-hygiene ②+E5), carried on
+/// `ScopedRunOutcome` and surfaced via the `loop.compile.ghostlinks` /
+/// `loop.page.iterations` audit lines.
+#[derive(Debug, Clone, Default)]
+pub struct CompileReport {
+    /// Ghost `[[wikilink]]` counters for this run.
+    pub ghostlinks: GhostlinkReport,
+    /// Prior page versions captured before overwrites (E5). The captured
+    /// files ride along so the caller can `txn.track_path()` them.
+    pub iterations: Vec<crate::wiki::CapturedIteration>,
+}
+
 impl GhostlinkReport {
     pub fn total(&self) -> usize {
         self.stripped + self.warned
@@ -154,18 +166,26 @@ impl WikiCompiler {
     /// - Generates `index.md` via [`WikiIndex`]
     /// - Logs operations via [`WikiLog`]
     pub fn compile(&self, notes: &[Note], wiki_dir: &Path) -> Result<Vec<WikiPage>> {
-        let (pages, _) = self.compile_with_policy(notes, wiki_dir, GhostlinkPolicy::Strip)?;
+        let (pages, _) = self.compile_with_policy(notes, wiki_dir, GhostlinkPolicy::Strip, None)?;
         Ok(pages)
     }
 
-    /// [`compile`](WikiCompiler::compile) with an explicit ghost policy,
-    /// returning the per-run [`GhostlinkReport`] alongside the pages.
+    /// [`compile`](WikiCompiler::compile) with an explicit ghost policy
+    /// and optional E5 page-iteration capture, returning the per-run
+    /// [`CompileReport`] alongside the pages.
+    ///
+    /// `page_iterations` (`Some`) captures the prior bytes of every page
+    /// this run overwrites into the `vault/iterations` store before the
+    /// write lands; the caller must `txn.track_path()` the captured files
+    /// (see [`CapturedIteration`]) so CAS rollback and crash replay cover
+    /// them. `None` disables capture (tests, `compile`).
     pub fn compile_with_policy(
         &self,
         notes: &[Note],
         wiki_dir: &Path,
         policy: GhostlinkPolicy,
-    ) -> Result<(Vec<WikiPage>, GhostlinkReport)> {
+        page_iterations: Option<&crate::wiki::PageIterations>,
+    ) -> Result<(Vec<WikiPage>, CompileReport)> {
         let structure = WikiStructure::new(wiki_dir);
         structure
             .ensure_directories()
@@ -206,17 +226,26 @@ impl WikiCompiler {
         }
 
         let mut written = 0usize;
+        let mut iterations = Vec::new();
         for page in &pages {
             let full_path = wiki_dir.join(&page.path);
 
-            // Atomic write via parent dir creation + temp rename
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create dir: {}", parent.display()))?;
             }
 
             let rendered = self.render_page(page);
-            std::fs::write(&full_path, &rendered)
+            // E5: protect the prior version before the pipeline overwrites
+            // a page a human may have hand-tuned.
+            if let Some(store) = page_iterations
+                && let Some(captured) = store
+                    .capture(wiki_dir, &full_path, &rendered)
+                    .with_context(|| format!("capture iteration: {}", full_path.display()))?
+            {
+                iterations.push(captured);
+            }
+            zen_core::atomic_file::write_atomic(&full_path, rendered.as_bytes())
                 .with_context(|| format!("write wiki page: {}", full_path.display()))?;
 
             info!(
@@ -257,7 +286,13 @@ impl WikiCompiler {
             report.stripped,
             report.warned
         );
-        Ok((pages, report))
+        Ok((
+            pages,
+            CompileReport {
+                ghostlinks: report,
+                iterations,
+            },
+        ))
     }
 
     /// Compile notion data into wiki pages under `wiki/notions/technology/`.
@@ -843,9 +878,9 @@ mod tests {
         ];
 
         let (pages, report) = compiler
-            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip, None)
             .unwrap();
-        assert_eq!(report.total(), 0);
+        assert_eq!(report.ghostlinks.total(), 0);
         assert_eq!(pages[0].wikilinks, vec!["Rust", "Tokio"]);
     }
 
@@ -1191,10 +1226,10 @@ mod tests {
         )];
 
         let (pages, report) = compiler
-            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip, None)
             .unwrap();
-        assert_eq!(report.stripped, 1);
-        assert_eq!(report.warned, 0);
+        assert_eq!(report.ghostlinks.stripped, 1);
+        assert_eq!(report.ghostlinks.warned, 0);
         assert!(pages[0].wikilinks.is_empty());
         assert!(
             pages[0]
@@ -1214,9 +1249,9 @@ mod tests {
         ];
 
         let (pages, report) = compiler
-            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip, None)
             .unwrap();
-        assert_eq!(report.total(), 0, "report: {report:?}");
+        assert_eq!(report.ghostlinks.total(), 0, "report: {report:?}");
         let pointer = pages
             .iter()
             .find(|p| p.title == "Pointer")
@@ -1239,9 +1274,13 @@ mod tests {
             vec![],
         )];
         let (pages, report) = compiler
-            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip, None)
             .unwrap();
-        assert_eq!(report.total(), 0, "de-slugified title link must survive");
+        assert_eq!(
+            report.ghostlinks.total(),
+            0,
+            "de-slugified title link must survive"
+        );
         assert_eq!(pages[0].wikilinks, vec!["Rust Guide"]);
 
         let notes2 = vec![make_test_note(
@@ -1249,9 +1288,13 @@ mod tests {
             vec![],
         )];
         let (pages2, report2) = compiler
-            .compile_with_policy(&notes2, dir.path(), GhostlinkPolicy::Strip)
+            .compile_with_policy(&notes2, dir.path(), GhostlinkPolicy::Strip, None)
             .unwrap();
-        assert_eq!(report2.total(), 0, "dashed stem link must survive");
+        assert_eq!(
+            report2.ghostlinks.total(),
+            0,
+            "dashed stem link must survive"
+        );
         assert_eq!(pages2[0].wikilinks, vec!["rust-guide"]);
     }
 
@@ -1270,9 +1313,13 @@ mod tests {
         ];
 
         let (pages, report) = compiler
-            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip, None)
             .unwrap();
-        assert_eq!(report.total(), 0, "NFC equivalence must hold: {report:?}");
+        assert_eq!(
+            report.ghostlinks.total(),
+            0,
+            "NFC equivalence must hold: {report:?}"
+        );
         let pointer = pages.iter().find(|p| p.title == "Note").unwrap();
         assert_eq!(pointer.wikilinks.len(), 1);
     }
@@ -1287,10 +1334,10 @@ mod tests {
         )];
 
         let (pages, report) = compiler
-            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Warn)
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Warn, None)
             .unwrap();
-        assert_eq!(report.warned, 1);
-        assert_eq!(report.stripped, 0);
+        assert_eq!(report.ghostlinks.warned, 1);
+        assert_eq!(report.ghostlinks.stripped, 0);
         assert_eq!(pages[0].wikilinks, vec!["Hallucinated Thing"]);
         assert!(pages[0].content.contains("[[Hallucinated Thing]]"));
     }
@@ -1323,6 +1370,7 @@ mod tests {
                 &[note],
                 dir.path().join("wiki").as_path(),
                 GhostlinkPolicy::Strip,
+                None,
             )
             .unwrap();
         assert_eq!(pages[0].sources, vec![source.to_string_lossy().to_string()]);
@@ -1334,11 +1382,49 @@ mod tests {
                 &[anon],
                 dir.path().join("wiki2").as_path(),
                 GhostlinkPolicy::Strip,
+                None,
             )
             .unwrap();
         assert!(pages2[0].sources.is_empty());
         let rendered = compiler.render_page(&pages2[0]);
         assert!(!rendered.contains("sources:"));
+    }
+
+    #[test]
+    fn e5_compile_capture_overwrites_not_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        let store = crate::wiki::PageIterations::new(dir.path().join("iterations"));
+
+        // Pre-existing page: the recompile must capture its prior bytes.
+        let existing_rel = PathBuf::from("notions/concepts").join("rendered-page.md");
+        let existing = wiki.join(&existing_rel);
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, "# Rendered Page\n\nhand-tuned\n").unwrap();
+
+        // A page that does not exist yet must NOT be captured (a create
+        // has nothing to protect).
+        let compiler = WikiCompiler::new();
+        let note = make_test_note("# Rendered Page\n\npipeline v2\n", vec![]);
+        let (pages, report) = compiler
+            .compile_with_policy(&[note], &wiki, GhostlinkPolicy::Strip, Some(&store))
+            .unwrap();
+
+        assert_eq!(report.iterations.len(), 1, "only the overwrite captured");
+        assert_eq!(pages[0].path, existing_rel);
+        let captured = &report.iterations[0];
+        assert_eq!(captured.page_rel, existing_rel);
+        let stored = std::fs::read_to_string(&captured.md_path).unwrap();
+        assert_eq!(stored, "# Rendered Page\n\nhand-tuned\n");
+        assert!(
+            captured.diff_path.as_ref().is_some_and(|d| d.exists()),
+            "diff sidecar written"
+        );
+        // The store lives OUTSIDE the wiki dir — inventory consumers
+        // (whitelist/lint/CAS) must never enumerate iteration files.
+        assert!(store.root().starts_with(dir.path()));
+        assert!(!store.root().starts_with(&wiki));
     }
 
     #[test]

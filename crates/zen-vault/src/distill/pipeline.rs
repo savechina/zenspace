@@ -87,6 +87,9 @@ pub struct ScopedRunOutcome {
     /// Ghost `[[wikilink]]` instances kept and counted under the `warn`
     /// policy (compile-hygiene ②).
     pub ghostlinks_warned: usize,
+    /// Prior page versions captured before pipeline overwrites
+    /// (compile-hygiene E5). The files themselves are txn-tracked.
+    pub iterations_captured: usize,
 }
 
 /// Scan content for known entity names and wrap them in `[[wikilinks]]`
@@ -1083,9 +1086,26 @@ impl DistillationPipeline {
         // Compile-hygiene ②: policy resolved once per run; Strip is the
         // fail-open default when config is unreadable.
         let ghost_policy = GhostlinkPolicy::from_env_config();
-        let (pages, ghostlinks) =
-            self.compiler
-                .compile_with_policy(&linked_notes, wiki_dir, ghost_policy)?;
+        // E5: version store for pages the pipeline is about to overwrite.
+        // Lives outside the wiki dir — the parent of `wiki_dir` is the
+        // vault — so inventory/whitelist/CAS consumers never see it.
+        let page_iterations = crate::wiki::PageIterations::new(
+            wiki_dir.parent().unwrap_or(wiki_dir).join("iterations"),
+        );
+        let (pages, compile_report) = self.compiler.compile_with_policy(
+            &linked_notes,
+            wiki_dir,
+            ghost_policy,
+            Some(&page_iterations),
+        )?;
+        let ghostlinks = compile_report.ghostlinks;
+        let mut iterations_captured = compile_report.iterations.len();
+        for captured in &compile_report.iterations {
+            txn.track_path(&captured.md_path)?;
+            if let Some(diff) = &captured.diff_path {
+                txn.track_path(diff)?;
+            }
+        }
         // The compiler also regenerates `log.md` and (when pages exist)
         // `index.md` — track them so CAS self-write filtering sees them and
         // rollback can clean them up like any other cycle output.
@@ -1120,7 +1140,9 @@ impl DistillationPipeline {
         }
 
         // T015: merge execution — cluster + fold duplicates (FR-016).
-        let merged_count = self.execute_merge_plans(wiki_dir, archive_dir, txn, cycle_id)?;
+        let (merged_count, merge_iterations) =
+            self.execute_merge_plans(wiki_dir, archive_dir, txn, cycle_id, &page_iterations)?;
+        iterations_captured += merge_iterations;
 
         let contradictions = self.detector.detect(&notes)?;
         let contradictions_found = contradictions.len();
@@ -1265,6 +1287,7 @@ impl DistillationPipeline {
             deferred_sources,
             ghostlinks_stripped: ghostlinks.stripped,
             ghostlinks_warned: ghostlinks.warned,
+            iterations_captured,
         })
     }
 
@@ -1389,12 +1412,14 @@ impl DistillationPipeline {
         archive_dir: &Path,
         txn: &TransactionScope,
         cycle_id: &str,
-    ) -> Result<usize> {
+        page_iterations: &crate::wiki::PageIterations,
+    ) -> Result<(usize, usize)> {
         use super::merge::{MergeStrategy, build_merge_plans};
 
+        let mut captured_iterations = 0usize;
         let inventory = crate::graph_verify::wiki_page_inventory(wiki_dir);
         if inventory.len() < 2 {
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         let (threshold, pure_dup) = match zen_core::config::load_config() {
@@ -1519,6 +1544,15 @@ impl DistillationPipeline {
                         rewritten.replace(&format!("[[{stem}]]"), &format!("[[{target_stem}]]"));
                 }
                 if rewritten != content {
+                    if let Ok(Some(captured)) =
+                        page_iterations.capture(wiki_dir, &page.path, &rewritten)
+                    {
+                        txn.track_path(&captured.md_path).ok();
+                        if let Some(diff) = &captured.diff_path {
+                            txn.track_path(diff).ok();
+                        }
+                        captured_iterations += 1;
+                    }
                     zen_core::atomic_file::write_atomic(&page.path, rewritten.as_bytes()).ok();
                     txn.track_path(&page.path)?;
                 }
@@ -1535,15 +1569,24 @@ impl DistillationPipeline {
                     ("cycle_id", cycle_id.to_string()),
                 ],
             );
+            if let Ok(Some(captured)) =
+                page_iterations.capture(wiki_dir, &target_path, &target_content)
+            {
+                txn.track_path(&captured.md_path)?;
+                if let Some(diff) = &captured.diff_path {
+                    txn.track_path(diff)?;
+                }
+                captured_iterations += 1;
+            }
             zen_core::atomic_file::write_atomic(&target_path, target_content.as_bytes())?;
             txn.track_path(&target_path)?;
             merged += 1;
         }
 
         if merged > 0 {
-            info!(merged, "merge: plans executed");
+            info!(merged, captured_iterations, "merge: plans executed");
         }
-        Ok(merged)
+        Ok((merged, captured_iterations))
     }
 
     /// Load all .md notes from the inbox directory.

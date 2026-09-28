@@ -42,5 +42,8 @@ pub use tindy::{
     ResearchTask, compute_embeddings, compute_embeddings_for_text, compute_file_checksum,
     needs_reindex, reindex_all, update_checksum,
 };
-pub use wiki::{WikiIndex, WikiLog, WikiPage, WikiStructure};
+pub use wiki::{
+    CapturedIteration, IterationVersion, PageIterations, WikiIndex, WikiLog, WikiPage,
+    WikiStructure,
+};
 pub use zen_repo::SqliteClient;

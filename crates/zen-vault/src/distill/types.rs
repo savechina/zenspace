@@ -96,6 +96,9 @@ pub struct LoopCycleReport {
     /// Ghost `[[wikilink]]` instances kept and counted under the `warn`
     /// policy (compile-hygiene ②).
     pub ghostlinks_warned: usize,
+    /// Prior page versions captured before pipeline overwrites
+    /// (compile-hygiene E5).
+    pub iterations_captured: usize,
     /// True when the cycle's wiki writes were rolled back by CAS drift
     /// detection (FR-032).
     pub cas_rolled_back: bool,

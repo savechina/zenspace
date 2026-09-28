@@ -52,6 +52,18 @@ pub enum WikiCommands {
         #[command(subcommand)]
         command: crate::cmd::loop_command::LoopCommands,
     },
+    /// Page-version iterations: list or restore a prior version (E5)
+    Rollback {
+        /// Page title, file stem, or wiki-relative path
+        name: Option<String>,
+        /// Restore a specific version by its unix-millis stamp
+        /// (default: the latest)
+        #[arg(long)]
+        to: Option<i64>,
+        /// List versions instead of restoring
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
@@ -240,6 +252,10 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             Ok(())
         }
         WikiCommands::Loop { command } => crate::cmd::loop_command::execute_command(command).await,
+        WikiCommands::Rollback { name, to, list } => {
+            debug!("rollback: name={:?} to={:?} list={}", name, to, list);
+            wiki_rollback(name.as_deref(), *to, *list)
+        }
     }
 }
 
@@ -340,4 +356,85 @@ fn kind_label(kind: zen_vault::tindy::SemanticFindingKind) -> &'static str {
         zen_vault::tindy::SemanticFindingKind::Stale => "stale",
         zen_vault::tindy::SemanticFindingKind::Redundant => "redundant",
     }
+}
+
+/// E5 page-version rollback surface: `zen wiki rollback --list` lists the
+/// pages that have stored iterations and their versions;
+/// `zen wiki rollback <page> [--to <millis>]` restores (capturing the
+/// clobbered current version first, so a rollback is itself reversible).
+fn wiki_rollback(name: Option<&str>, to: Option<i64>, list: bool) -> Result<(), ZenError> {
+    let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
+    let wiki_dir = paths.wiki();
+    let store = zen_vault::PageIterations::new(paths.vault().join("iterations"));
+
+    if list || name.is_none() {
+        let pages = store.list_pages();
+        if pages.is_empty() {
+            println!("No page iterations stored yet. They are captured automatically");
+            println!("when a distill cycle overwrites an existing wiki page.");
+            return Ok(());
+        }
+        println!("{}", "Page iterations".bold());
+        for page_rel in pages {
+            let page_path = wiki_dir.join(&page_rel);
+            let versions = store.versions(&wiki_dir, &page_path);
+            let title = page_rel
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            println!(
+                "  {} ({} version{})",
+                title.bold(),
+                versions.len(),
+                if versions.len() == 1 { "" } else { "s" }
+            );
+            for v in &versions {
+                println!(
+                    "    {}  {}",
+                    v.millis,
+                    chrono::DateTime::from_timestamp_millis(v.millis)
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let name = name.unwrap();
+    let Some(page_path) = store.resolve_page(&wiki_dir, name) else {
+        return Err(ZenError::Message(format!(
+            "no iterations found for page '{name}'"
+        )));
+    };
+    let mut versions = store.versions(&wiki_dir, &page_path);
+    if versions.is_empty() {
+        return Err(ZenError::Message(format!(
+            "no iterations found for page '{name}'"
+        )));
+    }
+    let version = match to {
+        Some(millis) => versions
+            .into_iter()
+            .find(|v| v.millis == millis)
+            .ok_or_else(|| {
+                ZenError::Message(format!(
+                    "no iteration {millis} for page '{name}' (see `zen wiki rollback --list`)"
+                ))
+            })?,
+        None => versions.remove(0),
+    };
+    let when = chrono::DateTime::from_timestamp_millis(version.millis)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default();
+    store
+        .restore(&wiki_dir, &version)
+        .map_err(|e| ZenError::Message(e.to_string()))?;
+    println!(
+        "{} Restored {} to the {} version (the overwritten content was captured first).",
+        "✅".green(),
+        name.bold(),
+        when,
+    );
+    Ok(())
 }

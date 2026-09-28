@@ -817,6 +817,23 @@ fn emit_ghostlinks_audit(logs_dir: &Path, cycle_id: &str, stripped: usize, warne
     }
 }
 
+/// Compile-hygiene E5: one `loop.page.iterations` audit line per cycle that
+/// captured at least one prior page version. Non-fatal on write failure.
+fn emit_iterations_audit(logs_dir: &Path, cycle_id: &str, captured: usize) {
+    if captured == 0 {
+        return;
+    }
+    let audit = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "kind": "loop.page.iterations",
+        "cycle_id": cycle_id,
+        "captured": captured,
+    });
+    if let Err(e) = append_jsonl_line(&logs_dir.join("audit.jsonl"), &audit) {
+        warn!(error = %e, "loop: iterations audit line failed (non-fatal)");
+    }
+}
+
 /// SC-002 (T185): each line also carries `attempts` — the retry-ledger depth
 /// at completion (`loop-attempts.json` prior failed cycles + this successful
 /// one; a note absent from the ledger completes on its first attempt). The
@@ -1235,6 +1252,10 @@ impl ZenWorker for ZenLoopWorker {
                     outcome.ghostlinks_stripped,
                     outcome.ghostlinks_warned,
                 );
+                // Compile-hygiene E5: one audit line per cycle that captured
+                // at least one prior page version (same flood discipline).
+                report.iterations_captured = outcome.iterations_captured;
+                emit_iterations_audit(&logs_dir, &cycle_id, outcome.iterations_captured);
                 gaps.extend(outcome.gaps);
                 record_note_mutations(
                     &logs_dir,

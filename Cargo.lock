@@ -10651,6 +10651,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "diffy",
  "fs2",
  "html2md",
  "reqwest 0.13.4",

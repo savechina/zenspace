@@ -1,4 +1,6 @@
+pub mod iterations;
 pub mod writer;
+pub use iterations::{CapturedIteration, IterationVersion, PageIterations};
 pub use writer::AtomicWikiWriter;
 
 use std::path::{Path, PathBuf};
