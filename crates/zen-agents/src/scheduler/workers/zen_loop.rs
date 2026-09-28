@@ -797,6 +797,26 @@ fn inbox_listing(inbox: &Path) -> HashSet<String> {
 /// tracked paths, and quarantines by their own gap record, so they are not
 /// duplicated here. Audit failures are logged and never fail the cycle.
 ///
+/// Compile-hygiene ②: one `loop.compile.ghostlinks` audit line per run that
+/// saw at least one ghost target. Zero-ghost cycles write nothing — the
+/// counters still ride `LoopCycleReport`, so a silent zero is observable
+/// there without flooding `audit.jsonl`. Non-fatal on write failure.
+fn emit_ghostlinks_audit(logs_dir: &Path, cycle_id: &str, stripped: usize, warned: usize) {
+    if stripped + warned == 0 {
+        return;
+    }
+    let audit = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "kind": "loop.compile.ghostlinks",
+        "cycle_id": cycle_id,
+        "stripped": stripped,
+        "warned": warned,
+    });
+    if let Err(e) = append_jsonl_line(&logs_dir.join("audit.jsonl"), &audit) {
+        warn!(error = %e, "loop: ghostlinks audit line failed (non-fatal)");
+    }
+}
+
 /// SC-002 (T185): each line also carries `attempts` — the retry-ledger depth
 /// at completion (`loop-attempts.json` prior failed cycles + this successful
 /// one; a note absent from the ledger completes on its first attempt). The
@@ -1204,6 +1224,17 @@ impl ZenWorker for ZenLoopWorker {
                 report.placeholder_downgrades = outcome.placeholder_downgrades;
                 report.cas_rolled_back = outcome.cas_rolled_back;
                 report.cas_drifted = outcome.cas_drifted;
+                // Compile-hygiene ②: ghostlink counters ride the cycle
+                // report; the audit line fires only when a ghost was seen
+                // (zero-ghost cycles would otherwise flood audit.jsonl).
+                report.ghostlinks_stripped = outcome.ghostlinks_stripped;
+                report.ghostlinks_warned = outcome.ghostlinks_warned;
+                emit_ghostlinks_audit(
+                    &logs_dir,
+                    &cycle_id,
+                    outcome.ghostlinks_stripped,
+                    outcome.ghostlinks_warned,
+                );
                 gaps.extend(outcome.gaps);
                 record_note_mutations(
                     &logs_dir,
@@ -1918,6 +1949,27 @@ mod tests {
         assert_eq!(worker.id(), "zen-loop");
         assert_eq!(worker.schedule(), "0 */5 * * * *");
         assert!(!worker.description().is_empty());
+    }
+
+    #[test]
+    fn ghostlinks_audit_line_shape_and_zero_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+
+        emit_ghostlinks_audit(&logs, "cycle-ghost", 3, 1);
+        let raw = std::fs::read_to_string(logs.join("audit.jsonl")).unwrap();
+        let line: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(line["kind"], "loop.compile.ghostlinks");
+        assert_eq!(line["cycle_id"], "cycle-ghost");
+        assert_eq!(line["stripped"], 3);
+        assert_eq!(line["warned"], 1);
+        assert!(line["ts"].is_string());
+
+        // Zero-ghost run: no audit line at all (report carries the zeros).
+        std::fs::remove_file(logs.join("audit.jsonl")).unwrap();
+        emit_ghostlinks_audit(&logs, "cycle-clean", 0, 0);
+        assert!(!logs.join("audit.jsonl").exists());
     }
 
     #[test]

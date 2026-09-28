@@ -21,7 +21,7 @@ use super::stages::LlmDistillStage;
 use super::transaction::TransactionScope;
 use super::transaction::VersionSnapshot;
 use super::types::{GapKind, GapRecord, LoopBudget, VerificationNode};
-use super::wiki_compile::WikiCompiler;
+use super::wiki_compile::{GhostlinkPolicy, WikiCompiler};
 use crate::graph_router::validate_slug;
 use crate::graph_verify::PlaceholderRegistry;
 use crate::notion::service::NotionService;
@@ -81,6 +81,12 @@ pub struct ScopedRunOutcome {
     /// Inbox sources archived this cycle whose removal was deferred to the
     /// CAS commit point (FR-032). Empty when CAS was inactive.
     pub deferred_sources: Vec<PathBuf>,
+    /// Ghost `[[wikilink]]` instances stripped to plain text at compile
+    /// time (compile-hygiene ②).
+    pub ghostlinks_stripped: usize,
+    /// Ghost `[[wikilink]]` instances kept and counted under the `warn`
+    /// policy (compile-hygiene ②).
+    pub ghostlinks_warned: usize,
 }
 
 /// Scan content for known entity names and wrap them in `[[wikilinks]]`
@@ -1034,7 +1040,12 @@ impl DistillationPipeline {
                 .map(|(_, rel)| wiki_dir.join(rel))
                 .collect();
 
-        let pages = self.compiler.compile(&linked_notes, wiki_dir)?;
+        // Compile-hygiene ②: policy resolved once per run; Strip is the
+        // fail-open default when config is unreadable.
+        let ghost_policy = GhostlinkPolicy::from_env_config();
+        let (pages, ghostlinks) =
+            self.compiler
+                .compile_with_policy(&linked_notes, wiki_dir, ghost_policy)?;
         // The compiler also regenerates `log.md` and (when pages exist)
         // `index.md` — track them so CAS self-write filtering sees them and
         // rollback can clean them up like any other cycle output.
@@ -1212,6 +1223,8 @@ impl DistillationPipeline {
             cas_rolled_back: false,
             cas_drifted: Vec::new(),
             deferred_sources,
+            ghostlinks_stripped: ghostlinks.stripped,
+            ghostlinks_warned: ghostlinks.warned,
         })
     }
 

@@ -90,6 +90,12 @@ pub struct LoopCycleReport {
     pub community_pages_written: usize,
     /// Page creates downgraded to updates via PlaceholderRegistry (FR-031).
     pub placeholder_downgrades: usize,
+    /// Ghost `[[wikilink]]` instances stripped to plain text at compile
+    /// time (compile-hygiene ②).
+    pub ghostlinks_stripped: usize,
+    /// Ghost `[[wikilink]]` instances kept and counted under the `warn`
+    /// policy (compile-hygiene ②).
+    pub ghostlinks_warned: usize,
     /// True when the cycle's wiki writes were rolled back by CAS drift
     /// detection (FR-032).
     pub cas_rolled_back: bool,

@@ -95,6 +95,6 @@ pub use types::{
     PlaceholderStatus, SelfModelItem, SelfModelLayer, ToolCall, TypedSignalKind, VerificationNode,
 };
 pub use vendor_eval::{evaluate, latest_report, not_evaluated, save_report};
-pub use wiki_compile::WikiCompiler;
+pub use wiki_compile::{GhostlinkPolicy, GhostlinkReport, WikiCompiler};
 
 pub struct Distill;

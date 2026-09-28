@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,10 +7,62 @@ use rig_compose::context::InvestigationContext;
 use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::{Skill, SkillOutcome};
 use tracing::info;
+use zen_repo::normalize_alias;
 
 use crate::note::Note;
 use crate::notion::NotionData;
 use crate::wiki::{WikiIndex, WikiLog, WikiPage, WikiStructure};
+
+/// Policy for `[[wikilink]]` targets missing from the compile whitelist
+/// (compile-hygiene ②).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GhostlinkPolicy {
+    /// Rewrite ghost `[[target]]` links to their plain text (default).
+    #[default]
+    Strip,
+    /// Keep ghost links in the emitted page, counting them only.
+    Warn,
+}
+
+impl GhostlinkPolicy {
+    /// Parse a `[agentic.compile] ghostlink_enforcement` value; unknown
+    /// values degrade to [`GhostlinkPolicy::Strip`] with a warn.
+    pub fn parse(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("warn") {
+            GhostlinkPolicy::Warn
+        } else {
+            if !raw.eq_ignore_ascii_case("strip") && !raw.is_empty() {
+                tracing::warn!(value = raw, "unknown ghostlink policy; using strip");
+            }
+            GhostlinkPolicy::Strip
+        }
+    }
+
+    /// Resolve the policy from `[agentic.compile] ghostlink_enforcement`,
+    /// failing open to [`GhostlinkPolicy::Strip`] when config is unreadable.
+    pub fn from_env_config() -> Self {
+        zen_core::config::load_config()
+            .map(|c| GhostlinkPolicy::parse(c.agentic.compile.ghostlink_enforcement_or_default()))
+            .unwrap_or_default()
+    }
+}
+
+/// Per-run ghostlink counters (compile-hygiene ②), carried on
+/// `ScopedRunOutcome` and surfaced via the `loop.compile.ghostlinks` audit
+/// line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GhostlinkReport {
+    /// Link instances rewritten to plain text.
+    pub stripped: usize,
+    /// Link instances kept under `Warn` policy.
+    pub warned: usize,
+}
+
+impl GhostlinkReport {
+    pub fn total(&self) -> usize {
+        self.stripped + self.warned
+    }
+}
 
 /// Known technology keywords for notion classification.
 const TECH_KEYWORDS: &[&str] = &[
@@ -89,11 +142,30 @@ impl WikiCompiler {
     /// 4. Categorize (Technology → `notions/technology/`, Concept → `concepts/`)
     /// 5. Write to disk under `wiki_dir`
     ///
+    /// Wikilink contract (compile-hygiene ②): every emitted `[[link]]` target
+    /// must exist — pages already under `wiki_dir` plus pages created in this
+    /// run. Ghost targets (LLM-hallucinated names) are stripped to plain text
+    /// under the default [`GhostlinkPolicy::Strip`]; use
+    /// [`compile_with_policy`](WikiCompiler::compile_with_policy) for the
+    /// `Warn` variant or to receive the per-run [`GhostlinkReport`].
+    ///
     /// After processing all notes:
     /// - Creates wiki directory structure via [`WikiStructure`]
     /// - Generates `index.md` via [`WikiIndex`]
     /// - Logs operations via [`WikiLog`]
     pub fn compile(&self, notes: &[Note], wiki_dir: &Path) -> Result<Vec<WikiPage>> {
+        let (pages, _) = self.compile_with_policy(notes, wiki_dir, GhostlinkPolicy::Strip)?;
+        Ok(pages)
+    }
+
+    /// [`compile`](WikiCompiler::compile) with an explicit ghost policy,
+    /// returning the per-run [`GhostlinkReport`] alongside the pages.
+    pub fn compile_with_policy(
+        &self,
+        notes: &[Note],
+        wiki_dir: &Path,
+        policy: GhostlinkPolicy,
+    ) -> Result<(Vec<WikiPage>, GhostlinkReport)> {
         let structure = WikiStructure::new(wiki_dir);
         structure
             .ensure_directories()
@@ -102,11 +174,39 @@ impl WikiCompiler {
         let log = WikiLog::new(wiki_dir);
         log.append("compile_start", &format!("compiling {} notes", notes.len()))?;
 
+        // Pass 1: convert every note before writing anything, so the
+        // whitelist covers same-run creates (page A may legitimately link
+        // page B compiled later in the batch).
         let mut pages = Vec::with_capacity(notes.len());
-        let mut written = 0usize;
-
         for note in notes {
-            let page = self.note_to_page(note)?;
+            pages.push(self.note_to_page(note)?);
+        }
+
+        // Whitelist: pre-existing page names ∪ this run's titles/slugs,
+        // compared through the canonical NFC alias normalization. Existing
+        // stems are slugified filenames, so both the dashed form and the
+        // de-slugified form must resolve to the same page title.
+        let mut whitelist: HashSet<String> = crate::graph_verify::wiki_page_inventory(wiki_dir)
+            .into_iter()
+            .flat_map(|(stem, _)| {
+                [
+                    normalize_alias(&stem),
+                    normalize_alias(&stem.replace('-', " ")),
+                ]
+            })
+            .collect();
+        for page in &pages {
+            whitelist.insert(normalize_alias(&page.title));
+            whitelist.insert(normalize_alias(&slugify(&page.title)));
+        }
+
+        let mut report = GhostlinkReport::default();
+        for page in &mut pages {
+            enforce_ghostlinks(page, &whitelist, policy, &mut report);
+        }
+
+        let mut written = 0usize;
+        for page in &pages {
             let full_path = wiki_dir.join(&page.path);
 
             // Atomic write via parent dir creation + temp rename
@@ -115,12 +215,11 @@ impl WikiCompiler {
                     .with_context(|| format!("create dir: {}", parent.display()))?;
             }
 
-            let rendered = self.render_page(&page);
+            let rendered = self.render_page(page);
             std::fs::write(&full_path, &rendered)
                 .with_context(|| format!("write wiki page: {}", full_path.display()))?;
 
             info!(
-                note_id = %note.id,
                 title = %page.title,
                 path = %page.path.display(),
                 wikilinks = page.wikilinks.len(),
@@ -132,7 +231,6 @@ impl WikiCompiler {
                 &format!("{} -> {}", page.title, page.path.display()),
             )?;
 
-            pages.push(page);
             written += 1;
         }
 
@@ -144,14 +242,22 @@ impl WikiCompiler {
 
         log.append(
             "compile_complete",
-            &format!("{} pages written from {} notes", written, notes.len()),
+            &format!(
+                "{} pages written from {} notes; ghostlinks stripped={} warned={}",
+                written,
+                notes.len(),
+                report.stripped,
+                report.warned
+            ),
         )?;
 
         info!(
-            "wiki compile complete: {written} pages from {} notes",
-            notes.len()
+            "wiki compile complete: {written} pages from {} notes; ghostlinks stripped={} warned={}",
+            notes.len(),
+            report.stripped,
+            report.warned
         );
-        Ok(pages)
+        Ok((pages, report))
     }
 
     /// Compile notion data into wiki pages under `wiki/notions/technology/`.
@@ -592,6 +698,44 @@ fn slugify(title: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
+/// Enforce the compile whitelist on one page (compile-hygiene ②): every
+/// `[[target]]` not in `whitelist` is counted and — under
+/// [`GhostlinkPolicy::Strip`] — rewritten to its plain text. Mutates the
+/// page body and its `wikilinks` frontmatter list so the two stay
+/// consistent.
+fn enforce_ghostlinks(
+    page: &mut WikiPage,
+    whitelist: &HashSet<String>,
+    policy: GhostlinkPolicy,
+    report: &mut GhostlinkReport,
+) {
+    let original_links = std::mem::take(&mut page.wikilinks);
+    let mut kept = Vec::with_capacity(original_links.len());
+
+    for target in original_links {
+        if whitelist.contains(&normalize_alias(&target)) {
+            kept.push(target);
+            continue;
+        }
+        match policy {
+            GhostlinkPolicy::Warn => {
+                report.warned += 1;
+                kept.push(target);
+            }
+            GhostlinkPolicy::Strip => {
+                let needle = format!("[[{target}]]");
+                let occurrences = page.content.matches(&needle).count();
+                if occurrences > 0 {
+                    page.content = page.content.replace(&needle, &target);
+                }
+                report.stripped += occurrences.max(1);
+            }
+        }
+    }
+
+    page.wikilinks = kept;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,12 +818,18 @@ mod tests {
     fn test_compile_extracts_wikilinks() {
         let dir = tempfile::tempdir().unwrap();
         let compiler = WikiCompiler::new();
-        let notes = vec![make_test_note(
-            "See [[Rust]] and [[Tokio]] for details.",
-            vec![],
-        )];
+        // Targets must exist (this run's creates) — compile-hygiene ②
+        // strips links whose targets are absent from the whitelist.
+        let notes = vec![
+            make_test_note("See [[Rust]] and [[Tokio]] for details.", vec![]),
+            make_test_note("# Rust\n\nContent.", vec![]),
+            make_test_note("# Tokio\n\nContent.", vec![]),
+        ];
 
-        let pages = compiler.compile(&notes, dir.path()).unwrap();
+        let (pages, report) = compiler
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .unwrap();
+        assert_eq!(report.total(), 0);
         assert_eq!(pages[0].wikilinks, vec!["Rust", "Tokio"]);
     }
 
@@ -1010,5 +1160,140 @@ mod tests {
         assert!(rendered.contains("tags: [\"tag1\"]"));
         assert!(rendered.contains("wikilinks: [\"Link1\"]"));
         assert!(rendered.contains("Body content"));
+    }
+
+    // ── Ghostlink whitelist (compile-hygiene ②) ─────────────────
+
+    #[test]
+    fn ghost_stripped_to_plain_text_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        let notes = vec![make_test_note(
+            "# Source\n\nSee [[Hallucinated Thing]] for details.",
+            vec![],
+        )];
+
+        let (pages, report) = compiler
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .unwrap();
+        assert_eq!(report.stripped, 1);
+        assert_eq!(report.warned, 0);
+        assert!(pages[0].wikilinks.is_empty());
+        assert!(
+            pages[0]
+                .content
+                .contains("See Hallucinated Thing for details.")
+        );
+        assert!(!pages[0].content.contains("[["));
+    }
+
+    #[test]
+    fn link_to_same_run_create_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        let notes = vec![
+            make_test_note("# Pointer\n\nRead [[Rust Guide]] first.", vec![]),
+            make_test_note("# Rust Guide\n\nRust content here.", vec![]),
+        ];
+
+        let (pages, report) = compiler
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .unwrap();
+        assert_eq!(report.total(), 0, "report: {report:?}");
+        let pointer = pages
+            .iter()
+            .find(|p| p.title == "Pointer")
+            .expect("pointer page");
+        assert_eq!(pointer.wikilinks, vec!["Rust Guide"]);
+    }
+
+    #[test]
+    fn link_to_preexisting_page_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+
+        // Pre-existing page (from an earlier compile run), slugified stem.
+        let prev_dir = dir.path().join("notions/concepts");
+        std::fs::create_dir_all(&prev_dir).unwrap();
+        std::fs::write(prev_dir.join("rust-guide.md"), "# Rust Guide\n\nold").unwrap();
+
+        let notes = vec![make_test_note(
+            "# New Note\n\nBack to [[Rust Guide]].",
+            vec![],
+        )];
+        let (pages, report) = compiler
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .unwrap();
+        assert_eq!(report.total(), 0, "de-slugified title link must survive");
+        assert_eq!(pages[0].wikilinks, vec!["Rust Guide"]);
+
+        let notes2 = vec![make_test_note(
+            "# New Note\n\nBack to [[rust-guide]].",
+            vec![],
+        )];
+        let (pages2, report2) = compiler
+            .compile_with_policy(&notes2, dir.path(), GhostlinkPolicy::Strip)
+            .unwrap();
+        assert_eq!(report2.total(), 0, "dashed stem link must survive");
+        assert_eq!(pages2[0].wikilinks, vec!["rust-guide"]);
+    }
+
+    #[test]
+    fn nfc_variant_of_valid_target_not_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+
+        // Create "Café" (precomposed NFC) this run; link with the
+        // decomposed NFD spelling — normalize_alias NFCs both sides.
+        let nfc = "Caf\u{e9}";
+        let nfd = "Cafe\u{301}";
+        let notes = vec![
+            make_test_note(&format!("# Note\n\nSee [[{nfd}]] now."), vec![]),
+            make_test_note(&format!("# {nfc}\n\nCoffee content."), vec![]),
+        ];
+
+        let (pages, report) = compiler
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Strip)
+            .unwrap();
+        assert_eq!(report.total(), 0, "NFC equivalence must hold: {report:?}");
+        let pointer = pages.iter().find(|p| p.title == "Note").unwrap();
+        assert_eq!(pointer.wikilinks.len(), 1);
+    }
+
+    #[test]
+    fn warn_policy_keeps_link_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        let notes = vec![make_test_note(
+            "# Source\n\nSee [[Hallucinated Thing]] for details.",
+            vec![],
+        )];
+
+        let (pages, report) = compiler
+            .compile_with_policy(&notes, dir.path(), GhostlinkPolicy::Warn)
+            .unwrap();
+        assert_eq!(report.warned, 1);
+        assert_eq!(report.stripped, 0);
+        assert_eq!(pages[0].wikilinks, vec!["Hallucinated Thing"]);
+        assert!(pages[0].content.contains("[[Hallucinated Thing]]"));
+    }
+
+    #[test]
+    fn bare_compile_defaults_to_strip() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        let notes = vec![make_test_note("# Source\n\nSee [[Ghost]] now.", vec![])];
+
+        let pages = compiler.compile(&notes, dir.path()).unwrap();
+        assert!(pages[0].wikilinks.is_empty());
+        assert!(pages[0].content.contains("See Ghost now."));
+    }
+
+    #[test]
+    fn ghost_policy_parse_degrades_to_strip() {
+        assert_eq!(GhostlinkPolicy::parse("strip"), GhostlinkPolicy::Strip);
+        assert_eq!(GhostlinkPolicy::parse("WARN"), GhostlinkPolicy::Warn);
+        assert_eq!(GhostlinkPolicy::parse(""), GhostlinkPolicy::Strip);
+        assert_eq!(GhostlinkPolicy::parse("stip"), GhostlinkPolicy::Strip);
     }
 }

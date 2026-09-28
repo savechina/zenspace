@@ -1062,24 +1062,30 @@ impl RetentionConfig {
     }
 }
 
-/// Wiki compile hygiene — TOML `[agentic.compile]` (compile-hygiene ①).
+/// Wiki compile hygiene — TOML `[agentic.compile]` (compile-hygiene ①②).
 ///
 /// Scope logic (Constitution XV):
 /// - Functionality: gates the OKF v0.1 conformance rule in `zen wiki lint`
-///   (pages missing a non-empty `type:` or `description:` frontmatter key
-///   are reported as findings; generated `index.md`/`log.md` are exempt).
+///   (`okf_lint`: pages missing a non-empty `type:` or `description:`
+///   frontmatter key are reported as findings; generated `index.md`/`log.md`
+///   are exempt) and the compile-time wikilink contract
+///   (`ghostlink_enforcement`: `strip` rewrites `[[target]]` links whose
+///   target is not in the compile whitelist to plain text, `warn` keeps and
+///   counts them; either way every compile run reports its counts).
 /// - User impact: `okf_lint = false` removes the OKF section from lint
-///   output entirely; findings are advisory either way — lint never fails
-///   a command, and legacy pages without frontmatter are reported, not
-///   treated as errors.
-/// - Default: `okf_lint = true` (absent section → enabled).
-/// - Interaction: env `ZEN_COMPILE_OKF_LINT` (5th layer) overrides any
-///   config file layer.
+///   output; findings are advisory either way — lint never fails a command.
+///   `ghostlink_enforcement = "warn"` preserves hallucinated links in the
+///   emitted pages instead of rewriting them.
+/// - Default: `okf_lint = true`, `ghostlink_enforcement = "strip"`.
+/// - Interaction: env `ZEN_COMPILE_OKF_LINT` / `ZEN_COMPILE_GHOSTLINK_ENFORCEMENT`
+///   (5th layer) override any config file layer.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct CompileConfig {
     /// OKF conformance lint fires when true (absent → true).
     pub okf_lint: Option<bool>,
+    /// Wikilink ghost policy — TOML `ghostlink_enforcement` (absent → "strip").
+    pub ghostlink_enforcement: Option<String>,
 }
 
 impl CompileConfig {
@@ -1087,7 +1093,28 @@ impl CompileConfig {
     pub fn okf_lint_or_default(&self) -> bool {
         self.okf_lint.unwrap_or(true)
     }
+
+    /// Effective ghost policy: "strip" (default) or "warn"; any other value
+    /// warns and degrades to "strip" so a typo cannot weaken the compile
+    /// contract silently in either direction.
+    pub fn ghostlink_enforcement_or_default(&self) -> &'static str {
+        match self.ghostlink_enforcement.as_deref() {
+            None => COMPILE_GHOSTLINK_STRIP,
+            Some(v) if v.eq_ignore_ascii_case(COMPILE_GHOSTLINK_STRIP) => COMPILE_GHOSTLINK_STRIP,
+            Some(v) if v.eq_ignore_ascii_case(COMPILE_GHOSTLINK_WARN) => COMPILE_GHOSTLINK_WARN,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "invalid [agentic.compile] ghostlink_enforcement; using \"strip\""
+                );
+                COMPILE_GHOSTLINK_STRIP
+            }
+        }
+    }
 }
+
+const COMPILE_GHOSTLINK_STRIP: &str = "strip";
+const COMPILE_GHOSTLINK_WARN: &str = "warn";
 
 /// Skill sections — TOML `[skills.*]` (005-agentic-loop, T076).
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -2063,6 +2090,10 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
         },
         compile: CompileConfig {
             okf_lint: ov.compile.okf_lint.or(base.compile.okf_lint),
+            ghostlink_enforcement: ov
+                .compile
+                .ghostlink_enforcement
+                .or(base.compile.ghostlink_enforcement),
         },
     }
 }
@@ -2409,6 +2440,9 @@ fn apply_retention_env(cfg: &mut RetentionConfig) {
 fn apply_compile_env(cfg: &mut CompileConfig) {
     if let Some(v) = env_bool("ZEN_COMPILE_OKF_LINT") {
         cfg.okf_lint = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_COMPILE_GHOSTLINK_ENFORCEMENT") {
+        cfg.ghostlink_enforcement = Some(v);
     }
 }
 
@@ -3288,6 +3322,48 @@ provider = "anthropic"
         let cfg = apply_env_overrides(ZenConfig::default());
         assert!(!cfg.agentic.compile.okf_lint_or_default());
         unsafe { std::env::remove_var("ZEN_COMPILE_OKF_LINT") };
+    }
+
+    #[test]
+    fn ghostlink_enforcement_defaults_warns_on_invalid_and_env_overrides() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let absent = parse("");
+        assert_eq!(
+            absent.agentic.compile.ghostlink_enforcement_or_default(),
+            "strip"
+        );
+
+        let warn = parse("[agentic.compile]\nghostlink_enforcement = \"warn\"\n");
+        assert_eq!(
+            warn.agentic.compile.ghostlink_enforcement_or_default(),
+            "warn"
+        );
+
+        let typo = parse("[agentic.compile]\nghostlink_enforcement = \"stip\"\n");
+        assert_eq!(
+            typo.agentic.compile.ghostlink_enforcement_or_default(),
+            "strip"
+        );
+
+        let merged = merge_configs(
+            parse("[agentic.compile]\nghostlink_enforcement = \"warn\"\n"),
+            parse(""),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.agentic.compile.ghostlink_enforcement_or_default(),
+            "warn"
+        );
+
+        // SAFETY: test-only env mutation; ZEN_COMPILE_GHOSTLINK_ENFORCEMENT is
+        // read by no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_COMPILE_GHOSTLINK_ENFORCEMENT", "warn") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.compile.ghostlink_enforcement_or_default(),
+            "warn"
+        );
+        unsafe { std::env::remove_var("ZEN_COMPILE_GHOSTLINK_ENFORCEMENT") };
     }
 
     #[test]

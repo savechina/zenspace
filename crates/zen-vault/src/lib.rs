@@ -20,8 +20,8 @@ pub use communities::{CommunitySummaryReport, run_community_summarization};
 pub use distill::{
     Checkpoint, CheckpointManager, Contradiction, ContradictionDetector, DiscoveryNode,
     DiscoveryTree, DistillationPipeline, DistillationPipelineInput, DistillationReport,
-    NotionExtractor, RecoveryManager, ScopedRunOutcome, SourceIngester, TransactionScope,
-    WikiCompiler, discovery_tree_path, prune_context,
+    GhostlinkPolicy, GhostlinkReport, NotionExtractor, RecoveryManager, ScopedRunOutcome,
+    SourceIngester, TransactionScope, WikiCompiler, discovery_tree_path, prune_context,
 };
 pub use graph_verify::{GraphIntegrityVerifier, wiki_page_inventory};
 pub use ingest::{
