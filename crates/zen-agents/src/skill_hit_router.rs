@@ -197,7 +197,9 @@ impl SkillHitRouter {
 /// Score one normalized trigger against the normalized query.
 ///
 /// Containment → 1.0 (literal trigger present); otherwise trigram-Jaccard.
-fn score_trigger(query_norm: &str, trigger_norm: &str) -> f32 {
+/// `pub(crate)`: the skill trigger grader reuses the exact routing
+/// arithmetic so a graded score means what a live hit would score.
+pub(crate) fn score_trigger(query_norm: &str, trigger_norm: &str) -> f32 {
     if query_norm.contains(trigger_norm) {
         return 1.0;
     }

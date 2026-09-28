@@ -62,6 +62,12 @@ impl SkillLoader {
         }
     }
 
+    /// Loader over an explicit directory (report-only surfaces such as the
+    /// skill trigger grader that receive a resolved path, not full ZenPaths).
+    pub fn new_from_dir(skills_dir: PathBuf) -> Self {
+        Self { skills_dir }
+    }
+
     /// List all available skill names.
     ///
     /// Discovers both the flat layout (`<name>.md`) and the D02 precipitation

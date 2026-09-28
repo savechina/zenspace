@@ -298,6 +298,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                             .to_string(),
                     )
                 });
+            let skill_eval = zen_agents::skill_trigger_eval::compute(&paths.skills());
             let success_criteria = serde_json::json!({
                 "first_attempt_success": serde_json::to_value(&first_attempt_success)
                     .map_err(|e| ZenError::Message(e.to_string()))?,
@@ -313,6 +314,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     "success_criteria": success_criteria,
                     "replay": replay,
                     "vendor_eval": vendor_eval,
+                    "skill_eval": skill_eval,
                 }))
                 .map_err(|e| ZenError::Message(e.to_string()))?
             );

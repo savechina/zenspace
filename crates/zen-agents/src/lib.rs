@@ -28,6 +28,7 @@ pub mod skill_history;
 pub mod skill_hit_router;
 pub mod skill_loader;
 pub mod skill_precipitation;
+pub mod skill_trigger_eval;
 pub mod wiring;
 pub mod zen_agent;
 pub mod zen_skill;
