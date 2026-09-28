@@ -646,7 +646,7 @@ fn extract_title(content: &str) -> Option<String> {
     None
 }
 
-fn strip_frontmatter(content: &str) -> String {
+pub(crate) fn strip_frontmatter(content: &str) -> String {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return content.to_string();

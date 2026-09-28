@@ -469,6 +469,8 @@ pub struct AgenticConfig {
     pub retention: RetentionConfig,
     /// Wiki compile hygiene — TOML `[agentic.compile]` (compile-hygiene ①).
     pub compile: CompileConfig,
+    /// Semantic wiki lint — TOML `[agentic.lint]` (compile-hygiene E1).
+    pub lint: LintConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -1110,6 +1112,32 @@ impl CompileConfig {
                 COMPILE_GHOSTLINK_STRIP
             }
         }
+    }
+}
+/// Semantic wiki lint configuration (compile-hygiene E1).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates the optional LLM audit of wiki pages
+///   (contradictions/gaps/stale/redundant) inside `zen wiki lint`.
+/// - User impact: `semantic = true` adds one bounded LLM call per lint run;
+///   findings are REPORTED (lint report + CLI counts), never written back
+///   to pages (read-only decision, docs/designs/e1-semantic-lint-writers.md).
+/// - Default: false — the gate ships closed; no LLM call happens unless the
+///   operator opens it (T168 shadow-mode precedent).
+/// - Interaction: env `ZEN_LINT_SEMANTIC` (5th layer) overrides any config
+///   file layer; with the gate open, an unconfigured/unreachable provider
+///   fails open to zero findings.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct LintConfig {
+    /// LLM semantic audit fires when true (absent → false).
+    pub semantic: Option<bool>,
+}
+
+impl LintConfig {
+    /// Effective semantic lint switch: config value, or off when absent.
+    pub fn semantic_or_default(&self) -> bool {
+        self.semantic.unwrap_or(false)
     }
 }
 
@@ -2088,6 +2116,9 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
             enabled: ov.retention.enabled.or(base.retention.enabled),
             dry_run: ov.retention.dry_run.or(base.retention.dry_run),
         },
+        lint: LintConfig {
+            semantic: ov.lint.semantic.or(base.lint.semantic),
+        },
         compile: CompileConfig {
             okf_lint: ov.compile.okf_lint.or(base.compile.okf_lint),
             ghostlink_enforcement: ov
@@ -2424,6 +2455,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_audit_env(&mut config.agentic.audit);
     apply_retention_env(&mut config.agentic.retention);
     apply_compile_env(&mut config.agentic.compile);
+    apply_lint_env(&mut config.agentic.lint);
     apply_skills_env(&mut config.skills.auto_route);
     config
 }
@@ -2434,6 +2466,12 @@ fn apply_retention_env(cfg: &mut RetentionConfig) {
     }
     if let Some(v) = env_bool("ZEN_RETENTION_DRY_RUN") {
         cfg.dry_run = Some(v);
+    }
+}
+
+fn apply_lint_env(cfg: &mut LintConfig) {
+    if let Some(v) = env_bool("ZEN_LINT_SEMANTIC") {
+        cfg.semantic = Some(v);
     }
 }
 
@@ -3298,6 +3336,20 @@ provider = "anthropic"
         unsafe { std::env::set_var("ZEN_LOOP_COMMUNITY_MIN_SIZE", "999") };
         let cfg = apply_env_overrides(ZenConfig::default());
         assert_eq!(cfg.agentic.loop_cfg.community_min_size_or_default(), 50);
+    }
+
+    #[test]
+    fn lint_semantic_defaults_closed_and_env_opens_it() {
+        // Default: the gate ships closed (T168 shadow-mode precedent).
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(!cfg.agentic.lint.semantic_or_default());
+
+        // SAFETY: test-only env mutation; ZEN_LINT_SEMANTIC is read by no
+        // sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_LINT_SEMANTIC", "true") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.lint.semantic_or_default());
+        unsafe { std::env::remove_var("ZEN_LINT_SEMANTIC") };
 
         unsafe { std::env::remove_var("ZEN_LOOP_COMMUNITY_RESOLUTION") };
         unsafe { std::env::remove_var("ZEN_LOOP_COMMUNITY_MIN_SIZE") };

@@ -28,6 +28,11 @@ pub struct LintResult {
     /// `created_at:` + `updated_at:` frontmatter; hand-written pages
     /// carry neither key and are never reported.
     pub sources_missing: Vec<String>,
+    /// LLM audit findings (compile-hygiene E1). Populated only when the
+    /// `[agentic.lint] semantic` gate is open; findings are reported, never
+    /// written back to pages (read-only contract,
+    /// docs/designs/e1-semantic-lint-writers.md).
+    pub semantic_findings: Vec<crate::tindy::semantic_lint::SemanticFinding>,
 }
 
 /// Required OKF v0.1 frontmatter keys checked by the conformance rule.

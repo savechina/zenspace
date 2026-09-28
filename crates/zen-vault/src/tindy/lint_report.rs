@@ -90,6 +90,25 @@ impl LintReportGenerator {
             report.push('\n');
         }
 
+        report.push_str("## Semantic Findings\n\n");
+        if result.semantic_findings.is_empty() {
+            report.push_str("No LLM audit findings (or the semantic gate is closed).\n\n");
+        } else {
+            for finding in &result.semantic_findings {
+                let kind = match finding.kind {
+                    crate::tindy::SemanticFindingKind::Contradiction => "contradiction",
+                    crate::tindy::SemanticFindingKind::Gap => "gap",
+                    crate::tindy::SemanticFindingKind::Stale => "stale",
+                    crate::tindy::SemanticFindingKind::Redundant => "redundant",
+                };
+                report.push_str(&format!(
+                    "- [{}] {}: {}\n",
+                    kind, finding.page, finding.note
+                ));
+            }
+            report.push('\n');
+        }
+
         fs::write(&report_path, report)?;
         Ok(report_path)
     }

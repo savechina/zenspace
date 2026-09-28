@@ -172,9 +172,14 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             let okf_enabled = zen_core::config::load_config()
                 .map(|c| c.agentic.compile.okf_lint_or_default())
                 .unwrap_or(true);
-            let result = linter
+            let mut result = linter
                 .run_with_okf(&wiki_dir, okf_enabled)
                 .map_err(|e| ZenError::Message(e.to_string()))?;
+            let semantic_enabled = zen_core::config::load_config()
+                .map(|c| c.agentic.lint.semantic_or_default())
+                .unwrap_or(false);
+            result.semantic_findings =
+                zen_vault::tindy::scan_semantic(&wiki_dir, semantic_enabled).await;
 
             let generator = zen_vault::tindy::LintReportGenerator::new();
             let report_path = generator
@@ -195,6 +200,15 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
                 );
             }
             println!("  Sources missing:    {}", result.sources_missing.len());
+            println!("  Semantic findings:  {}", result.semantic_findings.len());
+            for finding in &result.semantic_findings {
+                println!(
+                    "    - [{}] {}: {}",
+                    kind_label(finding.kind),
+                    finding.page,
+                    finding.note
+                );
+            }
             println!("  Report saved to:    {}", report_path.display());
 
             Ok(())
@@ -317,4 +331,13 @@ fn get_page_summary(path: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+fn kind_label(kind: zen_vault::tindy::SemanticFindingKind) -> &'static str {
+    match kind {
+        zen_vault::tindy::SemanticFindingKind::Contradiction => "contradiction",
+        zen_vault::tindy::SemanticFindingKind::Gap => "gap",
+        zen_vault::tindy::SemanticFindingKind::Stale => "stale",
+        zen_vault::tindy::SemanticFindingKind::Redundant => "redundant",
+    }
 }
