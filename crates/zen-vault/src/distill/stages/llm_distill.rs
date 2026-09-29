@@ -129,35 +129,68 @@ impl LlmDistillStage {
         let mut notions = Vec::new();
         let mut consumed = 0u32;
         for note in notes {
-            let estimate = estimate_tokens(&note.content);
-            if !self.budget.consume_tokens(estimate) {
-                warn!(
-                    consumed_tokens = self.budget.consumed_tokens,
-                    max_tokens = self.budget.max_tokens,
-                    "LlmDistillStage: budget exhausted — remaining notes stay heuristic-only"
-                );
-                break;
-            }
-            let mut note_tokens = estimate;
-            match call_llm(&model, EXTRACTION_SYSTEM, &note_prompt(note)).await {
-                Ok((reply, usage_tokens)) => {
-                    if usage_tokens > estimate {
-                        let delta = usage_tokens - estimate;
-                        if self.budget.consume_tokens(delta) {
-                            note_tokens = usage_tokens;
+            let tree_pages = zen_core::config::load_config()
+                .map(|c| c.agentic.loop_cfg.tree_index_pages_or_default())
+                .unwrap_or(20);
+            let (calls, toc) =
+                if super::super::tree_index::should_segment(&note.content, tree_pages) {
+                    match super::super::tree_index::segment_document(&note.content) {
+                        // ⑥ long-doc path: one bounded call per heading section,
+                        // the ToC riding each prompt as context — removes the
+                        // single-call truncation blindness.
+                        Some(sections) if sections.len() > 1 => {
+                            let toc = super::super::tree_index::render_toc(&sections);
+                            (
+                                sections.into_iter().map(|s| (s.title, s.body)).collect(),
+                                Some(toc),
+                            )
                         }
+                        // No headings / single section → plain truncated call.
+                        _ => (vec![(String::new(), note.content.clone())], None),
                     }
-                    notions.extend(parse_llm_notions(&reply, &note.id, MAX_NOTIONS_PER_NOTE));
-                }
-                Err(e) => {
+                } else {
+                    (vec![(String::new(), note.content.clone())], None)
+                };
+            for (section_title, section_body) in calls {
+                let estimate = estimate_tokens(&section_body);
+                if !self.budget.consume_tokens(estimate) {
                     warn!(
-                        error = %e,
-                        note_id = %note.id,
-                        "LlmDistillStage: LLM call failed — note stays heuristic-only"
+                        consumed_tokens = self.budget.consumed_tokens,
+                        max_tokens = self.budget.max_tokens,
+                        "LlmDistillStage: budget exhausted — remaining notes stay heuristic-only"
                     );
+                    return Ok((notions, consumed));
                 }
+                let mut note_tokens = estimate;
+                let task = match &toc {
+                    Some(toc) => format!(
+                        "Note id: {id}\nDocument outline:\n{toc}\n---\nExtract the notable notions from the section '{title}' below. Reply with ONLY the JSON array.\n\n{body}",
+                        id = note.id,
+                        title = section_title,
+                        body = truncate_chars(&section_body, MAX_NOTE_CHARS),
+                    ),
+                    None => note_prompt(note),
+                };
+                match call_llm(&model, EXTRACTION_SYSTEM, &task).await {
+                    Ok((reply, usage_tokens)) => {
+                        if usage_tokens > estimate {
+                            let delta = usage_tokens - estimate;
+                            if self.budget.consume_tokens(delta) {
+                                note_tokens = usage_tokens;
+                            }
+                        }
+                        notions.extend(parse_llm_notions(&reply, &note.id, MAX_NOTIONS_PER_NOTE));
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            note_id = %note.id,
+                            "LlmDistillStage: LLM call failed — note stays heuristic-only"
+                        );
+                    }
+                }
+                consumed = consumed.saturating_add(note_tokens);
             }
-            consumed = consumed.saturating_add(note_tokens);
         }
         Ok((notions, consumed))
     }

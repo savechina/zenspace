@@ -25,6 +25,7 @@ pub mod stages;
 pub mod success_criteria;
 pub mod tool_call_log;
 pub mod transaction;
+pub mod tree_index;
 pub mod types;
 pub mod vendor_eval;
 pub mod wiki_compile;

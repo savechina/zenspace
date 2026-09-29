@@ -505,6 +505,10 @@ pub struct LoopConfig {
     pub merge_llm_model: Option<String>,
     /// Explicit cloud opt-in for the T046 distill LLM calls (absent → false).
     pub distill_allow_cloud: Option<bool>,
+    /// ⑥ tree-index threshold: a note whose content exceeds this many
+    /// 3000-char pages is segmented and distilled per heading section
+    /// instead of truncated at the single-call bound (T046b consumer).
+    pub tree_index_pages: Option<u32>,
     /// Per-note retry attempts before quarantine (FR-010). Default 3.
     pub max_attempts: Option<u32>,
     /// Pre-cycle free-space guard in bytes; below → cycle Aborted (FR-005 guard).
@@ -592,6 +596,12 @@ impl LoopConfig {
     /// T168 shadow-mode precedent).
     pub fn distill_allow_cloud_or_default(&self) -> bool {
         self.distill_allow_cloud.unwrap_or(false)
+    }
+
+    /// ⑥ tree-index page threshold: config value clamped to 5..=200, or the
+    /// default 20 when absent.
+    pub fn tree_index_pages_or_default(&self) -> u32 {
+        self.tree_index_pages.unwrap_or(20).clamp(5, 200)
     }
 
     /// Whole-file ingest size ceiling in bytes (T158). Default 64 MiB;
@@ -2219,6 +2229,7 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
         merge_pure_duplicate: ov.merge_pure_duplicate.or(base.merge_pure_duplicate),
         merge_llm_model: str_merge(base.merge_llm_model, ov.merge_llm_model),
         distill_allow_cloud: ov.distill_allow_cloud.or(base.distill_allow_cloud),
+        tree_index_pages: ov.tree_index_pages.or(base.tree_index_pages),
         max_attempts: ov.max_attempts.or(base.max_attempts),
         min_free_bytes: ov.min_free_bytes.or(base.min_free_bytes),
         skip_extensions: ov.skip_extensions.or(base.skip_extensions),
@@ -2704,6 +2715,11 @@ fn apply_loop_env(cfg: &mut LoopConfig) {
     }
     if let Some(v) = env_bool("ZEN_LOOP_DISTILL_ALLOW_CLOUD") {
         cfg.distill_allow_cloud = Some(v);
+    }
+    if let Some(v) = env_u32("ZEN_LOOP_TREE_INDEX_PAGES")
+        && v > 0
+    {
+        cfg.tree_index_pages = Some(v);
     }
     if let Some(v) = env_str("ZEN_LOOP_MAX_INGEST_BYTES")
         && let Ok(n) = v.parse::<u64>()
