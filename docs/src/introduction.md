@@ -49,7 +49,7 @@ RAW NOTES ──► TIDY ──► ORGANIZE ──► DISTILL ──► FUSE
                           (MEMORY.md + beliefs)
 ```
 
-1. **Capture** — Notes, RSS feeds, raw files all go into inbox
+1. **Capture** — Notes, RSS feeds, and raw files all go into inbox (PDF/Office/ebooks auto-convert to Markdown)
 2. **Tidy** — Clean, chunk, normalize into structured Markdown
 3. **Organize** — Embed, index, classify — make everything searchable
 4. **Distill** — Extract entities, compile wiki pages, detect contradictions

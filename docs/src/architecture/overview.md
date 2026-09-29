@@ -96,6 +96,7 @@ Each tier adds depth: keyword search first, semantic when needed.
 ```
 note dropped into vault/inbox/ → ZenScheduler (zen_loop worker, every 5 min)
     → zen-vault (DistillationPipeline: extract → normalize → compile → merge → archive)
+    → zen-vault ingest (pdf/office/sidecar formats convert to Markdown at intake)
     → zen-provider (entity extraction)
     → zen-repo (graph entities + FTS5 + embeddings)
     → zen-vault (WikiPage generation, AtomicWikiWriter)
