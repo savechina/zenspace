@@ -40,18 +40,27 @@ pub fn ingest_url(url: &str) -> Result<IngestResult> {
 }
 
 pub fn ingest_local_file(file_path: &Path) -> Result<IngestResult> {
-    let is_pdf = file_path
+    let ext = file_path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
-    let content = if is_pdf {
-        let bytes = fs::read(file_path)
-            .with_context(|| format!("failed to read file: {}", file_path.display()))?;
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let bytes = fs::read(file_path)
+        .with_context(|| format!("failed to read file: {}", file_path.display()))?;
+    let content = if ext == "pdf" {
         super::pdf_to_markdown(&bytes)
             .with_context(|| format!("failed to convert pdf: {}", file_path.display()))?
+    } else if super::is_office_extension(&ext) {
+        super::office_to_markdown(&ext, &bytes).with_context(|| {
+            format!("failed to convert office document: {}", file_path.display())
+        })?
     } else {
-        fs::read_to_string(file_path)
-            .with_context(|| format!("failed to read file: {}", file_path.display()))?
+        String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "failed to read file: {} (stream did not contain valid UTF-8)",
+                file_path.display()
+            )
+        })?
     };
 
     let title = extract_title_from_md(&content).unwrap_or_else(|| {

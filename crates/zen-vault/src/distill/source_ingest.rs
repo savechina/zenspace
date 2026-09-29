@@ -124,9 +124,11 @@ impl SourceIngester {
                     continue;
                 }
                 let ext = staged.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let is_office = crate::ingest::is_office_extension(ext);
                 if !(ext.eq_ignore_ascii_case("md")
                     || ext.eq_ignore_ascii_case("txt")
-                    || ext.eq_ignore_ascii_case("pdf"))
+                    || ext.eq_ignore_ascii_case("pdf")
+                    || is_office)
                 {
                     continue;
                 }
@@ -135,14 +137,13 @@ impl SourceIngester {
                 };
                 let is_txt = ext.eq_ignore_ascii_case("txt");
                 let is_pdf = ext.eq_ignore_ascii_case("pdf");
-                // .txt files are converted to frontmatter-wrapped .md at promote
-                // time so the downstream distill inbox scan (ext == "md" only)
-                // picks them up as notes. .pdf files take the same promote-time
-                // conversion path (pdf-extract in-process, panic-contained);
-                // conversion failures are terminal, so unlike txt they
-                // quarantine (seen-set marker + staged removal) instead of
-                // re-warning every cycle.
-                let dest_name = if is_txt || is_pdf {
+                // .txt/.pdf/office files are converted to frontmatter-wrapped
+                // .md at promote time so the downstream distill inbox scan
+                // (ext == "md" only) picks them up as notes. Conversion runs
+                // in-process with panic containment; conversion failures are
+                // terminal, so unlike txt they quarantine (seen-set marker +
+                // staged removal) instead of re-warning every cycle.
+                let dest_name = if is_txt || is_pdf || is_office {
                     let stem = staged
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -199,7 +200,7 @@ impl SourceIngester {
                     );
                     continue;
                 }
-                if is_txt || is_pdf {
+                if is_txt || is_pdf || is_office {
                     // txt: non-UTF-8 files are skipped (warn, no ledger
                     // entry, no move — consistent with skip semantics).
                     // pdf: converted in-process; any failure (garbled,
@@ -222,8 +223,12 @@ impl SourceIngester {
                             fs::read(&staged)
                                 .map_err(|e| e.to_string())
                                 .and_then(|bytes| {
-                                    crate::ingest::pdf_to_markdown(&bytes)
-                                        .map_err(|e| e.to_string())
+                                    if is_pdf {
+                                        crate::ingest::pdf_to_markdown(&bytes)
+                                    } else {
+                                        crate::ingest::office_to_markdown(ext, &bytes)
+                                    }
+                                    .map_err(|e| e.to_string())
                                 });
                         match converted {
                             Ok(text) if !text.trim().is_empty() => text,
@@ -232,7 +237,7 @@ impl SourceIngester {
                                     &quarantined_dir,
                                     &staged,
                                     file_name,
-                                    "no extractable text (scanned or image-only pdf)",
+                                    "no extractable text (scanned/image-only pdf or empty document)",
                                 );
                                 continue;
                             }
@@ -466,6 +471,41 @@ mod tests {
         assert!(!inbox.join("feed0001_broken.md").exists());
         assert!(staging.join("quarantined").join("broken.pdf").is_file());
         assert!(!staging.join("broken.pdf").exists());
+    }
+
+    #[test]
+    fn promote_incoming_docx_converts_to_frontmattered_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("beef0003");
+        fs::create_dir_all(&staging).unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        office_oxide::create::create_from_markdown_to_writer(
+            "# Memo\n\nHost document body.\n",
+            office_oxide::format::DocumentFormat::Docx,
+            &mut buf,
+        )
+        .unwrap();
+        fs::write(staging.join("memo.docx"), buf.get_ref()).unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert_eq!(promoted.get("beef0003"), Some(&1));
+
+        let md = fs::read_to_string(inbox.join("beef0003_memo.md")).unwrap();
+        assert!(md.starts_with("---\n"));
+        let note = parse_frontmatter(&md).unwrap();
+        assert!(
+            note.content.contains("Host document body."),
+            "got: {:?}",
+            note.content
+        );
+        assert!(!staging.join("memo.docx").exists());
+        assert_eq!(
+            fs::read(staging.join("promoted").join("memo.docx")).unwrap(),
+            buf.get_ref().as_slice()
+        );
+        let again = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert!(again.is_empty());
     }
 
     #[test]

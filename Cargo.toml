@@ -119,6 +119,11 @@ diffy = "0.5"
 # minor memvid-core already pulls, so no new version island appears in the
 # tree (the T121 duplicate-island discipline). Do not bump casually.
 pdf-extract = "0.10"
+# Office (docx/xlsx/pptx) text extraction for the ingest pipeline. 2026-09-29
+# audit (docs/designs/doc-conversion.md): 719k downloads / 600k recent / 15
+# reverse deps incl. real consumers / fuzz targets + institutional CI. The
+# alternatives (undoc 20k dl, anytomd 9k dl) lack real-world consumers.
+office_oxide = "0.1"
 regex = "1"
 
 # WebSocket client for QQ Bot
