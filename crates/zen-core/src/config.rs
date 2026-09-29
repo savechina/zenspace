@@ -471,6 +471,9 @@ pub struct AgenticConfig {
     pub compile: CompileConfig,
     /// Semantic wiki lint — TOML `[agentic.lint]` (compile-hygiene E1).
     pub lint: LintConfig,
+    /// Prompt-cache breakpoints — TOML `[agentic.cache]` (compile-hygiene ③,
+    /// consumed by the T046 LLM distill stage).
+    pub cache: CacheConfig,
 }
 
 /// Knowledge-processing loop configuration (005-agentic-loop, T001).
@@ -495,7 +498,13 @@ pub struct LoopConfig {
     /// Similarity at/above which two pages short-circuit as pure duplicates. Default 0.98.
     pub merge_pure_duplicate: Option<f64>,
     /// Provider model reference for LLM-assisted merges (mem0 ADD/UPDATE discipline).
+    /// T046: also the FR-003 extraction-enrichment provider. A provider NAME
+    /// (see `LlmPreference::Provider`) — the model is the provider's configured
+    /// default. Naming a cloud provider alone does NOT move note content:
+    /// [`LoopConfig::distill_allow_cloud`] must also be true.
     pub merge_llm_model: Option<String>,
+    /// Explicit cloud opt-in for the T046 distill LLM calls (absent → false).
+    pub distill_allow_cloud: Option<bool>,
     /// Per-note retry attempts before quarantine (FR-010). Default 3.
     pub max_attempts: Option<u32>,
     /// Pre-cycle free-space guard in bytes; below → cycle Aborted (FR-005 guard).
@@ -576,6 +585,13 @@ impl LoopConfig {
     /// Per-cycle token budget. Default 8000; clamped to 1..=1_000_000.
     pub fn max_tokens_or_default(&self) -> u32 {
         self.max_tokens.unwrap_or(8_000).clamp(1, 1_000_000)
+    }
+
+    /// Explicit cloud opt-in for distill LLM calls: config value, or false
+    /// when absent — the gate ships closed (T045 allow_cloud precedent;
+    /// T168 shadow-mode precedent).
+    pub fn distill_allow_cloud_or_default(&self) -> bool {
+        self.distill_allow_cloud.unwrap_or(false)
     }
 
     /// Whole-file ingest size ceiling in bytes (T158). Default 64 MiB;
@@ -1138,6 +1154,37 @@ impl LintConfig {
     /// Effective semantic lint switch: config value, or off when absent.
     pub fn semantic_or_default(&self) -> bool {
         self.semantic.unwrap_or(false)
+    }
+}
+
+/// Prompt-cache breakpoints — TOML `[agentic.cache]` (compile-hygiene ③).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: when the T046 LLM distill stage routes to Anthropic and
+///   this is true, the call goes through `AnthropicProvider::complete_cached`
+///   (raw `/v1/messages` with `cache_control` breakpoints on the system/docs
+///   segments) instead of the plain completion path.
+/// - User impact: repeated distill calls share the cached system prefix —
+///   `cache_creation_input_tokens`/`cache_read_input_tokens` are echoed in
+///   the provider log for observability (acceptance 3 of the cache
+///   workstream).
+/// - Default: true — caching is a pure optimization; providers without
+///   cache support (trait default `supports_prompt_cache() -> false`) and
+///   non-Anthropic routes are byte-identical to the plain path.
+/// - Interaction: env `ZEN_CACHE_BREAKPOINTS` (5th layer) overrides any
+///   config file layer; a Private/local-first route never reaches the
+///   Anthropic path regardless of this switch.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Anthropic prompt-cache breakpoints on distill calls (absent → on).
+    pub breakpoints: Option<bool>,
+}
+
+impl CacheConfig {
+    /// Effective breakpoints switch: config value, or on when absent.
+    pub fn breakpoints_or_default(&self) -> bool {
+        self.breakpoints.unwrap_or(true)
     }
 }
 
@@ -2119,6 +2166,9 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
         lint: LintConfig {
             semantic: ov.lint.semantic.or(base.lint.semantic),
         },
+        cache: CacheConfig {
+            breakpoints: ov.cache.breakpoints.or(base.cache.breakpoints),
+        },
         compile: CompileConfig {
             okf_lint: ov.compile.okf_lint.or(base.compile.okf_lint),
             ghostlink_enforcement: ov
@@ -2168,6 +2218,7 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
         merge_threshold: ov.merge_threshold.or(base.merge_threshold),
         merge_pure_duplicate: ov.merge_pure_duplicate.or(base.merge_pure_duplicate),
         merge_llm_model: str_merge(base.merge_llm_model, ov.merge_llm_model),
+        distill_allow_cloud: ov.distill_allow_cloud.or(base.distill_allow_cloud),
         max_attempts: ov.max_attempts.or(base.max_attempts),
         min_free_bytes: ov.min_free_bytes.or(base.min_free_bytes),
         skip_extensions: ov.skip_extensions.or(base.skip_extensions),
@@ -2456,6 +2507,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_retention_env(&mut config.agentic.retention);
     apply_compile_env(&mut config.agentic.compile);
     apply_lint_env(&mut config.agentic.lint);
+    apply_cache_env(&mut config.agentic.cache);
     apply_skills_env(&mut config.skills.auto_route);
     config
 }
@@ -2472,6 +2524,12 @@ fn apply_retention_env(cfg: &mut RetentionConfig) {
 fn apply_lint_env(cfg: &mut LintConfig) {
     if let Some(v) = env_bool("ZEN_LINT_SEMANTIC") {
         cfg.semantic = Some(v);
+    }
+}
+
+fn apply_cache_env(cfg: &mut CacheConfig) {
+    if let Some(v) = env_bool("ZEN_CACHE_BREAKPOINTS") {
+        cfg.breakpoints = Some(v);
     }
 }
 
@@ -2643,6 +2701,9 @@ fn apply_loop_env(cfg: &mut LoopConfig) {
         && v > 0
     {
         cfg.max_tokens = Some(v);
+    }
+    if let Some(v) = env_bool("ZEN_LOOP_DISTILL_ALLOW_CLOUD") {
+        cfg.distill_allow_cloud = Some(v);
     }
     if let Some(v) = env_str("ZEN_LOOP_MAX_INGEST_BYTES")
         && let Ok(n) = v.parse::<u64>()
@@ -3336,6 +3397,21 @@ provider = "anthropic"
         unsafe { std::env::set_var("ZEN_LOOP_COMMUNITY_MIN_SIZE", "999") };
         let cfg = apply_env_overrides(ZenConfig::default());
         assert_eq!(cfg.agentic.loop_cfg.community_min_size_or_default(), 50);
+    }
+
+    #[test]
+    fn cache_breakpoints_default_on_and_env_disables() {
+        // Default: caching on — a pure optimization with a byte-identical
+        // plain path for providers without cache support.
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.cache.breakpoints_or_default());
+
+        // SAFETY: test-only env mutation; ZEN_CACHE_BREAKPOINTS is read by
+        // no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_CACHE_BREAKPOINTS", "false") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(!cfg.agentic.cache.breakpoints_or_default());
+        unsafe { std::env::remove_var("ZEN_CACHE_BREAKPOINTS") };
     }
 
     #[test]

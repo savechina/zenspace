@@ -1,133 +1,527 @@
-/// LLM Distill Stage (FR-003) — bounded LLM enrichment with heuristic fallback.
-///
-/// ## Scope Logic
-///
-/// **Functionality**: STUB (T046 pending) — when a model is configured the
-/// stage currently logs the intent and falls through to the deterministic
-/// `NotionExtractor` heuristic; `zen_provider::DefaultRouter` routing is not
-/// yet wired. The `merge_llm_model` config knob is parsed but not yet consumed.
-///
-/// **User impact**: Notes with an LLM-capable model configured get richer notion
-/// extraction (confidence-scored, relation-aware). Without LLM config, the system
-/// behaves identically to the pre-FR-003 heuristic path — zero regression.
-///
-/// **Default behavior**: `model: None` → pure heuristic extraction (no LLM call).
-///
-/// **Interaction**: Token consumption is bounded by `LoopBudget::consume_tokens`.
-/// Once over budget, the stage short-circuits to heuristic for all remaining notes.
-use anyhow::Result;
-use tracing::{debug, info};
+//! LLM Distill Stage (FR-003 / T046) — bounded LLM enrichment on top of the
+//! deterministic heuristic extraction.
+//!
+//! ## Scope Logic
+//!
+//! **Functionality**: when a provider is configured (the programmatic
+//! [`DistillationPipeline::with_llm_model`] override, or
+//! `[agentic.loop] merge_llm_model`), each note gets one bounded LLM
+//! extraction call producing structured JSON notions. The call routes through
+//! `DefaultRouter::route_with_preferences` at `Sensitivity::Private`
+//! (local-first) by default; `[agentic.loop] distill_allow_cloud = true`
+//! (env `ZEN_LOOP_DISTILL_ALLOW_CLOUD`) switches the request to
+//! `Sensitivity::Public` so a cloud provider named in `merge_llm_model` is
+//! actually reachable — the T045 `allow_cloud` encoding: naming a cloud
+//! provider alone never moves note content. The Anthropic route additionally
+//! honors `[agentic.cache] breakpoints` (compile-hygiene ③): the call goes
+//! through `AnthropicProvider::complete_cached` so repeated cycles share the
+//! cached system prefix and the real usage (`cache_creation` /
+//! `cache_read_input_tokens`) becomes the token accounting. The T046 merge
+//! assist [`merge_section`] reuses the same routing to compose merge
+//! sections. Any failure — unconfigured provider, unreachable, garbage reply
+//! — is fail-open: the affected note simply stays on the heuristic-only base
+//! the pipeline already produced.
+//!
+//! **User impact**: with a provider configured, notion extraction gains
+//! LLM-quality enrichment merged dedup-by-name over the heuristic base;
+//! without one (or on any LLM failure) behaviour is byte-identical to the
+//! heuristic path — zero regression. Token consumption is bounded by
+//! [`LoopBudget::consume_tokens`]: an estimate is reserved before each call
+//! (over-budget short-circuits the remaining notes) and the cached-path real
+//! usage reconciles the reservation upward.
+//!
+//! **Default behavior**: `model: None` → zero LLM calls, zero tokens, zero
+//! enrichment (this stage returns ONLY LLM-parsed notions — the heuristic
+//! base is the caller's).
+//!
+//! **Interaction**: `merge_llm_model` is a PROVIDER name (see
+//! `LlmPreference::Provider`), not a `provider:model` pair — the model is the
+//! provider's configured default. The cached path fires only when the
+//! routing actually selects Anthropic AND
+//! `[agentic.cache] breakpoints_or_default()` is true (default true).
 
-use super::super::notion_extraction::NotionExtractor;
+use anyhow::Result;
+use serde_json::Value;
+use tracing::{debug, info, warn};
+
 use super::super::types::LoopBudget;
 use crate::note::Note;
 use crate::notion::Notion as NotionType;
+use crate::notion::notion::parse_kind;
 
-/// Stub stage for LLM-enhanced distillation (FR-003).
+use zen_core::config::{LlmPreference, ModelOptions};
+use zen_core::types::Sensitivity;
+use zen_provider::cache::{CacheSegments, CacheUsage};
+use zen_provider::{DefaultRouter, LlmRouter, Provider, ProviderInstance, TaskRequirements};
+
+/// Reply budget the extraction prompt asks for; part of every reservation.
+const REPLY_ESTIMATE_TOKENS: u32 = 384;
+/// Input characters sent per note — beyond this the note is truncated (the
+/// heuristic path sees the full text; the LLM path stays bounded).
+const MAX_NOTE_CHARS: usize = 12_000;
+/// Notions accepted per note — a bloated reply is cut, not error-fatal.
+const MAX_NOTIONS_PER_NOTE: usize = 8;
+const MAX_NAME_CHARS: usize = 120;
+const MAX_DESCRIPTION_CHARS: usize = 300;
+const MAX_ALIASES: usize = 8;
+const MAX_TOPICS: usize = 8;
+/// Merge-assist bounds: the unique-line input and the composed output are
+/// both truncated so one merge can never blow the budget.
+const MERGE_INPUT_CHARS: usize = 6_000;
+const MERGE_OUTPUT_CHARS: usize = 4_000;
+
+/// Stable, cacheable extraction system prompt (compile-hygiene ③: the system
+/// segment is the cached prefix — it must not drift between cycles).
+const EXTRACTION_SYSTEM: &str = "You are a knowledge-base extraction engine. \
+From the given note, extract the notable notions (entities, concepts, \
+technologies, people, organizations, decisions). Reply with ONLY a JSON \
+array — no prose, no code fence. Each element: \
+{\"name\": string, \"kind\": one of function|class|module|concept|person|\
+organization|event|product|technology|other, \"description\": one sentence, \
+\"aliases\": [alternative names], \"topics\": [themes]}. Extract at most 8 \
+notions. Never invent facts absent from the note.";
+
+/// Stable, cacheable merge-assist system prompt.
+const MERGE_SYSTEM: &str = "You are a wiki merge assistant. You receive a \
+target page title, a source page name, and the source lines that are new to \
+the target. Rewrite the new lines as one cohesive markdown section body \
+(sub-headings allowed, NO top-level title), preserving facts verbatim where \
+possible and dropping redundancy. Reply with ONLY the section body — no \
+prose, no code fence.";
+
+/// LLM-enhanced distillation stage (FR-003, T046).
 ///
-/// Holds a `LoopBudget` for token accounting and an optional model name. When
-/// the model is `None` or the LLM call fails, all work falls through to the
-/// heuristic `NotionExtractor`.
+/// Holds a [`LoopBudget`] for token accounting and an optional provider
+/// name. The stage is an ENRICHMENT producer: it returns only the notions
+/// successfully parsed from LLM replies; the caller merges them over its own
+/// heuristic base. `model: None` → no calls, no tokens.
 pub struct LlmDistillStage {
     pub budget: LoopBudget,
-    /// Target model identifier (e.g. `"openai:gpt-4o"`). `None` disables LLM.
+    /// Target provider name (e.g. `"ollama"`, `"anthropic"`). `None` disables LLM.
     pub model: Option<String>,
-    /// Heuristic fallback extractor — always available.
-    extractor: NotionExtractor,
 }
 
 impl LlmDistillStage {
-    /// Create a new stage with the given budget ceiling and optional model.
+    /// Create a new stage with the given budget ceiling and optional provider.
     pub fn new(budget: LoopBudget, model: Option<String>) -> Self {
-        Self {
-            budget,
-            model,
-            extractor: NotionExtractor::new(),
-        }
+        Self { budget, model }
     }
 
-    /// Distill notes into notions, using LLM when possible, heuristic otherwise.
-    ///
-    /// ## Algorithm
-    /// 1. If `self.model` is `None` → full heuristic pass (no budget consumption).
-    /// 2. If `self.model` is `Some` → estimate token cost per note, attempt
-    ///    `budget.consume_tokens(estimate)`. If budget refused → fallback to
-    ///    heuristic for remaining notes.
-    /// 3. LLM path is a **stub**: logs the intent and falls through to heuristic
-    ///    until the zen-provider integration is wired (tracked in FR-003 follow-up).
-    ///
-    /// Returns `(notions, consumed_tokens)` — caller can persist the budget state.
-    pub fn distill_with_fallback(&mut self, notes: &[Note]) -> Result<(Vec<NotionType>, u32)> {
-        // Phase 1: If no model configured, pure heuristic — zero cost.
-        let model = match &self.model {
-            Some(m) => m.clone(),
-            None => {
-                debug!("LlmDistillStage: no model configured, using heuristic only");
-                let notions = self.extractor.extract_batch(notes)?;
-                return Ok((notions, 0));
-            }
+    /// Distill notes into LLM-enrichment notions. Returns
+    /// `(notions, consumed_tokens)` — the caller merges the notions
+    /// dedup-by-name over its heuristic base and folds the tokens into the
+    /// cycle budget.
+    pub async fn distill_with_fallback(
+        &mut self,
+        notes: &[Note],
+    ) -> Result<(Vec<NotionType>, u32)> {
+        let Some(model) = self.model.clone() else {
+            debug!("LlmDistillStage: no model configured — zero enrichment");
+            return Ok((Vec::new(), 0));
         };
 
         info!(
             model = %model,
             notes_count = notes.len(),
-            "LlmDistillStage: attempting LLM enrichment"
+            "LlmDistillStage: LLM enrichment enabled"
         );
 
-        // Phase 2/3: LLM call stub (T046 pending). No LLM work is performed,
-        // so no tokens are consumed or reported — reporting the estimate
-        // would be fictional accounting. zen_provider routing lands with T046.
-        debug!(
-            model = %model,
-            notes_count = notes.len(),
-            "LlmDistillStage: LLM stub — heuristic extraction, 0 tokens"
-        );
+        let mut notions = Vec::new();
+        let mut consumed = 0u32;
+        for note in notes {
+            let estimate = estimate_tokens(&note.content);
+            if !self.budget.consume_tokens(estimate) {
+                warn!(
+                    consumed_tokens = self.budget.consumed_tokens,
+                    max_tokens = self.budget.max_tokens,
+                    "LlmDistillStage: budget exhausted — remaining notes stay heuristic-only"
+                );
+                break;
+            }
+            let mut note_tokens = estimate;
+            match call_llm(&model, EXTRACTION_SYSTEM, &note_prompt(note)).await {
+                Ok((reply, usage_tokens)) => {
+                    if usage_tokens > estimate {
+                        let delta = usage_tokens - estimate;
+                        if self.budget.consume_tokens(delta) {
+                            note_tokens = usage_tokens;
+                        }
+                    }
+                    notions.extend(parse_llm_notions(&reply, &note.id, MAX_NOTIONS_PER_NOTE));
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        note_id = %note.id,
+                        "LlmDistillStage: LLM call failed — note stays heuristic-only"
+                    );
+                }
+            }
+            consumed = consumed.saturating_add(note_tokens);
+        }
+        Ok((notions, consumed))
+    }
+}
 
-        let notions = self.extractor.extract_batch(notes)?;
-        info!(
-            notions_extracted = notions.len(),
-            "LlmDistillStage: distillation complete (heuristic path)"
-        );
+/// One bounded LLM call. Returns `(reply, actual_tokens)`; on the plain
+/// path the actual equals the caller-visible estimate of the prompt actually
+/// sent, on the cached path it is the real billable usage from the provider
+/// echo.
+///
+/// Sensitivity encoding (T045 precedent): `distill_allow_cloud = false`
+/// (default) requests `Sensitivity::Private` so the router's
+/// `enforce_sensitivity` gate keeps note content local; `true` requests
+/// `Sensitivity::Public` — the explicit operator opt-in that lets a cloud
+/// provider named in `merge_llm_model` serve distill calls.
+async fn call_llm(
+    model: &str,
+    system: &str,
+    task: &str,
+) -> std::result::Result<(String, u32), String> {
+    let config = zen_core::config::load_config().map_err(|e| format!("config load failed: {e}"))?;
+    let allow_cloud = config.agentic.loop_cfg.distill_allow_cloud_or_default();
+    let use_cache = config.agentic.cache.breakpoints_or_default();
+    let sensitivity = if allow_cloud {
+        Sensitivity::Public
+    } else {
+        Sensitivity::Private
+    };
+    let router = DefaultRouter::from_agentic(config);
+    let requirements = TaskRequirements {
+        max_tokens: Some(2048),
+        sensitivity,
+        preferred_model: None,
+        budget_limit: None,
+    };
+    let prefs = [LlmPreference::Provider(model.to_string())];
+    let provider = router
+        .route_with_preferences(&requirements, &prefs)
+        .map_err(|e| {
+            if !allow_cloud {
+                format!(
+                    "{e} — note: '{model}' cannot serve distill while the cloud gate is closed; \
+                 set [agentic.loop] distill_allow_cloud = true (env \
+                 ZEN_LOOP_DISTILL_ALLOW_CLOUD=1) to route note content through it"
+                )
+            } else {
+                e.to_string()
+            }
+        })?;
 
-        Ok((notions, 0))
+    // Compile-hygiene ③: the Anthropic route honors [agentic.cache]
+    // breakpoints — the stable system prompt becomes the cached prefix and
+    // the real usage echo drives token accounting.
+    if use_cache
+        && provider == Provider::Anthropic
+        && let Some(ProviderInstance::Anthropic(anthropic)) = router.provider_instance("anthropic")
+    {
+        let segments = CacheSegments::build(system, &[task.to_string()], "", &[]);
+        let completion = anthropic
+            .complete_cached(&segments, task, &ModelOptions::default())
+            .await
+            .map_err(|e| e.to_string())?;
+        let billable = billable_tokens(&completion.usage, estimate_tokens(task));
+        return Ok((completion.text, billable));
+    }
+
+    // Plain path on a blocking thread — the established spawn_blocking guard:
+    // route()/call() are sync and OllamaProvider constructs a nested tokio
+    // Runtime inside them, which panics on an async worker thread.
+    let prompt_tokens = estimate_tokens(task);
+    let task = task.to_string();
+    let reply = tokio::task::spawn_blocking(move || router.call(provider, &task))
+        .await
+        .map_err(|e| format!("distill LLM task join failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+    Ok((reply, prompt_tokens))
+}
+
+/// Anthropic cache-usage echo → billable tokens (compile-hygiene ③
+/// acceptance: the `cache_creation_input_tokens` share is observable, and a
+/// cache READ is not re-billed as input). All-None usage (provider gave no
+/// echo) falls back to the caller's estimate; a parseable echo never
+/// estimates.
+fn billable_tokens(usage: &CacheUsage, fallback: u32) -> u32 {
+    match (usage.input_tokens, usage.output_tokens) {
+        (None, None) => fallback,
+        (input, output) => {
+            let output = output.unwrap_or(0) as u32;
+            let creation = usage.cache_creation_input_tokens.unwrap_or(0) as u32;
+            let input = input
+                .unwrap_or(0)
+                .saturating_sub(usage.cache_read_input_tokens.unwrap_or(0))
+                as u32;
+            output.saturating_add(creation).saturating_add(input).max(1)
+        }
+    }
+}
+
+/// Parse the LLM reply into validated enrichment notions. Anything
+/// unparseable, unknown-kind, or unnamed is dropped — a hallucinated or
+/// malformed reply must never reach the notion base. Returns at most `max`.
+fn parse_llm_notions(raw: &str, note_id: &str, max: usize) -> Vec<NotionType> {
+    let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) else {
+        warn!("LlmDistillStage: reply has no JSON array — zero enrichment (fail-open)");
+        return Vec::new();
+    };
+    if start >= end {
+        return Vec::new();
+    }
+    let items: Vec<Value> = match serde_json::from_str(&raw[start..=end]) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "LlmDistillStage: reply is not a JSON array — zero enrichment (fail-open)");
+            return Vec::new();
+        }
+    };
+    let mut notions = Vec::new();
+    for item in items {
+        if notions.len() >= max {
+            break;
+        }
+        let Some(name) = item.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(kind) = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(|k| parse_kind(&k.to_lowercase()))
+        else {
+            continue;
+        };
+        let mut notion = NotionType::new(truncate_chars(name, MAX_NAME_CHARS), kind, note_id);
+        if let Some(desc) = item.get("description").and_then(Value::as_str) {
+            notion.description = truncate_chars(desc.trim(), MAX_DESCRIPTION_CHARS).to_string();
+        }
+        if let Some(aliases) = item.get("aliases").and_then(Value::as_array) {
+            notion.aliases = aliases
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .take(MAX_ALIASES)
+                .map(String::from)
+                .collect();
+        }
+        if let Some(topics) = item.get("topics").and_then(Value::as_array) {
+            notion.topics = topics
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .take(MAX_TOPICS)
+                .map(String::from)
+                .collect();
+        }
+        notions.push(notion);
+    }
+    notions
+}
+
+/// Compose a merge section via the LLM (T046 merge assist). Returns `None`
+/// on any failure — the caller falls back to the deterministic raw append.
+/// Input/output are truncated so one merge can never blow the budget.
+pub async fn merge_section(
+    model: &str,
+    target_title: &str,
+    source_stem: &str,
+    unique: &str,
+) -> Option<String> {
+    let unique = truncate_chars(unique, MERGE_INPUT_CHARS);
+    let task = format!(
+        "Target page: {target_title}\nSource page: {source_stem}\n\nNew lines to absorb:\n\n{unique}\n\nRewrite the new lines as one cohesive markdown section body (sub-headings allowed, no top-level title), preserving facts verbatim where possible. Reply with ONLY the section body."
+    );
+    match call_llm(model, MERGE_SYSTEM, &task).await {
+        Ok((reply, _tokens)) => {
+            let body = truncate_chars(reply.trim(), MERGE_OUTPUT_CHARS).to_string();
+            if body.is_empty() {
+                warn!("merge assist: empty LLM section — falling back to raw append");
+                None
+            } else {
+                Some(body)
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "merge assist: LLM call failed — falling back to raw append");
+            None
+        }
+    }
+}
+
+/// The per-note user prompt: id + first-line title (the same 200-char
+/// derivation the FTS index uses) + bounded content.
+fn note_prompt(note: &Note) -> String {
+    let title: String = note
+        .content
+        .lines()
+        .next()
+        .unwrap_or(&note.content)
+        .chars()
+        .take(200)
+        .collect();
+    let content = truncate_chars(&note.content, MAX_NOTE_CHARS);
+    format!(
+        "Note id: {}\nTitle: {}\n\nExtract the notable notions from the note below. Reply with ONLY the JSON array.\n\n---\n{content}\n---",
+        note.id, title
+    )
+}
+
+/// Rough token estimate: ~4 chars per token with a 64-token floor, plus the
+/// reserved reply budget.
+fn estimate_tokens(content: &str) -> u32 {
+    (content.chars().count() as u32 / 4).max(64) + REPLY_ESTIMATE_TOKENS
+}
+
+/// Char-boundary-safe truncation (never splits a UTF-8 code point).
+fn truncate_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::note::Note;
 
-    fn sample_note(content: &str) -> Note {
+    fn make_note(content: &str) -> Note {
         Note {
-            id: "test-001".into(),
-            content: content.into(),
-            ..Default::default()
+            id: "note-1".to_string(),
+            content: content.to_string(),
+            ..Note::default()
         }
     }
 
-    #[test]
-    fn no_model_uses_heuristic() {
+    #[tokio::test]
+    async fn no_model_yields_zero_enrichment_and_zero_tokens() {
         let mut stage = LlmDistillStage::new(LoopBudget::default(), None);
-        let notes = vec![sample_note("Using Rust and PostgreSQL for the project")];
-        let (notions, cost) = stage.distill_with_fallback(&notes).unwrap();
-        assert_eq!(cost, 0, "no model should consume zero tokens");
+        let notes = vec![make_note("rust and sqlite notes")];
+        let (notions, tokens) = stage.distill_with_fallback(&notes).await.unwrap();
+        assert!(notions.is_empty());
+        assert_eq!(tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_stops_before_any_call() {
+        // 1-token ceiling: the first reservation is refused → no call, no tokens.
+        let mut stage = LlmDistillStage::new(LoopBudget::with_limits(5, 1), None);
+        let notes = vec![make_note("rust and sqlite notes")];
+        let (notions, tokens) = stage.distill_with_fallback(&notes).await.unwrap();
+        assert!(notions.is_empty());
+        assert_eq!(tokens, 0);
+    }
+
+    /// End-to-end fail-open through the real router plumbing: the mock
+    /// provider answers with a non-JSON "[mock] ..." line, the parser must
+    /// drop it and the reservation must still be accounted.
+    #[tokio::test]
+    async fn mock_provider_garbage_reply_fails_open() {
+        // Edition 2024: set_var is unsafe (process-global mutation).
+        unsafe { std::env::set_var("ZEN_LOOP_DISTILL_ALLOW_CLOUD", "1") };
+        zen_core::config::invalidate_config_cache();
+        let mut stage = LlmDistillStage::new(LoopBudget::default(), Some("mock".to_string()));
+        let notes = vec![make_note("rust and sqlite notes")];
+        let (notions, tokens) = stage.distill_with_fallback(&notes).await.unwrap();
         assert!(
-            !notions.is_empty(),
-            "heuristic should extract at least one notion"
+            notions.is_empty(),
+            "garbage reply must parse to zero notions"
+        );
+        assert!(
+            tokens > 0,
+            "the reservation must be accounted even on fail-open"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_section_unknown_provider_fails_open_to_none() {
+        unsafe { std::env::set_var("ZEN_LOOP_DISTILL_ALLOW_CLOUD", "1") };
+        zen_core::config::invalidate_config_cache();
+        let section = merge_section(
+            "definitely-not-a-provider",
+            "target",
+            "source",
+            "some unique line",
+        )
+        .await;
+        assert!(
+            section.is_none(),
+            "unconfigured provider must fail open to raw append"
         );
     }
 
     #[test]
-    fn stub_model_uses_heuristic_path() {
-        let budget = LoopBudget::default();
-        let mut stage = LlmDistillStage::new(budget, Some("openai:gpt-4o".into()));
-        let notes = vec![sample_note("Exploring WASM and Docker containers")];
-        let (notions, cost) = stage.distill_with_fallback(&notes).unwrap();
+    fn parse_accepts_valid_entries_and_sets_fields() {
+        let raw = r#" preamble [ {"name": "SQLite", "kind": "Technology", "description": "embedded db", "aliases": ["sqlite3"], "topics": ["db"]} ] trailing"#;
+        let notions = parse_llm_notions(raw, "n1", 8);
+        assert_eq!(notions.len(), 1);
+        assert_eq!(notions[0].name, "SQLite");
+        assert_eq!(notions[0].description, "embedded db");
+        assert_eq!(notions[0].aliases, vec!["sqlite3"]);
+        assert_eq!(notions[0].topics, vec!["db"]);
+        assert_eq!(notions[0].source_note_id, "n1");
+    }
+
+    #[test]
+    fn parse_drops_invalid_kind_and_empty_name_and_caps() {
+        let raw = r#"[
+            {"name": "Ghost", "kind": "alien-tech"},
+            {"name": "", "kind": "concept"},
+            {"kind": "concept"},
+            {"name": "A", "kind": "concept"},
+            {"name": "B", "kind": "concept"},
+            {"name": "C", "kind": "concept"}
+        ]"#;
+        let notions = parse_llm_notions(raw, "n1", 2);
         assert_eq!(
-            cost, 0,
-            "stub performs no LLM work, must report zero tokens"
+            notions.len(),
+            2,
+            "invalid entries dropped, output capped at max"
         );
-        assert!(!notions.is_empty());
+        assert_eq!(notions[0].name, "A");
+        assert_eq!(notions[1].name, "B");
+    }
+
+    #[test]
+    fn parse_fail_open_on_no_array_and_on_non_json() {
+        assert!(parse_llm_notions("no brackets here", "n1", 8).is_empty());
+        assert!(parse_llm_notions("[not json]", "n1", 8).is_empty());
+        assert!(parse_llm_notions("[]", "n1", 8).is_empty());
+    }
+
+    #[test]
+    fn estimate_has_floor_and_reply_budget() {
+        assert_eq!(estimate_tokens(""), 64 + REPLY_ESTIMATE_TOKENS);
+        assert_eq!(estimate_tokens("x"), 64 + REPLY_ESTIMATE_TOKENS);
+        assert_eq!(
+            estimate_tokens(&"a".repeat(400)),
+            100 + REPLY_ESTIMATE_TOKENS
+        );
+    }
+
+    #[test]
+    fn billable_uses_echo_and_never_rebills_cache_reads() {
+        let mut usage = CacheUsage::default();
+        assert_eq!(
+            billable_tokens(&usage, 777),
+            777,
+            "no echo → estimate fallback"
+        );
+        usage.input_tokens = Some(1000);
+        usage.output_tokens = Some(50);
+        usage.cache_creation_input_tokens = Some(200);
+        usage.cache_read_input_tokens = Some(800);
+        // 50 output + 200 creation + (1000 input − 800 cache-read) = 450.
+        assert_eq!(billable_tokens(&usage, 777), 450);
+    }
+
+    #[test]
+    fn truncate_is_char_boundary_safe() {
+        assert_eq!(truncate_chars("hello", 3), "hel");
+        assert_eq!(truncate_chars("hi", 10), "hi");
+        assert_eq!(truncate_chars("你好世界", 2), "你好");
     }
 }

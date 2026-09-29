@@ -1038,11 +1038,34 @@ impl DistillationPipeline {
             })
             .collect();
 
-        // FR-003: LLM enrichment hook — if model configured, attempt LLM-augmented
-        // notion extraction bounded by LoopBudget; otherwise heuristic path only.
-        let mut llm_stage = LlmDistillStage::new(LoopBudget::default(), self.llm_model.clone());
-        match llm_stage.distill_with_fallback(&normalized) {
+        // FR-003 / T046: LLM enrichment hook — the provider comes from the
+        // programmatic `with_llm_model` override or
+        // `[agentic.loop] merge_llm_model`; the stage borrows the scoped
+        // cycle ceilings (fresh counters) and its consumption folds back
+        // into the cycle budget below.
+        let stage_model = self.llm_model.clone().or_else(|| {
+            zen_core::config::load_config()
+                .ok()
+                .and_then(|c| c.agentic.loop_cfg.merge_llm_model.clone())
+        });
+        if self.llm_model.is_none() && stage_model.is_some() {
+            info!(
+                model = %stage_model.as_deref().unwrap_or_default(),
+                "FR-003: LLM enrichment enabled via [agentic.loop] merge_llm_model"
+            );
+        }
+        let stage_budget = budget
+            .as_ref()
+            .map(|b| LoopBudget::with_limits(b.max_steps, b.max_tokens))
+            .unwrap_or_default();
+        let mut llm_stage = LlmDistillStage::new(stage_budget, stage_model);
+        match llm_stage.distill_with_fallback(&normalized).await {
             Ok((llm_notions, tokens_used)) => {
+                if tokens_used > 0
+                    && let Some(b) = budget
+                {
+                    b.consume_tokens(tokens_used);
+                }
                 if !llm_notions.is_empty() {
                     let before = notions.len();
                     // Merge LLM notions, dedup by name.
@@ -1140,8 +1163,9 @@ impl DistillationPipeline {
         }
 
         // T015: merge execution — cluster + fold duplicates (FR-016).
-        let (merged_count, merge_iterations) =
-            self.execute_merge_plans(wiki_dir, archive_dir, txn, cycle_id, &page_iterations)?;
+        let (merged_count, merge_iterations) = self
+            .execute_merge_plans(wiki_dir, archive_dir, txn, cycle_id, &page_iterations)
+            .await?;
         iterations_captured += merge_iterations;
 
         let contradictions = self.detector.detect(&notes)?;
@@ -1406,7 +1430,7 @@ impl DistillationPipeline {
     /// frontmatter, and other pages' `[[source]]` wikilinks are rewritten to
     /// `[[target]]` (OVP2 bi-temporal pattern, data-model §5). Merge never
     /// deletes — originals live in the archive.
-    fn execute_merge_plans(
+    async fn execute_merge_plans(
         &self,
         wiki_dir: &Path,
         archive_dir: &Path,
@@ -1480,9 +1504,11 @@ impl DistillationPipeline {
                     .unwrap_or_default();
                 let source_content = std::fs::read_to_string(source).unwrap_or_default();
 
-                // Mechanical content absorption: append source body to target
-                // when it carries unique lines (deterministic; LLM assist via
-                // `merge_llm_model` is not yet wired — tracked by T046).
+                // Content absorption: unique source lines join the target —
+                // LLM-composed via `merge_llm_model` when configured (T046
+                // merge assist), deterministic raw append otherwise. Any LLM
+                // failure falls back to the raw append, so without config the
+                // behaviour is byte-identical to the pre-T046 merge.
                 if plan.strategy == MergeStrategy::Merge {
                     let unique: Vec<&str> = source_content
                         .lines()
@@ -1491,9 +1517,28 @@ impl DistillationPipeline {
                         })
                         .collect();
                     if !unique.is_empty() {
-                        target_content.push_str(&format!(
-                            "\n\n## From [[{source_stem}]]\n\n{}\n",
+                        let merge_model = zen_core::config::load_config()
+                            .ok()
+                            .and_then(|c| c.agentic.loop_cfg.merge_llm_model.clone());
+                        let section_body = if let Some(model) = merge_model {
+                            let target_title = target_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let unique_text = unique.join("\n");
+                            super::stages::llm_distill::merge_section(
+                                &model,
+                                &target_title,
+                                &source_stem,
+                                &unique_text,
+                            )
+                            .await
+                            .unwrap_or_else(|| unique.join("\n"))
+                        } else {
                             unique.join("\n")
+                        };
+                        target_content.push_str(&format!(
+                            "\n\n## From [[{source_stem}]]\n\n{section_body}\n"
                         ));
                     }
                 }
