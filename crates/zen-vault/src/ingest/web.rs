@@ -47,13 +47,9 @@ pub fn ingest_local_file(file_path: &Path) -> Result<IngestResult> {
         .unwrap_or_default();
     let bytes = fs::read(file_path)
         .with_context(|| format!("failed to read file: {}", file_path.display()))?;
-    let content = if ext == "pdf" {
-        super::pdf_to_markdown(&bytes)
-            .with_context(|| format!("failed to convert pdf: {}", file_path.display()))?
-    } else if super::is_office_extension(&ext) {
-        super::office_to_markdown(&ext, &bytes).with_context(|| {
-            format!("failed to convert office document: {}", file_path.display())
-        })?
+    let content = if super::is_convertible_extension(&ext) {
+        super::convert_to_markdown(&ext, &bytes)
+            .map_err(|e| anyhow::anyhow!("{}: {}", file_path.display(), e))?
     } else {
         String::from_utf8(bytes).map_err(|_| {
             anyhow::anyhow!(

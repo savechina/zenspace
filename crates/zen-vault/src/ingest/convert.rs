@@ -78,6 +78,159 @@ pub fn office_to_markdown(ext: &str, bytes: &[u8]) -> Result<String> {
     Ok(extracted)
 }
 
+/// Failure taxonomy for [`convert_to_markdown`]: the two classes get
+/// opposite treatment in the promote loop.
+#[derive(Debug)]
+pub enum ConvertError {
+    /// Environmental — the sidecar binary is not installed. Retryable: the
+    /// file stays staged and the next cycle retries once the operator
+    /// installs the converter. NEVER quarantines.
+    Unavailable(String),
+    /// Terminal — the converter ran and rejected the bytes (or timed out).
+    /// The file can never convert, so the caller quarantines it.
+    Failed(String),
+}
+
+impl std::fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConvertError::Unavailable(m) => write!(f, "converter unavailable: {m}"),
+            ConvertError::Failed(m) => write!(f, "conversion failed: {m}"),
+        }
+    }
+}
+
+/// The exotic formats routed to the `pandoc` sidecar (`rga` precedent: the
+/// binary is discovered on `$PATH`; its presence IS the feature switch — no
+/// config key, per the phantom-key rule T192).
+pub fn is_sidecar_extension(ext: &str) -> bool {
+    pandoc_format(ext).is_some()
+}
+
+fn pandoc_format(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "epub" => Some("epub"),
+        "odt" => Some("odt"),
+        "rtf" => Some("rtf"),
+        _ => None,
+    }
+}
+
+/// Hard bound on one sidecar invocation. A pathological document must not
+/// stall a scheduler cycle: on timeout the child is killed and the failure
+/// is terminal (quarantine class).
+const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Convert `epub`/`odt`/`rtf` bytes to markdown by piping them through the
+/// `pandoc` binary (`--from={fmt} --to=gfm --wrap=none`, the rga adapter
+/// shape). Structured argv — no shell string.
+///
+/// Out-of-process by design: pandoc crashes surface as exit codes, so the
+/// in-process `catch_unwind` containment the native tiers need does not
+/// apply here. Stdout/stderr are drained on threads while polling the child
+/// with a deadline, so a large document can never deadlock on a full pipe.
+pub fn pandoc_to_markdown(ext: &str, bytes: &[u8]) -> Result<String, ConvertError> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let format = pandoc_format(ext)
+        .ok_or_else(|| ConvertError::Failed(format!("unsupported sidecar format: .{ext}")))?;
+
+    let mut child = Command::new("pandoc")
+        .args([
+            format!("--from={format}"),
+            "--to=gfm".to_string(),
+            "--wrap=none".to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ConvertError::Unavailable(
+                    "pandoc is not installed — exotic formats (epub/odt/rtf) are skipped until it is on $PATH (brew install pandoc / apt install pandoc)".to_string(),
+                )
+            } else {
+                ConvertError::Failed(format!("failed to spawn pandoc: {e}"))
+            }
+        })?;
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+    let write_result = stdin.write_all(bytes);
+    drop(stdin); // close pandoc's stdin so it can finish
+
+    let deadline = std::time::Instant::now() + SIDECAR_TIMEOUT;
+    let status: Result<std::process::ExitStatus, String> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("timed out after 30s (killed)".to_string());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(e) => break Err(format!("wait failed: {e}")),
+        }
+    };
+
+    let out = out_reader.join().unwrap_or_default();
+    let err_msg = err_reader.join().unwrap_or_default();
+    let status = match (write_result, status) {
+        (Ok(()), Ok(s)) => s,
+        (Err(e), _) => return Err(ConvertError::Failed(format!("failed to feed pandoc: {e}"))),
+        (_, Err(reason)) => return Err(ConvertError::Failed(format!("pandoc {reason}"))),
+    };
+    if !status.success() {
+        let tail: String = err_msg.lines().next_back().unwrap_or("").to_string();
+        return Err(ConvertError::Failed(format!(
+            "pandoc exited with {status}{}",
+            if tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {tail}")
+            }
+        )));
+    }
+    String::from_utf8(out)
+        .map_err(|_| ConvertError::Failed("pandoc emitted non-UTF-8 output".to_string()))
+}
+
+/// Whether the unified dispatcher has a converter for this extension
+/// (native tiers + sidecar). The staging sweep uses this as its filter.
+pub fn is_convertible_extension(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("pdf") || is_office_extension(ext) || is_sidecar_extension(ext)
+}
+
+/// Unified extension dispatch for the ingest pipeline: the native tiers
+/// first, the pandoc sidecar for the exotic long tail. Empty output stays
+/// `Ok("")` — the caller decides quarantine (scanned PDF / empty document).
+pub fn convert_to_markdown(ext: &str, bytes: &[u8]) -> Result<String, ConvertError> {
+    let lower = ext.to_ascii_lowercase();
+    match lower.as_str() {
+        "pdf" => pdf_to_markdown(bytes).map_err(|e| ConvertError::Failed(e.to_string())),
+        e if is_office_extension(e) => {
+            office_to_markdown(e, bytes).map_err(|e| ConvertError::Failed(e.to_string()))
+        }
+        e if is_sidecar_extension(e) => pandoc_to_markdown(e, bytes),
+        other => Err(ConvertError::Failed(format!(
+            "unsupported format: .{other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +349,67 @@ mod tests {
         let err = office_to_markdown("docx", b"PK\x03\x04garbage-not-a-zip")
             .expect_err("garbage docx must be rejected");
         assert!(err.to_string().contains("office"));
+    }
+
+    #[test]
+    fn sidecar_extension_screen() {
+        for ext in ["epub", "EPUB", "odt", "rtf"] {
+            assert!(is_sidecar_extension(ext), "{ext}");
+            assert!(is_convertible_extension(ext), "{ext}");
+        }
+        assert!(!is_sidecar_extension("doc"));
+        // The unified screen covers every dispatcher branch.
+        assert!(is_convertible_extension("pdf"));
+        assert!(is_convertible_extension("docx"));
+        assert!(!is_convertible_extension("exe"));
+    }
+
+    fn pandoc_available() -> bool {
+        std::process::Command::new("pandoc")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn rtf_roundtrip_via_pandoc() {
+        if !pandoc_available() {
+            // CI boxes without the sidecar installed: the Unavailable path
+            // is what must hold there, not the conversion.
+            let err = pandoc_to_markdown("rtf", br"{\rtf1 oops}").unwrap_err();
+            assert!(matches!(err, ConvertError::Unavailable(_)), "{err:?}");
+            return;
+        }
+        let md = pandoc_to_markdown("rtf", br"{\rtf1\ansi Hello Zen sidecar}")
+            .expect("valid rtf must convert");
+        assert!(md.contains("Hello"), "got: {md:?}");
+        assert!(md.contains("sidecar"), "got: {md:?}");
+    }
+
+    #[test]
+    fn garbage_rtf_is_failed_not_unavailable() {
+        if !pandoc_available() {
+            return;
+        }
+        let err = pandoc_to_markdown("rtf", b"definitely not rtf at all {{{").unwrap_err();
+        assert!(matches!(err, ConvertError::Failed(_)), "{err:?}");
+    }
+
+    #[test]
+    fn dispatcher_routes_and_rejects() {
+        // pdf still routed (garbage -> Failed with the header message).
+        let err = convert_to_markdown("pdf", b"nope").unwrap_err();
+        assert!(
+            matches!(err, ConvertError::Failed(ref m) if m.contains("%PDF")),
+            "{err:?}"
+        );
+        // unsupported extension.
+        let err = convert_to_markdown("doc", b"legacy").unwrap_err();
+        assert!(
+            matches!(err, ConvertError::Failed(ref m) if m.contains("unsupported")),
+            "{err:?}"
+        );
     }
 
     #[test]

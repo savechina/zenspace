@@ -219,17 +219,12 @@ impl SourceIngester {
                             }
                         }
                     } else {
-                        let converted =
-                            fs::read(&staged)
-                                .map_err(|e| e.to_string())
-                                .and_then(|bytes| {
-                                    if is_pdf {
-                                        crate::ingest::pdf_to_markdown(&bytes)
-                                    } else {
-                                        crate::ingest::office_to_markdown(ext, &bytes)
-                                    }
-                                    .map_err(|e| e.to_string())
-                                });
+                        use crate::ingest::convert::ConvertError;
+                        let converted = fs::read(&staged)
+                            .map_err(|e| {
+                                ConvertError::Failed(format!("failed to read staged file: {e}"))
+                            })
+                            .and_then(|bytes| crate::ingest::convert_to_markdown(ext, &bytes));
                         match converted {
                             Ok(text) if !text.trim().is_empty() => text,
                             Ok(_) => {
@@ -241,8 +236,20 @@ impl SourceIngester {
                                 );
                                 continue;
                             }
+                            // Environmental (pandoc not installed): must NOT
+                            // quarantine — the staged file stays and the next
+                            // cycle retries once the operator installs the
+                            // converter.
+                            Err(e @ ConvertError::Unavailable(_)) => {
+                                warn!(
+                                    file = %file_name,
+                                    reason = %e,
+                                    "promote: converter unavailable — file stays staged for retry"
+                                );
+                                continue;
+                            }
                             Err(e) => {
-                                quarantine(&quarantined_dir, &staged, file_name, &e);
+                                quarantine(&quarantined_dir, &staged, file_name, &e.to_string());
                                 continue;
                             }
                         }

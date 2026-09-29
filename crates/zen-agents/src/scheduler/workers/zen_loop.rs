@@ -925,9 +925,9 @@ fn requeue_pending(paths: &ZenPaths, logs_dir: &Path) -> usize {
 /// A file is staged only when neither the pending slot nor the promoted
 /// ledger (`promoted/{name}`) holds it — the staging tree is the sweep's
 /// persistent seen-set, so each host file enters the pipeline exactly once.
-/// Only top-level `md`/`txt`/`pdf`/office files are swept (non-markdown
-/// formats stage raw bytes; conversion to markdown happens at promote time);
-/// config `skip_extensions` applies.
+/// Only top-level `md`/`txt` plus convertible formats (pdf/office/sidecar —
+/// staged raw, converted at promote time) are swept; config
+/// `skip_extensions` applies.
 fn stage_host_dir(ctx: &HostSourceContext, loop_cfg: &LoopConfig, inbox: &Path) -> Vec<String> {
     let staging = inbox.join("_incoming").join(&ctx.host_hash);
     let promoted_dir = staging.join("promoted");
@@ -948,13 +948,14 @@ fn stage_host_dir(ctx: &HostSourceContext, loop_cfg: &LoopConfig, inbox: &Path) 
             continue;
         };
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        // pdf/office files are staged as raw bytes; the promote layer
-        // converts them to frontmatter-wrapped .md (same txt pattern) —
-        // conversion failures quarantine there, not here.
+        // Non-markdown convertible files (pdf/office/epub/odt/rtf) are
+        // staged as raw bytes; the promote layer converts them to
+        // frontmatter-wrapped .md (same txt pattern) — conversion failures
+        // quarantine there, not here (an uninstalled sidecar converter
+        // leaves the file staged for retry).
         if !(ext.eq_ignore_ascii_case("md")
             || ext.eq_ignore_ascii_case("txt")
-            || ext.eq_ignore_ascii_case("pdf")
-            || zen_vault::ingest::is_office_extension(ext))
+            || zen_vault::ingest::is_convertible_extension(ext))
         {
             continue;
         }
