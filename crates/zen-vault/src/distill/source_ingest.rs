@@ -61,7 +61,10 @@ impl SourceIngester {
     /// Walks `inbox/_incoming/{host_hash}/`, moving every pending markdown/
     /// text file to `inbox/{host_hash}_{filename}` (hash prefix disambiguates
     /// same-named files from different hosts and from raw/ ingest copies).
-    /// Promoted files are recorded under `_incoming/{host_hash}/promoted/` so
+    /// `.txt` and `.pdf` files are converted to frontmatter-wrapped `.md` at
+    /// promote time (pdf via the panic-contained in-process extractor;
+    /// terminal conversion failures quarantine, see below). Promoted files
+    /// are recorded under `_incoming/{host_hash}/promoted/` so
     /// a file is promoted exactly once even though the sweep re-stages nothing
     /// twice — the staging tree is both the sweep's seen-set and the
     /// promotion ledger.
@@ -121,17 +124,25 @@ impl SourceIngester {
                     continue;
                 }
                 let ext = staged.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if !(ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("txt")) {
+                if !(ext.eq_ignore_ascii_case("md")
+                    || ext.eq_ignore_ascii_case("txt")
+                    || ext.eq_ignore_ascii_case("pdf"))
+                {
                     continue;
                 }
                 let Some(file_name) = staged.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
                 let is_txt = ext.eq_ignore_ascii_case("txt");
+                let is_pdf = ext.eq_ignore_ascii_case("pdf");
                 // .txt files are converted to frontmatter-wrapped .md at promote
                 // time so the downstream distill inbox scan (ext == "md" only)
-                // picks them up as notes.
-                let dest_name = if is_txt {
+                // picks them up as notes. .pdf files take the same promote-time
+                // conversion path (pdf-extract in-process, panic-contained);
+                // conversion failures are terminal, so unlike txt they
+                // quarantine (seen-set marker + staged removal) instead of
+                // re-warning every cycle.
+                let dest_name = if is_txt || is_pdf {
                     let stem = staged
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -150,6 +161,24 @@ impl SourceIngester {
                     warn!(file = %dest_name, "incoming promotion target exists, deferring");
                     continue;
                 }
+                // Quarantine a terminal conversion failure: the seen-set
+                // marker (checked by the staging sweep) plus staged-file
+                // removal stop the same broken file from being re-read and
+                // re-warned every cycle. The host original is untouched.
+                let quarantine =
+                    |quarantined_dir: &Path, staged: &Path, file_name: &str, reason: &str| {
+                        fs::create_dir_all(quarantined_dir).ok();
+                        let marker = quarantined_dir.join(file_name);
+                        if !marker.exists() {
+                            fs::write(&marker, b"").ok();
+                        }
+                        let _ = fs::remove_file(staged);
+                        warn!(
+                            file = file_name,
+                            reason,
+                            "promote: pdf conversion failed — quarantined (host original untouched)"
+                        );
+                    };
                 fs::create_dir_all(&promoted_dir).ok();
                 // T158: stat-and-skip above the ceiling; the quarantine marker
                 // is the sweep's seen-set entry so the file is not re-staged
@@ -170,18 +199,47 @@ impl SourceIngester {
                     );
                     continue;
                 }
-                if is_txt {
-                    // Read content; non-UTF-8 files are skipped (warn, no
-                    // ledger entry, no move — consistent with skip semantics).
-                    let content = match fs::read_to_string(&staged) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!(
-                                file = %file_name,
-                                error = %e,
-                                "skipping non-UTF-8 txt file during promote"
-                            );
-                            continue;
+                if is_txt || is_pdf {
+                    // txt: non-UTF-8 files are skipped (warn, no ledger
+                    // entry, no move — consistent with skip semantics).
+                    // pdf: converted in-process; any failure (garbled,
+                    // panic-contained, or zero extractable text — likely a
+                    // scanned image-only PDF) is terminal and quarantines.
+                    let content = if is_txt {
+                        match fs::read_to_string(&staged) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(
+                                    file = %file_name,
+                                    error = %e,
+                                    "skipping non-UTF-8 txt file during promote"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        let converted =
+                            fs::read(&staged)
+                                .map_err(|e| e.to_string())
+                                .and_then(|bytes| {
+                                    crate::ingest::pdf_to_markdown(&bytes)
+                                        .map_err(|e| e.to_string())
+                                });
+                        match converted {
+                            Ok(text) if !text.trim().is_empty() => text,
+                            Ok(_) => {
+                                quarantine(
+                                    &quarantined_dir,
+                                    &staged,
+                                    file_name,
+                                    "no extractable text (scanned or image-only pdf)",
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                quarantine(&quarantined_dir, &staged, file_name, &e);
+                                continue;
+                            }
                         }
                     };
                     // T159: durable destination FIRST, ledger after — a
@@ -322,6 +380,137 @@ mod tests {
         assert_eq!(note.sensitivity, Sensitivity::Private);
         assert!(note.domain.is_empty());
         assert!(note.project.is_none());
+    }
+
+    /// Assemble a minimal one-page PDF (same fixture approach as the
+    /// ingest::convert tests — generated, no binary blob in the repo).
+    fn tiny_pdf(text: &str) -> Vec<u8> {
+        let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "%PDF-1.4\n".to_string(),
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n".to_string(),
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{stream}\nendstream\nendobj\n",
+                stream.len()
+            ),
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+        ];
+        let mut body = Vec::new();
+        let mut offsets = Vec::new();
+        for obj in &objects {
+            offsets.push(body.len());
+            body.extend_from_slice(obj.as_bytes());
+        }
+        let xref_offset = body.len();
+        body.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        body.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            body.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        body.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        body
+    }
+
+    #[test]
+    fn promote_incoming_pdf_converts_to_frontmattered_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("cafe1234");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("paper.pdf"), tiny_pdf("Hello Zen")).unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert_eq!(promoted.get("cafe1234"), Some(&1));
+
+        let md = fs::read_to_string(inbox.join("cafe1234_paper.md")).unwrap();
+        assert!(md.starts_with("---\n"));
+        assert!(md.contains("source: \"host:cafe1234\""));
+        let note = parse_frontmatter(&md).unwrap();
+        assert!(note.content.contains("Hello"), "got: {:?}", note.content);
+        assert!(note.content.contains("Zen"), "got: {:?}", note.content);
+        // Exactly-once: staged file removed, ledger records the ORIGINAL name.
+        assert!(!staging.join("paper.pdf").exists());
+        assert_eq!(
+            fs::read(staging.join("promoted").join("paper.pdf")).unwrap(),
+            tiny_pdf("Hello Zen")
+        );
+        // Second run: nothing pending.
+        let again = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn promote_incoming_garbage_pdf_quarantines_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("feed0001");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(
+            staging.join("broken.pdf"),
+            b"%PDF-1.4\nbroken body \xff\xfe",
+        )
+        .unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert!(promoted.is_empty());
+        // No note, quarantine marker recorded (seen-set), staged file removed
+        // so the broken file is not re-read and re-warned every cycle.
+        assert!(!inbox.join("feed0001_broken.md").exists());
+        assert!(staging.join("quarantined").join("broken.pdf").is_file());
+        assert!(!staging.join("broken.pdf").exists());
+    }
+
+    #[test]
+    fn promote_incoming_textless_pdf_quarantines_as_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("feed0002");
+        fs::create_dir_all(&staging).unwrap();
+        let stream = String::new();
+        let pdf = {
+            // Same generator, empty content stream -> valid PDF, no text.
+            let objects = [
+                "%PDF-1.4\n".to_string(),
+                "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+                "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n".to_string(),
+                format!("4 0 obj\n<< /Length 0 >>\nstream\n{stream}\nendstream\nendobj\n"),
+            ];
+            let mut body = Vec::new();
+            let mut offsets = Vec::new();
+            for obj in &objects {
+                offsets.push(body.len());
+                body.extend_from_slice(obj.as_bytes());
+            }
+            let xref_offset = body.len();
+            body.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+            body.extend_from_slice(b"0000000000 65535 f \n");
+            for off in &offsets {
+                body.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            body.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                    objects.len() + 1
+                )
+                .as_bytes(),
+            );
+            body
+        };
+        fs::write(staging.join("scan.pdf"), pdf).unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        assert!(promoted.is_empty());
+        assert!(staging.join("quarantined").join("scan.pdf").is_file());
+        assert!(!staging.join("scan.pdf").exists());
     }
 
     #[test]

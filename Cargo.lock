@@ -10654,6 +10654,7 @@ dependencies = [
  "diffy",
  "fs2",
  "html2md",
+ "pdf-extract",
  "reqwest 0.13.4",
  "rig-compose",
  "rig-core",

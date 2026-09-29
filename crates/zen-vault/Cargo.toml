@@ -5,6 +5,8 @@ edition.workspace = true
 description = "Knowledge domain — note, wiki, search, consolidation"
 
 [dependencies]
+pdf-extract.workspace = true
+
 zen-core = { path = "../zen-core" }
 zen-memory = { path = "../zen-memory" }
 zen-repo = { path = "../zen-repo" }

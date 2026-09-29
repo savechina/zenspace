@@ -40,8 +40,19 @@ pub fn ingest_url(url: &str) -> Result<IngestResult> {
 }
 
 pub fn ingest_local_file(file_path: &Path) -> Result<IngestResult> {
-    let content = fs::read_to_string(file_path)
-        .with_context(|| format!("failed to read file: {}", file_path.display()))?;
+    let is_pdf = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    let content = if is_pdf {
+        let bytes = fs::read(file_path)
+            .with_context(|| format!("failed to read file: {}", file_path.display()))?;
+        super::pdf_to_markdown(&bytes)
+            .with_context(|| format!("failed to convert pdf: {}", file_path.display()))?
+    } else {
+        fs::read_to_string(file_path)
+            .with_context(|| format!("failed to read file: {}", file_path.display()))?
+    };
 
     let title = extract_title_from_md(&content).unwrap_or_else(|| {
         file_path

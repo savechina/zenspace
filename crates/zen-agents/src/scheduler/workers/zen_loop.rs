@@ -925,7 +925,8 @@ fn requeue_pending(paths: &ZenPaths, logs_dir: &Path) -> usize {
 /// A file is staged only when neither the pending slot nor the promoted
 /// ledger (`promoted/{name}`) holds it — the staging tree is the sweep's
 /// persistent seen-set, so each host file enters the pipeline exactly once.
-/// Only top-level `md`/`txt` files are swept; config `skip_extensions`
+/// Only top-level `md`/`txt`/`pdf` files are swept (`pdf` stages raw bytes;
+/// conversion to markdown happens at promote time); config `skip_extensions`
 /// applies.
 fn stage_host_dir(ctx: &HostSourceContext, loop_cfg: &LoopConfig, inbox: &Path) -> Vec<String> {
     let staging = inbox.join("_incoming").join(&ctx.host_hash);
@@ -947,7 +948,13 @@ fn stage_host_dir(ctx: &HostSourceContext, loop_cfg: &LoopConfig, inbox: &Path) 
             continue;
         };
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !(ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("txt")) {
+        // pdf files are staged as raw bytes; the promote layer converts them
+        // to frontmatter-wrapped .md (same txt pattern) — conversion failures
+        // quarantine there, not here.
+        if !(ext.eq_ignore_ascii_case("md")
+            || ext.eq_ignore_ascii_case("txt")
+            || ext.eq_ignore_ascii_case("pdf"))
+        {
             continue;
         }
         if loop_cfg.is_extension_skipped(ext) {

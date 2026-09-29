@@ -115,6 +115,10 @@ readabilityrs = "0.1"
 # only *emits* diffs — it has no parser/applyer in any version (2.x/3.x).
 # `diffy` is the maintained library with Patch::from_str + apply().
 diffy = "0.5"
+# PDF text extraction for the ingest pipeline — pinned to the SAME 0.10
+# minor memvid-core already pulls, so no new version island appears in the
+# tree (the T121 duplicate-island discipline). Do not bump casually.
+pdf-extract = "0.10"
 regex = "1"
 
 # WebSocket client for QQ Bot
