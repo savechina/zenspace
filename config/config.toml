@@ -433,6 +433,35 @@ disclaimer_acknowledged = false
 max_rounds = 8
 
 # =============================================================================
+# Distill LLM enrichment + tree-index segmentation (T046)
+# =============================================================================
+#
+# merge_llm_model names a PROVIDER (e.g. "ollama", "anthropic") whose
+# configured default model serves (a) per-note notion extraction and
+# (b) merge-section composition in the distill loop. Any LLM failure is
+# fail-open: the deterministic heuristic path stays the base.
+#
+# Naming a cloud provider alone never moves note content:
+# distill_allow_cloud = true (env ZEN_LOOP_DISTILL_ALLOW_CLOUD) is the
+# explicit opt-in that lets the named cloud provider serve distill calls
+# (T045 allow_cloud encoding). Default false — local-only routing.
+#
+# tree_index_pages (env ZEN_LOOP_TREE_INDEX_PAGES, clamp 5..=200): a note
+# longer than this many 3000-char pages is segmented on headings and
+# distilled one bounded call per section instead of truncated at the
+# single-call bound. Default 20.
+#
+# When the routing lands on Anthropic, [agentic.cache] breakpoints
+# (default true, env ZEN_CACHE_BREAKPOINTS) sends the stable system
+# prompt through the prompt-cache path and the real usage echo becomes
+# the token accounting.
+#
+[agentic.loop]
+# merge_llm_model = "ollama"          # uncomment to enable LLM enrichment
+# distill_allow_cloud = false         # required true for cloud providers
+# tree_index_pages = 20               # long-doc segmentation threshold
+
+# =============================================================================
 # Skill auto-routing — Pi-style trigger hits (005-agentic-loop, T076)
 # =============================================================================
 #
