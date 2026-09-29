@@ -254,6 +254,19 @@ max_tokens = 8000                # per-cycle LLM token budget
 max_ingest_bytes = 67108864      # skip+quarantine files > 64 MiB
 reverify_older_than_days = 7     # re-verify hypotheses older than this
 
+# LLM distill enrichment (T046): names a PROVIDER (e.g. "ollama") whose
+# configured default model extracts notions per note and composes merge
+# sections. Unset = deterministic heuristic path only (default). Any LLM
+# failure is fail-open.
+# merge_llm_model = "ollama"
+# distill_allow_cloud = false    # must be true to let a cloud provider serve distill calls
+# tree_index_pages = 20          # notes longer than this many 3000-char pages are
+                                 # distilled one call per heading section (clamp 5..=200)
+
+# Prompt-cache breakpoints (Anthropic routing only)
+[agentic.cache]
+breakpoints = true               # cache the stable system prefix (env ZEN_CACHE_BREAKPOINTS)
+
 # Agent tool loop: rounds per conversational turn
 [agentic.tool_loop]
 max_rounds = 8                   # clamp 1..=16 (env ZEN_TOOL_MAX_ROUNDS)
