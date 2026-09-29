@@ -1,6 +1,6 @@
 # 全格式文档 → Markdown 转换（ingest 管线）— 设计决策记录
 
-**日期**：2026-09-29 · **状态**：T2/T3 已落地（PR-1 `1e8d73c` PDF、PR-2 `c5d8123` Office），T4（pandoc sidecar 长尾）保留待办 · **依据**：Constitution XI（Design-First & Reuse）
+**日期**：2026-09-29 · **状态**：全部落地（T2 PDF `1e8d73c`、T3 Office `c5d8123`、T4 sidecar `172f2bb`） · **依据**：Constitution XI（Design-First & Reuse）
 
 ## 1. 问题
 
@@ -54,7 +54,7 @@ zen 的知识摄取入口只认 UTF-8 文本：
 | **T2 原生-新增** | **pdf**：`pdf-extract 0.10`（钉在 memvid-core 同版）；html：复用既有 `extract_readable_content` | 进程内 crate | **零新增版本岛** |
 | **T3 原生-新增（已落地）** | docx/xlsx/pptx：`office_oxide 0.1`（2026-09-29 迷你审计 GO：719k 下载/600k 近90天/15 个真实消费者/fuzz+制度级 CI；undoc 20k、anytomd 9k 因采用不足 NO-GO） | 进程内 crate + catch_unwind | 新依赖（纯 Rust） |
 | **T3 原生-待审计** | docx/pptx/xlsx | `office_oxide`/`undoc` 迷你审计通过后加入 | 新依赖（各 ~百 KB） |
-| **T4 sidecar-可选** | epub/odt/rtf 等长尾 | $PATH 探测 pandoc（rga 模式）；缺失→`zen doctor` 提示安装命令，**不阻塞** T1-T3 | 外部可选 |
+| **T4 sidecar（已落地）** | epub/odt/rtf 等长尾 | $PATH 探测 pandoc（rga 模式，argv 直传无 shell 串，30s 超时杀进程，管道线程排空防死锁）；缺失→Unavailable 类：**不隔离**、文件留暂存待装后重试（区别于 Failed 类终局隔离） | 外部可选 |
 
 **挂钩点**（两处，均为现状缺口）：`ingest_local_file` 按扩展名分派转换；host_sources 暂存过滤器 `md|txt` → `md|txt|pdf|(docx…)`，转换产物进 inbox 暂存树，原件按既有 `raw_policy` 处置。
 
