@@ -134,6 +134,17 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
                 .await
                 .map_err(|e| ZenError::Message(format!("Failed to open database: {e}")))?;
 
+            // NFC backfill (T143): legacy pre-2026-09-19 alias rows are stored
+            // decomposed and can never match an equality lookup — heal them as
+            // part of "rebuild derived state"; no-op on a clean table.
+            let repaired = zen_repo::NotionsRepo::new(&db_client)
+                .normalize_aliases_pass()
+                .await
+                .map_err(|e| ZenError::Message(e.to_string()))?;
+            if repaired > 0 {
+                println!("Normalized {repaired} legacy alias row(s) to NFC.");
+            }
+
             if *rebuild_fts {
                 let reindexer = zen_vault::tindy::Reindexer::with_client(db_client);
                 println!("Rebuilding FTS5 indexes...");

@@ -299,6 +299,84 @@ impl<'a> NotionsRepo<'a> {
         Ok(())
     }
 
+    /// One-shot NFC backfill for legacy alias rows (T143 closure, 2026-09-30
+    /// plan-eng-review decision 2A).
+    ///
+    /// # Functionality
+    /// Aliases persisted before the FR-022/T124 NFC-first [`normalize_alias`]
+    /// (2026-09-19) may be stored decomposed (NFD). SQL equality lookups
+    /// (`resolve_alias`) normalize the *query* but compare against the stored
+    /// column, so a legacy NFD row can never be hit — and re-extraction does
+    /// not heal it: it inserts a fresh NFC entity while the NFD row orphans
+    /// (duplicate-entity risk).
+    ///
+    /// # User impact
+    /// Restores the invariant every reader already assumes — "the alias
+    /// column is always canonical". Rows already canonical are untouched; on
+    /// a clean table the pass is a read-only no-op (detection and repair in
+    /// one idempotent pass).
+    ///
+    /// # Returns
+    /// Count of legacy rows repaired (0 = table already canonical).
+    ///
+    /// # Errors
+    /// A read failure returns `Err` and writes nothing; per-row repair
+    /// failures abort the pass loudly rather than half-migrate.
+    ///
+    /// # Interaction
+    /// A legacy row colliding with an existing canonical row (NFD + NFC of
+    /// the same alias for the same notion) is deleted and the canonical row
+    /// kept — `INSERT OR IGNORE` semantics, never a PK panic.
+    pub async fn normalize_aliases_pass(&self) -> Result<u64> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT alias, canonical_notion_id FROM notion_aliases")
+                .fetch_all(self.client.pool())
+                .await?;
+
+        // (legacy_row, canonical_replacement_or_None) — None means the row
+        // normalizes to nothing (e.g. a bare suffix alias) and is just deleted.
+        let repairs: Vec<((String, String), Option<String>)> = rows
+            .into_iter()
+            .filter_map(|(alias, notion_id)| {
+                let canonical = normalize_alias(&alias);
+                if canonical == alias {
+                    None
+                } else {
+                    Some(((alias, notion_id), Some(canonical)))
+                }
+            })
+            .collect();
+
+        if repairs.is_empty() {
+            return Ok(0);
+        }
+
+        let repaired = repairs.len() as u64;
+        self.client
+            .writer()
+            .call(move |conn| {
+                for ((alias, notion_id), canonical) in repairs {
+                    conn.execute(
+                        "DELETE FROM notion_aliases WHERE alias = ?1 AND canonical_notion_id = ?2",
+                        rusqlite::params![alias, notion_id],
+                    )?;
+                    if let Some(canonical) = canonical
+                        && !canonical.is_empty()
+                    {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO notion_aliases \
+                                 (alias, canonical_notion_id) VALUES (?1, ?2)",
+                            rusqlite::params![canonical, notion_id],
+                        )?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)?;
+        Ok(repaired)
+    }
+
     pub async fn load_aliases_for_entity(&self, notion_id: &str) -> Result<Vec<String>> {
         let rows = sqlx::query(
             "SELECT alias FROM notion_aliases WHERE canonical_notion_id = ?1 ORDER BY alias",
