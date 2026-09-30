@@ -100,7 +100,7 @@ Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias 
 
 ## Review (2026-09-20 /plan-eng-review — 005 spec docs)
 
-### Generated single-ledger for closure records (structural option, deferred)
+### Generated single-ledger for closure records (structural option, CLOSED 2026-09-30 — moot)
 
 **What:** Replace hand-mirrored closure history across spec.md record sections + tasks.md + AGENTS.md Recent Changes with tasks.md as the single source and the other two generated/pointing at it.
 
@@ -110,6 +110,8 @@ Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias 
 **Cons:** Speckit tooling (specify/converge/implement) reads/writes spec.md+tasks.md directly and would need adapting; AGENTS.md is hand-curated for agents, not generated.
 **Context:** Accepted as D2-A (keep convention, record limitation) in the 2026-09-20 eng review after outside-voice tension #8. Trigger: the next verdict-rot incident OR speckit tooling gaining generation support. Start from spec.md's closure-convention blockquote.
 **Effort:** M. **Priority:** P3. **Depends on:** speckit tooling evolution; not before.
+
+**Closed (moot):** 2026-09-30 plan-eng-review — `docs/specs/` no longer exists on this machine (gitignored local-only, never committed, directory deleted), so the single-source object (tasks.md) is gone and the trigger conditions have permanently dissolved. The live duplication is AGENTS.md Recent Changes vs TODOS.md — a hand-discipline matter (write closures in one, point from the other), not a tooling gap. Re-evaluate only if `/speckit-specify` regenerates an active spec tree.
 
 ### LLM cost reporting is zero everywhere — `llm_cost_cap_usd` cap cannot trip
 
@@ -122,11 +124,11 @@ Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias 
 **Context:** Spec annotation landed same day (config table marks it inert-until). Start at scheduler/mod.rs cap check + model_meta.rs pricing fields.
 **Effort:** S-M. **Priority:** P2. **Depends on:** none.
 
-**Completed:** 2026-09-20 (/speckit-implement batch 3): pricing config keys + metered completion path + WorkerCostLedger sidecar + cap-trip test. Remaining accuracy follow-up: provider usage tokens (currently bytes/4 estimate).
+**Completed:** 2026-09-20 (/speckit-implement batch 3): pricing config keys + metered completion path + WorkerCostLedger sidecar + cap-trip test. Accuracy follow-up superseded 2026-09-30: distill/merge spend is cap-visible (`093e68a`); the remaining bytes/4 estimate accuracy on `complete_metered` is tracked by the deferred "Provider-usage precise plumbing" TODO above.
 
 ## Review (2026-09-27 /plan-eng-review — docs/src user guide)
 
-### User-guide consistency check in CI (docs-rot alarm)
+### User-guide consistency check in CI (docs-rot alarm) — IMPLEMENTED 2026-09-30 (`c6067d9`)
 
 **What:** A test (or script wired into `.github/workflows/docs.yml`) asserting `docs/src/cli-commands.md` command tables match the live clap surface (renderable from the `Commands` enum in `crates/zen-cli/src/cli.rs` or `zen --help` output), and spot-asserting documented config keys exist as serde fields on the `zen-core` config structs. Fail CI on drift.
 
@@ -138,6 +140,27 @@ Landed via: intent pure `resolve_intent`/`passes_confidence_gate` seams + alias 
 
 **Context:** Narrower sibling of the deferred single-ledger TODO above (D2-A covers spec closure records; this gates the user guide's factual tables). Start from the `Commands` enum variants (names render deterministically) and `ProviderConfig`/`AgentConfig`/`Agentic*Config` serde fields in `crates/zen-core/src/config.rs`. Trigger: any future CLI/config surface change lands.
 **Effort:** S-M. **Priority:** P2. **Depends on:** none.
+
+**Completed:** 2026-09-30 (plan-eng-review decision 1A): `cli.rs` `#[cfg(test)] docs_consistency` — every clap subcommand must appear as the code-form prefix `` `zen <name> `` in the guide + the header count claim must equal the live variant count; `crates/zen-core/tests/config_documented_keys_test.rs` — sentinel round-trip for the highest-traffic documented keys (phantom keys parse silently without `deny_unknown_fields`; the sentinel asserts the value LANDED). Runs under rust.yml's existing `bin/test` — docs.yml only triggers on `docs/**` so it can never see the crate changes that cause drift.
+
+### NFC alias backfill (T143 closure) — IMPLEMENTED 2026-09-30 (`b344472`)
+
+Pre-2026-09-19 (FR-022/T124) persisted `notion_aliases` rows may be decomposed (NFD); `resolve_alias` normalizes the query but compares against the stored column, so legacy rows could never match, and re-extraction inserts a fresh NFC entity while the NFD row orphans. `NotionsRepo::normalize_aliases_pass` (idempotent, collision-dedup via INSERT OR IGNORE) now runs at the top of `zen wiki reindex`. Tests: `crates/zen-repo/tests/normalize_aliases_test.rs`.
+
+### Distill LLM spend invisible to the cost cap (3A) — IMPLEMENTED 2026-09-30 (`093e68a`)
+
+`zen_loop` hardcoded `llm_cost_usd: 0.0` while T046a's distill stage + merge assist make real LLM calls. Now: `LoopBudget.consumed_cost_usd` + `charge_cost` (same stage→cycle fold-back as tokens), `call_llm` bills via `usage_to_cost_usd` on the routed provider's metadata (mirrors `complete_metered`), `merge_section` returns its cost (tokens stay unbudgeted as before), `LoopCycleReport.llm_cost_usd` feeds `worker_report`. Partial spend before a cycle failure still bills.
+
+### Provider-usage precise plumbing (deferred, trigger-based)
+
+**What:** Thread real provider usage echoes through `complete_metered` (workers) and the distill plain path — today both bill on the bytes/4 estimate (router.rs `estimate_tokens`; distill `estimate_tokens` with reply-budget split).
+
+**Why:** For a personal tool on mostly-free local Ollama (cost 0 either way), estimate-vs-real does not change cap decisions; the cap is a runaway ceiling, not a bill. Real plumbing (M effort) buys exactness nobody is consuming yet.
+
+**Pros:** Exact cloud billing; cap trips at true thresholds. **Cons:** M-effort plumbing across 6 provider `complete()` impls (they return only text — usage is discarded inside them); the Anthropic cached path already echoes real usage (`parse_cache_usage`).
+
+**Context:** Reference implementation exists: `anthropic.rs::complete_cached`/`parse_cache_usage` + T046a `billable_tokens` reconciliation semantics (`llm_distill.rs`). **Trigger:** real metered cloud volume in `worker-costs.json` AND a cap misjudgment observed — revisit then. Distill spend is already cap-visible as of `093e68a` (this TODO is accuracy-only). Start at router.rs `complete_metered`.
+**Effort:** M. **Priority:** P3. **Depends on:** trigger above.
 
 ## Review (2026-09-27 /plan-ceo-review — OpenKB compile-hygiene program, deferred items)
 
@@ -165,6 +188,6 @@ Plan: `~/.gstack/projects/zenspace/ceo-plans/2026-09-27-openkb-compile-hygiene.m
 **Context:** Writer renders `wiki/index.md` summary + navigation conventions into the skill format; source of truth stays the vault. Start from `zen skill` command surface.
 **Effort:** S (human ~2h / CC ~1h). **Priority:** P3. **Depends on:** none. — **IMPLEMENTED per compile-hygiene Phase 4 [X] 2026-09-28: `crates/zen-vault/src/wiki/skill_export.rs` + `zen wiki export-skill [--output][--json]` (Agent Skills spec-conformant: six portable frontmatter fields, `zen-wiki` identity = directory name, 240-entry index cap; default target `~/.zen/skills/zen-wiki/SKILL.md` discoverable by zen's own SkillLoader; commit `697daee`)**
 
-### ⑥ scope note — PDF parsing (from same review)
+### ⑥ scope note — PDF parsing (from same review) — RESOLVED 2026-09-29
 
-`ingest_local_file` is plain `read_to_string` (crates/zen-vault/src/ingest/web.rs:42-44) — no PDF capability. Tree-index workstream ⑥ first phase covers markdown/long-text segmentation only; PDF parsing requires a new dependency (audit per Constitution XI before adding).
+`ingest_local_file` was plain `read_to_string` — no PDF capability. **Resolved** by the all-format ingestion program (2026-09-29): `pdf_to_markdown` (in-process `pdf-extract` + panic containment, commit `1e8d73c`), office formats via `office_oxide` (`c5d8123`), and epub/odt/rtf via the pandoc sidecar (`172f2bb`); promote-time conversion with quarantine semantics per `docs/designs/doc-conversion.md`. The dependency audit Constitution XI required was performed per PR.

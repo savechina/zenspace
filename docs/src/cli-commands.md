@@ -26,7 +26,7 @@ Zen's CLI surface is intentionally small: the TUI plus 23 subcommands. Heavy cap
 |---------|-------------|
 | `zen wiki list` | List wiki pages |
 | `zen wiki show <page>` | Show a wiki page |
-| `zen wiki reindex` | Rebuild the knowledge index (FTS5 + embeddings; `--dry-run` preview, `--fts-only` resync) |
+| `zen wiki reindex` | Rebuild the knowledge index (FTS5 + embeddings; also heals legacy non-NFC alias rows; `--dry-run` preview, `--fts-only` resync) |
 | `zen wiki lint` | Lint wiki (orphan pages, broken links, stale claims) |
 | `zen wiki distill` | Run the consolidation pipeline (inbox → wiki) |
 | `zen wiki rebuild-memory` | Rebuild the gateway memory store from Markdown + session archives (requires running daemon) |
