@@ -151,7 +151,7 @@ Pre-2026-09-19 (FR-022/T124) persisted `notion_aliases` rows may be decomposed (
 
 `zen_loop` hardcoded `llm_cost_usd: 0.0` while T046a's distill stage + merge assist make real LLM calls. Now: `LoopBudget.consumed_cost_usd` + `charge_cost` (same stage→cycle fold-back as tokens), `call_llm` bills via `usage_to_cost_usd` on the routed provider's metadata (mirrors `complete_metered`), `merge_section` returns its cost (tokens stay unbudgeted as before), `LoopCycleReport.llm_cost_usd` feeds `worker_report`. Partial spend before a cycle failure still bills.
 
-### Provider-usage precise plumbing (deferred, trigger-based)
+### Provider-usage precise plumbing (deferred, trigger-based) — IMPLEMENTED 2026-09-30 (`3aa4eb0`)
 
 **What:** Thread real provider usage echoes through `complete_metered` (workers) and the distill plain path — today both bill on the bytes/4 estimate (router.rs `estimate_tokens`; distill `estimate_tokens` with reply-budget split).
 
@@ -161,6 +161,8 @@ Pre-2026-09-19 (FR-022/T124) persisted `notion_aliases` rows may be decomposed (
 
 **Context:** Reference implementation exists: `anthropic.rs::complete_cached`/`parse_cache_usage` + T046a `billable_tokens` reconciliation semantics (`llm_distill.rs`). **Trigger:** real metered cloud volume in `worker-costs.json` AND a cap misjudgment observed — revisit then. Distill spend is already cap-visible as of `093e68a` (this TODO is accuracy-only). Start at router.rs `complete_metered`.
 **Effort:** M. **Priority:** P3. **Depends on:** trigger above.
+
+**Completed:** 2026-09-30 (`3aa4eb0`, owner pulled the trigger early after 3A made distill metering live): rig-core 0.42 already normalizes per-provider usage into `CompletionResponse.usage` — the providers were discarding it inside `agent.prompt()`. Additive: `SyncUsage`/`UsedCompletion`/`reconcile_usage` (Some-nonzero wins; None and all-zero echoes fall back to bytes/4), 6× `complete_with_usage` (rig `completion_request` builder path, same thread-guard), `LlmRouter::call_with_usage` with a delegating default, `complete_metered` + distill plain path reconcile, and `completion_model.rs` feeds the echo into rig `Usage` so AgentRun `run.usage()` is real (stream path keeps len/4, documented). Mock stays None — worker-cost estimate tests unchanged. Remaining estimate sites, deliberately: streaming surface, `executor.rs` inline estimates, `PromptHookTelemetry::record`.
 
 ## Review (2026-09-27 /plan-ceo-review — OpenKB compile-hygiene program, deferred items)
 
