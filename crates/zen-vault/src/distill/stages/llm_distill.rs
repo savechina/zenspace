@@ -52,7 +52,9 @@ use crate::notion::notion::parse_kind;
 use zen_core::config::{LlmPreference, ModelOptions};
 use zen_core::types::Sensitivity;
 use zen_provider::cache::{CacheSegments, CacheUsage};
-use zen_provider::{DefaultRouter, LlmRouter, Provider, ProviderInstance, TaskRequirements};
+use zen_provider::{
+    DefaultRouter, LlmRouter, Provider, ProviderInstance, TaskRequirements, usage_to_cost_usd,
+};
 
 /// Reply budget the extraction prompt asks for; part of every reservation.
 const REPLY_ESTIMATE_TOKENS: u32 = 384;
@@ -114,10 +116,10 @@ impl LlmDistillStage {
     pub async fn distill_with_fallback(
         &mut self,
         notes: &[Note],
-    ) -> Result<(Vec<NotionType>, u32)> {
+    ) -> Result<(Vec<NotionType>, u32, f64)> {
         let Some(model) = self.model.clone() else {
             debug!("LlmDistillStage: no model configured — zero enrichment");
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, 0.0));
         };
 
         info!(
@@ -128,6 +130,7 @@ impl LlmDistillStage {
 
         let mut notions = Vec::new();
         let mut consumed = 0u32;
+        let mut cost_spent = 0.0f64;
         for note in notes {
             let tree_pages = zen_core::config::load_config()
                 .map(|c| c.agentic.loop_cfg.tree_index_pages_or_default())
@@ -159,7 +162,7 @@ impl LlmDistillStage {
                         max_tokens = self.budget.max_tokens,
                         "LlmDistillStage: budget exhausted — remaining notes stay heuristic-only"
                     );
-                    return Ok((notions, consumed));
+                    return Ok((notions, consumed, cost_spent));
                 }
                 let mut note_tokens = estimate;
                 let task = match &toc {
@@ -172,7 +175,9 @@ impl LlmDistillStage {
                     None => note_prompt(note),
                 };
                 match call_llm(&model, EXTRACTION_SYSTEM, &task).await {
-                    Ok((reply, usage_tokens)) => {
+                    Ok((reply, usage_tokens, cost_usd)) => {
+                        self.budget.charge_cost(cost_usd);
+                        cost_spent += cost_usd;
                         if usage_tokens > estimate {
                             let delta = usage_tokens - estimate;
                             if self.budget.consume_tokens(delta) {
@@ -192,14 +197,16 @@ impl LlmDistillStage {
                 consumed = consumed.saturating_add(note_tokens);
             }
         }
-        Ok((notions, consumed))
+        Ok((notions, consumed, cost_spent))
     }
 }
 
-/// One bounded LLM call. Returns `(reply, actual_tokens)`; on the plain
-/// path the actual equals the caller-visible estimate of the prompt actually
-/// sent, on the cached path it is the real billable usage from the provider
-/// echo.
+/// One bounded LLM call. Returns `(reply, actual_tokens, cost_usd)`; on the
+// plain path the actual equals the caller-visible estimate of the prompt
+// actually sent, on the cached path it is the real billable usage from the
+// provider echo. `cost_usd` bills the call against the routed provider's
+// `[providers.<name>]` pricing (0.0 for local providers — see
+// `usage_to_cost_usd`) so the distill spend reaches the cost cap.
 ///
 /// Sensitivity encoding (T045 precedent): `distill_allow_cloud = false`
 /// (default) requests `Sensitivity::Private` so the router's
@@ -210,7 +217,7 @@ async fn call_llm(
     model: &str,
     system: &str,
     task: &str,
-) -> std::result::Result<(String, u32), String> {
+) -> std::result::Result<(String, u32, f64), String> {
     let config = zen_core::config::load_config().map_err(|e| format!("config load failed: {e}"))?;
     let allow_cloud = config.agentic.loop_cfg.distill_allow_cloud_or_default();
     let use_cache = config.agentic.cache.breakpoints_or_default();
@@ -241,6 +248,18 @@ async fn call_llm(
             }
         })?;
 
+    // Pricing metadata for the routed provider — mirrors
+    // `complete_metered` (router.rs) so both cost paths bill identically.
+    let provider_name = match &provider {
+        Provider::Unknown(name) => name.clone(),
+        _ => provider.to_string(),
+    };
+    let model_name = router
+        .provider_instance(&provider_name)
+        .map(|instance| instance.model_name().to_string())
+        .unwrap_or_else(|| model.to_string());
+    let metadata = router.model_metadata(&provider_name, &model_name);
+
     // Compile-hygiene ③: the Anthropic route honors [agentic.cache]
     // breakpoints — the stable system prompt becomes the cached prefix and
     // the real usage echo drives token accounting.
@@ -254,7 +273,8 @@ async fn call_llm(
             .await
             .map_err(|e| e.to_string())?;
         let billable = billable_tokens(&completion.usage, estimate_tokens(task));
-        return Ok((completion.text, billable));
+        let cost = cache_cost_usd(&completion.usage, &metadata, billable);
+        return Ok((completion.text, billable, cost));
     }
 
     // Plain path on a blocking thread — the established spawn_blocking guard:
@@ -266,7 +286,42 @@ async fn call_llm(
         .await
         .map_err(|e| format!("distill LLM task join failed: {e}"))?
         .map_err(|e| e.to_string())?;
-    Ok((reply, prompt_tokens))
+    let usage = plain_cost_split(prompt_tokens);
+    let cost = usage_to_cost_usd(&metadata, usage.0, usage.1);
+    Ok((reply, prompt_tokens, cost))
+}
+
+/// Cached-path cost split: `cache_creation` is billed as input, a cache
+/// READ is not re-billed. Mirrors `billable_tokens`' semantics so the
+/// billable-token number and the USD number stay coherent; an all-None
+/// (unparseable) echo never bills, falling back on the token estimate.
+fn cache_cost_usd(
+    usage: &CacheUsage,
+    metadata: &zen_provider::ModelMetadata,
+    fallback: u32,
+) -> f64 {
+    match (usage.input_tokens, usage.output_tokens) {
+        (None, None) => {
+            let (i, o) = plain_cost_split(fallback);
+            usage_to_cost_usd(metadata, i, o)
+        }
+        _ => {
+            let input_raw = usage.input_tokens.unwrap_or(0);
+            let creation = usage.cache_creation_input_tokens.unwrap_or(0);
+            let read = usage.cache_read_input_tokens.unwrap_or(0);
+            let input = (input_raw as i64 + creation as i64 - read as i64).max(0) as u64;
+            usage_to_cost_usd(metadata, input, usage.output_tokens.unwrap_or(0))
+        }
+    }
+}
+
+/// Plain-path cost split: the reservation is `input_estimate + reply_budget`
+/// (`estimate_tokens`), so bill the reply share as output.
+fn plain_cost_split(prompt_tokens: u32) -> (u64, u64) {
+    (
+        prompt_tokens.saturating_sub(REPLY_ESTIMATE_TOKENS) as u64,
+        REPLY_ESTIMATE_TOKENS as u64,
+    )
 }
 
 /// Anthropic cache-usage echo → billable tokens (compile-hygiene ③
@@ -355,27 +410,30 @@ fn parse_llm_notions(raw: &str, note_id: &str, max: usize) -> Vec<NotionType> {
     notions
 }
 
-/// Compose a merge section via the LLM (T046 merge assist). Returns `None`
-/// on any failure — the caller falls back to the deterministic raw append.
-/// Input/output are truncated so one merge can never blow the budget.
+/// Compose a merge section via the LLM (T046 merge assist). Returns
+/// `Some((body, tokens, cost_usd))` — the caller falls back to the
+/// deterministic raw append on `None` (3A: the cost rides out so merge
+/// assist spend reaches the cost cap; previously even `_tokens` were
+/// discarded). Input/output are truncated so one merge can never blow
+/// the budget.
 pub async fn merge_section(
     model: &str,
     target_title: &str,
     source_stem: &str,
     unique: &str,
-) -> Option<String> {
+) -> Option<(String, u32, f64)> {
     let unique = truncate_chars(unique, MERGE_INPUT_CHARS);
     let task = format!(
         "Target page: {target_title}\nSource page: {source_stem}\n\nNew lines to absorb:\n\n{unique}\n\nRewrite the new lines as one cohesive markdown section body (sub-headings allowed, no top-level title), preserving facts verbatim where possible. Reply with ONLY the section body."
     );
     match call_llm(model, MERGE_SYSTEM, &task).await {
-        Ok((reply, _tokens)) => {
+        Ok((reply, tokens, cost)) => {
             let body = truncate_chars(reply.trim(), MERGE_OUTPUT_CHARS).to_string();
             if body.is_empty() {
                 warn!("merge assist: empty LLM section — falling back to raw append");
                 None
             } else {
-                Some(body)
+                Some((body, tokens, cost))
             }
         }
         Err(e) => {
@@ -433,9 +491,10 @@ mod tests {
     async fn no_model_yields_zero_enrichment_and_zero_tokens() {
         let mut stage = LlmDistillStage::new(LoopBudget::default(), None);
         let notes = vec![make_note("rust and sqlite notes")];
-        let (notions, tokens) = stage.distill_with_fallback(&notes).await.unwrap();
+        let (notions, tokens, cost) = stage.distill_with_fallback(&notes).await.unwrap();
         assert!(notions.is_empty());
         assert_eq!(tokens, 0);
+        assert_eq!(cost, 0.0, "no model configured — no cost charged");
     }
 
     #[tokio::test]
@@ -443,9 +502,10 @@ mod tests {
         // 1-token ceiling: the first reservation is refused → no call, no tokens.
         let mut stage = LlmDistillStage::new(LoopBudget::with_limits(5, 1), None);
         let notes = vec![make_note("rust and sqlite notes")];
-        let (notions, tokens) = stage.distill_with_fallback(&notes).await.unwrap();
+        let (notions, tokens, cost) = stage.distill_with_fallback(&notes).await.unwrap();
         assert!(notions.is_empty());
         assert_eq!(tokens, 0);
+        assert_eq!(cost, 0.0, "budget refused the call — nothing billed");
     }
 
     /// End-to-end fail-open through the real router plumbing: the mock
@@ -458,10 +518,14 @@ mod tests {
         zen_core::config::invalidate_config_cache();
         let mut stage = LlmDistillStage::new(LoopBudget::default(), Some("mock".to_string()));
         let notes = vec![make_note("rust and sqlite notes")];
-        let (notions, tokens) = stage.distill_with_fallback(&notes).await.unwrap();
+        let (notions, tokens, cost) = stage.distill_with_fallback(&notes).await.unwrap();
         assert!(
             notions.is_empty(),
             "garbage reply must parse to zero notions"
+        );
+        assert!(
+            cost >= 0.0,
+            "fail-open reservation must still charge (0 on unpriced mock)"
         );
         assert!(
             tokens > 0,

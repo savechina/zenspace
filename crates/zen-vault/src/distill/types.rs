@@ -78,6 +78,11 @@ pub struct LoopCycleReport {
     pub hypotheses_rejected: usize,
     /// Skill drafts precipitated this cycle (FR-037, PD-04/G7).
     pub skills_precipitated: usize,
+    /// LLM USD spend charged by the distill stage + merge assist this cycle
+    /// (3A, 2026-09-30). 0.0 when no metered provider served (local = free)
+    /// or no model is configured; folds into WorkerCostLedger via
+    /// `worker_report` so `[cron] llm_cost_cap_usd` can see distill spend.
+    pub llm_cost_usd: f64,
     /// Validated learnings applied to wiki/beliefs/skills (PD-04/G3).
     pub promotions_applied: usize,
     /// Raw sources routed through the graph Router & Join (FR-030, Stage 3a).
@@ -377,6 +382,9 @@ pub struct LoopBudget {
     pub consumed_steps: u32,
     /// Tokens consumed this cycle; >max_tokens → pending pool.
     pub consumed_tokens: u32,
+    /// LLM USD cost charged this cycle (3A, 2026-09-30); recorded always —
+    /// unlike tokens, cost has no cycle ceiling, only the monthly cap.
+    pub consumed_cost_usd: f64,
 }
 
 impl Default for LoopBudget {
@@ -386,6 +394,7 @@ impl Default for LoopBudget {
             max_tokens: 8_000,
             consumed_steps: 0,
             consumed_tokens: 0,
+            consumed_cost_usd: 0.0,
         }
     }
 }
@@ -398,6 +407,15 @@ impl LoopBudget {
             max_tokens,
             consumed_steps: 0,
             consumed_tokens: 0,
+            consumed_cost_usd: 0.0,
+        }
+    }
+
+    /// Record LLM USD spend unconditionally — the cost cap is accountability,
+    /// not a throughput gate, so spend past any ceiling must still surface.
+    pub fn charge_cost(&mut self, usd: f64) {
+        if usd > 0.0 {
+            self.consumed_cost_usd += usd;
         }
     }
 
@@ -536,6 +554,19 @@ mod tests {
         assert!(!b.consume_tokens(1));
     }
 
+    /// 3A: cost charges accumulate (unlike tokens, past any ceiling) and
+    /// non-positive amounts are ignored — a 0.0 local-provider bill must
+    /// not dirty the accumulator.
+    #[test]
+    fn loop_budget_charge_cost_accumulates_and_ignores_non_positive() {
+        let mut b = LoopBudget::default();
+        b.charge_cost(0.25);
+        b.charge_cost(0.75);
+        b.charge_cost(0.0);
+        b.charge_cost(-1.0);
+        assert!((b.consumed_cost_usd - 1.0).abs() < 1e-9);
+    }
+
     #[test]
     fn loop_budget_skip_extensions_config_is_default() {
         let mut b = LoopBudget {
@@ -543,6 +574,7 @@ mod tests {
             max_tokens: 100,
             consumed_steps: 0,
             consumed_tokens: 0,
+            consumed_cost_usd: 0.0,
         };
         assert!(b.consume_step());
         assert!(b.over_budget());

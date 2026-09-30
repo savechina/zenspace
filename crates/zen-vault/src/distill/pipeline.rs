@@ -1060,11 +1060,19 @@ impl DistillationPipeline {
             .unwrap_or_default();
         let mut llm_stage = LlmDistillStage::new(stage_budget, stage_model);
         match llm_stage.distill_with_fallback(&normalized).await {
-            Ok((llm_notions, tokens_used)) => {
+            Ok((llm_notions, tokens_used, llm_cost_usd)) => {
                 if tokens_used > 0
-                    && let Some(b) = budget
+                    && let Some(b) = budget.as_mut()
                 {
                     b.consume_tokens(tokens_used);
+                }
+                // 3A: distill LLM USD spend folds into the cycle budget's
+                // cost accumulator (zen_loop reads it into the cycle report
+                // so `[cron] llm_cost_cap_usd` can see distill spend).
+                if llm_cost_usd > 0.0
+                    && let Some(b) = budget.as_mut()
+                {
+                    b.charge_cost(llm_cost_usd);
                 }
                 if !llm_notions.is_empty() {
                     let before = notions.len();
@@ -1163,10 +1171,16 @@ impl DistillationPipeline {
         }
 
         // T015: merge execution — cluster + fold duplicates (FR-016).
-        let (merged_count, merge_iterations) = self
+        let (merged_count, merge_iterations, merge_cost_usd) = self
             .execute_merge_plans(wiki_dir, archive_dir, txn, cycle_id, &page_iterations)
             .await?;
         iterations_captured += merge_iterations;
+        // 3A: merge-assist LLM spend joins the cycle cost accumulator.
+        if merge_cost_usd > 0.0
+            && let Some(b) = budget.as_mut()
+        {
+            b.charge_cost(merge_cost_usd);
+        }
 
         let contradictions = self.detector.detect(&notes)?;
         let contradictions_found = contradictions.len();
@@ -1437,13 +1451,14 @@ impl DistillationPipeline {
         txn: &TransactionScope,
         cycle_id: &str,
         page_iterations: &crate::wiki::PageIterations,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, f64)> {
         use super::merge::{MergeStrategy, build_merge_plans};
+        let mut merge_cost_usd = 0.0f64;
 
         let mut captured_iterations = 0usize;
         let inventory = crate::graph_verify::wiki_page_inventory(wiki_dir);
         if inventory.len() < 2 {
-            return Ok((0, 0));
+            return Ok((0, 0, 0.0));
         }
 
         let (threshold, pure_dup) = match zen_core::config::load_config() {
@@ -1533,6 +1548,10 @@ impl DistillationPipeline {
                                 &unique_text,
                             )
                             .await
+                            .map(|(body, _tokens, cost)| {
+                                merge_cost_usd += cost;
+                                body
+                            })
                             .unwrap_or_else(|| unique.join("\n"))
                         } else {
                             unique.join("\n")
@@ -1631,7 +1650,7 @@ impl DistillationPipeline {
         if merged > 0 {
             info!(merged, captured_iterations, "merge: plans executed");
         }
-        Ok((merged, captured_iterations))
+        Ok((merged, captured_iterations, merge_cost_usd))
     }
 
     /// Load all .md notes from the inbox directory.

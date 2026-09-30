@@ -1240,6 +1240,9 @@ impl ZenWorker for ZenLoopWorker {
         match distill {
             Ok(outcome) => {
                 report.notes_processed = outcome.report.notes_processed;
+                // 3A: distill + merge-assist LLM spend reaches the cost cap
+                // through the cycle budget accumulator.
+                report.llm_cost_usd = budget.consumed_cost_usd;
                 report.entities_persisted = outcome.report.entities_persisted;
                 report.pages_created = outcome.report.wiki_pages_created;
                 report.merged_count = outcome.report.merged_count;
@@ -1276,6 +1279,9 @@ impl ZenWorker for ZenLoopWorker {
             Err(e) => {
                 report.outcome = Some(CycleOutcome::Failed);
                 report.last_error = Some(format!("distill stage: {e:#}"));
+                // 3A: partial spend before a failure still bills — accountability
+                // is not gated on the cycle completing.
+                report.llm_cost_usd = budget.consumed_cost_usd;
                 report.gaps = gaps;
                 persist_report_and_audit(&paths, &logs_dir, &report).await?;
                 return Ok(worker_report(&report, started));
@@ -1794,7 +1800,7 @@ fn worker_report(report: &LoopCycleReport, started: Instant) -> WorkerReport {
         success: report.outcome == Some(CycleOutcome::Completed),
         fact_count: report.notes_processed,
         duration_ms: started.elapsed().as_millis() as u64,
-        llm_cost_usd: 0.0,
+        llm_cost_usd: report.llm_cost_usd,
     }
 }
 
