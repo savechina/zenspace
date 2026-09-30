@@ -330,3 +330,75 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Doctor { json } => doctor_command::execute_command(json),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Docs-consistency gate (2026-09-30 plan-eng-review, Open-A)
+//
+// PURPOSE: Fail the test gate when docs/src/cli-commands.md drifts from the
+//          live clap surface — the guide rotted three times silently (wrong
+//          command count, removed commands still taught, phantom keys).
+// USAGE: Runs under `bin/test`/rust.yml with the rest of the suite; no CI
+//        wiring changes (docs.yml only triggers on docs/**, so it can never
+//        see the crate changes that cause drift — the rust gate can).
+// EXPECTED: PASS while every subcommand is documented as `zen <name>` code
+//           form and the header count claim matches the enum.
+// ERRORS: A red test names the exact missing command or the drifted count —
+//         fix the DOC (or the enum if the command was deliberately added).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod docs_consistency {
+    use super::*;
+    use clap::CommandFactory;
+
+    const DOC: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/src/cli-commands.md"
+    );
+
+    fn doc() -> String {
+        std::fs::read_to_string(DOC)
+            .unwrap_or_else(|e| panic!("cannot read user guide at {DOC}: {e}"))
+    }
+
+    fn subcommand_names() -> Vec<String> {
+        // `help` is clap's auto-added builtin, not a Commands variant.
+        Cli::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .filter(|n| n != "help")
+            .collect()
+    }
+
+    /// Every live subcommand is documented in the guide. The match is the
+    /// code-form PREFIX `` `zen <name> `` (opening backtick anchored): it
+    /// matches standalone rows (`zen chat`) and nested rows (`zen sandbox
+    /// test` for `sandbox`), while prose mentions without code ticks cannot
+    /// false-positive.
+    #[test]
+    fn user_guide_documents_every_subcommand() {
+        let doc = doc();
+        let missing: Vec<String> = subcommand_names()
+            .into_iter()
+            .filter(|name| !doc.contains(&format!("`zen {name}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/src/cli-commands.md does not document {} as `zen <name>` — \
+             update the guide (or the Commands enum if intentional)",
+            missing.join(", ")
+        );
+    }
+
+    /// The guide's header count claim ("N subcommands") must equal the live
+    /// variant count — the first historical rot class was exactly this drift.
+    #[test]
+    fn user_guide_subcommand_count_claim_matches() {
+        let doc = doc();
+        let n = subcommand_names().len();
+        assert!(
+            doc.contains(&format!("{n} subcommands")),
+            "docs/src/cli-commands.md does not claim '{n} subcommands' — the \
+             count claim drifted (live Commands enum has {n} variants)"
+        );
+    }
+}
