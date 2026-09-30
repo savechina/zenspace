@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use futures_util::StreamExt;
 
-use crate::router::LlmError;
+use crate::router::{LlmError, UsedCompletion, text_from_choice};
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -100,6 +100,78 @@ impl OllamaProvider {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(120),
                     provider.complete_async(&prompt, &options),
+                )
+                .await
+                .map_err(|_| LlmError::Call {
+                    reason: "Ollama completion timed out after 120s".into(),
+                })?
+            })
+        })
+        .join()
+        .map_err(|e| LlmError::Call {
+            reason: format!("Ollama thread panic: {:?}", e),
+        })?
+    }
+
+    /// Usage-bearing sibling of [`Self::complete_async`]: same client
+    /// construction (loopback no-proxy included) and options, but the rig
+    /// `CompletionResponse` is kept whole so the provider's real token
+    /// usage rides out alongside the text.
+    pub async fn complete_async_with_usage(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<UsedCompletion, LlmError> {
+        let client = self.rig_client()?;
+
+        let model = client.completion_model(&self.model);
+        let mut request = model.completion_request(prompt);
+        if let Some(t) = options.temperature {
+            request = request.temperature(t);
+        }
+        if let Some(m) = options.max_tokens {
+            request = request.max_tokens(m);
+        }
+        let response = request.send().await.map_err(|e| LlmError::Call {
+            reason: format!("Ollama completion failed: {}", e),
+        })?;
+
+        let text = text_from_choice(&response.choice);
+        info!(
+            model = self.model,
+            response_len = text.len(),
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            "OllamaProvider complete (usage-bearing)"
+        );
+        Ok(UsedCompletion {
+            usage: Some(crate::router::SyncUsage {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+            }),
+            text,
+        })
+    }
+
+    /// Dedicated-thread wrapper around [`Self::complete_async_with_usage`]
+    /// — same 120s timeout and nesting-panic guard as [`Self::complete`].
+    pub fn complete_with_usage(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<UsedCompletion, LlmError> {
+        let base_url = self.base_url.clone();
+        let model = self.model.clone();
+        let prompt = prompt.to_string();
+        let options = options.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let provider = OllamaProvider { base_url, model };
+            rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    provider.complete_async_with_usage(&prompt, &options),
                 )
                 .await
                 .map_err(|_| LlmError::Call {

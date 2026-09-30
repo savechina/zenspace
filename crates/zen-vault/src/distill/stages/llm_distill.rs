@@ -282,13 +282,25 @@ async fn call_llm(
     // Runtime inside them, which panics on an async worker thread.
     let prompt_tokens = estimate_tokens(task);
     let task = task.to_string();
-    let reply = tokio::task::spawn_blocking(move || router.call(provider, &task))
+    let completion = tokio::task::spawn_blocking(move || router.call_with_usage(provider, &task))
         .await
         .map_err(|e| format!("distill LLM task join failed: {e}"))?
         .map_err(|e| e.to_string())?;
-    let usage = plain_cost_split(prompt_tokens);
-    let cost = usage_to_cost_usd(&metadata, usage.0, usage.1);
-    Ok((reply, prompt_tokens, cost))
+    let reply = completion.text;
+    // Real provider usage bills directly; the reservation split
+    // (input_estimate + reply_budget) only when the provider stayed silent.
+    let (tokens, cost) = match completion.usage {
+        Some(u) => {
+            let cost = usage_to_cost_usd(&metadata, u.input_tokens, u.output_tokens);
+            ((u.input_tokens + u.output_tokens) as u32, cost)
+        }
+        None => {
+            let usage = plain_cost_split(prompt_tokens);
+            let cost = usage_to_cost_usd(&metadata, usage.0, usage.1);
+            (prompt_tokens, cost)
+        }
+    };
+    Ok((reply, tokens, cost))
 }
 
 /// Cached-path cost split: `cache_creation` is billed as input, a cache

@@ -1,11 +1,12 @@
 use rig_agent::AgentBuilder;
 use rig_agent::completion::Prompt;
 use rig_core::client::CompletionClient;
+use rig_core::completion::CompletionModel;
 use rig_core::providers::cohere;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::router::LlmError;
+use crate::router::{LlmError, UsedCompletion, text_from_choice};
 
 #[derive(Debug, Clone)]
 pub struct CohereProvider {
@@ -63,6 +64,70 @@ impl CohereProvider {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let provider = CohereProvider { api_key, model };
             rt.block_on(provider.complete_async(&prompt, &options))
+        })
+        .join()
+        .map_err(|e| LlmError::Call {
+            reason: format!("Cohere thread panic: {:?}", e),
+        })?
+    }
+
+    /// Usage-bearing sibling of [`Self::complete_async`]: same model and
+    /// options, but the rig `CompletionResponse` is kept whole so the
+    /// provider's real token usage rides out alongside the text.
+    pub async fn complete_async_with_usage(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<UsedCompletion, LlmError> {
+        let client = cohere::Client::new(&self.api_key).map_err(|e| LlmError::Call {
+            reason: format!("Failed to create Cohere client: {}", e),
+        })?;
+
+        let model = client.completion_model(&self.model);
+        let mut request = model.completion_request(prompt);
+        if let Some(t) = options.temperature {
+            request = request.temperature(t);
+        }
+        if let Some(m) = options.max_tokens {
+            request = request.max_tokens(m);
+        }
+        let response = request.send().await.map_err(|e| LlmError::Call {
+            reason: format!("Cohere completion failed: {}", e),
+        })?;
+
+        let text = text_from_choice(&response.choice);
+        info!(
+            model = self.model,
+            response_len = text.len(),
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            "CohereProvider complete (usage-bearing)"
+        );
+        Ok(UsedCompletion {
+            usage: Some(crate::router::SyncUsage {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+            }),
+            text,
+        })
+    }
+
+    /// Dedicated-thread wrapper around [`Self::complete_async_with_usage`]
+    /// (same nesting-panic guard as [`Self::complete`]).
+    pub fn complete_with_usage(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<UsedCompletion, LlmError> {
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let prompt = prompt.to_string();
+        let options = options.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let provider = CohereProvider { api_key, model };
+            rt.block_on(provider.complete_async_with_usage(&prompt, &options))
         })
         .join()
         .map_err(|e| LlmError::Call {

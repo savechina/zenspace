@@ -56,13 +56,14 @@ fn stream_budget_for_next(token_count: usize) -> std::time::Duration {
     stream_budget(token_count == 0, first, inactivity)
 }
 
-/// Conservative token estimate for a response body: ~4 chars/token.
+/// Conservative token estimate for a STREAMED response body: ~4 chars/token.
 ///
 /// rig-core 0.42 replaced the 0.41 `GetTokenUsage` trait with the concrete
-/// `Usage` struct carried by `StreamFinal`/`CompletionResponse`; zen's
-/// providers do not report usage, so the same len/4 heuristic that fed the
-/// old `ZenCompletionResponse::token_usage` feeds `Usage.output_tokens`
-/// (T096 budgets read these totals).
+/// `Usage` struct carried by `StreamFinal`/`CompletionResponse`. The
+/// non-stream path now feeds real provider usage into `Usage` (see
+/// `completion`); the stream path has no provider echo yet, so the same
+/// len/4 heuristic that fed the old `ZenCompletionResponse::token_usage`
+/// feeds `Usage.output_tokens` (T096 budgets read these totals).
 fn estimate_tokens(text: &str) -> Usage {
     let n = text.len() as u64 / 4; // conservative ~4 chars/token
     Usage {
@@ -112,24 +113,42 @@ impl CompletionModel for ZenCompletionModel {
             "completion_model: starting LLM completion"
         );
 
-        let response_text = self
+        let completion = self
             .router
-            .call(self.provider.clone(), &prompt)
+            .call_with_usage(self.provider.clone(), &prompt)
             .map_err(|e| {
                 let err_msg = format!("zen-provider call failed: {e}");
                 tracing::error!(provider = %self.model_name, error = %err_msg, "completion_model: LLM completion failed");
                 CompletionError::ProviderError(err_msg)
             })?;
+        let response_text = completion.text;
 
         tracing::info!(
             provider = %self.model_name,
             response_len = response_text.len(),
+            usage_reported = completion.usage.is_some(),
             "completion_model: LLM completion succeeded"
         );
 
+        // Real provider usage when the sync surface echoed it (the rig
+        // Usage totals feed AgentRun/executor token accounting); the old
+        // empty Usage only when the provider stayed silent.
+        let usage = match completion.usage {
+            Some(u) => Usage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                total_tokens: u.input_tokens + u.output_tokens,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                tool_use_prompt_tokens: 0,
+                reasoning_tokens: 0,
+            },
+            None => Usage::new(),
+        };
+
         Ok(CompletionResponse::new(
             vec![AssistantContent::text(response_text.clone())],
-            Usage::new(),
+            usage,
             self.model_name.clone(),
         ))
     }

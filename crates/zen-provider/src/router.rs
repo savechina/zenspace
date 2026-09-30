@@ -215,9 +215,11 @@ pub struct MeteredCompletion {
     pub provider: String,
     /// Model name reported by the resolved provider instance.
     pub model: String,
-    /// Estimated input tokens (`bytes / 4` heuristic — see `complete_metered`).
+    /// Input tokens — real when the provider reported usage, otherwise the
+    /// `bytes / 4` estimate (see `complete_metered` / [`reconcile_usage`]).
     pub input_tokens: u64,
-    /// Estimated output tokens (`bytes / 4` heuristic — see `complete_metered`).
+    /// Output tokens — real when the provider reported usage, otherwise the
+    /// `bytes / 4` estimate (see `complete_metered` / [`reconcile_usage`]).
     pub output_tokens: u64,
     /// USD cost from [`usage_to_cost_usd`](crate::model_meta::usage_to_cost_usd);
     /// exactly 0.0 for local providers and unmetered (unpriced) cloud ones.
@@ -229,6 +231,79 @@ pub struct MeteredCompletion {
 /// uses, kept in one place so cost accounting and telemetry never diverge.
 fn estimate_tokens(text: &str) -> u64 {
     (text.len() as u64) / 4
+}
+
+// ---------------------------------------------------------------------------
+// SyncUsage / UsedCompletion — the usage-bearing completion surface
+// ---------------------------------------------------------------------------
+
+/// Token usage echoed by the provider for a sync completion.
+///
+/// Populated only when the provider actually reported usage on the response;
+/// a provider that stays silent surfaces as `None` on
+/// [`UsedCompletion::usage`] instead of zeros here (rig's own convention:
+/// zeros mean "provider failed to supply token metrics", so zeros are
+/// guarded at [`reconcile_usage`], never trusted directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SyncUsage {
+    /// Real input ("prompt") tokens reported by the provider.
+    pub input_tokens: u64,
+    /// Real output ("completion") tokens reported by the provider.
+    pub output_tokens: u64,
+}
+
+/// A sync completion that carries the provider's usage echo when available.
+///
+/// `usage: None` means the provider surface could not report usage (mock
+/// provider, or a future surface that did not adopt the echo) — callers
+/// fall back to their estimate unchanged.
+#[derive(Debug, Clone)]
+pub struct UsedCompletion {
+    /// Completion text (identical to what [`LlmRouter::call`] returns).
+    pub text: String,
+    /// Real provider usage when reported; `None` = fall back to estimates.
+    pub usage: Option<SyncUsage>,
+}
+
+/// Reconcile a provider usage echo against the bytes/4 estimate fallback.
+///
+/// # Returns
+/// `(input_tokens, output_tokens)` — the real echo when the provider
+/// reported a non-zero total, otherwise the estimate pair unchanged.
+/// A `Some` echo whose tokens are ALL zero is rig's "provider failed to
+/// report" marker and is treated as absent (never billed as zero).
+///
+/// # Examples
+/// ```
+/// use zen_provider::reconcile_usage;
+/// use zen_provider::SyncUsage;
+/// assert_eq!(reconcile_usage(Some(SyncUsage { input_tokens: 10, output_tokens: 5 }), 99, 99), (10, 5));
+/// assert_eq!(reconcile_usage(None, 7, 3), (7, 3));
+/// ```
+pub fn reconcile_usage(
+    usage: Option<SyncUsage>,
+    fallback_input: u64,
+    fallback_output: u64,
+) -> (u64, u64) {
+    match usage {
+        Some(u) if u.input_tokens + u.output_tokens > 0 => (u.input_tokens, u.output_tokens),
+        _ => (fallback_input, fallback_output),
+    }
+}
+
+/// Flatten a rig completion `choice` into plain text: concatenates every
+/// `AssistantContent::Text` part (space-joined when several), skipping
+/// `ToolCall`/`Reasoning`/`Image` parts. Empty string when the choice holds
+/// no text at all.
+pub fn text_from_choice(choice: &[rig_core::completion::AssistantContent]) -> String {
+    let parts: Vec<&str> = choice
+        .iter()
+        .filter_map(|c| match c {
+            rig_core::completion::AssistantContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    parts.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +319,24 @@ pub trait LlmRouter: std::fmt::Debug + Send + Sync {
     ///
     /// This is a **stub** — no actual HTTP calls are made.
     fn call(&self, provider: Provider, prompt: &str) -> Result<String, LlmError>;
+
+    /// Send a completion request and surface the provider's usage echo when
+    /// it reports one.
+    ///
+    /// Default: delegates to [`LlmRouter::call`] with `usage: None`, so
+    /// existing implementors keep compiling and their callers keep falling
+    /// back to estimates. [`DefaultRouter`] overrides this to thread real
+    /// usage out of the provider surface.
+    fn call_with_usage(
+        &self,
+        provider: Provider,
+        prompt: &str,
+    ) -> Result<UsedCompletion, LlmError> {
+        Ok(UsedCompletion {
+            text: self.call(provider, prompt)?,
+            usage: None,
+        })
+    }
 
     /// Send a streaming completion request. Returns [`crate::stream::StreamResponse`].
     fn call_stream(
@@ -424,6 +517,29 @@ impl ProviderInstance {
             ProviderInstance::Ollama(p) => p.complete(prompt, options),
             ProviderInstance::OpenAICompatible(p) => p.complete(prompt, options),
             ProviderInstance::Mock(p) => p.complete("call", prompt),
+        }
+    }
+
+    /// Sync completion that carries the provider's usage echo when its
+    /// surface reports one (mock stays `None` — estimates stay authoritative
+    /// there).
+    pub fn complete_with_usage(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<UsedCompletion, LlmError> {
+        match self {
+            ProviderInstance::Anthropic(p) => p.complete_with_usage(prompt, options),
+            ProviderInstance::AnthropicCompatible(p) => p.complete_with_usage(prompt, options),
+            ProviderInstance::Cohere(p) => p.complete_with_usage(prompt, options),
+            ProviderInstance::Gemini(p) => p.complete_with_usage(prompt, options),
+            ProviderInstance::Mistral(p) => p.complete_with_usage(prompt, options),
+            ProviderInstance::Ollama(p) => p.complete_with_usage(prompt, options),
+            ProviderInstance::OpenAICompatible(p) => p.complete_with_usage(prompt, options),
+            ProviderInstance::Mock(p) => {
+                let text = p.complete("call", prompt)?;
+                Ok(UsedCompletion { text, usage: None })
+            }
         }
     }
 
@@ -875,12 +991,12 @@ impl DefaultRouter {
     /// [`usage_to_cost_usd`](crate::model_meta::usage_to_cost_usd) from the
     /// resolved provider's configured pricing and the token usage.
     ///
-    /// Token usage is ESTIMATED as `bytes / 4` — the same heuristic
-    /// [`PromptHookTelemetry::record`](crate::model_meta::PromptHookTelemetry::record)
-    /// already uses — because the provider `complete()` implementations return
-    /// only text (the usage the provider reports is discarded inside them).
-    /// Provider-reported usage is the accuracy follow-up; the estimate keeps
-    /// the cost cap directionally real today.
+    /// Token usage is the provider's REAL echo when its surface reports one;
+    /// otherwise it falls back to the `bytes / 4` estimate (the same
+    /// heuristic [`PromptHookTelemetry::record`](crate::model_meta::PromptHookTelemetry::record)
+    /// uses) via [`reconcile_usage`] — a zero echo (rig's "provider failed
+    /// to report" marker) never replaces the estimate. The mock provider
+    /// never reports usage, so test-path costs keep the estimate semantics.
     ///
     /// A non-local provider with no configured pricing meters as 0.0 and logs
     /// a warning naming the config keys — the cap then cannot trip for that
@@ -904,9 +1020,10 @@ impl DefaultRouter {
             Provider::Unknown(name) => name.clone(),
             _ => provider.to_string(),
         };
-        let text = self
-            .call(provider.clone(), request)
+        let completion = self
+            .call_with_usage(provider.clone(), request)
             .map_err(|e| call_zen_error(task, &provider, e))?;
+        let text = completion.text;
 
         let model = if provider_name == "mock" {
             "mock".to_string()
@@ -916,8 +1033,14 @@ impl DefaultRouter {
                 .unwrap_or_else(|| "unknown".to_string())
         };
         let metadata = self.model_metadata(&provider_name, &model);
-        let input_tokens = estimate_tokens(request);
-        let output_tokens = estimate_tokens(&text);
+        // Real provider usage when the surface echoed it; the bytes/4
+        // estimate only when it did not (mock, or an echo that was all
+        // zeros — rig's "provider failed to report" marker).
+        let (input_tokens, output_tokens) = reconcile_usage(
+            completion.usage,
+            estimate_tokens(request),
+            estimate_tokens(&text),
+        );
         if !metadata.is_local
             && metadata.input_cost_per_million == 0.0
             && metadata.output_cost_per_million == 0.0
@@ -1202,6 +1325,48 @@ impl LlmRouter for DefaultRouter {
                 "DefaultRouter: calling provider"
             );
             instance.complete(prompt, &options)
+        } else {
+            Err(LlmError::ProviderUnavailable {
+                provider: provider_name.clone(),
+                reason: format!(
+                    "Provider '{}' not configured. Add to ~/.zen/config.toml: [providers.{}]",
+                    provider_name, provider_name
+                ),
+            })
+        }
+    }
+
+    fn call_with_usage(
+        &self,
+        provider: Provider,
+        prompt: &str,
+    ) -> Result<UsedCompletion, LlmError> {
+        let provider_name = match &provider {
+            Provider::Unknown(name) => name.clone(),
+            _ => provider.to_string(),
+        };
+
+        if provider_name == "mock" {
+            info!(
+                prompt_len = prompt.len(),
+                "DefaultRouter: delegating to MockProvider"
+            );
+            let text = self.mock.complete("call", prompt)?;
+            return Ok(UsedCompletion { text, usage: None });
+        }
+
+        let options = self
+            .resolve_effective_options(&provider_name)
+            .unwrap_or_default();
+
+        if let Some(instance) = self.provider_instance(&provider_name) {
+            info!(
+                provider = provider_name,
+                model = instance.model_name(),
+                prompt_len = prompt.len(),
+                "DefaultRouter: calling provider (usage-bearing)"
+            );
+            instance.complete_with_usage(prompt, &options)
         } else {
             Err(LlmError::ProviderUnavailable {
                 provider: provider_name.clone(),
@@ -1529,5 +1694,47 @@ mod tests {
             tokens.len() > 1,
             "default mock should produce multiple word-level tokens"
         );
+    }
+
+    #[test]
+    fn reconcile_usage_prefers_real_echo() {
+        let real = SyncUsage {
+            input_tokens: 120,
+            output_tokens: 45,
+        };
+        assert_eq!(reconcile_usage(Some(real), 999, 999), (120, 45));
+    }
+
+    #[test]
+    fn reconcile_usage_falls_back_when_absent() {
+        assert_eq!(reconcile_usage(None, 70, 30), (70, 30));
+    }
+
+    #[test]
+    fn reconcile_usage_treats_all_zero_echo_as_absent() {
+        // rig's marker for "provider failed to report" — never bill zeros.
+        let zero = SyncUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        assert_eq!(reconcile_usage(Some(zero), 70, 30), (70, 30));
+    }
+
+    #[test]
+    fn text_from_choice_concatenates_text_parts_only() {
+        use rig_core::completion::AssistantContent;
+        let text_only = vec![AssistantContent::text("hello".to_string())];
+        assert_eq!(text_from_choice(&text_only), "hello");
+
+        // ToolCall/Reasoning/Image parts are skipped; multiple text parts
+        // join with a space.
+        let mixed = vec![
+            AssistantContent::text("part one".to_string()),
+            AssistantContent::text("part two".to_string()),
+        ];
+        assert_eq!(text_from_choice(&mixed), "part one part two");
+
+        let empty: Vec<AssistantContent> = Vec::new();
+        assert_eq!(text_from_choice(&empty), "");
     }
 }

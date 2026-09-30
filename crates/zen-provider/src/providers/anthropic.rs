@@ -1,12 +1,13 @@
 use rig_agent::AgentBuilder;
 use rig_agent::completion::Prompt;
 use rig_core::client::CompletionClient;
+use rig_core::completion::CompletionModel;
 use rig_core::providers::anthropic;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::cache::{CacheSegments, CacheUsage, CachedCompletion, PromptCacheControl};
-use crate::router::LlmError;
+use crate::router::{LlmError, UsedCompletion, text_from_choice};
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -90,6 +91,78 @@ impl AnthropicProvider {
                 base_url,
             };
             rt.block_on(provider.complete_async(&prompt, &options))
+        })
+        .join()
+        .map_err(|e| LlmError::Call {
+            reason: format!("Anthropic thread panic: {:?}", e),
+        })?
+    }
+
+    /// Usage-bearing sibling of [`Self::complete_async`]: same model,
+    /// base-url handling and the 4096 max-token default, but the rig
+    /// `CompletionResponse` is kept whole so the provider's real token
+    /// usage rides out alongside the text.
+    pub async fn complete_async_with_usage(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<UsedCompletion, LlmError> {
+        let mut builder = anthropic::Client::builder().api_key(&self.api_key);
+        if self.base_url != zen_core::constants::ANTHROPIC_BASE_URL {
+            builder = builder.base_url(&self.base_url);
+        }
+        let client = builder.build().map_err(|e| LlmError::Call {
+            reason: format!("Failed to create Anthropic client: {}", e),
+        })?;
+
+        let model = client.completion_model(&self.model);
+        let mut request = model.completion_request(prompt);
+        request = request.max_tokens(options.max_tokens.unwrap_or(4096));
+        if let Some(t) = options.temperature {
+            request = request.temperature(t);
+        }
+        let response = request.send().await.map_err(|e| LlmError::Call {
+            reason: format!("Anthropic completion failed: {}", e),
+        })?;
+
+        let text = text_from_choice(&response.choice);
+        info!(
+            model = self.model,
+            response_len = text.len(),
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            "AnthropicProvider complete (usage-bearing)"
+        );
+        Ok(UsedCompletion {
+            usage: Some(crate::router::SyncUsage {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+            }),
+            text,
+        })
+    }
+
+    /// Dedicated-thread wrapper around [`Self::complete_async_with_usage`]
+    /// (same nesting-panic guard as [`Self::complete`]).
+    pub fn complete_with_usage(
+        &self,
+        prompt: &str,
+        options: &zen_core::config::ModelOptions,
+    ) -> Result<UsedCompletion, LlmError> {
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let base_url = self.base_url.clone();
+        let prompt = prompt.to_string();
+        let options = options.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let provider = AnthropicProvider {
+                api_key,
+                model,
+                base_url,
+            };
+            rt.block_on(provider.complete_async_with_usage(&prompt, &options))
         })
         .join()
         .map_err(|e| LlmError::Call {
