@@ -1674,6 +1674,12 @@ pub struct TuiConfig {
 ///   Enter → LLM dispatch snappy (input-display-plan.md P0).
 /// - `full`: use the tier selected by `TierSelector` (previous behaviour).
 /// - `off`: skip knowledge-base search entirely (direct file lookup only).
+///
+/// Interaction: env `ZEN_TUI_KNOWLEDGE_SEARCH` (fast|full|off, case-
+/// insensitive) overrides the TOML value in the env layer; unparsable
+/// values warn and keep the TOML-derived mode. Note this key gates ONLY
+/// the TUI chat context injection — `zen chat` and TUI `/search` always
+/// auto-select (see docs/designs/search-mode-defaults.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KnowledgeSearchMode {
@@ -2520,6 +2526,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_lint_env(&mut config.agentic.lint);
     apply_cache_env(&mut config.agentic.cache);
     apply_skills_env(&mut config.skills.auto_route);
+    apply_tui_env(&mut config.tui);
     config
 }
 
@@ -2774,6 +2781,25 @@ fn apply_cron_env(cron: &mut CronConfig) {
     }
     if let Some(v) = env_bool("ZEN_TUI_SCHEDULER") {
         cron.tui_scheduler = Some(v);
+    }
+}
+
+/// TUI env layer — `ZEN_TUI_KNOWLEDGE_SEARCH` (`fast` | `full` | `off`,
+/// case-insensitive) overrides `[tui] knowledge_search`, closing the last
+/// 5-layer key without an env surface. An unparsable value warns and keeps
+/// the config-derived mode (a typo must never silently shift behavior —
+/// same discipline as the cron-timezone guard).
+fn apply_tui_env(tui: &mut TuiConfig) {
+    if let Some(v) = env_str("ZEN_TUI_KNOWLEDGE_SEARCH") {
+        match v.to_lowercase().as_str() {
+            "fast" => tui.knowledge_search = KnowledgeSearchMode::Fast,
+            "full" => tui.knowledge_search = KnowledgeSearchMode::Full,
+            "off" => tui.knowledge_search = KnowledgeSearchMode::Off,
+            _ => tracing::warn!(
+                value = %v,
+                "invalid ZEN_TUI_KNOWLEDGE_SEARCH (expected fast|full|off); keeping the configured [tui] knowledge_search value"
+            ),
+        }
     }
 }
 
@@ -3615,12 +3641,32 @@ provider = "anthropic"
 
 #[cfg(test)]
 mod tui_config_tests {
-    use super::{KnowledgeSearchMode, ZenConfig};
+    use super::{KnowledgeSearchMode, ZenConfig, apply_env_overrides};
 
     #[test]
     fn knowledge_search_defaults_to_fast() {
         let cfg: ZenConfig = toml::from_str("").expect("empty config");
         assert_eq!(cfg.tui.knowledge_search, KnowledgeSearchMode::Fast);
+    }
+
+    #[test]
+    fn knowledge_search_env_override_applies() {
+        // SAFETY: test-only env mutation; ZEN_TUI_KNOWLEDGE_SEARCH is read
+        // by no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_TUI_KNOWLEDGE_SEARCH", "FULL") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.tui.knowledge_search, KnowledgeSearchMode::Full);
+        unsafe { std::env::remove_var("ZEN_TUI_KNOWLEDGE_SEARCH") };
+    }
+
+    #[test]
+    fn knowledge_search_env_invalid_value_falls_back_with_default() {
+        // SAFETY: test-only env mutation; ZEN_TUI_KNOWLEDGE_SEARCH is read
+        // by no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_TUI_KNOWLEDGE_SEARCH", "everything") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.tui.knowledge_search, KnowledgeSearchMode::Fast);
+        unsafe { std::env::remove_var("ZEN_TUI_KNOWLEDGE_SEARCH") };
     }
 
     #[test]

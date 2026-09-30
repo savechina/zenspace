@@ -40,4 +40,4 @@ The default-Fast trade: the TUI injects context **every turn**, so Fast buys a b
 
 ## 5. Decision
 
-(Owner input pending — record choice here.)
+**A — adopted 2026-09-30.** `ZEN_TUI_KNOWLEDGE_SEARCH` added (fast|full|off, case-insensitive, env layer; unparsable values warn and keep the TOML-derived mode — the cron-timezone discipline). `[tui] knowledge_search` annotated in `config/config.toml`. Default stays Fast. Options C (fused `search_knowledge` agent tool) and B (flip default behind a measured latency budget) remain open follow-ups; revisit on real TUI-usage evidence.

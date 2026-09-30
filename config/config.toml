@@ -22,6 +22,12 @@ theme = "deep-ocean"
 # ratatui-themes: dracula, one-dark-pro, nord, catppuccin-mocha, catppuccin-latte,
 #   gruvbox-dark, gruvbox-light, tokyo-night, solarized-dark, solarized-light,
 #   monokai-pro, rose-pine, kanagawa, everforest, cyberpunk
+# Knowledge search mode for TUI chat context injection: fast (default, FTS5
+# only) | full (TierSelector auto: RRF fusion over fts5+vec0+graph+ppr) | off.
+# Env override: ZEN_TUI_KNOWLEDGE_SEARCH (fast|full|off, case-insensitive).
+# Gates ONLY the TUI chat context injection — `zen chat` and TUI /search
+# always auto-select. See docs/designs/search-mode-defaults.md.
+# knowledge_search = "fast"
 
 # =============================================================================
 # Global command history (history.jsonl)
