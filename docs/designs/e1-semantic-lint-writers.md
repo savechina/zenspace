@@ -8,7 +8,7 @@ BEFORE any code: a grep-verified writer inventory of the wiki surfaces plus a
 decision record proving the semantic lint agent introduces no second-writer
 conflict (the T129/T130 precedent, Anti-Pattern Guardrail #2).
 
-## Writer inventory (grep-verified 2026-09-28)
+## Writer inventory (grep-verified 2026-09-28; re-verified 2026-10-02)
 
 ### wiki/wisdom/* (M4 wisdom surfaces)
 
@@ -51,6 +51,7 @@ conflict (the T129/T130 precedent, Anti-Pattern Guardrail #2).
 | distill pipeline | pipeline.rs:390-392, :1494 | vault/archive/ provenance |
 | | :1522, :1538 | REWRITES wiki pages (merge/provenance) |
 | E3 cascade | zen-vault/src/distill/cascade.rs | REWRITES/DELETES pages (txn-tracked) |
+| zen wiki rollback (E5) | zen-vault/src/wiki/iterations.rs:156 (write_atomic) | REWRITES a wiki page from a stored iteration |
 | communities | zen-vault/src/communities.rs:59-72 | wiki/communities/ |
 | graph_router | graph_router.rs:483, :616 | vault/{para_target}/host-*.md, vault/raw/ |
 | note | note.rs:267,344 | write_note |
@@ -80,3 +81,16 @@ are never written back to wiki pages. Therefore:
    never a fabricated finding.
 5. **Bounded input** — the audit digest caps pages (40) and per-page content
    (2,000 chars) so a large wiki cannot produce an unbounded prompt.
+
+### Inventory completeness note (2026-10-02)
+
+The inventory above is a point-in-time snapshot; the load-bearing output of
+this record is the read-only decision, not the enumeration. A re-verification
+found one writer missing: `zen wiki rollback`'s `PageIterations::restore`, added
+by E5 (`e8ef9e2`) after this inventory was taken. It changes no conclusion —
+`restore` is a user-invoked CLI action that captures the clobbered version
+before overwriting (so a rollback is itself reversible), and it is not a
+concurrent writer against the lint pass. Note that the "13 writers" figure
+recorded in `openkb-compile-hygiene.md` never matched this table, which lists 20
+entries (19 content writers + `retention`, the delete-only one); that count is
+corrected there.

@@ -350,14 +350,40 @@ mod docs_consistency {
     use super::*;
     use clap::CommandFactory;
 
-    const DOC: &str = concat!(
+    const GUIDE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/src/cli-commands.md"
     );
+    const AGENTS_MD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md");
 
-    fn doc() -> String {
-        std::fs::read_to_string(DOC)
-            .unwrap_or_else(|e| panic!("cannot read user guide at {DOC}: {e}"))
+    /// Marks where AGENTS.md stops describing the CURRENT surface and starts
+    /// the dated historical record. Current-surface sections restate the live
+    /// command count in three places (crate table, STRUCTURE tree, the COMMANDS
+    /// heading); the history below the marker may legitimately quote retired
+    /// counts (the T193 entry cites "29 commands"), so the count gate is scoped
+    /// to the text above it.
+    const AGENTS_HISTORY_MARKER: &str = "## Recent Changes";
+
+    /// AGENTS.md section holding its authoritative command table. Coverage is
+    /// scoped here rather than to the whole file: the historical notes discuss
+    /// commands in backticked prose, so a whole-file scan is satisfied by a
+    /// passing mention and deleting a table row would go unnoticed.
+    const AGENTS_COMMAND_TABLE_SECTION: &str = "## COMMANDS (CLI)";
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"))
+    }
+
+    fn agents_md_command_table(text: &str) -> &str {
+        let start = text.find(AGENTS_COMMAND_TABLE_SECTION).unwrap_or_else(|| {
+            panic!(
+                "AGENTS.md no longer contains the '{AGENTS_COMMAND_TABLE_SECTION}' \
+                     section this gate reads — move the marker or re-scope the gate"
+            )
+        }) + AGENTS_COMMAND_TABLE_SECTION.len();
+        let body = &text[start..];
+        let end = body.find("\n## ").unwrap_or(body.len());
+        &body[..end]
     }
 
     fn subcommand_names() -> Vec<String> {
@@ -369,36 +395,98 @@ mod docs_consistency {
             .collect()
     }
 
-    /// Every live subcommand is documented in the guide. The match is the
-    /// code-form PREFIX `` `zen <name> `` (opening backtick anchored): it
-    /// matches standalone rows (`zen chat`) and nested rows (`zen sandbox
-    /// test` for `sandbox`), while prose mentions without code ticks cannot
+    /// Shared coverage predicate: every live subcommand must appear in `text`
+    /// as the code-form PREFIX `` `zen <name> `` (opening backtick anchored), so
+    /// standalone rows (`zen chat`) and nested rows (`zen sandbox test` for
+    /// `sandbox`) both match while prose without code ticks cannot
     /// false-positive.
-    #[test]
-    fn user_guide_documents_every_subcommand() {
-        let doc = doc();
+    fn assert_documents_every_subcommand(label: &str, text: &str) {
         let missing: Vec<String> = subcommand_names()
             .into_iter()
-            .filter(|name| !doc.contains(&format!("`zen {name}")))
+            .filter(|name| !text.contains(&format!("`zen {name}")))
             .collect();
         assert!(
             missing.is_empty(),
-            "docs/src/cli-commands.md does not document {} as `zen <name>` — \
-             update the guide (or the Commands enum if intentional)",
+            "{label} does not document {} as `zen <name>` — update the file (or \
+             the Commands enum if the addition is intentional)",
             missing.join(", ")
         );
+    }
+
+    /// Numeric claims of the form "<N> commands" found in `text`: the
+    /// whitespace-delimited token immediately preceding each lowercase
+    /// "commands", with surrounding punctuation stripped so a parenthesised
+    /// claim ("(23 commands") counts too. A token must be all digits once
+    /// trimmed, which is what keeps prose out ("Nine manual commands") and what
+    /// excludes the capitalised heading "Agentic Commands" and "N subcommands"
+    /// (both leave a non-numeric token behind).
+    fn numeric_count_claims(text: &str) -> Vec<u32> {
+        text.split("commands")
+            .filter_map(|chunk| chunk.split_whitespace().next_back())
+            .filter_map(|token| {
+                let digits = token.trim_matches(|c: char| !c.is_ascii_digit());
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                digits.parse::<u32>().ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn user_guide_documents_every_subcommand() {
+        assert_documents_every_subcommand("docs/src/cli-commands.md", &read(GUIDE));
     }
 
     /// The guide's header count claim ("N subcommands") must equal the live
     /// variant count — the first historical rot class was exactly this drift.
     #[test]
     fn user_guide_subcommand_count_claim_matches() {
-        let doc = doc();
+        let doc = read(GUIDE);
         let n = subcommand_names().len();
         assert!(
             doc.contains(&format!("{n} subcommands")),
             "docs/src/cli-commands.md does not claim '{n} subcommands' — the \
              count claim drifted (live Commands enum has {n} variants)"
+        );
+    }
+
+    /// AGENTS.md carries its own command table and count claims, and was
+    /// outside every rot gate: it kept claiming "20 commands" for three
+    /// commands while the live enum grew to 23, and its table silently lost the
+    /// `zen sandbox` row. The `c6067d9` gate reads the user guide only, so the
+    /// same drift class recurred here unchecked. Coverage + count are both
+    /// pinned below.
+    #[test]
+    fn agents_md_documents_every_subcommand() {
+        let text = read(AGENTS_MD);
+        assert_documents_every_subcommand(
+            "AGENTS.md's command table (## COMMANDS (CLI))",
+            agents_md_command_table(&text),
+        );
+    }
+
+    #[test]
+    fn agents_md_command_count_claims_match() {
+        let text = read(AGENTS_MD);
+        let end = text.find(AGENTS_HISTORY_MARKER).unwrap_or_else(|| {
+            panic!(
+                "AGENTS.md no longer contains the '{AGENTS_HISTORY_MARKER}' section \
+                 this gate scopes the current-surface count claims to — move the marker \
+                 or re-scope the gate"
+            )
+        });
+        let (current, _history) = text.split_at(end);
+        let n = subcommand_names().len() as u32;
+        let stale: Vec<u32> = numeric_count_claims(current)
+            .into_iter()
+            .filter(|claimed| *claimed != n)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "AGENTS.md current-surface sections claim {stale:?} commands but the live \
+             Commands enum has {n} — update every '<N> commands' claim above the \
+             '{AGENTS_HISTORY_MARKER}' marker"
         );
     }
 }

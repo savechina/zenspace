@@ -83,7 +83,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | Crate | Role | Path |
 |-------|------|------|
 | zen | Binary entry (13-line wrapper) | `crates/zen/` |
-| zen-cli | CLI library (20 commands, TUI, dispatch) | `crates/zen-cli/` |
+| zen-cli | CLI library (23 commands, TUI, dispatch) | `crates/zen-cli/` |
 | zen-core | Config layers, error taxonomy, path scoping, constants (13 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
 | zen-repo | Unified data layer: SqliteClient + 9 domain repositories (FTS5, vec0, graph) | `crates/zen-repo/` |
@@ -141,7 +141,7 @@ zen serve start  → zen-gateway daemon + ZenScheduler (cron workers: journal, d
 zenspace/
 ├── crates/                     # 12 workspace crates (binary/library split)
 │   ├── zen/                    # Binary entry (13-line wrapper)
-│   ├── zen-cli/                # CLI library: 20 commands, TUI, clap derive
+│   ├── zen-cli/                # CLI library: 23 commands, TUI, clap derive
 │   │   ├── src/
 │   │   │   ├── lib.rs          # pub use cli::shell
 │   │   │   ├── cli.rs          # clap Parser/Subcommand (20 variants), shell() dispatcher
@@ -483,7 +483,7 @@ bin/zentest              # Any zen command against ~/.zentest instead of ~/.zen
 bin/release patch        # Bump version, tag, push
 ```
 
-### Agentic Commands (20 commands)
+### Agentic Commands (23 commands)
 
 Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal memory/knowledge pipeline. Nine manual commands (`note`, `search`, `similar`, `notion`/`graph`, `research`, `ingest`, `routine`, `brief`, `dispatch`) were removed from the CLI surface — their capabilities live on internally via ZenScheduler workers and the distill loop; the command files remain on disk uncompiled, restorable when business scenarios require.
 
@@ -511,6 +511,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen goal` | Goal management | `goal_command.rs` |
 | `zen skill` | Skill management (list, run, progress, show, precipitate, confirm) | `skill_command.rs` |
 | `zen discover` | Self-learning gate surface (PD-06): run (one zen-loop cycle now — stages 5b/5c/5d), stage/queue, confirm/reject (Hybrid C promotion gate; BeliefEvidence applies `Belief::update` on confirm), report (discover metrics, reads `loop-last-report.json`), arena (distill regression gate vs baselines/external CLIs — every lost case is staged as an improvement hypothesis under `wiki/wisdom/hypotheses/`) | `discover_command.rs` |
+| `zen sandbox` | OS-level sandbox surface: `run` (exec a binary under the active sandbox mode), `status`, `policy`, `test` (verify isolation works) | `sandbox_command.rs` |
 | `zen doctor` | System health: 8 liveness probes (config, state.db, memories, daemon, loop, provider, vault, outbox — staged briefs + unconfigured qqbot ⇒ FAIL with actionable message); `--json` machine output; exit 0 all-green / 1 any-fail | `doctor_command.rs` |
 
 ## AGENT TOOL INVENTORY (v0.0.6)
@@ -764,6 +765,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 - Binary/library split: `zen` binary (13 lines) → `zen-cli` library (exporting `shell()`)
 
 ## Recent Changes
+
+- **审计遗留两项收尾 + 门禁盲区关闭（2026-10-02）** — 上一批（2026-10-01）判定"未修"的两项，在此关闭；更关键的是修掉**让它们得以腐化的结构原因**（AGENTS.md 不在任何 rot 门禁内，而 `c6067d9` 门禁只读 `docs/src/cli-commands.md`——盲区在同一失效模式上原样复发）：
+  - **AGENTS.md 命令面（已修）** — 3 处"20 commands"→23（crate 表 / STRUCTURE 树 / COMMANDS 标题），命令表补 `zen sandbox` 行。
+- **rot 门禁扩展到 AGENTS.md（`crates/zen-cli/src/cli.rs` `docs_consistency`）** — 两个新测试，覆盖面**限定在 `## COMMANDS (CLI)` section 内**（全文扫描会被反引号散文提及满足，删表格行看不见——本批实测）；计数断言**限定在 `## Recent Changes` 之前**（历史条目合法引用已退役计数，如 T193 的"29 commands"），且扫描前剥标点（三处真实声明有两处是括号式 `(23 commands`）。
+  - **门禁鉴别力已实证** — 4 次扰动分别触发 3 个计数位点与表格行缺失，全部正确 FAILED。第一版实现**只钉住 3 处中的 1 处**：token `"(23"` 解析失败被静默跳过，测试"绿"但欠鉴别——这是"测试通过 ≠ 有效"的又一例，与同批 OKF 验收断言同一纪律。
+  - **E1 writer 清单补第 20 个条目（`docs/designs/e1-semantic-lint-writers.md`）** — `zen wiki rollback` 的 `PageIterations::restore`（`wiki/iterations.rs:156` `write_atomic`，E5 `e8ef9e2` 晚于清单编制新增）。不改变 E1 只读结论（`semantic_lint.rs` 生产代码零写入；restore 是用户手动 CLI、先 capture 再还原、自身可逆，不构成并发 writer 冲突）。
+  - **顺带更正一个从未成立的数字** — `openkb-compile-hygiene.md` 的"13 个 wiki writer"与清单实际条目数不符（一直是 20 个条目 = 19 内容写入者 + 1 仅删除的 retention）；上一批条目按当时的文档原样引用了"13"，更正落在设计文档与本条目，历史条目不改写。
 
 - **设计验证审计 + 两个 P1 修复（2026-10-01）** — 对 4 份设计记录（`docs/designs/*`）+ TODOS.md 全部未决项做了"存在 ≠ 落地"的活跃路径验证（每项均验证调用链、配置门默认值、可观测验收），25 项确认落地，抓出 3 个缺陷，修复其中 2 个 P1：
   - **P1 pandoc sidecar 层生产不可达（已修）** — `stage_host_dir` 用 `is_convertible_extension` 暂存（含 epub/odt/rtf），而 `promote_incoming` 只接受 `md|txt|pdf|office`：sidecar 文件被暂存后**永不推进、永不隔离、永不重暂存**（暂存树兼 seen-set）→ 永久孤儿；唯一能转换它的 `ingest_local_file` 自 2026-08-28 CLI 收缩起零生产调用者（`ingest_command.rs` 未编译），故 T4 层（`172f2bb`）实现完整却**无任何活跃路径可达**。修复用**根因方式**：`promote_incoming` 改为复用 `is_convertible_extension` 这一唯一谓词（"dispatcher 有转换器吗"），两个列表各自维护正是漂移根因，现结构上不可能再漂移。`ConvertError` 语义逐字保留：`Unavailable`（pandoc 未装）**留暂存待重试、永不隔离**；`Failed` 终局隔离。测试钉在开关两侧（本机 pandoc 已装 → 走真实转换提升的强断言；未装 → 走 Unavailable 契约）。
