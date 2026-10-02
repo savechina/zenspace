@@ -466,7 +466,24 @@ impl WikiCompiler {
             tags: note.tags.clone(),
             wikilinks,
             para: note.para.clone(),
-            okf_type: note.okf_type.clone(),
+            // OKF conformance (compile-hygiene ①): the lint requires BOTH
+            // `type` and `description` on every page, so the compiler must
+            // always supply both — a page that emitted neither was reported
+            // as non-conforming on every single lint run, forever.
+            //
+            // `type` falls back to the note's own classification — the same
+            // taxonomy that chose the output directory, so the value is not
+            // invented. `description` prefers the note's own frontmatter and
+            // otherwise derives one bounded line from the body.
+            okf_type: Some(
+                note.okf_type
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", category)),
+            ),
+            description: note
+                .description
+                .clone()
+                .or_else(|| first_substantive_line(&content)),
             // E2 provenance: the original source file. The archive hook
             // redirects this to the durable archive dest in the same cycle.
             sources: note
@@ -516,6 +533,11 @@ impl WikiCompiler {
         }
         if let Some(ref okf_type) = page.okf_type {
             fm.push_str(&format!("\ntype: \"{}\"", okf_type));
+        }
+        if let Some(ref description) = page.description
+            && !description.trim().is_empty()
+        {
+            fm.push_str(&format!("\ndescription: \"{description}\""));
         }
         if !page.sources.is_empty() {
             let sources_str = page
@@ -715,6 +737,36 @@ fn classify_note(content: &str, tags: &[String]) -> NoteCategory {
     NoteCategory::Concept
 }
 
+/// First substantive line of a note body, used as a compiled page's OKF
+/// `description` when the source note carries none.
+///
+/// Skips lines that carry no prose — blank lines, ATX headings, fences,
+/// thematic breaks, block quotes, tables and images — and collapses
+/// internal whitespace so a wrapped sentence stays one line. The bound and
+/// quote-escaping come from [`truncate_for_description`], shared with the
+/// entity renderer so both description sources truncate identically.
+///
+/// Returns `None` when the body has no prose at all (an image-only or
+/// table-only note): the field is then left empty rather than filled with a
+/// placeholder, which is the honest signal the OKF lint reports on.
+fn first_substantive_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.starts_with('#')
+                && !line.starts_with("```")
+                && !line.starts_with("---")
+                && !line.starts_with('>')
+                && !line.starts_with('|')
+                && !line.starts_with("![")
+        })
+        .map(|line| {
+            let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            truncate_for_description(&collapsed)
+        })
+}
+
 fn truncate_for_description(s: &str) -> String {
     const MAX: usize = 100;
     if s.len() <= MAX {
@@ -806,6 +858,7 @@ mod tests {
             project: None,
             para: None,
             okf_type: None,
+            description: None,
             content: content.to_string(),
             file_path: None,
         }
@@ -825,6 +878,7 @@ mod tests {
             project: None,
             para: None,
             okf_type: None,
+            description: None,
             content: content.to_string(),
             file_path: None,
         }
@@ -914,6 +968,7 @@ mod tests {
             project: None,
             para: None,
             okf_type: None,
+            description: None,
             content: "# TS Note\n\nBody".to_string(),
             file_path: None,
         };
@@ -1191,6 +1246,92 @@ mod tests {
         assert!(!page.content.contains("---"));
     }
 
+    /// Compile-hygiene ① acceptance, pinned at the source: a page compiled from
+    /// an ordinary note must carry BOTH OKF required keys. Before the fix the
+    /// compiler emitted `description` never and `type` only when the source
+    /// note had one, so every compiled page was reported as non-conforming on
+    /// every lint run.
+    #[test]
+    fn compiled_note_page_always_carries_okf_type_and_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        let note = make_test_note(
+            "---\nid: \"n1\"\n---\n\n# Heading\n\nThe first real sentence carries the summary.\n",
+            vec![],
+        );
+
+        let pages = compiler.compile(&[note], dir.path()).unwrap();
+        let page = &pages[0];
+
+        let okf_type = page.okf_type.as_deref().expect("type always set");
+        assert!(!okf_type.trim().is_empty(), "type must be non-empty");
+        assert_eq!(
+            page.description.as_deref(),
+            Some("The first real sentence carries the summary."),
+            "description is the first substantive line — the heading is skipped"
+        );
+
+        let rendered = compiler.render_page(page);
+        assert!(rendered.contains(&format!("\ntype: \"{okf_type}\"")));
+        assert!(
+            rendered.contains("\ndescription: \"The first real sentence carries the summary.\"")
+        );
+    }
+
+    #[test]
+    fn note_frontmatter_type_and_description_win_over_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        // Parsed, not hand-built: this also pins the frontmatter arm.
+        let note = crate::note::parse_frontmatter(
+            "---\nid: \"n2\"\ntype: \"reference\"\ndescription: \"Hand-authored summary.\"\n---\n\nBody text here.\n",
+        )
+        .unwrap();
+
+        let pages = compiler.compile(&[note], dir.path()).unwrap();
+        assert_eq!(pages[0].okf_type.as_deref(), Some("reference"));
+        assert_eq!(
+            pages[0].description.as_deref(),
+            Some("Hand-authored summary."),
+            "an explicit description must not be overwritten by the derived one"
+        );
+    }
+
+    #[test]
+    fn body_only_note_still_gets_a_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        let note = make_test_note("Bare prose with no frontmatter at all.", vec![]);
+
+        let pages = compiler.compile(&[note], dir.path()).unwrap();
+        assert_eq!(
+            pages[0].description.as_deref(),
+            Some("Bare prose with no frontmatter at all.")
+        );
+    }
+
+    #[test]
+    fn freshly_compiled_pages_pass_the_okf_conformance_scan() {
+        // The design record's acceptance metric, asserted against the real
+        // lint rather than the renderer's own output.
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = WikiCompiler::new();
+        let note = make_test_note(
+            "---\nid: \"n4\"\n---\n\nA plain note about a compiled topic.\n",
+            vec![],
+        );
+        compiler.compile(&[note], dir.path()).unwrap();
+
+        let result = crate::tindy::lint::Linter::new()
+            .run_with_okf(dir.path(), true)
+            .unwrap();
+        assert!(
+            result.okf_missing.is_empty(),
+            "a freshly compiled page must satisfy the OKF required keys, got: {:?}",
+            result.okf_missing
+        );
+    }
+
     #[test]
     fn test_render_page_includes_frontmatter() {
         let compiler = WikiCompiler::new();
@@ -1203,6 +1344,7 @@ mod tests {
             wikilinks: vec!["Link1".into()],
             para: None,
             okf_type: None,
+            description: None,
             sources: Vec::new(),
             content: "Body content".to_string(),
         };

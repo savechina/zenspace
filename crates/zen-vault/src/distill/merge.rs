@@ -262,6 +262,7 @@ mod tests {
             wikilinks: vec![],
             para: None,
             okf_type: None,
+            description: None,
             sources: Vec::new(),
             content: content.to_string(),
         }

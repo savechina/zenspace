@@ -544,6 +544,7 @@ mod tests {
             project: None,
             para: None,
             okf_type: None,
+            description: None,
             content: content.to_string(),
             file_path: None,
         }

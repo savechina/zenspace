@@ -124,11 +124,19 @@ impl SourceIngester {
                     continue;
                 }
                 let ext = staged.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let is_office = crate::ingest::is_office_extension(ext);
+                // One predicate, shared with the staging sweep: it answers
+                // exactly one question — "does the unified dispatcher have a
+                // converter for this extension?" (pdf, office OOXML, and the
+                // pandoc sidecar's epub/odt/rtf). Reusing it here instead of
+                // re-listing the formats is deliberate: the two lists were
+                // written independently and drifted once, which left every
+                // staged epub/odt/rtf silently skipped here and orphaned in
+                // `_incoming/` forever (the staging tree is a seen-set, so the
+                // sweep never re-staged them either).
+                let needs_conversion = crate::ingest::is_convertible_extension(ext);
                 if !(ext.eq_ignore_ascii_case("md")
                     || ext.eq_ignore_ascii_case("txt")
-                    || ext.eq_ignore_ascii_case("pdf")
-                    || is_office)
+                    || needs_conversion)
                 {
                     continue;
                 }
@@ -136,14 +144,16 @@ impl SourceIngester {
                     continue;
                 };
                 let is_txt = ext.eq_ignore_ascii_case("txt");
-                let is_pdf = ext.eq_ignore_ascii_case("pdf");
-                // .txt/.pdf/office files are converted to frontmatter-wrapped
-                // .md at promote time so the downstream distill inbox scan
-                // (ext == "md" only) picks them up as notes. Conversion runs
-                // in-process with panic containment; conversion failures are
-                // terminal, so unlike txt they quarantine (seen-set marker +
-                // staged removal) instead of re-warning every cycle.
-                let dest_name = if is_txt || is_pdf || is_office {
+                // `.txt` and every convertible format (pdf / office / pandoc
+                // sidecar) become a frontmatter-wrapped `.md` at promote time
+                // so the downstream distill inbox scan (ext == "md" only) picks
+                // them up as notes. txt converts in-process with panic
+                // containment; conversion failures are terminal, so unlike txt
+                // they quarantine (seen-set marker + staged removal) instead of
+                // re-warning every cycle. A sidecar whose converter is not
+                // installed stays staged for retry — see the `Unavailable` arm
+                // below.
+                let dest_name = if is_txt || needs_conversion {
                     let stem = staged
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -177,7 +187,7 @@ impl SourceIngester {
                         warn!(
                             file = file_name,
                             reason,
-                            "promote: pdf conversion failed — quarantined (host original untouched)"
+                            "promote: conversion failed — quarantined (host original untouched)"
                         );
                     };
                 fs::create_dir_all(&promoted_dir).ok();
@@ -200,12 +210,14 @@ impl SourceIngester {
                     );
                     continue;
                 }
-                if is_txt || is_pdf || is_office {
+                if is_txt || needs_conversion {
                     // txt: non-UTF-8 files are skipped (warn, no ledger
                     // entry, no move — consistent with skip semantics).
-                    // pdf: converted in-process; any failure (garbled,
-                    // panic-contained, or zero extractable text — likely a
-                    // scanned image-only PDF) is terminal and quarantines.
+                    // Convertible formats: any failure (garbled, panic-
+                    // contained, zero extractable text — likely a scanned
+                    // image-only PDF, or a sidecar whose converter is not
+                    // installed) is either terminal-and-quarantined or, for
+                    // `Unavailable`, left staged for retry.
                     let content = if is_txt {
                         match fs::read_to_string(&staged) {
                             Ok(c) => c,
@@ -232,7 +244,7 @@ impl SourceIngester {
                                     &quarantined_dir,
                                     &staged,
                                     file_name,
-                                    "no extractable text (scanned/image-only pdf or empty document)",
+                                    "no extractable text (scanned/image-only or empty document)",
                                 );
                                 continue;
                             }
@@ -513,6 +525,64 @@ mod tests {
         );
         let again = SourceIngester::new().promote_incoming(&inbox).unwrap();
         assert!(again.is_empty());
+    }
+
+    /// Mirrors the `pandoc --version` probe in `ingest::convert`'s own tests.
+    /// Deliberately a local probe rather than a shared production helper: a
+    /// converter-presence helper with only test callers would be a
+    /// consumer-less primitive.
+    fn pandoc_available() -> bool {
+        std::process::Command::new("pandoc")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn promote_incoming_reaches_the_sidecar_converter() {
+        // pandoc's presence on $PATH is the sidecar feature switch (no config
+        // key by design), so this pins the contract on BOTH sides of that
+        // switch. Before the fix `promote_incoming` skipped every sidecar
+        // extension, so a staged epub/odt/rtf was never converted, never
+        // quarantined, and never re-staged (the staging tree is a seen-set) —
+        // a permanent orphan.
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        let staging = inbox.join("_incoming").join("f00d0005");
+        fs::create_dir_all(&staging).unwrap();
+        // RTF is a text format, so a valid minimal document needs no binary
+        // fixture: `pandoc --from=rtf --to=gfm` renders the plain-text span.
+        fs::write(staging.join("memo.rtf"), br"{\rtf1\ansi Hello Zen sidecar}").unwrap();
+
+        let promoted = SourceIngester::new().promote_incoming(&inbox).unwrap();
+        let dest = inbox.join("f00d0005_memo.md");
+        let marker = staging.join("quarantined").join("memo.rtf");
+
+        if pandoc_available() {
+            // Reached the converter: exactly one terminal outcome, and never
+            // the silent skip that orphaned these files.
+            assert!(
+                dest.exists() || marker.is_file(),
+                "sidecar file left silently staged: neither promoted nor quarantined"
+            );
+            if dest.exists() {
+                assert_eq!(promoted.get("f00d0005"), Some(&1));
+                let note = parse_frontmatter(&fs::read_to_string(&dest).unwrap()).unwrap();
+                assert!(note.content.contains("Hello"), "got: {:?}", note.content);
+            }
+        } else {
+            // Environmental: `Unavailable` must stay staged so the operator can
+            // install the converter and let a later cycle pick it up, and must
+            // never quarantine.
+            assert_eq!(promoted.get("f00d0005"), None);
+            assert!(
+                staging.join("memo.rtf").exists(),
+                "Unavailable must stay staged for retry"
+            );
+            assert!(!marker.exists(), "Unavailable must never quarantine");
+            assert!(!dest.exists());
+        }
     }
 
     #[test]

@@ -24,6 +24,11 @@ pub struct WikiPage {
     pub wikilinks: Vec<String>,
     pub para: Option<String>,
     pub okf_type: Option<String>,
+    /// One-line OKF summary. Emitted by the compiler on every compiled page
+    /// because the OKF conformance lint (compile-hygiene ①) requires it —
+    /// `None` only on pages that never went through `note_to_page`.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Provenance: vault paths of the source notes this page was compiled
     /// from (compile-hygiene E2). Code-managed — the LLM never writes it;
     /// empty for hand-written pages, which the E3 cascade never touches.

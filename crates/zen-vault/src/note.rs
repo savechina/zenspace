@@ -78,6 +78,10 @@ pub struct Note {
     pub para: Option<String>,
     /// OKF type field for Open Knowledge Format alignment (None = not set)
     pub okf_type: Option<String>,
+    /// One-line summary carried into the compiled page's OKF `description`
+    /// (None = not set). Kept separate from the body so the compiler never has
+    /// to invent one when a note provides it.
+    pub description: Option<String>,
     pub content: String,
     pub file_path: Option<PathBuf>,
 }
@@ -97,6 +101,7 @@ impl Default for Note {
             project: None,
             para: None,
             okf_type: None,
+            description: None,
             content: String::new(),
             file_path: None,
         }
@@ -227,6 +232,9 @@ pub fn parse_frontmatter(content: &str) -> Result<Note, anyhow::Error> {
             }
             "type" if !value.is_empty() && value != "null" && value != "~" => {
                 note.okf_type = Some(value);
+            }
+            "description" if !value.is_empty() && value != "null" && value != "~" => {
+                note.description = Some(value);
             }
             "tags" => note.tags = parse_array(&value),
             "sensitivity" => {
@@ -380,6 +388,7 @@ impl NoteService {
             project: None,
             para: None,
             okf_type: None,
+            description: None,
             content: content.to_string(),
             file_path: None,
         };
@@ -537,6 +546,7 @@ Body
             project: Some("proj".to_string()),
             para: None,
             okf_type: None,
+            description: None,
             content: "Hello world".to_string(),
             file_path: None,
         };
@@ -671,6 +681,7 @@ Body
             project: None,
             para: Some("areas".to_string()),
             okf_type: Some("reference".to_string()),
+            description: None,
             content: "test content".to_string(),
             file_path: None,
         };
@@ -697,6 +708,7 @@ Body
             project: None,
             para: Some("resources".to_string()),
             okf_type: Some("tool".to_string()),
+            description: None,
             content: "roundtrip content".to_string(),
             file_path: None,
         };

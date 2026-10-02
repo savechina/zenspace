@@ -2,6 +2,8 @@
 
 **日期**：2026-09-29 · **状态**：全部落地（T2 PDF `1e8d73c`、T3 Office `c5d8123`、T4 sidecar `172f2bb`） · **依据**：Constitution XI（Design-First & Reuse）
 
+> **2026-10-01 审计修正**：T4 sidecar 层落地时**未接入任何活跃路径**——`stage_host_dir` 用 `is_convertible_extension` 暂存（含 epub/odt/rtf），而 `promote_incoming` 只接受 `md|txt|pdf|office`，导致 sidecar 文件被暂存后永不推进（暂存树兼作 seen-set，连重暂存都不会发生）→ 永久孤儿。已修：`promote_incoming` 改为复用 `is_convertible_extension` 这唯一谓词（两个列表各自维护正是漂移根因，结构上已不可能再漂移）。同时更正下文两处失实描述（暂存过滤器范围、`ingest_local_file` 的"活跃入口"定位）。
+
 ## 1. 问题
 
 zen 的知识摄取入口只认 UTF-8 文本：
@@ -56,7 +58,9 @@ zen 的知识摄取入口只认 UTF-8 文本：
 | **T3 原生-待审计** | docx/pptx/xlsx | `office_oxide`/`undoc` 迷你审计通过后加入 | 新依赖（各 ~百 KB） |
 | **T4 sidecar（已落地）** | epub/odt/rtf 等长尾 | $PATH 探测 pandoc（rga 模式，argv 直传无 shell 串，30s 超时杀进程，管道线程排空防死锁）；缺失→Unavailable 类：**不隔离**、文件留暂存待装后重试（区别于 Failed 类终局隔离） | 外部可选 |
 
-**挂钩点**（两处，均为现状缺口）：`ingest_local_file` 按扩展名分派转换；host_sources 暂存过滤器 `md|txt` → `md|txt|pdf|(docx…)`，转换产物进 inbox 暂存树，原件按既有 `raw_policy` 处置。
+**挂钩点**：
+- **生产活跃路径**——host_sources 暂存过滤器 `stage_host_dir`：`md|txt` + `is_convertible_extension`（= pdf + office OOXML + sidecar 的 epub/odt/rtf）；转换发生在 promote 时刻的 `promote_incoming`（由 `sweep_host_sources` 调用），产物为frontmatter 包裹的 `{host_hash}_{stem}.md`，原件按既有 `raw_policy` 处置。
+- **库 API，非活跃入口**——`ingest_local_file`（`ingest/web.rs`）按扩展名分派转换，自 2026-08-28 CLI 收缩（`zen ingest` 移除）起**无生产调用者**，`ingest_command.rs` 留在磁盘未编译。它是手动摄取的遗留入口，转换能力已由上面的 promote 路径覆盖。
 
 **横切不变式**：
 - 转换失败/panic → **隔离区 + warn**（复用 `max_ingest_bytes` 隔离路径；`catch_unwind` 边界包住 pdf-extract panic 史）；

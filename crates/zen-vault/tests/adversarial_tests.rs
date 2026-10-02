@@ -16,6 +16,7 @@ fn make_note(id: &str, content: &str) -> Note {
         project: None,
         para: None,
         okf_type: None,
+        description: None,
         content: content.to_string(),
         file_path: Some(PathBuf::from(format!("notes/{id}.md"))),
     }

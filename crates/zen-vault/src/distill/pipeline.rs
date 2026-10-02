@@ -1482,6 +1482,7 @@ impl DistillationPipeline {
                     wikilinks: crate::wiki::WikiPage::extract_wikilinks(&raw),
                     para: None,
                     okf_type: None,
+                    description: None,
                     sources: Vec::new(),
                     content: raw,
                 })
