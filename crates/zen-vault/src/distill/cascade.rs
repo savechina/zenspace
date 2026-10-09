@@ -14,16 +14,24 @@
 //!   to plain text.
 //!
 //! Safety contract: pages without a `sources:` key are hand-written and
-//! NEVER touched. All mutations go through the cycle's
-//! [`TransactionScope`] so CAS rollback (FR-032) and crash replay (④)
-//! cover them. Sources values are code-managed (E2) — absolute vault
-//! paths, so existence is a plain `Path::exists`.
+//! NEVER touched. Rewrites go through the cycle's [`TransactionScope`] so
+//! CAS rollback (FR-032) and crash replay (④) cover them.
+//!
+//! Orphan DELETES are deliberately *not* txn-tracked —
+//! [`TransactionScope::rollback`] removes tracked paths rather than
+//! restoring them, so a tracked delete could never be undone. A delete is
+//! made recoverable instead by capturing the page's prior bytes into the
+//! [`PageIterations`](crate::wiki::PageIterations) store first (recoverable
+//! via `zen wiki rollback`) and by requiring two consecutive sweeps, so a
+//! transiently unreachable vault cannot mass-delete the wiki. Sources
+//! values are code-managed (E2) — absolute vault paths, so existence is a
+//! plain `Path::exists`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::transaction::TransactionScope;
 
@@ -36,6 +44,9 @@ pub struct CascadeReport {
     pub entries_stripped: usize,
     /// Pages deleted because their provenance was fully dead.
     pub pages_deleted: usize,
+    /// Fully-orphaned pages captured but NOT yet deleted — they need one
+    /// more consecutive sweep before removal (see `sweep_dead_sources`).
+    pub orphans_pending: usize,
     /// Inbound `[[links]]` rewritten to plain text after a page deletion.
     pub links_cleaned: usize,
 }
@@ -85,7 +96,11 @@ pub fn redirect_page_source(
 
 /// Cycle-start sweep: strip dead source entries, delete fully-orphaned
 /// machine-rendered pages, clean inbound links to deleted pages.
-pub fn sweep_dead_sources(wiki_dir: &Path, track: &TransactionScope) -> Result<CascadeReport> {
+pub fn sweep_dead_sources(
+    wiki_dir: &Path,
+    track: &TransactionScope,
+    iterations: Option<&crate::wiki::PageIterations>,
+) -> Result<CascadeReport> {
     let mut report = CascadeReport::default();
     if !wiki_dir.is_dir() {
         return Ok(report);
@@ -93,6 +108,7 @@ pub fn sweep_dead_sources(wiki_dir: &Path, track: &TransactionScope) -> Result<C
 
     // Pass 1: strip dead entries; collect fully-orphaned pages for deletion.
     let mut deleted: Vec<(String, String)> = Vec::new(); // (title, slug)
+    let mut captured_paths: Vec<PathBuf> = Vec::new();
     for_each_page(wiki_dir, &mut |path, content| {
         report.pages_scanned += 1;
         let Some(sources) = parse_sources(content) else {
@@ -113,13 +129,65 @@ pub fn sweep_dead_sources(wiki_dir: &Path, track: &TransactionScope) -> Result<C
 
         if alive.is_empty() {
             // Fully-orphaned machine page: OpenKB's orphan deletion.
+            //
+            // Two guards, both load-bearing — a bare delete here is
+            // unrecoverable and can be catastrophic:
+            //
+            // 1. REVERSIBILITY. `TransactionScope::rollback` *deletes* every
+            //    tracked path; it has no backup, so tracking a deleted page
+            //    cannot restore it. Prior bytes must be captured into the
+            //    iteration store BEFORE removal, which makes the delete
+            //    recoverable through `zen wiki rollback`.
+            // 2. TWO-SWEEP GRACE. A page must be observed fully-orphaned on
+            //    two consecutive sweeps: the first only captures, the second
+            //    deletes. `sources` are absolute vault paths, so a transiently
+            //    unreachable vault (unmount, relocated ZEN_HOME, restored
+            //    backup) makes *every* source read as dead. Without this
+            //    grace that condition mass-deletes the compiled wiki.
+            // With no store there is no way to record the observation, so
+            // the grace cannot apply — fall back to deleting immediately
+            // (legacy behaviour) rather than deferring forever. Production
+            // always passes a store; `None` exists for callers that have
+            // none.
+            let seen_before = iterations
+                .map(|store| !store.versions(wiki_dir, path).is_empty())
+                .unwrap_or(true);
             let title = frontmatter_title(content).unwrap_or_else(|| path_title(path));
             let slug = super::wiki_compile::slugify(&title);
-            if fs::remove_file(path).is_ok() {
-                report.pages_deleted += 1;
-                deleted.push((title, slug));
-                return Some(String::new()); // signal: file gone.
+
+            if seen_before {
+                if fs::remove_file(path).is_ok() {
+                    report.pages_deleted += 1;
+                    deleted.push((title, slug));
+                    return Some(String::new()); // signal: file gone.
+                }
+                return None;
             }
+
+            if let Some(store) = iterations {
+                match store.capture(wiki_dir, path, "") {
+                    Ok(Some(captured)) => {
+                        captured_paths.push(captured.md_path);
+                        if let Some(diff) = &captured.diff_path {
+                            captured_paths.push(diff.clone());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "orphan capture failed — deferring delete to a later sweep"
+                        );
+                        return None;
+                    }
+                }
+            }
+            report.orphans_pending += 1;
+            info!(
+                path = %path.display(),
+                "fully-orphaned page captured; delete deferred to the next sweep"
+            );
             return None;
         }
 
@@ -128,6 +196,10 @@ pub fn sweep_dead_sources(wiki_dir: &Path, track: &TransactionScope) -> Result<C
         Some(new_content)
     })
     .context("cascade sweep: walk wiki pages")?;
+
+    for path in &captured_paths {
+        track.track_path(path)?;
+    }
 
     if deleted.is_empty() {
         return Ok(report);
@@ -371,7 +443,7 @@ mod tests {
             ),
         );
 
-        let report = sweep_dead_sources(&wiki, &txn).unwrap();
+        let report = sweep_dead_sources(&wiki, &txn, None).unwrap();
         assert_eq!(report.entries_stripped, 1);
         assert_eq!(report.pages_deleted, 0);
         let content = fs::read_to_string(&page).unwrap();
@@ -399,14 +471,14 @@ mod tests {
         let content_before = fs::read_to_string(&page).unwrap();
         assert!(content_before.contains(&doomed.to_string_lossy().to_string()));
 
-        let report = sweep_dead_sources(&wiki, &txn).unwrap();
+        let report = sweep_dead_sources(&wiki, &txn, None).unwrap();
         assert_eq!(report.pages_deleted, 1);
         assert!(
             !page.exists(),
             "fully-orphaned machine page must be deleted"
         );
 
-        let after = sweep_dead_sources(&wiki, &txn).unwrap();
+        let after = sweep_dead_sources(&wiki, &txn, None).unwrap();
         assert_eq!(after.pages_scanned, 0);
         let remaining: Vec<PathBuf> = fs::read_dir(&wiki)
             .unwrap()
@@ -428,7 +500,7 @@ mod tests {
             "# My own note\n\nNo frontmatter, mentions [[Deleted Page]] freely.",
         );
 
-        let report = sweep_dead_sources(&wiki, &txn).unwrap();
+        let report = sweep_dead_sources(&wiki, &txn, None).unwrap();
         assert_eq!(report.pages_deleted, 0);
         assert_eq!(
             fs::read_to_string(&page).unwrap(),
@@ -464,12 +536,107 @@ mod tests {
             ),
         );
 
-        let report = sweep_dead_sources(&wiki, &txn).unwrap();
+        let report = sweep_dead_sources(&wiki, &txn, None).unwrap();
         assert_eq!(report.pages_deleted, 1);
         assert_eq!(report.links_cleaned, 1, "only [[Victim]] counts");
 
         let content = fs::read_to_string(&holder).unwrap();
         assert!(content.contains("See Victim and [[Live Page]]."));
         assert!(!content.contains("[[Victim]]"));
+    }
+
+    /// A page whose sources are all unreachable must NOT be deleted on the
+    /// first sweep. This is the mass-deletion guard: `sources` are absolute
+    /// vault paths, so an unmounted or relocated vault makes every source
+    /// read as dead.
+    #[test]
+    fn first_orphan_sweep_captures_without_deleting() {
+        let (_dir, wiki, _logs, txn) = setup();
+        let missing = wiki.parent().unwrap().join("archive/gone.md");
+        let store = crate::wiki::PageIterations::new(wiki.parent().unwrap().join("iterations"));
+        let page = write_page(
+            &wiki,
+            "orphan",
+            &format!(
+                "---\ntitle: \"Orphan\"\ncreated_at: \"2026-09-28\"\nupdated_at: \"2026-09-28\"\nsources: [\"{}\"]\n---\n\nBody.\n",
+                missing.display()
+            ),
+        );
+
+        let report = sweep_dead_sources(&wiki, &txn, Some(&store)).unwrap();
+        assert_eq!(report.pages_deleted, 0, "first sweep must not delete");
+        assert_eq!(report.orphans_pending, 1);
+        assert!(page.exists(), "page must survive the first sweep");
+
+        let captured = fs::read_to_string(&page).unwrap();
+        assert!(captured.contains("Body."), "content must be intact");
+
+        let second = sweep_dead_sources(&wiki, &txn, Some(&store)).unwrap();
+        assert_eq!(second.pages_deleted, 1, "second sweep deletes");
+        assert_eq!(second.orphans_pending, 0);
+        assert!(!page.exists(), "page is gone after the grace elapsed");
+    }
+
+    /// The captured bytes must be restorable — this is what makes the
+    /// delete recoverable at all, since txn rollback only deletes.
+    #[test]
+    fn orphan_delete_is_recoverable_from_the_iteration_store() {
+        let (_dir, wiki, _logs, txn) = setup();
+        let missing = wiki.parent().unwrap().join("archive/gone.md");
+        let store = crate::wiki::PageIterations::new(wiki.parent().unwrap().join("iterations"));
+        let page = write_page(
+            &wiki,
+            "orphan",
+            &format!(
+                "---\ntitle: \"Orphan\"\ncreated_at: \"2026-09-28\"\nupdated_at: \"2026-09-28\"\nsources: [\"{}\"]\n---\n\nPrecious body.\n",
+                missing.display()
+            ),
+        );
+
+        sweep_dead_sources(&wiki, &txn, Some(&store)).unwrap();
+        sweep_dead_sources(&wiki, &txn, Some(&store)).unwrap();
+        assert!(!page.exists());
+
+        let versions = store.versions(&wiki, &page);
+        assert!(!versions.is_empty(), "prior bytes must be recoverable");
+        store.restore(&wiki, &versions[0]).unwrap();
+        assert!(
+            fs::read_to_string(&page)
+                .unwrap()
+                .contains("Precious body.")
+        );
+    }
+
+    /// A vault that recovers between sweeps must leave the page alone — the
+    /// pending capture is inert, never a deletion ticket.
+    #[test]
+    fn a_recovered_source_cancels_the_pending_delete() {
+        let (_dir, wiki, _logs, txn) = setup();
+        let src = wiki.parent().unwrap().join("archive/live.md");
+        let store = crate::wiki::PageIterations::new(wiki.parent().unwrap().join("iterations"));
+        let page = write_page(
+            &wiki,
+            "orphan",
+            &format!(
+                "---\ntitle: \"Orphan\"\ncreated_at: \"2026-09-28\"\nupdated_at: \"2026-09-28\"\nsources: [\"{}\"]\n---\n\nBody.\n",
+                src.display()
+            ),
+        );
+
+        // Source does not exist yet → first sweep only captures.
+        assert_eq!(
+            sweep_dead_sources(&wiki, &txn, Some(&store))
+                .unwrap()
+                .orphans_pending,
+            1
+        );
+
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, "back").unwrap();
+
+        let second = sweep_dead_sources(&wiki, &txn, Some(&store)).unwrap();
+        assert_eq!(second.pages_deleted, 0);
+        assert_eq!(second.orphans_pending, 0);
+        assert!(page.exists(), "a live source must cancel the delete");
     }
 }

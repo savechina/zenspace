@@ -595,9 +595,15 @@ impl DistillationPipeline {
             recovery.recover()?;
         }
         // Compile-hygiene ④: roll back partial writes left by a killed
-        // cycle BEFORE this cycle's txn.begin() — a stale `.txn-*.jsonl`
-        // at this point belongs to a dead process (1h age guard keeps a
-        // concurrently-running cycle's tracking file safe). Fail-open.
+        // cycle BEFORE this cycle's txn.begin(). Fail-open.
+        //
+        // Concurrency note: the 1h age guard is a backstop for *crashed*
+        // processes, NOT a concurrency guard. The distill cycle has no
+        // overall deadline (only per-source host staging and per-call LLM
+        // budgets), so a legitimately long cycle can outlive any fixed age.
+        // What actually prevents a live cycle's tracking file from being
+        // rolled back is the scheduler lease — one cycle at a time per
+        // ZEN_HOME — plus this running before `txn.begin()` in-process.
         match recovery.replay_stale_transactions() {
             Ok(report) if report.tracking_files > 0 => {
                 info!(
@@ -625,7 +631,13 @@ impl DistillationPipeline {
         // clean inbound links. Runs INSIDE the txn so CAS rollback and
         // crash replay cover every mutation. Fail-open.
         if wiki_dir.is_dir()
-            && let Err(e) = super::cascade::sweep_dead_sources(wiki_dir, &txn)
+            && let Err(e) = super::cascade::sweep_dead_sources(
+                wiki_dir,
+                &txn,
+                Some(&crate::wiki::PageIterations::new(
+                    wiki_dir.parent().unwrap_or(wiki_dir).join("iterations"),
+                )),
+            )
         {
             warn!(error = %e, "E3 cascade sweep failed — continuing (fail-open)");
         }
