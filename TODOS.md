@@ -2,11 +2,12 @@
 
 ## Review
 
-### QQBot outbox drainer (morning-brief push completion)
+### QQBot outbox drainer (morning-brief push completion) — RESOLVED 2026-09-04 (005 T101)
 
 **What:** Gateway-side task draining `logs/outbox/morning-brief-*.json` via qqbot active send (`msg_id=None`), deleting each file on successful send, leaving failures for retry with warn log.
 
-**Why:** Completes FR-038's push face; without it the 9am brief never reaches chat — the outbox is currently write-only.
+**Why:** *(historical)* Completes FR-038's push face; without it the 9am brief never reaches chat — the outbox was write-only.
+**Resolved:** `crates/zen-gateway/src/channel/qqbot/outbox_drainer.rs` drains staged briefs on a tick (Public-only fail-closed, group-first/C2C-fallback, never deletes undelivered).
 
 **Pros:** True proactive push; reuses `QqBotApi::send_group/c2c_message`; fail-soft seam already tested producer-side.
 
@@ -18,7 +19,7 @@
 **Priority:** P1
 **Depends on:** 005-agentic-loop T079 (done, `morning-brief` worker + outbox contract) — **IMPLEMENTED per 005-agentic-loop T101 [X] 2026-09-04: `crates/zen-gateway/src/channel/qqbot/outbox_drainer.rs` (`drain_once` + tick spawn, Public-only fail-closed, never deletes undelivered; recipients via `QqBindingRepo::list_chat_ids`, group-first/C2C-fallback)**
 
-### Harden dispatch hold-transport contract (shutdown_write EOF test)
+### Harden dispatch hold-transport contract (shutdown_write EOF test) — RESOLVED 2026-08-25 (004 T066/T071)
 
 **What:** Document `shutdown_write` as the only EOF path for detached SPAWNED tasks and add test that `abort + shutdown_write → EOF` while `abort` alone does not hang.
 
@@ -30,11 +31,12 @@
 **Priority:** P1
 **Depends on:** Lane PR1 (gateway-core) — **Aligned to tasks.md T066/T071 (Phase 13.1) — IMPLEMENTED per 004-agentic-gateway tasks.md [X] 2026-08-25**
 
-### Turn-affinity approval fix (thread turn_id through callback)
+### Turn-affinity approval fix (thread turn_id through callback) — RESOLVED 2026-09-04 (005 T103)
 
 **What:** Thread `turn_id` / `ConnectionHandle` affinity through sandbox `ApprovalCallback` so `ApprovalBroker::decide` binds to originating turn, not first unclaimed route.
 
-**Why:** Current `decide()` scans for first `!claimed` — concurrent turns misroute approvals, surface B can approve surface A's `shell.exec`, violating SC-007 (privilege escalation, P0).
+**Why:** *(historical)* `decide()` scanned for the first `!claimed` route — concurrent turns misrouted approvals, letting surface B approve surface A's `shell.exec` (SC-007 privilege escalation, P0).
+**Resolved:** `ApprovalCallback` now carries `Option<String>` turn id; `AskApprovalHook` reads the task-local `APPROVAL_TURN`; the broker exact-matches on `decide_for`/`route_for` (unknown or claimed → Deny). Pinned by `turn_bound_routing_survives_inverted_firing_order`.
 
 **Context:** Prior learning `approval-broker-claim-misroutes` (2026-08-23, 9/10, cross-model). Files: `crates/zen-gateway/src/server/approval.rs:158-169`, `crates/zen-gateway/src/daemon.rs:387`. Requires threading `turn_id` via `zen_core::sandbox::ApprovalCallback` (inference-typed). Test: concurrent `route()` E2E pinning approval to correct surface (see `approval.rs:route`).
 
