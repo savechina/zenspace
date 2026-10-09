@@ -51,9 +51,10 @@ use crate::notion::notion::parse_kind;
 
 use zen_core::config::{LlmPreference, ModelOptions};
 use zen_core::types::Sensitivity;
-use zen_provider::cache::{CacheSegments, CacheUsage};
+use zen_provider::cache::{CacheSegments, CacheUsage, PromptCacheControl};
 use zen_provider::{
-    DefaultRouter, LlmRouter, Provider, ProviderInstance, TaskRequirements, usage_to_cost_usd,
+    CachedTokenUsage, DefaultRouter, LlmRouter, Provider, ProviderInstance, TaskRequirements,
+    cached_usage_to_cost_usd, usage_to_cost_usd,
 };
 
 /// Reply budget the extraction prompt asks for; part of every reservation.
@@ -180,9 +181,18 @@ impl LlmDistillStage {
                         cost_spent += cost_usd;
                         if usage_tokens > estimate {
                             let delta = usage_tokens - estimate;
-                            if self.budget.consume_tokens(delta) {
-                                note_tokens = usage_tokens;
-                            }
+                            // Report what the provider ACTUALLY consumed even
+                            // when the budget refuses the top-up:
+                            // `consume_tokens` discards on refusal, so gating
+                            // `note_tokens` on it would silently under-report
+                            // the cycle's token spend. `charge_cost` above is
+                            // unconditional for the same reason — tokens and
+                            // cost are facts about what happened, not
+                            // permissions. Refusal is still enforced: the next
+                            // section's `consume_tokens(estimate)` guard sees a
+                            // full budget and returns.
+                            let _ = self.budget.consume_tokens(delta);
+                            note_tokens = usage_tokens;
                         }
                         notions.extend(parse_llm_notions(&reply, &note.id, MAX_NOTIONS_PER_NOTE));
                     }
@@ -262,10 +272,13 @@ async fn call_llm(
 
     // Compile-hygiene ③: the Anthropic route honors [agentic.cache]
     // breakpoints — the stable system prompt becomes the cached prefix and
-    // the real usage echo drives token accounting.
+    // the real usage echo drives token accounting. The capability is
+    // queried, not assumed: a provider that does not implement
+    // `PromptCacheControl` reports `false` and falls through to the plain
+    // path, so a second cache-capable provider needs no change here.
     if use_cache
-        && provider == Provider::Anthropic
         && let Some(ProviderInstance::Anthropic(anthropic)) = router.provider_instance("anthropic")
+        && anthropic.supports_prompt_cache()
     {
         let segments = CacheSegments::build(system, &[task.to_string()], "", &[]);
         let completion = anthropic
@@ -303,27 +316,35 @@ async fn call_llm(
     Ok((reply, tokens, cost))
 }
 
-/// Cached-path cost split: `cache_creation` is billed as input, a cache
-/// READ is not re-billed. Mirrors `billable_tokens`' semantics so the
-/// billable-token number and the USD number stay coherent; an all-None
-/// (unparseable) echo never bills, falling back on the token estimate.
+/// Split an Anthropic cache echo into its four disjoint buckets.
+///
+/// Absent fields stay `None`; a fully empty echo returns `None` so the
+/// caller falls back to its estimate instead of billing a structural zero.
+fn cached_token_usage(usage: &CacheUsage) -> Option<CachedTokenUsage> {
+    let split = CachedTokenUsage {
+        uncached_input_tokens: usage.input_tokens.unwrap_or(0),
+        cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+        cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        output_tokens: usage.output_tokens.unwrap_or(0),
+    };
+    (!split.is_empty()).then_some(split)
+}
+
+/// Cached-path cost: each input bucket is priced at its own prompt-cache
+/// rate (uncached 1x, write 1.25x, read 0.1x). The buckets are disjoint —
+/// see [`CachedTokenUsage`]. An all-absent echo never bills, falling back on
+/// the caller's token estimate.
 fn cache_cost_usd(
     usage: &CacheUsage,
     metadata: &zen_provider::ModelMetadata,
     fallback: u32,
 ) -> f64 {
-    match (usage.input_tokens, usage.output_tokens) {
-        (None, None) => {
+    match cached_token_usage(usage) {
+        None => {
             let (i, o) = plain_cost_split(fallback);
             usage_to_cost_usd(metadata, i, o)
         }
-        _ => {
-            let input_raw = usage.input_tokens.unwrap_or(0);
-            let creation = usage.cache_creation_input_tokens.unwrap_or(0);
-            let read = usage.cache_read_input_tokens.unwrap_or(0);
-            let input = (input_raw as i64 + creation as i64 - read as i64).max(0) as u64;
-            usage_to_cost_usd(metadata, input, usage.output_tokens.unwrap_or(0))
-        }
+        Some(split) => cached_usage_to_cost_usd(metadata, &split),
     }
 }
 
@@ -336,23 +357,16 @@ fn plain_cost_split(prompt_tokens: u32) -> (u64, u64) {
     )
 }
 
-/// Anthropic cache-usage echo → billable tokens (compile-hygiene ③
-/// acceptance: the `cache_creation_input_tokens` share is observable, and a
-/// cache READ is not re-billed as input). All-None usage (provider gave no
-/// echo) falls back to the caller's estimate; a parseable echo never
-/// estimates.
+/// Anthropic cache echo → tokens charged against the cycle budget.
+///
+/// This is the **throughput** figure: every token the request processed,
+/// across all four buckets. A cache read is discounted in *cost*
+/// ([`cache_cost_usd`]) but still consumed context and provider work, so it
+/// counts here in full. An all-absent echo falls back to the estimate.
 fn billable_tokens(usage: &CacheUsage, fallback: u32) -> u32 {
-    match (usage.input_tokens, usage.output_tokens) {
-        (None, None) => fallback,
-        (input, output) => {
-            let output = output.unwrap_or(0) as u32;
-            let creation = usage.cache_creation_input_tokens.unwrap_or(0) as u32;
-            let input = input
-                .unwrap_or(0)
-                .saturating_sub(usage.cache_read_input_tokens.unwrap_or(0))
-                as u32;
-            output.saturating_add(creation).saturating_add(input).max(1)
-        }
+    match cached_token_usage(usage) {
+        None => fallback,
+        Some(split) => u32::try_from(split.total_tokens()).unwrap_or(u32::MAX),
     }
 }
 
@@ -612,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn billable_uses_echo_and_never_rebills_cache_reads() {
+    fn billable_sums_all_disjoint_buckets_without_subtraction() {
         let mut usage = CacheUsage::default();
         assert_eq!(
             billable_tokens(&usage, 777),
@@ -623,8 +637,113 @@ mod tests {
         usage.output_tokens = Some(50);
         usage.cache_creation_input_tokens = Some(200);
         usage.cache_read_input_tokens = Some(800);
-        // 50 output + 200 creation + (1000 input − 800 cache-read) = 450.
-        assert_eq!(billable_tokens(&usage, 777), 450);
+        // Anthropic: total input = input + cache_creation + cache_read.
+        // 1000 + 200 + 800 + 50 output = 2050. The old code computed
+        // 50 + 200 + (1000 - 800) = 450, under-billing a disjoint bucket
+        // that was never inside `input_tokens` to begin with.
+        assert_eq!(billable_tokens(&usage, 777), 2050);
+    }
+
+    #[test]
+    fn billable_does_not_go_to_zero_on_a_cache_heavy_note() {
+        // Regression: the old `saturating_sub` collapsed this to 0, so a
+        // heavily-cached note consumed no budget at all.
+        let usage = CacheUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(8000),
+        };
+        assert_eq!(billable_tokens(&usage, 777), 8120);
+    }
+
+    #[test]
+    fn cache_cost_prices_each_bucket_at_its_own_rate() {
+        let meta = zen_provider::ModelMetadata {
+            name: "m".into(),
+            provider: "anthropic".into(),
+            context_window: 0,
+            input_cost_per_million: 4.0,
+            output_cost_per_million: 20.0,
+            capabilities: vec![],
+            is_local: false,
+        };
+        let usage = CacheUsage {
+            input_tokens: Some(1000),
+            output_tokens: Some(50),
+            cache_creation_input_tokens: Some(200),
+            cache_read_input_tokens: Some(800),
+        };
+        // 1000*4 + 200*4*1.25 + 800*4*0.1 + 50*20, per 1M tokens.
+        let expected =
+            (1000.0 * 4.0 + 200.0 * 4.0 * 1.25 + 800.0 * 4.0 * 0.1 + 50.0 * 20.0) / 1_000_000.0;
+        assert!((cache_cost_usd(&usage, &meta, 777) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cache_read_is_discounted_not_free() {
+        // A read is billed at 0.1x, so it must contribute a nonzero but
+        // sub-base amount — the old formula removed it entirely.
+        let meta = zen_provider::ModelMetadata {
+            name: "m".into(),
+            provider: "anthropic".into(),
+            context_window: 0,
+            input_cost_per_million: 10.0,
+            output_cost_per_million: 10.0,
+            capabilities: vec![],
+            is_local: false,
+        };
+        let read_only = CacheUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(1_000_000),
+        };
+        let cost = cache_cost_usd(&read_only, &meta, 777);
+        assert!(
+            (cost - 1.0).abs() < 1e-12,
+            "1M reads at 0.1x of $10 = $1, got {cost}"
+        );
+    }
+
+    #[test]
+    fn absent_echo_falls_back_to_the_token_estimate() {
+        let meta = zen_provider::ModelMetadata {
+            name: "m".into(),
+            provider: "anthropic".into(),
+            context_window: 0,
+            input_cost_per_million: 4.0,
+            output_cost_per_million: 20.0,
+            capabilities: vec![],
+            is_local: false,
+        };
+        let usage = CacheUsage::default();
+        let (i, o) = plain_cost_split(777);
+        assert!(
+            (cache_cost_usd(&usage, &meta, 777) - usage_to_cost_usd(&meta, i, o)).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn budget_refusal_discards_rather_than_clamps() {
+        // The distill top-up does `let _ = consume_tokens(delta)` and reports
+        // the real usage regardless. That is only sound because a refusal
+        // leaves the accumulator untouched — if it ever clamped instead, the
+        // discarded call would mutate the budget and the report would drift.
+        let mut b = LoopBudget::with_limits(10, 100);
+        assert!(b.consume_tokens(80));
+        assert!(!b.consume_tokens(30), "would exceed the cap");
+        assert_eq!(b.consumed_tokens, 80, "refusal must not charge");
+    }
+
+    #[test]
+    fn cost_is_charged_even_when_the_budget_refuses() {
+        // Cost is accountability, not a gate — the mirror of the token
+        // top-up. Pins the asymmetry that the two are both unconditional.
+        let mut b = LoopBudget::with_limits(10, 100);
+        b.consume_tokens(100);
+        b.charge_cost(1.25);
+        assert_eq!(b.consumed_cost_usd, 1.25);
     }
 
     #[test]
