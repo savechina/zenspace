@@ -6,7 +6,7 @@ use rig_core::providers::mistral;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::router::{LlmError, UsedCompletion, text_from_choice};
+use crate::router::{LlmError, UsedCompletion, blocking_usage_call, used_completion};
 
 #[derive(Debug, Clone)]
 pub struct MistralProvider {
@@ -95,21 +95,7 @@ impl MistralProvider {
             reason: format!("Mistral completion failed: {}", e),
         })?;
 
-        let text = text_from_choice(&response.choice);
-        info!(
-            model = self.model,
-            response_len = text.len(),
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
-            "MistralProvider complete (usage-bearing)"
-        );
-        Ok(UsedCompletion {
-            usage: Some(crate::router::SyncUsage {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-            }),
-            text,
-        })
+        Ok(used_completion("Mistral", response))
     }
 
     /// Dedicated-thread wrapper around [`Self::complete_async_with_usage`]
@@ -124,15 +110,10 @@ impl MistralProvider {
         let prompt = prompt.to_string();
         let options = options.clone();
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+        blocking_usage_call("Mistral", move || async move {
             let provider = MistralProvider { api_key, model };
-            rt.block_on(provider.complete_async_with_usage(&prompt, &options))
+            provider.complete_async_with_usage(&prompt, &options).await
         })
-        .join()
-        .map_err(|e| LlmError::Call {
-            reason: format!("Mistral thread panic: {:?}", e),
-        })?
     }
 
     pub async fn complete_streaming(

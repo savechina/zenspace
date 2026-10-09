@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use futures_util::StreamExt;
 
-use crate::router::{LlmError, UsedCompletion, text_from_choice};
+use crate::router::{LlmError, UsedCompletion, blocking_usage_call, used_completion};
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -136,21 +136,7 @@ impl OllamaProvider {
             reason: format!("Ollama completion failed: {}", e),
         })?;
 
-        let text = text_from_choice(&response.choice);
-        info!(
-            model = self.model,
-            response_len = text.len(),
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
-            "OllamaProvider complete (usage-bearing)"
-        );
-        Ok(UsedCompletion {
-            usage: Some(crate::router::SyncUsage {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-            }),
-            text,
-        })
+        Ok(used_completion("Ollama", response))
     }
 
     /// Dedicated-thread wrapper around [`Self::complete_async_with_usage`]
@@ -165,24 +151,17 @@ impl OllamaProvider {
         let prompt = prompt.to_string();
         let options = options.clone();
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+        blocking_usage_call("Ollama", move || async move {
             let provider = OllamaProvider { base_url, model };
-            rt.block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    provider.complete_async_with_usage(&prompt, &options),
-                )
-                .await
-                .map_err(|_| LlmError::Call {
-                    reason: "Ollama completion timed out after 120s".into(),
-                })?
-            })
+            tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                provider.complete_async_with_usage(&prompt, &options),
+            )
+            .await
+            .map_err(|_| LlmError::Call {
+                reason: "Ollama completion timed out after 120s".into(),
+            })?
         })
-        .join()
-        .map_err(|e| LlmError::Call {
-            reason: format!("Ollama thread panic: {:?}", e),
-        })?
     }
 
     pub async fn complete_streaming(

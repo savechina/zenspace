@@ -292,7 +292,7 @@ pub fn reconcile_usage(
 }
 
 /// Flatten a rig completion `choice` into plain text: concatenates every
-/// `AssistantContent::Text` part (space-joined when several), skipping
+/// `AssistantContent::Text` part (space-spaced-joined when several), skipping
 /// `ToolCall`/`Reasoning`/`Image` parts. Empty string when the choice holds
 /// no text at all.
 pub fn text_from_choice(choice: &[rig_core::completion::AssistantContent]) -> String {
@@ -304,6 +304,54 @@ pub fn text_from_choice(choice: &[rig_core::completion::AssistantContent]) -> St
         })
         .collect();
     parts.join(" ")
+}
+
+/// Build a [`UsedCompletion`] from a provider response: flatten the text and
+/// lift the real usage echo. Shared by every provider's
+/// `complete_async_with_usage` so the text-extraction and usage-extraction
+/// rules cannot drift between providers.
+pub fn used_completion(
+    provider_label: &str,
+    response: rig_core::completion::CompletionResponse,
+) -> UsedCompletion {
+    let text = text_from_choice(&response.choice);
+    info!(
+        provider = provider_label,
+        response_len = text.len(),
+        input_tokens = response.usage.input_tokens,
+        output_tokens = response.usage.output_tokens,
+        "provider complete (usage-bearing)"
+    );
+    UsedCompletion {
+        usage: Some(SyncUsage {
+            input_tokens: response.usage.input_tokens,
+            output_tokens: response.usage.output_tokens,
+        }),
+        text,
+    }
+}
+
+/// Run an async completion on a dedicated thread with its own runtime.
+///
+/// Every sync provider surface funnels through here because `OllamaProvider`
+/// constructs a nested `tokio::runtime::Runtime`; calling that from inside a
+/// running runtime panics. A fresh thread has no ambient runtime, and
+/// `join` converts any panic into a typed error. `label` only decorates that
+/// error message.
+pub fn blocking_usage_call<F, Fut, T>(label: &'static str, fut: F) -> Result<T, LlmError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, LlmError>> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(fut())
+    })
+    .join()
+    .map_err(|e| LlmError::Call {
+        reason: format!("{label} thread panic: {e:?}"),
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,14 +1090,28 @@ impl DefaultRouter {
             estimate_tokens(&text),
         );
         if !metadata.is_local
-            && metadata.input_cost_per_million == 0.0
-            && metadata.output_cost_per_million == 0.0
+            && (metadata.input_cost_per_million == 0.0 || metadata.output_cost_per_million == 0.0)
         {
+            let missing = [
+                (
+                    metadata.input_cost_per_million == 0.0,
+                    "input_cost_per_million",
+                ),
+                (
+                    metadata.output_cost_per_million == 0.0,
+                    "output_cost_per_million",
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(absent, key)| absent.then_some(key))
+            .collect::<Vec<_>>()
+            .join(" + ");
             warn!(
                 task,
                 provider = %provider_name,
                 model = %model,
-                "LLM cost unmetered: set input_cost_per_million/output_cost_per_million under [providers.{provider_name}] so the worker cost cap can see this spend"
+                missing = %missing,
+                "LLM cost partly unmetered: set {missing} under [providers.{provider_name}] so the worker cost cap can see this spend"
             );
         }
         let cost_usd = crate::model_meta::usage_to_cost_usd(&metadata, input_tokens, output_tokens);

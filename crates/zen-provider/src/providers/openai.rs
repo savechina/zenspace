@@ -6,7 +6,7 @@ use rig_core::providers::openai;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::router::{LlmError, UsedCompletion, text_from_choice};
+use crate::router::{LlmError, UsedCompletion, blocking_usage_call, used_completion};
 
 #[derive(Debug, Clone)]
 pub struct OpenAIProvider {
@@ -127,21 +127,7 @@ impl OpenAIProvider {
             reason: format!("OpenAI completion failed: {}", e),
         })?;
 
-        let text = text_from_choice(&response.choice);
-        info!(
-            model = self.model,
-            response_len = text.len(),
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
-            "OpenAIProvider complete (usage-bearing)"
-        );
-        Ok(UsedCompletion {
-            usage: Some(crate::router::SyncUsage {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-            }),
-            text,
-        })
+        Ok(used_completion("Openai", response))
     }
 
     /// Dedicated-thread wrapper around [`Self::complete_async_with_usage`]
@@ -157,19 +143,14 @@ impl OpenAIProvider {
         let prompt = prompt.to_string();
         let options = options.clone();
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+        blocking_usage_call("OpenAI", move || async move {
             let provider = OpenAIProvider {
                 api_key,
                 model,
                 base_url,
             };
-            rt.block_on(provider.complete_async_with_usage(&prompt, &options))
+            provider.complete_async_with_usage(&prompt, &options).await
         })
-        .join()
-        .map_err(|e| LlmError::Call {
-            reason: format!("OpenAI thread panic: {:?}", e),
-        })?
     }
 
     pub async fn complete_streaming(
