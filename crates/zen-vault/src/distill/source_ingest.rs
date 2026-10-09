@@ -1,10 +1,29 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::{info, warn};
+
+/// Files already reported as "converter not installed", per process.
+///
+/// The condition is environmental and permanent until an operator installs
+/// the converter, so a per-cycle warn would repeat forever. The set resets
+/// on restart, which is the right cadence: a restart re-notifies without
+/// writing any state to disk.
+static MISSING_CONVERTER_WARNED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Returns true the first time `file_name` is seen in this process.
+fn warn_once_for_missing_converter(file_name: &str) -> bool {
+    match MISSING_CONVERTER_WARNED.lock() {
+        Ok(mut seen) => seen.insert(file_name.to_string()),
+        // A poisoned lock must not stall ingestion; fall back to warning.
+        Err(_) => true,
+    }
+}
 
 /// Ingests files from a raw directory into the notes workspace.
 pub struct SourceIngester;
@@ -253,11 +272,21 @@ impl SourceIngester {
                             // cycle retries once the operator installs the
                             // converter.
                             Err(e @ ConvertError::Unavailable(_)) => {
-                                warn!(
-                                    file = %file_name,
-                                    reason = %e,
-                                    "promote: converter unavailable — file stays staged for retry"
-                                );
+                                // Warn once per file per process. This is
+                                // a permanent-until-fixed condition, so
+                                // re-warning every cycle (default 5min)
+                                // would be ~288 identical lines a day
+                                // forever, drowning real signal. The file
+                                // still stays staged — silence here is not
+                                // a drop.
+                                if warn_once_for_missing_converter(file_name) {
+                                    warn!(
+                                        file = %file_name,
+                                        reason = %e,
+                                        "promote: converter unavailable — file stays staged for retry \
+                                         (further cycles for this file will not re-warn)"
+                                    );
+                                }
                                 continue;
                             }
                             Err(e) => {
