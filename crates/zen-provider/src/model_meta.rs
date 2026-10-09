@@ -73,6 +73,107 @@ pub fn usage_to_cost_usd(metadata: &ModelMetadata, input_tokens: u64, output_tok
     input + output
 }
 
+/// Anthropic 5-minute cache-write price, as a multiple of the base input
+/// token price (1.25x). Source: Anthropic prompt-caching pricing table.
+///
+/// The 1-hour TTL tier is deliberately absent: zen only ever sends
+/// `cache_control: {"type": "ephemeral"}` with **no** `ttl` field, and the
+/// API documents 5 minutes as the default. A future explicit-TTL feature must
+/// split this constant per TTL rather than silently billing 1h writes at the
+/// 5m rate.
+pub const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+
+/// Anthropic cache-read price, as a multiple of the base input token price
+/// (0.1x). A cache hit is **not** free — it is billed at a tenth of base.
+/// The 5.1 and Opus 5.5 families use cheaper tiers (0.025x / 0.05x); those
+/// are covered by the per-model pricing table, not here.
+pub const CACHE_READ_MULTIPLIER: f64 = 0.1;
+
+/// The four disjoint buckets of one cached completion's token usage.
+///
+/// **These must never be summed into `input_tokens` before being split.**
+/// Anthropic's API reference is explicit: *"Total input tokens for a request
+/// are calculated by summing `input_tokens`, `cache_creation_input_tokens`,
+/// and `cache_read_input_tokens`."* Each field counts a **disjoint** slice —
+/// `input_tokens` is only the *uncached remainder*. Subtracting one bucket
+/// from another double-counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachedTokenUsage {
+    /// Uncached prompt tokens (`usage.input_tokens`).
+    pub uncached_input_tokens: u64,
+    /// Prompt tokens written to cache (`usage.cache_creation_input_tokens`).
+    pub cache_write_tokens: u64,
+    /// Prompt tokens served from cache (`usage.cache_read_input_tokens`).
+    pub cache_read_tokens: u64,
+    /// Completion tokens (`usage.output_tokens`).
+    pub output_tokens: u64,
+}
+
+impl CachedTokenUsage {
+    /// Every token the request processed, across all four buckets.
+    ///
+    /// This is the **throughput** figure (context consumed, budget ceiling),
+    /// not the cost figure — a cache read costs 0.1x but still occupies
+    /// context and still consumed provider work. Cost lives in
+    /// [`cached_usage_to_cost_usd`], which weights each bucket.
+    pub fn total_tokens(&self) -> u64 {
+        self.uncached_input_tokens
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.output_tokens)
+    }
+
+    /// Total *input* tokens across the three input buckets (excludes output).
+    pub fn total_input_tokens(&self) -> u64 {
+        self.uncached_input_tokens
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// True when the echo carried no token data at all, so the caller should
+    /// fall back to its estimate rather than bill a structural zero.
+    pub fn is_empty(&self) -> bool {
+        self.total_tokens() == 0
+    }
+}
+
+/// Convert a cached completion's four usage buckets into USD.
+///
+/// Unlike [`usage_to_cost_usd`], this weights each input bucket by its
+/// prompt-cache price: uncached at base, cache writes at
+/// [`CACHE_WRITE_MULTIPLIER`]×, cache reads at [`CACHE_READ_MULTIPLIER`]×.
+///
+/// # Errors
+/// Never — negative prices are clamped to 0, and local models return `0.0`.
+///
+/// # Example
+/// ```
+/// use zen_provider::model_meta::{CachedTokenUsage, ModelMetadata, cached_usage_to_cost_usd};
+/// let meta = ModelMetadata {
+///     name: "m".into(), provider: "anthropic".into(), context_window: 0,
+///     input_cost_per_million: 4.0, output_cost_per_million: 20.0,
+///     capabilities: vec![], is_local: false,
+/// };
+/// // 1000 uncached + 200 writes (1.25x) + 800 reads (0.1x) + 50 out.
+/// let cost = cached_usage_to_cost_usd(&meta, &CachedTokenUsage {
+///     uncached_input_tokens: 1000, cache_write_tokens: 200,
+///     cache_read_tokens: 800, output_tokens: 50,
+/// });
+/// // 1000/1M*4 + 200/1M*4*1.25 + 800/1M*4*0.1 + 50/1M*20 = 0.00632
+/// assert!((cost - 0.00632).abs() < 1e-12, "got {cost}");
+/// ```
+pub fn cached_usage_to_cost_usd(metadata: &ModelMetadata, usage: &CachedTokenUsage) -> f64 {
+    if metadata.is_local {
+        return 0.0;
+    }
+    let base = metadata.input_cost_per_million.max(0.0);
+    let uncached = (usage.uncached_input_tokens as f64) * base;
+    let write = (usage.cache_write_tokens as f64) * base * CACHE_WRITE_MULTIPLIER;
+    let read = (usage.cache_read_tokens as f64) * base * CACHE_READ_MULTIPLIER;
+    let output = (usage.output_tokens as f64) * metadata.output_cost_per_million.max(0.0);
+    (uncached + write + read + output) / 1_000_000.0
+}
+
 pub struct ModelRouter {
     models: Arc<RwLock<HashMap<String, String>>>,
     metadata: Arc<RwLock<HashMap<String, ModelMetadata>>>,

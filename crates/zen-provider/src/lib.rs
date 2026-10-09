@@ -14,7 +14,8 @@ pub use embedding::{
     OllamaEmbeddingProvider, OpenAiEmbeddingProvider,
 };
 pub use model_meta::{
-    ModelMetadata, ModelRouter, ModelStats, PromptHookTelemetry, PromptTelemetry, usage_to_cost_usd,
+    CACHE_READ_MULTIPLIER, CACHE_WRITE_MULTIPLIER, CachedTokenUsage, ModelMetadata, ModelRouter,
+    ModelStats, PromptHookTelemetry, PromptTelemetry, cached_usage_to_cost_usd, usage_to_cost_usd,
 };
 pub use router::{
     DefaultLlmRetryClassifier, DefaultRouter, LlmConfig, LlmError, LlmRetryClassifier, LlmRouter,
