@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::cache::{CacheSegments, CacheUsage, CachedCompletion, PromptCacheControl};
-use crate::router::{LlmError, UsedCompletion, text_from_choice};
+use crate::router::{LlmError, UsedCompletion, blocking_usage_call, used_completion};
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -20,6 +20,14 @@ pub struct AnthropicProvider {
 /// whitelist block (cumulative prefix checkpoints — OpenKB's 3-marker
 /// layout). The system block alone is never marked.
 pub const CACHE_BREAKPOINTS_PER_PROMPT: usize = 3;
+
+/// Wall-clock ceiling for one cached `/v1/messages` request.
+///
+/// `reqwest::Client::new()` has **no** default timeout, so without this a
+/// stalled connection hangs the calling worker forever. Matches the 120s
+/// bound the Ollama path already uses; this is a single non-streaming
+/// request with a bounded prompt, not a long stream.
+pub const CACHED_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl AnthropicProvider {
     pub fn new(api_key: String, model: String) -> Self {
@@ -125,21 +133,7 @@ impl AnthropicProvider {
             reason: format!("Anthropic completion failed: {}", e),
         })?;
 
-        let text = text_from_choice(&response.choice);
-        info!(
-            model = self.model,
-            response_len = text.len(),
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
-            "AnthropicProvider complete (usage-bearing)"
-        );
-        Ok(UsedCompletion {
-            usage: Some(crate::router::SyncUsage {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-            }),
-            text,
-        })
+        Ok(used_completion("Anthropic", response))
     }
 
     /// Dedicated-thread wrapper around [`Self::complete_async_with_usage`]
@@ -155,19 +149,14 @@ impl AnthropicProvider {
         let prompt = prompt.to_string();
         let options = options.clone();
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
+        blocking_usage_call("Anthropic", move || async move {
             let provider = AnthropicProvider {
                 api_key,
                 model,
                 base_url,
             };
-            rt.block_on(provider.complete_async_with_usage(&prompt, &options))
+            provider.complete_async_with_usage(&prompt, &options).await
         })
-        .join()
-        .map_err(|e| LlmError::Call {
-            reason: format!("Anthropic thread panic: {:?}", e),
-        })?
     }
 
     pub async fn complete_streaming(
@@ -224,7 +213,12 @@ impl AnthropicProvider {
     ) -> Result<CachedCompletion, LlmError> {
         let body = build_cached_request_body(&self.model, segments, task, options);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(CACHED_COMPLETE_TIMEOUT)
+            .build()
+            .map_err(|e| LlmError::Call {
+                reason: format!("Anthropic cached client build failed: {}", e),
+            })?;
         let response = client
             .post(&url)
             .header("x-api-key", &self.api_key)
@@ -293,6 +287,12 @@ pub fn build_cached_request_body(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+    debug_assert_eq!(
+        marked.len(),
+        CACHE_BREAKPOINTS_PER_PROMPT,
+        "a CacheSegments built by `build` always carries one Doc, Summary \
+         and Whitelist block, so all three breakpoints must land"
+    );
 
     let system: Vec<serde_json::Value> = segments
         .segments
