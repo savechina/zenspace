@@ -4,10 +4,17 @@
 //! [`ZenMemvidStore`] for unified vector retrieval.  This is a batch indexer — it does NOT
 //! extract or generate content, it only sinks existing Markdown into the memvid store.
 //!
+//! Roots follow Path Spec v2 (T195/W1): the indexer takes the two real
+//! locations explicitly — `memory_root` = `ZenPaths::memory()` (e.g.
+//! `~/.zen/memories`) and `wiki_root` = `ZenPaths::wiki()` (e.g.
+//! `~/.zen/vault/wiki`). No single workspace root can satisfy both joins.
+//!
 //! Indexing tiers:
-//! - **M2 (Episodic)** — `memories/journal/*.md`, chunked by `## ` headers
-//! - **M3 (Semantic)** — `wiki/notions/technology/*.md`, full content per file
-//! - **M4 (Wisdom)** — `wiki/wisdom/{reflections,anti-patterns,models}/*.md`, full content per file
+//! - **M2 (Episodic)** — `memory_root/journal/*.md`, chunked by `## ` headers
+//! - **M3 (Semantic)** — `wiki_root/notions/**/*.md` (recursive — production
+//!   pages live under `notions/technology/`), full content per file
+//! - **M4 (Wisdom)** — `wiki_root/wisdom/{reflections,anti-patterns,models,preferences}/*.md`,
+//!   full content per file
 
 use std::path::{Path, PathBuf};
 
@@ -43,13 +50,20 @@ pub struct MemvidIndexReport {
 /// Batch indexer that scans source directories and feeds Markdown content
 /// into a [`ZenMemvidStore`].
 pub struct MemvidIndexer {
-    workspace_root: PathBuf,
+    memory_root: PathBuf,
+    wiki_root: PathBuf,
 }
 
 impl MemvidIndexer {
-    /// Create a new indexer rooted at `workspace_root`.
-    pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+    /// Create a new indexer from the two Path Spec v2 roots:
+    /// `memory_root` = `ZenPaths::memory()` (journal + checksum sidecar live
+    /// under it), `wiki_root` = `ZenPaths::wiki()` (notions + wisdom live
+    /// under it).
+    pub fn new(memory_root: PathBuf, wiki_root: PathBuf) -> Self {
+        Self {
+            memory_root,
+            wiki_root,
+        }
     }
 
     /// Run all indexing tiers (M2 + M3 + M4) and return a combined report.
@@ -106,10 +120,7 @@ impl MemvidIndexer {
     /// mtime are re-indexed. Falls back to `index_all()` if the checksum file
     /// is missing or unreadable.
     pub fn index_incremental(&self, store: &mut ZenMemvidStore) -> Result<MemvidIndexReport> {
-        let checksum_path = self
-            .workspace_root
-            .join("memories")
-            .join(".index-checksums.json");
+        let checksum_path = self.memory_root.join(".index-checksums.json");
         let previous = load_checksums(&checksum_path);
 
         if previous.is_empty() {
@@ -117,12 +128,12 @@ impl MemvidIndexer {
             let report = self.index_all(store)?;
             save_checksums(
                 &checksum_path,
-                &collect_current_checksums(&self.workspace_root)?,
+                &collect_current_checksums(&self.memory_root, &self.wiki_root)?,
             );
             return Ok(report);
         }
 
-        let current = collect_current_checksums(&self.workspace_root)?;
+        let current = collect_current_checksums(&self.memory_root, &self.wiki_root)?;
         let changed: Vec<PathBuf> = current
             .iter()
             .filter(|(path, mtime)| match previous.get(*path) {
@@ -165,7 +176,13 @@ impl MemvidIndexer {
             return Ok(0);
         }
 
-        let relative = path.strip_prefix(&self.workspace_root).unwrap_or(path);
+        // Strip against the root that owns the file: a journal file reduces to
+        // `journal/YYYY-MM-DD.md` → session id `journal-YYYY-MM-DD`, the same
+        // id scheme the M2 batch path uses (so the temporal tag can fire).
+        let relative = path
+            .strip_prefix(&self.memory_root)
+            .or_else(|_| path.strip_prefix(&self.wiki_root))
+            .unwrap_or(path);
         let session_id = relative
             .to_string_lossy()
             .replace('/', "-")
@@ -191,7 +208,7 @@ impl MemvidIndexer {
 
     // ─── M2 (Episodic) ──────────────────────────────────────────────
 
-    /// Index journal files under `memories/journal/*.md`.
+    /// Index journal files under `memory_root/journal/*.md`.
     ///
     /// Each file is chunked by `## ` headers (Facts, Reflections, Commitments, etc.)
     /// and each chunk is written to the store with a `"journal-{date}"` session id.
@@ -200,7 +217,7 @@ impl MemvidIndexer {
     /// append-order store, newer chunks land at higher frame ids) and every
     /// time-anchored chunk is tagged `temporal_entity`.
     pub fn index_m2_episodic(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
-        let journal_dir = self.workspace_root.join("memories").join("journal");
+        let journal_dir = self.memory_root.join("journal");
 
         let files = reorder_by_recency(list_md_files(&journal_dir)?);
         if files.is_empty() {
@@ -265,13 +282,16 @@ impl MemvidIndexer {
 
     // ─── M3 (Semantic) ──────────────────────────────────────────────
 
-    /// Index wiki notion files under `wiki/notions/technology/*.md`.
+    /// Index wiki notion files under `wiki_root/notions/**/*.md`.
     ///
+    /// Recursive walk: production compile output lands in category
+    /// subdirectories (`notions/technology/…`) while the scheduler's
+    /// wiki-compiler writes flat `notions/*.md` — the walk covers both.
     /// Each file is stored in full with a `"knowledge-base"` session id.
     pub fn index_m3_semantic(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
-        let entities_dir = self.workspace_root.join("wiki").join("notions");
+        let entities_dir = self.wiki_root.join("notions");
 
-        let files = list_md_files(&entities_dir)?;
+        let files = list_md_files_recursive(&entities_dir)?;
         if files.is_empty() {
             debug!("M3: no notion files in {}", entities_dir.display());
             return Ok((0, 0));
@@ -318,14 +338,14 @@ impl MemvidIndexer {
     // ─── M4 (Wisdom) ────────────────────────────────────────────────
 
     /// Index wisdom files across four subdirectories:
-    /// - `wiki/wisdom/reflections/*.md`
-    /// - `wiki/wisdom/anti-patterns/*.md`
-    /// - `wiki/wisdom/models/*.md`
-    /// - `wiki/wisdom/preferences/*.md` (FR-021 Pi point 2, M4)
+    /// - `wiki_root/wisdom/reflections/*.md`
+    /// - `wiki_root/wisdom/anti-patterns/*.md`
+    /// - `wiki_root/wisdom/models/*.md`
+    /// - `wiki_root/wisdom/preferences/*.md` (FR-021 Pi point 2, M4)
     ///
     /// Each file is stored in full with a `"knowledge-base"` session id.
     pub fn index_m4_wisdom(&self, store: &mut ZenMemvidStore) -> Result<(usize, usize)> {
-        let wisdom_root = self.workspace_root.join("wiki").join("wisdom");
+        let wisdom_root = self.wiki_root.join("wisdom");
 
         let subdirs = ["reflections", "anti-patterns", "models", "preferences"];
 
@@ -503,40 +523,39 @@ fn save_checksums(path: &Path, checksums: &ChecksumMap) {
     }
 }
 
-fn collect_current_checksums(workspace_root: &Path) -> Result<ChecksumMap> {
+fn collect_current_checksums(memory_root: &Path, wiki_root: &Path) -> Result<ChecksumMap> {
+    fn record_mtime(map: &mut ChecksumMap, path: &Path) {
+        if let Ok(meta) = std::fs::metadata(path)
+            && let Ok(mtime) = meta.modified()
+        {
+            let mtime_ms = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            map.insert(path.to_path_buf(), mtime_ms);
+        }
+    }
+
     let mut map = ChecksumMap::new();
-    let dirs = [
-        workspace_root.join("memories").join("journal"),
-        workspace_root.join("wiki").join("notions"),
-        workspace_root
-            .join("wiki")
-            .join("wisdom")
-            .join("reflections"),
-        workspace_root
-            .join("wiki")
-            .join("wisdom")
-            .join("anti-patterns"),
-        workspace_root.join("wiki").join("wisdom").join("models"),
-        workspace_root
-            .join("wiki")
-            .join("wisdom")
-            .join("preferences"),
+    let flat_dirs = [
+        memory_root.join("journal"),
+        wiki_root.join("wisdom").join("reflections"),
+        wiki_root.join("wisdom").join("anti-patterns"),
+        wiki_root.join("wisdom").join("models"),
+        wiki_root.join("wisdom").join("preferences"),
     ];
-    for dir in &dirs {
+    for dir in &flat_dirs {
         if !dir.exists() {
             continue;
         }
         for path in list_md_files(dir)? {
-            if let Ok(meta) = std::fs::metadata(&path)
-                && let Ok(mtime) = meta.modified()
-            {
-                let mtime_ms = mtime
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                map.insert(path, mtime_ms);
-            }
+            record_mtime(&mut map, &path);
         }
+    }
+    // Notions mirrors index_m3_semantic's recursive walk so the checksum
+    // sidecar tracks exactly the set that incremental indexing reads.
+    for path in list_md_files_recursive(&wiki_root.join("notions"))? {
+        record_mtime(&mut map, &path);
     }
     Ok(map)
 }
@@ -568,6 +587,22 @@ fn list_md_files(dir: &Path) -> Result<Vec<PathBuf>> {
         .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
         .collect();
 
+    files.sort();
+    Ok(files)
+}
+
+/// List `.md` files under a directory tree recursively (sorted; empty vec if
+/// the dir doesn't exist).
+fn list_md_files_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .map(|e| e.into_path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "md"))
+        .collect();
     files.sort();
     Ok(files)
 }
@@ -699,7 +734,7 @@ mod tests {
     fn indexer_missing_dirs_returns_zero() {
         let _guard = crate::memvid::lock_and_reset_singletons();
         let tmp = TempDir::new().unwrap();
-        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
 
         // Create a minimal MemvidStore
         let db_path = tmp.path().join("test.mv2");
@@ -727,7 +762,7 @@ mod tests {
         )
         .unwrap();
 
-        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
         let db_path = tmp.path().join("test.mv2");
         let mut store = ZenMemvidStore::new(db_path).unwrap();
 
@@ -752,7 +787,7 @@ mod tests {
         .unwrap();
         std::fs::write(entities_dir.join("empty.md"), "").unwrap();
 
-        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
         let db_path = tmp.path().join("test.mv2");
         let mut store = ZenMemvidStore::new(db_path).unwrap();
 
@@ -775,7 +810,7 @@ mod tests {
             std::fs::write(dir.join("item.md"), format!("# {subdir}\n\nSome wisdom.\n")).unwrap();
         }
 
-        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
         let db_path = tmp.path().join("test.mv2");
         let mut store = ZenMemvidStore::new(db_path).unwrap();
 
@@ -795,7 +830,7 @@ mod tests {
         std::fs::create_dir_all(&journal_dir).unwrap();
         std::fs::write(journal_dir.join("2026-06-01.md"), "").unwrap();
 
-        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
         let db_path = tmp.path().join("test.mv2");
         let mut store = ZenMemvidStore::new(db_path).unwrap();
 
@@ -830,7 +865,7 @@ mod tests {
         std::fs::create_dir_all(&wisdom_dir).unwrap();
         std::fs::write(wisdom_dir.join("lesson.md"), "# Lesson\n\nWisdom.\n").unwrap();
 
-        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
         let db_path = tmp.path().join("test.mv2");
         let mut store = ZenMemvidStore::new(db_path).unwrap();
 
@@ -904,12 +939,49 @@ mod tests {
         )
         .unwrap();
 
-        let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+        let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
         let db_path = tmp.path().join("test.mv2");
         let mut store = ZenMemvidStore::new(db_path).unwrap();
 
         let (files, chunks) = indexer.index_m4_wisdom(&mut store).unwrap();
         assert_eq!(files, 1);
         assert_eq!(chunks, 1);
+    }
+
+    // ── T195/W1 regression: real Path Spec v2 layout ─────────────────
+    // Each tier dir holds exactly one .md file, so a total of 3 scanned /
+    // 3 indexed is only reachable when EVERY tier resolves its real v2
+    // location ({global}/memories/journal, {global}/vault/wiki/…) — a
+    // stranded tier reads 0 files and the totals drop. The pre-fix indexer
+    // (single workspace_root) fails this test by construction.
+    #[test]
+    fn index_all_reads_path_spec_v2_layout() {
+        let _guard = crate::memvid::lock_and_reset_singletons();
+        let tmp = TempDir::new().unwrap();
+        let paths = zen_core::paths::ZenPaths::for_testing(tmp.path().to_path_buf());
+
+        let journal_dir = paths.journal_entries();
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        std::fs::write(journal_dir.join("2026-06-01.md"), "## Facts\n- v2 fact\n").unwrap();
+
+        let notions_dir = paths.wiki().join("notions").join("technology");
+        std::fs::create_dir_all(&notions_dir).unwrap();
+        std::fs::write(notions_dir.join("x.md"), "# X\n\nNotion body.\n").unwrap();
+
+        let reflections_dir = paths.wiki().join("wisdom").join("reflections");
+        std::fs::create_dir_all(&reflections_dir).unwrap();
+        std::fs::write(reflections_dir.join("y.md"), "# Y\n\nWisdom body.\n").unwrap();
+
+        let indexer = MemvidIndexer::new(paths.memory(), paths.wiki());
+        let db_path = tmp.path().join("test.mv2");
+        let mut store = ZenMemvidStore::new(db_path).unwrap();
+
+        let report = indexer.index_all(&mut store).unwrap();
+        assert_eq!(
+            report.files_scanned, 3,
+            "M2+M3+M4 must each find their v2 dir"
+        );
+        assert_eq!(report.chunks_indexed, 3);
+        assert!(report.errors.is_empty());
     }
 }

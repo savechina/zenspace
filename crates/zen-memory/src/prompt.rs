@@ -78,7 +78,7 @@ pub enum CacheScope {
 /// ═══ __SYSTEM_PROMPT_DYNAMIC_BOUNDARY__ ═══
 ///
 /// DYNAMIC ZONE (sections 13-18, per-session)
-///   ├── 13. Environment Info  — CWD, git branch, OS, model, date
+///   ├── 13. Environment Info  — CWD, session, agent, date
 ///   ├── 14. Scratchpad        — Temp directory path
 ///   ├── 15. Function Result   — Context compaction
 ///   ├── 16. MCP Instructions  — MCP server instructions (UNCACHED)
@@ -145,7 +145,7 @@ pub struct PromptAssembly {
     pub proactive: Option<String>,
 
     // -- Dynamic Zone (sections 13-18, per-session) --
-    /// Section 13: Environment Info (CWD, git, OS, model, date)
+    /// Section 13: Environment Info (CWD, session, agent, date)
     pub env_info: Option<String>,
 
     /// Section 14: Scratchpad (Temp directory)
@@ -888,8 +888,8 @@ Current sensitivity level: {}"#,
         format!(
             r#"## Environment Info
 - CWD: {}
-- Git branch: {}
-- Model: {}
+- Session: {}
+- Agent: {}
 - Date: {}"#,
             std::env::current_dir()
                 .map(|p| p.display().to_string())

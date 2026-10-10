@@ -1084,6 +1084,25 @@ fn record_rejected_hypotheses(
     }
 }
 
+/// Workspace tag stamped into host-source provenance when no workspace root
+/// resolves (T199/W7). Opaque label — no consumer does path semantics on it.
+const GLOBAL_WORKSPACE_ID: &str = "global";
+
+/// Resolve the host-source provenance tag (T199/W7).
+///
+/// `workspace_root()` is cwd-dependent: a launchd-hosted daemon runs with
+/// cwd=/ and resolves none, so deriving the tag from it alone made the
+/// raw-copy frontmatter/audit stamp drift with the loop host's launch cwd.
+/// Consumers (`graph_router` frontmatter + metadata stamps) treat the tag as
+/// an opaque label, so `None` falls back to the deterministic constant
+/// `"global"` and daemon-hosted cycles stamp consistently.
+fn resolve_workspace_id(paths: &ZenPaths) -> String {
+    paths
+        .workspace_root()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| GLOBAL_WORKSPACE_ID.to_string())
+}
+
 /// `ZenWorker` implementation — the main cycle entry point.
 ///
 /// `execute()` runs the full 6-stage pipeline: pre-cycle guards, ingest
@@ -1124,13 +1143,11 @@ impl ZenWorker for ZenLoopWorker {
         // FR-033 (T043): resolve governed host sources once per cycle.
         // Invalid entries are warn-and-skipped (fail-closed validation in
         // HostSourceConfig::resolve), never silently reinterpreted.
-        let workspace_id = paths
-            .workspace_root()
-            .map(|p| p.to_string_lossy().into_owned());
+        let workspace_id = resolve_workspace_id(&paths);
         let host_contexts: Vec<HostSourceContext> = loop_cfg
             .host_sources
             .iter()
-            .filter_map(|source| match source.resolve(workspace_id.as_deref()) {
+            .filter_map(|source| match source.resolve(Some(&workspace_id)) {
                 Ok(ctx) => Some(ctx),
                 Err(reason) => {
                     warn!(
@@ -2012,6 +2029,16 @@ mod tests {
     fn worker_with_schedule_override() {
         let worker = ZenLoopWorker::new().with_schedule("0 */10 * * * *");
         assert_eq!(worker.schedule(), "0 */10 * * * *");
+    }
+
+    #[test]
+    fn workspace_id_falls_back_to_global_when_no_workspace_root() {
+        // T199/W7: a daemon-hosted loop (launchd cwd=/) resolves no workspace
+        // root; the provenance tag must not drift with the launch cwd.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        assert_eq!(paths.workspace_root(), None);
+        assert_eq!(resolve_workspace_id(&paths), GLOBAL_WORKSPACE_ID);
     }
 
     #[test]

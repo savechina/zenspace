@@ -201,7 +201,7 @@ fn test_memvid_incremental_indexing_method_exists() {
     use zen_memory::memvid_index::MemvidIndexer;
 
     let tmp = setup_workspace();
-    let indexer = MemvidIndexer::new(tmp.path().to_path_buf());
+    let indexer = MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"));
     let db_path = tmp.path().join("test_incremental.mv2");
     let mut store = ZenMemvidStore::new(db_path).unwrap();
 

@@ -413,8 +413,11 @@ fn sc015_budget_pending_pool_and_git_history() {
     let mut test = ZenTest::new();
     init_workspace(&test);
 
-    // commit_cycle_to_git gates on paths.workspace_root(); the anti-leak
-    // walk-up cannot see the temp dir, so pin it explicitly via ZEN_WORKSPACE.
+    // Since Path Spec v2, commit_cycle_to_git targets the vault repo
+    // (paths.vault()) — the `git init` at the test root below covers it
+    // because the vault is a subdirectory of that repo. ZEN_WORKSPACE is
+    // pinned so workspace_root() resolves deterministically for host-source
+    // provenance regardless of where the test binary was launched from.
     test.env.insert(
         "ZEN_WORKSPACE".into(),
         test.cwd.to_str().expect("utf8 cwd").into(),

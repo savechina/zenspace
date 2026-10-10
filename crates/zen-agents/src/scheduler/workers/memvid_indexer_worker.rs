@@ -1,7 +1,7 @@
 use std::fs;
 
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::info;
 
 use zen_core::constants::MEMVID_STORE_FILE;
 use zen_core::paths::ZenPaths;
@@ -48,20 +48,6 @@ impl ZenWorker for MemvidIndexerWorker {
         let start = std::time::Instant::now();
         let paths = ZenPaths::detect()?;
 
-        let workspace_root = match paths.workspace_root() {
-            Some(root) => root.clone(),
-            None => {
-                debug!("no workspace root configured, skipping memvid indexing");
-                return Ok(WorkerReport {
-                    worker_id: self.id().to_string(),
-                    success: true,
-                    fact_count: 0,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    llm_cost_usd: 0.0,
-                });
-            }
-        };
-
         let store_path = paths.memory().join(MEMVID_STORE_FILE);
         fs::create_dir_all(store_path.parent().unwrap_or(&store_path)).with_context(|| {
             format!(
@@ -73,7 +59,10 @@ impl ZenWorker for MemvidIndexerWorker {
         let mut store =
             ZenMemvidStore::new(store_path).with_context(|| "failed to open memvid store")?;
 
-        let indexer = MemvidIndexer::new(workspace_root);
+        // Path Spec v2 (T195/W1): roots come from ZenPaths — no workspace_root
+        // dependency, and no silent skip when it is absent (a launchd daemon
+        // runs with cwd=/ and never resolves one).
+        let indexer = MemvidIndexer::new(paths.memory(), paths.wiki());
         let report = indexer
             .index_all(&mut store)
             .with_context(|| "memvid indexing failed")?;

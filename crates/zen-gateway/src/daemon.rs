@@ -983,12 +983,12 @@ impl GatewayService {
         if self.store_health().await == "unavailable" {
             return Err(crate::protocol::RpcError::store_unavailable("unavailable"));
         }
-        let workspace_root = zen_core::paths::ZenPaths::detect()
-            .ok()
-            .and_then(|p| p.workspace_root().cloned())
-            .ok_or_else(|| {
-                crate::protocol::RpcError::internal("workspace root unavailable for rebuild")
-            })?;
+        // Path Spec v2 (T195/W1): rebuild roots come from ZenPaths (memories/
+        // + vault/wiki/) — no workspace_root requirement (a launchd daemon
+        // runs with cwd=/ and never resolves one).
+        let paths = zen_core::paths::ZenPaths::detect().map_err(|e| {
+            crate::protocol::RpcError::internal(&format!("ZEN paths unavailable: {e}"))
+        })?;
 
         tracing::info!("memory/rebuild: full memvid reindex starting");
         let report = {
@@ -996,7 +996,7 @@ impl GatewayService {
             let Some(store) = guard.as_mut() else {
                 return Err(crate::protocol::RpcError::store_unavailable("unavailable"));
             };
-            MemvidIndexer::new(workspace_root)
+            MemvidIndexer::new(paths.memory(), paths.wiki())
                 .index_all(store)
                 .map_err(|e| {
                     crate::protocol::RpcError::internal(&format!("memvid reindex failed: {e}"))
