@@ -16,6 +16,7 @@
 //! - **M4 (Wisdom)** — `wiki_root/wisdom/{reflections,anti-patterns,models,preferences}/*.md`,
 //!   full content per file
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -29,6 +30,17 @@ use crate::memvid::ZenMemvidStore;
 /// Frame tag applied to time-anchored chunks (T071, FR-021 Pi point 3).
 /// Tag-only metadata: no new index, no schema change.
 pub const TEMPORAL_ENTITY_TAG: &str = "temporal_entity";
+
+/// `extra_metadata` key carrying the indexed file's path RELATIVE to the
+/// root that owns it (Phase 31 T208, design F1-D2). Static provenance —
+/// written once at put time (frames are append-only), read back on search
+/// hits via `SearchHitMetadata.extra_metadata`. Consumers join it to the
+/// reward sidecars / file mtime for retention-strength anchoring.
+pub const PROVENANCE_SOURCE_PATH_KEY: &str = "source_path";
+
+/// `extra_metadata` key carrying the M-tier the file was indexed from
+/// (`"m2"` | `"m3"` | `"m4"`, Phase 31 T208).
+pub const PROVENANCE_TIER_KEY: &str = "tier";
 
 /// Recency half-life for time-anchored content (days), reusing the FR-025
 /// 30-day confidence half-life so all decay in the system shares one constant.
@@ -52,18 +64,77 @@ pub struct MemvidIndexReport {
 pub struct MemvidIndexer {
     memory_root: PathBuf,
     wiki_root: PathBuf,
+    provenance_metadata: bool,
 }
 
 impl MemvidIndexer {
     /// Create a new indexer from the two Path Spec v2 roots:
     /// `memory_root` = `ZenPaths::memory()` (journal + checksum sidecar live
     /// under it), `wiki_root` = `ZenPaths::wiki()` (notions + wisdom live
-    /// under it).
+    /// under it). Provenance metadata ships OFF — see
+    /// [`Self::with_provenance_metadata`].
     pub fn new(memory_root: PathBuf, wiki_root: PathBuf) -> Self {
         Self {
             memory_root,
             wiki_root,
+            provenance_metadata: false,
         }
+    }
+
+    /// Additive builder (Phase 31 T208): when enabled, M2/M3/M4 puts carry
+    /// `extra_metadata {source_path, tier}` (memvid-core `PutOptions` write
+    /// channel, echoed on search hits). The caller wires this from
+    /// `[agentic.memory_strength] enabled` — the indexer itself reads no
+    /// config. Disabled (the default) produces byte-identical puts to the
+    /// pre-Phase-31 indexer.
+    pub fn with_provenance_metadata(mut self, enabled: bool) -> Self {
+        self.provenance_metadata = enabled;
+        self
+    }
+
+    /// Whether provenance metadata writes are enabled.
+    pub fn provenance_metadata_enabled(&self) -> bool {
+        self.provenance_metadata
+    }
+
+    /// Build the `extra_metadata` map for one source file: `source_path`
+    /// relative to the root that owns the file + the `tier` it was scanned
+    /// from. Returns an EMPTY map when provenance is disabled or the file
+    /// belongs to none of the indexed subtrees (`memory_root/journal` → m2,
+    /// `wiki_root/notions` → m3, `wiki_root/wisdom` → m4) — an empty map
+    /// keeps the put byte-identical to the metadata-free path.
+    fn provenance_map(&self, path: &Path) -> BTreeMap<String, String> {
+        fn entry(tier: &str, rel: &Path) -> BTreeMap<String, String> {
+            let mut map = BTreeMap::new();
+            map.insert(
+                PROVENANCE_SOURCE_PATH_KEY.to_string(),
+                rel.to_string_lossy().into_owned(),
+            );
+            map.insert(PROVENANCE_TIER_KEY.to_string(), tier.to_string());
+            map
+        }
+
+        if !self.provenance_metadata {
+            return BTreeMap::new();
+        }
+        // wiki_root subtrees are probed FIRST so a wiki_root nested under
+        // memory_root could never mis-tag m3/m4 content as m2.
+        if path.starts_with(self.wiki_root.join("notions"))
+            && let Ok(rel) = path.strip_prefix(&self.wiki_root)
+        {
+            return entry("m3", rel);
+        }
+        if path.starts_with(self.wiki_root.join("wisdom"))
+            && let Ok(rel) = path.strip_prefix(&self.wiki_root)
+        {
+            return entry("m4", rel);
+        }
+        if path.starts_with(self.memory_root.join("journal"))
+            && let Ok(rel) = path.strip_prefix(&self.memory_root)
+        {
+            return entry("m2", rel);
+        }
+        BTreeMap::new()
     }
 
     /// Run all indexing tiers (M2 + M3 + M4) and return a combined report.
@@ -188,6 +259,7 @@ impl MemvidIndexer {
             .replace('/', "-")
             .replace(".md", "");
         let extra_tag = extract_anchor_date(&session_id).map(|_| TEMPORAL_ENTITY_TAG);
+        let provenance = self.provenance_map(path);
 
         let chunks = chunk_by_headers(&content);
         let mut indexed = 0usize;
@@ -197,7 +269,7 @@ impl MemvidIndexer {
             }
             let label = format!("[{}] {}", chunk.header, chunk.text.trim());
             if store
-                .persist_structured_turn_tagged(&session_id, "system", &label, extra_tag)
+                .persist_structured_turn_meta(&session_id, "system", &label, extra_tag, &provenance)
                 .is_ok()
             {
                 indexed += 1;
@@ -255,6 +327,7 @@ impl MemvidIndexer {
                 None => "journal-unknown".to_string(),
             };
             let temporal = extract_anchor_date(&session_id).is_some();
+            let provenance = self.provenance_map(path);
 
             for chunk in &chunks {
                 if chunk.text.trim().is_empty() {
@@ -262,8 +335,13 @@ impl MemvidIndexer {
                 }
                 let label = format!("[{}] {}", chunk.header, chunk.text.trim());
                 let extra_tag = temporal.then_some(TEMPORAL_ENTITY_TAG);
-                match store.persist_structured_turn_tagged(&session_id, "system", &label, extra_tag)
-                {
+                match store.persist_structured_turn_meta(
+                    &session_id,
+                    "system",
+                    &label,
+                    extra_tag,
+                    &provenance,
+                ) {
                     Ok(_) => chunks_indexed += 1,
                     Err(e) => {
                         warn!(
@@ -320,7 +398,14 @@ impl MemvidIndexer {
                 continue;
             }
 
-            match store.persist_structured_turn("knowledge-base", "system", &content) {
+            let provenance = self.provenance_map(path);
+            match store.persist_structured_turn_meta(
+                "knowledge-base",
+                "system",
+                &content,
+                None,
+                &provenance,
+            ) {
                 Ok(_) => chunks_indexed += 1,
                 Err(e) => {
                     warn!(
@@ -387,7 +472,14 @@ impl MemvidIndexer {
                     continue;
                 }
 
-                match store.persist_structured_turn("knowledge-base", "system", &content) {
+                let provenance = self.provenance_map(path);
+                match store.persist_structured_turn_meta(
+                    "knowledge-base",
+                    "system",
+                    &content,
+                    None,
+                    &provenance,
+                ) {
                     Ok(_) => chunks_indexed += 1,
                     Err(e) => {
                         warn!(
@@ -983,5 +1075,215 @@ mod tests {
         );
         assert_eq!(report.chunks_indexed, 3);
         assert!(report.errors.is_empty());
+    }
+
+    // ── Phase 31 T208: provenance extra_metadata ──────────────────────
+
+    fn provenance_fixture(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        let memory_root = tmp.path().join("memories");
+        let wiki_root = tmp.path().join("wiki");
+
+        let journal_dir = memory_root.join("journal");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        std::fs::write(
+            journal_dir.join("2026-06-01.md"),
+            "## Facts\n- m2provtoken journal fact\n",
+        )
+        .unwrap();
+
+        let notions_dir = wiki_root.join("notions").join("technology");
+        std::fs::create_dir_all(&notions_dir).unwrap();
+        std::fs::write(
+            notions_dir.join("rust.md"),
+            "# Rust\n\nm3provtoken notion body.\n",
+        )
+        .unwrap();
+
+        let reflections_dir = wiki_root.join("wisdom").join("reflections");
+        std::fs::create_dir_all(&reflections_dir).unwrap();
+        std::fs::write(
+            reflections_dir.join("lesson.md"),
+            "# Lesson\n\nm4provtoken wisdom body.\n",
+        )
+        .unwrap();
+
+        (memory_root, wiki_root)
+    }
+
+    fn find_hit(
+        store: &ZenMemvidStore,
+        token: &str,
+        uri: &str,
+    ) -> memvid_core::types::search::SearchHit {
+        let resp = store
+            .store()
+            .search(memvid_core::SearchRequest {
+                query: token.to_string(),
+                top_k: 10,
+                snippet_chars: 400,
+                uri: None,
+                scope: None,
+                cursor: None,
+                as_of_frame: None,
+                as_of_ts: None,
+                no_sketch: false,
+                acl_context: None,
+                acl_enforcement_mode: Default::default(),
+            })
+            .unwrap();
+        resp.hits
+            .into_iter()
+            .find(|h| h.text.contains(token) && h.uri == uri)
+            .unwrap_or_else(|| panic!("no hit for {token} at uri {uri}"))
+    }
+
+    fn extra_meta(hit: &memvid_core::types::search::SearchHit) -> BTreeMap<String, String> {
+        hit.metadata
+            .as_ref()
+            .map(|m| m.extra_metadata.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn provenance_map_classifies_tiers_and_respects_gate() {
+        let tmp = TempDir::new().unwrap();
+        let (memory_root, wiki_root) = (tmp.path().join("memories"), tmp.path().join("wiki"));
+
+        let off = MemvidIndexer::new(memory_root.clone(), wiki_root.clone());
+        assert!(!off.provenance_metadata_enabled());
+        assert!(
+            off.provenance_map(&memory_root.join("journal").join("2026-06-01.md"))
+                .is_empty(),
+            "gate off ⇒ empty map ⇒ byte-identical puts"
+        );
+
+        let on = off.with_provenance_metadata(true);
+        assert!(on.provenance_metadata_enabled());
+        let m2 = on.provenance_map(&memory_root.join("journal").join("2026-06-01.md"));
+        assert_eq!(m2.get(PROVENANCE_TIER_KEY).map(String::as_str), Some("m2"));
+        assert_eq!(
+            m2.get(PROVENANCE_SOURCE_PATH_KEY).map(String::as_str),
+            Some("journal/2026-06-01.md")
+        );
+        let m3 = on.provenance_map(&wiki_root.join("notions").join("technology").join("rust.md"));
+        assert_eq!(m3.get(PROVENANCE_TIER_KEY).map(String::as_str), Some("m3"));
+        assert_eq!(
+            m3.get(PROVENANCE_SOURCE_PATH_KEY).map(String::as_str),
+            Some("notions/technology/rust.md")
+        );
+        let m4 = on.provenance_map(&wiki_root.join("wisdom").join("reflections").join("l.md"));
+        assert_eq!(m4.get(PROVENANCE_TIER_KEY).map(String::as_str), Some("m4"));
+        assert_eq!(
+            m4.get(PROVENANCE_SOURCE_PATH_KEY).map(String::as_str),
+            Some("wisdom/reflections/l.md")
+        );
+        // Files outside every indexed subtree get no metadata.
+        assert!(
+            on.provenance_map(&tmp.path().join("elsewhere.md"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn provenance_disabled_by_default_frames_carry_no_extra_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let (memory_root, wiki_root) = provenance_fixture(&tmp);
+        let indexer = MemvidIndexer::new(memory_root, wiki_root);
+        let mut store = ZenMemvidStore::from_store(
+            crate::memvid_store::MemvidStore::open_or_create(&tmp.path().join("off.mv2")).unwrap(),
+        );
+
+        indexer.index_all(&mut store).unwrap();
+
+        let tokens = [
+            ("m2provtoken", "journal-2026-06-01"),
+            ("m3provtoken", "knowledge-base"),
+            ("m4provtoken", "knowledge-base"),
+        ];
+        for (token, uri) in tokens {
+            let hit = find_hit(&store, token, uri);
+            let meta = extra_meta(&hit);
+            // Gate-off pin: the indexer writes NO provenance keys. (The map
+            // itself may carry memvid-core's own enrichment entries, e.g.
+            // `extractous_metadata` — engine-side writes, not the indexer's
+            // channel, and timing-dependent under the extraction budget.)
+            assert!(
+                !meta.contains_key(PROVENANCE_SOURCE_PATH_KEY)
+                    && !meta.contains_key(PROVENANCE_TIER_KEY),
+                "gate-off pin: {token} frame must carry no zen provenance keys, got {meta:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_enabled_attaches_source_path_and_tier_per_tier() {
+        let tmp = TempDir::new().unwrap();
+        let (memory_root, wiki_root) = provenance_fixture(&tmp);
+        let indexer = MemvidIndexer::new(memory_root, wiki_root).with_provenance_metadata(true);
+        let mut store = ZenMemvidStore::from_store(
+            crate::memvid_store::MemvidStore::open_or_create(&tmp.path().join("on.mv2")).unwrap(),
+        );
+
+        indexer.index_all(&mut store).unwrap();
+
+        let expected = [
+            (
+                "m2provtoken",
+                "journal-2026-06-01",
+                "journal/2026-06-01.md",
+                "m2",
+            ),
+            (
+                "m3provtoken",
+                "knowledge-base",
+                "notions/technology/rust.md",
+                "m3",
+            ),
+            (
+                "m4provtoken",
+                "knowledge-base",
+                "wisdom/reflections/lesson.md",
+                "m4",
+            ),
+        ];
+        for (token, uri, source_path, tier) in expected {
+            let hit = find_hit(&store, token, uri);
+            let meta = extra_meta(&hit);
+            assert_eq!(
+                meta.get(PROVENANCE_SOURCE_PATH_KEY).map(String::as_str),
+                Some(source_path),
+                "token {token}"
+            );
+            assert_eq!(
+                meta.get(PROVENANCE_TIER_KEY).map(String::as_str),
+                Some(tier),
+                "token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_enabled_index_incremental_attaches_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let (memory_root, wiki_root) = provenance_fixture(&tmp);
+        let indexer = MemvidIndexer::new(memory_root, wiki_root).with_provenance_metadata(true);
+        let mut store = ZenMemvidStore::from_store(
+            crate::memvid_store::MemvidStore::open_or_create(&tmp.path().join("inc.mv2")).unwrap(),
+        );
+
+        // No previous checksums ⇒ incremental falls back to the full path,
+        // which must carry the same provenance metadata.
+        indexer.index_incremental(&mut store).unwrap();
+
+        let hit = find_hit(&store, "m3provtoken", "knowledge-base");
+        let meta = extra_meta(&hit);
+        assert_eq!(
+            meta.get(PROVENANCE_SOURCE_PATH_KEY).map(String::as_str),
+            Some("notions/technology/rust.md")
+        );
+        assert_eq!(
+            meta.get(PROVENANCE_TIER_KEY).map(String::as_str),
+            Some("m3")
+        );
     }
 }

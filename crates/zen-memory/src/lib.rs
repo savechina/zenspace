@@ -29,6 +29,7 @@ pub mod self_model;
 pub mod sensitivity;
 pub mod session;
 pub mod session_replayer;
+pub mod strength;
 pub mod virtue_log;
 
 pub use frontmatter::{extract_frontmatter, parse_field, parse_yaml_array};
@@ -75,5 +76,6 @@ pub use session::{Message, RetrievedNote, SessionContext};
 pub use session_replayer::{
     InMemoryReplayCheckpoints, ReplayCheckpointStore, ReplayStats, SessionReplayer, turn_replay_key,
 };
+pub use strength::{resolve_content_anchor, retention_strength};
 pub use virtue_log::{VirtueDomain, VirtueLog, VirtueStatus};
 pub use zen_core::types::{Session, SessionStatus};

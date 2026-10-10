@@ -348,9 +348,29 @@ impl ZenMemvidStore {
     pub fn persist_structured_turn_tagged(
         &self,
         session_id: &str,
+        role: &str,
+        content: &str,
+        extra_tag: Option<&str>,
+    ) -> Result<(u64, Option<memvid_core::MemoryCardId>)> {
+        self.persist_structured_turn_meta(session_id, role, content, extra_tag, &Default::default())
+    }
+
+    /// Like [`Self::persist_structured_turn_tagged`] with frame-level
+    /// provenance metadata (Phase 31 T208, design F1-D2): `extra_metadata`
+    /// rides `PutOptions.extra_metadata` (memvid-core write channel) and is
+    /// echoed back on search hits via `SearchHitMetadata.extra_metadata`
+    /// (read channel). Frames are append-only — metadata is WRITE-TIME only;
+    /// legacy frames without it stay searchable and consumers fall back to
+    /// uri/created_at anchors. An EMPTY map produces byte-identical
+    /// `PutOptions` to the tagged variant, so existing call sites are
+    /// behavior-unchanged (gate-off byte-identity).
+    pub fn persist_structured_turn_meta(
+        &self,
+        session_id: &str,
         _role: &str,
         content: &str,
         extra_tag: Option<&str>,
+        extra_metadata: &std::collections::BTreeMap<String, String>,
     ) -> Result<(u64, Option<memvid_core::MemoryCardId>)> {
         let mut builder = memvid_core::PutOptions::builder()
             .uri(session_id)
@@ -359,7 +379,8 @@ impl ZenMemvidStore {
         if let Some(tag) = extra_tag {
             builder = builder.push_tag(tag);
         }
-        let opts = builder.build();
+        let mut opts = builder.build();
+        opts.extra_metadata = extra_metadata.clone();
 
         let frame_id = self.store.put_text(content, opts)?;
         let card_result = MemoryCardBuilder::new()

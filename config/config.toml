@@ -468,6 +468,62 @@ max_rounds = 8
 # tree_index_pages = 20               # long-doc segmentation threshold
 
 # =============================================================================
+# Memory strength — Ebbinghaus retention curve (Phase 31 T206)
+# =============================================================================
+#
+# enabled: master gate — absent/false ⇒ zero behavior change (no indexer
+#   provenance metadata, no search rerank, no nightly strength report).
+# half_life_days: retention half-life — REUSE of the system-wide 30-day
+#   RECENCY_HALF_LIFE_DAYS constant (clamped 1.0..=365.0).
+# search_rerank: RANKING-ONLY strength reorder of memory search + card
+#   selection (calibration debt — default off until arena measurement;
+#   never filters or deletes).
+# eviction_report_size: length of the nightly lowest-strength REPORT
+#   (report-only, retention-quarantine precedent — nothing is deleted).
+# Env: ZEN_MEMORY_STRENGTH_ENABLED / _HALF_LIFE_DAYS / _RERANK / _REPORT_SIZE.
+#
+[agentic.memory_strength]
+# enabled = false
+# half_life_days = 30.0
+# search_rerank = false
+# eviction_report_size = 20
+
+# =============================================================================
+# Orchestrator knowledge injection (Phase 31 T206; injection code lands T214)
+# =============================================================================
+#
+# knowledge_inject: "on" (DEFAULT — owner decision D-F revised: knowledge
+#   management is the product's core value) | "shadow" (retrieve + audit,
+#   no injection) | "off" (pre-Phase-31 behavior). Invalid values fall back
+#   to "off" with a warning — a typo must never silently keep injection on.
+# knowledge_tiers: retrieval tier string ("fts" default — T138 discipline:
+#   fusion stays opt-in).
+# knowledge_budget_chars: total injected-block char budget (default 4000,
+#   UPSTREAM_SNIPPET_MAX_CHARS precedent; clamped 512..=16000).
+# knowledge_timeout_ms: retrieval hang guard (default 2000 — calibration
+#   debt, named trigger: measured p95; timeout ⇒ skip + warn, fail-open).
+# Env: ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT / _TIERS / _BUDGET_CHARS / _TIMEOUT_MS.
+#
+[agentic.orchestrator]
+# knowledge_inject = "on"
+# knowledge_tiers = "fts"
+# knowledge_budget_chars = 4000
+# knowledge_timeout_ms = 2000
+
+# =============================================================================
+# Delegate sub-agent context inheritance (Phase 31 T206; seam lands T215)
+# =============================================================================
+#
+# context_inheritance: false (default, gate closed) ⇒ sub-agents keep
+#   today's empty SessionContext byte-identically; true ⇒ the parent's
+#   retrieved knowledge block + skill hits are inherited with a
+#   depth-halved budget (no fresh retrieval per subtask).
+# Env: ZEN_DELEGATE_CONTEXT_INHERITANCE.
+#
+[agentic.delegate]
+# context_inheritance = false
+
+# =============================================================================
 # Skill auto-routing — Pi-style trigger hits (005-agentic-loop, T076)
 # =============================================================================
 #

@@ -471,6 +471,9 @@ pub struct AgenticConfig {
     pub audit: AuditConfig,
     /// Retention sweep gating — TOML `[agentic.retention]` (review D2).
     pub retention: RetentionConfig,
+    /// Memory strength (Ebbinghaus retention curve) — TOML
+    /// `[agentic.memory_strength]` (Phase 31 T206).
+    pub memory_strength: MemoryStrengthConfig,
     /// Wiki compile hygiene — TOML `[agentic.compile]` (compile-hygiene ①).
     pub compile: CompileConfig,
     /// Semantic wiki lint — TOML `[agentic.lint]` (compile-hygiene E1).
@@ -823,6 +826,12 @@ pub struct DelegateConfig {
     /// Parallel fan-out width for multi-task delegation
     /// (absent → 4, clamped 1..=8).
     pub max_concurrent: Option<u32>,
+    /// Sub-agent context inheritance (Phase 31 T206; seam lands T215).
+    /// false (default, gate closed) ⇒ sub-agents keep today's empty
+    /// `SessionContext` byte-identically; true ⇒ the parent's retrieved
+    /// knowledge block + skill hits are inherited with a depth-halved
+    /// budget (no fresh retrieval per subtask).
+    pub context_inheritance: Option<bool>,
 }
 
 impl DelegateConfig {
@@ -851,9 +860,16 @@ impl DelegateConfig {
             .unwrap_or(DELEGATE_CONCURRENT_DEFAULT)
             .clamp(DELEGATE_CONCURRENT_MIN, DELEGATE_CONCURRENT_MAX)
     }
+
+    /// Sub-agent context inheritance gate (default false — gate closed;
+    /// off ⇒ today's empty sub-agent `SessionContext` byte-identically).
+    pub fn context_inheritance_or_default(&self) -> bool {
+        self.context_inheritance.unwrap_or(false)
+    }
 }
 
-/// Orchestrator tool surface — TOML `[agentic.orchestrator]` (T378).
+/// Orchestrator tool surface + knowledge injection — TOML
+/// `[agentic.orchestrator]` (T378; knowledge keys Phase 31 T206).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct OrchestratorConfig {
@@ -862,10 +878,61 @@ pub struct OrchestratorConfig {
     /// in scoped sub-agents via delegate.task / plan.execute
     /// (001 A.8 ultra surface). Unknown values fall back to `full`.
     pub surface: Option<String>,
+    /// Knowledge-doc injection mode (absent → `"on"` — owner decision D-F
+    /// revised: knowledge management is the product's core value, the sole
+    /// non-closed Phase 31 gate). Values `"off"` | `"shadow"` | `"on"`;
+    /// an INVALID value degrades to `Off` with a `tracing::warn` — a typo
+    /// must never silently keep injection on. The injection code itself
+    /// lands in T214; this key is the parseable gate surface.
+    pub knowledge_inject: Option<String>,
+    /// Retrieval tiers for knowledge injection (absent → `"fts"` — T138
+    /// discipline: fusion stays opt-in). Passed to the search stack as-is.
+    pub knowledge_tiers: Option<String>,
+    /// Total injected-block character budget (absent → 4000, clamped
+    /// 512..=16000).
+    pub knowledge_budget_chars: Option<usize>,
+    /// Retrieval hang guard in ms (absent → 2000). On timeout the injection
+    /// is skipped with a warn (fail-open; never blocks a turn).
+    pub knowledge_timeout_ms: Option<u64>,
 }
 
 pub const ORCHESTRATOR_SURFACE_DELEGATION_ONLY: &str = "delegation-only";
 pub const ORCHESTRATOR_SURFACE_FULL: &str = "full";
+
+/// Valid `[agentic.orchestrator] knowledge_inject` value: no retrieval, no
+/// injection — pre-Phase-31 behavior (byte-identity pinned by T214).
+pub const KNOWLEDGE_INJECT_OFF: &str = "off";
+/// Valid `knowledge_inject` value: retrieve + audit
+/// (`loop.knowledge.injected`), but do NOT inject — measurement mode.
+pub const KNOWLEDGE_INJECT_SHADOW: &str = "shadow";
+/// Valid `knowledge_inject` value: retrieve and inject KB context on
+/// eligible turns (non-Conversation intent, empty pre-supplied knowledge).
+pub const KNOWLEDGE_INJECT_ON: &str = "on";
+
+/// Effective `[agentic.orchestrator] knowledge_inject` mode (Phase 31 T206).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeInjectMode {
+    /// No retrieval, no injection — pre-Phase-31 behavior.
+    Off,
+    /// Retrieve + audit only — measurement mode for the latency/token guards.
+    Shadow,
+    /// Retrieve and inject KB context on eligible turns.
+    On,
+}
+
+/// Default `knowledge_tiers` — FTS5-only per the T138 decision memo
+/// (`docs/designs/search-mode-defaults.md`): fusion stays opt-in.
+pub const KNOWLEDGE_TIERS_DEFAULT: &str = "fts";
+/// Default total injection budget in chars — `UPSTREAM_SNIPPET_MAX_CHARS =
+/// 4000` precedent (zen-agents `plan_task.rs`).
+pub const KNOWLEDGE_BUDGET_CHARS_DEFAULT: usize = 4000;
+/// Clamp bounds for `knowledge_budget_chars` (design F2-D7 config table).
+pub const KNOWLEDGE_BUDGET_CHARS_MIN: usize = 512;
+pub const KNOWLEDGE_BUDGET_CHARS_MAX: usize = 16000;
+/// Default retrieval hang guard in ms. CALIBRATION DEBT — a hang guard, not
+/// a tuned value; named trigger for replacing it: measured injection p95
+/// (`loop.knowledge.injected.ms`).
+pub const KNOWLEDGE_TIMEOUT_MS_DEFAULT: u64 = 2000;
 
 impl OrchestratorConfig {
     /// Effective surface string; invalid values warn and degrade to
@@ -887,6 +954,50 @@ impl OrchestratorConfig {
     /// True when the orchestrator must run delegation-only.
     pub fn delegation_only(&self) -> bool {
         self.surface_or_default() == ORCHESTRATOR_SURFACE_DELEGATION_ONLY
+    }
+
+    /// Effective knowledge-injection mode (default `On` — owner decision D-F
+    /// revised). Invalid values warn and degrade to `Off`: because this is
+    /// the sole non-closed Phase 31 gate, its failure direction is closed
+    /// (a typo must never silently keep injection on).
+    pub fn knowledge_inject_mode(&self) -> KnowledgeInjectMode {
+        match self.knowledge_inject.as_deref() {
+            None => KnowledgeInjectMode::On,
+            Some(v) if v.eq_ignore_ascii_case(KNOWLEDGE_INJECT_ON) => KnowledgeInjectMode::On,
+            Some(v) if v.eq_ignore_ascii_case(KNOWLEDGE_INJECT_SHADOW) => {
+                KnowledgeInjectMode::Shadow
+            }
+            Some(v) if v.eq_ignore_ascii_case(KNOWLEDGE_INJECT_OFF) => KnowledgeInjectMode::Off,
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "invalid [agentic.orchestrator] knowledge_inject; falling back to off"
+                );
+                KnowledgeInjectMode::Off
+            }
+        }
+    }
+
+    /// Effective retrieval tiers string (default `"fts"`).
+    pub fn knowledge_tiers_or_default(&self) -> &str {
+        self.knowledge_tiers
+            .as_deref()
+            .unwrap_or(KNOWLEDGE_TIERS_DEFAULT)
+    }
+
+    /// Effective injection budget in chars (default 4000, clamped
+    /// 512..=16000).
+    pub fn knowledge_budget_chars_or_default(&self) -> usize {
+        self.knowledge_budget_chars
+            .unwrap_or(KNOWLEDGE_BUDGET_CHARS_DEFAULT)
+            .clamp(KNOWLEDGE_BUDGET_CHARS_MIN, KNOWLEDGE_BUDGET_CHARS_MAX)
+    }
+
+    /// Effective retrieval hang guard in ms (default 2000 — calibration
+    /// debt, named trigger: measured p95).
+    pub fn knowledge_timeout_ms_or_default(&self) -> u64 {
+        self.knowledge_timeout_ms
+            .unwrap_or(KNOWLEDGE_TIMEOUT_MS_DEFAULT)
     }
 }
 
@@ -1091,6 +1202,99 @@ impl RetentionConfig {
 
     pub fn dry_run_or_default(&self) -> bool {
         self.dry_run.unwrap_or(false)
+    }
+}
+
+/// Default retention half-life in days — a REUSE of `RECENCY_HALF_LIFE_DAYS
+/// = 30.0` (zen-memory `memvid_index.rs`), which itself reuses the FR-025
+/// 30-day belief-confidence half-life so all decay in the system shares one
+/// constant. Not an invention; the config key exists for tunability.
+pub const MEMORY_STRENGTH_HALF_LIFE_DEFAULT: f64 = 30.0;
+/// Clamp floor for `half_life_days` (design F1 config table; also guarantees
+/// the strength accessor hands consumers a positive value).
+pub const MEMORY_STRENGTH_HALF_LIFE_MIN: f64 = 1.0;
+/// Clamp ceiling for `half_life_days` (design F1 config table).
+pub const MEMORY_STRENGTH_HALF_LIFE_MAX: f64 = 365.0;
+/// Default nightly eviction-report length — `DEFAULT_SEARCH_LIMIT = 20`
+/// precedent (zen-vault `search/service.rs`). Structural: report length only.
+pub const MEMORY_STRENGTH_REPORT_SIZE_DEFAULT: usize = 20;
+
+/// Memory strength (Ebbinghaus retention curve) — TOML
+/// `[agentic.memory_strength]` (Phase 31 T206, design
+/// `docs/designs/memory-strength-knowledge-wave.md` Feature 1).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates the derived retention-strength subsystem —
+///   indexer provenance metadata (`extra_metadata {source_path, tier}` on
+///   M2/M3/M4 puts), strength-aware reordering of memory search hits and
+///   card selection, and the nightly lowest-strength eviction report.
+/// - User impact: with `enabled = false` there is zero behavior change
+///   anywhere (no metadata writes, no rerank, no report). `search_rerank`
+///   is RANKING-ONLY — strength reorders retrieval results, it never
+///   filters, gates, or deletes. The eviction report is report-only
+///   (retention-quarantine precedent); no deletion path exists.
+/// - Default: enabled=false, half_life_days=30.0, search_rerank=false,
+///   eviction_report_size=20. Strength itself is never persisted — it is
+///   derived at read time, so the T153 compounding-decay bug class is
+///   structurally impossible.
+/// - Interaction: env `ZEN_MEMORY_STRENGTH_ENABLED` /
+///   `ZEN_MEMORY_STRENGTH_HALF_LIFE_DAYS` / `ZEN_MEMORY_STRENGTH_RERANK` /
+///   `ZEN_MEMORY_STRENGTH_REPORT_SIZE` (5th layer) override any config file
+///   layer.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct MemoryStrengthConfig {
+    /// Master gate — the strength subsystem is active when true
+    /// (absent → false).
+    pub enabled: Option<bool>,
+    /// Retention half-life in days (absent → 30.0, clamped 1.0..=365.0;
+    /// non-finite values warn and fall back to the default).
+    pub half_life_days: Option<f64>,
+    /// Strength rerank of memory search + card selection (absent → false).
+    /// Calibration debt: ranking-only, default-off until arena/recall
+    /// measurement exists (T138 discipline).
+    pub search_rerank: Option<bool>,
+    /// Nightly lowest-strength report length (absent → 20).
+    pub eviction_report_size: Option<usize>,
+}
+
+impl MemoryStrengthConfig {
+    /// Master gate (default false — absent means zero behavior change).
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    /// Effective half-life in days (default 30.0 = `RECENCY_HALF_LIFE_DAYS`,
+    /// clamped 1.0..=365.0). Non-finite values (TOML `nan`/`inf`) warn and
+    /// fall back to the default — a typo must never silently shift decay
+    /// (cron-timezone discipline). The clamp guarantees
+    /// `zen_memory::strength::retention_strength` callers receive a positive
+    /// finite value (that function additionally guards defensively).
+    pub fn half_life_days_or_default(&self) -> f64 {
+        match self.half_life_days {
+            Some(v) if v.is_finite() => {
+                v.clamp(MEMORY_STRENGTH_HALF_LIFE_MIN, MEMORY_STRENGTH_HALF_LIFE_MAX)
+            }
+            Some(_) => {
+                tracing::warn!(
+                    value = ?self.half_life_days,
+                    "non-finite [agentic.memory_strength] half_life_days; using 30.0"
+                );
+                MEMORY_STRENGTH_HALF_LIFE_DEFAULT
+            }
+            None => MEMORY_STRENGTH_HALF_LIFE_DEFAULT,
+        }
+    }
+
+    /// Ranking-only rerank switch (default false — calibration debt).
+    pub fn search_rerank_or_default(&self) -> bool {
+        self.search_rerank.unwrap_or(false)
+    }
+
+    /// Nightly report length (default 20 — `DEFAULT_SEARCH_LIMIT` precedent).
+    pub fn eviction_report_size_or_default(&self) -> usize {
+        self.eviction_report_size
+            .unwrap_or(MEMORY_STRENGTH_REPORT_SIZE_DEFAULT)
     }
 }
 
@@ -2224,6 +2428,22 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
         delegate: merge_delegate(base.delegate, ov.delegate),
         orchestrator: OrchestratorConfig {
             surface: ov.orchestrator.surface.or(base.orchestrator.surface),
+            knowledge_inject: ov
+                .orchestrator
+                .knowledge_inject
+                .or(base.orchestrator.knowledge_inject),
+            knowledge_tiers: ov
+                .orchestrator
+                .knowledge_tiers
+                .or(base.orchestrator.knowledge_tiers),
+            knowledge_budget_chars: ov
+                .orchestrator
+                .knowledge_budget_chars
+                .or(base.orchestrator.knowledge_budget_chars),
+            knowledge_timeout_ms: ov
+                .orchestrator
+                .knowledge_timeout_ms
+                .or(base.orchestrator.knowledge_timeout_ms),
         },
         intent: IntentConfig {
             shadow_embedding: ov.intent.shadow_embedding.or(base.intent.shadow_embedding),
@@ -2249,6 +2469,21 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
             enabled: ov.retention.enabled.or(base.retention.enabled),
             dry_run: ov.retention.dry_run.or(base.retention.dry_run),
         },
+        memory_strength: MemoryStrengthConfig {
+            enabled: ov.memory_strength.enabled.or(base.memory_strength.enabled),
+            half_life_days: ov
+                .memory_strength
+                .half_life_days
+                .or(base.memory_strength.half_life_days),
+            search_rerank: ov
+                .memory_strength
+                .search_rerank
+                .or(base.memory_strength.search_rerank),
+            eviction_report_size: ov
+                .memory_strength
+                .eviction_report_size
+                .or(base.memory_strength.eviction_report_size),
+        },
         lint: LintConfig {
             semantic: ov.lint.semantic.or(base.lint.semantic),
         },
@@ -2271,6 +2506,7 @@ fn merge_delegate(base: DelegateConfig, ov: DelegateConfig) -> DelegateConfig {
         timeout_secs: ov.timeout_secs.or(base.timeout_secs),
         max_depth: ov.max_depth.or(base.max_depth),
         max_concurrent: ov.max_concurrent.or(base.max_concurrent),
+        context_inheritance: ov.context_inheritance.or(base.context_inheritance),
     }
 }
 
@@ -2592,6 +2828,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_classifier_env(&mut config.agentic.classifiers);
     apply_audit_env(&mut config.agentic.audit);
     apply_retention_env(&mut config.agentic.retention);
+    apply_memory_strength_env(&mut config.agentic.memory_strength);
     apply_compile_env(&mut config.agentic.compile);
     apply_lint_env(&mut config.agentic.lint);
     apply_cache_env(&mut config.agentic.cache);
@@ -2619,6 +2856,33 @@ fn apply_retention_env(cfg: &mut RetentionConfig) {
 fn apply_lint_env(cfg: &mut LintConfig) {
     if let Some(v) = env_bool("ZEN_LINT_SEMANTIC") {
         cfg.semantic = Some(v);
+    }
+}
+
+fn apply_memory_strength_env(cfg: &mut MemoryStrengthConfig) {
+    if let Some(v) = env_bool("ZEN_MEMORY_STRENGTH_ENABLED") {
+        cfg.enabled = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_MEMORY_STRENGTH_HALF_LIFE_DAYS") {
+        match v.trim().parse::<f64>() {
+            Ok(parsed) => cfg.half_life_days = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_MEMORY_STRENGTH_HALF_LIFE_DAYS is not a number; ignoring (30-day default stays)"
+            ),
+        }
+    }
+    if let Some(v) = env_bool("ZEN_MEMORY_STRENGTH_RERANK") {
+        cfg.search_rerank = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_MEMORY_STRENGTH_REPORT_SIZE") {
+        match v.trim().parse::<usize>() {
+            Ok(parsed) => cfg.eviction_report_size = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_MEMORY_STRENGTH_REPORT_SIZE is not a number; ignoring (default 20 stays)"
+            ),
+        }
     }
 }
 
@@ -2689,11 +2953,38 @@ fn apply_delegate_env(cfg: &mut DelegateConfig) {
     {
         cfg.max_concurrent = Some(n);
     }
+    if let Some(v) = env_bool("ZEN_DELEGATE_CONTEXT_INHERITANCE") {
+        cfg.context_inheritance = Some(v);
+    }
 }
 
 fn apply_orchestrator_env(cfg: &mut OrchestratorConfig) {
     if let Some(v) = env_str("ZEN_ORCHESTRATOR_SURFACE") {
         cfg.surface = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT") {
+        cfg.knowledge_inject = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_ORCHESTRATOR_KNOWLEDGE_TIERS") {
+        cfg.knowledge_tiers = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_ORCHESTRATOR_KNOWLEDGE_BUDGET_CHARS") {
+        match v.trim().parse::<usize>() {
+            Ok(parsed) => cfg.knowledge_budget_chars = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_ORCHESTRATOR_KNOWLEDGE_BUDGET_CHARS is not a number; ignoring (default 4000 stays)"
+            ),
+        }
+    }
+    if let Some(v) = env_str("ZEN_ORCHESTRATOR_KNOWLEDGE_TIMEOUT_MS") {
+        match v.trim().parse::<u64>() {
+            Ok(parsed) => cfg.knowledge_timeout_ms = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_ORCHESTRATOR_KNOWLEDGE_TIMEOUT_MS is not a number; ignoring (default 2000 stays)"
+            ),
+        }
     }
 }
 
@@ -3219,6 +3510,7 @@ mod tests {
             timeout_secs: Some(5),
             max_depth: Some(9),
             max_concurrent: Some(99),
+            ..DelegateConfig::default()
         };
         assert!(!clamped.enabled_or_default());
         assert_eq!(clamped.timeout_or_default(), 30);
@@ -3233,11 +3525,13 @@ mod tests {
 
         let ultra = OrchestratorConfig {
             surface: Some(ORCHESTRATOR_SURFACE_DELEGATION_ONLY.to_string()),
+            ..OrchestratorConfig::default()
         };
         assert!(ultra.delegation_only());
         assert!(!OrchestratorConfig::default().delegation_only());
         let typo = OrchestratorConfig {
             surface: Some("delegation_only!".to_string()),
+            ..OrchestratorConfig::default()
         };
         assert!(!typo.delegation_only(), "invalid surface degrades to full");
         let merged_orch = merge_agentic(
@@ -3611,6 +3905,313 @@ provider = "anthropic"
             "warn"
         );
         unsafe { std::env::remove_var("ZEN_COMPILE_GHOSTLINK_ENFORCEMENT") };
+    }
+
+    #[test]
+    fn memory_strength_defaults_gate_closed() {
+        let config: ZenConfig = toml::from_str("").unwrap();
+        let ms = &config.agentic.memory_strength;
+        assert!(!ms.enabled_or_default());
+        assert_eq!(ms.half_life_days_or_default(), 30.0);
+        assert!(!ms.search_rerank_or_default());
+        assert_eq!(ms.eviction_report_size_or_default(), 20);
+    }
+
+    #[test]
+    fn memory_strength_toml_sentinels_land() {
+        let config: ZenConfig = toml::from_str(
+            "[agentic.memory_strength]\n\
+             enabled = true\n\
+             half_life_days = 7.5\n\
+             search_rerank = true\n\
+             eviction_report_size = 5\n",
+        )
+        .unwrap();
+        let ms = &config.agentic.memory_strength;
+        assert_eq!(ms.enabled, Some(true));
+        assert_eq!(ms.half_life_days, Some(7.5));
+        assert_eq!(ms.search_rerank, Some(true));
+        assert_eq!(ms.eviction_report_size, Some(5));
+        assert!(ms.enabled_or_default());
+        assert_eq!(ms.half_life_days_or_default(), 7.5);
+        assert!(ms.search_rerank_or_default());
+        assert_eq!(ms.eviction_report_size_or_default(), 5);
+    }
+
+    #[test]
+    fn memory_strength_half_life_clamped_and_non_finite_falls_back() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        assert_eq!(
+            parse("[agentic.memory_strength]\nhalf_life_days = 0.2\n")
+                .agentic
+                .memory_strength
+                .half_life_days_or_default(),
+            1.0
+        );
+        assert_eq!(
+            parse("[agentic.memory_strength]\nhalf_life_days = 999.0\n")
+                .agentic
+                .memory_strength
+                .half_life_days_or_default(),
+            365.0
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cfg = MemoryStrengthConfig {
+                half_life_days: Some(bad),
+                ..MemoryStrengthConfig::default()
+            };
+            assert_eq!(cfg.half_life_days_or_default(), 30.0, "bad: {bad}");
+        }
+    }
+
+    #[test]
+    fn memory_strength_env_overrides_and_invalid_numbers_keep_default() {
+        // SAFETY: test-only env mutation; ZEN_MEMORY_STRENGTH_* are read by
+        // no sibling test in this binary and are removed at the end.
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_ENABLED", "true") };
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_HALF_LIFE_DAYS", "14") };
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_RERANK", "1") };
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_REPORT_SIZE", "3") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.memory_strength.enabled_or_default());
+        assert_eq!(
+            cfg.agentic.memory_strength.half_life_days_or_default(),
+            14.0
+        );
+        assert!(cfg.agentic.memory_strength.search_rerank_or_default());
+        assert_eq!(
+            cfg.agentic
+                .memory_strength
+                .eviction_report_size_or_default(),
+            3
+        );
+
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_HALF_LIFE_DAYS", "abc") };
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_REPORT_SIZE", "xyz") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.memory_strength.half_life_days, None);
+        assert_eq!(
+            cfg.agentic.memory_strength.half_life_days_or_default(),
+            30.0
+        );
+        assert_eq!(cfg.agentic.memory_strength.eviction_report_size, None);
+        assert_eq!(
+            cfg.agentic
+                .memory_strength
+                .eviction_report_size_or_default(),
+            20
+        );
+
+        unsafe { std::env::remove_var("ZEN_MEMORY_STRENGTH_ENABLED") };
+        unsafe { std::env::remove_var("ZEN_MEMORY_STRENGTH_HALF_LIFE_DAYS") };
+        unsafe { std::env::remove_var("ZEN_MEMORY_STRENGTH_RERANK") };
+        unsafe { std::env::remove_var("ZEN_MEMORY_STRENGTH_REPORT_SIZE") };
+    }
+
+    #[test]
+    fn memory_strength_merge_overlay_wins_base_survives_absent() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let merged = merge_configs(
+            parse("[agentic.memory_strength]\nenabled = true\nhalf_life_days = 10.0\n"),
+            parse("[agentic.memory_strength]\nhalf_life_days = 20.0\nsearch_rerank = true\n"),
+        )
+        .unwrap();
+        let ms = &merged.agentic.memory_strength;
+        assert_eq!(ms.enabled, Some(true));
+        assert_eq!(ms.half_life_days, Some(20.0));
+        assert_eq!(ms.search_rerank, Some(true));
+        assert_eq!(ms.eviction_report_size, None);
+    }
+
+    #[test]
+    fn knowledge_inject_defaults_on_modes_parse_invalid_falls_off() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let mode = |c: &ZenConfig| c.agentic.orchestrator.knowledge_inject_mode();
+
+        // Absent ⇒ On — owner decision D-F revised (the sole non-closed
+        // Phase 31 gate).
+        assert_eq!(mode(&parse("")), KnowledgeInjectMode::On);
+        assert_eq!(
+            mode(&parse(
+                "[agentic.orchestrator]\nknowledge_inject = \"off\"\n"
+            )),
+            KnowledgeInjectMode::Off
+        );
+        assert_eq!(
+            mode(&parse(
+                "[agentic.orchestrator]\nknowledge_inject = \"shadow\"\n"
+            )),
+            KnowledgeInjectMode::Shadow
+        );
+        assert_eq!(
+            mode(&parse(
+                "[agentic.orchestrator]\nknowledge_inject = \"ON\"\n"
+            )),
+            KnowledgeInjectMode::On
+        );
+        // Invalid ⇒ Off (must NOT default to On) and no panic.
+        assert_eq!(
+            mode(&parse(
+                "[agentic.orchestrator]\nknowledge_inject = \"banana\"\n"
+            )),
+            KnowledgeInjectMode::Off
+        );
+    }
+
+    #[test]
+    fn knowledge_tiers_budget_timeout_defaults_and_clamps() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let absent = parse("");
+        assert_eq!(
+            absent.agentic.orchestrator.knowledge_tiers_or_default(),
+            "fts"
+        );
+        assert_eq!(
+            absent
+                .agentic
+                .orchestrator
+                .knowledge_budget_chars_or_default(),
+            4000
+        );
+        assert_eq!(
+            absent
+                .agentic
+                .orchestrator
+                .knowledge_timeout_ms_or_default(),
+            2000
+        );
+
+        let tuned = parse(
+            "[agentic.orchestrator]\n\
+             knowledge_tiers = \"fts,vec\"\n\
+             knowledge_budget_chars = 8000\n\
+             knowledge_timeout_ms = 250\n",
+        );
+        assert_eq!(
+            tuned.agentic.orchestrator.knowledge_tiers_or_default(),
+            "fts,vec"
+        );
+        assert_eq!(
+            tuned
+                .agentic
+                .orchestrator
+                .knowledge_budget_chars_or_default(),
+            8000
+        );
+        assert_eq!(
+            tuned.agentic.orchestrator.knowledge_timeout_ms_or_default(),
+            250
+        );
+
+        let clamped = parse("[agentic.orchestrator]\nknowledge_budget_chars = 10\n");
+        assert_eq!(
+            clamped
+                .agentic
+                .orchestrator
+                .knowledge_budget_chars_or_default(),
+            512
+        );
+        let clamped_high = parse("[agentic.orchestrator]\nknowledge_budget_chars = 999999\n");
+        assert_eq!(
+            clamped_high
+                .agentic
+                .orchestrator
+                .knowledge_budget_chars_or_default(),
+            16000
+        );
+    }
+
+    #[test]
+    fn knowledge_env_overrides_and_invalid_numbers_keep_default() {
+        // SAFETY: test-only env mutation; ZEN_ORCHESTRATOR_KNOWLEDGE_* are
+        // read by no sibling test in this binary and removed at the end.
+        unsafe { std::env::set_var("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT", "shadow") };
+        unsafe { std::env::set_var("ZEN_ORCHESTRATOR_KNOWLEDGE_TIERS", "fts,graph") };
+        unsafe { std::env::set_var("ZEN_ORCHESTRATOR_KNOWLEDGE_BUDGET_CHARS", "8000") };
+        unsafe { std::env::set_var("ZEN_ORCHESTRATOR_KNOWLEDGE_TIMEOUT_MS", "500") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.orchestrator.knowledge_inject_mode(),
+            KnowledgeInjectMode::Shadow
+        );
+        assert_eq!(
+            cfg.agentic.orchestrator.knowledge_tiers_or_default(),
+            "fts,graph"
+        );
+        assert_eq!(
+            cfg.agentic.orchestrator.knowledge_budget_chars_or_default(),
+            8000
+        );
+        assert_eq!(
+            cfg.agentic.orchestrator.knowledge_timeout_ms_or_default(),
+            500
+        );
+
+        unsafe { std::env::set_var("ZEN_ORCHESTRATOR_KNOWLEDGE_BUDGET_CHARS", "lots") };
+        unsafe { std::env::set_var("ZEN_ORCHESTRATOR_KNOWLEDGE_TIMEOUT_MS", "soon") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.orchestrator.knowledge_budget_chars, None);
+        assert_eq!(
+            cfg.agentic.orchestrator.knowledge_budget_chars_or_default(),
+            4000
+        );
+        assert_eq!(cfg.agentic.orchestrator.knowledge_timeout_ms, None);
+        assert_eq!(
+            cfg.agentic.orchestrator.knowledge_timeout_ms_or_default(),
+            2000
+        );
+
+        unsafe { std::env::remove_var("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT") };
+        unsafe { std::env::remove_var("ZEN_ORCHESTRATOR_KNOWLEDGE_TIERS") };
+        unsafe { std::env::remove_var("ZEN_ORCHESTRATOR_KNOWLEDGE_BUDGET_CHARS") };
+        unsafe { std::env::remove_var("ZEN_ORCHESTRATOR_KNOWLEDGE_TIMEOUT_MS") };
+    }
+
+    #[test]
+    fn knowledge_merge_overlay_wins() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let merged = merge_configs(
+            parse("[agentic.orchestrator]\nknowledge_inject = \"off\"\nknowledge_budget_chars = 1000\n"),
+            parse("[agentic.orchestrator]\nknowledge_inject = \"shadow\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.agentic.orchestrator.knowledge_inject_mode(),
+            KnowledgeInjectMode::Shadow
+        );
+        assert_eq!(
+            merged
+                .agentic
+                .orchestrator
+                .knowledge_budget_chars_or_default(),
+            1000
+        );
+    }
+
+    #[test]
+    fn delegate_context_inheritance_defaults_closed_toml_env_merge() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        assert!(!parse("").agentic.delegate.context_inheritance_or_default());
+        assert!(
+            parse("[agentic.delegate]\ncontext_inheritance = true\n")
+                .agentic
+                .delegate
+                .context_inheritance_or_default()
+        );
+
+        let merged = merge_configs(
+            parse("[agentic.delegate]\ncontext_inheritance = true\n"),
+            parse("[agentic.delegate]\ncontext_inheritance = false\n"),
+        )
+        .unwrap();
+        assert!(!merged.agentic.delegate.context_inheritance_or_default());
+
+        // SAFETY: test-only env mutation; ZEN_DELEGATE_CONTEXT_INHERITANCE is
+        // read by no sibling test in this binary and removed at the end.
+        unsafe { std::env::set_var("ZEN_DELEGATE_CONTEXT_INHERITANCE", "true") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.delegate.context_inheritance_or_default());
+        unsafe { std::env::remove_var("ZEN_DELEGATE_CONTEXT_INHERITANCE") };
     }
 
     #[test]
