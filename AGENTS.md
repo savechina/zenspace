@@ -496,7 +496,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen wps` | Work process utilities | `wps_command.rs` |
 | `zen version` | Show version | `cli.rs` inline |
 | `zen session` | Session lifecycle | `session_command.rs` |
-| `zen serve` | Gateway daemon: start [--foreground] [--http] / status / stop / mcp / install / uninstall (macOS launchd LaunchAgent); `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
+| `zen serve` | Gateway daemon: start [--foreground] [--http] / status [--json] / stop / restart / mcp / install / uninstall (macOS launchd LaunchAgent); `status` shows binary vs running-daemon version with a `STALE`/`STALE-unknown` marker (JSON: `versionState`/`stale`/`binaryVersion`/`daemonVersion`); `restart` = `launchctl kickstart -k gui/{uid}/dev.zen.serve` when the LaunchAgent plist exists, else graceful stop (SIGTERM drain ≤10s + audited cancels) + start under StartupLock/readiness — a stopped daemon makes restart a plain start; `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
 | `zen agent` | Agent registry | `agent_command.rs` |
 | `zen workspace` | `.zen/` structure | `workspace_command.rs` |
 | `zen config` | Config layers | `config_command.rs` |
@@ -512,7 +512,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen skill` | Skill management (list, run, progress, show, precipitate, confirm) | `skill_command.rs` |
 | `zen discover` | Self-learning gate surface (PD-06): run (one zen-loop cycle now — stages 5b/5c/5d), stage/queue, confirm/reject (Hybrid C promotion gate; BeliefEvidence applies `Belief::update` on confirm), report (discover metrics, reads `loop-last-report.json`), arena (distill regression gate vs baselines/external CLIs — every lost case is staged as an improvement hypothesis under `wiki/wisdom/hypotheses/`) | `discover_command.rs` |
 | `zen sandbox` | OS-level sandbox surface: `run` (exec a binary under the active sandbox mode), `status`, `policy`, `test` (verify isolation works) | `sandbox_command.rs` |
-| `zen doctor` | System health: 8 liveness probes (config, state.db, memories, daemon, loop, provider, vault, outbox — staged briefs + unconfigured qqbot ⇒ FAIL with actionable message); `--json` machine output; exit 0 all-green / 1 any-fail | `doctor_command.rs` |
+| `zen doctor` | System health: 9 liveness probes (config, state.db, memories, daemon, daemon-version, loop, provider, vault, outbox — staged briefs + unconfigured qqbot ⇒ FAIL with actionable message; daemon-version: running explicit daemon whose pid-record version mismatches/is unknown ⇒ FAIL with "run `zen serve restart`", daemon-down or implicit daemon ⇒ pass); `--json` machine output; exit 0 all-green / 1 any-fail | `doctor_command.rs` |
 
 ## AGENT TOOL INVENTORY (v0.0.6)
 
@@ -555,6 +555,22 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 
 `zen serve install` / `zen serve uninstall` manage a macOS LaunchAgent for the gateway daemon:
 
+**Scope logic — `[gateway] upgrade_policy`** (Phase 30 G3):
+```
+[gateway] upgrade_policy
+  Functionality: selects what the stale-daemon detection points (`zen serve status` human mode,
+    TUI prewarm) do when the running daemon binary ≠ invoking CLI binary (post-`brew upgrade` case)
+  User impact: `warn` surfaces only (status STALE marker, doctor `daemon-version` FAIL, TUI banner
+    hint); `auto-restart` additionally runs the `zen serve restart` drain-restart on the spot —
+    in-flight turns drain ≤10s then cancel with audit lines; one restart + one reconnect, never a loop
+  Default: `warn` (gate-closed, owner decision D-A); invalid values fall back to `warn` with a
+    tracing warning (never silent — cron-timezone discipline)
+  Interaction: env `ZEN_GATEWAY_UPGRADE_POLICY` (5th layer) overrides config layers; applies ONLY to
+    explicit/launchd daemons (implicit TUI-spawned daemons run the current binary and never trigger);
+    `zen doctor` daemon-version probe is diagnose-only regardless of policy; `zen serve status --json`
+    reports without acting so machine consumers decide
+```
+
 ```
 zen serve install
   Functionality: writes ~/Library/LaunchAgents/dev.zen.serve.plist with:
@@ -580,18 +596,22 @@ Implementation: `render_plist()` is a pure function (unit-testable); `gui_domain
 
 ### zen doctor System Health
 
-`zen doctor` runs 7 liveness probes with JSON/human dual output (Principle IX):
+`zen doctor` runs 9 liveness probes with JSON/human dual output (Principle IX):
 
 ```
 zen doctor [--json]
-  Functionality: runs 7 isolated health checks:
+  Functionality: runs 9 isolated health checks:
     1. config: load_config() succeeds (4-layer global)
     2. state.db: exists + readable (file header check)
     3. memories: memvid store under {global}/memories/ exists (count/size)
     4. daemon: gateway socket alive (UDS connect or file-exists)
-    5. loop: last cycle evidence (loop-last-report.json mtime <2× interval)
-    6. provider: configured provider resolves API key OR ollama-local
-    7. vault: {global}/vault/ exists, git work-tree, inbox/wiki/raw counts
+    5. daemon-version (Phase 30 G3): running explicit daemon's pid-record version vs binary —
+       mismatch/unknown (pre-version record) ⇒ FAIL "run `zen serve restart`"; daemon-down or
+       implicit daemon (no pid record — runs current binary by construction) ⇒ pass; diagnose-only
+    6. loop: last cycle evidence (loop-last-report.json mtime <2× interval)
+    7. provider: configured provider resolves API key OR ollama-local
+    8. vault: {global}/vault/ exists, git work-tree, inbox/wiki/raw counts
+    9. outbox (T189): staged morning-briefs + unconfigured [channels.qqbot] ⇒ FAIL naming the fix
   User impact: exit 0 all-green / exit 1 any-fail; --json for machine parsing
   Default: human-readable one-line-per-check output
   Interaction: exit code follows Principle IX conventional exit codes
@@ -770,7 +790,7 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
   - **T195 (W1, HIGH) MemvidIndexer 重扎根 Path Spec v2（已修）** — indexer 仍按 v2 之前的布局扫描 `{workspace_root}/memories/journal` + `{workspace_root}/wiki/...`，而真实位置是 `~/.zen/memories/journal` + `~/.zen/vault/wiki/...`：**不存在任何 workspace_root 取值能让两组 join 同时命中**（`find_workspace_root` 结构上不返回 global_root）⇒ 夜间 memvid-indexer 生产上是静默 no-op（None-skip 或空目录），M2/M3/M4 从未进入 memvid；`memory/rebuild` RPC 半边空转；doctor 保持绿色；测试全绿只因自建旧布局。修复：`MemvidIndexer::new(memory_root, wiki_root)` 显式双根；worker None-skip **删除**（fail-loud）；RPC 去掉 workspace_root 前置；**M3 递归遍历**（walkdir 既有依赖——生产 notion 页在 `notions/technology/` 下，`wiki_compile.rs:314`，平铺 read_dir 即使根正确也会漏掉 M3；checksum 集与遍历集镜像）；判别性回归测试 `index_all_reads_path_spec_v2_layout`（真实 v2 布局 × 每 tier 恰一文件 ⇒ 3/3 总数即逐 tier 判别，旧代码只得 1）。
   - **T196/T197/T199（已修）** — `build_env_info` 标签撒谎（`Git branch:` 渲染 session_id、`Model:` 渲染 agent_name → 改 `Session:`/`Agent:`）；`loop_wisdom_test.rs:416` 过期注释（commit_cycle_to_git 早已 vault-based）改正；`workspace_id` 溯源标签随 daemon cwd 漂移 → 消费者审计证实**全 workspace 零读者**（graph_router 三个 stamp 点纯写入）⇒ 不透明标签 ⇒ None 时确定性回落 `"global"`，测试钉住。
   - **T198/T200（记录）** — `ZEN_WORKSPACE` env override（接受任意存在目录）补进本文件 Path scoping；daemon workspace 契约记录：launchd daemon（cwd=/）workspace_root=None 是**正常 hosted 形态**——全局树全功能，hosted turn 不支持项目 workspace 写入（sandbox 报错已含补救指引）；identity AGENTS.md 的 workspace 回退在 launchd 下永不可见 = 已接受的表面不对称。
-  - **Phase 30 gateway 升级管理（设计已定，T201-T205 待实施）** — 一手研究 `codex-rs/app-server-daemon`（11 项机制全表）+ pi 无 daemon 教训；zen 已有握手版本协商（`negotiate_version` MAJOR 相等 + client minor ≤ server minor，`-32001{recovery}`）但**线上版本信息零消费者**。设计：G1 pid 记录+status 双版本可见（STALE 标记）、G2 `zen serve restart`（launchd kickstart -k / 优雅 drain+start）、G3 三入口诊断 + `[gateway] upgrade_policy=warn|auto-restart`（owner 决策：默认 **warn**，gate-closed）、G4 迁移竞态审计（SELECT */位置映射证据）、G5 契约 additive 补遗 + runbook；G6（codex 式独立 updater + 包解耦）**owner 决策推迟**（brew/cargo 单渠道；revisit trigger=分发渠道变化或 remote-control 需求）。设计记录 `docs/designs/gateway-upgrade-management.md`。
+  - **Phase 30 gateway 升级管理（已实施，T201-T205）** — 一手研究 `codex-rs/app-server-daemon`（11 项机制全表）+ pi 无 daemon 教训；zen 已有握手版本协商（`negotiate_version` MAJOR 相等 + client minor ≤ server minor，`-32001{recovery}`）但**线上版本信息零消费者**。落地：G1 pid 记录 additive `version`/`protocol`（legacy 形状容错，never parse-error；顺带修复 pre-existing bug——bare-pid 回退分支因 JSON number 误入 object 分支而不可达）+ `zen serve status [--json]` Binary vs Daemon 双版本 + STALE/STALE-unknown 标记；G2 `zen serve restart`（launchd 在装 ⇒ `launchctl kickstart -k gui/{uid}/dev.zen.serve` + readiness poll（复用 READY_BUDGET）；否则优雅 stop（既有 SIGTERM drain）+ StartupLock 下 start；Start/Stop 体**提取复用非复制**；stopped daemon ⇒ restart=plain start）；G3 `[gateway] upgrade_policy=warn|auto-restart`（owner 决策 D-A：默认 **warn**，gate-closed；非法值 ⇒ warn+tracing::warn 绝不静默）三入口诊断（status STALE + policy action 仅 human 模式、doctor 第 9 探针 daemon-version 仅诊断、TUI prewarm health/status 对比 + -32001 ⇒ banner 提示一次 + auto-restart ⇒ 一次 restart+reconnect 绝无循环；隐式 daemon 结构上不触发）；G4 迁移竞态审计 **PASS**（zen-repo 零 `SELECT *`；唯一位置映射 notions_repo.rs:1050-1052 读固定显式投影——additive 列不可移位；结构性注意：容忍度依赖 Principle XIII 的 NOT NULL DEFAULT 纪律）；G5 契约 additive 补遗（contracts/00 §Addendum：pid 形状 + 版本消费约定，无 RPC/错误目录变更）+ spec Configuration Surface `[gateway]` 行 + 升级 runbook（设计记录 §5）。G6（codex 式独立 updater + 包解耦）**owner 决策推迟**（brew/cargo 单渠道；revisit trigger=分发渠道变化或 remote-control 需求）。测试 +23（config 5 / pid_record 4 / serve 4 / doctor 5 / prewarm 5）。设计记录 `docs/designs/gateway-upgrade-management.md`。
   - **Phase 31 特性波（设计完成，5 个 owner 决策待答）** — `docs/designs/memory-strength-knowledge-wave.md`：① 记忆遗忘曲线 = **纯函数派生强度**（不存储、零迁移——Ebbinghaus `R=0.5^(t/(HL×(1+log2(1+n))))`，HL 复用既有 `RECENCY_HALF_LIFE_DAYS=30`，n=access_count+citations 来自既有 MemoryReward sidecar，anchor=max(内容日期,last_reward_at)，belief.rs 锚点纪律；T153 复合衰减 bug 类被结构性排除——无累计状态）；indexer additive 写 `source_path` extra_metadata（memvid-core PutOptions 支持，SearchHitMetadata 回读）；消费者=ranking-only（gateway memory/search rerank + select_cards，config 门默认关）+ 夜间 report-only 低强度清单（retention 检疫先例，永不删除）。② `.agents/skills` 标准发现面（codex+pi 双双收敛的中立面）：SkillLoader 多根（zen-native > 项目 > 用户，first-wins+warn）、`export-skill --target agents`。③ orchestrator 知识注入：`[agentic.orchestrator] knowledge_inject` 门（默认关，T138 纪律），仅对 knowledge 为空的非 TUI 面（gateway/qqbot 今天拿不到任何 KB 上下文），Conversation 类跳过，FTS tier + 4000 字符预算 + 超时 fail-open。④ sub-agent 上下文继承：`compose_sub_session` 单缝（run_single ⇒ plan.execute/resume 自动覆盖），`[agentic.delegate] context_inheritance` 门，深度减半预算，loop.delegate.gates additive 遥测。⑤ 链路加固：fan-out **硬上限 8**（记录值复用，今天代码无上限=spec 漂移）、reservation refund-on-early-error 回归钉、resume 审计 `checkpoint_age_secs`。
   - 门禁：`bin/lint` exit 0；`bin/test` **2986 passed / 0 failed / 25 skipped**（基线 2984，+2 = v2 布局回归 + workspace_id 回落）。
   - **基础设施备注（诚实记录）**：本日 explore/librarian/plan 三类 subagent 全部因模型下线失败（mimo-v2.5-free deprecated / muse-spark-1.3-contributor-free 缺失）；`general` 通道正常——修复批（28min）与特性设计（15min）均由 general 代理完成并经主会话 diff 抽查 + 独立测试复跑核验。

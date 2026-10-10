@@ -1,9 +1,20 @@
 # Memory Strength × Knowledge Wave — 设计记录 (Phase 31 candidate)
 
-**Date**: 2026-10-10 · **Status**: PROPOSED — 5 owner decisions pending (see "Open questions" §)
+**Date**: 2026-10-10 · **Status**: ACCEPTED — owner decisions resolved (see below; OQ-4 dissolved by the T195 re-root landing `4529f1c`). Ledger: tasks.md Phase 31 (renumbered T206-T218).
 **Scope**: 记忆遗忘曲线 (Ebbinghaus retention strength) · `.agents/skills` 标准发现面 · orchestrator 知识文档注入 · sub-agent 上下文继承 · 调度链路加固 (fan-out cap 8, refund pin, checkpoint age)
 **Method**: read-only design pass, every wiring point file:line-verified against the tree (designer reasoning trace included verbatim below — citations are the evidence of record).
 **ID note**: designer used T200-T223; tasks.md Phase 31 renumbers to avoid the Phase 30 (gateway upgrade T201-T205) collision.
+
+## Owner Decisions (2026-10-10, resolved)
+
+| # | Question | Decision |
+|---|----------|----------|
+| OQ-1 | Skill-root precedence | **zen-native first** (`~/.zen/skills` > workspace `.agents/skills` closest-wins > `~/.agents/skills`), collisions first-wins + warn (pi precedent); `skill_export_discovery` contract stability protected; overrides remain possible via `--output` / `auto_route:false` |
+| OQ-2 | Knowledge-inject default | **REVISED by owner → default ON** ("作为个人 agent 最重要的是知识管理" — knowledge management IS the product). The designer's ship-false recommendation followed T138's no-flip discipline; owner ruling: that discipline binds the TUI *fusion* default (unchanged: `knowledge_tiers="fts"`), not whether hosted surfaces get KB context at all (today: zero). Safety envelope for default-on: empty-knowledge precondition (no double retrieval on TUI surfaces), Conversation-category skip, 4000-char budget, 2000ms timeout fail-open, `loop.knowledge.injected` audit as live observability. `shadow` mode retained for measurement; `off` keeps a byte-identity pin |
+| OQ-3 | Strength-rerank scope | **Both consumers, one flag**: gateway `memory/search` + `select_cards` behind `[agentic.memory_strength] search_rerank` (default off — ranking-only, calibration debt until arena measurement) |
+| OQ-4 | Sequencing vs memvid re-root | **Dissolved**: the re-root landed (`4529f1c`) before this phase starts; C3/T208 builds on the `(memory_root, wiki_root)` shape with recursive M3 walk |
+| OQ-5 | Fan-out cap | **Enforce the recorded 8** (hard reject `tasks.len() > 8` in `parse_requests`, structured model-readable error; 8 = AGENTS.md/spec recorded value — reuse, not invention) |
+
 
 ---
 
