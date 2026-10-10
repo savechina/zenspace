@@ -54,6 +54,14 @@ pub struct PidRecord {
     /// Native start-instant repr (`ps -o lstart=` output); `None` for
     /// legacy bare-pid files or when unverifiable.
     pub start: Option<String>,
+    /// Daemon binary version (`CARGO_PKG_VERSION` at write time, Phase 30
+    /// G1); `None` for records written before the field existed — readers
+    /// must treat `None` as "version unknown, predates the current build",
+    /// never as a parse error.
+    pub version: Option<String>,
+    /// Protocol version the daemon speaks (`SERVER_PROTOCOL_VERSION` at
+    /// write time, Phase 30 G1); `None` for pre-field records.
+    pub protocol: Option<String>,
 }
 
 /// Best-effort OS-native identity of `pid`'s start instant.
@@ -105,6 +113,8 @@ pub fn write_pid_for<P: AsRef<Path>>(path: P, pid: u32) -> std::io::Result<()> {
     let record = serde_json::json!({
         "pid": pid,
         "start": process_start_token(pid),
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": crate::protocol::SERVER_PROTOCOL_VERSION,
     });
     let body = record.to_string();
     let target = path.as_ref();
@@ -186,21 +196,37 @@ pub fn read_pid<P: AsRef<Path>>(path: P) -> std::io::Result<u32> {
 
 fn parse_pid_record(content: &str) -> std::io::Result<PidRecord> {
     let trimmed = content.trim();
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+    // Object gate: a bare-pid file ("4242") is also valid JSON (a number),
+    // so without `is_object` the legacy fallback below is unreachable and
+    // pre-JSON pid files fail to parse.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && v.is_object()
+    {
         let pid = v
             .get("pid")
             .and_then(serde_json::Value::as_u64)
             .filter(|p| *p <= u64::from(u32::MAX))
             .ok_or_else(|| invalid("missing pid"))? as u32;
-        let start = v
-            .get("start")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        return Ok(PidRecord { pid, start });
+        let str_field = |key: &str| {
+            v.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        return Ok(PidRecord {
+            pid,
+            start: str_field("start"),
+            version: str_field("version"),
+            protocol: str_field("protocol"),
+        });
     }
     trimmed
         .parse::<u32>()
-        .map(|pid| PidRecord { pid, start: None })
+        .map(|pid| PidRecord {
+            pid,
+            start: None,
+            version: None,
+            protocol: None,
+        })
         .map_err(|e| invalid(&e.to_string()))
 }
 

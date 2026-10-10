@@ -82,6 +82,8 @@ pub struct ZenConfig {
     pub agentic: AgenticConfig,
     /// Skill auto-routing (`[skills.*]`, 005-agentic-loop T076).
     pub skills: SkillsConfig,
+    /// Gateway daemon section (`[gateway]`, Phase 30 G3).
+    pub gateway: GatewayConfig,
 }
 
 /// Sandbox hardening config — `[sandbox.*]` sections (T091).
@@ -128,6 +130,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             sandbox: SandboxConfig,
             agentic: AgenticConfig,
             skills: SkillsConfig,
+            gateway: GatewayConfig,
         }
 
         let shadow = ZenConfigShadow::deserialize(deserializer)?;
@@ -151,6 +154,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             sandbox: shadow.sandbox,
             agentic: shadow.agentic,
             skills: shadow.skills,
+            gateway: shadow.gateway,
         })
     }
 }
@@ -1201,6 +1205,66 @@ impl CacheConfig {
 const COMPILE_GHOSTLINK_STRIP: &str = "strip";
 const COMPILE_GHOSTLINK_WARN: &str = "warn";
 
+/// Valid `[gateway] upgrade_policy` value: surface the stale daemon but
+/// never act on it (default).
+pub const GATEWAY_UPGRADE_WARN: &str = "warn";
+/// Valid `[gateway] upgrade_policy` value: stale-daemon detection points
+/// (`zen serve status`, TUI prewarm) execute the drain-restart flow.
+pub const GATEWAY_UPGRADE_AUTO_RESTART: &str = "auto-restart";
+
+/// Gateway daemon section — TOML `[gateway]` (Phase 30 G3).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: `upgrade_policy` decides what the stale-daemon detection
+///   points do when the running gateway daemon was built from a different
+///   binary than the invoking CLI (the post-`brew upgrade` case): `warn`
+///   surfaces a STALE marker / doctor FAIL / TUI hint, `auto-restart`
+///   additionally executes the `zen serve restart` drain-restart flow.
+/// - User impact: `auto-restart` cancels in-flight daemon turns after the
+///   ≤10s drain window (audited) whenever a detection point fires — this is
+///   why the policy ships as `warn` (gate-closed, owner decision D-A).
+/// - Default: `warn`. Unparsable values fall back to `warn` with a
+///   `tracing::warn` (cron-timezone discipline: a typo must never silently
+///   change behavior).
+/// - Interaction: env `ZEN_GATEWAY_UPGRADE_POLICY` (5th layer) overrides any
+///   config file layer. Applies only to explicit/launchd daemons — implicit
+///   TUI-spawned daemons run the current binary by construction and never
+///   trigger the policy. `zen doctor`'s daemon-version probe diagnoses but
+///   never acts, regardless of policy.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct GatewayConfig {
+    /// Stale-daemon action — TOML `upgrade_policy` (absent → "warn").
+    pub upgrade_policy: Option<String>,
+}
+
+impl GatewayConfig {
+    /// Effective upgrade policy: "warn" (default) or "auto-restart"; any
+    /// other value warns and degrades to "warn" so a typo can never
+    /// silently enable daemon restarts.
+    pub fn upgrade_policy_or_default(&self) -> &'static str {
+        match self.upgrade_policy.as_deref() {
+            None => GATEWAY_UPGRADE_WARN,
+            Some(v) if v.eq_ignore_ascii_case(GATEWAY_UPGRADE_WARN) => GATEWAY_UPGRADE_WARN,
+            Some(v) if v.eq_ignore_ascii_case(GATEWAY_UPGRADE_AUTO_RESTART) => {
+                GATEWAY_UPGRADE_AUTO_RESTART
+            }
+            Some(other) => {
+                tracing::warn!(
+                    value = other,
+                    "invalid [gateway] upgrade_policy; using \"warn\""
+                );
+                GATEWAY_UPGRADE_WARN
+            }
+        }
+    }
+
+    /// Whether detection points should drain-restart a stale daemon.
+    pub fn auto_restart(&self) -> bool {
+        self.upgrade_policy_or_default() == GATEWAY_UPGRADE_AUTO_RESTART
+    }
+}
+
 /// Skill sections — TOML `[skills.*]` (005-agentic-loop, T076).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -2143,6 +2207,12 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         sandbox: merge_sandbox(base.sandbox, override_cfg.sandbox),
         agentic: merge_agentic(base.agentic, override_cfg.agentic),
         skills: merge_skills(base.skills, override_cfg.skills),
+        gateway: GatewayConfig {
+            upgrade_policy: override_cfg
+                .gateway
+                .upgrade_policy
+                .or(base.gateway.upgrade_policy),
+        },
     })
 }
 
@@ -2527,7 +2597,14 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_cache_env(&mut config.agentic.cache);
     apply_skills_env(&mut config.skills.auto_route);
     apply_tui_env(&mut config.tui);
+    apply_gateway_env(&mut config.gateway);
     config
+}
+
+fn apply_gateway_env(cfg: &mut GatewayConfig) {
+    if let Some(v) = env_str("ZEN_GATEWAY_UPGRADE_POLICY") {
+        cfg.upgrade_policy = Some(v);
+    }
 }
 
 fn apply_retention_env(cfg: &mut RetentionConfig) {
@@ -3680,6 +3757,70 @@ mod tui_config_tests {
             let cfg: ZenConfig = toml::from_str(&toml_str).expect("parse mode");
             assert_eq!(cfg.tui.knowledge_search, expected, "mode: {raw}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_config_tests {
+    use super::{
+        GATEWAY_UPGRADE_AUTO_RESTART, GATEWAY_UPGRADE_WARN, ZenConfig, apply_env_overrides,
+    };
+
+    #[test]
+    fn upgrade_policy_defaults_to_warn() {
+        let cfg: ZenConfig = toml::from_str("").expect("empty config");
+        assert_eq!(
+            cfg.gateway.upgrade_policy_or_default(),
+            GATEWAY_UPGRADE_WARN
+        );
+        assert!(!cfg.gateway.auto_restart());
+    }
+
+    #[test]
+    fn upgrade_policy_parses_auto_restart_case_insensitively() {
+        for raw in ["auto-restart", "AUTO-RESTART", "Auto-Restart"] {
+            let cfg: ZenConfig =
+                toml::from_str(&format!("[gateway]\nupgrade_policy = \"{raw}\"")).expect("parse");
+            assert_eq!(
+                cfg.gateway.upgrade_policy_or_default(),
+                GATEWAY_UPGRADE_AUTO_RESTART,
+                "raw: {raw}"
+            );
+            assert!(cfg.gateway.auto_restart(), "raw: {raw}");
+        }
+    }
+
+    #[test]
+    fn upgrade_policy_invalid_value_falls_back_to_warn() {
+        let cfg: ZenConfig =
+            toml::from_str("[gateway]\nupgrade_policy = \"restart-everything\"").expect("parse");
+        assert_eq!(
+            cfg.gateway.upgrade_policy_or_default(),
+            GATEWAY_UPGRADE_WARN
+        );
+        assert!(!cfg.gateway.auto_restart());
+    }
+
+    #[test]
+    fn upgrade_policy_env_override_applies() {
+        // SAFETY: test-only env mutation; ZEN_GATEWAY_UPGRADE_POLICY is read
+        // by no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_GATEWAY_UPGRADE_POLICY", "auto-restart") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.gateway.auto_restart());
+        unsafe { std::env::remove_var("ZEN_GATEWAY_UPGRADE_POLICY") };
+    }
+
+    #[test]
+    fn upgrade_policy_env_invalid_keeps_parse_safe() {
+        // SAFETY: test-only env mutation; removed at the end.
+        unsafe { std::env::set_var("ZEN_GATEWAY_UPGRADE_POLICY", "bogus") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.gateway.upgrade_policy_or_default(),
+            GATEWAY_UPGRADE_WARN
+        );
+        unsafe { std::env::remove_var("ZEN_GATEWAY_UPGRADE_POLICY") };
     }
 }
 

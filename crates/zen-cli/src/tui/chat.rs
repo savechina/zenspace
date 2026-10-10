@@ -448,9 +448,16 @@ impl App {
                                 self.invalidate_output_cache();
                             }
                             self.current_response_tokens = response.len() / 4;
-                            self.gateway_banner = super::banner::GatewayBannerState::Ok(
-                                zen_gateway::protocol::SERVER_PROTOCOL_VERSION.to_string(),
-                            );
+                            let protocol =
+                                zen_gateway::protocol::SERVER_PROTOCOL_VERSION.to_string();
+                            // Phase 30 G3: the prewarm-recorded stale hint rides
+                            // the Ok banner (visible one-row warn, viewport-safe).
+                            self.gateway_banner = match super::prewarm::stale_hint() {
+                                Some(hint) => super::banner::GatewayBannerState::Ok(format!(
+                                    "{protocol} — {hint}"
+                                )),
+                                None => super::banner::GatewayBannerState::Ok(protocol),
+                            };
                             self.auto_scroll = true;
                             self.chat_history.push((_query.clone(), response.clone()));
                             if let Some(store) = &self.conversation_store {

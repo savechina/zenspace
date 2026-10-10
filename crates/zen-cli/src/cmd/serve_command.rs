@@ -43,8 +43,35 @@ pub enum ServeCommands {
     },
     /// Stop the gateway server
     Stop,
+    /// Restart the gateway daemon under the current binary (Phase 30 G2)
+    ///
+    /// Functionality: launchd-installed (plist present) ⇒ `launchctl
+    ///   kickstart -k gui/{uid}/dev.zen.serve` (KeepAlive relaunches and
+    ///   PATH resolves the NEW binary); otherwise graceful stop (SIGTERM,
+    ///   drain ≤10s, audited cancels) then a background start under the
+    ///   existing StartupLock/readiness semantics.
+    /// User impact: in-flight daemon turns drain for ≤10s then cancel with
+    ///   audit lines; this is the recommended follow-up to `brew upgrade`.
+    /// Default: manual stop+start (launchd path only when the plist exists).
+    /// Interaction: a stopped daemon makes restart a plain start; idempotent
+    ///   like start (a live post-kickstart daemon answers the readiness
+    ///   probe). `[gateway] upgrade_policy = "auto-restart"` runs this flow
+    ///   automatically at the status/TUI stale-detection points.
+    Restart,
     /// Show gateway server status
-    Status,
+    ///
+    /// Functionality: binary version vs running daemon version with a STALE
+    ///   marker when they differ (unknown daemon version ⇒ STALE-unknown).
+    /// User impact: `--json` emits the machine-readable status object.
+    /// Default: human-readable output.
+    /// Interaction: with `[gateway] upgrade_policy = "auto-restart"`, a
+    ///   STALE daemon is drain-restarted on the spot (human mode only —
+    ///   `--json` reports without acting so machine consumers decide).
+    Status {
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Test MCP server connectivity
     Test {
         /// Port of the gateway (default: 9876)
@@ -70,13 +97,29 @@ pub enum ServeCommands {
     Uninstall,
 }
 
-const PID_FILE_NAME: &str = "daemon.pid";
+pub(crate) const PID_FILE_NAME: &str = "daemon.pid";
+
+/// Readiness probe cadence/budget shared by `run_background` and the
+/// launchd kickstart path (same values, one definition).
+const READY_POLL: Duration = Duration::from_millis(250);
+const READY_BUDGET: Duration = Duration::from_secs(10);
+
+/// Human-output reporter: `quiet` mode (TUI-triggered restart) routes the
+/// same messages to the tracing log instead of stdout, which the inline
+/// viewport owns.
+fn report(quiet: bool, msg: String) {
+    if quiet {
+        tracing::info!(target: "zen_serve", "{msg}");
+    } else {
+        println!("{msg}");
+    }
+}
 
 fn uds_socket_path() -> std::path::PathBuf {
     zen_gateway::transport::uds::default_socket_path()
 }
 
-fn pid_path() -> Result<std::path::PathBuf, ZenError> {
+pub(crate) fn pid_path() -> Result<std::path::PathBuf, ZenError> {
     let paths = ZenPaths::detect()?;
     Ok(paths.global_root().join(PID_FILE_NAME))
 }
@@ -113,10 +156,13 @@ async fn gateway_is_live() -> bool {
     }
 }
 
-fn clean_stale_pid(path: &Path) {
+fn clean_stale_pid(path: &Path, quiet: bool) {
     let Ok(record) = read_pid_record(path) else {
         if path.exists() {
-            println!("{} Removed unreadable PID file", "🧹".yellow());
+            report(
+                quiet,
+                format!("{} Removed unreadable PID file", "🧹".yellow()),
+            );
             remove_pid(path).ok();
         }
         return;
@@ -125,15 +171,18 @@ fn clean_stale_pid(path: &Path) {
         return;
     }
     let recycled = is_pid_alive(record.pid);
-    println!(
-        "{} Cleaned up stale PID file (pid: {} {})",
-        "🧹".yellow(),
-        record.pid,
-        if recycled {
-            "was recycled by another process"
-        } else {
-            "is dead"
-        }
+    report(
+        quiet,
+        format!(
+            "{} Cleaned up stale PID file (pid: {} {})",
+            "🧹".yellow(),
+            record.pid,
+            if recycled {
+                "was recycled by another process"
+            } else {
+                "is dead"
+            }
+        ),
     );
     remove_pid(path).ok();
 }
@@ -332,205 +381,14 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
             if *mcp {
                 return run_mcp_stdio().await;
             }
-            let path = pid_path()?;
-            clean_stale_pid(&path);
-            ensure_pid_dir(&path);
-            // Probe BEFORE spawning: if a gateway is already serving, this
-            // start is a no-op and, critically, must not touch the pid file —
-            // the running daemon owns that record now.
-            if gateway_is_live().await {
-                match read_pid_record(&path)
-                    .ok()
-                    .filter(|r| pid_record_alive(r.pid, r.start.as_deref()))
-                    .map(|r| r.pid)
-                {
-                    Some(pid) => println!("{} Gateway already running (pid: {pid})", "✅".green()),
-                    None => println!("{} Gateway already running", "✅".green()),
-                }
-                println!("  Socket:   {}", uds_socket_path().display());
-                return Ok(());
-            }
-            // `--http` now enables the loopback HTTP carrier alongside the
-            // UDS daemon (T046: legacy HttpGateway retired); env opt-in
-            // also honored per FR-019 config layering.
-            let http_cfg = resolve_http_carrier(*http, bind.as_deref(), *port);
-            // QQBot channel (Phase 13): config.toml-only (`[channels.qqbot]`);
-            // its presence implies the loopback HTTP carrier it bridges to.
-            let zen_config = zen_core::config::load_config()?;
-            let qqbot_cfg = resolve_qqbot_channel(zen_config);
-            let http_cfg = http_cfg.or_else(|| {
-                qqbot_cfg.as_ref().map(|_| HttpConfig::default()).map(|d| {
-                    zen_gateway::transport::http::HttpCarrierConfig {
-                        bind_addr: d.bind_addr,
-                        port: d.port,
-                    }
-                })
-            });
-            if *foreground {
-                return run_uds_foreground(http_cfg, qqbot_cfg).await;
-            }
-            run_background(&path, http_cfg).await
+            start_daemon(false, *foreground, *http, bind.as_deref(), *port).await
         }
         ServeCommands::Stop => {
-            // Preferred path: graceful `shutdown` RPC over the UDS socket.
-            if let Ok(client) = zen_gateway::client::GatewayClient::connect(uds_socket_path()).await
-            {
-                let _ = client
-                    .handshake("cli-stop", "0.0", Default::default())
-                    .await;
-                if let Ok(result) = client.request("shutdown", serde_json::json!({})).await {
-                    remove_pid(&pid_path()?).ok();
-                    println!(
-                        "{} Gateway stopped via socket (drained: {}, cancelled: {})",
-                        "✅".green(),
-                        result["drained"],
-                        result["cancelled"]
-                    );
-                    return Ok(());
-                }
-            }
-
-            let path = pid_path()?;
-            if !path.exists() {
-                println!("Gateway not running (no PID file)");
-                return Ok(());
-            }
-
-            let record = match read_pid_record(&path) {
-                Ok(r) => r,
-                Err(e) => return Err(ZenError::Service(e.to_string())),
-            };
-
-            if !pid_record_alive(record.pid, record.start.as_deref()) {
-                if is_pid_alive(record.pid) {
-                    println!(
-                        "PID file is stale (pid: {} was recycled by another process)",
-                        record.pid
-                    );
-                } else {
-                    println!("Gateway process not responding (pid: {})", record.pid);
-                }
-                remove_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
-                println!("Gateway not running");
-                return Ok(());
-            }
-            let pid = record.pid;
-
-            #[cfg(unix)]
-            {
-                let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                if result == 0 {
-                    info!("Sent SIGTERM to gateway (pid: {})", pid);
-                    println!("Sent stop signal to gateway (pid: {})", pid);
-                } else {
-                    println!("Failed to send signal to gateway (pid: {})", pid);
-                }
-
-                // Escalation chain (codex app-server-daemon pattern): the
-                // daemon drains in-flight turns for ≤10s after SIGTERM, so
-                // grace slightly beyond that before a forced kill — and
-                // never report success over a wedged process.
-                const TERM_GRACE: Duration = Duration::from_secs(15);
-                const KILL_GRACE: Duration = Duration::from_secs(5);
-                if !wait_exit(pid, TERM_GRACE).await {
-                    println!("Process not responding, force killing...");
-                    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                    if !wait_exit(pid, KILL_GRACE).await {
-                        return Err(ZenError::Service(format!(
-                            "gateway pid {pid} survived SIGKILL"
-                        )));
-                    }
-                }
-            }
-
-            #[cfg(not(unix))]
-            {
-                println!("Stop signal sent (pid: {})", pid);
-            }
-
-            remove_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
-            println!("{} Gateway stopped", "✅".green());
+            stop_daemon(false).await?;
             Ok(())
         }
-        ServeCommands::Status => {
-            // Preferred path: live health/status over the UDS socket.
-            if let Ok(client) = zen_gateway::client::GatewayClient::connect(uds_socket_path()).await
-                && client
-                    .handshake("cli-status", "0.0", Default::default())
-                    .await
-                    .is_ok()
-                && let Ok(s) = client.request("health/status", serde_json::json!({})).await
-            {
-                let pid = pid_path().ok().and_then(|p| read_pid(&p).ok());
-                println!("{} Gateway running (UDS)", "✅".green());
-                if let Some(p) = pid {
-                    println!("  PID: {}", p);
-                }
-                println!("  Socket: {}", uds_socket_path().display());
-                println!(
-                    "  Version: {} (protocol {})",
-                    s["serverVersion"], s["protocolVersion"]
-                );
-                println!("  Clients: {}", s["clients"]);
-                println!("  Store:   {}", s["storeHealth"]);
-                println!("  Uptime:  {}ms", s["uptimeMs"]);
-                println!("  Turns:   {}", s["activeTurns"]);
-                print_process_stats(pid.unwrap_or(0));
-                return Ok(());
-            }
-
-            let path = pid_path().ok();
-            let config = HttpConfig::default();
-            let health_url = format!("http://{}:{}/health", config.bind_addr, config.port);
-
-            let addr =
-                format!("{}:{}", config.bind_addr, config.port).parse::<std::net::SocketAddr>();
-
-            let http_ok = addr
-                .ok()
-                .and_then(|addr| {
-                    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
-                        .ok()
-                })
-                .is_some();
-
-            if http_ok {
-                let pid = path.as_ref().and_then(|p| read_pid(p).ok());
-
-                println!("{} Gateway running", "✅".green());
-                if let Some(p) = pid {
-                    println!("  PID: {}", p);
-                }
-                println!("  Health: {}", health_url);
-                println!(
-                    "  API:    http://{}:{}/api/v1/",
-                    config.bind_addr, config.port
-                );
-
-                let body = fetch_http_body(&config.bind_addr, config.port, "/health");
-                if let Some(b) = body {
-                    println!("  Status: {}", b);
-                }
-
-                print_process_stats(pid.unwrap_or(0));
-            } else if let Some(path) = path {
-                if path.exists()
-                    && let Ok(pid) = read_pid(&path)
-                    && is_pid_alive(pid)
-                {
-                    println!(
-                        "{} Gateway process alive (pid: {}) but HTTP not responding",
-                        "⚠️".yellow(),
-                        pid
-                    );
-                    return Ok(());
-                }
-                println!("{} Gateway not running", "⛔".red());
-            } else {
-                println!("{} Gateway not running", "⛔".red());
-            }
-            Ok(())
-        }
+        ServeCommands::Restart => restart_daemon().await,
+        ServeCommands::Status { json } => status_command(*json).await,
         ServeCommands::Test { port } => {
             let config = HttpConfig::default();
             let port = port.unwrap_or(config.port);
@@ -574,6 +432,550 @@ pub async fn execute_command(operation: &ServeCommands) -> Result<(), ZenError> 
         ServeCommands::Install => install_launchd(),
         ServeCommands::Uninstall => uninstall_launchd(),
     }
+}
+
+/// Start path shared by `zen serve start` and the restart flow (Phase 30
+/// G2 — reuse, never duplicate). `quiet` routes human output to tracing.
+async fn start_daemon(
+    quiet: bool,
+    foreground: bool,
+    http: bool,
+    bind: Option<&str>,
+    port: Option<u16>,
+) -> Result<(), ZenError> {
+    let path = pid_path()?;
+    clean_stale_pid(&path, quiet);
+    ensure_pid_dir(&path);
+    // Probe BEFORE spawning: if a gateway is already serving, this
+    // start is a no-op and, critically, must not touch the pid file —
+    // the running daemon owns that record now.
+    if gateway_is_live().await {
+        match read_pid_record(&path)
+            .ok()
+            .filter(|r| pid_record_alive(r.pid, r.start.as_deref()))
+            .map(|r| r.pid)
+        {
+            Some(pid) => report(
+                quiet,
+                format!("{} Gateway already running (pid: {pid})", "✅".green()),
+            ),
+            None => report(quiet, format!("{} Gateway already running", "✅".green())),
+        }
+        report(
+            quiet,
+            format!("  Socket:   {}", uds_socket_path().display()),
+        );
+        return Ok(());
+    }
+    // `--http` now enables the loopback HTTP carrier alongside the
+    // UDS daemon (T046: legacy HttpGateway retired); env opt-in
+    // also honored per FR-019 config layering.
+    let http_cfg = resolve_http_carrier(http, bind, port);
+    // QQBot channel (Phase 13): config.toml-only (`[channels.qqbot]`);
+    // its presence implies the loopback HTTP carrier it bridges to.
+    let zen_config = zen_core::config::load_config()?;
+    let qqbot_cfg = resolve_qqbot_channel(zen_config);
+    let http_cfg = http_cfg.or_else(|| {
+        qqbot_cfg.as_ref().map(|_| HttpConfig::default()).map(|d| {
+            zen_gateway::transport::http::HttpCarrierConfig {
+                bind_addr: d.bind_addr,
+                port: d.port,
+            }
+        })
+    });
+    if foreground {
+        return run_uds_foreground(http_cfg, qqbot_cfg).await;
+    }
+    run_background(&path, http_cfg, quiet).await
+}
+
+/// Stop path shared by `zen serve stop` and the restart flow. Returns
+/// whether a running daemon was actually stopped (`false` = not running —
+/// restart callers announce the plain-start case).
+async fn stop_daemon(quiet: bool) -> Result<bool, ZenError> {
+    // Preferred path: graceful `shutdown` RPC over the UDS socket.
+    if let Ok(client) = zen_gateway::client::GatewayClient::connect(uds_socket_path()).await {
+        let _ = client
+            .handshake("cli-stop", "0.0", Default::default())
+            .await;
+        if let Ok(result) = client.request("shutdown", serde_json::json!({})).await {
+            remove_pid(&pid_path()?).ok();
+            report(
+                quiet,
+                format!(
+                    "{} Gateway stopped via socket (drained: {}, cancelled: {})",
+                    "✅".green(),
+                    result["drained"],
+                    result["cancelled"]
+                ),
+            );
+            return Ok(true);
+        }
+    }
+
+    let path = pid_path()?;
+    if !path.exists() {
+        report(quiet, "Gateway not running (no PID file)".to_string());
+        return Ok(false);
+    }
+
+    let record = match read_pid_record(&path) {
+        Ok(r) => r,
+        Err(e) => return Err(ZenError::Service(e.to_string())),
+    };
+
+    if !pid_record_alive(record.pid, record.start.as_deref()) {
+        if is_pid_alive(record.pid) {
+            report(
+                quiet,
+                format!(
+                    "PID file is stale (pid: {} was recycled by another process)",
+                    record.pid
+                ),
+            );
+        } else {
+            report(
+                quiet,
+                format!("Gateway process not responding (pid: {})", record.pid),
+            );
+        }
+        remove_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
+        report(quiet, "Gateway not running".to_string());
+        return Ok(false);
+    }
+    let pid = record.pid;
+
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if result == 0 {
+            info!("Sent SIGTERM to gateway (pid: {})", pid);
+            report(quiet, format!("Sent stop signal to gateway (pid: {})", pid));
+        } else {
+            report(
+                quiet,
+                format!("Failed to send signal to gateway (pid: {})", pid),
+            );
+        }
+
+        // Escalation chain (codex app-server-daemon pattern): the
+        // daemon drains in-flight turns for ≤10s after SIGTERM, so
+        // grace slightly beyond that before a forced kill — and
+        // never report success over a wedged process.
+        const TERM_GRACE: Duration = Duration::from_secs(15);
+        const KILL_GRACE: Duration = Duration::from_secs(5);
+        if !wait_exit(pid, TERM_GRACE).await {
+            report(
+                quiet,
+                "Process not responding, force killing...".to_string(),
+            );
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if !wait_exit(pid, KILL_GRACE).await {
+                return Err(ZenError::Service(format!(
+                    "gateway pid {pid} survived SIGKILL"
+                )));
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        report(quiet, format!("Stop signal sent (pid: {})", pid));
+    }
+
+    remove_pid(&path).map_err(|e| ZenError::Service(e.to_string()))?;
+    report(quiet, format!("{} Gateway stopped", "✅".green()));
+    Ok(true)
+}
+
+/// Version-match state of a running daemon against the invoking binary
+/// (Phase 30 G1/G3). `Unknown` = the daemon answered without a version
+/// (predates version reporting) ⇒ treated as STALE-unknown: it is by
+/// definition an older build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonVersionState {
+    Current,
+    Stale,
+    Unknown,
+}
+
+impl DaemonVersionState {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the upgrade policy acts on this state (stale and unknown
+    /// both mean "not provably the current binary").
+    pub(crate) fn is_stale(&self) -> bool {
+        !matches!(self, Self::Current)
+    }
+}
+
+/// Pure STALE classification: `None`/blank daemon version ⇒ `Unknown`,
+/// equal ⇒ `Current`, different ⇒ `Stale`.
+pub(crate) fn classify_daemon_version(
+    binary_version: &str,
+    daemon_version: Option<&str>,
+) -> DaemonVersionState {
+    match daemon_version.map(str::trim).filter(|v| !v.is_empty()) {
+        None => DaemonVersionState::Unknown,
+        Some(v) if v == binary_version => DaemonVersionState::Current,
+        Some(_) => DaemonVersionState::Stale,
+    }
+}
+
+/// Effective `[gateway] upgrade_policy` auto-restart switch. Config load
+/// failure falls back to warn (never restart on an unreadable policy).
+pub(crate) fn upgrade_policy_auto_restart() -> bool {
+    match zen_core::config::load_config() {
+        Ok(c) => c.gateway.auto_restart(),
+        Err(e) => {
+            tracing::warn!(error = %e, "config load failed; upgrade_policy stays at \"warn\"");
+            false
+        }
+    }
+}
+
+async fn status_command(json: bool) -> Result<(), ZenError> {
+    let binary_version = env!("CARGO_PKG_VERSION");
+
+    // Preferred path: live health/status over the UDS socket.
+    if let Ok(client) = zen_gateway::client::GatewayClient::connect(uds_socket_path()).await
+        && client
+            .handshake("cli-status", "0.0", Default::default())
+            .await
+            .is_ok()
+        && let Ok(s) = client.request("health/status", serde_json::json!({})).await
+    {
+        let pid = pid_path().ok().and_then(|p| read_pid(&p).ok());
+        let daemon_version = s["serverVersion"].as_str();
+        let state = classify_daemon_version(binary_version, daemon_version);
+
+        if json {
+            let payload = serde_json::json!({
+                "running": true,
+                "transport": "uds",
+                "pid": pid,
+                "socket": uds_socket_path().display().to_string(),
+                "binaryVersion": binary_version,
+                "daemonVersion": daemon_version,
+                "daemonProtocol": s["protocolVersion"].as_str(),
+                "versionState": state.as_str(),
+                "stale": state.is_stale(),
+                "clients": s["clients"],
+                "storeHealth": s["storeHealth"],
+                "uptimeMs": s["uptimeMs"],
+                "activeTurns": s["activeTurns"],
+            });
+            println!("{payload}");
+            return Ok(());
+        }
+
+        println!("{} Gateway running (UDS)", "✅".green());
+        if let Some(p) = pid {
+            println!("  PID: {}", p);
+        }
+        println!("  Socket: {}", uds_socket_path().display());
+        println!("  Binary:  {}", binary_version);
+        match state {
+            DaemonVersionState::Current => println!(
+                "  Daemon:  {} (protocol {})",
+                daemon_version.unwrap_or_default(),
+                s["protocolVersion"]
+            ),
+            DaemonVersionState::Stale => println!(
+                "  Daemon:  {} (protocol {}) {}",
+                daemon_version.unwrap_or_default(),
+                s["protocolVersion"],
+                "STALE — run `zen serve restart`".yellow()
+            ),
+            DaemonVersionState::Unknown => println!(
+                "  Daemon:  unknown (predates version reporting) {}",
+                "STALE-unknown — run `zen serve restart`".yellow()
+            ),
+        }
+        println!("  Clients: {}", s["clients"]);
+        println!("  Store:   {}", s["storeHealth"]);
+        println!("  Uptime:  {}ms", s["uptimeMs"]);
+        println!("  Turns:   {}", s["activeTurns"]);
+        print_process_stats(pid.unwrap_or(0));
+
+        // G3 detection point (a): policy action — human mode only, so
+        // `--json` output stays parseable and machine consumers decide.
+        if state.is_stale() && upgrade_policy_auto_restart() {
+            println!(
+                "{} upgrade_policy=auto-restart: restarting the stale daemon",
+                "🔄".blue()
+            );
+            return restart_daemon().await;
+        }
+        return Ok(());
+    }
+
+    let path = pid_path().ok();
+    let config = HttpConfig::default();
+    let health_url = format!("http://{}:{}/health", config.bind_addr, config.port);
+
+    let addr = format!("{}:{}", config.bind_addr, config.port).parse::<std::net::SocketAddr>();
+
+    let http_ok = addr
+        .ok()
+        .and_then(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).ok()
+        })
+        .is_some();
+
+    if http_ok {
+        let pid = path.as_ref().and_then(|p| read_pid(p).ok());
+        // HTTP fallback has no live version RPC; the pid record's version
+        // field (when the daemon wrote one) is the only source.
+        let record_version = path
+            .as_ref()
+            .and_then(|p| read_pid_record(p).ok())
+            .filter(|r| pid_record_alive(r.pid, r.start.as_deref()))
+            .and_then(|r| r.version);
+        let state = classify_daemon_version(binary_version, record_version.as_deref());
+
+        if json {
+            let payload = serde_json::json!({
+                "running": true,
+                "transport": "http",
+                "pid": pid,
+                "binaryVersion": binary_version,
+                "daemonVersion": record_version,
+                "versionState": state.as_str(),
+                "stale": state.is_stale(),
+                "health": health_url,
+            });
+            println!("{payload}");
+            return Ok(());
+        }
+
+        println!("{} Gateway running", "✅".green());
+        if let Some(p) = pid {
+            println!("  PID: {}", p);
+        }
+        println!("  Binary:  {}", binary_version);
+        match state {
+            DaemonVersionState::Current => {
+                println!(
+                    "  Daemon:  {}",
+                    record_version.as_deref().unwrap_or_default()
+                )
+            }
+            DaemonVersionState::Stale => println!(
+                "  Daemon:  {} {}",
+                record_version.as_deref().unwrap_or_default(),
+                "STALE — run `zen serve restart`".yellow()
+            ),
+            DaemonVersionState::Unknown => println!(
+                "  Daemon:  unknown {}",
+                "STALE-unknown — run `zen serve restart`".yellow()
+            ),
+        }
+        println!("  Health: {}", health_url);
+        println!(
+            "  API:    http://{}:{}/api/v1/",
+            config.bind_addr, config.port
+        );
+
+        let body = fetch_http_body(&config.bind_addr, config.port, "/health");
+        if let Some(b) = body {
+            println!("  Status: {}", b);
+        }
+
+        print_process_stats(pid.unwrap_or(0));
+        if state.is_stale() && upgrade_policy_auto_restart() {
+            println!(
+                "{} upgrade_policy=auto-restart: restarting the stale daemon",
+                "🔄".blue()
+            );
+            return restart_daemon().await;
+        }
+    } else if let Some(path) = path {
+        if path.exists()
+            && let Ok(pid) = read_pid(&path)
+            && is_pid_alive(pid)
+        {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "running": false,
+                        "transport": "none",
+                        "pid": pid,
+                        "binaryVersion": binary_version,
+                        "versionState": serde_json::Value::Null,
+                        "stale": false,
+                        "detail": "process alive but not answering health probes",
+                    })
+                );
+                return Ok(());
+            }
+            println!(
+                "{} Gateway process alive (pid: {}) but HTTP not responding",
+                "⚠️".yellow(),
+                pid
+            );
+            return Ok(());
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "running": false,
+                    "transport": "none",
+                    "binaryVersion": binary_version,
+                    "versionState": serde_json::Value::Null,
+                    "stale": false,
+                })
+            );
+            return Ok(());
+        }
+        println!("{} Gateway not running", "⛔".red());
+    } else if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "running": false,
+                "transport": "none",
+                "binaryVersion": binary_version,
+                "versionState": serde_json::Value::Null,
+                "stale": false,
+            })
+        );
+        return Ok(());
+    } else {
+        println!("{} Gateway not running", "⛔".red());
+    }
+    Ok(())
+}
+
+/// CLI entry for `zen serve restart` (human output).
+pub(crate) async fn restart_daemon() -> Result<(), ZenError> {
+    restart_inner(false).await
+}
+
+/// TUI entry (Phase 30 G3 detection point c): same flow, output routed to
+/// tracing so the inline viewport is not corrupted.
+pub(crate) async fn restart_daemon_quiet() -> Result<(), ZenError> {
+    restart_inner(true).await
+}
+
+async fn restart_inner(quiet: bool) -> Result<(), ZenError> {
+    #[cfg(target_os = "macos")]
+    if restart_mode(plist_path().map(|p| p.exists()).unwrap_or(false))
+        == RestartMode::LaunchdKickstart
+    {
+        return restart_via_launchd(quiet).await;
+    }
+
+    let was_running = stop_daemon(quiet).await?;
+    if !was_running {
+        report(
+            quiet,
+            format!(
+                "{} Daemon was not running — restart is a plain start",
+                "ℹ️".blue()
+            ),
+        );
+    }
+    start_daemon(quiet, false, false, None, None).await
+}
+
+/// Restart decision (pure): a launchd-installed plist means KeepAlive owns
+/// the lifecycle, so `kickstart -k` is the only correct relaunch path —
+/// a manual stop would be immediately respawned by launchd, racing the
+/// manual start.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartMode {
+    LaunchdKickstart,
+    ManualStopStart,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn restart_mode(plist_installed: bool) -> RestartMode {
+    if plist_installed {
+        RestartMode::LaunchdKickstart
+    } else {
+        RestartMode::ManualStopStart
+    }
+}
+
+/// Pure launchctl kickstart target: `gui/{uid}/dev.zen.serve`.
+#[cfg(target_os = "macos")]
+pub(crate) fn kickstart_target(gui_domain: &str) -> String {
+    format!("{gui_domain}/{LAUNCHD_LABEL}")
+}
+
+/// Pure launchctl argv for a forced service restart (`-k` kills the
+/// running instance first; KeepAlive relaunches via PATH ⇒ new binary).
+#[cfg(target_os = "macos")]
+pub(crate) fn kickstart_args(target: &str) -> Vec<String> {
+    vec!["kickstart".into(), "-k".into(), target.into()]
+}
+
+#[cfg(target_os = "macos")]
+async fn restart_via_launchd(quiet: bool) -> Result<(), ZenError> {
+    let domain = gui_domain()?;
+    let target = kickstart_target(&domain);
+    let args = kickstart_args(&target);
+
+    let output = Command::new("launchctl")
+        .args(&args)
+        .output()
+        .map_err(|e| ZenError::Service(format!("launchctl kickstart: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ZenError::Service(format!(
+            "launchctl kickstart failed: {}",
+            stderr.trim()
+        )));
+    }
+    report(
+        quiet,
+        format!(
+            "{} Gateway restart requested via launchd (kickstart -k {})",
+            "✅".green(),
+            target
+        ),
+    );
+
+    // Readiness = handshake answer, same budget as the start path.
+    let deadline = tokio::time::Instant::now() + READY_BUDGET;
+    loop {
+        if gateway_is_live().await {
+            report(
+                quiet,
+                format!(
+                    "{} Gateway ready (relaunched by launchd under the current binary {})",
+                    "✅".green(),
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(READY_POLL).await;
+    }
+    // Kickstart succeeded but the daemon has not answered yet — launchd
+    // may still be relaunching (ThrottleInterval). Report honestly.
+    report(
+        quiet,
+        format!(
+            "{} Gateway did not answer within {}s after kickstart; launchd may still be relaunching — check `zen serve status`",
+            "⚠️".yellow(),
+            READY_BUDGET.as_secs()
+        ),
+    );
+    Ok(())
 }
 
 /// Resolves the loopback HTTP carrier config from the `--http` flag,
@@ -802,6 +1204,7 @@ async fn wait_for_stop_signal() {
 async fn run_background(
     path: &Path,
     http_cfg: Option<zen_gateway::transport::http::HttpCarrierConfig>,
+    quiet: bool,
 ) -> Result<(), ZenError> {
     let exe = std::env::current_exe().map_err(|e| ZenError::Service(e.to_string()))?;
 
@@ -842,8 +1245,6 @@ async fn run_background(
     // the single-instance arbiter; a losing or crashed child never
     // answers, so failure is reported honestly (codex parity — the
     // probe is ground truth, pid files advisory).
-    const READY_POLL: Duration = Duration::from_millis(250);
-    const READY_BUDGET: Duration = Duration::from_secs(10);
     let deadline = tokio::time::Instant::now() + READY_BUDGET;
     loop {
         // Liveness FIRST: a child that lost the start race exits within
@@ -865,27 +1266,39 @@ async fn run_background(
             match read_pid_record(path) {
                 Ok(record) if record.pid == child_pid => {
                     ensure_pid_dir(path);
-                    println!(
-                        "{} Gateway started (background, pid: {})",
-                        "✅".green(),
-                        child_pid
+                    report(
+                        quiet,
+                        format!(
+                            "{} Gateway started (background, pid: {})",
+                            "✅".green(),
+                            child_pid
+                        ),
                     );
                     if let Some(cfg) = &http_cfg {
-                        println!("  HTTP:     http://{}:{}/health", cfg.bind_addr, cfg.port);
+                        report(
+                            quiet,
+                            format!("  HTTP:     http://{}:{}/health", cfg.bind_addr, cfg.port),
+                        );
                     }
-                    println!("  Socket:   {}", uds_socket_path().display());
-                    println!("  PID file: {}", path.display());
-                    println!("  Run 'zen serve stop' to stop");
+                    report(
+                        quiet,
+                        format!("  Socket:   {}", uds_socket_path().display()),
+                    );
+                    report(quiet, format!("  PID file: {}", path.display()));
+                    report(quiet, "  Run 'zen serve stop' to stop".to_string());
                     return Ok(());
                 }
                 Ok(record) if pid_record_alive(record.pid, record.start.as_deref()) => {
                     // A different, live daemon owns the socket: our child lost
                     // the race and exited. Report the truth and do not claim
                     // (or clobber) the pid record.
-                    println!(
-                        "{} Gateway already running (pid: {}); this start attempt exited",
-                        "⚠️".yellow(),
-                        record.pid
+                    report(
+                        quiet,
+                        format!(
+                            "{} Gateway already running (pid: {}); this start attempt exited",
+                            "⚠️".yellow(),
+                            record.pid
+                        ),
                     );
                     return Ok(());
                 }
@@ -1025,6 +1438,64 @@ mod tests {
         assert!(plist.contains("HOME"));
         assert!(plist.contains("PATH"));
         assert!(plist.contains("/opt/homebrew/bin"));
+    }
+
+    #[test]
+    fn classify_daemon_version_states() {
+        assert_eq!(
+            classify_daemon_version("0.0.9", Some("0.0.9")),
+            DaemonVersionState::Current
+        );
+        assert_eq!(
+            classify_daemon_version("0.0.9", Some("0.0.8")),
+            DaemonVersionState::Stale
+        );
+        assert_eq!(
+            classify_daemon_version("0.0.9", None),
+            DaemonVersionState::Unknown
+        );
+        assert_eq!(
+            classify_daemon_version("0.0.9", Some("")),
+            DaemonVersionState::Unknown
+        );
+        assert_eq!(
+            classify_daemon_version("0.0.9", Some("  ")),
+            DaemonVersionState::Unknown
+        );
+    }
+
+    #[test]
+    fn version_state_staleness_and_wire_names() {
+        assert!(!DaemonVersionState::Current.is_stale());
+        assert!(DaemonVersionState::Stale.is_stale());
+        assert!(
+            DaemonVersionState::Unknown.is_stale(),
+            "unknown ⇒ STALE-unknown (pre-version build is by definition older)"
+        );
+        assert_eq!(DaemonVersionState::Current.as_str(), "current");
+        assert_eq!(DaemonVersionState::Stale.as_str(), "stale");
+        assert_eq!(DaemonVersionState::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn restart_mode_decides_launchd_vs_manual() {
+        assert_eq!(restart_mode(true), RestartMode::LaunchdKickstart);
+        assert_eq!(restart_mode(false), RestartMode::ManualStopStart);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn kickstart_args_force_restart_the_labeled_service() {
+        assert_eq!(kickstart_target("gui/501"), "gui/501/dev.zen.serve");
+        assert_eq!(
+            kickstart_args("gui/501/dev.zen.serve"),
+            vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                "gui/501/dev.zen.serve".to_string()
+            ]
+        );
     }
 
     #[test]

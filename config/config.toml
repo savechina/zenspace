@@ -479,3 +479,22 @@ max_rounds = 8
 #
 [skills.auto_route]
 enabled = true
+
+# =============================================================================
+# Gateway daemon (Phase 30 — upgrade management)
+# =============================================================================
+#
+# upgrade_policy (env ZEN_GATEWAY_UPGRADE_POLICY): what the stale-daemon
+# detection points do when the running gateway daemon was built from a
+# different binary than the invoking CLI (the post-`brew upgrade` case).
+#   "warn"         — surface STALE (`zen serve status`), FAIL the
+#                    `zen doctor` daemon-version probe, hint in the TUI.
+#   "auto-restart" — additionally run the `zen serve restart` drain-restart
+#                    flow at status/TUI detection points (in-flight turns
+#                    drain ≤10s, then cancel with audits).
+# Default "warn" (gate-closed). Invalid values fall back to "warn" with a
+# warning log. Applies only to explicit/launchd daemons — implicit
+# TUI-spawned daemons run the current binary by construction.
+#
+[gateway]
+# upgrade_policy = "warn"

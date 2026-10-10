@@ -55,6 +55,7 @@ fn run_all_checks() -> Vec<CheckResult> {
         check_state_db(),
         check_memories(),
         check_daemon(),
+        check_daemon_version(),
         check_loop_liveness(),
         check_provider(),
         check_vault(),
@@ -162,6 +163,78 @@ fn check_daemon() -> CheckResult {
             ok: false,
             detail: "gateway socket not found".into(),
         }
+    }
+}
+
+/// Probe 9 (Phase 30 G3): stale-daemon diagnosis — the post-`brew upgrade`
+/// case where an old gateway daemon keeps running under the new CLI.
+/// Diagnose-only: this probe NEVER acts on `upgrade_policy` (the acting
+/// detection points are `zen serve status` and the TUI prewarm path).
+///
+/// Version source: the `daemon.pid` record's `version` field (written by
+/// the daemon itself after winning the startup lock). A live record
+/// without the field predates version reporting ⇒ unknown ⇒ FAIL (it is
+/// by definition an older build). No live record while the socket answers
+/// means an implicit (TUI-spawned) daemon, which runs the current binary
+/// by construction ⇒ PASS.
+fn check_daemon_version() -> CheckResult {
+    let socket = zen_gateway::transport::uds::default_socket_path();
+    let socket_alive = socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok();
+    let live_record = crate::cmd::serve_command::pid_path()
+        .ok()
+        .and_then(|p| zen_gateway::read_pid_record(p).ok())
+        .filter(|r| zen_gateway::pid_record_alive(r.pid, r.start.as_deref()));
+    daemon_version_probe(
+        socket_alive,
+        live_record.is_some(),
+        live_record.as_ref().and_then(|r| r.version.as_deref()),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// Pure half of the daemon-version probe (testable without sockets/pids).
+fn daemon_version_probe(
+    socket_alive: bool,
+    live_record: bool,
+    record_version: Option<&str>,
+    binary_version: &str,
+) -> CheckResult {
+    const NAME: &str = "daemon-version";
+    if !socket_alive {
+        return CheckResult {
+            name: NAME.into(),
+            ok: true,
+            detail: "daemon not running (liveness covered by the daemon probe)".into(),
+        };
+    }
+    if !live_record {
+        return CheckResult {
+            name: NAME.into(),
+            ok: true,
+            detail: "no explicit-daemon pid record (implicit daemons run the current binary)"
+                .into(),
+        };
+    }
+    match record_version {
+        None => CheckResult {
+            name: NAME.into(),
+            ok: false,
+            detail: format!(
+                "daemon version unknown (predates version records, binary {binary_version}) — run `zen serve restart`"
+            ),
+        },
+        Some(v) if v == binary_version => CheckResult {
+            name: NAME.into(),
+            ok: true,
+            detail: format!("daemon {v} matches binary {binary_version}"),
+        },
+        Some(v) => CheckResult {
+            name: NAME.into(),
+            ok: false,
+            detail: format!(
+                "daemon {v} != binary {binary_version} (STALE) — run `zen serve restart`"
+            ),
+        },
     }
 }
 
@@ -556,6 +629,52 @@ mod tests {
             unsafe { std::env::set_var("ZEN_QQBOT_CLIENT_SECRET", v) };
         }
         zen_core::config::invalidate_config_cache();
+    }
+
+    #[test]
+    fn daemon_version_probe_match_passes() {
+        let r = daemon_version_probe(true, true, Some("0.0.9"), "0.0.9");
+        assert_eq!(r.name, "daemon-version");
+        assert!(r.ok, "matching versions must PASS: {}", r.detail);
+    }
+
+    #[test]
+    fn daemon_version_probe_mismatch_fails_actionable() {
+        let r = daemon_version_probe(true, true, Some("0.0.8"), "0.0.9");
+        assert!(!r.ok, "version mismatch must FAIL");
+        assert!(
+            r.detail.contains("zen serve restart"),
+            "detail must be actionable: {}",
+            r.detail
+        );
+        assert!(
+            r.detail.contains("0.0.8") && r.detail.contains("0.0.9"),
+            "detail must name both versions: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn daemon_version_probe_unknown_fails() {
+        let r = daemon_version_probe(true, true, None, "0.0.9");
+        assert!(!r.ok, "unknown version (legacy record) must FAIL");
+        assert!(r.detail.contains("zen serve restart"));
+    }
+
+    #[test]
+    fn daemon_version_probe_not_running_passes() {
+        let r = daemon_version_probe(false, false, None, "0.0.9");
+        assert!(r.ok, "daemon-not-running is the daemon probe's job");
+    }
+
+    #[test]
+    fn daemon_version_probe_implicit_daemon_passes() {
+        let r = daemon_version_probe(true, false, None, "0.0.9");
+        assert!(
+            r.ok,
+            "no pid record ⇒ implicit daemon ⇒ current binary by construction"
+        );
+        assert!(r.detail.contains("implicit"));
     }
 
     #[test]
