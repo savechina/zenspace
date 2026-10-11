@@ -606,3 +606,31 @@ Ordering rationale: pure/config first (no behavior), single-file crates parallel
 - **Single-writer conflicts**: no new markdown/DB writers; reward sidecars keep their one flock-serialized writer path (new call sites are same-crate, same discipline); `memory-strength-report.json` written only by the daemon-exclusive nightly worker via `write_atomic`.
 - **Dormant-gate accumulation**: three new default-off gates (`memory_strength.enabled`, `knowledge_inject`, `context_inheritance`) + `agents_roots` default-on. Mitigation: each ships with a gate-off byte-identity test AND an audit-line emitter so "on but never fires" is observable; add all four to the spec Configuration Surface in the same commits (rule 6); put `search_rerank` and `knowledge_timeout_ms` on the calibration-debt ledger with named triggers (arena corpus / measured p95).
 - **memvid append-only growth**: F1-D2 metadata is write-time only; no re-put path exists, so no frame duplication risk — but legacy frames permanently lack `source_path` (strength falls back to uri/created_at); a full `index_all` refresh (nightly) converges new content naturally.
+
+## Implementation Record
+
+> Note: the Risks section above is pre-decision design text. Per owner decision D-F
+> (**REVISED** 2026-10-10, see Owner Decisions), `knowledge_inject` ships **ON** by
+> default — it is the SOLE non-closed gate of this phase; every other gate ships closed
+> with a byte-identity pin exactly as designed.
+
+### Wave 1 — T206/T207/T208 (landed `def929b`, 2026-10-11)
+
+- `[agentic.memory_strength] {enabled=false, half_life_days=30, search_rerank=false, eviction_report_size=20}`; `[agentic.orchestrator] {knowledge_inject=on, knowledge_tiers=fts, knowledge_budget_chars=4000, knowledge_timeout_ms=2000}`; `[agentic.delegate] context_inheritance=false`. All env (`ZEN_*`) + 5-layer + commented sample keys (T192). Invalid `knowledge_inject` ⇒ `Off` + warn (failure direction closed).
+- `zen-memory/src/strength.rs` — pure `retention_strength(anchor, last_event, events, now, half_life_days) -> f64` + `resolve_content_anchor(journal_uri_date, source_file_mtime, frame_created_at)`. Read-time derivation, zero storage, zero migrations; T153 compounding-decay class structurally impossible (5-step-advance ≡ single-evaluation idempotency test).
+- `MemvidIndexer::with_provenance_metadata(bool)` (default OFF — the worker is the sole production flipper) writes `source_path`/`tier` into frame `extra_metadata` via `PutOptions`; `ZenMemvidStore::select_cards_with_strength(store, selection, query, strength_of)`; `PROVENANCE_SOURCE_PATH_KEY`/`PROVENANCE_TIER_KEY` exported.
+- **Empirical consumer contract**: memvid-core injects its own `extractous_metadata` key into `extra_metadata` — consumers MUST key on `source_path`/`tier` presence, NEVER on map emptiness (pinned by test fixture).
+- Gate: bin/lint 0; bin/test 3041/0/25 (+32).
+
+### Wave 2 — T209/T210/T212/T213 (landed 2026-10-11, pending commit hash)
+
+- **T209** (D-G single flag): gateway `memory/search` stable-sorts by `score × R` DESC + additive per-hit `strength` behind `enabled && search_rerank`; gate-off `render_hits(hits, None)` is the byte-identical pre-T209 mapping (verified: early-return branch is a verbatim copy). Anchor chain: journal-uri date > `source_path` mtime (tier→root: m2=memory_root, m3/m4=wiki_root) > frame `created_at`; unparsable ⇒ R=1.0 neutral (unknown-age hits never sunk). `zen_agent.rs retrieve_memories_structured` routes through `select_cards_with_strength` when gated on (fail-closed on config error, `shadow_embedding_enabled` precedent); cards carry no `source_path` ⇒ anchor-only resolver, events=0.
+- **Sidecar-join finding (honest, pinned)**: today's production writer keys reward sidecars by `card_id_from_path(note.path)` over FLATTENED ABSOLUTE paths (knowledge/search `r.file.display()`), while memvid frames carry ROOT-RELATIVE `source_path` ⇒ the join necessarily misses (events=0, anchor-only strength) until **T211** writes memvid-derived increments with the same `card_id_from_path(source_path)` derivation both consumers already use (forward-compatible; documented at both consumer sites; pinned by `sidecar_events_raise_strength_via_source_path_join`).
+- **T210**: memvid-indexer worker flips `.with_provenance_metadata(cfg.enabled_or_default())` (fail-open to gate-closed on config error); when enabled, writes the file-based (journal anchors + reward sidecars, NO store scan) bottom-N `logs/memory-strength-report.json` via `write_atomic` + ONE `loop.memory.strength` audit line only when count>0. REPORT-ONLY: zero deletion paths in production code (grep-verified; sole `remove_dir_all` is `#[cfg(test)]` tempdir teardown). `zen discover report` additive `memory_strength` section, missing/corrupt ⇒ `{"recorded": false}` (replay-section precedent). Report shape/reader live in zen-agents (writer's crate) exported via `scheduler::` — deviation recorded, avoids cross-crate JSON-shape duplication.
+- **T212/T213** (D-E): `SkillLoader::new(&paths)` builds ordered roots `[~/.zen/skills, project .agents/skills (cwd→repo-root walk, closest wins), ~/.agents/skills]`; pure `build_roots`/`project_skill_roots`; same-name collisions first-wins + `tracing::warn` naming both paths; `new_from_dir` stays single-root (`roots: vec![dir]`), trigram router unchanged. `zen wiki export-skill --target zen|agents` via pure `resolve_skill_export_path(target, explicit_output, zen_root, agents_root)` — explicit `--output` wins over both (pinned). Shared derivation `zen_core::paths::{agents_skills_under, user_agents_skills_dir}` so loader root and export target cannot drift.
+- Deviations: collision-warn text not asserted (no tracing-capture dep in tree; first-wins behavior pinned instead).
+- Gate: bin/lint 0; bin/test 3074/0/25 (+33).
+
+### Wave 3 — T214/T215/T216/T217/T218/T211 (not started)
+
+Handoff notes for wave 3: orchestrator.rs hot-file serialization (T214 → T215 → T211 last); T211 MUST use the `card_id_from_path(source_path)` derivation wave 2's consumers pinned, closing the sidecar-join miss; `loop.knowledge.injected{ms,notes,chars,skipped_reason}` emitted in BOTH shadow and on modes (default-on per revised D-F makes it the live latency/token observability).
