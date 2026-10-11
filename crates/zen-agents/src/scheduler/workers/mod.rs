@@ -24,7 +24,11 @@ pub use evidence_gatherer::EvidenceGatherer;
 pub use express::ExpressWorker;
 pub use marker_state::{JournalEntryState, SessionState};
 pub use memory_curator::MemoryCurator;
-pub use memvid_indexer_worker::MemvidIndexerWorker;
+pub use memvid_indexer_worker::{
+    MEMORY_STRENGTH_REPORT_FILE, MemoryStrengthItem, MemoryStrengthReport, MemvidIndexerWorker,
+    build_strength_items, memory_strength_report_path, read_memory_strength_report,
+    write_strength_report,
+};
 pub use morning_brief::MorningBriefWorker;
 pub use notion_extractor_worker::NotionExtractorWorker;
 pub use promotion_worker::{

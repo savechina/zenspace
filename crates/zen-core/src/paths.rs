@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use crate::constants::{
@@ -58,6 +58,22 @@ fn test_home_fallback() -> PathBuf {
 #[cfg(any(test, feature = "test-support"))]
 pub fn real_production_root() -> PathBuf {
     home::home_dir().map(|h| h.join(".zen")).unwrap_or_default()
+}
+
+/// The standard Agent Skills discovery directory relative to `base`:
+/// `<base>/.agents/skills` — the vendor-neutral location codex-style and
+/// pi-style CLIs probe for skills (Phase 31 T212/T213, owner decision D-E).
+/// Shared by `SkillLoader`'s project/user-scope roots and
+/// `zen wiki export-skill --target agents` so the export target and the
+/// discovery root can never drift apart.
+pub fn agents_skills_under(base: &Path) -> PathBuf {
+    base.join(".agents").join("skills")
+}
+
+/// The user-scope `~/.agents/skills` root (Phase 31 T212). `None` only when
+/// the home directory is unresolvable.
+pub fn user_agents_skills_dir() -> Option<PathBuf> {
+    home::home_dir().map(|h| agents_skills_under(&h))
 }
 
 pub struct ZenPaths {

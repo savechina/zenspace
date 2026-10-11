@@ -299,6 +299,15 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     )
                 });
             let skill_eval = zen_agents::skill_trigger_eval::compute(&paths.skills());
+            // T210: additive memory-strength section (the replay-section
+            // precedent — a missing/corrupt report is "not recorded", never
+            // an error; the section is advisory).
+            let memory_strength = zen_agents::scheduler::read_memory_strength_report(&paths.logs())
+                .map(|report| {
+                    serde_json::to_value(&report).map_err(|e| ZenError::Message(e.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({ "recorded": false }));
             let success_criteria = serde_json::json!({
                 "first_attempt_success": serde_json::to_value(&first_attempt_success)
                     .map_err(|e| ZenError::Message(e.to_string()))?,
@@ -315,6 +324,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     "replay": replay,
                     "vendor_eval": vendor_eval,
                     "skill_eval": skill_eval,
+                    "memory_strength": memory_strength,
                 }))
                 .map_err(|e| ZenError::Message(e.to_string()))?
             );

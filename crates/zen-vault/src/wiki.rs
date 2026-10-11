@@ -3,7 +3,8 @@ pub mod skill_export;
 pub mod writer;
 pub use iterations::{CapturedIteration, IterationVersion, PageIterations};
 pub use skill_export::{
-    WIKI_SKILL_NAME, WikiSkillPage, collect_skill_pages, render_wiki_skill_md, skill_file_name,
+    SkillExportTarget, WIKI_SKILL_NAME, WikiSkillPage, collect_skill_pages, render_wiki_skill_md,
+    resolve_skill_export_path, skill_file_name,
 };
 pub use writer::AtomicWikiWriter;
 

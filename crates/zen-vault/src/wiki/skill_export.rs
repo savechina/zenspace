@@ -16,7 +16,7 @@
 //! truncation marker rather than silently growing.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -38,6 +38,45 @@ pub struct WikiSkillPage {
 /// The skill file name and directory this export writes to.
 pub fn skill_file_name() -> &'static str {
     "SKILL.md"
+}
+
+/// Export target surface of `zen wiki export-skill --target` (Phase 31 T213).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillExportTarget {
+    /// zen-native discovery root (`~/.zen/skills`, the pre-T213 default).
+    Zen,
+    /// The vendor-neutral user scope `~/.agents/skills` that codex-style and
+    /// pi-style CLIs discover (FR-039 neutral plane; owner decision D-E).
+    Agents,
+}
+
+/// Resolve the export output path (T213). Pure — pinned by tests.
+///
+/// Precedence (unchanged from the pre-T213 behavior): an explicit `output`
+/// wins over BOTH targets; otherwise the target's root carries the fixed
+/// `<root>/zen-wiki/SKILL.md` layout (the directory name MUST equal the
+/// frontmatter `name`, Agent Skills spec). `agents_root` is `None` only when
+/// the home directory is unresolvable — an error, never a silent fallback
+/// into the zen root.
+pub fn resolve_skill_export_path(
+    target: SkillExportTarget,
+    output: Option<&Path>,
+    zen_skills_dir: &Path,
+    agents_root: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(p) = output {
+        return Ok(p.to_path_buf());
+    }
+    let root = match target {
+        SkillExportTarget::Zen => zen_skills_dir.to_path_buf(),
+        SkillExportTarget::Agents => match agents_root {
+            Some(d) => d.to_path_buf(),
+            None => anyhow::bail!(
+                "--target agents requires a resolvable home directory (~/.agents/skills)"
+            ),
+        },
+    };
+    Ok(root.join(WIKI_SKILL_NAME).join(skill_file_name()))
 }
 
 /// Walk `wiki_dir` (same enumeration the compile whitelist uses) and
@@ -243,6 +282,42 @@ mod tests {
         let out = render_wiki_skill_md(&pages);
         assert!(out.contains("Index truncated at"));
         assert!(out.lines().count() < 500, "skill body budget");
+    }
+
+    #[test]
+    fn export_path_default_target_is_zen_root() {
+        let zen = Path::new("/home/u/.zen/skills");
+        let agents = Path::new("/home/u/.agents/skills");
+        let p = resolve_skill_export_path(SkillExportTarget::Zen, None, zen, Some(agents)).unwrap();
+        assert_eq!(p, zen.join(WIKI_SKILL_NAME).join("SKILL.md"));
+    }
+
+    #[test]
+    fn export_path_agents_target_resolves_user_scope_root() {
+        let zen = Path::new("/home/u/.zen/skills");
+        let agents = Path::new("/home/u/.agents/skills");
+        let p =
+            resolve_skill_export_path(SkillExportTarget::Agents, None, zen, Some(agents)).unwrap();
+        assert_eq!(p, agents.join(WIKI_SKILL_NAME).join("SKILL.md"));
+    }
+
+    #[test]
+    fn export_path_explicit_output_wins_over_both_targets() {
+        let zen = Path::new("/home/u/.zen/skills");
+        let agents = Path::new("/home/u/.agents/skills");
+        let explicit = Path::new("/tmp/custom/SKILL.md");
+        for target in [SkillExportTarget::Zen, SkillExportTarget::Agents] {
+            let p = resolve_skill_export_path(target, Some(explicit), zen, Some(agents)).unwrap();
+            assert_eq!(p, explicit);
+        }
+    }
+
+    #[test]
+    fn export_path_agents_without_home_is_error_not_silent_fallback() {
+        let zen = Path::new("/home/u/.zen/skills");
+        let err = resolve_skill_export_path(SkillExportTarget::Agents, None, zen, None)
+            .expect_err("must not fall back into the zen root");
+        assert!(err.to_string().contains("home directory"));
     }
 
     #[test]

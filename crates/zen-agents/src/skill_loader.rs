@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
-use zen_core::paths::ZenPaths;
+use tracing::{debug, warn};
+use zen_core::paths::{ZenPaths, agents_skills_under, user_agents_skills_dir};
 
 /// A skill definition parsed from a Markdown file with YAML frontmatter.
 ///
@@ -50,75 +51,177 @@ impl SkillDefinition {
     }
 }
 
-/// Loads skill definitions from Markdown files in `~/.zen/skills/`.
+/// Loads skill definitions from Markdown files across ordered discovery
+/// roots (Phase 31 T212, owner decision D-E — zen-native first):
+///
+/// 1. `~/.zen/skills` (zen-native: precipitated + exported skills),
+/// 2. project `.agents/skills` — walked UP from the workspace root,
+///    closest-to-cwd first, stopping at the repo root (a directory
+///    containing `.git`) or the filesystem root,
+/// 3. `~/.agents/skills` (user scope — the vendor-neutral directory
+///    codex-style and pi-style CLIs share).
+///
+/// Same-name collisions across roots resolve FIRST-WINS with a
+/// `tracing::warn!` naming both paths (pi precedent) — an override is
+/// always observable, never silent.
 pub struct SkillLoader {
-    skills_dir: PathBuf,
+    roots: Vec<PathBuf>,
+}
+
+/// Collect the project-scope `.agents/skills` roots by walking UP from
+/// `start`: closest-to-cwd first, stopping after the first directory
+/// containing a `.git` marker (the repo root) or at the filesystem root.
+/// Non-existent candidates are kept — consumers skip them — so a later
+/// `mkdir` needs no loader rebuild.
+fn project_skill_roots(start: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        roots.push(agents_skills_under(d));
+        if d.join(".git").exists() {
+            break;
+        }
+        dir = d.parent();
+    }
+    roots
+}
+
+/// Build the ordered discovery roots (D-E precedence). Pure — pinned by
+/// tests; `SkillLoader::new` injects the live home directory.
+fn build_roots(
+    zen_skills: PathBuf,
+    workspace_root: Option<&PathBuf>,
+    user_home_agents: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots = vec![zen_skills];
+    if let Some(ws) = workspace_root {
+        roots.extend(project_skill_roots(ws));
+    }
+    if let Some(agents) = user_home_agents {
+        roots.push(agents);
+    }
+    roots
 }
 
 impl SkillLoader {
     pub fn new(paths: &ZenPaths) -> Self {
         Self {
-            skills_dir: paths.skills(),
+            roots: build_roots(
+                paths.skills(),
+                paths.workspace_root(),
+                user_agents_skills_dir(),
+            ),
         }
     }
 
-    /// Loader over an explicit directory (report-only surfaces such as the
-    /// skill trigger grader that receive a resolved path, not full ZenPaths).
+    /// Loader over an explicit SINGLE directory (report-only surfaces such
+    /// as the skill trigger grader that evaluate zen-confirmed skills only —
+    /// deliberately NOT multi-root, Phase 31 T212).
     pub fn new_from_dir(skills_dir: PathBuf) -> Self {
-        Self { skills_dir }
+        Self {
+            roots: vec![skills_dir],
+        }
     }
 
-    /// List all available skill names.
+    /// The ordered discovery roots (highest precedence first).
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    /// List all available skill names across every root.
     ///
     /// Discovers both the flat layout (`<name>.md`) and the D02 precipitation
     /// layout (`<name>/SKILL.md`); the name is the file stem / directory name.
+    /// Roots are merged in precedence order with first-wins dedup: a name
+    /// shadowed by an earlier root keeps that root and the collision is
+    /// warned with both paths (D-E).
     pub fn list_skills(&self) -> anyhow::Result<Vec<String>> {
         let mut skills = Vec::new();
+        let mut winner: HashMap<String, &Path> = HashMap::new();
 
-        if !self.skills_dir.is_dir() {
-            return Ok(skills);
-        }
+        for root in &self.roots {
+            if !root.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                let path = entry.path();
 
-        for entry in fs::read_dir(&self.skills_dir)? {
-            let entry = entry?;
-            let path = entry.path();
+                let name = if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                } else if path.is_dir() && path.join("SKILL.md").is_file() {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let Some(name) = name else { continue };
 
-            if path.extension().and_then(|e| e.to_str()) == Some("md")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            {
-                skills.push(stem.to_string());
-            } else if path.is_dir()
-                && path.join("SKILL.md").is_file()
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            {
-                skills.push(stem.to_string());
+                match winner.get(&name) {
+                    Some(kept) => {
+                        warn!(
+                            skill = %name,
+                            kept = %kept.display(),
+                            shadowed = %root.display(),
+                            "skill name collision across roots — first root wins (D-E)"
+                        );
+                    }
+                    None => {
+                        winner.insert(name.clone(), root.as_path());
+                        skills.push(name);
+                    }
+                }
             }
         }
 
         skills.sort();
-        debug!(count = skills.len(), "listed skills");
+        debug!(
+            count = skills.len(),
+            roots = self.roots.len(),
+            "listed skills"
+        );
         Ok(skills)
     }
 
-    /// Load a skill definition by name.
+    /// Resolve the on-disk file of `name` by probing roots in precedence
+    /// order: within each root the flat `<name>.md` layout wins over the D02
+    /// `<name>/SKILL.md` layout (the pre-T212 single-root order).
+    fn find_skill_file(&self, name: &str) -> Option<PathBuf> {
+        self.roots.iter().find_map(|root| {
+            let flat = root.join(format!("{name}.md"));
+            if flat.is_file() {
+                return Some(flat);
+            }
+            let nested = root.join(name).join("SKILL.md");
+            nested.is_file().then_some(nested)
+        })
+    }
+
+    /// Load a skill definition by name (first root containing it wins).
     ///
     /// Tries the flat `<name>.md` first, then the D02 `<name>/SKILL.md`.
     pub fn load_skill(&self, name: &str) -> anyhow::Result<SkillDefinition> {
-        let flat = self.skills_dir.join(format!("{name}.md"));
-        let path = if flat.is_file() {
-            flat
-        } else {
-            self.skills_dir.join(name).join("SKILL.md")
-        };
+        let path = self.find_skill_file(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "skill '{name}' not found in any root ({})",
+                self.roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
         let content = fs::read_to_string(&path)?;
 
         parse_skill_file(name, &content)
     }
 
-    /// Check if a skill file exists (either layout).
+    /// Check if a skill file exists (either layout, any root).
     pub fn skill_exists(&self, name: &str) -> bool {
-        self.skills_dir.join(format!("{name}.md")).is_file()
-            || self.skills_dir.join(name).join("SKILL.md").is_file()
+        self.find_skill_file(name).is_some()
     }
 }
 
@@ -320,9 +423,7 @@ mod tests {
         // Non-.md file should be ignored
         fs::write(skills_dir.join("gamma.txt"), "not a skill").unwrap();
 
-        let loader = SkillLoader {
-            skills_dir: skills_dir.to_path_buf(),
-        };
+        let loader = SkillLoader::new_from_dir(skills_dir.to_path_buf());
         let mut skills = loader.list_skills().unwrap();
 
         skills.sort();
@@ -349,9 +450,7 @@ This is the skill body in Markdown."#;
 
         fs::write(skills_dir.join("weekly-review.md"), skill_content).unwrap();
 
-        let loader = SkillLoader {
-            skills_dir: skills_dir.to_path_buf(),
-        };
+        let loader = SkillLoader::new_from_dir(skills_dir.to_path_buf());
         let skill = loader.load_skill("weekly-review").unwrap();
 
         assert_eq!(skill.name, "weekly-review");
@@ -363,5 +462,168 @@ This is the skill body in Markdown."#;
         );
         assert_eq!(skill.prompt, "Review the past week...");
         assert!(skill.body.contains("# Skill body"));
+    }
+
+    fn write_skill(dir: &Path, name: &str, description: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\ndescription: {description}\n---\nBody"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn build_roots_orders_zen_native_first_project_closest_user_last() {
+        let zen = PathBuf::from("/tmp/zen-skills");
+        let ws = PathBuf::from("/tmp/ws-root");
+        let user = PathBuf::from("/tmp/user-agents-skills");
+        let roots = build_roots(zen.clone(), Some(&ws), Some(user.clone()));
+        assert_eq!(roots[0], zen);
+        // Project roots walk UP from the workspace root, closest first.
+        assert_eq!(roots[1], ws.join(".agents").join("skills"));
+        assert_eq!(*roots.last().unwrap(), user);
+        // No workspace root ⇒ only zen-native + user scope.
+        let roots = build_roots(zen.clone(), None, Some(user.clone()));
+        assert_eq!(roots, vec![zen.clone(), user]);
+        // No home ⇒ no user-scope root.
+        let roots = build_roots(zen.clone(), None, None);
+        assert_eq!(roots, vec![zen]);
+    }
+
+    #[test]
+    fn project_walk_stops_at_repo_root_git_marker() {
+        let base = tempdir().unwrap();
+        let repo = base.path().join("repo");
+        let nested = repo.join("crates").join("app");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let roots = project_skill_roots(&nested);
+        assert_eq!(
+            roots,
+            vec![
+                nested.join(".agents").join("skills"),
+                repo.join("crates").join(".agents").join("skills"),
+                repo.join(".agents").join("skills"),
+            ],
+            "walk must include the repo root itself and never its parent"
+        );
+    }
+
+    #[test]
+    fn project_walk_without_git_marker_stops_at_filesystem_root() {
+        let base = tempdir().unwrap();
+        let deep = base.path().join("a").join("b");
+        fs::create_dir_all(&deep).unwrap();
+        let roots = project_skill_roots(&deep);
+        assert_eq!(
+            roots.last().map(PathBuf::as_path),
+            Some(Path::new("/").join(".agents").join("skills").as_path())
+        );
+        assert!(roots.len() >= 3);
+    }
+
+    #[test]
+    fn multi_root_merge_is_first_wins_with_later_roots_still_discovered() {
+        let zen_root = tempdir().unwrap();
+        let project_root = tempdir().unwrap();
+        let user_root = tempdir().unwrap();
+        write_skill(zen_root.path(), "shared", "from-zen-native");
+        write_skill(project_root.path(), "shared", "from-project");
+        write_skill(project_root.path(), "project-only", "p");
+        write_skill(user_root.path(), "user-only", "u");
+
+        let loader = SkillLoader {
+            roots: vec![
+                zen_root.path().to_path_buf(),
+                project_root.path().to_path_buf(),
+                user_root.path().to_path_buf(),
+            ],
+        };
+        let names = loader.list_skills().unwrap();
+        assert_eq!(names, vec!["project-only", "shared", "user-only"]);
+        // Collision: the FIRST root wins (D-E, pi precedent; warned at merge).
+        let shared = loader.load_skill("shared").unwrap();
+        assert_eq!(shared.description, "from-zen-native");
+        assert!(loader.skill_exists("user-only"));
+    }
+
+    #[test]
+    fn later_root_nested_skill_layout_is_discovered() {
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        let nested = second.path().join("zen-wiki");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: zen-wiki\ndescription: exported KB\n---\nBody",
+        )
+        .unwrap();
+
+        let loader = SkillLoader {
+            roots: vec![first.path().to_path_buf(), second.path().to_path_buf()],
+        };
+        assert_eq!(loader.list_skills().unwrap(), vec!["zen-wiki"]);
+        assert_eq!(
+            loader.load_skill("zen-wiki").unwrap().description,
+            "exported KB"
+        );
+    }
+
+    #[test]
+    fn flat_layout_wins_over_nested_within_one_root() {
+        let root = tempdir().unwrap();
+        write_skill(root.path(), "dup", "flat");
+        let nested = root.path().join("dup");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: dup\ndescription: nested\n---\nBody",
+        )
+        .unwrap();
+        let loader = SkillLoader::new_from_dir(root.path().to_path_buf());
+        assert_eq!(loader.load_skill("dup").unwrap().description, "flat");
+    }
+
+    #[test]
+    fn new_from_dir_stays_single_root() {
+        let own = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        write_skill(own.path(), "alpha", "a");
+        write_skill(other.path(), "beta", "b");
+
+        let loader = SkillLoader::new_from_dir(own.path().to_path_buf());
+        assert_eq!(
+            loader.roots(),
+            std::slice::from_ref(&own.path().to_path_buf())
+        );
+        assert_eq!(loader.list_skills().unwrap(), vec!["alpha"]);
+        assert!(!loader.skill_exists("beta"));
+    }
+
+    #[test]
+    fn load_missing_skill_error_names_every_probed_root() {
+        let a = tempdir().unwrap();
+        let b = tempdir().unwrap();
+        let loader = SkillLoader {
+            roots: vec![a.path().to_path_buf(), b.path().to_path_buf()],
+        };
+        let err = loader.load_skill("nope").unwrap_err().to_string();
+        assert!(err.contains(&a.path().display().to_string()), "{err}");
+        assert!(err.contains(&b.path().display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn missing_roots_are_skipped_not_fatal() {
+        let real = tempdir().unwrap();
+        write_skill(real.path(), "alpha", "a");
+        let loader = SkillLoader {
+            roots: vec![
+                real.path().join("does-not-exist"),
+                real.path().to_path_buf(),
+            ],
+        };
+        assert_eq!(loader.list_skills().unwrap(), vec!["alpha"]);
     }
 }

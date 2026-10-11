@@ -1,12 +1,42 @@
 use std::fs;
 use std::path::PathBuf;
 
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use colored::Colorize;
 use tracing::debug;
 
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
+
+/// `--target` surface of `zen wiki export-skill` (Phase 31 T213).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: selects the discovery root the SKILL.md is written to —
+///   `zen` = `~/.zen/skills` (zen's own SkillLoader root, the pre-T213
+///   default), `agents` = `~/.agents/skills` (the vendor-neutral user scope
+///   codex-style and pi-style CLIs discover; FR-039 neutral plane).
+/// - User impact: `agents` closes the loop for external agents without
+///   touching zen-native discovery; an explicit `--output` still wins over
+///   both targets.
+/// - Default: `zen` — unchanged behavior (pinned by the
+///   `skill_export_discovery` contract test).
+/// - Interaction: multi-root `SkillLoader` (T212) discovers BOTH roots, so a
+///   zen-native export stays visible regardless of target.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillExportTargetArg {
+    #[default]
+    Zen,
+    Agents,
+}
+
+impl From<SkillExportTargetArg> for zen_vault::SkillExportTarget {
+    fn from(arg: SkillExportTargetArg) -> Self {
+        match arg {
+            SkillExportTargetArg::Zen => zen_vault::SkillExportTarget::Zen,
+            SkillExportTargetArg::Agents => zen_vault::SkillExportTarget::Agents,
+        }
+    }
+}
 
 #[derive(Subcommand)]
 pub enum WikiCommands {
@@ -57,6 +87,9 @@ pub enum WikiCommands {
         /// Output file (default: ~/.zen/skills/zen-wiki/SKILL.md)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Discovery root: zen = ~/.zen/skills, agents = ~/.agents/skills
+        #[arg(long, value_enum, default_value_t = SkillExportTargetArg::Zen)]
+        target: SkillExportTargetArg,
         /// Machine-readable summary (written path + page count)
         #[arg(long)]
         json: bool,
@@ -272,9 +305,16 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             Ok(())
         }
         WikiCommands::Loop { command } => crate::cmd::loop_command::execute_command(command).await,
-        WikiCommands::ExportSkill { output, json } => {
-            debug!("export-skill: output={:?} json={}", output, json);
-            wiki_export_skill(output.as_deref(), *json)
+        WikiCommands::ExportSkill {
+            output,
+            target,
+            json,
+        } => {
+            debug!(
+                "export-skill: output={:?} target={:?} json={}",
+                output, target, json
+            );
+            wiki_export_skill(output.as_deref(), *target, *json)
         }
         WikiCommands::Rollback { name, to, list } => {
             debug!("rollback: name={:?} to={:?} list={}", name, to, list);
@@ -465,24 +505,30 @@ fn wiki_rollback(name: Option<&str>, to: Option<i64>, list: bool) -> Result<(), 
 
 /// E7 SKILL.md export: render the wiki inventory into an Agent Skills
 /// file so external agents (Claude Code / Codex CLI / Gemini CLI) can
-/// read the KB with zero runtime setup. Default target
-/// `~/.zen/skills/zen-wiki/SKILL.md` — the directory name MUST equal the
-/// frontmatter `name` (Agent Skills spec), which also makes the exported
-/// skill discoverable by zen's own SkillLoader (FR-039 neutral plane).
-fn wiki_export_skill(output: Option<&std::path::Path>, json: bool) -> Result<(), ZenError> {
+/// read the KB with zero runtime setup. Default target `zen` writes
+/// `~/.zen/skills/zen-wiki/SKILL.md`; `--target agents` writes the
+/// vendor-neutral `~/.agents/skills/zen-wiki/SKILL.md` (T213). The
+/// directory name MUST equal the frontmatter `name` (Agent Skills spec),
+/// which also makes the exported skill discoverable by zen's own
+/// multi-root SkillLoader (FR-039 neutral plane).
+fn wiki_export_skill(
+    output: Option<&std::path::Path>,
+    target: SkillExportTargetArg,
+    json: bool,
+) -> Result<(), ZenError> {
     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
     let wiki_dir = paths.wiki();
     let pages =
         zen_vault::collect_skill_pages(&wiki_dir).map_err(|e| ZenError::Message(e.to_string()))?;
     let rendered = zen_vault::render_wiki_skill_md(&pages);
 
-    let out_path = match output {
-        Some(p) => p.to_path_buf(),
-        None => paths
-            .skills()
-            .join(zen_vault::WIKI_SKILL_NAME)
-            .join(zen_vault::skill_file_name()),
-    };
+    let out_path = zen_vault::resolve_skill_export_path(
+        target.into(),
+        output,
+        &paths.skills(),
+        zen_core::paths::user_agents_skills_dir().as_deref(),
+    )
+    .map_err(|e| ZenError::Message(e.to_string()))?;
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| ZenError::Message(format!("create {}: {e}", parent.display())))?;
@@ -508,4 +554,74 @@ fn wiki_export_skill(output: Option<&std::path::Path>, json: bool) -> Result<(),
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    #[derive(clap::Parser)]
+    struct Cmd {
+        #[command(subcommand)]
+        command: WikiCommands,
+    }
+
+    fn parse(args: &[&str]) -> Result<WikiCommands, clap::Error> {
+        let mut full = vec!["zen"];
+        full.extend_from_slice(args);
+        Cmd::try_parse_from(full).map(|c| c.command)
+    }
+
+    #[test]
+    fn export_skill_target_defaults_to_zen() {
+        match parse(&["export-skill"]).unwrap() {
+            WikiCommands::ExportSkill {
+                output,
+                target,
+                json,
+            } => {
+                assert_eq!(target, SkillExportTargetArg::Zen);
+                assert!(output.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected ExportSkill"),
+        }
+    }
+
+    #[test]
+    fn export_skill_target_agents_parses_and_output_still_accepted() {
+        let cmd = parse(&[
+            "export-skill",
+            "--target",
+            "agents",
+            "--output",
+            "/tmp/x/SKILL.md",
+        ])
+        .unwrap();
+        match cmd {
+            WikiCommands::ExportSkill { output, target, .. } => {
+                assert_eq!(target, SkillExportTargetArg::Agents);
+                assert_eq!(output.unwrap().to_string_lossy(), "/tmp/x/SKILL.md");
+            }
+            _ => panic!("expected ExportSkill"),
+        }
+    }
+
+    #[test]
+    fn export_skill_rejects_unknown_target() {
+        assert!(parse(&["export-skill", "--target", "gemini"]).is_err());
+    }
+
+    #[test]
+    fn target_arg_maps_onto_vault_target() {
+        assert_eq!(
+            zen_vault::SkillExportTarget::from(SkillExportTargetArg::Agents),
+            zen_vault::SkillExportTarget::Agents
+        );
+        assert_eq!(
+            zen_vault::SkillExportTarget::from(SkillExportTargetArg::Zen),
+            zen_vault::SkillExportTarget::Zen
+        );
+    }
 }

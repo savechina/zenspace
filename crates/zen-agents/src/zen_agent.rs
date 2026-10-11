@@ -15,7 +15,9 @@ use zen_core::notion_graph::NotionGraphProvider;
 use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::{MessageRole, SessionContext};
-use zen_memory::memvid_store::{CardSelection, MemvidStore, select_cards};
+use zen_memory::memvid_store::{
+    CardSelection, MemvidStore, select_cards, select_cards_with_strength,
+};
 use zen_provider::DefaultRouter;
 
 use crate::completion_model::ZenCompletionModel;
@@ -648,6 +650,52 @@ fn read_identity_file(path: &std::path::Path) -> std::io::Result<String> {
     let content = read_to_string(path)?;
     Ok(InputSanitizer::new().strip_dangerous_patterns(&content))
 }
+
+/// `Some(half_life_days)` when `[agentic.memory_strength] enabled &&
+/// search_rerank` (Phase 31 T209, owner decision D-G: the ONE flag also
+/// drives the gateway `memory/search` rerank). Config-load failure fails
+/// CLOSED (rerank off) — a ranking change must never surprise a
+/// misconfigured workspace (`shadow_embedding_enabled` precedent).
+fn memory_strength_half_life() -> Option<f64> {
+    match zen_core::config::load_config() {
+        Ok(config) => {
+            let ms = &config.agentic.memory_strength;
+            (ms.enabled_or_default() && ms.search_rerank_or_default())
+                .then(|| ms.half_life_days_or_default())
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "config load failed; memory strength rerank stays off"
+            );
+            None
+        }
+    }
+}
+
+/// Retention strength of one memory card (T209 `select_cards` consumer).
+///
+/// Cards carry NO provenance `extra_metadata` (no `source_path`), so the
+/// anchor chain reduces to journal-uri date (`source_uri`) > card
+/// `created_at`, and the reward-sidecar join is unavailable — `events`
+/// stays 0 (recorded limitation; no faked join). Ranking-only: the value
+/// feeds `select_cards_with_strength`, never a filter.
+fn card_retention_strength(
+    card: &zen_memory::memvid_store::memvid_core::MemoryCard,
+    half_life_days: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> f64 {
+    let uri_date = card
+        .source_uri
+        .as_deref()
+        .and_then(zen_memory::memvid_index::extract_anchor_date)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc());
+    let created_at = chrono::DateTime::from_timestamp(card.created_at, 0).unwrap_or(now);
+    let anchor = zen_memory::strength::resolve_content_anchor(uri_date, None, created_at);
+    zen_memory::strength::retention_strength(anchor, None, 0, now, half_life_days)
+}
+
 /// A Zen-tailored agent combining rig_compose's skill-driver [`GenericAgent`]
 /// with a [`ZenCompletionModel`] for direct LLM routing.
 pub struct ZenAgent {
@@ -807,11 +855,21 @@ impl ZenAgent {
     #[instrument(skip(self), fields(session_id, query_len = query.len()))]
     fn retrieve_memories_structured(&self, session_id: &str, query: &str) -> Option<Vec<String>> {
         self.memvid_store.as_ref().and_then(|store| {
-            match select_cards(
-                store,
-                &CardSelection::ForPrincipal(session_id.to_string()),
-                query,
-            ) {
+            let selection = CardSelection::ForPrincipal(session_id.to_string());
+            // T209 (D-G): gate OFF ⇒ plain `select_cards`, byte-identical to
+            // pre-T209; gate ON ⇒ stable strength-descending reorder (the
+            // zen-memory pin guarantees a constant resolver reproduces
+            // `select_cards` exactly).
+            let cards = match memory_strength_half_life() {
+                Some(half_life) => {
+                    let now = chrono::Utc::now();
+                    select_cards_with_strength(store, &selection, query, |card| {
+                        card_retention_strength(card, half_life, now)
+                    })
+                }
+                None => select_cards(store, &selection, query),
+            };
+            match cards {
                 Ok(cards) if !cards.is_empty() => {
                     tracing::info!(
                         session_id,
@@ -2333,5 +2391,77 @@ mod belief_surface_tests {
             line.contains("candidate: 36%"),
             "M2 line must render the Noisy-OR candidate: {line}"
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_strength_consumer_tests {
+    use super::*;
+    use zen_memory::memvid_store::memvid_core::{MemoryCard, MemoryCardBuilder};
+
+    fn card(uri: Option<&str>) -> MemoryCard {
+        MemoryCardBuilder::new()
+            .event()
+            .entity("user")
+            .slot("test-slot")
+            .value("v")
+            .source(1, uri.map(str::to_string))
+            .engine("zen-test", "1")
+            .build(0)
+            .unwrap()
+    }
+
+    fn clear_strength_env() {
+        unsafe {
+            std::env::remove_var("ZEN_MEMORY_STRENGTH_ENABLED");
+            std::env::remove_var("ZEN_MEMORY_STRENGTH_RERANK");
+        }
+        zen_core::config::invalidate_config_cache();
+    }
+
+    #[test]
+    fn uri_dated_card_decays_below_created_at_anchored_card() {
+        let now = chrono::Utc::now();
+        let aged = card(Some("journal-2020-01-01"));
+        let fresh = card(None);
+        let r_aged = card_retention_strength(&aged, 30.0, now);
+        let r_fresh = card_retention_strength(&fresh, 30.0, now);
+        assert!(r_aged < 0.2, "2020 journal anchor must decay: {r_aged}");
+        assert!(
+            r_fresh > 0.99,
+            "created_at≈now must stay near 1.0: {r_fresh}"
+        );
+    }
+
+    #[test]
+    fn undated_uri_falls_back_to_created_at() {
+        let now = chrono::Utc::now();
+        let kb = card(Some("knowledge-base"));
+        let r = card_retention_strength(&kb, 30.0, now);
+        assert!(r > 0.99, "non-journal uri ⇒ created_at anchor: {r}");
+    }
+
+    #[test]
+    fn rerank_gate_closed_by_default() {
+        clear_strength_env();
+        assert!(
+            memory_strength_half_life().is_none(),
+            "gate-off must route retrieve_memories_structured through plain select_cards"
+        );
+    }
+
+    #[test]
+    fn rerank_gate_requires_both_flags() {
+        clear_strength_env();
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_ENABLED", "1") };
+        zen_core::config::invalidate_config_cache();
+        assert!(
+            memory_strength_half_life().is_none(),
+            "enabled alone must NOT rerank (D-G: search_rerank is the ranking switch)"
+        );
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_RERANK", "1") };
+        zen_core::config::invalidate_config_cache();
+        assert_eq!(memory_strength_half_life(), Some(30.0));
+        clear_strength_env();
     }
 }
