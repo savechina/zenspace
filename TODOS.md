@@ -2,6 +2,42 @@
 
 ## Review
 
+### Contentless FTS5 serves structurally-empty tier-2 content (found by Phase 31 T214, 2026-10-11)
+
+**What:** `notes_fts` is a contentless FTS5 table (`content=''`, migration 001:27-31) ⇒ `NotesRepo::search`'s `SUBSTR(nf.content,…)` snippet returns `''` for EVERY tier-2 hit. Gateway `knowledge/search` RPC and TUI Fast-mode context injection serve empty `content` to consumers today. T214's `inject_knowledge_context` works around it by reading the canonical markdown file (256KiB cap + sanitize, wake-up-brief precedent) — the workaround should be generalized or the defect fixed at the source.
+
+**Why:** Tier-2 is the default search tier (`KnowledgeSearchMode::Fast` pins `tiers=["fts"]`); every surface that renders snippet content shows nothing. Silent since 001 — consumers treat empty content as "no match detail" rather than a defect.
+
+**Context:** Found empirically by the wave-3 agent (`019861f`, orchestrator.rs `inject_knowledge_context`). Options: (a) external-content FTS5 (`content='notes_meta'` + rebuild triggers — migration is additive-adjacent but touches FTS semantics, Principle XIII #8 rebuild discipline applies); (b) join the canonical file read into `NotesRepo::search` results; (c) leave the per-consumer file-read workaround and document it. Start by reading migration 001's FTS block, `notes_repo.rs` search, and the gateway `knowledge/search` handler.
+
+**Effort:** M
+**Priority:** P2
+**Depends on:** none — pre-existing defect, independent of Phase 31 (which routed around it)
+
+### D1-class Confidential async routing hazard — audit `enforce_sensitivity → reqwest::blocking` chain (re-observed by Phase 31 T215, 2026-10-11)
+
+**What:** Sensitivity routing in async contexts reaches `enforce_sensitivity → is_local_llm_available → OllamaProvider::health_check → reqwest::blocking` — the nested-runtime drop-panic class (D1, previously fixed at specific call sites via `spawn_blocking` guards: intent.rs, review_pipeline, semantic_lint). `DelegateTaskTool::run_single` has routed under mirrored sensitivity since 006 WITHOUT a spawn_blocking guard — re-observed (not introduced) by the wave-3 agent; async tests avoided Confidential for this reason.
+
+**Why:** A Confidential delegate/plan sub-turn on a live async runtime can hit the blocking-in-async panic path. The 2026-09-30 "false alarm" record proved the sync `complete()` sites are safe (dedicated-thread pattern), but `is_local_llm_available`'s health check is a DIFFERENT blocking call site — its guard coverage was never audited end-to-end.
+
+**Context:** Wave-3 report deviation #10 (`019861f`). Audit task: enumerate every `enforce_sensitivity`/`is_local_llm_available` caller reachable from async contexts, verify each is behind `spawn_blocking` or a dedicated thread, add guards + regression pins where missing. Start by reading `zen-provider/src/router.rs` (enforce_sensitivity), `providers/ollama.rs` (health_check), and grepping callers in zen-agents.
+
+**Effort:** S
+**Priority:** P2
+**Depends on:** none — audit + targeted guards
+
+### Memory-strength enriched-path symmetry decision (Phase 31 T209/T211 recorded limitation)
+
+**What:** Both the strength READ side (`card_retention_strength` in `retrieve_memories_structured`, T209) and the reward WRITE side (`increment_memvid_injection_rewards`, T211) live ONLY in the `structured` retrieve path — but the chain prefers `retrieve_memories_enriched`, so when enriched is populated neither fires. Read/write are symmetric (deliberate, recorded), but the strength/reward loop is dormant on the primary path.
+
+**Why:** Deciding whether to extend both sides to the enriched path changes per-turn behavior on the primary retrieve chain — needs an explicit decision, not an implicit change (single-writer + gate discipline).
+
+**Context:** Recorded in design doc Implementation Record wave 3 + tasks.md T211 closure note (`019861f`). If extended: enriched memories must expose the same card/source_path resolution T211 built (`resolve_card_source_path`), and T209's rerank must apply to the enriched formatter. Gate stays `memory_strength.enabled` (provably no-op when closed).
+
+**Effort:** M
+**Priority:** P3
+**Depends on:** owner decision — extend to enriched path, or document structured-only as the intended scope
+
 ### QQBot outbox drainer (morning-brief push completion) — RESOLVED 2026-09-04 (005 T101)
 
 **What:** Gateway-side task draining `logs/outbox/morning-brief-*.json` via qqbot active send (`msg_id=None`), deleting each file on successful send, leaving failures for retry with warn log.
