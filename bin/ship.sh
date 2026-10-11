@@ -9,16 +9,20 @@
 #   --no-hooks            不安装/不依赖 git hooks（无 hook 时脚本内直跑 bin/lint）
 #   --allow-main          允许在 main/master 分支提交（默认拒绝）
 #   --allow-ai-trailer    允许消息中带 AI 署名（默认 commit-msg hook 拦截）
+#   --allow-detail        允许消息中带文件/测试/门禁明细（默认 commit-msg hook 拦截；细节写设计文档，不进 git 历史）
 #   --dry-run             只打印将要执行的动作，不改工作区
 #   --suggest             只暂存+输出结构化变更摘要（含启发式 Conventional Commits 草稿），不提交（给 agent/summarizer skill 用）
 #   --auto-message        用启发式草稿直接当提交标题（快路径；--type 可覆盖类型）
 #   --type T              覆盖启发式类型（feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert）
-# EXPECTED: 装好 .git/hooks/{pre-commit,commit-msg}（幂等，只碰自家标记的 hook）；1 个无 AI 署名、符合 Conventional Commits 的 commit；最后只提示 push 命令
-# ERRORS: lint 失败 → 修完重跑；有剩余 untracked 且无 --all → 中止并列出；消息命中 AI 署名或格式不符 → hook 拦截
+# EXPECTED: 装好 .git/hooks/{pre-commit,commit-msg}（幂等，只碰自家标记的 hook）；1 个无 AI 署名、无明细、符合 Conventional Commits 的 commit；最后只提示 push 命令
+# ERRORS: lint 失败 → 修完重跑；有剩余 untracked 且无 --all → 中止并列出；消息命中 AI 署名、明细模式或格式不符 → hook 拦截
 # AGENT PROTOCOL (coding agent + summarizer skill):
 #   1. agent: ./bin/ship.sh --suggest [--all] [-- path...]  → 暂存 + 输出 [ship-suggest] 结构化摘要
-#   2. skill: 按 Conventional Commits 精修标题/正文（type(scope): subject，subject<=120）
-#   3. agent: ./bin/ship.sh -m "title" [-b "body"] [同上 flags]  → hooks(QA 门+格式门+AI 拦截)后提交
+#   2. skill: 按 Conventional Commits 精修标题/正文（type(scope): subject，subject<=120）。
+#      MESSAGE RULES（像人工提交）: 正文只写功能点（改了什么能力/为什么，≤5 个短 bullet）；
+#      禁止文件清单、diffstat、测试数、门禁结果——commit-msg hook 拦截这些明细模式
+#      （单次放行 SHIP_ALLOW_DETAIL=1 或 --allow-detail）；细节归档到 docs/designs/ 或 tasks.md ledger
+#   3. agent: ./bin/ship.sh -m "title" [-b "body"] [同上 flags]  → hooks(QA 门+格式门+AI 拦截+明细拦截)后提交
 #   QA 扩展点: SHIP_QA_EXTRA="cmd args..."（pre-commit 在 bin/lint 后追加执行）；SHIP_RUN_TESTS=1 时追加 cargo test --workspace（慢，默认关）
 set -euo pipefail
 
@@ -30,6 +34,7 @@ NO_VERIFY=0
 NO_HOOKS=0
 ALLOW_MAIN=0
 ALLOW_AI_TRAILER=0
+ALLOW_DETAIL=0
 DRY_RUN=0
 SUGGEST=0
 AUTO_MESSAGE=0
@@ -47,6 +52,7 @@ while [ $# -gt 0 ]; do
     --no-hooks) NO_HOOKS=1; shift ;;
     --allow-main) ALLOW_MAIN=1; shift ;;
     --allow-ai-trailer) ALLOW_AI_TRAILER=1; shift ;;
+    --allow-detail) ALLOW_DETAIL=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --suggest) SUGGEST=1; shift ;;
     --auto-message) AUTO_MESSAGE=1; shift ;;
@@ -112,6 +118,16 @@ if [ \"\${SHIP_ALLOW_AI_TRAILER:-0}\" != \"1\" ] && grep -Ei 'co-authored-by:[[:
   echo '[ship] 人工合著署名不受影响；确需放行请用 ./bin/ship.sh --allow-ai-trailer 重试。' >&2
   exit 1
 fi
+if [ \"\${SHIP_ALLOW_DETAIL:-0}\" != \"1\" ]; then
+  DETAIL_HITS=\$(grep -Eic 'files changed \\(\\+|[0-9]+ passed|[0-9]+ failed|[0-9]+ skipped|bin/test[[:space:]]+[0-9]|^gate:|baseline[[:space:]]+[0-9]|\\(\\+[0-9]+' \"\$F\" || true)
+  CRATES_MENTIONS=\$(grep -o 'crates/' \"\$F\" | wc -l | tr -d ' ')
+  if [ \"\$DETAIL_HITS\" -gt 0 ] || [ \"\$CRATES_MENTIONS\" -ge 3 ]; then
+    echo '[ship] BLOCKED: 提交消息包含文件/测试/门禁明细——只写功能点，像人工提交。' >&2
+    echo '[ship] 规约: 标题 type(scope): 功能点；正文 ≤5 个短 bullet（改了什么能力/为什么）。明细归档 docs/designs/ 或 tasks.md ledger。' >&2
+    echo '[ship] 单次放行: SHIP_ALLOW_DETAIL=1 或 ./bin/ship.sh --allow-detail' >&2
+    exit 1
+  fi
+fi
 if ! printf '%s' \"\$SUBJECT\" | grep -Eq '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\\([^)]+\\))?!?: [^ ].*'; then
   echo '[ship] BLOCKED: 标题不符合 Conventional Commits：type(scope): subject' >&2
   echo '[ship] type 限 feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert；示例: feat(zen-agents): add skill auto-route' >&2
@@ -149,13 +165,11 @@ echo "staged:"; git diff --cached --stat | tail -1
 
 # 3. 启发式 Conventional Commits 草稿（给 --suggest/--auto-message 用；skill 精修优先）
 suggest_message() {
-  local files added_cnt mod_cnt del_cnt add_lines del_lines scope type top
+  local files added_cnt mod_cnt del_cnt scope type topdir area
   files="$(git diff --cached --name-only)"
   added_cnt="$(git diff --cached --diff-filter=A --name-only | grep -c . || true)"
   mod_cnt="$(git diff --cached --diff-filter=M --name-only | grep -c . || true)"
   del_cnt="$(git diff --cached --diff-filter=D --name-only | grep -c . || true)"
-  add_lines="$(git diff --cached --numstat | awk '{a+=$1} END {print a+0}')"
-  del_lines="$(git diff --cached --numstat | awk '{d+=$2} END {print d+0}')"
   scope="$(printf '%s' "$files" | awk -F/ '{if ($1=="crates" && NF>1) print $2; else print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')"
   if [ -n "$TYPE_OVERRIDE" ]; then
     type="$TYPE_OVERRIDE"
@@ -170,9 +184,10 @@ suggest_message() {
   else
     type="fix"
   fi
-  top="$(git diff --cached --numstat | awk '{print $1+$2, $3}' | sort -rn | head -3 | awk '{print $2}' | xargs -n1 basename 2>/dev/null | paste -sd, -)"
-  printf '[ship-suggest]\ntype=%s\nscope=%s\nsubject=%s(%s): %s files changed (+%s/-%s), top: %s\nfiles_added=%s\nfiles_modified=%s\nfiles_deleted=%s\n' \
-    "$type" "$scope" "$type" "$scope" "$((added_cnt + mod_cnt + del_cnt))" "$add_lines" "$del_lines" "$top" "$added_cnt" "$mod_cnt" "$del_cnt"
+  topdir="$(git diff --cached --numstat | awk '{s[$3]+=$1+$2} END {for (f in s) print s[f], f}' | sort -rn | head -1 | awk '{print $2}' | xargs -n1 dirname 2>/dev/null)"
+  area="$(basename "${topdir:-.}")"
+  printf '[ship-suggest]\ntype=%s\nscope=%s\nsubject=%s(%s): update %s\nrule=正文只写功能点（≤5 短 bullet），禁止文件清单/diffstat/测试数/门禁结果（commit-msg hook 拦截；单次放行 SHIP_ALLOW_DETAIL=1）\nfiles_added=%s\nfiles_modified=%s\nfiles_deleted=%s\n' \
+    "$type" "$scope" "$type" "$scope" "$area" "$added_cnt" "$mod_cnt" "$del_cnt"
   echo "---stat---"
   git diff --cached --stat | tail -8
 }
@@ -194,6 +209,7 @@ fi
 # 5. 提交：脚本自身永不拼接任何 trailer；--no-verify/--allow-ai-trailer 透传给 hook 做单次放行
 export SHIP_SKIP_VERIFY="$NO_VERIFY"
 export SHIP_ALLOW_AI_TRAILER="$ALLOW_AI_TRAILER"
+export SHIP_ALLOW_DETAIL="$ALLOW_DETAIL"
 ARGS=()
 if [ -n "$MSG" ]; then
   ARGS+=(-m "$MSG")
