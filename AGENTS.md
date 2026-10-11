@@ -475,8 +475,8 @@ When adding new CLI commands:
 cargo build              # Build all crates
 cargo test               # Run integration tests
 bin/lint                 # fmt --check + clippy -D warnings
-orb run bash -c 'cd "$PWD" && CARGO_TARGET_DIR="$HOME/zen-linux-target" bin/lint'  # Linux lint gate in OrbStack VM (CI parity; arm64; isolates target dir from macOS)
-orb run bash -c 'cd "$PWD" && CARGO_TARGET_DIR="$HOME/zen-linux-target" cargo test -p <crate> --lib <filter>'  # Run tests under real Linux git/glibc
+orb run bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; cd "$PWD" && CARGO_TARGET_DIR="$HOME/zen-linux-target" bin/lint'  # Linux lint gate in OrbStack VM (CI parity; arm64; isolates target dir from macOS). Proxy unset is MANDATORY: OrbStack injects the macOS host proxy into the VM; a dead host proxy leaves http_proxy=0.0.0.0:1087 and every cargo registry fetch fails with "curl failed … via 0.0.0.0" — the VM's NAT networking needs no proxy (verified: direct curl to index.crates.io returns 200 with proxy vars unset)
+orb run bash -c 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; cd "$PWD" && CARGO_TARGET_DIR="$HOME/zen-linux-target" cargo test -p <crate> --lib <filter>'  # Run tests under real Linux git/glibc (same proxy-unset requirement)
 cargo fmt --all          # Format
 bin/load-harness         # SC-004 load test: 100-note batch, isolated ZEN_HOME (ignored by default)
 bin/zentest              # Any zen command against ~/.zentest instead of ~/.zen
