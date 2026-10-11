@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rig_agent::agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome};
@@ -15,6 +15,7 @@ use rig_core::completion::{AssistantContent, Usage, message::ToolCall as NativeT
 use rig_core::message::Message;
 use tracing::{debug, info, instrument, warn};
 
+use zen_core::config::KnowledgeInjectMode;
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::{MessageRole, RetrievedNote, Sensitivity, SessionContext};
 use zen_memory::ZenMemvidStore;
@@ -54,6 +55,22 @@ const M1_TOP_K: usize = 5;
 /// identity files before M1 insertion.
 const WAKE_UP_BRIEF_MAX_BYTES: u64 = 256 * 1024;
 
+/// Max knowledge notes retrieved per gated turn (T214). The value is the
+/// design F2-D7 config-table record (`knowledge_limit` default 3) — reuse,
+/// not invention; T206 deliberately left the key out of config until this
+/// consumer landed (T192 no-dormant-key discipline).
+const KNOWLEDGE_NOTE_LIMIT: usize = 3;
+
+/// Lazily-initialized KB search stack for knowledge injection (T214, design
+/// F2-D6): `SearchService` over a `SqliteClient` opened once per orchestrator
+/// lifetime. Mirrors `PlanExecuteTool::db`'s race-tolerant `OnceLock` pattern
+/// (`plan_task.rs:87-95`): a failed open is NOT cached (next turn retries),
+/// a concurrent double-open loses its `set` and reads back the winner.
+struct KnowledgeStack {
+    service: zen_vault::search::SearchService,
+    client: Arc<zen_repo::SqliteClient>,
+}
+
 /// Orchestrator manages agent lifecycle, registry, and execution flow.
 ///
 /// Architecture (ADR-011 + FR-TUI-012):
@@ -79,6 +96,12 @@ pub struct AgentOrchestrator {
     /// 006: parent sensitivity shared with DelegateTaskTool so delegated
     /// sub-turns route under the same sensitivity policy.
     delegate_sensitivity: crate::delegate_task::SharedSensitivity,
+    /// T215 (design F2-D8): parent M1 knowledge block shared with
+    /// DelegateTaskTool so `compose_sub_session` can inherit it into
+    /// sub-agent sessions under `[agentic.delegate] context_inheritance`.
+    delegate_knowledge: crate::delegate_task::SharedKnowledge,
+    /// T214: lazy KB search stack (`[agentic.orchestrator] knowledge_inject`).
+    knowledge_stack: OnceLock<Option<Arc<KnowledgeStack>>>,
 }
 
 /// Resolve the tool-loop cap from the 5-layer merged config (T054).
@@ -377,6 +400,173 @@ fn inject_wake_up_brief(paths: &ZenPaths, session: &mut SessionContext) -> bool 
     true
 }
 
+/// Config-resolved knowledge-injection settings for one turn (T214).
+/// `None` from [`knowledge_inject_settings`] means the gate is closed:
+/// no retrieval, no injection, no audit — pre-Phase-31 behavior.
+struct KnowledgeInjectSettings {
+    mode: KnowledgeInjectMode,
+    tiers: String,
+    budget_chars: usize,
+    timeout: Duration,
+}
+
+/// Resolve `[agentic.orchestrator] knowledge_*` (Phase 31 T206 surface).
+///
+/// Config-load failure fails CLOSED (`None`) — the T206 failure-direction
+/// decision: because `knowledge_inject` is the sole default-ON gate of the
+/// phase, a misconfigured workspace must never keep injecting by accident
+/// (same discipline as an invalid value degrading to `Off` in config.rs).
+fn knowledge_inject_settings() -> Option<KnowledgeInjectSettings> {
+    let config = match zen_core::config::load_config() {
+        Ok(config) => config,
+        Err(e) => {
+            warn!(error = %e, "config load failed; knowledge injection stays off");
+            return None;
+        }
+    };
+    let orchestrator = &config.agentic.orchestrator;
+    let mode = orchestrator.knowledge_inject_mode();
+    if mode == KnowledgeInjectMode::Off {
+        return None;
+    }
+    Some(KnowledgeInjectSettings {
+        mode,
+        tiers: orchestrator.knowledge_tiers_or_default().to_string(),
+        budget_chars: orchestrator.knowledge_budget_chars_or_default(),
+        timeout: Duration::from_millis(orchestrator.knowledge_timeout_ms_or_default()),
+    })
+}
+
+/// Map a `[agentic.orchestrator] knowledge_tiers` entry onto the numeric
+/// `SearchService` tier — the same contract names as the gateway
+/// `knowledge/search` resolver (`zen-gateway/src/server/knowledge.rs:54-73`):
+/// first non-empty comma-separated entry wins; an unrecognized name yields
+/// `None` (skip + audited reason) so a typo never silently reroutes to a
+/// different tier (cron-timezone discipline).
+fn resolve_knowledge_tier(tiers: &str) -> Option<u8> {
+    let first = tiers
+        .split(',')
+        .map(str::trim)
+        .find(|entry| !entry.is_empty())?;
+    match first {
+        "ripgrep" => Some(1),
+        "fts" => Some(2),
+        "vec" => Some(3),
+        "graph" => Some(4),
+        "llm" => Some(5),
+        _ => None,
+    }
+}
+
+/// Truncate retrieved notes to a total char budget at char boundaries
+/// (never mid-codepoint), preserving rank order; notes past the exhausted
+/// budget are dropped. Returns `(notes, total content chars)`.
+///
+/// Shared seam for the T214 injection budget (`knowledge_budget_chars`) and
+/// the T215 sub-agent inheritance budget (depth-halved) so both consumers
+/// enforce one truncation contract.
+pub(crate) fn truncate_notes_to_budget(
+    notes: Vec<RetrievedNote>,
+    budget_chars: usize,
+) -> (Vec<RetrievedNote>, usize) {
+    let mut truncated = Vec::with_capacity(notes.len());
+    let mut used = 0usize;
+    for mut note in notes {
+        let remaining = budget_chars.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let len = note.content.chars().count();
+        if len > remaining {
+            note.content = note.content.chars().take(remaining).collect();
+        }
+        used += len.min(remaining);
+        truncated.push(note);
+    }
+    (truncated, used)
+}
+
+/// One `loop.knowledge.injected` line in `<logs>/audit.jsonl` — per gated
+/// turn BY DESIGN (owner decision D-F: this line is the live observability
+/// for the sole default-ON gate's latency/token guards), skips included via
+/// `skipped_reason`. `mode` distinguishes shadow (measured, not injected)
+/// from on (injected) lines — additive to the task-recorded field set.
+fn append_knowledge_audit(
+    paths: &ZenPaths,
+    mode: KnowledgeInjectMode,
+    ms: u64,
+    notes: usize,
+    chars: usize,
+    skipped_reason: Option<&str>,
+) {
+    let mut entry = serde_json::json!({
+        "kind": "loop.knowledge.injected",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "mode": match mode {
+            KnowledgeInjectMode::Shadow => "shadow",
+            KnowledgeInjectMode::On | KnowledgeInjectMode::Off => "on",
+        },
+        "ms": ms,
+        "notes": notes,
+        "chars": chars,
+    });
+    if let Some(reason) = skipped_reason {
+        entry["skipped_reason"] = serde_json::json!(reason);
+    }
+    if let Err(e) = zen_core::jsonl::append_jsonl_line(&paths.logs().join("audit.jsonl"), &entry) {
+        warn!(error = %e, "loop.knowledge.injected audit append failed");
+    }
+}
+
+/// FR-037 skill-hit injection body — free-function seam (design F2-D9,
+/// T215): shared by the orchestrator's turn path
+/// ([`AgentOrchestrator::inject_skill_hits`], which keeps the scope-logic
+/// doc) and `delegate_task::compose_sub_session`'s sub-prompt injection, so
+/// the routing logic has exactly one source and cannot drift. Gates
+/// (`[skills.auto_route]`, per-skill `auto_route` frontmatter), the
+/// contract constants (threshold 0.72 / max_hits 1) and the [`M1_TOP_K`]
+/// truncation are unchanged from the pre-extraction method.
+pub(crate) fn inject_skill_hits_into(
+    router: &SkillHitRouter,
+    session: &mut SessionContext,
+    user_query: &str,
+) -> Option<SkillHit> {
+    if !auto_route_enabled() {
+        return None;
+    }
+    let paths = ZenPaths::detect().ok()?;
+    let loader = SkillLoader::new(&paths);
+    let names = loader.list_skills().ok()?;
+    let mut eligible = Vec::new();
+    for name in names {
+        if let Ok(def) = loader.load_skill(&name)
+            && def.is_auto_route_enabled()
+        {
+            eligible.push(def);
+        }
+    }
+    let hits = router.route(user_query, &eligible);
+    let hit = hits.first()?.clone();
+    let def = eligible.iter().find(|d| d.name == hit.skill)?;
+    session.knowledge.insert(
+        0,
+        RetrievedNote {
+            path: format!("skills/{}", def.name),
+            content: render_skill_prompt(def),
+            sensitivity: Sensitivity::Private,
+            relevance: f64::from(hit.score),
+        },
+    );
+    session.knowledge.truncate(M1_TOP_K);
+    info!(
+        skill = %hit.skill,
+        score = %hit.score,
+        triggers = ?hit.triggers_matched,
+        "skill hit auto-injected into M1 context"
+    );
+    Some(hit)
+}
+
 impl AgentOrchestrator {
     pub fn new(router: DefaultRouter) -> Self {
         let registry = crate::registry::DefaultAgentRegistry::new();
@@ -402,6 +592,8 @@ impl AgentOrchestrator {
             max_tool_rounds,
             skill_router: SkillHitRouter::new(),
             delegate_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            delegate_knowledge: Arc::new(std::sync::Mutex::new(Vec::new())),
+            knowledge_stack: OnceLock::new(),
         }
     }
 
@@ -426,6 +618,8 @@ impl AgentOrchestrator {
             max_tool_rounds,
             skill_router: SkillHitRouter::new(),
             delegate_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            delegate_knowledge: Arc::new(std::sync::Mutex::new(Vec::new())),
+            knowledge_stack: OnceLock::new(),
         }
     }
 
@@ -500,6 +694,7 @@ impl AgentOrchestrator {
             self.tool_overlay.clone(),
             self.memvid_store.clone(),
             Arc::clone(&self.delegate_sensitivity),
+            Arc::clone(&self.delegate_knowledge),
             Arc::clone(&self.token_budget),
             std::time::Duration::from_secs(timeout),
             max_depth,
@@ -545,6 +740,199 @@ impl AgentOrchestrator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *cell = sensitivity;
+    }
+
+    /// T215 (design F2-D8): mirror the turn's retrieved M1 knowledge block
+    /// into the delegate tool's shared cell so `compose_sub_session` can
+    /// inherit it — same last-writer-wins mirror semantics as
+    /// [`AgentOrchestrator::propagate_sensitivity`], refreshed on every turn
+    /// entry so a later turn never inherits an earlier turn's block.
+    fn propagate_knowledge(&self, knowledge: &[RetrievedNote]) {
+        let mut cell = self
+            .delegate_knowledge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cell = knowledge.to_vec();
+    }
+
+    /// Lazily open the KB search stack once per orchestrator (T214, design
+    /// F2-D6). Failure is NOT cached (a transient state.db open error must
+    /// not disable injection for the daemon's lifetime); the race-tolerant
+    /// get→open→set shape is the `PlanExecuteTool::db` precedent.
+    async fn knowledge_stack(&self, paths: &ZenPaths) -> Option<Arc<KnowledgeStack>> {
+        if let Some(existing) = self.knowledge_stack.get() {
+            return existing.clone();
+        }
+        // install_delegate_tool's state.db path derivation (:517-519).
+        let db_path = paths.data().join("state.db");
+        let client = match zen_repo::SqliteClient::open_lazy(&db_path).await {
+            Ok(client) => client,
+            Err(e) => {
+                warn!(error = %e, path = %db_path.display(), "knowledge stack: state.db open failed");
+                return None;
+            }
+        };
+        let stack = Arc::new(KnowledgeStack {
+            service: zen_vault::search::SearchService::new(self.executor.router().clone()),
+            client: Arc::new(client),
+        });
+        let _ = self.knowledge_stack.set(Some(Arc::clone(&stack)));
+        self.knowledge_stack.get().and_then(|s| s.clone())
+    }
+
+    /// Retrieve up to [`KNOWLEDGE_NOTE_LIMIT`] KB notes for `query`,
+    /// sanitized at insert (wake-up-brief hygiene precedent, :361) and
+    /// tagged with the session's sensitivity policy (design F2 wiring).
+    /// `relevance` is the flat 1.0 of the gateway knowledge/search mapping
+    /// (`zen-gateway/src/server/knowledge.rs:110-115`) — FTS rank order is
+    /// carried by position, not score.
+    ///
+    /// Content comes from the note FILE (capped at [`WAKE_UP_BRIEF_MAX_BYTES`]
+    /// before read, wake-up-brief precedent), not the search snippet:
+    /// `notes_fts` is a CONTENTLESS fts5 table (`content=''`, migration
+    /// 001:27-31), so tier-2 snippets are structurally empty — markdown
+    /// files are the canonical source of truth (AGENTS.md). An unreadable
+    /// or oversized file falls back to the (possibly empty) snippet; a note
+    /// with no content at all is dropped rather than injected blank.
+    async fn retrieve_knowledge_notes(
+        &self,
+        paths: &ZenPaths,
+        query: &str,
+        tier: u8,
+        sensitivity: Sensitivity,
+    ) -> Result<Vec<RetrievedNote>> {
+        let stack = self
+            .knowledge_stack(paths)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("knowledge search stack unavailable"))?;
+        let results = stack
+            .service
+            .search(
+                query,
+                &paths.wiki(),
+                &stack.client,
+                Some(tier),
+                None,
+                Some(KNOWLEDGE_NOTE_LIMIT),
+            )
+            .await?;
+        let sanitizer = InputSanitizer::new();
+        Ok(results
+            .into_iter()
+            .filter_map(|r| {
+                let from_file = fs::metadata(&r.file)
+                    .ok()
+                    .filter(|m| m.len() <= WAKE_UP_BRIEF_MAX_BYTES)
+                    .and_then(|_| fs::read_to_string(&r.file).ok());
+                let raw = from_file.unwrap_or_else(|| r.content.clone());
+                if raw.trim().is_empty() {
+                    return None;
+                }
+                Some(RetrievedNote {
+                    path: r.file.display().to_string(),
+                    content: sanitizer.strip_dangerous_patterns(&raw),
+                    sensitivity,
+                    relevance: 1.0,
+                })
+            })
+            .collect())
+    }
+
+    /// Phase 31 T214 (owner decision D-F, default ON): inject KB context on
+    /// gated turns for surfaces that supply none (gateway/qqbot/MCP arrive
+    /// with empty `session.knowledge`; the TUI pre-retrieves and is skipped).
+    ///
+    /// Scope logic (Constitution XV):
+    /// - Functionality: one bounded FTS retrieval (`knowledge_tiers`, default
+    ///   `fts` — T138: fusion stays opt-in) after the intent ladder, wrapped
+    ///   in `tokio::time::timeout(knowledge_timeout_ms)`; the result is
+    ///   sanitized, budget-truncated (`knowledge_budget_chars`) and pushed
+    ///   into `session.knowledge` under the [`M1_TOP_K`] cap, so the existing
+    ///   FR-034 reward path (`increment_reward_for_query`) covers the notes.
+    /// - User impact: hosted turns gain KB context; latency bounded by the
+    ///   timeout, tokens by the char budget.
+    /// - Default: `on` (the sole non-closed Phase 31 gate); `shadow`
+    ///   retrieves + audits without injecting; `off` is byte-identical to
+    ///   pre-Phase-31 (no retrieval, no audit — pinned by test).
+    /// - Interaction: skips (audited) when the surface pre-supplied knowledge
+    ///   or the ladder classified `Conversation`; every failure mode
+    ///   (stack/timeout/search error) fails OPEN to a skipped injection —
+    ///   never blocks or fails a turn.
+    ///
+    /// `pre_supplied` is captured at turn entry, BEFORE zen's own M1
+    /// injectors (wake-up brief, skill hits) run — those must not mask the
+    /// TUI-supplied-knowledge precondition.
+    async fn inject_knowledge_context(
+        &self,
+        paths: Option<&ZenPaths>,
+        session: &mut SessionContext,
+        user_query: &str,
+        category: intent::IntentCategory,
+        pre_supplied: bool,
+    ) {
+        let Some(settings) = knowledge_inject_settings() else {
+            return;
+        };
+        let Some(paths) = paths else {
+            // No home ⇒ neither retrieval roots nor an audit file exist.
+            debug!("knowledge injection skipped: no ZenPaths");
+            return;
+        };
+        if pre_supplied {
+            append_knowledge_audit(
+                paths,
+                settings.mode,
+                0,
+                0,
+                0,
+                Some("knowledge_pre_supplied"),
+            );
+            return;
+        }
+        if category == intent::IntentCategory::Conversation {
+            append_knowledge_audit(paths, settings.mode, 0, 0, 0, Some("conversation_intent"));
+            return;
+        }
+        let Some(tier) = resolve_knowledge_tier(&settings.tiers) else {
+            warn!(
+                tiers = %settings.tiers,
+                "invalid [agentic.orchestrator] knowledge_tiers; injection skipped"
+            );
+            append_knowledge_audit(paths, settings.mode, 0, 0, 0, Some("unknown_tier"));
+            return;
+        };
+
+        let started = Instant::now();
+        let sensitivity = session.sensitivity_policy;
+        let outcome = tokio::time::timeout(
+            settings.timeout,
+            self.retrieve_knowledge_notes(paths, user_query, tier, sensitivity),
+        )
+        .await;
+        let ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Err(_) => {
+                warn!(
+                    timeout_ms = settings.timeout.as_millis() as u64,
+                    "knowledge retrieval timed out; injection skipped (fail-open)"
+                );
+                append_knowledge_audit(paths, settings.mode, ms, 0, 0, Some("timeout"));
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "knowledge retrieval failed; injection skipped (fail-open)");
+                append_knowledge_audit(paths, settings.mode, ms, 0, 0, Some("retrieval_failed"));
+            }
+            Ok(Ok(notes)) => {
+                let (notes, chars) = truncate_notes_to_budget(notes, settings.budget_chars);
+                let count = notes.len();
+                if settings.mode == KnowledgeInjectMode::On {
+                    session.knowledge.extend(notes);
+                    session.knowledge.truncate(M1_TOP_K);
+                }
+                // Shadow retrieves + audits but never injects (D-F measurement mode).
+                append_knowledge_audit(paths, settings.mode, ms, count, chars, None);
+            }
+        }
     }
 
     /// 006 US2: the pipeline `Task` for a turn review — entropy stays 0.0
@@ -809,6 +1197,9 @@ impl AgentOrchestrator {
         let start = Instant::now();
         self.ensure_delegate_tool();
         let paths = ZenPaths::detect().ok();
+        // T214 precondition, captured BEFORE zen's own M1 injectors run:
+        // only surface-supplied knowledge (TUI) may skip the retrieval.
+        let knowledge_pre_supplied = !session.knowledge.is_empty();
         if let Some(paths) = paths.as_ref() {
             inject_wake_up_brief(paths, session);
         }
@@ -857,6 +1248,17 @@ impl AgentOrchestrator {
             "AgentOrchestrator: executing query"
         );
 
+        // T214: after the ladder (needs its category), before build_agent
+        // (M1 assembly must see the injected notes).
+        self.inject_knowledge_context(
+            paths.as_ref(),
+            session,
+            user_query,
+            intent.category,
+            knowledge_pre_supplied,
+        )
+        .await;
+
         let zen_agent = self.build_agent(&agent_name).await?;
         session.agent_name.clone_from(&agent_name);
 
@@ -899,6 +1301,7 @@ impl AgentOrchestrator {
         self.wiring.connect_mcp_servers().await;
         self.wiring.set_sensitivity(session.sensitivity_policy);
         self.propagate_sensitivity(session.sensitivity_policy);
+        self.propagate_knowledge(&session.knowledge);
 
         let tool_manifest = zen_agent.tool_manifest();
         let tool_names: BTreeSet<String> = zen_agent
@@ -1563,6 +1966,9 @@ impl AgentOrchestrator {
         let _start = Instant::now();
         self.ensure_delegate_tool();
         let paths = ZenPaths::detect().ok();
+        // T214 precondition, captured BEFORE zen's own M1 injectors run:
+        // only surface-supplied knowledge (TUI) may skip the retrieval.
+        let knowledge_pre_supplied = !session.knowledge.is_empty();
         if let Some(paths) = paths.as_ref() {
             inject_wake_up_brief(paths, session);
         }
@@ -1611,12 +2017,24 @@ impl AgentOrchestrator {
             "AgentOrchestrator: streaming execution"
         );
 
+        // T214: after the ladder (needs its category), before build_agent
+        // (M1 assembly must see the injected notes).
+        self.inject_knowledge_context(
+            paths.as_ref(),
+            session,
+            user_query,
+            intent.category,
+            knowledge_pre_supplied,
+        )
+        .await;
+
         let zen_agent = self.build_agent(&agent_name).await?;
         session.agent_name.clone_from(&agent_name);
 
         self.wiring.connect_mcp_servers().await;
         self.wiring.set_sensitivity(session.sensitivity_policy);
         self.propagate_sensitivity(session.sensitivity_policy);
+        self.propagate_knowledge(&session.knowledge);
 
         // FR-034: reward sidecar bookkeeping for this turn (access, plus
         // corrections when the user is correcting prior output). The sidecar
@@ -2022,40 +2440,7 @@ impl AgentOrchestrator {
         session: &mut SessionContext,
         user_query: &str,
     ) -> Option<SkillHit> {
-        if !auto_route_enabled() {
-            return None;
-        }
-        let paths = ZenPaths::detect().ok()?;
-        let loader = SkillLoader::new(&paths);
-        let names = loader.list_skills().ok()?;
-        let mut eligible = Vec::new();
-        for name in names {
-            if let Ok(def) = loader.load_skill(&name)
-                && def.is_auto_route_enabled()
-            {
-                eligible.push(def);
-            }
-        }
-        let hits = self.skill_router.route(user_query, &eligible);
-        let hit = hits.first()?.clone();
-        let def = eligible.iter().find(|d| d.name == hit.skill)?;
-        session.knowledge.insert(
-            0,
-            RetrievedNote {
-                path: format!("skills/{}", def.name),
-                content: render_skill_prompt(def),
-                sensitivity: Sensitivity::Private,
-                relevance: f64::from(hit.score),
-            },
-        );
-        session.knowledge.truncate(M1_TOP_K);
-        info!(
-            skill = %hit.skill,
-            score = %hit.score,
-            triggers = ?hit.triggers_matched,
-            "skill hit auto-injected into M1 context"
-        );
-        Some(hit)
+        inject_skill_hits_into(&self.skill_router, session, user_query)
     }
 
     #[must_use]
@@ -2918,5 +3303,318 @@ mod tests {
             entry.get("input_excerpt").is_none(),
             "the excerpt is OFF by default: no input_excerpt field when [agentic.audit] decision_excerpt_chars is unset"
         );
+    }
+
+    // ── Phase 31 T214: knowledge injection ─────────────────────────────
+
+    fn mock_knowledge_router() -> DefaultRouter {
+        zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        })
+    }
+
+    async fn seed_knowledge_note(paths: &ZenPaths, id: &str, content: &str, file_name: &str) {
+        let db_path = paths.data().join("state.db");
+        let client = zen_repo::SqliteClient::open_lazy(&db_path)
+            .await
+            .expect("open state.db");
+        let file_path = paths.wiki().join("notions").join(file_name);
+        // Injection reads content from the FILE (notes_fts is contentless),
+        // so the seeded note must exist on disk under the wiki root.
+        fs::create_dir_all(file_path.parent().expect("wiki notions dir")).expect("mkdir");
+        fs::write(&file_path, content).expect("write note file");
+        zen_repo::NotesRepo::new(&client)
+            .index_note(zen_repo::IndexNoteRequest {
+                id,
+                title: id,
+                content,
+                tags: "",
+                file_path: &file_path.display().to_string(),
+                source: "test",
+            })
+            .await
+            .expect("index note");
+    }
+
+    fn knowledge_audit_lines(paths: &ZenPaths) -> Vec<serde_json::Value> {
+        let Ok(content) = fs::read_to_string(paths.logs().join("audit.jsonl")) else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry["kind"] == "loop.knowledge.injected")
+            .collect()
+    }
+
+    fn set_knowledge_env(key: &str, value: Option<&str>) {
+        match value {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        zen_core::config::invalidate_config_cache();
+    }
+
+    /// Env-dependent phases run in ONE test to avoid parallel env races
+    /// (`skill_hit_contract.rs` precedent). Pins: off ⇒ byte-identical
+    /// (no inject, no audit), shadow ⇒ audit-without-inject, env-absent ⇒
+    /// ON (owner decision D-F default — this phase fails if the default
+    /// flips), skips audited with reasons.
+    #[tokio::test]
+    async fn knowledge_inject_gate_modes_and_audited_skips() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let saved_home = std::env::var("ZEN_HOME").ok();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        seed_knowledge_note(
+            &paths,
+            "zenwave",
+            "zenwave ownership keeps memory safe",
+            "zenwave.md",
+        )
+        .await;
+        let orchestrator = AgentOrchestrator::new(mock_knowledge_router());
+
+        // Phase 1 — off: byte-identical to pre-Phase-31.
+        set_knowledge_env("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT", Some("off"));
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                false,
+            )
+            .await;
+        assert!(session.knowledge.is_empty(), "off must not inject");
+        assert!(
+            knowledge_audit_lines(&paths).is_empty(),
+            "off must not even audit — byte-identical pre-Phase-31 behavior"
+        );
+
+        // Phase 2 — shadow: retrieve + audit, never inject.
+        set_knowledge_env("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT", Some("shadow"));
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                false,
+            )
+            .await;
+        assert!(session.knowledge.is_empty(), "shadow must not inject");
+        let lines = knowledge_audit_lines(&paths);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["mode"], "shadow");
+        assert_eq!(lines[0]["notes"].as_u64(), Some(1));
+        assert!(lines[0]["chars"].as_u64().unwrap() > 0);
+        assert!(lines[0]["ms"].as_u64().is_some());
+        assert!(lines[0].get("skipped_reason").is_none());
+
+        // Phase 3 — default (env absent): D-F gate ON. Fails on a default flip.
+        set_knowledge_env("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT", None);
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        session.sensitivity_policy = Sensitivity::Private;
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                false,
+            )
+            .await;
+        assert_eq!(session.knowledge.len(), 1, "default-on must inject");
+        assert!(session.knowledge[0].content.contains("zenwave"));
+        assert!(session.knowledge[0].path.ends_with("zenwave.md"));
+        assert_eq!(session.knowledge[0].sensitivity, Sensitivity::Private);
+        let lines = knowledge_audit_lines(&paths);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["mode"], "on");
+        assert_eq!(lines[1]["notes"].as_u64(), Some(1));
+
+        // Phase 4 — audited skips: pre-supplied knowledge, Conversation intent.
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                true,
+            )
+            .await;
+        assert!(
+            session.knowledge.is_empty(),
+            "pre-supplied surfaces never double-retrieve"
+        );
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "hello there",
+                intent::IntentCategory::Conversation,
+                false,
+            )
+            .await;
+        assert!(session.knowledge.is_empty());
+        let lines = knowledge_audit_lines(&paths);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[2]["skipped_reason"], "knowledge_pre_supplied");
+        assert_eq!(lines[2]["notes"].as_u64(), Some(0));
+        assert_eq!(lines[3]["skipped_reason"], "conversation_intent");
+
+        // Phase 5 — unknown tier name: skip + audited reason (a typo never
+        // silently reroutes to a different tier).
+        set_knowledge_env("ZEN_ORCHESTRATOR_KNOWLEDGE_TIERS", Some("banana"));
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                false,
+            )
+            .await;
+        assert!(session.knowledge.is_empty());
+        let lines = knowledge_audit_lines(&paths);
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[4]["skipped_reason"], "unknown_tier");
+        set_knowledge_env("ZEN_ORCHESTRATOR_KNOWLEDGE_TIERS", None);
+
+        match saved_home {
+            Some(home) => unsafe { std::env::set_var("ZEN_HOME", home) },
+            None => unsafe { std::env::remove_var("ZEN_HOME") },
+        }
+        zen_core::config::invalidate_config_cache();
+    }
+
+    #[tokio::test]
+    async fn knowledge_inject_sanitizes_and_fails_open() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let saved_home = std::env::var("ZEN_HOME").ok();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        zen_core::config::invalidate_config_cache();
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        seed_knowledge_note(
+            &paths,
+            "zenquake",
+            "zenquake summary <script>alert(1)</script> eval(alert)",
+            "zenquake.md",
+        )
+        .await;
+        let orchestrator = AgentOrchestrator::new(mock_knowledge_router());
+
+        // Sanitize at insert (wake-up-brief hygiene precedent).
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenquake summary",
+                intent::IntentCategory::Query,
+                false,
+            )
+            .await;
+        assert_eq!(session.knowledge.len(), 1);
+        let content = &session.knowledge[0].content;
+        assert!(!content.contains("<script>"), "html injection stripped");
+        assert!(!content.contains("eval("), "code execution stripped");
+        assert!(content.contains("zenquake"), "benign text survives");
+
+        // No FTS match: fail-open, audited with notes=0 and no skip reason.
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "qqqmissingtoken",
+                intent::IntentCategory::Query,
+                false,
+            )
+            .await;
+        assert!(session.knowledge.is_empty());
+        let lines = knowledge_audit_lines(&paths);
+        let last = lines.last().expect("audit line");
+        assert_eq!(last["notes"].as_u64(), Some(0));
+        assert!(last.get("skipped_reason").is_none());
+
+        // Unopenable state.db: retrieval fails open to an audited skip —
+        // the turn itself never fails for a KB outage.
+        let dead_dir = tempfile::TempDir::new().expect("tempdir");
+        let dead_paths = ZenPaths::for_testing(dead_dir.path().to_path_buf());
+        fs::write(dead_dir.path().join("data"), "not a directory").expect("blocker file");
+        let dead_orchestrator = AgentOrchestrator::new(mock_knowledge_router());
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        dead_orchestrator
+            .inject_knowledge_context(
+                Some(&dead_paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                false,
+            )
+            .await;
+        assert!(session.knowledge.is_empty());
+        let lines = knowledge_audit_lines(&dead_paths);
+        assert_eq!(
+            lines.last().and_then(|l| l["skipped_reason"].as_str()),
+            Some("retrieval_failed")
+        );
+
+        match saved_home {
+            Some(home) => unsafe { std::env::set_var("ZEN_HOME", home) },
+            None => unsafe { std::env::remove_var("ZEN_HOME") },
+        }
+        zen_core::config::invalidate_config_cache();
+    }
+
+    #[test]
+    fn truncate_notes_to_budget_keeps_rank_order_and_char_boundaries() {
+        let note = |content: &str| RetrievedNote {
+            path: "p".to_string(),
+            content: content.to_string(),
+            sensitivity: Sensitivity::Public,
+            relevance: 1.0,
+        };
+        let (notes, chars) =
+            truncate_notes_to_budget(vec![note("aaa"), note("bbb"), note("ccc")], 7);
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0].content, "aaa");
+        assert_eq!(notes[2].content, "c", "last note truncated to fit");
+        assert_eq!(chars, 7);
+
+        // Char-boundary safety: multibyte content is never split mid-codepoint.
+        let (notes, chars) = truncate_notes_to_budget(vec![note("🔧🔧🔧")], 2);
+        assert_eq!(notes[0].content, "🔧🔧");
+        assert_eq!(chars, 2);
+
+        // Exhausted budget drops the remaining notes.
+        let (notes, chars) = truncate_notes_to_budget(vec![note("aaaa"), note("bb")], 4);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(chars, 4);
+
+        let (notes, chars) = truncate_notes_to_budget(vec![note("aa")], 0);
+        assert!(notes.is_empty());
+        assert_eq!(chars, 0);
+    }
+
+    #[test]
+    fn resolve_knowledge_tier_maps_gateway_contract_names() {
+        // Same name→tier contract as zen-gateway knowledge/search resolve_tier.
+        assert_eq!(resolve_knowledge_tier("fts"), Some(2));
+        assert_eq!(resolve_knowledge_tier("fts,vec"), Some(2));
+        assert_eq!(resolve_knowledge_tier(" vec "), Some(3));
+        assert_eq!(resolve_knowledge_tier("ripgrep"), Some(1));
+        assert_eq!(resolve_knowledge_tier("graph"), Some(4));
+        assert_eq!(resolve_knowledge_tier("llm"), Some(5));
+        assert_eq!(resolve_knowledge_tier("banana"), None);
+        assert_eq!(resolve_knowledge_tier(""), None);
     }
 }

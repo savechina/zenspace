@@ -696,6 +696,125 @@ fn card_retention_strength(
     zen_memory::strength::retention_strength(anchor, None, 0, now, half_life_days)
 }
 
+/// T211 gate: `[agentic.memory_strength] enabled` — the master flag is also
+/// the SOLE flipper of the indexer's provenance writes
+/// (`memvid_indexer_worker.rs:312-313`), so while it is closed no frame can
+/// carry `source_path` and sidecar resolution is provably a no-op; skipping
+/// it keeps the gate-closed retrieve path free of extra I/O. Config-load
+/// failure fails CLOSED (the `memory_strength_half_life` precedent above).
+fn memvid_reward_enabled() -> bool {
+    match zen_core::config::load_config() {
+        Ok(config) => config.agentic.memory_strength.enabled_or_default(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "config load failed; memvid injection rewards stay off"
+            );
+            false
+        }
+    }
+}
+
+/// Resolve the provenance `source_path` of the frame a memory card was
+/// extracted from (T211): one uri-scoped lexical search (top_k=1, snippet
+/// 96 — the `contains_turn` marker-search shape, `memvid.rs:452-465`) with
+/// the card's own value as the query, accepting the top hit's `source_path`
+/// only when present (key PRESENCE, never map emptiness — T208 empirical
+/// consumer contract: memvid-core injects its own `extractous_metadata`).
+///
+/// Attribution model (a frame-id equality check is IMPOSSIBLE through the
+/// public API: `put`-returned ids and `SearchHit.frame_id` are different
+/// memvid-core id spaces — empirically put→1 for the frame hits report as 0;
+/// cards also carry no `source_offset`):
+/// - m2 journal frames are EXACT — the indexer gives each journal file its
+///   own `journal-<date>` uri (`memvid_index.rs` M2 path), so every frame in
+///   scope shares one `source_path`.
+/// - m3/m4 frames share the `knowledge-base` uri, so the top hit is the
+///   lexical best match of the card's own literal value text — the source
+///   frame always contains that text; a miss yields `None` ⇒ NO increment
+///   (conservative undercount, fail-safe direction).
+fn resolve_card_source_path(
+    store: &MemvidStore,
+    card: &zen_memory::memvid_store::memvid_core::MemoryCard,
+) -> Option<String> {
+    let uri = card.source_uri.clone()?;
+    if card.value.trim().is_empty() {
+        return None;
+    }
+    let request = zen_memory::memvid_store::memvid_core::SearchRequest {
+        query: card.value.clone(),
+        top_k: 1,
+        snippet_chars: 96,
+        uri: Some(uri),
+        scope: None,
+        cursor: None,
+        as_of_frame: None,
+        as_of_ts: None,
+        no_sketch: false,
+        acl_context: None,
+        acl_enforcement_mode: Default::default(),
+    };
+    let response = match store.search(request) {
+        Ok(response) => response,
+        Err(e) => {
+            debug!(error = %e, "T211 provenance lookup search failed");
+            return None;
+        }
+    };
+    let hit = response.hits.first()?;
+    hit.metadata
+        .as_ref()?
+        .extra_metadata
+        .get(zen_memory::memvid_index::PROVENANCE_SOURCE_PATH_KEY)
+        .cloned()
+}
+
+/// T211 (design F1-D8): FR-034 reward-sidecar reinforcement for
+/// memvid-derived M1 injections — closes the wave-2 sidecar-join miss by
+/// writing increments under the SAME `card_id_from_path(source_path)`
+/// derivation both strength consumers read (gateway `hit_strength`,
+/// `memvid_indexer_worker::build_strength_items`), with the same flock
+/// discipline (`memories/.reward/.lock`, fs2 — inside `increment_access`).
+/// Frames WITHOUT `source_path` (legacy/provenance-off) get NO increment —
+/// one AGGREGATED debug line, never a warn flood. Dedup by resolved
+/// source_path: one access event per source per injection (the per-document
+/// semantics of `increment_reward_for_query`).
+///
+/// Blocking-I/O note: the flock+fsync increments ride this path's EXISTING
+/// sync seam — the memvid store calls here are already synchronous
+/// (`entity_memories` holds the store mutex on this thread); the orchestrator's
+/// T160 spawn_blocking discipline covers the async turn body, and this work
+/// is bounded (deduped sources, gated) so it never scales with card count.
+fn increment_memvid_injection_rewards(
+    paths: &ZenPaths,
+    store: &MemvidStore,
+    cards: &[zen_memory::memvid_store::memvid_core::MemoryCard],
+) {
+    let reward_dir = paths.memory().join(".reward");
+    let mut seen = std::collections::HashSet::new();
+    let mut misses = 0usize;
+    for card in cards {
+        let Some(source_path) = resolve_card_source_path(store, card) else {
+            misses += 1;
+            continue;
+        };
+        if !seen.insert(source_path.clone()) {
+            continue;
+        }
+        let card_id = zen_vault::distill::card_id_from_path(&source_path);
+        if let Err(e) = zen_vault::distill::increment_access(&reward_dir, &card_id) {
+            debug!(error = %e, card_id, "T211 memvid reward increment failed");
+        }
+    }
+    if misses > 0 {
+        debug!(
+            misses,
+            cards = cards.len(),
+            "T211: frames without provenance source_path — no increment"
+        );
+    }
+}
+
 /// A Zen-tailored agent combining rig_compose's skill-driver [`GenericAgent`]
 /// with a [`ZenCompletionModel`] for direct LLM routing.
 pub struct ZenAgent {
@@ -876,13 +995,25 @@ impl ZenAgent {
                         count = cards.len(),
                         "Structured memory cards retrieved"
                     );
+                    let injected: Vec<_> = cards
+                        .into_iter()
+                        .filter(|c| {
+                            c.confidence.unwrap_or(1.0)
+                                >= zen_memory::memvid::TRIPLET_MIN_CONFIDENCE
+                        })
+                        .collect();
+                    // T211: reinforcement events for the cards that actually
+                    // enter M1 — write side of the sidecar join the T209
+                    // consumers read; gated (provably no-op when closed).
+                    if !injected.is_empty()
+                        && memvid_reward_enabled()
+                        && let Ok(paths) = ZenPaths::detect()
+                    {
+                        increment_memvid_injection_rewards(&paths, store, &injected);
+                    }
                     Some(
-                        cards
+                        injected
                             .into_iter()
-                            .filter(|c| {
-                                c.confidence.unwrap_or(1.0)
-                                    >= zen_memory::memvid::TRIPLET_MIN_CONFIDENCE
-                            })
                             .map(|c| format!("[{}] {}={}: {}", c.kind, c.entity, c.slot, c.value))
                             .collect(),
                     )
@@ -2463,5 +2594,206 @@ mod memory_strength_consumer_tests {
         zen_core::config::invalidate_config_cache();
         assert_eq!(memory_strength_half_life(), Some(30.0));
         clear_strength_env();
+    }
+}
+
+#[cfg(test)]
+mod memvid_injection_reward_tests {
+    use super::*;
+    use zen_memory::memvid_store::memvid_core::{MemoryCard, MemoryCardBuilder, PutOptions};
+
+    const SOURCE_PATH: &str = "journal/2026-01-01.md";
+    const JOURNAL_URI: &str = "journal-2026-01-01";
+
+    fn clear_reward_env() {
+        unsafe {
+            std::env::remove_var("ZEN_MEMORY_STRENGTH_ENABLED");
+            std::env::remove_var("ZEN_HOME");
+        }
+        zen_core::config::invalidate_config_cache();
+    }
+
+    fn provenance_frame_opts(uri: &str, with_provenance: bool) -> PutOptions {
+        let mut opts = PutOptions::builder().uri(uri).build();
+        if with_provenance {
+            // memvid-core injects its own key alongside ours (T208 contract):
+            // presence-keying must tolerate it.
+            opts.extra_metadata
+                .insert("extractous_metadata".to_string(), "{}".to_string());
+            opts.extra_metadata
+                .insert("source_path".to_string(), SOURCE_PATH.to_string());
+            opts.extra_metadata
+                .insert("tier".to_string(), "m2".to_string());
+        }
+        opts
+    }
+
+    fn card(entity: &str, value: &str, frame_id: u64, uri: Option<&str>) -> MemoryCard {
+        MemoryCardBuilder::new()
+            .event()
+            .entity(entity)
+            .slot("note")
+            .value(value)
+            .source(frame_id, uri.map(str::to_string))
+            .engine("zen-test", "1")
+            .confidence(1.0)
+            .build(0)
+            .unwrap()
+    }
+
+    #[test]
+    fn resolve_joins_uri_scoped_provenance_and_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemvidStore::open_or_create(&dir.path().join("resolve.mv2")).unwrap();
+        let prov_frame = store
+            .put_text(
+                "zenwave deployment plan details",
+                provenance_frame_opts(JOURNAL_URI, true),
+            )
+            .unwrap();
+        let bare_frame = store
+            .put_text(
+                "plain session turn about lunch",
+                provenance_frame_opts("session-bare", false),
+            )
+            .unwrap();
+
+        let joined = resolve_card_source_path(
+            &store,
+            &card("user", "deployment plan", prov_frame, Some(JOURNAL_URI)),
+        );
+        assert_eq!(joined.as_deref(), Some(SOURCE_PATH));
+
+        let bare = resolve_card_source_path(
+            &store,
+            &card("user", "about lunch", bare_frame, Some("session-bare")),
+        );
+        assert!(
+            bare.is_none(),
+            "legacy/provenance-off frames must never increment"
+        );
+
+        let no_uri =
+            resolve_card_source_path(&store, &card("user", "deployment plan", prov_frame, None));
+        assert!(no_uri.is_none(), "no source_uri ⇒ no resolution");
+    }
+
+    #[test]
+    fn increments_dedup_by_source_path_and_use_wave2_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let store = MemvidStore::open_or_create(&dir.path().join("incr.mv2")).unwrap();
+        let frame = store
+            .put_text(
+                "zenwave deployment plan details",
+                provenance_frame_opts(JOURNAL_URI, true),
+            )
+            .unwrap();
+        let bare_frame = store
+            .put_text(
+                "plain session turn about lunch",
+                provenance_frame_opts("session-bare", false),
+            )
+            .unwrap();
+
+        let cards = vec![
+            card("user", "deployment plan", frame, Some(JOURNAL_URI)),
+            // Second card, SAME frame ⇒ one access event per source per injection.
+            card("user", "zenwave details", frame, Some(JOURNAL_URI)),
+            // Provenance-less frame ⇒ counted as a miss, never incremented.
+            card("user", "about lunch", bare_frame, Some("session-bare")),
+        ];
+        increment_memvid_injection_rewards(&paths, &store, &cards);
+
+        let reward_dir = paths.memory().join(".reward");
+        // The SAME derivation wave 2's consumers pinned.
+        let card_id = zen_vault::distill::card_id_from_path(SOURCE_PATH);
+        assert_eq!(card_id, "journal_2026-01-01");
+        let reward = zen_vault::distill::read_reward(&reward_dir, &card_id);
+        assert_eq!(reward.access_count, 1, "deduped by source_path");
+        assert!(reward.last_reward_at.is_some());
+
+        // A second injection is a second access event.
+        increment_memvid_injection_rewards(&paths, &store, &cards);
+        assert_eq!(
+            zen_vault::distill::read_reward(&reward_dir, &card_id).access_count,
+            2
+        );
+        // The provenance-less frame never gained a sidecar.
+        assert_eq!(
+            std::fs::read_dir(&reward_dir)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            2, // the sidecar + the flock `.lock` file only
+            "no sidecar may exist for frames without source_path"
+        );
+    }
+
+    #[test]
+    fn reward_gate_defaults_closed() {
+        clear_reward_env();
+        assert!(
+            !memvid_reward_enabled(),
+            "gate-off must keep the retrieve path free of sidecar writes"
+        );
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_ENABLED", "1") };
+        zen_core::config::invalidate_config_cache();
+        assert!(memvid_reward_enabled());
+        clear_reward_env();
+    }
+
+    /// Seam-level pin: with the master gate OPEN, cards injected into M1 via
+    /// `retrieve_memories_structured` write the sidecar the T209 consumers
+    /// read — closing the documented events=0 join miss end to end.
+    #[test]
+    fn structured_retrieve_writes_sidecar_when_gate_open() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("ZEN_HOME", dir.path());
+            std::env::set_var("ZEN_MEMORY_STRENGTH_ENABLED", "1");
+        }
+        zen_core::config::invalidate_config_cache();
+
+        let store = MemvidStore::open_or_create(&dir.path().join("seam.mv2")).unwrap();
+        let frame = store
+            .put_text(
+                "zenwave deployment plan details",
+                provenance_frame_opts(JOURNAL_URI, true),
+            )
+            .unwrap();
+        store
+            .put_memory_card(card(
+                "session-t211",
+                "deployment plan",
+                frame,
+                Some(JOURNAL_URI),
+            ))
+            .unwrap();
+
+        let router = DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let agent = ZenAgent::builder("Explore")
+            .with_memvid_store(store)
+            .build(&ZenWiring::new(), &router)
+            .expect("agent builds");
+
+        let memories = agent
+            .retrieve_memories_structured("session-t211", "deployment")
+            .expect("cards injected into M1");
+        assert!(
+            memories.iter().any(|m| m.contains("deployment plan")),
+            "{memories:?}"
+        );
+
+        let card_id = zen_vault::distill::card_id_from_path(SOURCE_PATH);
+        let reward =
+            zen_vault::distill::read_reward(&dir.path().join("memories").join(".reward"), &card_id);
+        assert_eq!(
+            reward.access_count, 1,
+            "the wave-2 sidecar-join key now has a production writer"
+        );
+        clear_reward_env();
     }
 }

@@ -15,7 +15,7 @@ use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::dispatch_tool_invocations_with_hooks;
 use rig_compose::tool::{Tool, ToolSchema};
 use tracing::{info, warn};
-use zen_core::types::{Sensitivity, SessionContext};
+use zen_core::types::{RetrievedNote, Sensitivity, SessionContext};
 use zen_provider::DefaultRouter;
 
 use crate::AgentContext;
@@ -23,6 +23,7 @@ use crate::agent_profile::Role;
 use crate::delegate_tools;
 use crate::executor::AgentExecutor;
 use crate::registry::{AgentRegistry, DefaultAgentRegistry};
+use crate::skill_hit_router::SkillHitRouter;
 use crate::wiring::ZenWiring;
 use crate::zen_agent::ZenAgent;
 use zen_memory::memvid_store::MemvidStore;
@@ -50,6 +51,67 @@ const MAX_DELEGATE_ROUNDS: usize = 4;
 /// already calls `wiring.set_sensitivity`.
 pub type SharedSensitivity = Arc<Mutex<Sensitivity>>;
 
+/// Shared cell carrying the parent turn's retrieved M1 knowledge block into
+/// delegated sub-turns (Phase 31 T215, design F2-D8 — exact
+/// [`SharedSensitivity`] pattern): the orchestrator refreshes it where it
+/// already calls `propagate_sensitivity`, and `compose_sub_session` copies a
+/// depth-budgeted truncation into the sub-agent's `SessionContext`. Same
+/// last-writer-wins mirror semantics as the sensitivity cell.
+pub type SharedKnowledge = Arc<Mutex<Vec<RetrievedNote>>>;
+
+/// One sub-agent's inherited context (Phase 31 T215, design F3-D1). The
+/// single contract carried across the delegation seam — prompt-string
+/// concatenation was rejected there: it loses sensitivity tagging and the
+/// FR-034 reward bookkeeping that reads `session.knowledge`.
+pub(crate) struct SubAgentContext {
+    /// Inherited knowledge notes (already depth-budget truncated).
+    pub knowledge: Vec<RetrievedNote>,
+    /// Skill names whose prompts were injected into the sub-session.
+    pub skill_hits: Vec<String>,
+    /// Char budget the knowledge block was truncated to (0 = gate closed).
+    pub budget_chars: usize,
+}
+
+impl SubAgentContext {
+    /// Total inherited content chars — the reservation-estimate term
+    /// (design F2-D10) and the `inherited_chars` audit field.
+    fn knowledge_chars(&self) -> usize {
+        self.knowledge
+            .iter()
+            .map(|n| n.content.chars().count())
+            .sum()
+    }
+}
+
+/// Effective inheritance budget when `[agentic.delegate]
+/// context_inheritance` is OPEN — the base is `[agentic.orchestrator]
+/// knowledge_budget_chars` (design F2-D8: sub-agents inherit the parent's
+/// block under the same budget family). `None` = gate CLOSED (default) or
+/// config-load failure: the failure direction is closed (T206 "absent =
+/// closed" — a broken config must never silently start copying parent
+/// context into sub-agents).
+fn inheritance_budget_chars() -> Option<usize> {
+    match zen_core::config::load_config() {
+        Ok(config) => config
+            .agentic
+            .delegate
+            .context_inheritance_or_default()
+            .then(|| {
+                config
+                    .agentic
+                    .orchestrator
+                    .knowledge_budget_chars_or_default()
+            }),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "config load failed; delegate context inheritance stays closed"
+            );
+            None
+        }
+    }
+}
+
 pub struct DelegateTaskTool {
     wiring: Arc<ZenWiring>,
     executor: AgentExecutor,
@@ -57,10 +119,12 @@ pub struct DelegateTaskTool {
     overlay: Vec<String>,
     memvid_store: Option<MemvidStore>,
     sensitivity: SharedSensitivity,
+    knowledge: SharedKnowledge,
     token_budget: Arc<AtomicTokenBudget>,
     timeout: Duration,
     max_depth: u32,
     max_concurrent: u32,
+    skill_router: SkillHitRouter,
 }
 
 impl DelegateTaskTool {
@@ -71,6 +135,7 @@ impl DelegateTaskTool {
         overlay: Vec<String>,
         memvid_store: Option<MemvidStore>,
         sensitivity: SharedSensitivity,
+        knowledge: SharedKnowledge,
         token_budget: Arc<AtomicTokenBudget>,
         timeout: Duration,
         max_depth: u32,
@@ -83,10 +148,12 @@ impl DelegateTaskTool {
             overlay,
             memvid_store,
             sensitivity,
+            knowledge,
             token_budget,
             timeout,
             max_depth,
             max_concurrent,
+            skill_router: SkillHitRouter::new(),
         }
     }
 
@@ -176,9 +243,16 @@ impl DelegateTaskTool {
     }
 
     /// Parse the single-task form (`agent`+`prompt`) or the fan-out form
-    /// (`tasks: [...]`). Mixed forms prefer `tasks`.
+    /// (`tasks: [...]`). Mixed forms prefer `tasks`. Fan-out batches are
+    /// hard-capped at [`FANOUT_MAX_TASKS`] (T216).
     fn parse_requests(args: &serde_json::Value) -> Result<Vec<DelegateRequest>, String> {
         if let Some(arr) = args.get("tasks").and_then(|v| v.as_array()) {
+            if arr.len() > FANOUT_MAX_TASKS {
+                return Err(format!(
+                    "fan-out batch of {} tasks exceeds the hard cap of {FANOUT_MAX_TASKS}; split the work into batches of at most {FANOUT_MAX_TASKS} independent tasks",
+                    arr.len()
+                ));
+            }
             let mut tasks = Vec::with_capacity(arr.len());
             for item in arr {
                 let Some(agent) = item.get("agent").and_then(|v| v.as_str()) else {
@@ -284,12 +358,20 @@ impl DelegateTaskTool {
     }
 
     /// One `loop.delegate.gates` line in `<logs>/audit.jsonl`.
+    ///
+    /// T215: per-task entries gain ADDITIVE `{inherited_notes,
+    /// inherited_chars, skill_hits}` fields (design Feature-2d audit row);
+    /// existing consumers keep parsing (all pre-T215 fields unchanged).
+    /// Entries for tasks that never composed (rejected/unbounded) carry
+    /// zeros; gate-closed compositions also carry zeros — the field shape
+    /// is unconditional so consumers never branch on presence.
     fn append_gates_audit(
         &self,
         parent: &str,
         depth: u32,
         tasks: &[DelegateRequest],
         reports: &[GateReport],
+        composed: &[Option<(SessionContext, SubAgentContext)>],
     ) {
         let Ok(paths) = zen_core::paths::ZenPaths::detect() else {
             return;
@@ -297,7 +379,9 @@ impl DelegateTaskTool {
         let entries: Vec<serde_json::Value> = tasks
             .iter()
             .zip(reports)
-            .map(|(t, r)| {
+            .zip(composed)
+            .map(|((t, r), slot)| {
+                let ctx = slot.as_ref().map(|(_, c)| c);
                 serde_json::json!({
                     "agent": t.agent,
                     "prompt_chars": t.prompt.len(),
@@ -305,6 +389,9 @@ impl DelegateTaskTool {
                     "consumer_decision": r.consumer_decision,
                     "bounded": r.bounded,
                     "worth_it": r.worth_it,
+                    "inherited_notes": ctx.map(|c| c.knowledge.len()).unwrap_or(0),
+                    "inherited_chars": ctx.map(|c| c.knowledge_chars()).unwrap_or(0),
+                    "skill_hits": ctx.map(|c| c.skill_hits.len()).unwrap_or(0),
                 })
             })
             .collect();
@@ -330,6 +417,72 @@ impl DelegateTaskTool {
         }
     }
 
+    /// The SINGLE sub-session composition seam (Phase 31 T215, design
+    /// F3-D1): used by `run_single`, therefore automatically by
+    /// `plan.execute` AND resume (shared `Arc<DelegateTaskTool>`; replayed
+    /// checkpoints keep their recorded outputs verbatim — they ran under
+    /// their time's context, design F3-D6).
+    ///
+    /// Contract:
+    /// - Gate CLOSED (`[agentic.delegate] context_inheritance=false`, the
+    ///   default): output is byte-identical to the pre-T215 inline
+    ///   construction — empty `SessionContext` + mirrored sensitivity, no
+    ///   skill routing (pinned by
+    ///   `compose_sub_session_gate_off_matches_legacy_shape`).
+    /// - Gate OPEN: the parent's already-retrieved knowledge block is
+    ///   inherited (NO fresh retrieval per subtask, design F2-D8),
+    ///   truncated to the depth-halved budget `base >> depth` clamped to
+    ///   `KNOWLEDGE_BUDGET_CHARS_MIN` (structural halving; `max_depth ≤ 3`
+    ///   bounds the shift, `validate_task` enforces the cap before every
+    ///   call — the `min` keeps the shift total anyway), plus skill-hit
+    ///   injection on the sub-prompt through the orchestrator's shared
+    ///   helper (design F2-D9, no logic duplication).
+    fn compose_sub_session(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        depth: u32,
+    ) -> (SessionContext, SubAgentContext) {
+        let sensitivity = *self
+            .sensitivity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut session = SessionContext::new(agent_name.to_string(), String::new());
+        session.sensitivity_policy = sensitivity;
+        let Some(base_budget) = inheritance_budget_chars() else {
+            return (
+                session,
+                SubAgentContext {
+                    knowledge: Vec::new(),
+                    skill_hits: Vec::new(),
+                    budget_chars: 0,
+                },
+            );
+        };
+        let budget_chars =
+            (base_budget >> depth.min(31)).max(zen_core::config::KNOWLEDGE_BUDGET_CHARS_MIN);
+        let snapshot = self
+            .knowledge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let (knowledge, _) = crate::orchestrator::truncate_notes_to_budget(snapshot, budget_chars);
+        session.knowledge = knowledge.clone();
+        let skill_hits =
+            crate::orchestrator::inject_skill_hits_into(&self.skill_router, &mut session, prompt)
+                .map(|hit| hit.skill)
+                .into_iter()
+                .collect();
+        (
+            session,
+            SubAgentContext {
+                knowledge,
+                skill_hits,
+                budget_chars,
+            },
+        )
+    }
+
     /// Execute one validated delegation request (tier/depth/bounded checks
     /// already passed in `invoke`). Always returns a readable Value.
     pub(crate) async fn run_single(
@@ -337,6 +490,24 @@ impl DelegateTaskTool {
         req: &DelegateRequest,
         depth: u32,
         parent: &str,
+    ) -> serde_json::Value {
+        let (session, sub) = self.compose_sub_session(&req.agent, &req.prompt, depth);
+        self.run_single_composed(req, depth, parent, session, sub)
+            .await
+    }
+
+    /// `run_single` with a pre-composed sub-session — the `invoke` fan-out
+    /// path composes BEFORE `append_gates_audit` so the audit line carries
+    /// the real per-task `{inherited_notes, inherited_chars, skill_hits}`
+    /// values; composition is deterministic, so pre-composing here and
+    /// inside `run_single` (the plan.execute path) cannot drift.
+    pub(crate) async fn run_single_composed(
+        &self,
+        req: &DelegateRequest,
+        depth: u32,
+        parent: &str,
+        session: SessionContext,
+        sub: SubAgentContext,
     ) -> serde_json::Value {
         let started = Instant::now();
         let agent_name = req.agent.as_str();
@@ -356,12 +527,6 @@ impl DelegateTaskTool {
             });
         };
 
-        let sensitivity = *self
-            .sensitivity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut session = SessionContext::new(agent_name.to_string(), String::new());
-        session.sensitivity_policy = sensitivity;
         let mut context = AgentContext::new(profile.clone(), prompt.to_string(), session)
             .with_preferences(profile.llm_preferences.clone());
         context
@@ -373,7 +538,13 @@ impl DelegateTaskTool {
 
         // Budget: reserve a conservative estimate for the whole sub-turn;
         // an exhausted parent budget refuses the delegation up front.
-        let estimated = (prompt.len() / 4 + 1024) as u64;
+        // T215 (design F2-D10): inherited knowledge rides the SessionContext
+        // (prompt assembly), never the prompt string — the 32k bounded gate
+        // is untouched; the estimate additively includes knowledge_chars/4
+        // (same bytes→tokens divisor as the prompt term) so reservations
+        // stay honest.
+        let inherited_chars = sub.knowledge_chars();
+        let estimated = (prompt.len() / 4 + 1024 + inherited_chars / 4) as u64;
         let reservation = match self.token_budget.try_reserve_tokens(estimated).await {
             Ok(Some(reservation)) => reservation,
             Ok(None) => {
@@ -487,6 +658,9 @@ impl DelegateTaskTool {
             agent = agent_name,
             rounds,
             duration_ms = started.elapsed().as_millis() as u64,
+            knowledge_inherited = !sub.knowledge.is_empty(),
+            inherited_chars,
+            inherited_budget_chars = sub.budget_chars,
             "delegate.task sub-turn completed"
         );
         output
@@ -515,6 +689,15 @@ pub struct GateReport {
 pub(crate) const BOUNDED_PROMPT_CHARS: usize = 32_000;
 /// Advisory line above which a delegation is flagged not-worth-it.
 const ADVISORY_TOKEN_LINE: u64 = 50_000;
+
+/// Fan-out hard cap (T216, owner decision D-H): 8 is the RECORDED spec
+/// value (AGENTS.md tool inventory: "≤8/batch") that the design audit found
+/// unenforced — enforcing it is reuse, not invention. Rejection is a
+/// structured model-readable `Ok(json!({"error": ...}))` via `parse_requests`
+/// (this file's existing structured-error style). `plan.execute` keeps its
+/// own MAX_PLAN_TASKS=12 cap: plan layers batch through `run_single`
+/// directly, never through `parse_requests`.
+pub(crate) const FANOUT_MAX_TASKS: usize = 8;
 
 #[async_trait::async_trait]
 impl Tool for DelegateTaskTool {
@@ -601,7 +784,6 @@ impl Tool for DelegateTaskTool {
             .iter()
             .map(|t| Self::evaluate_gates(t, tasks.len()))
             .collect();
-        self.append_gates_audit(&parent, depth, &tasks, &reports);
 
         // Slot-ordered assembly: results[i] always corresponds to tasks[i],
         // whether the task was rejected, unbounded, or executed.
@@ -623,10 +805,25 @@ impl Tool for DelegateTaskTool {
             }
         }
 
+        // T215: compose the runnable sub-sessions BEFORE the audit line so
+        // `loop.delegate.gates` carries the real per-task inheritance stats;
+        // the audit still precedes every sub-turn spawn (T374 contract).
+        let mut composed: Vec<Option<(SessionContext, SubAgentContext)>> =
+            (0..tasks.len()).map(|_| None).collect();
+        for &i in &runnable {
+            composed[i] = Some(self.compose_sub_session(&tasks[i].agent, &tasks[i].prompt, depth));
+        }
+        self.append_gates_audit(&parent, depth, &tasks, &reports, &composed);
+
         for chunk in runnable.chunks(self.max_concurrent as usize) {
             let futures: Vec<_> = chunk
                 .iter()
-                .map(|&i| self.run_single(&tasks[i], depth, &parent))
+                .map(|&i| {
+                    let (session, sub) = composed[i]
+                        .take()
+                        .expect("runnable slots are composed above");
+                    self.run_single_composed(&tasks[i], depth, &parent, session, sub)
+                })
                 .collect();
             let results = futures::future::join_all(futures).await;
             for (&i, outcome) in chunk.iter().zip(results) {
@@ -706,6 +903,7 @@ mod tests {
             overlay,
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             budget,
             Duration::from_secs(300),
             max_depth,
@@ -1027,11 +1225,186 @@ mod tests {
             overlay,
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             budget,
             Duration::from_secs(300),
             max_depth,
             max_concurrent,
         )
+    }
+
+    /// T216 (owner decision D-H): 9 → structured rejection naming the
+    /// recorded cap; 8 → accepted; the cap does not disturb mixed
+    /// reject/run slot ordering.
+    #[tokio::test]
+    async fn fanout_hard_cap_rejects_nine_and_accepts_eight() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(1_000_000)),
+        );
+        let batch = |n: usize, agent_at: Option<(usize, &str)>| -> serde_json::Value {
+            serde_json::json!({
+                "tasks": (0..n)
+                    .map(|i| serde_json::json!({
+                        "agent": agent_at.filter(|(j, _)| *j == i).map(|(_, a)| a).unwrap_or("Explore"),
+                        "prompt": format!("capped task {i}")
+                    }))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let over = tool
+            .invoke(batch(FANOUT_MAX_TASKS + 1, None))
+            .await
+            .unwrap();
+        let error = over["error"].as_str().expect("structured rejection");
+        assert!(
+            error.contains("hard cap of 8"),
+            "the rejection must name the recorded cap: {error}"
+        );
+        assert!(
+            error.contains("9 tasks"),
+            "the rejection must state the offending width: {error}"
+        );
+
+        let at_cap = tool.invoke(batch(FANOUT_MAX_TASKS, None)).await.unwrap();
+        let results = at_cap["results"].as_array().expect("batch shape");
+        assert_eq!(
+            results.len(),
+            FANOUT_MAX_TASKS,
+            "exactly at the cap: accepted"
+        );
+        assert!(
+            results.iter().all(|r| r["response"].as_str().is_some()),
+            "every capped task ran: {at_cap}"
+        );
+
+        // Cap-boundary batch with one rejection inside: slot ordering holds.
+        let mixed = tool
+            .invoke(batch(FANOUT_MAX_TASKS, Some((7, "Nope"))))
+            .await
+            .unwrap();
+        let results = mixed["results"].as_array().expect("batch shape");
+        assert_eq!(results.len(), FANOUT_MAX_TASKS);
+        for (i, r) in results.iter().enumerate().take(7) {
+            assert_eq!(r["agent"].as_str(), Some("Explore"), "slot {i}");
+            assert!(r["response"].as_str().is_some(), "slot {i} ran");
+        }
+        assert!(
+            results[7]["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown delegate"),
+            "slot 7 keeps its rejection: {mixed}"
+        );
+    }
+
+    /// T217 (design F3-D4 pin, no production change): the early LLM-round
+    /// failure path returns BEFORE `record_usage`, dropping the reservation;
+    /// rig-compose's `TokenReservation` refunds on `Drop`
+    /// (rig-compose-0.5.0/src/budget.rs:253-259) — so a failed delegation
+    /// must never consume the parent budget.
+    #[tokio::test]
+    async fn early_llm_round_failure_refunds_reservation() {
+        // Budget-level pin of the Drop-refund property itself: consumed only
+        // moves through record_usage; a dropped reservation restores
+        // availability exactly.
+        let budget = Arc::new(AtomicTokenBudget::new(100_000));
+        {
+            let reservation = budget.try_reserve_tokens(2025).await.unwrap().unwrap();
+            assert_eq!(budget.available(), 100_000 - 2025);
+            drop(reservation);
+        }
+        assert_eq!(budget.available(), 100_000, "Drop refunds the estimate");
+        assert_eq!(budget.tokens_consumed().await, 0);
+
+        // Path-level pin: drive run_single's early_error branch with a
+        // deterministic non-retryable LLM failure. The 401 responder puts
+        // "401" in the error text ⇒ ErrorCategory::ClientError ⇒
+        // non-retryable ⇒ execute_round Errs on the FIRST attempt
+        // (executor.rs:370-380) — no retry delays, no mock fallback.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // Drain the FULL request before responding: closing mid-body
+                // (prompts are ~200KB) would surface as a retryable
+                // connection error instead of the intended 401.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 18\r\nconnection: close\r\n\r\n{\"error\":\"401-no\"}",
+                );
+            }
+        });
+
+        // NO_PROXY: reqwest honors proxy env vars, and a machine-level HTTP
+        // proxy would swallow the loopback request (returning its OWN status
+        // instead of the 401) — the same loopback-no-proxy discipline the
+        // OllamaProvider applies.
+        unsafe {
+            std::env::set_var("FAIL401_API_KEY", "test-key");
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+            std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        }
+        let config = zen_core::config::ZenConfig {
+            default_provider: Some("fail401".to_string()),
+            providers: std::collections::HashMap::from([(
+                "fail401".to_string(),
+                zen_core::config::ProviderConfig {
+                    provider_type: Some("openai-compatible".to_string()),
+                    base_url: Some(format!("http://127.0.0.1:{port}")),
+                    default_model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let tool = DelegateTaskTool::new(
+            Arc::new(ZenWiring::new()),
+            DefaultRouter::from_agentic(&config),
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::clone(&budget),
+            Duration::from_secs(300),
+            1,
+            4,
+        );
+
+        let out = tool
+            .invoke(
+                serde_json::json!({ "agent": "Explore", "prompt": "trigger the failing round" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("LLM round failed"),
+            "the early-error path must surface its structured error: {out}"
+        );
+        assert_eq!(
+            budget.tokens_consumed().await,
+            0,
+            "the dropped reservation must refund — a failed delegation never consumes budget"
+        );
+        assert_eq!(budget.available(), budget.capacity());
+        unsafe {
+            std::env::remove_var("FAIL401_API_KEY");
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
     }
 
     #[tokio::test]
@@ -1125,5 +1498,236 @@ mod tests {
                 .all(|r| r["response"].as_str().is_some_and(|s| !s.is_empty())),
             "every result must carry a non-empty response: {out}"
         );
+    }
+
+    // ── Phase 31 T215: sub-agent context inheritance ──────────────────
+
+    fn note(content: &str) -> RetrievedNote {
+        RetrievedNote {
+            path: "vault/wiki/notions/n.md".to_string(),
+            content: content.to_string(),
+            sensitivity: Sensitivity::Private,
+            relevance: 1.0,
+        }
+    }
+
+    fn tool_with_knowledge(
+        budget: Arc<AtomicTokenBudget>,
+        knowledge: SharedKnowledge,
+    ) -> DelegateTaskTool {
+        // Public sensitivity in the async gate-on test: Confidential would
+        // trip the PRE-EXISTING sync-route hazard in async contexts
+        // (enforce_sensitivity → is_local_llm_available → reqwest-blocking
+        // health_check; the D1 hazard class), orthogonal to inheritance.
+        // Confidential mirroring is pinned by the sync gate-off test below
+        // (compose_sub_session never routes, so no hazard there).
+        DelegateTaskTool::new(
+            Arc::new(ZenWiring::new()),
+            mock_router(),
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            knowledge,
+            budget,
+            Duration::from_secs(300),
+            3,
+            4,
+        )
+    }
+
+    fn set_inheritance_env(home: Option<&std::path::Path>, inherit: Option<&str>) {
+        match home {
+            Some(h) => unsafe { std::env::set_var("ZEN_HOME", h) },
+            None => unsafe { std::env::remove_var("ZEN_HOME") },
+        }
+        match inherit {
+            Some(v) => unsafe { std::env::set_var("ZEN_DELEGATE_CONTEXT_INHERITANCE", v) },
+            None => unsafe { std::env::remove_var("ZEN_DELEGATE_CONTEXT_INHERITANCE") },
+        }
+        zen_core::config::invalidate_config_cache();
+    }
+
+    /// Gate-CLOSED pin (default config): `compose_sub_session` reproduces
+    /// the pre-T215 inline construction — empty knowledge, mirrored
+    /// sensitivity, zeroed context — and this test FAILS if the
+    /// `context_inheritance` default ever flips open.
+    #[test]
+    fn compose_sub_session_gate_off_matches_legacy_shape() {
+        set_inheritance_env(None, None);
+        let knowledge: SharedKnowledge = Arc::new(std::sync::Mutex::new(vec![note(
+            "parent knowledge that must NOT leak while the gate is closed",
+        )]));
+        // Confidential cell: compose_sub_session mirrors sensitivity without
+        // routing, so the D1 sync-route hazard cannot fire in this sync test.
+        let tool = DelegateTaskTool::new(
+            Arc::new(ZenWiring::new()),
+            mock_router(),
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(Sensitivity::Confidential)),
+            knowledge,
+            Arc::new(AtomicTokenBudget::new(100_000)),
+            Duration::from_secs(300),
+            3,
+            4,
+        );
+        let (session, sub) = tool.compose_sub_session("Explore", "any subtask prompt", 0);
+        assert!(
+            session.knowledge.is_empty(),
+            "gate-off must keep today's empty SessionContext byte-identical"
+        );
+        assert_eq!(
+            session.sensitivity_policy,
+            Sensitivity::Confidential,
+            "sensitivity mirroring is unchanged by the gate"
+        );
+        assert_eq!(session.agent_name, "Explore");
+        assert!(sub.knowledge.is_empty());
+        assert!(sub.skill_hits.is_empty());
+        assert_eq!(sub.budget_chars, 0);
+    }
+
+    /// Env-dependent phases in ONE test (skill_hit_contract.rs precedent):
+    /// gate ON ⇒ depth-halved inheritance + skill-hit injection + the
+    /// knowledge term in the reservation estimate + additive audit fields.
+    #[tokio::test]
+    async fn context_inheritance_gate_on_halves_budget_and_audits() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        set_inheritance_env(Some(dir.path()), Some("1"));
+
+        // Skill fixture: containment match (score 1.0 ≥ 0.72 contract).
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).expect("skills dir");
+        std::fs::write(
+            skills.join("zen-probe.md"),
+            "---\nname: zen-probe\ndescription: probe\ntriggers: [zen inheritance probe]\n---\n# zen-probe\nDo the probe.",
+        )
+        .expect("write skill");
+
+        let knowledge: SharedKnowledge = Arc::new(std::sync::Mutex::new(vec![
+            note(&"a".repeat(3000)),
+            note(&"b".repeat(3000)),
+        ]));
+
+        // Phase 1 — depth-halved budgets (base 4000 = config default).
+        let tool = tool_with_knowledge(
+            Arc::new(AtomicTokenBudget::new(100_000)),
+            Arc::clone(&knowledge),
+        );
+        let (session_d0, sub_d0) =
+            tool.compose_sub_session("Explore", "plain subtask without a match", 0);
+        assert_eq!(sub_d0.budget_chars, 4000);
+        assert_eq!(sub_d0.knowledge.len(), 2);
+        assert_eq!(sub_d0.knowledge_chars(), 4000, "3000 + truncated 1000");
+        assert_eq!(session_d0.knowledge.len(), 2);
+        assert!(sub_d0.skill_hits.is_empty(), "no trigger ⇒ no skill hit");
+
+        let (_session_d1, sub_d1) =
+            tool.compose_sub_session("Explore", "plain subtask without a match", 1);
+        assert_eq!(sub_d1.budget_chars, 2000, "budget halves per depth level");
+        assert_eq!(sub_d1.knowledge.len(), 1);
+        assert_eq!(sub_d1.knowledge_chars(), 2000);
+
+        let (_session_d3, sub_d3) =
+            tool.compose_sub_session("Explore", "plain subtask without a match", 3);
+        assert_eq!(
+            sub_d3.budget_chars,
+            zen_core::config::KNOWLEDGE_BUDGET_CHARS_MIN,
+            "structural clamp floor (design F2-D8)"
+        );
+
+        // Phase 2 — skill-hit injection through the shared orchestrator helper.
+        let (session_skill, sub_skill) =
+            tool.compose_sub_session("Explore", "please run the zen inheritance probe now", 0);
+        assert_eq!(sub_skill.skill_hits, vec!["zen-probe".to_string()]);
+        assert_eq!(
+            session_skill.knowledge[0].path, "skills/zen-probe",
+            "skill prompt rides at slot 0 (parent inject_skill_hits semantics)"
+        );
+
+        // Phase 3 — reservation estimate includes knowledge_chars/4: a
+        // capacity that admits prompt/4+1024 but not the knowledge term
+        // must refuse the delegation.
+        // prompt "hello" ⇒ 5/4 + 1024 = 1025; inherited 4000/4 = 1000 ⇒ 2025.
+        let tight = tool_with_knowledge(Arc::new(AtomicTokenBudget::new(1500)), knowledge.clone());
+        let out = tight
+            .invoke(serde_json::json!({ "agent": "Explore", "prompt": "hello" }))
+            .await
+            .unwrap();
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("token budget"),
+            "the knowledge term must keep try_reserve_tokens honest: {out}"
+        );
+
+        // Phase 4 — loop.delegate.gates carries the additive fields with
+        // real values while every pre-T215 field stays present.
+        let out = tool
+            .invoke(serde_json::json!({ "agent": "Explore", "prompt": "audit probe" }))
+            .await
+            .unwrap();
+        assert!(out["response"].as_str().is_some(), "{out}");
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl"))
+            .expect("audit file under ZEN_HOME");
+        let gates = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.delegate.gates")
+            .expect("gates line");
+        let entry = &gates["gates"][0];
+        assert_eq!(entry["inherited_notes"].as_u64(), Some(2));
+        assert_eq!(entry["inherited_chars"].as_u64(), Some(4000));
+        assert_eq!(entry["skill_hits"].as_u64(), Some(0));
+        for legacy in [
+            "agent",
+            "prompt_chars",
+            "independent",
+            "consumer_decision",
+            "bounded",
+            "worth_it",
+        ] {
+            assert!(
+                entry.get(legacy).is_some(),
+                "pre-T215 field {legacy} must survive (existing consumers keep parsing)"
+            );
+        }
+
+        set_inheritance_env(None, None);
+    }
+
+    /// Gate CLOSED still emits the additive audit fields as zeros — the
+    /// field shape is unconditional so consumers never branch on presence.
+    #[tokio::test]
+    async fn gates_audit_inheritance_fields_are_zero_when_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let saved_home = std::env::var("ZEN_HOME").ok();
+        set_inheritance_env(Some(dir.path()), None);
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let out = tool
+            .invoke(serde_json::json!({ "agent": "Explore", "prompt": "x" }))
+            .await
+            .unwrap();
+        assert!(out["response"].as_str().is_some(), "{out}");
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).expect("audit");
+        let gates = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.delegate.gates")
+            .expect("gates line");
+        let entry = &gates["gates"][0];
+        assert_eq!(entry["inherited_notes"].as_u64(), Some(0));
+        assert_eq!(entry["inherited_chars"].as_u64(), Some(0));
+        assert_eq!(entry["skill_hits"].as_u64(), Some(0));
+        match saved_home {
+            Some(home) => unsafe { std::env::set_var("ZEN_HOME", home) },
+            None => unsafe { std::env::remove_var("ZEN_HOME") },
+        }
+        zen_core::config::invalidate_config_cache();
     }
 }

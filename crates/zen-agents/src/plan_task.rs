@@ -383,6 +383,14 @@ impl Tool for PlanExecuteTool {
             .map(|s| s.to_string());
         let mut resumed = false;
         let mut outcomes: Vec<Option<TaskOutcome>> = vec![None; plan.tasks.len()];
+        // T218 (design F3-D3, REPORT-ONLY): staleness risk — a replayed
+        // ok-checkpoint's recorded output is injected into downstream prompts
+        // as a 4000-char snippet (`upstream_snippet`/`compose_task_prompt`)
+        // REGARDLESS of its age, so it can be inconsistent with re-executed
+        // sibling tasks. TTL invalidation was rejected: it would need an
+        // invented staleness threshold. The age rides the completion audit
+        // line instead, making staleness observable without gating on it.
+        let mut replayed_ages: Vec<(String, i64)> = Vec::new();
         let plan_id = match (self.db().await, resumed_id) {
             (Some(db), Some(rid)) => {
                 let repo = zen_repo::WorkflowRepo::new(db);
@@ -411,6 +419,7 @@ impl Tool for PlanExecuteTool {
                             }
                         }
                         resumed = true;
+                        let resumed_now = chrono::Utc::now().timestamp();
                         for t in repo.load_task_rows(&rid).await.unwrap_or_default() {
                             if t.status != "ok" {
                                 continue;
@@ -424,6 +433,10 @@ impl Tool for PlanExecuteTool {
                             if plan.tasks[i].agent != t.agent {
                                 continue;
                             }
+                            // Age source is the existing `workflow_tasks`
+                            // row timestamp — no schema change (T218).
+                            replayed_ages
+                                .push((t.task_id.clone(), (resumed_now - t.updated_at).max(0)));
                             outcomes[i] = Some(TaskOutcome {
                                 status: "ok",
                                 value: serde_json::json!({
@@ -622,7 +635,7 @@ impl Tool for PlanExecuteTool {
                 )
                 .await;
         }
-        let audit_entry = serde_json::json!({
+        let mut audit_entry = serde_json::json!({
             "kind": "loop.plan.completed",
             "plan": plan.name.as_deref().unwrap_or("<unnamed>"),
             "plan_id": if plan_id.is_empty() { None } else { Some(&plan_id) },
@@ -634,6 +647,18 @@ impl Tool for PlanExecuteTool {
             "delivery_ready": gate.delivery_ready,
             "duration_ms": started.elapsed().as_millis() as u64,
         });
+        // T218 additive field (resume runs with replays only): per replayed
+        // task, the checkpoint age at resume — existing consumers keep
+        // parsing (all pre-T218 fields unchanged).
+        if resumed && !replayed_ages.is_empty() {
+            audit_entry["replayed_checkpoints"] = replayed_ages
+                .iter()
+                .map(|(task_id, age)| {
+                    serde_json::json!({ "task": task_id, "checkpoint_age_secs": age })
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
         self.append_plan_audit(audit_entry);
         info!(
             plan = plan.name.as_deref().unwrap_or("<unnamed>"),
@@ -782,6 +807,7 @@ mod tests {
             Vec::new(),
             None,
             std::sync::Arc::new(Mutex::new(Sensitivity::Public)),
+            std::sync::Arc::new(Mutex::new(Vec::new())),
             std::sync::Arc::new(rig_compose::budget::AtomicTokenBudget::new(100_000)),
             Duration::from_secs(30),
             1,
@@ -1160,6 +1186,70 @@ mod tests {
             assert_eq!(row["id"], serde_json::json!(format!("t{i}")), "{out}");
             assert_eq!(row["status"], "ok", "slot {i} across chunks: {out}");
         }
+    }
+
+    /// T218: a replayed ok-checkpoint's age rides the `loop.plan.completed`
+    /// audit line (report-only staleness observability, design F3-D3) — read
+    /// from the existing `workflow_tasks.updated_at`, no schema change.
+    #[tokio::test]
+    async fn resume_audit_records_checkpoint_age() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let tool = plan_tool_with(Some(state_db.clone()));
+
+        let plan_id = "aged-checkpoints".to_string();
+        let client = zen_repo::SqliteClient::open_lazy(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let now = chrono::Utc::now().timestamp();
+        repo.create_plan(&plan_id, None, "{}", now).await.unwrap();
+        repo.checkpoint_task(zen_repo::TaskCheckpoint {
+            plan_id: &plan_id,
+            task_id: "a",
+            agent: "Explore",
+            status: "ok",
+            response: Some("REPLAYED"),
+            error: None,
+            now: now - 120,
+        })
+        .await
+        .unwrap();
+        drop(client);
+
+        let out = tool
+            .invoke(serde_json::json!({
+                "resume_plan_id": plan_id,
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "already done" },
+                    { "id": "b", "agent": "Explore", "prompt": "fresh work" }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["resumed"], serde_json::json!(true), "{out}");
+
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl"))
+            .expect("audit file under ZEN_HOME");
+        let completed = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.plan.completed")
+            .expect("completion audit line");
+        let replayed = completed["replayed_checkpoints"]
+            .as_array()
+            .expect("additive replayed_checkpoints field");
+        assert_eq!(replayed.len(), 1, "only the replayed task is listed");
+        assert_eq!(replayed[0]["task"], "a");
+        let age = replayed[0]["checkpoint_age_secs"].as_i64().unwrap();
+        assert!(
+            (100..600).contains(&age),
+            "age ≈ the 120s seeded offset, got {age}"
+        );
+        // Pre-T218 fields stay present (existing consumers keep parsing).
+        for field in ["tasks_total", "tasks_ok", "plan_approved", "duration_ms"] {
+            assert!(completed.get(field).is_some(), "{field} missing");
+        }
+        unsafe { std::env::remove_var("ZEN_HOME") };
     }
 
     #[tokio::test]
