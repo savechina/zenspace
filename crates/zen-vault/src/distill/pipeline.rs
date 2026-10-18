@@ -111,63 +111,57 @@ pub fn auto_link_wikilinks(content: &str, known_entities: &[String]) -> String {
             continue;
         }
 
-        // Only wrap if the entity appears as plain text (not inside [[...]] or `...`)
-        let entity_lower = entity.to_lowercase();
+        // The scan is char-based: a byte-index walk (the previous
+        // implementation) lands inside multi-byte characters on CJK content,
+        // panicking at char-boundary slices and corrupting output via
+        // `byte as char`. Case-insensitive matching compares each source
+        // char's full lowercase expansion against the entity so indices
+        // never drift the way a whole-string `to_lowercase()` would.
+        let entity_lower: Vec<char> = entity.chars().flat_map(|c| c.to_lowercase()).collect();
+        let src: Vec<char> = result.chars().collect();
+        let entity_len = entity.chars().count();
+
         let mut new_result = String::with_capacity(result.len());
         let mut i = 0;
-        let bytes = result.as_bytes();
-        let result_lower = result.to_lowercase();
 
-        while i < bytes.len() {
-            // Check if we're inside a wikilink or backtick
-            if bytes[i] == b'[' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-                // Skip until ]]
-                new_result.push_str(&result[i..i + 2]);
+        while i < src.len() {
+            // Already-linked [[...]] spans pass through verbatim
+            if src[i] == '[' && src.get(i + 1) == Some(&'[') {
+                new_result.push_str("[[");
                 i += 2;
-                while i < bytes.len() - 1 {
-                    if bytes[i] == b']' && bytes[i + 1] == b']' {
+                while i < src.len() {
+                    if src[i] == ']' && src.get(i + 1) == Some(&']') {
                         new_result.push_str("]]");
                         i += 2;
                         break;
                     }
-                    new_result.push(bytes[i] as char);
+                    new_result.push(src[i]);
                     i += 1;
                 }
                 continue;
             }
-            if bytes[i] == b'`' {
-                // Skip until closing backtick
-                new_result.push(bytes[i] as char);
+            // `code` spans pass through verbatim
+            if src[i] == '`' {
+                new_result.push('`');
                 i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'`' {
-                        new_result.push(bytes[i] as char);
-                        i += 1;
+                while i < src.len() {
+                    let c = src[i];
+                    new_result.push(c);
+                    i += 1;
+                    if c == '`' {
                         break;
                     }
-                    new_result.push(bytes[i] as char);
-                    i += 1;
                 }
                 continue;
             }
 
-            // Check if entity starts at this position
-            let remaining_lower = &result_lower[i..];
-            if remaining_lower.starts_with(&entity_lower) {
-                // Ensure word boundary
-                let end = i + entity.len();
-                let before_ok = i == 0 || !result.as_bytes()[i - 1].is_ascii_alphanumeric();
-                let after_ok =
-                    end >= result.len() || !result.as_bytes()[end].is_ascii_alphanumeric();
-
-                if before_ok && after_ok {
-                    new_result.push_str(&format!("[[{entity}]]"));
-                    i = end;
-                    continue;
-                }
+            if let Some(end) = matches_entity_at(&src, i, &entity_lower, entity_len) {
+                new_result.push_str(&format!("[[{entity}]]"));
+                i = end;
+                continue;
             }
 
-            new_result.push(bytes[i] as char);
+            new_result.push(src[i]);
             i += 1;
         }
 
@@ -175,6 +169,48 @@ pub fn auto_link_wikilinks(content: &str, known_entities: &[String]) -> String {
     }
 
     result
+}
+
+/// Case-insensitive entity match at `src[i..]` returning the source char
+/// index just past the match. Each source char contributes its ENTIRE
+/// lowercase expansion (a single char may lowercase to several), so a match
+/// never ends mid-expansion and returned indices always land on the
+/// original char grid. Word boundaries keep the historical ASCII semantics.
+fn matches_entity_at(
+    src: &[char],
+    i: usize,
+    entity_lower: &[char],
+    entity_len: usize,
+) -> Option<usize> {
+    let before_ok = i == 0 || !src[i - 1].is_ascii_alphanumeric();
+    if !before_ok {
+        return None;
+    }
+
+    let end = i + entity_len;
+    let after_ok = end >= src.len() || !src[end].is_ascii_alphanumeric();
+    if !after_ok {
+        return None;
+    }
+
+    let mut k = i;
+    let mut e = 0;
+    while k < end && e < entity_lower.len() {
+        let expansion: Vec<char> = src[k].to_lowercase().collect();
+        if expansion.is_empty() || e + expansion.len() > entity_lower.len() {
+            return None;
+        }
+        if expansion[..] != entity_lower[e..e + expansion.len()] {
+            return None;
+        }
+        e += expansion.len();
+        k += 1;
+    }
+    if e == entity_lower.len() {
+        Some(end)
+    } else {
+        None
+    }
 }
 
 /// T004: deterministic content normalization (FR-003) —

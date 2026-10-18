@@ -134,12 +134,21 @@ fn chunk_content(content: &str, chunk_size: usize, overlap: usize) -> Vec<String
         .collect()
 }
 
-fn aggregate_chunks(chunks: &[String]) -> Vec<f32> {
+/// Average the per-chunk embeddings into one vector and report whether ANY
+/// chunk fell back to the hash provider.
+///
+/// Aggregation math (mean of the per-chunk vectors, then L2-normalize) is
+/// byte-identical to the pre-tagged implementation; the only addition is the
+/// `degraded` union so a mixed run — some chunks real, some hash — is still
+/// reported as degraded.
+fn aggregate_chunks_tagged(chunks: &[String]) -> (Vec<f32>, bool) {
     let dim = SYSTEM_EMBEDDING_DIM;
     let mut aggregated = vec![0.0f32; dim];
+    let mut degraded = false;
 
     for chunk in chunks {
-        let (embedding, _degraded) = compute_embedding_with_fallback(chunk);
+        let (embedding, chunk_degraded) = compute_embedding_with_fallback(chunk);
+        degraded |= chunk_degraded;
 
         let len = embedding.len().min(dim);
         for (i, v) in embedding.iter().enumerate().take(len) {
@@ -153,22 +162,77 @@ fn aggregate_chunks(chunks: &[String]) -> Vec<f32> {
         }
     }
     l2_normalize(&mut aggregated);
-    aggregated
+    (aggregated, degraded)
 }
 
-pub fn compute_embeddings_for_text(text: &str) -> Result<Vec<f32>> {
+/// Compute an embedding for `text` and report whether the hash fallback was used.
+///
+/// # Description
+/// Splits `text` at the shared 400-word / 80-word-overlap boundary and either
+/// embeds the single chunk via [`compute_embeddings`] or averages the
+/// per-chunk vectors via [`aggregate_chunks_tagged`]. The returned flag is
+/// `true` when ANY contributing chunk was served by the byte-hash
+/// pseudo-embedding (the provider chain was exhausted) instead of a real
+/// semantic model.
+///
+/// # Parameters
+/// - `text`: source text; whitespace-only input yields a zero vector.
+///
+/// # Returns
+/// `Ok((embedding, degraded))` where `embedding` is always
+/// `SYSTEM_EMBEDDING_DIM` long and `degraded` is `true` iff the hash fallback
+/// contributed to it.
+///
+/// # Errors
+/// Never fails today — the provider chain ends in the infallible hash
+/// fallback — but the `Result` is preserved for parity with the untagged
+/// wrapper and future providers.
+///
+/// # Example
+/// ```
+/// let (vector, _degraded) =
+///     zen_vault::tindy::embeddings::compute_embeddings_for_text_tagged("hello").unwrap();
+/// assert_eq!(vector.len(), 4096);
+/// ```
+pub fn compute_embeddings_for_text_tagged(text: &str) -> Result<(Vec<f32>, bool)> {
     let chunks = chunk_content(text, 400, 80);
     if chunks.is_empty() {
         info!("compute_embeddings_for_text: no chunks");
-        return Ok(vec![0.0; SYSTEM_EMBEDDING_DIM]);
+        return Ok((vec![0.0; SYSTEM_EMBEDDING_DIM], false));
     }
 
     if chunks.len() == 1 {
         let result = compute_embeddings(&chunks[0])?;
-        Ok(result.embedding)
+        Ok((result.embedding, result.degraded))
     } else {
-        Ok(aggregate_chunks(&chunks))
+        Ok(aggregate_chunks_tagged(&chunks))
     }
+}
+
+/// Compute an embedding for `text`, dropping the degradation flag.
+///
+/// # Description
+/// Thin wrapper over [`compute_embeddings_for_text_tagged`] that keeps the
+/// original signature for existing callers (search tiers, notion service,
+/// gateway warm-up). Behaviour is byte-identical to the pre-tagged
+/// implementation.
+///
+/// # Parameters
+/// - `text`: source text.
+///
+/// # Returns
+/// `Ok(embedding)` — a `SYSTEM_EMBEDDING_DIM`-long vector.
+///
+/// # Errors
+/// See [`compute_embeddings_for_text_tagged`].
+///
+/// # Example
+/// ```
+/// let vector = zen_vault::tindy::compute_embeddings_for_text("hello").unwrap();
+/// assert_eq!(vector.len(), 4096);
+/// ```
+pub fn compute_embeddings_for_text(text: &str) -> Result<Vec<f32>> {
+    compute_embeddings_for_text_tagged(text).map(|(embedding, _degraded)| embedding)
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +326,14 @@ mod tests {
         let result = compute_embeddings("").unwrap();
         assert_eq!(result.dimensions, SYSTEM_EMBEDDING_DIM);
         assert!(result.embedding.iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn test_compute_embeddings_for_text_is_fail_open() {
+        // Pins the daemon embedding-warmup contract: this never errors (hash
+        // fallback), so a failed warmup can only warn, never abort startup.
+        let v = compute_embeddings_for_text("zen embedding warmup").unwrap();
+        assert_eq!(v.len(), SYSTEM_EMBEDDING_DIM);
     }
 
     #[test]

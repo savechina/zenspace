@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 use tui_textarea::{Input, Key};
 
 use super::app::InputMode;
+use super::history_search;
 use super::selection::{Selection, TextPosition};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -120,6 +121,13 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
         };
     }
 
+    // B7: Reverse-i-search mode — all keys route to the SINGLE shared state
+    // machine (the same one the inline prompt calls) before normal dispatch.
+    if app.history_search.active {
+        history_search::handle_key(key, app);
+        return KeyAction::Continue;
+    }
+
     let input_before = app.input.lines().join("\n");
 
     if matches!(
@@ -185,6 +193,12 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             if app.session_picker.visible && !app.session_picker.rename_mode {
                 app.session_picker.start_rename();
                 return KeyAction::Continue;
+            }
+            // B7: enter reverse-i-search via the shared state machine, but
+            // only when neither the session picker nor the slash popup owns
+            // the keys (picker precedence above is preserved exactly).
+            if !app.session_picker.visible && !app.slash_state.visible {
+                history_search::handle_key(key, app);
             }
             return KeyAction::Continue;
         }
@@ -798,5 +812,87 @@ mod tests {
         let mut app = test_app();
         app.poll_memory_nudges_in(&temp.path().join("logs"));
         assert!(app.get_active_toast().is_none());
+    }
+
+    // === B7: Ctrl+R reverse-i-search (fullscreen) — exercises the SHARED
+    // history_search::handle_key through the fullscreen entry points. ===
+
+    /// (a) Ctrl+R enters the search state, previews the newest history entry,
+    /// and snapshots the pre-search draft.
+    #[test]
+    fn ctrl_r_enters_reverse_i_search() {
+        let mut app = test_app();
+        app.command_history = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        app.input = App::create_input_textarea("current draft");
+        let action = press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Continue);
+        assert!(app.history_search.active);
+        // Preview shows the newest match
+        assert_eq!(app.input.lines().join("\n"), "gamma");
+        // Draft snapshot preserved for Esc
+        assert_eq!(app.history_search.draft_snapshot, "current draft");
+    }
+
+    /// (b) A typed character narrows the query while search is active (the
+    /// key must reach the search, not the composer or the `l` panel toggle).
+    #[test]
+    fn reverse_search_typing_narrows_query() {
+        let mut app = test_app();
+        app.command_history = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        app.input = App::create_input_textarea("");
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let action = press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(action, KeyAction::Continue);
+        assert_eq!(app.history_search.query, "a");
+        // alpha / beta / gamma all contain 'a' — newest first
+        assert_eq!(app.history_search.matches.len(), 3);
+        assert_eq!(app.history_search.current_match(), Some("gamma"));
+        assert_eq!(app.input.lines().join("\n"), "gamma");
+    }
+
+    /// (c) Ctrl+R again while active cycles to the older match.
+    #[test]
+    fn ctrl_r_cycles_older_match_while_active() {
+        let mut app = test_app();
+        app.command_history = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        app.input = App::create_input_textarea("");
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(app.history_search.current_match(), Some("gamma"));
+        let action = press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Continue);
+        assert!(app.history_search.active, "cycling must stay in search");
+        assert_eq!(app.history_search.match_index, 1);
+        assert_eq!(app.history_search.current_match(), Some("beta"));
+        assert_eq!(app.input.lines().join("\n"), "beta");
+    }
+
+    /// (d) Esc restores the draft snapshot and exits the search.
+    #[test]
+    fn reverse_search_esc_restores_draft_and_exits() {
+        let mut app = test_app();
+        app.command_history = vec!["alpha".into()];
+        app.input = App::create_input_textarea("my draft");
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        let action = press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(action, KeyAction::Continue);
+        assert!(!app.history_search.active);
+        assert_eq!(app.input.lines().join("\n"), "my draft");
+        assert_eq!(app.input.effective_mode(), InputMode::Default);
+    }
+
+    /// Precedence pin: a visible session picker owns Ctrl+R — it must never
+    /// start history search (rename handling is unchanged above it).
+    #[test]
+    fn ctrl_r_with_session_picker_never_starts_search() {
+        let mut app = test_app();
+        app.command_history = vec!["alpha".into()];
+        app.session_picker.visible = true;
+        let action = press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Continue);
+        assert!(
+            !app.history_search.active,
+            "session picker owns Ctrl+R — no search entry"
+        );
     }
 }

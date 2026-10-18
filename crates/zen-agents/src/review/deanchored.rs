@@ -42,6 +42,88 @@ use super::pipeline::SemanticVerdict;
 /// frontier prompt so the escalation path stays byte-identical.
 const DRAFT_CHARS: usize = 4000;
 
+/// Fixed base constant for deterministic de-biasing seeds (D8). Combined with
+/// a per-item id it yields a stable permutation across processes and runs.
+pub const DEBIAS_SEED_BASE: u64 = 0x5EED_1D8E_5EED_1D8E;
+
+/// Deterministic permutation of `0..len` selected by `seed` (Fisher–Yates
+/// over a SplitMix64 stream). Same `(seed, len)` ⇒ same order; distinct seeds
+/// generally differ for `len >= 2`. Documented in every caller.
+pub fn seeded_order(seed: u64, len: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..len).collect();
+    if len < 2 {
+        return order;
+    }
+    let mut state = seed;
+    for i in (1..len).rev() {
+        let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    order
+}
+
+/// Combine the fixed [`DEBIAS_SEED_BASE`] with a per-item id (D8).
+pub fn debias_seed(id: u64) -> u64 {
+    DEBIAS_SEED_BASE ^ id
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// One pairwise scoring prompt: candidates in a fixed order, the SECOND
+/// scored. [`pairwise_score_prompts`] builds the two position-swapped orders.
+pub fn pairwise_score_prompt(first: &str, second: &str) -> String {
+    let a: String = first.chars().take(DRAFT_CHARS).collect();
+    let b: String = second.chars().take(DRAFT_CHARS).collect();
+    format!(
+        "You are scoring two candidate answers to the same task. Rate the SECOND \
+         candidate on how completely and correctly it addresses the task, from 0.0 \
+         (poor) to 1.0 (excellent), independent of presentation order.\n\
+         Candidate 1:\n{a}\n\
+         Candidate 2:\n{b}\n\n\
+         Respond with exactly one line: \"SCORE: <0.0-1.0>\""
+    )
+}
+
+/// The two position-swapped prompts for scoring `target` against `reference`
+/// (D8 AB/BA). Both ask for `target`'s score; averaging them cancels position
+/// bias.
+pub fn pairwise_score_prompts(reference: &str, target: &str) -> [String; 2] {
+    [
+        pairwise_score_prompt(reference, target),
+        pairwise_score_prompt(target, reference),
+    ]
+}
+
+/// Merge the two order scores by arithmetic mean (D8 fixed rule). Mean was
+/// chosen over agreement-required-escalate: it is order-invariant, always
+/// defined, and never turns a scoring step into a routing decision.
+pub fn merge_pairwise_scores(first: f32, second: f32) -> f32 {
+    ((first + second) / 2.0).clamp(0.0, 1.0)
+}
+
+/// Parse a pairwise reply's `SCORE: <0.0-1.0>` line.
+pub fn parse_pairwise_score(reply: &str) -> Option<f32> {
+    for line in reply.lines() {
+        let lower = line.to_lowercase();
+        if let Some(index) = lower.find("score:") {
+            let raw = line[index + "score:".len()..].trim();
+            let token = raw
+                .split(|c: char| c.is_whitespace() || c == ',' || c == '%')
+                .next()?;
+            if let Ok(value) = token.trim().parse::<f32>() {
+                return Some(value.clamp(0.0, 1.0));
+            }
+        }
+    }
+    None
+}
+
 /// One model round-trip. Injectable so the cascade and the de-anchoring
 /// invariant are testable without a live provider.
 #[async_trait]
@@ -173,6 +255,26 @@ impl DeAnchoredJudge {
         parse_local_judgement(&scored)
     }
 
+    /// Position-debiased pairwise score of `target` against `reference` (D8):
+    /// evaluate both presentation orders and merge with
+    /// [`merge_pairwise_scores`]. The frontier model is used; the existing
+    /// single-candidate `judge` path is untouched.
+    pub async fn score_pairwise(
+        &self,
+        model: &dyn JudgeModel,
+        reference: &str,
+        target: &str,
+    ) -> Result<f32, String> {
+        let [first_order, second_order] = pairwise_score_prompts(reference, target);
+        let first = model.complete(&first_order).await?;
+        let second = model.complete(&second_order).await?;
+        let first_score = parse_pairwise_score(&first)
+            .ok_or_else(|| format!("pairwise score missing in AB reply: {first}"))?;
+        let second_score = parse_pairwise_score(&second)
+            .ok_or_else(|| format!("pairwise score missing in BA reply: {second}"))?;
+        Ok(merge_pairwise_scores(first_score, second_score))
+    }
+
     /// Judge the draft, escalating to the frontier only when needed.
     ///
     /// With no calibrated τ this is exactly the pre-T170 frontier call. With
@@ -295,6 +397,10 @@ pub fn record_decision(paths: &ZenPaths, judged: &JudgedVerdict, input: &str) {
 
 /// The judge's own answer to the task. **Contains no part of the draft** —
 /// that exclusion is what makes the subsequent scoring de-anchored.
+///
+/// Rubric-order policy (D8): this builder emits a single instruction, not a
+/// list of rubric items, so seeded permutation does not apply here; position
+/// de-biasing for two candidates is provided by [`pairwise_score_prompts`].
 pub fn commit_prompt(task: &str) -> String {
     format!(
         "Answer the following task yourself, concisely and completely. \
@@ -305,6 +411,9 @@ pub fn commit_prompt(task: &str) -> String {
 }
 
 /// Score a draft against the judge's own committed answer.
+///
+/// Rubric-order policy (D8): no rubric item list is emitted, so no seeded
+/// permutation applies; the prompt is byte-identical to the pre-D8 shape.
 pub fn score_prompt(commitment: &str, deliverable: &str) -> String {
     let draft: String = deliverable.chars().take(DRAFT_CHARS).collect();
     format!(
@@ -319,7 +428,8 @@ pub fn score_prompt(commitment: &str, deliverable: &str) -> String {
 }
 
 /// The pre-T170 frontier prompt, preserved byte-for-byte so escalation cost
-/// and behaviour are unchanged.
+/// and behaviour are unchanged. Rubric-order policy (D8): no rubric item list
+/// is emitted, so no seeded permutation applies.
 pub fn frontier_prompt(task: &str, deliverable: &str) -> String {
     let draft: String = deliverable.chars().take(DRAFT_CHARS).collect();
     format!(
@@ -654,5 +764,87 @@ mod tests {
         assert!(prompt.contains("Task: do the thing"));
         assert!(prompt.contains("Draft answer (truncated):\nthe draft"));
         assert!(prompt.ends_with("\"REJECTED: <reason>\"."));
+    }
+
+    #[test]
+    fn seeded_order_is_deterministic_for_a_seed() {
+        let a = seeded_order(debias_seed(7), 6);
+        let b = seeded_order(debias_seed(7), 6);
+        assert_eq!(a, b, "same seed ⇒ same order");
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..6).collect::<Vec<_>>(), "a permutation of 0..n");
+    }
+
+    #[test]
+    fn seeded_order_varies_with_seed() {
+        let orders: std::collections::HashSet<Vec<usize>> = [1u64, 2, 3, 4]
+            .iter()
+            .map(|seed| seeded_order(debias_seed(*seed), 6))
+            .collect();
+        assert!(
+            orders.len() >= 2,
+            "distinct seeds must not all collapse to one order: {orders:?}"
+        );
+    }
+
+    #[test]
+    fn merge_pairwise_scores_is_the_mean() {
+        assert!((merge_pairwise_scores(0.2, 0.8) - 0.5).abs() < 1e-6);
+        assert!((merge_pairwise_scores(1.0, 0.0) - 0.5).abs() < 1e-6);
+        assert!((merge_pairwise_scores(0.9, 0.7) - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pairwise_prompts_swap_positions_in_ab_and_ba() {
+        let [ab, ba] = pairwise_score_prompts("REFERENCE", "TARGET");
+        assert!(
+            ab.contains("Candidate 1:\nREFERENCE"),
+            "AB presents reference first"
+        );
+        assert!(
+            ab.contains("Candidate 2:\nTARGET"),
+            "AB presents target second"
+        );
+        assert!(
+            ba.contains("Candidate 1:\nTARGET"),
+            "BA presents target first"
+        );
+        assert!(
+            ba.contains("Candidate 2:\nREFERENCE"),
+            "BA presents reference second"
+        );
+    }
+
+    #[test]
+    fn parse_pairwise_score_reads_the_score_line() {
+        assert_eq!(parse_pairwise_score("SCORE: 0.42"), Some(0.42));
+        assert_eq!(parse_pairwise_score("score: 1.0 — excellent"), Some(1.0));
+        assert_eq!(parse_pairwise_score("no score here"), None);
+    }
+
+    #[tokio::test]
+    async fn score_pairwise_evaluates_both_orders_and_merges() {
+        // Position-biased model: scores the SECOND candidate 0.2, the FIRST
+        // 0.8. Swapping the order must expose the bias, and the mean (0.5)
+        // is the debiased target score.
+        struct PositionBiased;
+        #[async_trait]
+        impl JudgeModel for PositionBiased {
+            async fn complete(&self, prompt: &str) -> Result<String, String> {
+                let first_is_target = prompt.find("Candidate 1:\nTARGET").is_some();
+                Ok(format!(
+                    "SCORE: {}",
+                    if first_is_target { 0.8 } else { 0.2 }
+                ))
+            }
+        }
+        let frontier = ScriptedModel::new(&["APPROVED"]);
+        let judge = DeAnchoredJudge::new(frontier, None, None);
+        let score = judge
+            .score_pairwise(&PositionBiased, "REFERENCE", "TARGET")
+            .await
+            .expect("both orders parsed");
+        assert!((score - 0.5).abs() < 1e-6, "bias averaged out: {score}");
     }
 }

@@ -1,6 +1,7 @@
 pub mod commitment_tracker;
 pub mod decision_tracker;
 pub mod dream;
+pub mod embedding_refresher;
 pub mod evidence_gatherer;
 pub mod express;
 pub mod marker_state;
@@ -20,6 +21,7 @@ pub mod zen_loop;
 pub use commitment_tracker::CommitmentTracker;
 pub use decision_tracker::DecisionTracker;
 pub use dream::DreamWorker;
+pub use embedding_refresher::{EMBEDDING_REFRESH_SCHEDULE, EmbeddingRefresherWorker};
 pub use evidence_gatherer::EvidenceGatherer;
 pub use express::ExpressWorker;
 pub use marker_state::{JournalEntryState, SessionState};

@@ -25,6 +25,10 @@ description = "Zenspace AI Agents productivity suite，个人生产力套件"
 version = "0.0.9"
 
 [workspace.dependencies]
+# Micro-benchmark harness (benches/*.rs, harness = false) — divan over
+# criterion: stable-only (criterion 0.8 MSRV 1.86 > workspace MSRV), lighter
+# dep tree, codex-rs precedent (nvzqz/divan 0.1.21).
+divan = "0.1.21"
 clap = { version = "4.5.39", features = ["derive", "env", "string"] }
 bigdecimal = { version = "0.4.8", features = ["serde", "serde_json"] }
 # Session-replay idempotency keys (Phase 11 T048) — matches the blake3
@@ -120,7 +124,7 @@ diffy = "0.5"
 # tree (the T121 duplicate-island discipline). Do not bump casually.
 pdf-extract = "0.10"
 # Office (docx/xlsx/pptx) text extraction for the ingest pipeline. 2026-09-29
-# audit (docs/designs/doc-conversion.md): 719k downloads / 600k recent / 15
+# audit (docs/designs/architecture.md §5): 719k downloads / 600k recent / 15
 # reverse deps incl. real consumers / fuzz targets + institutional CI. The
 # alternatives (undoc 20k dl, anytomd 9k dl) lack real-world consumers.
 office_oxide = "0.1"

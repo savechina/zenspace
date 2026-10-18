@@ -1,7 +1,7 @@
 //! Semantic wiki lint (compile-hygiene E1): an opt-in LLM audit of wiki
 //! pages for contradictions, gaps, stale claims and redundancy.
 //!
-//! Contract (docs/designs/e1-semantic-lint-writers.md): strictly READ-ONLY
+//! Contract (docs/designs/architecture.md §5 (e1 entry)): strictly READ-ONLY
 //! over wiki pages — findings ride the existing lint reporting path and are
 //! never written back. Gate (`[agentic.lint] semantic`, default false)
 //! ships closed; with the gate open every failure (unconfigured provider,

@@ -1,11 +1,31 @@
-//! Intent classification (001-agentic-foundation A.3, convergence T372).
+//! Intent classification — the coded L0/L1/L2 decision ladder.
 //!
-//! Pipeline order — **LLM first, keyword is the degraded fast path**: a
-//! cheap LLM classification turn runs at the top of every orchestrator
-//! turn; only when the LLM is unavailable (routing error, stream error,
-//! timeout, unparsable reply) does the keyword table take over. A
+//! The orchestrator calls `decision::classify_intent`, which implements the
+//! three-tier ladder from V8 增补 A (T168/T169):
+//!
+//! - **L0** — deterministic Rust: the `INTENT_SIGNALS` keyword table
+//!   ([`keyword_route`]), always available and the fallback every rung
+//!   degrades to.
+//! - **L1** — the calibrated decision layer: an embedding router over the
+//!   seed intent table, then [`crate::decision::LocalClassifierRung`]. Each
+//!   L1 rung gates the turn **only** when its calibrated threshold τ is
+//!   supplied (config `[agentic.intent] l1_threshold`, or T173's
+//!   `logs/decision-audit/thresholds.json`). No τ ⇒ every L1 gate is closed
+//!   (V13-A.3: no invented threshold) and the ladder is byte-identical to the
+//!   pre-T169 path.
+//! - **L2** — the LLM: [`classify`] below, the existing LLM-first
+//!   classification with the keyword fast path as its degraded branch.
+//!
+//! Within L2, pipeline order is **LLM first, keyword is the degraded fast
+//! path**: a cheap LLM classification turn runs at the top of every
+//! orchestrator turn; only when the LLM is unavailable (routing error, stream
+//! error, timeout, unparsable reply) does the keyword table take over. A
 //! low-confidence LLM verdict (<0.7) and a keyword-miss both fall back to
 //! `Conversation`, mirroring 001's "unknown → Conversation fallback".
+//!
+//! The drift record for this module's doc (it previously described the
+//! pre-T169 path) is spec 006 §C7 / D14(c); the coded ladder lives in
+//! `decision/mod.rs::classify_intent`.
 //!
 //! # Functionality
 //! Produces an [`Intent`] (category + ACL + confidence + provenance) used
@@ -14,11 +34,12 @@
 //! Ambiguous requests now reach a model-driven classification instead of a
 //! substring match; every degrade is observable in logs + audit.
 //! # Default behavior
-//! LLM-first, 20s wall-clock cap, `>=0.7` confidence gate.
+//! L1 closed (no τ) ⇒ `classify`: LLM-first, 20s wall-clock cap, `>=0.7`
+//! confidence gate.
 //! # Interaction
 //! `keyword_route` is reused verbatim by `AgentOrchestrator::classify_intent`
 //! for the synchronous `route()` facade; the async [`classify`] is the
-//! execute/execute_stream path.
+//! L2 execute/execute_stream path.
 //!
 //! # Routing scope (eng-review D4, accepted behavior)
 //! The LLM path maps categories to category-default agents

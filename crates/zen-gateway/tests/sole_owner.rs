@@ -111,20 +111,18 @@ async fn rpc(
 #[tokio::test]
 async fn two_clients_cross_visibility_and_sole_owner() {
     unsafe { std::env::set_var("ZEN_SKIP_RLIMIT", "1") };
-    // Restore soft limits that a prior test's ZenWiring may have lowered
-    // to NPROC=50 (soft-only). Without this, thread spawn fails with
-    // EAGAIN on Linux when nextest runs many workers under one UID.
+    // Restore the NOFILE soft cap a prior test's ZenWiring lowered: it is
+    // per-process, and several embedded daemons in one nextest worker exceed
+    // 256 fds with EMFILE.
     #[cfg(unix)]
     unsafe {
-        for resource in [libc::RLIMIT_NOFILE, libc::RLIMIT_NPROC] {
-            let mut rl = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::getrlimit(resource, &mut rl) == 0 {
-                rl.rlim_cur = rl.rlim_max;
-                libc::setrlimit(resource, &rl);
-            }
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            rl.rlim_cur = rl.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
         }
     }
     let tmp = tempfile::tempdir().unwrap();

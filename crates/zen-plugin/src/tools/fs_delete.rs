@@ -79,7 +79,7 @@ impl Tool for FsDeleteTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let path = PathBuf::from(path_str);
+        let path = zen_core::sandbox::resolve_agent_path(path_str);
         self.validator
             .validate_path_for_write(&path)
             .map_err(KernelError::ToolFailed)?;

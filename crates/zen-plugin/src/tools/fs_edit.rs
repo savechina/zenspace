@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -65,35 +64,49 @@ impl Tool for FsEditTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let path_str = args["path"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'path' field".into())
-        })?;
+        let path_str = match args["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(json!({ "error": "Missing or invalid 'path' field" })),
+        };
 
-        let path = PathBuf::from(path_str);
+        let path = zen_core::sandbox::resolve_agent_path(path_str);
         self.validator
             .validate_path_for_write(&path)
             .map_err(KernelError::ToolFailed)?;
 
-        let original = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("Failed to read {}: {}", path_str, e)))?;
+        let original = match tokio::fs::read_to_string(&path).await {
+            Ok(o) => o,
+            Err(e) => return Ok(json!({ "error": format!("Failed to read {}: {}", path_str, e) })),
+        };
 
         let (modified, replacements) = match args.get("diff") {
             Some(diff) => {
-                let diff_str = diff.as_str().ok_or_else(|| {
-                    KernelError::InvalidArgument("'diff' must be a string".into())
-                })?;
-                apply_diff(&original, diff_str).map_err(|e| {
-                    KernelError::ToolFailed(format!("Failed to apply diff to {}: {}", path_str, e))
-                })?
+                let diff_str = match diff.as_str() {
+                    Some(s) => s,
+                    None => return Ok(json!({ "error": "'diff' must be a string" })),
+                };
+                match apply_diff(&original, diff_str) {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        return Ok(json!({
+                            "error": format!("Failed to apply diff to {}: {}", path_str, e)
+                        }));
+                    }
+                }
             }
             None => {
-                let old_text = args["old_text"].as_str().ok_or_else(|| {
-                    KernelError::InvalidArgument("Missing or invalid 'old_text' field".into())
-                })?;
-                let new_text = args["new_text"].as_str().ok_or_else(|| {
-                    KernelError::InvalidArgument("Missing or invalid 'new_text' field".into())
-                })?;
+                let old_text = match args["old_text"].as_str() {
+                    Some(t) => t,
+                    None => {
+                        return Ok(json!({ "error": "Missing or invalid 'old_text' field" }));
+                    }
+                };
+                let new_text = match args["new_text"].as_str() {
+                    Some(t) => t,
+                    None => {
+                        return Ok(json!({ "error": "Missing or invalid 'new_text' field" }));
+                    }
+                };
                 let replace_all = args
                     .get("replace_all")
                     .and_then(|v| v.as_bool())
@@ -101,16 +114,15 @@ impl Tool for FsEditTool {
 
                 let count = original.matches(old_text).count();
                 if count == 0 {
-                    return Err(KernelError::ToolFailed(format!(
-                        "old_text not found in {}",
-                        path_str
-                    )));
+                    return Ok(json!({ "error": format!("old_text not found in {}", path_str) }));
                 }
                 if count > 1 && !replace_all {
-                    return Err(KernelError::ToolFailed(format!(
-                        "old_text appears {} times in {} (use replace_all=true)",
-                        count, path_str
-                    )));
+                    return Ok(json!({
+                        "error": format!(
+                            "old_text appears {} times in {} (use replace_all=true)",
+                            count, path_str
+                        )
+                    }));
                 }
 
                 let modified = if replace_all {
@@ -123,8 +135,9 @@ impl Tool for FsEditTool {
             }
         };
 
-        std::str::from_utf8(modified.as_bytes())
-            .map_err(|_| KernelError::ToolFailed("Result is not valid UTF-8".into()))?;
+        if std::str::from_utf8(modified.as_bytes()).is_err() {
+            return Ok(json!({ "error": "Result is not valid UTF-8" }));
+        }
 
         let backup_path = path.with_extension(format!(
             "{}.bak",
@@ -133,9 +146,9 @@ impl Tool for FsEditTool {
         // FR-040: guard the backup so a failure later in the sequence (temp
         // write, rename) removes the stale .bak instead of leaving it behind.
         let mut backup_guard = TempfileDropGuard::new(&backup_path);
-        tokio::fs::copy(&path, &backup_path)
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("Failed to create backup: {}", e)))?;
+        if let Err(e) = tokio::fs::copy(&path, &backup_path).await {
+            return Ok(json!({ "error": format!("Failed to create backup: {}", e) }));
+        }
 
         let temp_path = path.with_extension(format!(
             "{}.tmp",
@@ -147,20 +160,23 @@ impl Tool for FsEditTool {
         let mut temp_guard = TempfileDropGuard::new(&temp_path);
 
         {
-            let mut temp_file = std::fs::File::create(&temp_path).map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to create temp file: {}", e))
-            })?;
-            temp_file.write_all(modified.as_bytes()).map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to write temp file: {}", e))
-            })?;
-            temp_file
-                .sync_all()
-                .map_err(|e| KernelError::ToolFailed(format!("Failed to sync temp file: {}", e)))?;
+            let mut temp_file = match std::fs::File::create(&temp_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Ok(json!({ "error": format!("Failed to create temp file: {}", e) }));
+                }
+            };
+            if let Err(e) = temp_file.write_all(modified.as_bytes()) {
+                return Ok(json!({ "error": format!("Failed to write temp file: {}", e) }));
+            }
+            if let Err(e) = temp_file.sync_all() {
+                return Ok(json!({ "error": format!("Failed to sync temp file: {}", e) }));
+            }
         }
 
-        std::fs::rename(&temp_path, &path).map_err(|e| {
-            KernelError::ToolFailed(format!("Failed to atomically replace file: {}", e))
-        })?;
+        if let Err(e) = std::fs::rename(&temp_path, &path) {
+            return Ok(json!({ "error": format!("Failed to atomically replace file: {}", e) }));
+        }
 
         // Edit fully succeeded: the temp file has been renamed into place and
         // the .bak backup is intentionally retained (returned to the caller).
@@ -284,12 +300,18 @@ mod tests {
         let file = dir.path().join("note.md");
         std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
         let tool = FsEditTool::new(make_validator(dir.path()));
-        // Patch parses but does not apply → ToolFailed after reading the file.
+        // Patch parses but does not apply → structured error after reading the file.
         let args = json!({
             "path": file.to_string_lossy(),
             "diff": "@@ -1 +1 @@\n-b\n+c\n",
         });
-        assert!(block_on(tool.invoke(args)).is_err());
+        let res = block_on(tool.invoke(args)).unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Failed to apply diff")),
+            "expected structured diff error, got: {res}"
+        );
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -318,7 +340,13 @@ mod tests {
             "old_text": "world",
             "new_text": "rust",
         });
-        assert!(block_on(tool.invoke(args)).is_err());
+        let res = block_on(tool.invoke(args)).unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Failed to create temp file")),
+            "expected structured temp-file error, got: {res}"
+        );
         assert!(
             !dir.path().join("note.md.bak").exists(),
             "stale .bak must be removed by the backup guard"

@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -56,16 +55,18 @@ impl Tool for FsMoveTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let source_str = args["source"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'source' field".into())
-        })?;
+        let source_str = match args["source"].as_str() {
+            Some(s) => s,
+            None => return Ok(json!({ "error": "Missing or invalid 'source' field" })),
+        };
 
-        let dest_str = args["destination"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'destination' field".into())
-        })?;
+        let dest_str = match args["destination"].as_str() {
+            Some(d) => d,
+            None => return Ok(json!({ "error": "Missing or invalid 'destination' field" })),
+        };
 
-        let source = PathBuf::from(source_str);
-        let dest = PathBuf::from(dest_str);
+        let source = zen_core::sandbox::resolve_agent_path(source_str);
+        let dest = zen_core::sandbox::resolve_agent_path(dest_str);
 
         self.validator
             .validate_path_for_read(&source)
@@ -77,20 +78,54 @@ impl Tool for FsMoveTool {
             .validate_path_for_write(&dest)
             .map_err(KernelError::ToolFailed)?;
 
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to create parent dir: {}", e))
-            })?;
+        if let Some(parent) = dest.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            return Ok(json!({ "error": format!("Failed to create parent dir: {}", e) }));
         }
 
-        tokio::fs::rename(&source, &dest)
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("Failed to move: {}", e)))?;
+        if let Err(e) = tokio::fs::rename(&source, &dest).await {
+            return Ok(json!({ "error": format!("Failed to move: {}", e) }));
+        }
 
         Ok(json!({
             "source": source_str,
             "destination": dest_str,
             "moved": true
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_validator(dir: &std::path::Path) -> SandboxValidator {
+        SandboxValidator::new(
+            zen_core::sandbox::SandboxMode::WorkspaceWrite,
+            vec![dir.to_path_buf()],
+        )
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn missing_source_returns_structured_error() {
+        let dir = tempdir().unwrap();
+        let tool = FsMoveTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({
+            "source": dir.path().join("does-not-exist.txt").to_string_lossy(),
+            "destination": dir.path().join("out.txt").to_string_lossy()
+        })))
+        .unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Failed to move")),
+            "expected structured error, got: {res}"
+        );
     }
 }

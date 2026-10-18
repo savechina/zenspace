@@ -1033,6 +1033,171 @@ pub async fn run_intent_shadow(
     append_decision_audit(paths, &entry);
 }
 
+// ---------------------------------------------------------------------------
+// W3 — calibration-queue shadow observers (D13; shadow-only, V13-A.3)
+// ---------------------------------------------------------------------------
+//
+// Three observers that enter the T173 decision-audit queue (spec D13). Each
+// emits one `loop.decision` line with `rung:"shadow"` and a distinct
+// `decision_kind`, and each is a PURE OBSERVER: it never gates, routes,
+// escalates, or mutates any production state. They exist to accrue
+// (prediction, actual-outcome) pairs for a future calibrated threshold — there
+// is NO threshold here, and `thresholds.json` is never consulted.
+
+/// The `rung` value every W3 shadow observer writes. Distinct from the ladder
+/// rungs `L0`/`L1`/`L2`, so a consumer can exclude shadow observations with one
+/// comparison. Shadow lines deliberately do NOT carry an `agree` field, which
+/// is what `zen-vault`'s intent-shadow baseline keys on.
+pub const SHADOW_RUNG: &str = "shadow";
+
+/// Boundary above which the W3.1 heuristic score is recorded as predicting
+/// escalation, and below which the W3.2 posterior mean predicts escalation.
+/// DOCUMENTED AS A HEURISTIC, NOT CALIBRATED — V13-A.3 forbids inventing τ, so
+/// this only labels an observation for future calibration; it gates nothing.
+pub const SHADOW_HEURISTIC_BOUNDARY: f32 = 0.5;
+
+/// W3.1 input: the shape of a completed sub-turn result. Deliberately minimal
+/// (no model call) so the observer adds no latency to the turn it observes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualitySignal {
+    /// The result carried a structured `error` key (failure shape).
+    pub has_error: bool,
+    /// Characters in the response/deliverable.
+    pub response_chars: usize,
+}
+
+/// W3.1 pure heuristic (QE cascade, arXiv:2606.27457): a deterministic,
+/// uncalibrated score in `0.0..=1.0` from the result shape alone — a failure
+/// flag plus response-length bands. It is NOT a confidence gate; it exists so
+/// the future threshold has `(score, actual-outcome)` pairs to calibrate on.
+pub fn estimate_quality_escalation(signal: &QualitySignal) -> f32 {
+    if signal.has_error {
+        0.9
+    } else if signal.response_chars == 0 {
+        0.85
+    } else if signal.response_chars < 40 {
+        0.7
+    } else if signal.response_chars < 200 {
+        0.4
+    } else {
+        0.15
+    }
+}
+
+/// Common `loop.decision` envelope for every W3 shadow observation.
+fn shadow_entry(decision_kind: &str, session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "loop.decision",
+        "decision": "shadow",
+        "decision_kind": decision_kind,
+        "rung": SHADOW_RUNG,
+        "session_id": session_id,
+        "calibrated": false,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// W3.1 QE-cascade observer. Predicts — from a cheap local heuristic, never a
+/// model call — whether the completed sub-turn would warrant escalation, and
+/// records the prediction against the actual outcome when the caller has it.
+/// Appends one `loop.decision` line (`decision_kind` `"qe_cascade"`). The
+/// observer returns nothing and cannot change the observed result.
+pub fn run_qe_cascade_shadow(
+    paths: &ZenPaths,
+    session_id: &str,
+    signal: &QualitySignal,
+    actual_escalated: Option<bool>,
+) {
+    let score = estimate_quality_escalation(signal);
+    let predicted = score >= SHADOW_HEURISTIC_BOUNDARY;
+    let mut entry = shadow_entry("qe_cascade", session_id);
+    entry["heuristic"] = serde_json::json!(true);
+    entry["score"] = serde_json::json!(audit_score(score));
+    entry["confidence"] = serde_json::json!(audit_score(score));
+    entry["has_error"] = serde_json::json!(signal.has_error);
+    entry["response_chars"] = serde_json::json!(signal.response_chars);
+    entry["predicted_escalate"] = serde_json::json!(predicted);
+    entry["choice"] = serde_json::json!(if predicted { "escalate" } else { "keep" });
+    if let Some(actual) = actual_escalated {
+        entry["actual_escalated"] = serde_json::json!(actual);
+        entry["agrees_with_actual"] = serde_json::json!(predicted == actual);
+    }
+    append_decision_audit(paths, &entry);
+}
+
+/// W3.2 Bayesian self-escalation observer (arXiv:2608.24087). Shadow-compares
+/// a competence posterior ([`zen_vault::distill::decision_audit::CompetenceStatistics`],
+/// computed offline) against the production routing decision, and appends one
+/// `loop.decision` line (`decision_kind` `"bayesian_escalation"`). Applies no
+/// threshold and never re-routes: the production `rung` it reports is an input,
+/// not something this observer influences.
+pub fn run_bayesian_escalation_shadow(
+    paths: &ZenPaths,
+    session_id: &str,
+    stats: &zen_vault::distill::decision_audit::CompetenceStatistics,
+    production_rung: &str,
+    production_escalated: bool,
+) {
+    let predicted = (stats.mean as f32) < SHADOW_HEURISTIC_BOUNDARY;
+    let mut entry = shadow_entry("bayesian_escalation", session_id);
+    entry["heuristic"] = serde_json::json!(true);
+    entry["labeled"] = serde_json::json!(stats.labeled);
+    entry["successes"] = serde_json::json!(stats.successes);
+    entry["failures"] = serde_json::json!(stats.failures);
+    entry["alpha"] = serde_json::json!(stats.alpha);
+    entry["beta"] = serde_json::json!(stats.beta);
+    entry["posterior_mean"] = serde_json::json!(audit_score(stats.mean as f32));
+    entry["confidence"] = serde_json::json!(audit_score(stats.mean as f32));
+    entry["predicted_escalate"] = serde_json::json!(predicted);
+    entry["choice"] = serde_json::json!(if predicted { "escalate" } else { "keep" });
+    entry["production_rung"] = serde_json::json!(production_rung);
+    entry["production_escalated"] = serde_json::json!(production_escalated);
+    entry["agrees_with_actual"] = serde_json::json!(predicted == production_escalated);
+    append_decision_audit(paths, &entry);
+}
+
+/// Runtime read for the W3.2 observer: load the labeled dataset at the global
+/// logs dir and compute the `intent`/`L1` competence posterior. This is the
+/// seam that joins the OFFLINE statistics ([`competence_statistics`]) to the
+/// runtime comparison above. Fail-open — a missing or unreadable dataset
+/// yields the honest unlabeled prior (`labeled = 0`, `mean = 0.5`), never an
+/// error, so a fresh install observes without effect. Callers should compute
+/// this offline and cache it rather than reloading per turn.
+///
+/// [`competence_statistics`]: zen_vault::distill::decision_audit::competence_statistics
+pub fn load_intent_l1_competence(
+    paths: &ZenPaths,
+) -> zen_vault::distill::decision_audit::CompetenceStatistics {
+    use zen_vault::distill::decision_audit::{competence_statistics, load_dataset};
+    let records = load_dataset(&paths.logs()).unwrap_or_default();
+    competence_statistics(&records, "intent", "L1")
+}
+
+/// W3.3 Minority Sentinel observer (arXiv:2606.29270). Dormant until any
+/// quorum / N-version set exists: with `quorum == 0` it records ONE
+/// `dormant: true, reason: "no_quorum"` line per process, then stops. It runs
+/// no detector and never overturns a decision.
+pub fn run_minority_sentinel_shadow(paths: &ZenPaths, session_id: &str, quorum: usize) {
+    use std::sync::atomic::Ordering;
+    static DORMANT_OBSERVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if quorum == 0 {
+        if DORMANT_OBSERVED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut entry = shadow_entry("minority_sentinel", session_id);
+        entry["dormant"] = serde_json::json!(true);
+        entry["reason"] = serde_json::json!("no_quorum");
+        entry["quorum"] = serde_json::json!(0);
+        append_decision_audit(paths, &entry);
+        return;
+    }
+    let mut entry = shadow_entry("minority_sentinel", session_id);
+    entry["dormant"] = serde_json::json!(false);
+    entry["quorum"] = serde_json::json!(quorum);
+    append_decision_audit(paths, &entry);
+}
+
 /// Map the production intent's provenance onto the ladder rung that produced
 /// it. The Conversation fallback is deterministic Rust, so it counts as L0.
 fn production_rung(source: IntentSource) -> &'static str {
@@ -1780,5 +1945,48 @@ mod tests {
     fn binary_decision_as_str_roundtrips() {
         assert_eq!(BinaryDecision::Correction.as_str(), "correction");
         assert_eq!(BinaryDecision::Citation.as_str(), "citation");
+    }
+
+    /// Runtime-safety pin for the L1 availability gate. The free helper
+    /// `zen_provider::is_local_llm_available` dispatches through
+    /// `&dyn LlmRouter`; `DefaultRouter` now overrides that trait method to
+    /// delegate to its inherent probe (`provider_instance("ollama")` +
+    /// dedicated-threaded `health_check`), so these async rungs really probe.
+    /// This test pins the in-runtime abstain contract: an unreachable local
+    /// LLM yields `false` and the rung abstains (Ok(None)) without hitting
+    /// the nested-runtime panic the blocking health check would cause if it
+    /// ran on the async thread. Port 1 on loopback is unassigned:
+    /// connection-refused is immediate and deterministic, and the provider
+    /// pins `no_proxy` for loopback so a machine-level proxy cannot
+    /// intercept (T217 lesson).
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_rung_probes_inside_runtime_abstain_without_panic() {
+        let router = DefaultRouter::from_agentic(&zen_core::config::ZenConfig {
+            default_provider: Some("ollama".to_string()),
+            providers: std::collections::HashMap::from([(
+                "ollama".to_string(),
+                zen_core::config::ProviderConfig {
+                    provider_type: Some("ollama".to_string()),
+                    base_url: Some("http://127.0.0.1:1".to_string()),
+                    default_model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+
+        let binary = LocalBinaryClassifier::new(&router, BinaryDecision::Correction);
+        let outcome = binary.decide("不对，应该是 300").await;
+        assert!(
+            matches!(outcome, Ok(None)),
+            "unreachable local LLM ⇒ abstain (Ok(None)), got {outcome:?}"
+        );
+
+        let intent = LocalClassifierRung::new(&router);
+        let outcome = intent.decide("research the zen architecture").await;
+        assert!(
+            matches!(outcome, Ok(None)),
+            "unreachable local LLM ⇒ abstain (Ok(None)), got {outcome:?}"
+        );
     }
 }

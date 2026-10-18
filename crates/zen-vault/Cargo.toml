@@ -44,3 +44,8 @@ tokio = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
+divan = { workspace = true }
+
+[[bench]]
+name = "search_rrf"
+harness = false

@@ -610,22 +610,22 @@ pub struct WorkerSummary {
 ///
 /// | Profile | Host | Workers | Rationale |
 /// |---------|------|---------|-----------|
-/// | `Full` | `zen serve start` daemon | All 17 | Daemon is the sole owner of the memvid store and the morning-brief outbox — needs every worker. |
-/// | `InApp` | TUI session (in-process) | 15 (excludes `memvid-indexer`, `morning-brief`) | The memvid indexer requires exclusive file-system flock held by the daemon; morning-brief stages to an outbox consumed by the daemon's `OutboxDrainer`. Running either in the TUI would race the daemon. |
+/// | `Full` | `zen serve start` daemon | All 18 | Daemon is the sole owner of the memvid store and the morning-brief outbox — needs every worker. |
+/// | `InApp` | TUI session (in-process) | 16 (excludes `memvid-indexer`, `morning-brief`) | The memvid indexer requires exclusive file-system flock held by the daemon; morning-brief stages to an outbox consumed by the daemon's `OutboxDrainer`. Running either in the TUI would race the daemon. |
 ///
 /// Both profiles share identical cron schedules (from `CronConfig`), timezone
 /// wiring (`with_timezone`), and per-worker config gates (e.g.
 /// `[agentic.loop].enabled` for `zen-loop`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SchedulerProfile {
-    /// Full daemon profile — all 17 background workers.
+    /// Full daemon profile — all 18 background workers.
     ///
     /// Used by `zen serve start` where the process is the sole long-lived
     /// owner of shared resources (memvid store, outbox drainer, git
     /// work-tree).
     Full,
 
-    /// In-app learning-core profile — 15 workers, excluding
+    /// In-app learning-core profile — 16 workers, excluding
     /// `memvid-indexer` and `morning-brief`.
     ///
     /// Used by the TUI when hosting a lightweight in-process scheduler for
@@ -658,6 +658,7 @@ pub enum SchedulerProfile {
 /// - `memvid-indexer` (MemvidIndexerWorker): runs nightly 1AM (cron: `0 0 1 * * *`), ingests journal, wiki, wisdom into memvid store
 /// - `evidence-gatherer` (EvidenceGatherer): runs weekly Mon 6AM (cron: `0 0 6 * * 1`), scans beliefs with low evidence count, generates research suggestions
 /// - `retention` (RetentionWorker): runs daily 3:30AM (cron: `0 30 3 * * *`), bounded-retention sweep over the append-only filesystem homes
+/// - `embedding-refresher` (EmbeddingRefresherWorker): runs every 30 minutes (cron: `0 */30 * * * *`), re-embeds stale vec0 vectors incrementally (the embedding-enabled companion to the zen-loop's dirty-only reindex)
 pub fn create_default_scheduler() -> ZenScheduler {
     // Utc on purpose: this constructor never loads config (dormant-safe
     // set). The production serve/TUI path uses create_configured_scheduler,
@@ -720,6 +721,9 @@ pub fn create_default_scheduler() -> ZenScheduler {
     }
     if let Err(e) = scheduler.register(RetentionWorker::new()) {
         warn!("scheduler: failed to register retention worker (non-critical): {e}");
+    }
+    if let Err(e) = scheduler.register(EmbeddingRefresherWorker::new()) {
+        warn!("scheduler: failed to register embedding-refresher worker (non-critical): {e}");
     }
 
     // Knowledge-processing loop: the default scheduler enables zen-loop with
@@ -843,6 +847,13 @@ pub fn create_configured_scheduler_with(
         warn!("scheduler: failed to register retention worker (non-critical): {e}");
     }
 
+    // Both profiles: the embedding refresher consumes the same
+    // `embedded_hash` marker the zen-loop marks dirty; the cross-process
+    // scheduler lease guarantees exactly one host runs the refresh.
+    if let Err(e) = scheduler.register(EmbeddingRefresherWorker::new()) {
+        warn!("scheduler: failed to register embedding-refresher worker (non-critical): {e}");
+    }
+
     // Knowledge-processing loop: interval + enabled come from
     // [agentic.loop]; disabled → manual-only (`zen wiki loop run`).
     if let Ok(config) = zen_core::config::load_config() {
@@ -862,7 +873,7 @@ pub fn create_configured_scheduler_with(
 /// Create a [`ZenScheduler`] wired with `CronConfig` values for worker schedules.
 ///
 /// Convenience wrapper around [`create_configured_scheduler_with`] with
-/// [`SchedulerProfile::Full`] — all 17 workers registered. Existing call
+/// [`SchedulerProfile::Full`] — all 18 workers registered. Existing call
 /// sites (TUI, serve command) use this entry point.
 pub fn create_configured_scheduler(config: &CronConfig) -> ZenScheduler {
     create_configured_scheduler_with(config, SchedulerProfile::Full)
@@ -1222,7 +1233,7 @@ mod tests {
     fn test_create_default_scheduler() {
         let scheduler = create_default_scheduler();
         let items = scheduler.list();
-        assert_eq!(items.len(), 17);
+        assert_eq!(items.len(), 18);
         assert!(items.iter().any(|w| w.id == "memory-curator"));
         assert!(items.iter().any(|w| w.id == "dream"));
         assert!(items.iter().any(|w| w.id == "subconscious"));
@@ -1239,16 +1250,17 @@ mod tests {
         assert!(items.iter().any(|w| w.id == "morning-brief"));
         assert!(items.iter().any(|w| w.id == "promotion"));
         assert!(items.iter().any(|w| w.id == "retention"));
+        assert!(items.iter().any(|w| w.id == "embedding-refresher"));
         assert!(items.iter().any(|w| w.id == "zen-loop"));
     }
 
     #[test]
     fn test_create_configured_scheduler_core_workers() {
         // zen-loop is config-gated (enabled flag via load_config), so only
-        // the 16 core workers are asserted unconditionally.
+        // the 17 core workers are asserted unconditionally.
         let scheduler = create_configured_scheduler(&CronConfig::default());
         let items = scheduler.list();
-        assert!(items.len() >= 16);
+        assert!(items.len() >= 17);
         for id in [
             "memory-curator",
             "dream",
@@ -1266,6 +1278,7 @@ mod tests {
             "morning-brief",
             "promotion",
             "retention",
+            "embedding-refresher",
         ] {
             assert!(
                 items.iter().any(|w| w.id == id),
@@ -1294,6 +1307,7 @@ mod tests {
         "morning-brief",
         "promotion",
         "retention",
+        "embedding-refresher",
         "zen-loop",
     ];
 
@@ -1312,15 +1326,16 @@ mod tests {
         "evidence-gatherer",
         "promotion",
         "retention",
+        "embedding-refresher",
         "zen-loop",
     ];
 
     #[test]
-    fn test_full_profile_has_all_17_workers() {
+    fn test_full_profile_has_all_18_workers() {
         let scheduler =
             create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::Full);
         let ids = scheduler.worker_ids();
-        assert_eq!(ids.len(), 17, "Full profile must register 17 workers");
+        assert_eq!(ids.len(), 18, "Full profile must register 18 workers");
         for expected in FULL_WORKERS {
             assert!(
                 ids.contains(&expected.to_string()),
@@ -1330,20 +1345,20 @@ mod tests {
     }
 
     #[test]
-    fn test_inapp_profile_has_15_workers() {
+    fn test_inapp_profile_has_16_workers() {
         let scheduler =
             create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::InApp);
         let ids = scheduler.worker_ids();
 
-        // Exactly 15 workers (zen-loop may or may not register depending on
-        // load_config; assert >= 15 to handle the config-gated edge).
+        // Exactly 16 workers (zen-loop may or may not register depending on
+        // load_config; assert >= 16 to handle the config-gated edge).
         assert!(
-            ids.len() >= 15,
-            "InApp profile must register at least 15 workers, got {}",
+            ids.len() >= 16,
+            "InApp profile must register at least 16 workers, got {}",
             ids.len()
         );
 
-        // Inclusion: all 15 expected workers present.
+        // Inclusion: all 16 expected workers present.
         for expected in INAPP_WORKERS {
             assert!(
                 ids.contains(&expected.to_string()),

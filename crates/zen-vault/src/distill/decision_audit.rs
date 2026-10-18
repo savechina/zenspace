@@ -543,6 +543,85 @@ fn accuracy(pairs: &[(f64, bool)]) -> f64 {
     pairs.iter().filter(|(_, correct)| *correct).count() as f64 / pairs.len() as f64
 }
 
+// ---------------------------------------------------------------------------
+// W3.2 — competence posterior sufficient statistics (D13, arXiv:2608.24087)
+// ---------------------------------------------------------------------------
+
+/// Beta-Bernoulli competence posterior sufficient statistics for one
+/// `(kind, rung)` cell of the labeled dataset.
+///
+/// This is the **offline** half of the W3.2 Bayesian self-escalation observer
+/// (spec D13): the runtime observer
+/// (`zen_agents::decision::run_bayesian_escalation_shadow`) shadow-compares a
+/// competence posterior against the production routing decision, and the
+/// statistics themselves are a PURE function of the labeled trajectories —
+/// computed on demand, stored nowhere, and gating nothing.
+///
+/// `alpha`/`beta` carry a uniform `Beta(1, 1)` prior so an unlabeled cell is
+/// the honest "no information" mean of `0.5` rather than a `0 / 0` division.
+/// The prior is a modelling choice with no activation semantics (V13-A.3): no
+/// threshold is derived here, and `thresholds.json` is never consulted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompetenceStatistics {
+    /// Decision kind the sample came from (e.g. `"intent"`).
+    pub kind: String,
+    /// Rung the sample came from (e.g. `"L1"`).
+    pub rung: String,
+    /// Labeled records in the cell. Records without a label are excluded — an
+    /// unlabeled decision carries no correctness signal.
+    pub labeled: usize,
+    /// Labeled records whose recorded decision matched the label.
+    pub successes: usize,
+    /// Labeled records whose recorded decision disagreed with the label.
+    pub failures: usize,
+    /// Posterior `alpha` = `successes + 1` (uniform prior).
+    pub alpha: f64,
+    /// Posterior `beta` = `failures + 1` (uniform prior).
+    pub beta: f64,
+    /// Posterior mean `alpha / (alpha + beta)`.
+    pub mean: f64,
+}
+
+/// Compute the competence posterior sufficient statistics for one
+/// `(kind, rung)` cell.
+///
+/// Purely derived from `records`: the same input yields the same statistics,
+/// and an empty or mismatched cell yields the unlabeled prior
+/// (`alpha = beta = 1`, `mean = 0.5`, `labeled = 0`). Correctness is the same
+/// label-vs-recorded-decision comparison the calibration metrics use
+/// ([`is_correct`]), so a posterior and a Brier score over the same cell can
+/// never disagree about which records were correct.
+pub fn competence_statistics(
+    records: &[DecisionRecord],
+    kind: &str,
+    rung: &str,
+) -> CompetenceStatistics {
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    for record in records {
+        if record.kind != kind || record.rung != rung {
+            continue;
+        }
+        match is_correct(record) {
+            Some(true) => successes += 1,
+            Some(false) => failures += 1,
+            None => {}
+        }
+    }
+    let alpha = successes as f64 + 1.0;
+    let beta = failures as f64 + 1.0;
+    CompetenceStatistics {
+        kind: kind.to_string(),
+        rung: rung.to_string(),
+        labeled: successes + failures,
+        successes,
+        failures,
+        alpha,
+        beta,
+        mean: alpha / (alpha + beta),
+    }
+}
+
 fn drift_for_kinds(records: &[DecisionRecord]) -> Vec<KindDrift> {
     let now = Utc::now();
     let recent_start = now - Duration::days(DRIFT_WINDOW_DAYS);

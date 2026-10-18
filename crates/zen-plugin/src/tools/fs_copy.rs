@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -58,21 +57,23 @@ impl Tool for FsCopyTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let source_str = args["source"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'source' field".into())
-        })?;
+        let source_str = match args["source"].as_str() {
+            Some(s) => s,
+            None => return Ok(json!({ "error": "Missing or invalid 'source' field" })),
+        };
 
-        let dest_str = args["destination"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'destination' field".into())
-        })?;
+        let dest_str = match args["destination"].as_str() {
+            Some(d) => d,
+            None => return Ok(json!({ "error": "Missing or invalid 'destination' field" })),
+        };
 
         let overwrite = args
             .get("overwrite")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let source = PathBuf::from(source_str);
-        let dest = PathBuf::from(dest_str);
+        let source = zen_core::sandbox::resolve_agent_path(source_str);
+        let dest = zen_core::sandbox::resolve_agent_path(dest_str);
 
         self.validator
             .validate_path_for_read(&source)
@@ -82,21 +83,24 @@ impl Tool for FsCopyTool {
             .map_err(KernelError::ToolFailed)?;
 
         if dest.exists() && !overwrite {
-            return Err(KernelError::InvalidArgument(format!(
-                "Destination {} already exists (use overwrite=true)",
-                dest_str
-            )));
+            return Ok(json!({
+                "error": format!(
+                    "Destination {} already exists (use overwrite=true)",
+                    dest_str
+                )
+            }));
         }
 
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to create parent dir: {}", e))
-            })?;
+        if let Some(parent) = dest.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            return Ok(json!({ "error": format!("Failed to create parent dir: {}", e) }));
         }
 
-        let bytes = tokio::fs::copy(&source, &dest)
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("Failed to copy: {}", e)))?;
+        let bytes = match tokio::fs::copy(&source, &dest).await {
+            Ok(b) => b,
+            Err(e) => return Ok(json!({ "error": format!("Failed to copy: {}", e) })),
+        };
 
         Ok(json!({
             "source": source_str,
@@ -104,5 +108,41 @@ impl Tool for FsCopyTool {
             "copied": true,
             "bytes_copied": bytes
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_validator(dir: &std::path::Path) -> SandboxValidator {
+        SandboxValidator::new(
+            zen_core::sandbox::SandboxMode::WorkspaceWrite,
+            vec![dir.to_path_buf()],
+        )
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn existing_destination_returns_structured_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("src.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("dst.txt"), "b").unwrap();
+        let tool = FsCopyTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({
+            "source": dir.path().join("src.txt").to_string_lossy(),
+            "destination": dir.path().join("dst.txt").to_string_lossy()
+        })))
+        .unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("already exists")),
+            "expected structured error, got: {res}"
+        );
     }
 }

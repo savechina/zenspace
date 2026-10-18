@@ -12,6 +12,13 @@
 //! plan-completion signal. Downstream tasks of a failed/skipped node are
 //! skipped, never run against stale inputs. One `loop.plan.completed`
 //! audit line lands in `<logs>/audit.jsonl` per plan.
+//!
+//! W2.1 (D11): each task carries an optional `on_failure` transition. The
+//! default `skip` is the behavior above (byte-identical). `retry` re-queues
+//! ONLY the failed node once — verified siblings keep their checkpoints, so
+//! repair is localized to the failed node's minimal subgraph (ATG); `halt`
+//! stops the layer chain. A failed plan also persists a W2.2 rewind memory
+//! (see [`record_plan_rewind`]).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +42,33 @@ pub const MAX_PLAN_TASKS: usize = 12;
 /// itself be delegated (and hits the delegate depth matrix anyway).
 pub const MAX_PLAN_LAYERS: usize = 3;
 
+/// W2.1 (D11): failure-transition edge for one plan node (GraphPlan,
+/// ESWA). `Skip` is the pre-W2 behavior and the default, so a plan without
+/// `on_failure` is byte-identical to before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAction {
+    /// Downstream dependents are skipped; the plan continues. Default.
+    Skip,
+    /// Re-queue THIS task exactly once; verified siblings keep their
+    /// checkpoints (minimal-subgraph repair).
+    Retry,
+    /// Stop the layer chain: no further layers run.
+    Halt,
+}
+
+impl FailureAction {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "skip" => Ok(Self::Skip),
+            "retry" => Ok(Self::Retry),
+            "halt" => Ok(Self::Halt),
+            other => Err(format!(
+                "invalid on_failure `{other}` (expected retry|skip|halt)"
+            )),
+        }
+    }
+}
+
 /// One node of the model-drafted DAG.
 #[derive(Debug, Clone)]
 pub struct PlanTaskSpec {
@@ -42,6 +76,10 @@ pub struct PlanTaskSpec {
     pub agent: String,
     pub prompt: String,
     pub depends_on: Vec<String>,
+    /// W2.1 (D11): failure-transition edge (default [`FailureAction::Skip`]).
+    pub on_failure: FailureAction,
+    /// W2.2 (D12): optional sandbox-validated artifact output path.
+    pub artifact: Option<String>,
 }
 
 /// The full plan as parsed from tool args.
@@ -64,6 +102,10 @@ pub struct PlanExecuteTool {
     max_concurrent: u32,
     state_db: Option<std::path::PathBuf>,
     db: std::sync::OnceLock<Option<Arc<zen_repo::SqliteClient>>>,
+    #[cfg(test)]
+    test_failures: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    #[cfg(test)]
+    test_calls: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl PlanExecuteTool {
@@ -79,7 +121,54 @@ impl PlanExecuteTool {
             max_concurrent: max_concurrent.clamp(1, 8),
             state_db,
             db: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            test_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            test_calls: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Test seam (W2.1): make the next `times` runs of `agent` fail before a
+    /// real sub-turn runs, so the retry edge can be exercised deterministically
+    /// (the mock provider never fails). Compiled only for unit tests.
+    #[cfg(test)]
+    pub(crate) fn inject_test_failure(&self, agent: &str, times: u32) {
+        self.test_failures
+            .lock()
+            .unwrap()
+            .insert(agent.to_string(), times);
+    }
+
+    #[cfg(test)]
+    fn test_take_failure(&self, agent: &str) -> bool {
+        let mut failures = self.test_failures.lock().unwrap();
+        match failures.get_mut(agent) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_note_call(&self, agent: &str) {
+        *self
+            .test_calls
+            .lock()
+            .unwrap()
+            .entry(agent.to_string())
+            .or_insert(0) += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_call_count(&self, agent: &str) -> u32 {
+        self.test_calls
+            .lock()
+            .unwrap()
+            .get(agent)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Lazily open state.db once per tool lifetime; `None` disables
@@ -139,6 +228,8 @@ impl PlanExecuteTool {
                 agent: agent.to_string(),
                 prompt: prompt.to_string(),
                 depends_on,
+                on_failure: parse_failure_action(item, id)?,
+                artifact: parse_artifact(item, id)?,
             });
         }
         // Unique ids + dependencies that actually exist.
@@ -255,6 +346,32 @@ impl PlanExecuteTool {
 
 const UPSTREAM_SNIPPET_MAX_CHARS: usize = 4000;
 
+/// Parse a task's optional `on_failure` (absent/null ⇒ [`FailureAction::Skip`).
+fn parse_failure_action(item: &serde_json::Value, id: &str) -> Result<FailureAction, String> {
+    match item.get("on_failure") {
+        None | Some(serde_json::Value::Null) => Ok(FailureAction::Skip),
+        Some(serde_json::Value::String(value)) => {
+            FailureAction::parse(value).map_err(|e| format!("task `{id}` has {e}"))
+        }
+        Some(_) => Err(format!("task `{id}` has a non-string `on_failure`")),
+    }
+}
+
+/// Parse a task's optional artifact output path (absent/null ⇒ `None`;
+/// present ⇒ non-empty).
+fn parse_artifact(item: &serde_json::Value, id: &str) -> Result<Option<String>, String> {
+    match item.get("artifact") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.clone()))
+        }
+        Some(serde_json::Value::String(_)) => {
+            Err(format!("task `{id}` has an empty `artifact` path"))
+        }
+        Some(_) => Err(format!("task `{id}` has a non-string `artifact` path")),
+    }
+}
+
 /// Extract the human-readable answer from a `run_single` outcome value —
 /// the success payload carries the sub-agent answer in `response`; any
 /// other shape falls back to the JSON itself.
@@ -285,6 +402,42 @@ fn compose_task_prompt(base: &str, upstream: &[(String, String)]) -> String {
         prompt.push_str(&format!("\n\n### upstream task `{id}` output\n{snippet}"));
     }
     prompt
+}
+
+/// W2.2 (D12): persist a rewind memory for a failed plan at the
+/// `vault/wiki/wisdom/rewinds/` boundary (reuses the reflection helper
+/// shape). The first failed task's error is the falsifier; the next attempt
+/// reads the guidance instead of repeating the failure. `None` when no
+/// `ZenPaths` is available or the first failure carries no error.
+fn record_plan_rewind(
+    plan: &PlanSpec,
+    outcomes: &[Option<TaskOutcome>],
+) -> Option<std::path::PathBuf> {
+    let paths = zen_core::paths::ZenPaths::detect().ok()?;
+    let rewinds = paths.wiki().join("wisdom/rewinds");
+    let (task_id, error) = plan.tasks.iter().enumerate().find_map(|(i, t)| {
+        let outcome = outcomes[i].as_ref()?;
+        (outcome.status == "failed").then(|| {
+            let error = outcome
+                .value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("task failed")
+                .to_string();
+            (t.id.clone(), error)
+        })
+    })?;
+    let claim = format!(
+        "plan `{}` task `{task_id}` failed",
+        plan.name.as_deref().unwrap_or("<unnamed>")
+    );
+    zen_vault::distill::reflection::record_rewind(
+        &rewinds,
+        &claim,
+        &error,
+        "plan.execute task failure",
+    )
+    .ok()
 }
 
 #[async_trait::async_trait]
@@ -326,6 +479,15 @@ impl Tool for PlanExecuteTool {
                                     "type": "array",
                                     "items": { "type": "string" },
                                     "description": "Ids of tasks that must finish OK first"
+                                },
+                                "on_failure": {
+                                    "type": "string",
+                                    "enum": ["retry", "skip", "halt"],
+                                    "description": "Failure transition: skip (default) skips dependents; retry re-queues this task once; halt stops the layer chain"
+                                },
+                                "artifact": {
+                                    "type": "string",
+                                    "description": "Optional sandbox-validated path this task's sub-agent should write its deliverable to (requires the agent's fs.write grant)"
                                 }
                             },
                             "required": ["id", "agent", "prompt"]
@@ -347,7 +509,9 @@ impl Tool for PlanExecuteTool {
                                 "agent": { "type": "string" },
                                 "status": { "type": "string", "enum": ["ok", "failed", "skipped"] },
                                 "response": { "type": "string" },
-                                "error": { "type": "string" }
+                                "error": { "type": "string" },
+                                "artifact_path": { "type": "string" },
+                                "summary": { "type": "string" }
                             }
                         }
                     },
@@ -482,7 +646,11 @@ impl Tool for PlanExecuteTool {
             }
             (None, None) => String::new(),
         };
+        let mut retried = vec![false; plan.tasks.len()];
+        let mut retry_count = 0usize;
+        let mut halted = false;
         for layer in &layers {
+            let mut halt_hit = false;
             let mut runnable = Vec::new();
             for &i in layer {
                 if outcomes[i].is_some() {
@@ -519,8 +687,12 @@ impl Tool for PlanExecuteTool {
                     prompt: compose_task_prompt(&plan.tasks[i].prompt, &upstream),
                     description: Some(format!("plan task `{}`", plan.tasks[i].id)),
                     independent: true,
+                    artifact: plan.tasks[i].artifact.clone(),
                 };
                 if let Some(error) = self.delegate.validate_task(DELEGATE_ROOT_PARENT, 0, &req) {
+                    if plan.tasks[i].on_failure == FailureAction::Halt {
+                        halt_hit = true;
+                    }
                     let outcome = TaskOutcome {
                         status: "failed",
                         value: serde_json::json!({ "error": error }),
@@ -537,6 +709,18 @@ impl Tool for PlanExecuteTool {
                     .map(|(_, req)| {
                         let req = req.clone();
                         async move {
+                            #[cfg(test)]
+                            {
+                                self.test_note_call(&req.agent);
+                                if self.test_take_failure(&req.agent) {
+                                    return TaskOutcome {
+                                        status: "failed",
+                                        value: serde_json::json!({
+                                            "error": "injected test failure"
+                                        }),
+                                    };
+                                }
+                            }
                             let value = self
                                 .delegate
                                 .run_single(&req, 0, DELEGATE_ROOT_PARENT)
@@ -551,12 +735,54 @@ impl Tool for PlanExecuteTool {
                     })
                     .collect();
                 let results = futures::future::join_all(futures).await;
+
+                // W2.1 (D11): failure-transition edges. Default `skip` leaves
+                // this block inert (byte-identical). `retry` re-queues ONLY the
+                // failed node once (verified siblings keep their checkpoints —
+                // minimal-subgraph repair); `halt` stops the layer chain.
+                let mut retry_batch: Vec<(usize, DelegateRequest)> = Vec::new();
+                for (&(i, ref req), outcome) in batch.iter().zip(&results) {
+                    if outcome.status != "failed" {
+                        continue;
+                    }
+                    match plan.tasks[i].on_failure {
+                        FailureAction::Retry if !retried[i] => {
+                            retried[i] = true;
+                            retry_batch.push((i, req.clone()));
+                        }
+                        FailureAction::Halt => halt_hit = true,
+                        _ => {}
+                    }
+                }
+
                 for (&(i, _), outcome) in batch.iter().zip(&results) {
                     self.checkpoint(&plan_id, &plan.tasks[i], outcome).await;
                 }
                 for (&(i, _), outcome) in batch.iter().zip(results) {
                     outcomes[i] = Some(outcome);
                 }
+
+                for (i, req) in retry_batch {
+                    #[cfg(test)]
+                    self.test_note_call(&req.agent);
+                    let value = self
+                        .delegate
+                        .run_single(&req, 0, DELEGATE_ROOT_PARENT)
+                        .await;
+                    let status = if value.get("error").is_some() {
+                        "failed"
+                    } else {
+                        "ok"
+                    };
+                    let outcome = TaskOutcome { status, value };
+                    self.checkpoint(&plan_id, &plan.tasks[i], &outcome).await;
+                    outcomes[i] = Some(outcome);
+                    retry_count += 1;
+                }
+            }
+            if halt_hit {
+                halted = true;
+                break;
             }
         }
 
@@ -592,6 +818,12 @@ impl Tool for PlanExecuteTool {
             }
             if let Some(err) = outcome.value.get("error").cloned() {
                 row["error"] = err;
+            }
+            if let Some(artifact) = outcome.value.get("artifact_path").cloned() {
+                row["artifact_path"] = artifact;
+            }
+            if let Some(summary) = outcome.value.get("summary").cloned() {
+                row["summary"] = summary;
             }
             task_rows.push(row);
         }
@@ -659,6 +891,23 @@ impl Tool for PlanExecuteTool {
                 .collect::<Vec<_>>()
                 .into();
         }
+        // W2.1 additive fields — emitted ONLY for plans that use the new
+        // failure edges, so a default (`skip`) plan's audit line stays
+        // byte-identical.
+        if retry_count > 0 {
+            audit_entry["task_retries"] = serde_json::json!(retry_count);
+        }
+        if halted {
+            audit_entry["halted"] = serde_json::json!(true);
+        }
+        // W2.2 (D12): the plan-failure rollback boundary persists a rewind
+        // memory so the next attempt does not repeat the failed path. Best-
+        // effort; a write failure never affects the plan result.
+        if failed > 0
+            && let Some(path) = record_plan_rewind(&plan, &outcomes)
+        {
+            audit_entry["rewind"] = serde_json::json!(path.display().to_string());
+        }
         self.append_plan_audit(audit_entry);
         info!(
             plan = plan.name.as_deref().unwrap_or("<unnamed>"),
@@ -689,6 +938,8 @@ mod tests {
             agent: agent.to_string(),
             prompt: format!("do {id}"),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            on_failure: FailureAction::Skip,
+            artifact: None,
         }
     }
 
@@ -1325,5 +1576,257 @@ mod tests {
         assert!(prompt.contains("3 key findings"));
         assert!(prompt.contains("upstream task `fetch` output"));
         assert!(prompt.contains("raw dataset rows"));
+    }
+
+    #[test]
+    fn parse_plan_validates_failure_edge_and_artifact() {
+        for (raw, expected) in [
+            ("retry", FailureAction::Retry),
+            ("skip", FailureAction::Skip),
+            ("halt", FailureAction::Halt),
+        ] {
+            let args = serde_json::json!({
+                "tasks": [{ "id": "a", "agent": "Explore", "prompt": "x", "on_failure": raw }]
+            });
+            assert_eq!(
+                PlanExecuteTool::parse_plan(&args).unwrap().tasks[0].on_failure,
+                expected
+            );
+        }
+
+        let bad = serde_json::json!({
+            "tasks": [{ "id": "a", "agent": "Explore", "prompt": "x", "on_failure": "explode" }]
+        });
+        assert!(
+            PlanExecuteTool::parse_plan(&bad)
+                .unwrap_err()
+                .contains("on_failure"),
+            "unknown failure action must be rejected"
+        );
+
+        let empty = serde_json::json!({
+            "tasks": [{ "id": "a", "agent": "Explore", "prompt": "x", "artifact": "  " }]
+        });
+        assert!(
+            PlanExecuteTool::parse_plan(&empty)
+                .unwrap_err()
+                .contains("artifact"),
+            "an empty artifact path must be rejected"
+        );
+
+        let none = serde_json::json!({
+            "tasks": [{ "id": "a", "agent": "Explore", "prompt": "x" }]
+        });
+        let spec = &PlanExecuteTool::parse_plan(&none).unwrap().tasks[0];
+        assert_eq!(spec.on_failure, FailureAction::Skip, "default is skip");
+        assert!(spec.artifact.is_none(), "artifact is optional");
+    }
+
+    /// W2.1 byte-identity pin: a plan with NO `on_failure` emits exactly the
+    /// pre-W2 audit keys — no `task_retries`/`halted`/`rewind` fields.
+    #[tokio::test]
+    async fn default_plan_audit_line_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let tool = plan_tool();
+        let out = tool
+            .invoke(serde_json::json!({
+                "name": "default",
+                "tasks": [{ "id": "a", "agent": "Explore", "prompt": "x" }]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl"))
+            .expect("audit file under ZEN_HOME");
+        let completed = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.plan.completed")
+            .expect("completion audit line");
+        let keys: std::collections::BTreeSet<&str> = completed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "kind",
+            "plan",
+            "plan_id",
+            "tasks_total",
+            "tasks_ok",
+            "tasks_failed",
+            "tasks_skipped",
+            "plan_approved",
+            "delivery_ready",
+            "duration_ms",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected, "default plan audit line is byte-identical");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    #[tokio::test]
+    async fn retry_edge_reruns_failed_task_once_then_downstream_runs() {
+        let tool = plan_tool();
+        tool.inject_test_failure("Atlas", 1);
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Atlas", "prompt": "flaky", "on_failure": "retry" },
+                    { "id": "b", "agent": "Explore", "prompt": "downstream", "depends_on": ["a"] }
+                ]
+            }))
+            .await
+            .unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows[0]["status"], "ok", "retry succeeds: {out}");
+        assert_eq!(
+            rows[1]["status"], "ok",
+            "downstream runs after retry: {out}"
+        );
+        assert_eq!(tool.test_call_count("Atlas"), 2, "exactly one retry");
+    }
+
+    /// W2.1 minimal-subgraph repair: only the failed node re-runs; a verified
+    /// sibling in the same layer keeps its single execution/checkpoint.
+    #[tokio::test]
+    async fn retry_reuses_verified_siblings() {
+        let tool = plan_tool();
+        tool.inject_test_failure("Atlas", 1);
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "root", "agent": "Explore", "prompt": "root" },
+                    { "id": "sib", "agent": "Explore", "prompt": "sibling", "depends_on": ["root"] },
+                    { "id": "flaky", "agent": "Atlas", "prompt": "flaky", "depends_on": ["root"], "on_failure": "retry" },
+                    { "id": "join", "agent": "Explore", "prompt": "join", "depends_on": ["sib", "flaky"] }
+                ]
+            }))
+            .await
+            .unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert!(rows.iter().all(|r| r["status"] == "ok"), "{out}");
+        assert_eq!(
+            tool.test_call_count("Atlas"),
+            2,
+            "only the failed node retries"
+        );
+        assert_eq!(
+            tool.test_call_count("Explore"),
+            3,
+            "root + sibling + join each ran exactly once (no subtree re-execution)"
+        );
+    }
+
+    #[tokio::test]
+    async fn halt_edge_stops_the_layer_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let tool = plan_tool();
+        tool.inject_test_failure("Atlas", 1);
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Atlas", "prompt": "boom", "on_failure": "halt" },
+                    { "id": "b", "agent": "Explore", "prompt": "independent" },
+                    { "id": "c", "agent": "Explore", "prompt": "next layer", "depends_on": ["b"] }
+                ]
+            }))
+            .await
+            .unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows[0]["status"], "failed", "{out}");
+        assert_eq!(
+            rows[1]["status"], "ok",
+            "same-layer independent task ran: {out}"
+        );
+        assert_eq!(rows[2]["status"], "skipped", "next layer never ran: {out}");
+        assert_eq!(rows[2]["error"], "never scheduled", "{out}");
+
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl")).unwrap();
+        let completed = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.plan.completed")
+            .expect("completion audit line");
+        assert_eq!(completed["halted"], serde_json::json!(true), "{completed}");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    #[tokio::test]
+    async fn halt_edge_on_validation_failure_stops_chain() {
+        let tool = plan_tool();
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "NoSuchAgent", "prompt": "x", "on_failure": "halt" },
+                    { "id": "b", "agent": "Explore", "prompt": "independent" },
+                    { "id": "c", "agent": "Explore", "prompt": "next layer", "depends_on": ["b"] }
+                ]
+            }))
+            .await
+            .unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows[0]["status"], "failed", "{out}");
+        assert_eq!(rows[1]["status"], "ok", "{out}");
+        assert_eq!(rows[2]["status"], "skipped", "{out}");
+    }
+
+    #[tokio::test]
+    async fn plan_failure_writes_rewind_picked_up_by_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let tool = plan_tool();
+        let out = tool
+            .invoke(serde_json::json!({
+                "name": "nightly",
+                "tasks": [{ "id": "compile", "agent": "NoSuchAgent", "prompt": "x" }]
+            }))
+            .await
+            .unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows[0]["status"], "failed", "{out}");
+
+        let rewinds_dir = dir.path().join("vault/wiki/wisdom/rewinds");
+        let files: Vec<_> = std::fs::read_dir(&rewinds_dir)
+            .expect("rewinds dir created")
+            .collect();
+        assert_eq!(files.len(), 1, "one rewind memory per failed plan");
+
+        let rewinds = zen_vault::distill::reflection::recent_rewinds(&rewinds_dir, 5);
+        assert_eq!(rewinds.len(), 1, "next injection picks up the rewind");
+        assert!(rewinds[0].contains("nightly"), "{}", rewinds[0]);
+        assert!(
+            rewinds[0].to_lowercase().contains("do not re-propose"),
+            "guidance present: {}",
+            rewinds[0]
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    #[tokio::test]
+    async fn plan_task_artifact_without_grant_fails() {
+        let tool = plan_tool();
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [{
+                    "id": "x",
+                    "agent": "Explore",
+                    "prompt": "write it",
+                    "artifact": "out.md"
+                }]
+            }))
+            .await
+            .unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows[0]["status"], "failed", "{out}");
+        assert!(
+            rows[0]["error"].as_str().unwrap().contains("fs.write"),
+            "no-grant agent cannot declare an artifact: {out}"
+        );
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicBool;
+
 use anyhow::Result;
 use chrono::Utc;
 use tracing::info;
@@ -6,6 +8,9 @@ use zen_core::paths::ZenPaths;
 use zen_memory::dream::ZenDream;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
+use super::zen_loop::log_once;
+
+static DB_OPEN_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub struct DreamWorker {
     scheduled: Option<&'static str>,
@@ -58,7 +63,9 @@ impl ZenWorker for DreamWorker {
                         >)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to open state.db for dream cycle");
+                    if log_once(&DB_OPEN_FAILED_LOGGED) {
+                        tracing::warn!(error = %e, "failed to open state.db for dream cycle");
+                    }
                     None
                 }
             }

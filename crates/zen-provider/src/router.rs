@@ -1537,6 +1537,15 @@ impl LlmRouter for DefaultRouter {
 
         result
     }
+
+    /// Delegate to the inherent probe so the `&dyn LlmRouter` path (the free
+    /// [`is_local_llm_available`] helper) actually probes Ollama instead of
+    /// hitting the trait-default `false`. The inherent method probes ONLY
+    /// `provider_instance("ollama")` + `health_check()` (dedicated-threaded,
+    /// async-safe); cloud health checks are unreachable from here.
+    fn is_local_llm_available(&self) -> bool {
+        DefaultRouter::is_local_llm_available(self)
+    }
 }
 
 // ---------------------------------------------------------------------------

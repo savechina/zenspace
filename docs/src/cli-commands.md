@@ -63,7 +63,7 @@ Zen's CLI surface is intentionally small: the TUI plus 23 subcommands. Heavy cap
 | `zen serve stop` | Stop daemon |
 | `zen serve test` | Test MCP connectivity |
 | `zen serve install` / `uninstall` | Manage macOS launchd auto-start |
-| `zen doctor` | System health: 8 liveness probes (`--json` for scripts) |
+| `zen doctor` | System health: 10 liveness probes (`--json` for scripts) |
 | `zen clean cache` | Clean caches (ungated) |
 | `zen clean all` / `trash` | Destructive cleanup — asks for confirmation unless `--yes` |
 | `zen logs <service>` | View structured logs |

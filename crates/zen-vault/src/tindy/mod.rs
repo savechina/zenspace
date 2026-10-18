@@ -9,6 +9,7 @@ pub mod semantic_lint;
 pub use checksum::{ChangeDetector, compute_file_checksum, needs_reindex, update_checksum};
 pub use embeddings::{
     ComputeEmbeddings, EmbeddingResult, compute_embeddings, compute_embeddings_for_text,
+    compute_embeddings_for_text_tagged,
 };
 pub use learning_loop::{GapType, KnowledgeGap, LearningLoop, LearningReport, ResearchTask};
 pub use lint::{LintResult, Linter, OkfFinding};

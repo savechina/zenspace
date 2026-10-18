@@ -118,11 +118,21 @@ pub fn validate_para(para: &Option<String>) -> bool {
 
 // ── Front matter parsing helpers ────────────────────────────────────
 
+/// True when the document opens with a `---` front-matter fence.
+///
+/// Absence of front matter is legitimate — plain Markdown notes, and generated
+/// files that OKF §6 exempts (`wiki/index.md`, `wiki/log.md`) — so callers that
+/// log on parse failure should use this to tell "no front matter" apart from
+/// "malformed front matter" instead of matching on error strings.
+pub(crate) fn has_frontmatter(content: &str) -> bool {
+    content.trim_start().starts_with("---")
+}
+
 /// Extract YAML front matter between triple-dash delimiters.
 /// Returns (yaml_body, content_after_dashes) or an error.
 fn extract_front_matter(content: &str) -> Result<(&str, &str), anyhow::Error> {
     let content = content.trim_start();
-    if !content.starts_with("---") {
+    if !has_frontmatter(content) {
         return Err(anyhow::anyhow!("missing leading --- delimiter"));
     }
 
@@ -213,6 +223,13 @@ pub fn parse_frontmatter(content: &str) -> Result<Note, anyhow::Error> {
     for line in yaml_body.lines() {
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        // Block-sequence items (`- "x"`) belong to list-valued fields the writer
+        // emits via YAML (e.g. `evidence_refs:`), which `Note` does not carry.
+        // Skipped like any unknown field — rejecting them here discarded the
+        // entire front matter (O19, report §9.7).
+        if line.starts_with("- ") {
             continue;
         }
         let (key, value) = parse_kv_line(line)
@@ -755,5 +772,28 @@ Old note content
         assert!(!validate_para(&Some("random".to_string())));
         assert!(!validate_para(&Some("Projects".to_string())));
         assert!(!validate_para(&Some("".to_string())));
+    }
+
+    #[test]
+    fn test_parse_frontmatter_tolerates_block_sequence_fields() {
+        let input = "---\nid: hypothesis-one\ntags: [test]\nevidence_refs:\n  - \"notions/alpha.md\"\n  - \"notions/beta.md\"\n---\n\nclaim body\n";
+        let note = parse_frontmatter(input)
+            .expect("block-sequence items belong to unknown list-valued keys, not an error");
+        assert_eq!(note.id, "hypothesis-one");
+        assert_eq!(note.tags, vec!["test".to_string()]);
+        assert_eq!(note.content.trim(), "claim body");
+        assert!(
+            !note.content.contains("evidence_refs"),
+            "the YAML block must stay out of the indexed body: {:?}",
+            note.content
+        );
+    }
+
+    #[test]
+    fn test_has_frontmatter_distinguishes_fence_from_plain_markdown() {
+        assert!(has_frontmatter("---\nid: x\n---\nbody"));
+        assert!(has_frontmatter("\n\n  ---\nid: x\n---\n"));
+        assert!(!has_frontmatter("# plain heading\n\nno front matter\n"));
+        assert!(!has_frontmatter(""));
     }
 }

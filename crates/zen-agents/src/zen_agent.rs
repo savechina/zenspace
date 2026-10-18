@@ -651,17 +651,24 @@ fn read_identity_file(path: &std::path::Path) -> std::io::Result<String> {
     Ok(InputSanitizer::new().strip_dangerous_patterns(&content))
 }
 
-/// `Some(half_life_days)` when `[agentic.memory_strength] enabled &&
-/// search_rerank` (Phase 31 T209, owner decision D-G: the ONE flag also
-/// drives the gateway `memory/search` rerank). Config-load failure fails
+/// `Some((half_life_days, strength_floor))` when `[agentic.memory_strength]
+/// enabled && search_rerank` (Phase 31 T209, owner decision D-G: the ONE flag
+/// also drives the gateway `memory/search` rerank). Config-load failure fails
 /// CLOSED (rerank off) — a ranking change must never surprise a
 /// misconfigured workspace (`shadow_embedding_enabled` precedent).
-fn memory_strength_half_life() -> Option<f64> {
+/// `strength_floor` (Phase 32 T224) defaults to 0.0 ⇒ byte-identical to the
+/// unclamped ranking; the gateway `memory/search` rank site reads the SAME
+/// config key (D-G single-gate discipline).
+fn memory_strength_rank_params() -> Option<(f64, f64)> {
     match zen_core::config::load_config() {
         Ok(config) => {
             let ms = &config.agentic.memory_strength;
-            (ms.enabled_or_default() && ms.search_rerank_or_default())
-                .then(|| ms.half_life_days_or_default())
+            (ms.enabled_or_default() && ms.search_rerank_or_default()).then(|| {
+                (
+                    ms.half_life_days_or_default(),
+                    ms.strength_floor_or_default(),
+                )
+            })
         }
         Err(e) => {
             warn!(
@@ -694,6 +701,20 @@ fn card_retention_strength(
     let created_at = chrono::DateTime::from_timestamp(card.created_at, 0).unwrap_or(now);
     let anchor = zen_memory::strength::resolve_content_anchor(uri_date, None, created_at);
     zen_memory::strength::retention_strength(anchor, None, 0, now, half_life_days)
+}
+
+/// Rank multiplier of one card under the T224 floor: `max(R, floor)`. The
+/// default floor 0.0 is byte-identical to the unclamped R because
+/// `retention_strength` returns `R ∈ (0, 1]` — never negative, never NaN —
+/// so `max(R, 0.0) = R` exactly. Mirrors the gateway `memory/search` rank
+/// site (`server/memory.rs`); the floor is ranking-only, never a filter.
+fn clamped_card_strength(
+    card: &zen_memory::memvid_store::memvid_core::MemoryCard,
+    half_life_days: f64,
+    strength_floor: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> f64 {
+    card_retention_strength(card, half_life_days, now).max(strength_floor)
 }
 
 /// T211 gate: `[agentic.memory_strength] enabled` — the master flag is also
@@ -979,11 +1000,11 @@ impl ZenAgent {
             // pre-T209; gate ON ⇒ stable strength-descending reorder (the
             // zen-memory pin guarantees a constant resolver reproduces
             // `select_cards` exactly).
-            let cards = match memory_strength_half_life() {
-                Some(half_life) => {
+            let cards = match memory_strength_rank_params() {
+                Some((half_life, floor)) => {
                     let now = chrono::Utc::now();
                     select_cards_with_strength(store, &selection, query, |card| {
-                        card_retention_strength(card, half_life, now)
+                        clamped_card_strength(card, half_life, floor, now)
                     })
                 }
                 None => select_cards(store, &selection, query),
@@ -1038,13 +1059,29 @@ impl ZenAgent {
             zen_store = zen_store.with_notion_graph(graph.clone());
         }
 
-        match zen_store.retrieve_with_entity_context(session_id).await {
-            Ok(enriched) if !enriched.is_empty() => {
+        match zen_store
+            .retrieve_with_entity_context_and_cards(session_id)
+            .await
+        {
+            Ok((enriched, cards)) if !enriched.is_empty() => {
                 tracing::info!(
                     session_id,
                     count = enriched.len(),
                     "Enriched memories retrieved (KB notion context)"
                 );
+                // T221 (review R3): the enriched path wins this retrieval
+                // chain after a session's first persisted turn, so the T211
+                // reinforcement fires HERE too — same gate, same helper, same
+                // flock + dedup-by-source_path semantics as the structured
+                // path (gate closed ⇒ provably zero writes). Blocking-I/O
+                // note: the flock+fsync increments ride the store's existing
+                // sync seam (entity_memories/search already hold the store
+                // mutex on this thread) and are bounded by deduped sources.
+                if memvid_reward_enabled()
+                    && let Ok(paths) = ZenPaths::detect()
+                {
+                    increment_memvid_injection_rewards(&paths, store, &cards);
+                }
                 Some(enriched.iter().map(|e| e.format_enriched()).collect())
             }
             Ok(_) => {
@@ -2546,6 +2583,7 @@ mod memory_strength_consumer_tests {
         unsafe {
             std::env::remove_var("ZEN_MEMORY_STRENGTH_ENABLED");
             std::env::remove_var("ZEN_MEMORY_STRENGTH_RERANK");
+            std::env::remove_var("ZEN_MEMORY_STRENGTH_FLOOR");
         }
         zen_core::config::invalidate_config_cache();
     }
@@ -2576,7 +2614,7 @@ mod memory_strength_consumer_tests {
     fn rerank_gate_closed_by_default() {
         clear_strength_env();
         assert!(
-            memory_strength_half_life().is_none(),
+            memory_strength_rank_params().is_none(),
             "gate-off must route retrieve_memories_structured through plain select_cards"
         );
     }
@@ -2587,13 +2625,56 @@ mod memory_strength_consumer_tests {
         unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_ENABLED", "1") };
         zen_core::config::invalidate_config_cache();
         assert!(
-            memory_strength_half_life().is_none(),
+            memory_strength_rank_params().is_none(),
             "enabled alone must NOT rerank (D-G: search_rerank is the ranking switch)"
         );
         unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_RERANK", "1") };
         zen_core::config::invalidate_config_cache();
-        assert_eq!(memory_strength_half_life(), Some(30.0));
+        assert_eq!(
+            memory_strength_rank_params(),
+            Some((30.0, 0.0)),
+            "T224: the floor defaults to 0.0 = byte-identical ranking"
+        );
         clear_strength_env();
+    }
+
+    #[test]
+    fn rank_params_carry_strength_floor_env() {
+        clear_strength_env();
+        unsafe {
+            std::env::set_var("ZEN_MEMORY_STRENGTH_ENABLED", "1");
+            std::env::set_var("ZEN_MEMORY_STRENGTH_RERANK", "1");
+            std::env::set_var("ZEN_MEMORY_STRENGTH_FLOOR", "0.4");
+        }
+        zen_core::config::invalidate_config_cache();
+        assert_eq!(memory_strength_rank_params(), Some((30.0, 0.4)));
+        clear_strength_env();
+    }
+
+    /// T224 pin: floor=0.0 is BIT-for-bit the unclamped resolver output (R is
+    /// always in (0,1], so max(R,0)=R); floor>0 lifts a deeply decayed card's
+    /// rank multiplier to exactly the floor and never touches R ≥ floor.
+    #[test]
+    fn floor_zero_is_byte_identical_and_positive_floor_clamps() {
+        let now = chrono::Utc::now();
+        let aged = card(Some("journal-2020-01-01"));
+        let fresh = card(None);
+        for c in [&aged, &fresh] {
+            assert_eq!(
+                clamped_card_strength(c, 30.0, 0.0, now).to_bits(),
+                card_retention_strength(c, 30.0, now).to_bits(),
+                "floor=0.0 must be byte-identical to the unclamped formula"
+            );
+        }
+        // The 2020 anchor decays to ≈0; the floor becomes its multiplier.
+        assert!(card_retention_strength(&aged, 30.0, now) < 0.2);
+        assert_eq!(clamped_card_strength(&aged, 30.0, 0.4, now), 0.4);
+        // A fresh card's R ≈ 1.0 is above the floor — untouched.
+        let fresh_unclamped = card_retention_strength(&fresh, 30.0, now);
+        assert_eq!(
+            clamped_card_strength(&fresh, 30.0, 0.4, now).to_bits(),
+            fresh_unclamped.to_bits()
+        );
     }
 }
 
@@ -2794,6 +2875,124 @@ mod memvid_injection_reward_tests {
             reward.access_count, 1,
             "the wave-2 sidecar-join key now has a production writer"
         );
+        clear_reward_env();
+    }
+
+    /// T221 seam-level pin (review R3): with the master gate OPEN, cards
+    /// injected into M1 via the ENRICHED path — the one that wins the
+    /// retrieval chain after a session's first persisted turn — write the
+    /// same sidecar the structured path writes, deduped by source_path.
+    #[tokio::test]
+    async fn enriched_retrieve_writes_sidecar_when_gate_open() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("ZEN_HOME", dir.path());
+            std::env::set_var("ZEN_MEMORY_STRENGTH_ENABLED", "1");
+        }
+        zen_core::config::invalidate_config_cache();
+
+        let store = MemvidStore::open_or_create(&dir.path().join("enriched.mv2")).unwrap();
+        let frame = store
+            .put_text(
+                "zenwave deployment plan details",
+                provenance_frame_opts(JOURNAL_URI, true),
+            )
+            .unwrap();
+        store
+            .put_memory_card(card(
+                "session-t221",
+                "deployment plan",
+                frame,
+                Some(JOURNAL_URI),
+            ))
+            .unwrap();
+        // Second card, SAME source ⇒ dedup: one access event per injection.
+        store
+            .put_memory_card(card(
+                "session-t221",
+                "zenwave details",
+                frame,
+                Some(JOURNAL_URI),
+            ))
+            .unwrap();
+
+        let router = DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let agent = ZenAgent::builder("Explore")
+            .with_memvid_store(store)
+            .build(&ZenWiring::new(), &router)
+            .expect("agent builds");
+
+        let memories = agent
+            .retrieve_memories_enriched("session-t221")
+            .await
+            .expect("enriched cards injected into M1");
+        assert!(
+            memories.iter().any(|m| m.contains("deployment plan")),
+            "{memories:?}"
+        );
+
+        let card_id = zen_vault::distill::card_id_from_path(SOURCE_PATH);
+        let reward =
+            zen_vault::distill::read_reward(&dir.path().join("memories").join(".reward"), &card_id);
+        assert_eq!(
+            reward.access_count, 1,
+            "the enriched path increments once per source per injection (dedup preserved)"
+        );
+        clear_reward_env();
+    }
+
+    /// T221 gate-closed pin: the enriched retrieval itself is NOT gated
+    /// (memories still returned byte-identically), but sidecar writes are
+    /// provably zero when `[agentic.memory_strength] enabled` is closed.
+    #[tokio::test]
+    async fn enriched_retrieve_gate_closed_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        clear_reward_env();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        zen_core::config::invalidate_config_cache();
+
+        let store = MemvidStore::open_or_create(&dir.path().join("closed.mv2")).unwrap();
+        let frame = store
+            .put_text(
+                "zenwave deployment plan details",
+                provenance_frame_opts(JOURNAL_URI, true),
+            )
+            .unwrap();
+        store
+            .put_memory_card(card(
+                "session-t221-closed",
+                "deployment plan",
+                frame,
+                Some(JOURNAL_URI),
+            ))
+            .unwrap();
+
+        let router = DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let agent = ZenAgent::builder("Explore")
+            .with_memvid_store(store)
+            .build(&ZenWiring::new(), &router)
+            .expect("agent builds");
+
+        let memories = agent
+            .retrieve_memories_enriched("session-t221-closed")
+            .await
+            .expect("enriched retrieval itself is not gated");
+        assert!(
+            memories.iter().any(|m| m.contains("deployment plan")),
+            "{memories:?}"
+        );
+
+        let reward_dir = dir.path().join("memories").join(".reward");
+        let writes = std::fs::read_dir(&reward_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(writes, 0, "gate closed ⇒ zero sidecar writes");
         clear_reward_env();
     }
 }

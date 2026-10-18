@@ -5,6 +5,8 @@ use tracing::debug;
 use zen_core::errors::ZenError;
 use zen_gateway::client::SurfaceClient;
 
+use crate::session::estimate_tokens;
+
 #[derive(Parser)]
 pub struct ChatArgs {
     /// Message to send to the agent
@@ -67,13 +69,13 @@ pub async fn execute_command(args: &ChatArgs) -> Result<(), ZenError> {
             println!(
                 "\n{} {} tokens",
                 "\u{2713}".green().bold(),
-                response.len() / 4
+                estimate_tokens(&response)
             );
 
             if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
                 let summary = format!(
                     "Chat with {agent_label} agent — {} tokens.",
-                    response.len() / 4
+                    estimate_tokens(&response)
                 );
                 tracing::debug!(agent = %agent_label, "writing daily log entry for CLI chat");
                 if let Err(e) = zen_memory::journal::Journal::create_entry(&paths, &summary) {

@@ -434,11 +434,16 @@ impl AgentExecutor {
     ///
     /// Builds the full prompt (system identity + tool manifest + user
     /// content + tool results), routes to a provider, calls the LLM with
-    /// retry, and returns the response text plus any native provider
-    /// `ToolCall`s extracted from the `CompletionResponse`.
+    /// retry, and returns the response text.
     ///
-    /// The orchestrator drives this from `AgentRun::next_step()` when it
-    /// receives `AgentRunStep::CallModel`.
+    /// **Fenced-only contract (W4.6a/G1-01)**: the router `complete()` path
+    /// returns plain text and cannot carry native provider tool calls, so
+    /// `native_calls` is always empty on this surface and the orchestrator
+    /// parses fenced ```json blocks instead. Native tool capture lives on the
+    /// streaming surface (`ZenAgent::execute_stream_round`). Do not "fix"
+    /// this by inventing a native path here without rewriting the executor's
+    /// provider plumbing — the contract is pinned by
+    /// `execute_model_call_is_fenced_only`.
     #[instrument(skip(self, context, agent), fields(agent_name = %context.agent_profile.name, sensitivity = ?context.sensitivity))]
     pub fn execute_model_call(
         &self,
@@ -470,63 +475,9 @@ impl AgentExecutor {
         let (response, _tokens, _used_mock) =
             self.execute_with_retry(&provider, &prompt, &context.agent_profile.name)?;
 
-        // The router `complete()` path returns plain text — it cannot carry
-        // native provider tool calls, so the orchestrator falls back to
-        // fenced-JSON parsing via `resolve_invocations` (T114).
         let native_calls: Vec<NativeToolCall> = Vec::new();
 
         Ok((response, native_calls))
-    }
-
-    /// T115: Streaming-model-call helper for the AgentRun driver loop.
-    ///
-    /// Uses the router's `call_stream` to accumulate tokens while
-    /// forwarding each chunk to `callback`. Returns the full accumulated
-    /// response text plus any native provider `ToolCall`s captured from
-    /// the stream.
-    #[instrument(skip(self, context, agent, callback), fields(agent_name = %context.agent_profile.name))]
-    pub async fn execute_model_call_stream(
-        &self,
-        context: &AgentContext,
-        agent: &crate::ZenAgent,
-        tool_manifest: &str,
-        tool_results: &str,
-        mut callback: impl FnMut(&str) + Send + 'static,
-    ) -> Result<(String, Vec<NativeToolCall>)> {
-        let requirements = TaskRequirements {
-            max_tokens: Some(context.max_tokens as u32),
-            sensitivity: context.sensitivity,
-            preferred_model: None,
-            budget_limit: None,
-        };
-
-        let provider = self
-            .router
-            .route_with_preferences(&requirements, &context.preferences)
-            .or_else(|e| {
-                info!("Preference routing failed: {e}, falling back");
-                self.router.route(&requirements)
-            })
-            .unwrap_or_else(|e| {
-                warn!("All routing failed: {e}, using mock fallback");
-                Provider::Mock
-            });
-
-        let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
-
-        let stream_resp = self.router.call_stream(provider, &prompt)?;
-
-        let mut full_response = String::new();
-        let native_calls: Vec<NativeToolCall> = Vec::new();
-
-        let mut token_rx = stream_resp.token_rx;
-
-        while let Some(text) = token_rx.recv().await {
-            callback(&text);
-            full_response.push_str(&text);
-        }
-
-        Ok((full_response, native_calls))
     }
 }
 
@@ -569,5 +520,52 @@ mod tests {
             .execute_with_retry(&Provider::Mock, "hi", "test")
             .expect("mock direct succeeds");
         assert!(!used_mock, "direct mock is not a fallback");
+    }
+
+    #[test]
+    fn execute_model_call_is_fenced_only() {
+        use crate::context::AgentContext;
+        use crate::registry::{AgentRegistry, DefaultAgentRegistry};
+        use crate::wiring::ZenWiring;
+        use crate::zen_agent::ZenAgent;
+        use zen_core::types::SessionContext;
+
+        let router = DefaultRouter::new(LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        })
+        .with_mock_response("```json\n{\"tool\": \"fs.read\", \"args\": {\"path\": \"/x\"}}\n```");
+        let wiring = ZenWiring::new();
+        let agent = ZenAgent::builder("Sisyphus")
+            .build(&wiring, &router)
+            .expect("agent builds");
+        let profile = DefaultAgentRegistry::new()
+            .find_by_name("Sisyphus")
+            .expect("profile")
+            .clone();
+        let context = AgentContext::new(
+            profile,
+            "read a file".to_string(),
+            SessionContext::new("Sisyphus".to_string(), String::new()),
+        );
+
+        let executor = AgentExecutor::new(router).with_retry_policy(RetryPolicy {
+            max_retries: 0,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter: false,
+        });
+        let (response, native_calls) = executor
+            .execute_model_call(&context, &agent, "", "")
+            .expect("model call");
+
+        assert!(
+            native_calls.is_empty(),
+            "W4.6a/G1-01: the non-stream surface is fenced-only; native capture lives on the stream path"
+        );
+        assert!(
+            response.contains("```json"),
+            "the fenced block is the only tool-call channel here: {response}"
+        );
     }
 }

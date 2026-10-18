@@ -55,9 +55,17 @@ pub enum WikiCommands {
         /// Preview actions without modifying anything
         #[arg(short, long)]
         dry_run: bool,
-        /// Rebuild FTS5 indexes only (resync when triggers drift), then exit
-        #[arg(long, help = "Rebuild FTS5 indexes (resync when triggers drift)")]
+        /// Reset the FTS5 index, then repopulate it with a forced full reindex
+        #[arg(
+            long,
+            help = "Reset the FTS5 index, then repopulate via a full reindex"
+        )]
         rebuild_fts: bool,
+        #[arg(
+            long,
+            help = "Drop and recreate the vector (vec0) embedding index, then re-embed every note"
+        )]
+        reset_embeddings: bool,
     },
     /// Run the knowledge lint (orphans, broken links, stale claims)
     Lint {
@@ -160,6 +168,7 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             path,
             dry_run,
             rebuild_fts,
+            reset_embeddings,
         } => {
             let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
             let db_path = paths.data().join("state.db");
@@ -178,17 +187,6 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
                 println!("Normalized {repaired} legacy alias row(s) to NFC.");
             }
 
-            if *rebuild_fts {
-                let reindexer = zen_vault::tindy::Reindexer::with_client(db_client);
-                println!("Rebuilding FTS5 indexes...");
-                reindexer
-                    .rebuild_fts_indexes()
-                    .await
-                    .map_err(|e| ZenError::Message(e.to_string()))?;
-                println!("FTS5 indexes rebuilt.");
-                return Ok(());
-            }
-
             let knowledge_dir = match path {
                 Some(p) => p.clone(),
                 None => paths.vault(),
@@ -202,9 +200,35 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
                 return Ok(());
             }
 
-            debug!("reindex: path={}", knowledge_dir.display());
+            // `--rebuild-fts` empties the contentless `notes_fts` index while
+            // `notes_meta.content_hash` values persist, so a gated reindex
+            // would read every file as unchanged and leave search silently
+            // broken. Reset first, then repopulate with a FORCED full reindex
+            // in the same run (`force_full` bypasses the change gate).
+            if *reset_embeddings {
+                zen_repo::EmbeddingsRepo::new(&db_client)
+                    .reset_embedding_tables()
+                    .await
+                    .map_err(|e| ZenError::Message(e.to_string()))?;
+                println!("Reset embedding index (vec0); re-embedding all notes...");
+            }
 
-            let reindexer = zen_vault::tindy::Reindexer::with_client(db_client);
+            let reindexer = if *rebuild_fts || *reset_embeddings {
+                zen_vault::tindy::Reindexer::with_client(db_client).force_full()
+            } else {
+                zen_vault::tindy::Reindexer::with_client(db_client)
+            };
+
+            if *rebuild_fts {
+                println!("Rebuilding FTS5 indexes...");
+                reindexer
+                    .rebuild_fts_indexes()
+                    .await
+                    .map_err(|e| ZenError::Message(e.to_string()))?;
+                println!("FTS5 indexes reset; repopulating with a full reindex...");
+            }
+
+            debug!("reindex: path={}", knowledge_dir.display());
             println!("Scanning {}...", knowledge_dir.display());
 
             let report = reindexer
@@ -216,6 +240,13 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
                 "Updated {} files, {} unchanged",
                 report.files_updated, report.files_unchanged
             );
+
+            if report.embeddings_degraded > 0 {
+                println!(
+                    "⚠ {} vector(s) used the hash fallback (degraded — not semantic); set [embeddings] local_provider=\"ollama\" to get real vectors",
+                    report.embeddings_degraded
+                );
+            }
 
             if !report.errors.is_empty() {
                 eprintln!("\nErrors:");

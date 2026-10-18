@@ -1,6 +1,8 @@
 use std::fmt;
 use zen_core::types::Task;
 
+use super::deanchored::{debias_seed, seeded_order};
+
 #[derive(Debug, Clone)]
 pub struct MomusFinding {
     pub finding_type: MomusFindingType,
@@ -41,11 +43,30 @@ impl MomusReviewer {
         Self
     }
 
+    /// Plan gate over the three rubric checks (consistency / acceptance /
+    /// verifiability).
+    ///
+    /// Rubric item order (D8): the three check groups are evaluated in a
+    /// deterministic seeded permutation keyed on the task id, so the presented
+    /// order does not track a fixed position (rubric-order bias, arXiv
+    /// 2602.02219) while staying reproducible for a given task. Findings are
+    /// independent of the order, so decisions do not change.
     pub fn gate_review(&self, task: &Task, plan: &str) -> MomusReview {
+        self.gate_review_seeded(task, plan, rubric_seed(task))
+    }
+
+    /// `gate_review` with an explicit permutation seed — the deterministic
+    /// seam tests pin the shuffle against.
+    pub fn gate_review_seeded(&self, task: &Task, plan: &str, seed: u64) -> MomusReview {
+        let groups = [
+            self.check_plan_consistency(plan),
+            self.validate_acceptance_criteria(plan),
+            self.assess_verifiability(plan),
+        ];
         let mut findings = Vec::new();
-        findings.extend(self.check_plan_consistency(plan));
-        findings.extend(self.validate_acceptance_criteria(plan));
-        findings.extend(self.assess_verifiability(plan));
+        for &index in &seeded_order(seed, groups.len()) {
+            findings.extend(groups[index].iter().cloned());
+        }
 
         let blocked = findings.iter().any(|f| f.is_blocking);
         let veto_reason = if blocked {
@@ -228,6 +249,14 @@ impl Default for MomusReviewer {
     }
 }
 
+/// Deterministic per-task permutation seed (D8): the fixed base constant
+/// combined with the low 64 bits of the task id. The same task ⇒ the same
+/// rubric order; different tasks ⇒ a different order.
+fn rubric_seed(task: &Task) -> u64 {
+    let id_low = (task.id.as_u128() & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+    debias_seed(id_low)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +289,35 @@ mod tests {
         let task = Task::new("test", 0.5, TaskType::Text);
         let review = reviewer.gate_review(&task, "test plan");
         assert!(!reviewer.can_veto(&review));
+    }
+
+    #[test]
+    fn rubric_order_is_deterministic_for_a_seed_and_seed_keyed_by_task() {
+        let reviewer = MomusReviewer::new();
+        let task = Task::new("gate", 0.6, TaskType::Code);
+        let plan = "create the new table. delete the old table. verify it works";
+        let descriptions = |seed| {
+            reviewer
+                .gate_review_seeded(&task, plan, seed)
+                .findings
+                .iter()
+                .map(|f| f.description.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            descriptions(1234),
+            descriptions(1234),
+            "same seed ⇒ same order"
+        );
+        assert_eq!(
+            reviewer
+                .gate_review(&task, plan)
+                .findings
+                .iter()
+                .map(|f| f.description.clone())
+                .collect::<Vec<_>>(),
+            descriptions(rubric_seed(&task)),
+            "gate_review uses the deterministic task-keyed seed"
+        );
     }
 }

@@ -340,9 +340,9 @@ fn bootstrap_lock() -> &'static tokio::sync::Mutex<()> {
     BOOT.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Undoes the process-wide soft-limit lowering that `ZenWiring::new`
-/// performs on every daemon construction (FR-038: NOFILE=256,
-/// NPROC=50). Those caps are production hardening, but integration
+/// Undoes the process-wide NOFILE soft-limit lowering that
+/// `ZenWiring::new` performs on every daemon construction (FR-038:
+/// NOFILE=256). That cap is production hardening, but integration
 /// tests embed MANY daemons in ONE process — sockets + sqlite + mv2
 /// files blow past 256 fds and sibling stacks die with EMFILE. The
 /// soft cap is reversible by design (hard limit preserved), so the
@@ -351,23 +351,21 @@ fn bootstrap_lock() -> &'static tokio::sync::Mutex<()> {
 fn restore_process_soft_limits() {
     #[cfg(unix)]
     unsafe {
-        for resource in [libc::RLIMIT_NOFILE, libc::RLIMIT_NPROC] {
-            let mut rl = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::getrlimit(resource, &mut rl) == 0 {
-                rl.rlim_cur = rl.rlim_max;
-                libc::setrlimit(resource, &rl);
-            }
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            rl.rlim_cur = rl.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
         }
     }
 }
 
 async fn spawn_stack(executor: Arc<dyn TurnExecutor>, drain: Duration) -> Stack {
-    // Prevent the production RLIMIT_NPROC=50 cap from wedging the test
-    // daemon on Linux — see wiring.rs note. Must be set before the
-    // daemon's `ZenWiring` (or any `apply_resource_limits` caller) runs.
+    // Keep the production NOFILE=256 cap from wedging the test daemon —
+    // see wiring.rs note. Must be set before the daemon's `ZenWiring`
+    // (or any `apply_resource_limits` caller) runs.
     unsafe { std::env::set_var("ZEN_SKIP_RLIMIT", "1") };
     let boot_guard = bootstrap_lock().lock().await;
     restore_process_soft_limits();

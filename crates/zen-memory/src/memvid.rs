@@ -509,15 +509,43 @@ impl ZenMemvidStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<EnrichedMemory>> {
+        let (enriched, _cards) = self
+            .retrieve_with_entity_context_and_cards(session_id)
+            .await?;
+        Ok(enriched)
+    }
+
+    /// Additive sibling of [`ZenMemvidStore::retrieve_with_entity_context`]
+    /// (Phase 32 T221): identical behavior, but ALSO returns the filtered
+    /// [`memvid_core::MemoryCard`]s the enriched entries were built from —
+    /// positionally aligned (one card per enriched entry), already
+    /// confidence-filtered (`>= TRIPLET_MIN_CONFIDENCE`).
+    ///
+    /// Purpose: the enriched path wins the zen_agent retrieval chain after a
+    /// session's first persisted turn, so the FR-034 reward reinforcement
+    /// (T211 `increment_memvid_injection_rewards`) must run on THIS path's
+    /// cards too, or the usage-half of the strength ranking structurally
+    /// starves once `[agentic.memory_strength] enabled` is flipped (review
+    /// R3). Returning the cards this method already computes keeps the
+    /// attribution logic in exactly one place — callers never re-derive which
+    /// cards entered M1.
+    ///
+    /// # Errors
+    /// Memvid read failure (same as [`ZenMemvidStore::retrieve_with_entity_context`]).
+    pub async fn retrieve_with_entity_context_and_cards(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<EnrichedMemory>, Vec<memvid_core::MemoryCard>)> {
         let cards = self.store.entity_memories(session_id)?;
 
         let filtered: Vec<_> = cards
             .into_iter()
             .filter(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE)
             .collect();
+        let cards_out = filtered.clone();
 
         let Some(ref graph) = self.notion_graph else {
-            return Ok(filtered
+            let enriched = filtered
                 .into_iter()
                 .map(|c| EnrichedMemory {
                     kind: c.kind.to_string(),
@@ -527,7 +555,8 @@ impl ZenMemvidStore {
                     confidence: f64::from(c.confidence.unwrap_or(1.0)),
                     entity_context: None,
                 })
-                .collect());
+                .collect();
+            return Ok((enriched, cards_out));
         };
 
         let importance_map: HashMap<String, f64> = match graph.compute_importance(100, 0.85).await {
@@ -572,7 +601,7 @@ impl ZenMemvidStore {
             });
         }
 
-        Ok(enriched)
+        Ok((enriched, cards_out))
     }
 }
 
@@ -991,6 +1020,68 @@ mod tests {
         assert!(
             enriched.iter().all(|e| e.entity_context.is_none()),
             "all memories should have None context when no provider is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_and_cards_returns_aligned_filtered_cards() {
+        let (_dir, store) = {
+            let _guard = lock_and_reset_singletons();
+            let dir = tempdir().unwrap();
+            let memory_path = dir.path().join("test_cards.mv2");
+            (dir, ZenMemvidStore::new(memory_path).unwrap())
+        };
+
+        store
+            .persist_structured_turn("session-3", "user", "Hello world")
+            .unwrap();
+
+        let weak = memvid_core::MemoryCardBuilder::new()
+            .event()
+            .entity("session-3")
+            .slot("note")
+            .value("low confidence whisper")
+            .source(1, None)
+            .engine("zen-test", "1")
+            .confidence(0.5)
+            .build(0)
+            .unwrap();
+        store.store.put_memory_card(weak).unwrap();
+
+        let (enriched, cards) = store
+            .retrieve_with_entity_context_and_cards("session-3")
+            .await
+            .unwrap();
+        assert!(!enriched.is_empty());
+        assert_eq!(
+            cards.len(),
+            enriched.len(),
+            "one card per enriched entry, positionally aligned"
+        );
+        for (e, c) in enriched.iter().zip(&cards) {
+            assert_eq!(e.notion, c.entity);
+            assert_eq!(e.slot, c.slot);
+            assert_eq!(e.value, c.value);
+        }
+        assert!(
+            cards
+                .iter()
+                .all(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE),
+            "the confidence filter applies to the returned cards"
+        );
+        assert!(
+            !cards.iter().any(|c| c.value == "low confidence whisper"),
+            "below-threshold cards never enter M1, so they are never returned"
+        );
+
+        let plain = store
+            .retrieve_with_entity_context("session-3")
+            .await
+            .unwrap();
+        assert_eq!(
+            plain.len(),
+            enriched.len(),
+            "the legacy method delegates with unchanged behavior"
         );
     }
 

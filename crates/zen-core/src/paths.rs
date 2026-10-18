@@ -44,6 +44,20 @@ fn test_home_fallback() -> PathBuf {
     static TEST_HOME: LazyLock<PathBuf> = LazyLock::new(|| {
         let base = std::env::temp_dir().join(format!("zen-test-home-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&base);
+        // Loud over silent: running a test-support binary (e.g. the
+        // target/debug artifact rebuilt by `bin/test`, which unifies the
+        // dev-dependency feature) outside a test harness used to land here
+        // with zero indication — the operator sees an empty home (no
+        // state.db/vault/memories) and reads it as data loss or a migration
+        // failure. One stderr line makes the ephemerality obvious.
+        eprintln!(
+            "zen: no ZEN_HOME set — using an EPHEMERAL per-process home ({}). \
+             This binary was built with the test-support feature: state.db, \
+             vault, memories, and audit.jsonl are TEMPORARY and disappear with \
+             the process. For real data set ZEN_HOME, or install the release \
+             build: cargo install --path crates/zen --force",
+            base.display()
+        );
         base
     });
     TEST_HOME.clone()

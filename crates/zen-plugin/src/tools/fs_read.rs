@@ -1,5 +1,4 @@
 use std::io::SeekFrom;
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -116,9 +115,10 @@ impl Tool for FsReadTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let path_str = args["path"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'path' field".into())
-        })?;
+        let path_str = match args["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(json!({ "error": "Missing or invalid 'path' field" })),
+        };
 
         let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(1) as usize;
         let limit = args
@@ -146,15 +146,16 @@ impl Tool for FsReadTool {
             .unwrap_or("utf8");
         let is_base64 = encoding.eq_ignore_ascii_case("base64");
 
-        let path = PathBuf::from(path_str);
+        let path = zen_core::sandbox::resolve_agent_path(path_str);
 
         self.validator
             .validate_path_for_read(&path)
             .map_err(KernelError::ToolFailed)?;
 
-        let metadata = tokio::fs::metadata(&path)
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("Failed to read {}: {}", path_str, e)))?;
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) => return Ok(json!({ "error": format!("Failed to read {}: {}", path_str, e) })),
+        };
         let file_size = metadata.len() as usize;
 
         let byte_mode = args.get("offset_bytes").is_some() || args.get("length").is_some();
@@ -164,18 +165,22 @@ impl Tool for FsReadTool {
             let start = offset_bytes.min(file_size);
             let want = length.map(|l| l.min(max_bytes)).unwrap_or(max_bytes);
             let to_read = want.min(file_size - start);
-            let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to open {}: {}", path_str, e))
-            })?;
-            file.seek(SeekFrom::Start(start as u64))
-                .await
-                .map_err(|e| {
-                    KernelError::ToolFailed(format!("Failed to seek {}: {}", path_str, e))
-                })?;
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    return Ok(json!({ "error": format!("Failed to open {}: {}", path_str, e) }));
+                }
+            };
+            if let Err(e) = file.seek(SeekFrom::Start(start as u64)).await {
+                return Ok(json!({ "error": format!("Failed to seek {}: {}", path_str, e) }));
+            }
             let mut buf = vec![0u8; to_read];
-            let n = read_up_to(&mut file, &mut buf).await.map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to read {}: {}", path_str, e))
-            })?;
+            let n = match read_up_to(&mut file, &mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    return Ok(json!({ "error": format!("Failed to read {}: {}", path_str, e) }));
+                }
+            };
             buf.truncate(n);
             (buf, file_size > max_bytes)
         } else {
@@ -184,14 +189,20 @@ impl Tool for FsReadTool {
             // the read, so an unbounded tokio::fs::read here was an OOM
             // vector. Reading max_bytes + 1 lets us detect post-read growth
             // (truncated) instead of silently believing the stale metadata.
-            let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to open {}: {}", path_str, e))
-            })?;
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    return Ok(json!({ "error": format!("Failed to open {}: {}", path_str, e) }));
+                }
+            };
             let read_cap = max_bytes.saturating_add(1);
             let mut buf = vec![0u8; read_cap];
-            let n = read_up_to(&mut file, &mut buf).await.map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to read {}: {}", path_str, e))
-            })?;
+            let n = match read_up_to(&mut file, &mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    return Ok(json!({ "error": format!("Failed to read {}: {}", path_str, e) }));
+                }
+            };
             let truncated = n > max_bytes;
             buf.truncate(n.min(max_bytes));
             (buf, truncated)
@@ -335,5 +346,21 @@ mod tests {
             .decode(res["content"].as_str().unwrap())
             .unwrap();
         assert_eq!(decoded, bytes);
+    }
+
+    #[tokio::test]
+    async fn missing_file_returns_structured_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.txt");
+        let res = tool()
+            .invoke(json!({ "path": path.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Failed to read")),
+            "expected structured error, got: {res}"
+        );
     }
 }

@@ -1,9 +1,9 @@
-//! TODO-004: Verify INSERT OR REPLACE preserves FTS5 rowid alignment.
+//! Verify INSERT OR REPLACE preserves FTS5 rowid alignment.
 //!
-//! NotesRepo::index_note() does INSERT OR REPLACE on notes_meta (TEXT PK),
-//! then INSERT OR REPLACE INTO notes_fts using last_insert_rowid() to bind
-//! the FTS row to the new notes_meta rowid. This test documents what
-//! actually happens to the alignment under INSERT OR REPLACE.
+//! NotesRepo::index_note() derives ONE deterministic rowid from the note id and
+//! writes it explicitly to BOTH notes_meta and notes_fts, so the search JOIN
+//! (`notes_fts.rowid = notes_meta.rowid`) keeps resolving after a re-index and
+//! the rowid no longer churns on every write (2026-10-17 data-bloat fix).
 
 use tempfile::tempdir;
 use zen_repo::{IndexNoteRequest, NotesRepo, SqliteClient};
@@ -76,9 +76,9 @@ async fn insert_or_replace_preserves_fts_rowid_alignment() {
         "INSERT OR REPLACE on notes_meta + app-side FTS re-insert must leave one notes_fts row at the new meta rowid"
     );
 
-    assert_ne!(
+    assert_eq!(
         meta_row_after_first.0, meta_row_after_second.0,
-        "INSERT OR REPLACE must allocate a fresh rowid (DELETE+INSERT semantics)"
+        "the rowid is derived deterministically from the note id and must be stable across re-index calls"
     );
 
     let hits_second = notes.search("alpha", 10).await.unwrap();

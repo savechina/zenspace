@@ -220,6 +220,45 @@ pub fn wiki_page_inventory(wiki_dir: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// Top-level wiki subdirectories that are machine-generated wisdom /
+/// community surfaces rather than notion concept pages.
+const NON_CONCEPT_DIRS: &[&str] = &["wisdom", "communities"];
+/// Top-level machine-maintained wiki files (OKF §6 exemption precedent).
+const NON_CONCEPT_FILES: &[&str] = &["index.md", "log.md"];
+
+/// Concept-page-only variant of [`wiki_page_inventory`] — the correct input
+/// for [`GraphIntegrityVerifier::verify`] Check 1 ("every wiki CONCEPT page
+/// has a DB entity").
+///
+/// Feeding the full inventory into verify was the engine of the 2026-10-15
+/// hypothesis explosion: wisdom pages (hypotheses/reflections/beliefs/…)
+/// never have DB entities, so every cycle gapped them all; the resulting
+/// hypothesis pages re-entered the next inventory, chaining
+/// `missing_entity-<previous-slug>` generations with truncation-hash
+/// suffixes that never converge — 26k files in under an hour once the
+/// worker's compile-stage CJK panic (which had masked this) was fixed.
+pub fn concept_page_inventory(wiki_dir: &Path) -> Vec<(String, String)> {
+    wiki_page_inventory(wiki_dir)
+        .into_iter()
+        .filter(|(_, rel)| {
+            let mut comps = Path::new(rel).components();
+            match comps.next() {
+                Some(c) if c.as_os_str().to_string_lossy().starts_with('.') => false,
+                Some(c) => {
+                    let top = c.as_os_str().to_string_lossy();
+                    let rest_is_top_level = comps.next().is_none();
+                    if rest_is_top_level {
+                        !NON_CONCEPT_FILES.iter().any(|f| *f == rel)
+                    } else {
+                        !NON_CONCEPT_DIRS.iter().any(|d| *d == top)
+                    }
+                }
+                None => false,
+            }
+        })
+        .collect()
+}
+
 // ── Placeholder-based graph ingest (FR-031, T032a) ─────────────────────
 
 /// Outcome of a concurrent claim against a declared placeholder slot (FR-031).
@@ -381,6 +420,30 @@ impl PlaceholderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concept_page_inventory_excludes_machine_surfaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path().join("wiki");
+        for rel in [
+            "notions/technology/go.md",
+            "my-page.md",
+            "wisdom/hypotheses/missing_entity-x.md",
+            "wisdom/beliefs/b1.md",
+            "communities/c1.md",
+            "index.md",
+            "log.md",
+        ] {
+            let p = wiki.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+        }
+        let full = wiki_page_inventory(&wiki);
+        assert_eq!(full.len(), 7, "full inventory sees everything");
+        let concepts = concept_page_inventory(&wiki);
+        let rels: Vec<&str> = concepts.iter().map(|(_, r)| r.as_str()).collect();
+        assert_eq!(rels, vec!["notions/technology/go.md", "my-page.md"]);
+    }
 
     #[test]
     fn inventory_lists_md_files_vault_relative() {

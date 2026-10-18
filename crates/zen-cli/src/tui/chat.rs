@@ -5,6 +5,7 @@ use ratatui::text::Line;
 
 use super::app::{App, ECHO_SCRIPT, PendingCallKind, PendingLlmCallStream};
 use super::cell::{OutputCell, PlainCell};
+use crate::session::estimate_tokens;
 use zen_core::types::SessionContext;
 
 impl App {
@@ -368,7 +369,7 @@ impl App {
                 if !result.tokens.is_empty() {
                     self.status_hint = None; // T056: model started speaking
                 }
-                self.current_response_tokens = self.stream_collector.buffer().len() / 4;
+                self.current_response_tokens = estimate_tokens(self.stream_collector.buffer());
                 // T082 (NFR-009): stalls closed by a later delta emit once,
                 // here — never per tick.
                 self.emit_stream_stall_audits();
@@ -447,7 +448,7 @@ impl App {
                                 }
                                 self.invalidate_output_cache();
                             }
-                            self.current_response_tokens = response.len() / 4;
+                            self.current_response_tokens = estimate_tokens(&response);
                             let protocol =
                                 zen_gateway::protocol::SERVER_PROTOCOL_VERSION.to_string();
                             // Phase 30 G3: the prewarm-recorded stale hint rides

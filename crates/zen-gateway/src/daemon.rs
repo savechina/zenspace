@@ -271,6 +271,24 @@ impl Drop for SoleOwnerClaim {
     }
 }
 
+/// One-per-process skew emission guard (D16/D18): tolerance removes the
+/// retry-flood at the source, so this warn line must never repeat even when
+/// several `GatewayService::open` calls succeed in one process.
+static SCHEMA_SKEW_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Emits the D17 informational skew line at most once per process.
+/// Returns whether this call was the one that logged (test seam).
+fn warn_schema_skew_once(db_max: i64, embedded_max: i64) -> bool {
+    if SCHEMA_SKEW_LOGGED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    tracing::warn!(
+        "state.db schema v{db_max} is ahead of this binary (v{embedded_max}) — \
+         tolerated (additive-only); upgrade zen when convenient"
+    );
+    true
+}
+
 /// How this server instance came to life. Embedded servers are owned
 /// by the surface process that spawned them and refuse sibling
 /// attachment (sole-owner store semantics); standalone daemons share.
@@ -487,6 +505,18 @@ impl GatewayService {
             }
         };
         let knowledge = Self::build_knowledge(config, paths.as_ref()).await;
+
+        // Spec D16/D17: one informational line per process when the on-disk
+        // schema is ahead of this binary's embedded set (old binary vs newer
+        // DB). Tolerated under additive-only migrations — never a refusal,
+        // never an auto-restart (restarting the same binary cannot help).
+        // A failed knowledge stack is skipped silently (`detect_schema_skew`
+        // returns `None`).
+        if let Some(state) = knowledge.as_ref()
+            && let Some((db, emb)) = state.detect_schema_skew().await
+        {
+            warn_schema_skew_once(db, emb);
+        }
 
         // Hosted-session stack: orchestrator (Ask-capable) + approval
         // broker + guards + audit sink.
@@ -1017,12 +1047,32 @@ impl GatewayService {
         })?;
 
         tracing::info!("memory/rebuild: full memvid reindex starting");
+        // T223 (review R5): provenance metadata rides the SAME
+        // `[agentic.memory_strength]` gate the nightly worker flips (T210,
+        // memvid_indexer_worker.rs) — without it a rebuild under an enabled
+        // gate degrades strength to anchor-only and stalls the T211
+        // increments until the next nightly. Fail-open: a config load failure
+        // keeps the rebuild alive with provenance OFF (warn, never abort).
+        //
+        // Rebuild re-appends frames by design (manual, bounded; the nightly
+        // incremental index now dedups via T219).
+        let provenance_enabled = match zen_core::config::load_config() {
+            Ok(config) => config.agentic.memory_strength.enabled_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "memory/rebuild: config load failed — provenance metadata stays off"
+                );
+                false
+            }
+        };
         let report = {
             let mut guard = self.store.write().await;
             let Some(store) = guard.as_mut() else {
                 return Err(crate::protocol::RpcError::store_unavailable("unavailable"));
             };
             MemvidIndexer::new(paths.memory(), paths.wiki())
+                .with_provenance_metadata(provenance_enabled)
                 .index_all(store)
                 .map_err(|e| {
                     crate::protocol::RpcError::internal(&format!("memvid reindex failed: {e}"))
@@ -1158,6 +1208,35 @@ impl GatewayService {
             serverVersion = env!("CARGO_PKG_VERSION"),
             "gateway listening"
         );
+
+        // Embedding warmup: load the local embedding model (e.g. ollama
+        // `qwen3-embedding`, multi-GB) at daemon start so the FIRST
+        // `knowledge/search` does not pay the cold-load cost past the
+        // client's 30s RPC timeout (the observed `-32603`). Reuses the same
+        // process-wide router the search path uses; best-effort and
+        // blocking, so any failure only warns.
+        let warmup_task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match tokio::task::spawn_blocking(|| {
+                zen_vault::tindy::embeddings::compute_embeddings_for_text("zen embedding warmup")
+            })
+            .await
+            {
+                Ok(Ok(v)) => tracing::info!(
+                    dim = v.len(),
+                    ms = started.elapsed().as_millis() as u64,
+                    "embedding warmup complete"
+                ),
+                Ok(Err(e)) => tracing::warn!(
+                    error = %e,
+                    "embedding warmup failed; first search may be slow"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "embedding warmup task failed; first search may be slow"
+                ),
+            }
+        });
 
         // StaleClientGC (E7): heartbeat pings at GC_HEARTBEAT cadence so
         // half-dead peers surface as send errors and get reaped by their
@@ -1301,6 +1380,7 @@ impl GatewayService {
         // in-flight reply finishes its POST rather than being silently
         // dropped mid-send by an abort().
         gc_task.abort();
+        warmup_task.abort();
         if let Some(task) = idle_task {
             task.abort();
         }
@@ -1475,5 +1555,28 @@ mod drain_tests {
         let exit =
             wait_drain_or_force(&counter(n), &mut rx, std::time::Duration::from_millis(50)).await;
         assert_eq!(exit, DrainExit::WindowElapsed);
+    }
+}
+
+#[cfg(test)]
+mod schema_skew_tests {
+    use super::*;
+
+    #[test]
+    fn warn_schema_skew_once_fires_at_most_once_per_process() {
+        SCHEMA_SKEW_LOGGED.store(false, Ordering::SeqCst);
+        assert!(
+            warn_schema_skew_once(11, 10),
+            "first skew observation must log"
+        );
+        assert!(
+            !warn_schema_skew_once(11, 10),
+            "repeat observations must be suppressed"
+        );
+        assert!(
+            !warn_schema_skew_once(12, 10),
+            "guard is per-process, not per-value"
+        );
+        SCHEMA_SKEW_LOGGED.store(false, Ordering::SeqCst);
     }
 }

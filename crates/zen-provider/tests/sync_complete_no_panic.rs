@@ -77,3 +77,32 @@ async fn embed_inside_current_thread_runtime_does_not_panic() {
         .expect("spawn_blocking join");
     assert!(r.is_err(), "unreachable endpoint must yield Err, got Ok");
 }
+
+/// `health_check` is the OTHER blocking surface — `reqwest::blocking`, not
+/// the nested-Runtime `complete` path. `enforce_sensitivity →
+/// is_local_llm_available` reaches it from async callers (delegate sub-turns,
+/// orchestrator turns, scheduler workers, CLI), and reqwest's blocking client
+/// must never run inside an async runtime (nested-runtime panic in debug
+/// builds; a parked runtime worker in release). The dedicated-thread guard
+/// inside `health_check` itself is the contract: the probe is called DIRECTLY
+/// on the runtime thread here — no caller-side spawn_blocking — and must
+/// return `false` (unreachable), never panic.
+#[tokio::test(flavor = "current_thread")]
+async fn health_check_inside_current_thread_runtime_does_not_panic() {
+    let p = OllamaProvider::new(UNREACHABLE.into(), MODEL.into());
+    assert!(
+        !p.health_check(),
+        "unreachable endpoint must report unavailable, not panic"
+    );
+}
+
+/// Multi-thread runtime (production flavor): same contract, called directly
+/// on a worker thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_check_inside_multi_thread_runtime_does_not_panic() {
+    let p = OllamaProvider::new(UNREACHABLE.into(), MODEL.into());
+    assert!(
+        !p.health_check(),
+        "unreachable endpoint must report unavailable, not panic"
+    );
+}

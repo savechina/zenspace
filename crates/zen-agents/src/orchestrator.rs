@@ -5,14 +5,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use rig_agent::agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome};
+use futures::{StreamExt, TryStreamExt};
+use rig_agent::agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, PendingToolCall};
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::{
     ToolDispatchHook, ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
 use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_core::completion::{AssistantContent, Usage, message::ToolCall as NativeToolCall};
-use rig_core::message::Message;
+use rig_core::message::{Message, ToolResultContent, UserContent};
 use tracing::{debug, info, instrument, warn};
 
 use zen_core::config::KnowledgeInjectMode;
@@ -60,6 +61,17 @@ const WAKE_UP_BRIEF_MAX_BYTES: u64 = 256 * 1024;
 /// not invention; T206 deliberately left the key out of config until this
 /// consumer landed (T192 no-dormant-key discipline).
 const KNOWLEDGE_NOTE_LIMIT: usize = 3;
+
+/// W4.6c (G1-07) cap for the per-turn accumulated tool-results history.
+///
+/// The provider tool results reach `AgentRun`, but zen owns prompt assembly
+/// (executor / zen_agent), so each round's results must be threaded forward
+/// in the orchestrator or the model only ever sees the latest round. This is
+/// a constant, not a config key (T192 no-dormant-key discipline): ~4k tokens
+/// of prior-round context, sufficient for multi-round chains while keeping
+/// the prompt bounded. Oldest rounds are dropped first when the cap is hit;
+/// the newest round always survives.
+const TOOL_RESULTS_HISTORY_CAP_CHARS: usize = 16_000;
 
 /// Lazily-initialized KB search stack for knowledge injection (T214, design
 /// F2-D6): `SearchService` over a `SqliteClient` opened once per orchestrator
@@ -287,29 +299,205 @@ fn tool_output_is_error(output: &serde_json::Value) -> bool {
     }
 }
 
-/// FR-036: dispatch invocations one at a time through the hook pipeline,
-/// timing each dispatch individually so per-tool latency is the real
-/// measured dispatch time — not the batch total divided by the result
-/// count (T157). A hook terminate aborts the remaining batch exactly like
-/// the batch dispatcher.
+/// W4.5a (G1-02): a hook `Terminate` (approval/seatbelt) or a budget denial
+/// aborts the whole dispatch; every other kernel error is a per-invocation
+/// tool failure that must not discard already-executed siblings. Mirrors
+/// `delegate_task::dispatch_error_feedback` (G1-09), which is private there.
+fn is_hook_termination(error: &KernelError) -> bool {
+    matches!(
+        error,
+        KernelError::ToolDispatchTerminated(_) | KernelError::BudgetFailed(_)
+    )
+}
+
+/// W4.5a (G1-02): label a *whole-batch* dispatch abort accurately. With
+/// per-invocation isolation in `dispatch_timed`, this path only fires for a
+/// hook `Terminate` / budget denial — the old blanket "blocked by sandbox"
+/// mislabeled every `ToolFailed`/`ToolNotFound`.
+fn dispatch_error_feedback(error: &KernelError) -> String {
+    if is_hook_termination(error) {
+        format!("tool dispatch blocked (approval/seatbelt/budget): {error}")
+    } else {
+        format!("tool failed: {error}")
+    }
+}
+
+/// W4.5c (G1-04): build a tool-result `UserContent` answering one call by id.
+fn tool_result_content(call_id: String, name: String, text: String) -> UserContent {
+    UserContent::tool_result(call_id, name, vec![ToolResultContent::text(text)])
+}
+
+/// Upper bound on concurrently in-flight tool dispatches within one round.
+/// Ordered (`buffered`) execution preserves the result↔invocation
+/// positional contract that `BatchPlan` and the answer-zip in both driver
+/// loops rely on; 4 matches the delegate fan-out default.
+const DISPATCH_MAX_CONCURRENT: usize = 4;
+
+/// FR-036: dispatch invocations through the hook pipeline, timing each
+/// dispatch individually so per-tool latency is the real measured dispatch
+/// time — not the batch total divided by the result count (T157).
+///
+/// Invocations run CONCURRENTLY (bounded by [`DISPATCH_MAX_CONCURRENT`],
+/// order-preserving): independent reads (fs.list + tier2_search + web.search
+/// in one round) no longer serialize. A per-invocation error is caught and
+/// synthesized as a structured `{"error": …}` result so sibling results
+/// already collected survive and the round continues. A hook `Terminate` /
+/// budget denial propagates via `try_collect` and aborts the batch
+/// (approval/seatbelt policy is intentionally batch-scoped); invocations
+/// already in flight when it fires are inherently completed — that is the
+/// accepted cost of parallel dispatch.
 async fn dispatch_timed(
     tools: &ToolRegistry,
     invocations: &[ToolInvocation],
     hooks: &[&dyn ToolDispatchHook],
 ) -> Result<(Vec<ToolInvocationResult>, Vec<u64>), KernelError> {
-    let mut results = Vec::with_capacity(invocations.len());
-    let mut latencies = Vec::with_capacity(invocations.len());
+    // A plain loop building an owned-future Vec (not a closure returning an
+    // async block) — the closure form fails higher-ranked lifetime checks
+    // once this future is boxed behind `TurnExecutor`.
+    let mut dispatches = Vec::with_capacity(invocations.len());
     for invocation in invocations {
-        let start = Instant::now();
-        let mut batch =
-            dispatch_tool_invocations_with_hooks(tools, std::slice::from_ref(invocation), hooks)
-                .await?;
-        latencies.push(start.elapsed().as_millis() as u64);
-        if let Some(result) = batch.pop() {
-            results.push(result);
-        }
+        let invocation = invocation.clone();
+        dispatches.push(async move {
+            let start = Instant::now();
+            let entry = match dispatch_tool_invocations_with_hooks(
+                tools,
+                std::slice::from_ref(&invocation),
+                hooks,
+            )
+            .await
+            {
+                Ok(mut batch) => {
+                    Ok(batch.pop().unwrap_or_else(|| ToolInvocationResult {
+                        invocation,
+                        output: serde_json::json!({ "error": "dispatch returned no result" }),
+                    }))
+                }
+                Err(error) => {
+                    if is_hook_termination(&error) {
+                        Err(error)
+                    } else {
+                        debug!(tool = %invocation.name, error = %error, "tool invocation failed; isolated from batch");
+                        Ok(ToolInvocationResult {
+                            invocation,
+                            output: serde_json::json!({ "error": error.to_string() }),
+                        })
+                    }
+                }
+            };
+            entry.map(|result| (result, start.elapsed().as_millis() as u64))
+        });
+    }
+    let timed: Result<Vec<(ToolInvocationResult, u64)>, KernelError> =
+        futures::stream::iter(dispatches)
+            .buffered(DISPATCH_MAX_CONCURRENT)
+            .try_collect()
+            .await;
+
+    let entries = timed?;
+    let mut results = Vec::with_capacity(entries.len());
+    let mut latencies = Vec::with_capacity(entries.len());
+    for (result, latency) in entries {
+        results.push(result);
+        latencies.push(latency);
     }
     Ok((results, latencies))
+}
+
+/// W4.6c (G1-07): append one round's rendered tool results to the per-turn
+/// history, dropping oldest rounds first once the char cap is exceeded. The
+/// newest round always survives (truncated at a char boundary if it alone
+/// exceeds the cap).
+fn push_tool_results_history(history: &mut Vec<String>, round: String) {
+    history.push(round);
+    let mut total: usize = history.iter().map(String::len).sum();
+    while total > TOOL_RESULTS_HISTORY_CAP_CHARS && history.len() > 1 {
+        let removed = history.remove(0);
+        total = total.saturating_sub(removed.len());
+    }
+    if total > TOOL_RESULTS_HISTORY_CAP_CHARS {
+        let newest = history.last_mut().expect("history is non-empty");
+        let mut cut = newest.len() - TOOL_RESULTS_HISTORY_CAP_CHARS;
+        while cut < newest.len() && !newest.is_char_boundary(cut) {
+            cut += 1;
+        }
+        *newest = newest[cut..].to_string();
+    }
+}
+
+/// W4.6c (G1-07): join the accumulated per-round history for prompt assembly.
+fn join_tool_results_history(history: &[String]) -> String {
+    history.join("\n---\n")
+}
+
+/// W4.5b (G1-03): split normalized invocations into the granted subset that
+/// enters `model_response` and the not-granted names answered with a targeted
+/// structured rejection. rig's `InvalidToolCallAction::Skip` suppresses the
+/// *entire* turn (any-skipped marks every call preresolved), so an ungranted
+/// name cannot be left to rig — pre-filtering is the only per-call fix.
+/// Returns `(granted, rejected)` where `rejected` is `(name, args-json)`.
+fn partition_granted_invocations(
+    invocations: Vec<ToolInvocation>,
+    tool_names: &BTreeSet<String>,
+) -> (Vec<ToolInvocation>, Vec<(String, String)>) {
+    let mut granted = Vec::new();
+    let mut rejected = Vec::new();
+    for invocation in invocations {
+        if tool_names.contains(invocation.name.as_str()) {
+            granted.push(invocation);
+        } else {
+            rejected.push((invocation.name.to_string(), invocation.args.to_string()));
+        }
+    }
+    (granted, rejected)
+}
+
+/// One batch's execution plan derived from rig's pending tool calls.
+struct BatchPlan {
+    /// Calls to dispatch, each paired with its rig call id (result order
+    /// matches this slice exactly, so results map by id — never by index).
+    dispatch: Vec<(String, ToolInvocation)>,
+    /// Answers for preresolved / normalizer-rejected calls, keyed by id.
+    answers: Vec<UserContent>,
+    /// Observability records for normalizer-rejected calls.
+    rejected: Vec<ToolCall>,
+}
+
+/// W4.5c (G1-04) + W4.6b (G1-05): turn rig's pending calls into an id-keyed
+/// execution plan. Preresolved calls are answered verbatim; calls rejected by
+/// the normalizer are answered inline with `invalid arguments: …` so their
+/// ids are never left unanswered (which would protocol-violate the turn).
+fn plan_tool_batch(calls: &[PendingToolCall]) -> BatchPlan {
+    let mut dispatch = Vec::new();
+    let mut answers = Vec::with_capacity(calls.len());
+    let mut rejected = Vec::new();
+    for pending in calls {
+        if let Some(pre) = &pending.preresolved_result {
+            answers.push(pre.clone());
+            continue;
+        }
+        let tc = &pending.tool_call;
+        match ToolInvocation::new(tc.function.name.clone(), tc.function.arguments.clone()) {
+            Ok(invocation) => dispatch.push((tc.id.to_string(), invocation)),
+            Err(error) => {
+                let reason = format!("invalid arguments: {error}");
+                rejected.push(ToolCall {
+                    tool_name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.to_string(),
+                    result: reason.clone(),
+                });
+                answers.push(tool_result_content(
+                    tc.id.to_string(),
+                    tc.function.name.clone(),
+                    reason,
+                ));
+            }
+        }
+    }
+    BatchPlan {
+        dispatch,
+        answers,
+        rejected,
+    }
 }
 
 /// FR-034: derive a citation fingerprint from a note's body — the first
@@ -456,6 +644,18 @@ fn resolve_knowledge_tier(tiers: &str) -> Option<u8> {
         "llm" => Some(5),
         _ => None,
     }
+}
+
+/// T220 (R2/P1): the pre-supplied-knowledge predicate for the T214 skip,
+/// shared by both turn-entry capture sites (`execute`/`execute_stream`) so
+/// the criterion has a single source. A non-empty vec is NOT sufficient: a
+/// surface can pass structurally empty notes (contentless-FTS snippets,
+/// unreadable canonical files) and honoring those as "supplied knowledge"
+/// suppressed the sole default-ON injection gate on the main interactive
+/// surface (TUI Fast) while M1 rendered empty blocks. Pre-supplied knowledge
+/// means at least one entry with non-whitespace content.
+fn has_substantive_knowledge(notes: &[RetrievedNote]) -> bool {
+    notes.iter().any(|note| !note.content.trim().is_empty())
 }
 
 /// Truncate retrieved notes to a total char budget at char boundaries
@@ -1199,7 +1399,9 @@ impl AgentOrchestrator {
         let paths = ZenPaths::detect().ok();
         // T214 precondition, captured BEFORE zen's own M1 injectors run:
         // only surface-supplied knowledge (TUI) may skip the retrieval.
-        let knowledge_pre_supplied = !session.knowledge.is_empty();
+        // T220: "supplied" requires ≥1 entry with real content — an all-empty
+        // vec is a false positive that suppressed the default-ON gate.
+        let knowledge_pre_supplied = has_substantive_knowledge(&session.knowledge);
         if let Some(paths) = paths.as_ref() {
             inject_wake_up_brief(paths, session);
         }
@@ -1328,57 +1530,74 @@ impl AgentOrchestrator {
             );
 
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut tokens_spent: u64 = 0;
         let mut last_model_used = String::new();
         let mut final_response = String::new();
         let mut dispatch_round: usize = 0;
+        // W4.6c (G1-07): per-turn accumulated tool results. W1.4a: per-round
+        // budget probes held for the turn so a multi-round turn cannot overrun.
+        let mut accumulated_results: Vec<String> = Vec::new();
+        let mut pending_rejection_entries: Vec<String> = Vec::new();
+        let mut round_reservations: Vec<rig_compose::budget::TokenReservation> = Vec::new();
 
         loop {
             match run.next_step()? {
                 AgentRunStep::CallModel {
-                    prompt,
+                    prompt: _,
                     history: _,
                     turn,
                 } => {
-                    let tool_results_text = match &prompt {
-                        Message::User { content } => {
-                            let text = match content.first() {
-                                Some(rig_core::message::UserContent::Text(t)) => t.text.clone(),
-                                _ => String::new(),
-                            };
-                            if text.starts_with("## Tool Results") {
-                                text
-                            } else {
-                                String::new()
-                            }
+                    // W1.4a: in-loop budget gate. The reservation is held for
+                    // the rest of the turn (refunded on drop) so availability
+                    // reflects prior rounds; exhaustion breaks with a
+                    // structured note rather than overrunning.
+                    match self
+                        .token_budget
+                        .try_reserve_tokens(estimated_tokens as u64)
+                        .await
+                    {
+                        Ok(Some(reservation)) => round_reservations.push(reservation),
+                        Ok(None) => {
+                            let consumed = self.token_budget.tokens_consumed().await;
+                            warn!(
+                                consumed,
+                                "token budget exhausted mid-loop; stopping tool rounds"
+                            );
+                            tool_calls.push(ToolCall {
+                                tool_name: "<budget>".to_string(),
+                                arguments: String::new(),
+                                result:
+                                    "budget_exhausted: token budget exhausted before this round"
+                                        .to_string(),
+                            });
+                            break;
                         }
-                        _ => String::new(),
-                    };
-                    let tool_results_str = if tool_results_text.is_empty() {
-                        ""
-                    } else {
-                        &tool_results_text
-                    };
+                        Err(e) => {
+                            warn!(error = %e, "token budget reservation failed; gate skipped");
+                        }
+                    }
 
+                    let history_text = join_tool_results_history(&accumulated_results);
                     let (response_text, native_calls) = self.executor.execute_model_call(
                         &context,
                         &zen_agent,
                         &tool_manifest,
-                        tool_results_str,
+                        &history_text,
                     )?;
 
                     let (invocations, parse_errors, _degraded) =
                         Self::resolve_invocations(&response_text, &native_calls);
 
-                    if !parse_errors.is_empty() {
-                        for err in &parse_errors {
-                            warn!(error = %err, turn, "fenced tool block unparseable");
-                            tool_calls.push(ToolCall {
-                                tool_name: "<parse>".to_string(),
-                                arguments: String::new(),
-                                result: err.clone(),
-                            });
-                        }
+                    for err in &parse_errors {
+                        warn!(error = %err, turn, "fenced tool block unparseable");
+                        tool_calls.push(ToolCall {
+                            tool_name: "<parse>".to_string(),
+                            arguments: String::new(),
+                            result: err.clone(),
+                        });
+                    }
+                    if invocations.is_empty() && !parse_errors.is_empty() {
+                        // No valid sibling to preserve: retain the corrective
+                        // re-prompt (W4.6b keeps it only for this case).
                         let feedback = format!(
                             "Your previous tool call block could not be parsed and was NOT executed:\n{}\nRe-emit exactly one valid ```json block with {{\"tool\": \"<name>\", \"args\": {{...}}}}.",
                             parse_errors.join("\n")
@@ -1392,12 +1611,31 @@ impl AgentOrchestrator {
                         continue;
                     }
 
-                    let assistant_content: Vec<AssistantContent> = if invocations.is_empty() {
+                    let (granted, rejected) =
+                        partition_granted_invocations(invocations, &tool_names);
+                    pending_rejection_entries.clear();
+                    for (name, args) in &rejected {
+                        let reason = format!(
+                            "tool not available: {name} is not granted/registered on this agent"
+                        );
+                        warn!(tool = %name, "tool invocation rejected: not granted/registered");
+                        tool_calls.push(ToolCall {
+                            tool_name: name.clone(),
+                            arguments: args.clone(),
+                            result: reason.clone(),
+                        });
+                        pending_rejection_entries.push(format!(
+                            "tool: {name}\nargs: {args}\nresult: {}",
+                            serde_json::json!({ "error": reason })
+                        ));
+                    }
+
+                    let assistant_content: Vec<AssistantContent> = if granted.is_empty() {
                         vec![AssistantContent::text(response_text.clone())]
                     } else {
                         let mut items: Vec<AssistantContent> =
                             vec![AssistantContent::text(response_text.clone())];
-                        for (idx, inv) in invocations.iter().enumerate() {
+                        for (idx, inv) in granted.iter().enumerate() {
                             items.push(AssistantContent::tool_call(
                                 format!("call_{idx}"),
                                 inv.name.clone(),
@@ -1418,11 +1656,20 @@ impl AgentOrchestrator {
                     match run.model_response(model_turn)? {
                         ModelTurnOutcome::Continue { .. } => {}
                         ModelTurnOutcome::NeedsResolution(_) => {
-                            run.resolve_invalid_tool_call(
-                                rig_agent::agent::hook::InvalidToolCallAction::skip(
-                                    "invalid tool call",
-                                ),
-                            )?;
+                            // W4.5b (G1-06): a following invalid name can leave
+                            // another resolution pending; loop (bounded by the
+                            // call count) so the next `next_step()` cannot
+                            // protocol-violate.
+                            for _ in 0..=granted.len() {
+                                match run.resolve_invalid_tool_call(
+                                    rig_agent::agent::hook::InvalidToolCallAction::skip(
+                                        "invalid tool call",
+                                    ),
+                                )? {
+                                    ModelTurnOutcome::NeedsResolution(_) => continue,
+                                    _ => break,
+                                }
+                            }
                         }
                         ModelTurnOutcome::TurnRetried => continue,
                     }
@@ -1439,82 +1686,61 @@ impl AgentOrchestrator {
                     if dispatch_round > self.max_tool_rounds {
                         break;
                     }
-                    let mut invocations = Vec::new();
-                    for pending in &calls {
-                        if pending.preresolved_result.is_some() {
-                            continue;
-                        }
-                        let tc = &pending.tool_call;
-                        match ToolInvocation::new(
-                            tc.function.name.clone(),
-                            tc.function.arguments.clone(),
-                        ) {
-                            Ok(inv) => invocations.push(inv),
-                            Err(e) => {
-                                warn!(tool = %tc.function.name, "tool invocation rejected: {e}");
-                                tool_calls.push(ToolCall {
-                                    tool_name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.to_string(),
-                                    result: format!("rejected: {e}"),
-                                });
-                            }
-                        }
-                    }
+                    let BatchPlan {
+                        dispatch,
+                        mut answers,
+                        rejected,
+                    } = plan_tool_batch(&calls);
 
-                    if invocations.is_empty() {
-                        let results: Vec<rig_core::message::UserContent> = calls
-                            .iter()
-                            .map(|c| {
-                                use rig_core::message::ToolResultContent;
-                                rig_core::message::UserContent::tool_result(
-                                    c.tool_call.id.clone(),
-                                    c.tool_call.function.name.clone(),
-                                    vec![ToolResultContent::text(
-                                        "no valid invocations to dispatch",
-                                    )],
-                                )
-                            })
-                            .collect();
-                        run.tool_results(results)?;
+                    if dispatch.is_empty() {
+                        run.tool_results(answers)?;
                         continue;
                     }
 
-                    for invocation in &invocations {
+                    for call in rejected {
+                        tool_calls.push(call);
+                    }
+                    for (_, invocation) in &dispatch {
                         tool_calls.push(ToolCall {
                             tool_name: invocation.name.to_string(),
                             arguments: invocation.args.to_string(),
                             result: String::new(),
                         });
                     }
+                    let invocations: Vec<ToolInvocation> =
+                        dispatch.iter().map(|(_, inv)| inv.clone()).collect();
 
                     let hooks = self.wiring.dispatch_hooks();
-                    let (mut results, latencies) =
-                        match dispatch_timed(zen_agent.generic.tools(), &invocations, &hooks).await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                warn!(error = %e, "tool dispatch terminated by sandbox hook");
-                                tool_calls.push(ToolCall {
-                                    tool_name: "<dispatch>".to_string(),
-                                    arguments: String::new(),
-                                    result: format!("blocked by sandbox: {e}"),
-                                });
-                                let err_msg = format!("blocked by sandbox: {e}");
-                                let results: Vec<rig_core::message::UserContent> = calls
-                                    .iter()
-                                    .map(|c| {
-                                        use rig_core::message::ToolResultContent;
-                                        rig_core::message::UserContent::tool_result(
-                                            c.tool_call.id.clone(),
-                                            c.tool_call.function.name.clone(),
-                                            vec![ToolResultContent::text(err_msg.clone())],
-                                        )
-                                    })
-                                    .collect();
-                                run.tool_results(results)?;
-                                continue;
-                            }
-                        };
+                    let (mut results, latencies) = match dispatch_timed(
+                        zen_agent.generic.tools(),
+                        &invocations,
+                        &hooks,
+                    )
+                    .await
+                    {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            let feedback = dispatch_error_feedback(&e);
+                            warn!(error = %e, "tool dispatch terminated (approval/seatbelt/budget)");
+                            tool_calls.push(ToolCall {
+                                tool_name: "<dispatch>".to_string(),
+                                arguments: String::new(),
+                                result: feedback.clone(),
+                            });
+                            let results: Vec<rig_core::message::UserContent> = calls
+                                .iter()
+                                .map(|c| {
+                                    tool_result_content(
+                                        c.tool_call.id.to_string(),
+                                        c.tool_call.function.name.clone(),
+                                        feedback.clone(),
+                                    )
+                                })
+                                .collect();
+                            run.tool_results(results)?;
+                            continue;
+                        }
+                    };
                     for result in &mut results {
                         let screened = Self::screen_tool_output(&result.output);
                         if screened != result.output {
@@ -1565,25 +1791,26 @@ impl AgentOrchestrator {
                             }
                         }
                     }
-                    let tool_results: Vec<rig_core::message::UserContent> = results
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| {
-                            use rig_core::message::ToolResultContent;
-                            let call = calls
-                                .get(i)
-                                .map(|c| c.tool_call.id.as_str().to_string())
-                                .unwrap_or_default();
-                            rig_core::message::UserContent::tool_result(
-                                call,
-                                r.invocation.name.to_string(),
-                                vec![ToolResultContent::text(
-                                    serde_json::to_string(&r.output).unwrap_or_default(),
-                                )],
-                            )
-                        })
-                        .collect();
-                    run.tool_results(tool_results)?;
+
+                    // W4.6c: accumulate this round's rejections + results so
+                    // the next CallModel prompt carries prior rounds.
+                    let mut round_entry = String::new();
+                    for entry in pending_rejection_entries.drain(..) {
+                        round_entry.push_str(&entry);
+                        round_entry.push_str("\n---\n");
+                    }
+                    round_entry.push_str(&Self::results_to_prompt(&results));
+                    push_tool_results_history(&mut accumulated_results, round_entry);
+
+                    // W4.5c: map each result back to its call id (never by index).
+                    for ((call_id, _), result) in dispatch.iter().zip(results.iter()) {
+                        answers.push(tool_result_content(
+                            call_id.clone(),
+                            result.invocation.name.to_string(),
+                            serde_json::to_string(&result.output).unwrap_or_default(),
+                        ));
+                    }
+                    run.tool_results(answers)?;
                 }
                 AgentRunStep::Done(response) => {
                     final_response = response.output;
@@ -1668,14 +1895,8 @@ impl AgentOrchestrator {
                 &review_task,
                 &final_response,
                 |feedback| {
-                    let redrafted = self.executor.execute_round(
-                        &context,
-                        &zen_agent,
-                        &tool_manifest,
-                        &feedback,
-                    )?;
-                    tokens_spent += ((feedback.len() + redrafted.response.len()) / 4) as u64;
-                    Ok(redrafted)
+                    self.executor
+                        .execute_round(&context, &zen_agent, &tool_manifest, &feedback)
                 },
             )
             .await?
@@ -1968,7 +2189,9 @@ impl AgentOrchestrator {
         let paths = ZenPaths::detect().ok();
         // T214 precondition, captured BEFORE zen's own M1 injectors run:
         // only surface-supplied knowledge (TUI) may skip the retrieval.
-        let knowledge_pre_supplied = !session.knowledge.is_empty();
+        // T220: "supplied" requires ≥1 entry with real content — an all-empty
+        // vec is a false positive that suppressed the default-ON gate.
+        let knowledge_pre_supplied = has_substantive_knowledge(&session.knowledge);
         if let Some(paths) = paths.as_ref() {
             inject_wake_up_brief(paths, session);
         }
@@ -2054,6 +2277,26 @@ impl AgentOrchestrator {
             .map(|td| td.name)
             .collect();
 
+        // W1.4a (G5-02): mirror `execute()`'s turn-level pre-loop reservation
+        // so the stream path gates BEFORE the loop; the post-loop block below
+        // only reconciles this reservation.
+        let estimated_tokens = user_query.len() / 4 + 512;
+        let reservation = match self
+            .token_budget
+            .try_reserve_tokens(estimated_tokens as u64)
+            .await
+        {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => {
+                return Err(anyhow::anyhow!(
+                    "Token budget exhausted ({} consumed, {} capacity)",
+                    self.token_budget.tokens_consumed().await,
+                    self.token_budget.capacity()
+                ));
+            }
+            Err(e) => return Err(anyhow::anyhow!("Token budget reservation failed: {e}")),
+        };
+
         let output_schema = agent_output_schema_value(&agent_name).cloned();
         let output_retries = max_output_schema_retries();
         let mut run = AgentRun::new(Message::user(user_query))
@@ -2075,36 +2318,52 @@ impl AgentOrchestrator {
         let mut interaction_turns: Vec<(&str, String)> = Vec::new();
         let mut final_response = String::new();
         let mut dispatch_round: usize = 0;
+        let mut accumulated_results: Vec<String> = Vec::new();
+        let mut pending_rejection_entries: Vec<String> = Vec::new();
+        let mut round_reservations: Vec<rig_compose::budget::TokenReservation> = Vec::new();
 
         loop {
             match run.next_step()? {
                 AgentRunStep::CallModel {
-                    prompt,
+                    prompt: _,
                     history: _,
                     turn,
                 } => {
-                    let tool_results_text = match &prompt {
-                        Message::User { content } => {
-                            let text = match content.first() {
-                                Some(rig_core::message::UserContent::Text(t)) => t.text.clone(),
-                                _ => String::new(),
-                            };
-                            if text.starts_with("## Tool Results") {
-                                Some(text)
-                            } else {
-                                None
-                            }
+                    // W1.4a: in-loop budget gate, identical to `execute()`.
+                    match self
+                        .token_budget
+                        .try_reserve_tokens(estimated_tokens as u64)
+                        .await
+                    {
+                        Ok(Some(reservation)) => round_reservations.push(reservation),
+                        Ok(None) => {
+                            let consumed = self.token_budget.tokens_consumed().await;
+                            warn!(
+                                consumed,
+                                "token budget exhausted mid-loop; stopping tool rounds"
+                            );
+                            tool_calls.push(ToolCall {
+                                tool_name: "<budget>".to_string(),
+                                arguments: String::new(),
+                                result:
+                                    "budget_exhausted: token budget exhausted before this round"
+                                        .to_string(),
+                            });
+                            break;
                         }
-                        _ => None,
-                    };
+                        Err(e) => {
+                            warn!(error = %e, "token budget reservation failed; gate skipped");
+                        }
+                    }
 
+                    let history_text = join_tool_results_history(&accumulated_results);
+                    let history_opt = if history_text.is_empty() {
+                        None
+                    } else {
+                        Some(history_text.as_str())
+                    };
                     let (response_text, native_calls) = zen_agent
-                        .execute_stream_round(
-                            user_query,
-                            session,
-                            tool_results_text.as_deref(),
-                            &mut callback,
-                        )
+                        .execute_stream_round(user_query, session, history_opt, &mut callback)
                         .await?;
 
                     let (invocations, parse_errors, degraded) =
@@ -2115,16 +2374,16 @@ impl AgentOrchestrator {
                         );
                     }
 
-                    if !parse_errors.is_empty() {
-                        for err in &parse_errors {
-                            warn!(error = %err, turn, "fenced tool block unparseable");
-                            callback(&format!("⚠️ tool block ignored: {err}\n"));
-                            tool_calls.push(ToolCall {
-                                tool_name: "<parse>".to_string(),
-                                arguments: String::new(),
-                                result: err.clone(),
-                            });
-                        }
+                    for err in &parse_errors {
+                        warn!(error = %err, turn, "fenced tool block unparseable");
+                        callback(&format!("⚠️ tool block ignored: {err}\n"));
+                        tool_calls.push(ToolCall {
+                            tool_name: "<parse>".to_string(),
+                            arguments: String::new(),
+                            result: err.clone(),
+                        });
+                    }
+                    if invocations.is_empty() && !parse_errors.is_empty() {
                         let feedback = format!(
                             "Your previous tool call block could not be parsed and was NOT executed:\n{}\nRe-emit exactly one valid ```json block with {{\"tool\": \"<name>\", \"args\": {{...}}}}.",
                             parse_errors.join("\n")
@@ -2140,12 +2399,32 @@ impl AgentOrchestrator {
                         continue;
                     }
 
-                    let assistant_content: Vec<AssistantContent> = if invocations.is_empty() {
+                    let (granted, rejected) =
+                        partition_granted_invocations(invocations, &tool_names);
+                    pending_rejection_entries.clear();
+                    for (name, args) in &rejected {
+                        let reason = format!(
+                            "tool not available: {name} is not granted/registered on this agent"
+                        );
+                        warn!(tool = %name, "tool invocation rejected: not granted/registered");
+                        callback(&format!("⚠️ tool unavailable: {name}\n"));
+                        tool_calls.push(ToolCall {
+                            tool_name: name.clone(),
+                            arguments: args.clone(),
+                            result: reason.clone(),
+                        });
+                        pending_rejection_entries.push(format!(
+                            "tool: {name}\nargs: {args}\nresult: {}",
+                            serde_json::json!({ "error": reason })
+                        ));
+                    }
+
+                    let assistant_content: Vec<AssistantContent> = if granted.is_empty() {
                         vec![AssistantContent::text(response_text.clone())]
                     } else {
                         let mut items: Vec<AssistantContent> =
                             vec![AssistantContent::text(response_text.clone())];
-                        for (idx, inv) in invocations.iter().enumerate() {
+                        for (idx, inv) in granted.iter().enumerate() {
                             items.push(AssistantContent::tool_call(
                                 format!("call_{idx}"),
                                 inv.name.clone(),
@@ -2166,11 +2445,16 @@ impl AgentOrchestrator {
                     match run.model_response(model_turn)? {
                         ModelTurnOutcome::Continue { .. } => {}
                         ModelTurnOutcome::NeedsResolution(_) => {
-                            run.resolve_invalid_tool_call(
-                                rig_agent::agent::hook::InvalidToolCallAction::skip(
-                                    "invalid tool call",
-                                ),
-                            )?;
+                            for _ in 0..=granted.len() {
+                                match run.resolve_invalid_tool_call(
+                                    rig_agent::agent::hook::InvalidToolCallAction::skip(
+                                        "invalid tool call",
+                                    ),
+                                )? {
+                                    ModelTurnOutcome::NeedsResolution(_) => continue,
+                                    _ => break,
+                                }
+                            }
                         }
                         ModelTurnOutcome::TurnRetried => continue,
                     }
@@ -2182,45 +2466,21 @@ impl AgentOrchestrator {
                     if dispatch_round > self.max_tool_rounds {
                         break;
                     }
-                    let mut invocations = Vec::new();
-                    for pending in &calls {
-                        if pending.preresolved_result.is_some() {
-                            continue;
-                        }
-                        let tc = &pending.tool_call;
-                        match ToolInvocation::new(
-                            tc.function.name.clone(),
-                            tc.function.arguments.clone(),
-                        ) {
-                            Ok(inv) => invocations.push(inv),
-                            Err(e) => {
-                                warn!(tool = %tc.function.name, "tool invocation rejected: {e}");
-                                tool_calls.push(ToolCall {
-                                    tool_name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.to_string(),
-                                    result: format!("rejected: {e}"),
-                                });
-                            }
-                        }
-                    }
+                    let BatchPlan {
+                        dispatch,
+                        mut answers,
+                        rejected,
+                    } = plan_tool_batch(&calls);
 
-                    if invocations.is_empty() {
-                        let results: Vec<rig_core::message::UserContent> = calls
-                            .iter()
-                            .map(|c| {
-                                use rig_core::message::ToolResultContent;
-                                rig_core::message::UserContent::tool_result(
-                                    c.tool_call.id.clone(),
-                                    c.tool_call.function.name.clone(),
-                                    vec![ToolResultContent::text("no valid invocations")],
-                                )
-                            })
-                            .collect();
-                        run.tool_results(results)?;
+                    if dispatch.is_empty() {
+                        run.tool_results(answers)?;
                         continue;
                     }
 
-                    for invocation in &invocations {
+                    for call in rejected {
+                        tool_calls.push(call);
+                    }
+                    for (_, invocation) in &dispatch {
                         callback(&format!("🔧 {} …\n", invocation.name.as_str()));
                         tool_calls.push(ToolCall {
                             tool_name: invocation.name.to_string(),
@@ -2228,36 +2488,41 @@ impl AgentOrchestrator {
                             result: String::new(),
                         });
                     }
+                    let invocations: Vec<ToolInvocation> =
+                        dispatch.iter().map(|(_, inv)| inv.clone()).collect();
 
                     let hooks = self.wiring.dispatch_hooks();
-                    let (mut results, latencies) =
-                        match dispatch_timed(zen_agent.generic.tools(), &invocations, &hooks).await
-                        {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                warn!(error = %e, "tool dispatch terminated by sandbox hook");
-                                tool_calls.push(ToolCall {
-                                    tool_name: "<dispatch>".to_string(),
-                                    arguments: String::new(),
-                                    result: format!("blocked by sandbox: {e}"),
-                                });
-                                callback(&format!("❌ tool dispatch blocked: {e}\n"));
-                                let err_msg = format!("blocked by sandbox: {e}");
-                                let results: Vec<rig_core::message::UserContent> = calls
-                                    .iter()
-                                    .map(|c| {
-                                        use rig_core::message::ToolResultContent;
-                                        rig_core::message::UserContent::tool_result(
-                                            c.tool_call.id.clone(),
-                                            c.tool_call.function.name.clone(),
-                                            vec![ToolResultContent::text(err_msg.clone())],
-                                        )
-                                    })
-                                    .collect();
-                                run.tool_results(results)?;
-                                continue;
-                            }
-                        };
+                    let (mut results, latencies) = match dispatch_timed(
+                        zen_agent.generic.tools(),
+                        &invocations,
+                        &hooks,
+                    )
+                    .await
+                    {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            let feedback = dispatch_error_feedback(&e);
+                            warn!(error = %e, "tool dispatch terminated (approval/seatbelt/budget)");
+                            tool_calls.push(ToolCall {
+                                tool_name: "<dispatch>".to_string(),
+                                arguments: String::new(),
+                                result: feedback.clone(),
+                            });
+                            callback(&format!("❌ tool dispatch blocked: {e}\n"));
+                            let results: Vec<rig_core::message::UserContent> = calls
+                                .iter()
+                                .map(|c| {
+                                    tool_result_content(
+                                        c.tool_call.id.to_string(),
+                                        c.tool_call.function.name.clone(),
+                                        feedback.clone(),
+                                    )
+                                })
+                                .collect();
+                            run.tool_results(results)?;
+                            continue;
+                        }
+                    };
                     for result in &mut results {
                         let screened = Self::screen_tool_output(&result.output);
                         if screened != result.output {
@@ -2309,30 +2574,35 @@ impl AgentOrchestrator {
                             }
                         }
                     }
+
+                    // W4.6d (G1-08): persist the calls that actually ran, not
+                    // an empty slice.
+                    let turn_native_calls: Vec<NativeToolCall> =
+                        calls.iter().map(|c| c.tool_call.clone()).collect();
                     let assistant_text =
-                        append_native_tool_calls_fenced(final_response.clone(), &[]);
+                        append_native_tool_calls_fenced(final_response.clone(), &turn_native_calls);
                     interaction_turns.push(("assistant", assistant_text));
                     let results_json = Self::results_to_prompt(&results);
-                    interaction_turns.push(("tool", results_json));
-                    let tool_results: Vec<rig_core::message::UserContent> = results
-                        .iter()
-                        .enumerate()
-                        .map(|(i, r)| {
-                            use rig_core::message::ToolResultContent;
-                            let call = calls
-                                .get(i)
-                                .map(|c| c.tool_call.id.as_str().to_string())
-                                .unwrap_or_default();
-                            rig_core::message::UserContent::tool_result(
-                                call,
-                                r.invocation.name.to_string(),
-                                vec![ToolResultContent::text(
-                                    serde_json::to_string(&r.output).unwrap_or_default(),
-                                )],
-                            )
-                        })
-                        .collect();
-                    run.tool_results(tool_results)?;
+                    interaction_turns.push(("tool", results_json.clone()));
+
+                    // W4.6c: thread this round (rejections + results) forward.
+                    let mut round_entry = String::new();
+                    for entry in pending_rejection_entries.drain(..) {
+                        round_entry.push_str(&entry);
+                        round_entry.push_str("\n---\n");
+                    }
+                    round_entry.push_str(&results_json);
+                    push_tool_results_history(&mut accumulated_results, round_entry);
+
+                    // W4.5c: map each result back to its call id (never by index).
+                    for ((call_id, _), result) in dispatch.iter().zip(results.iter()) {
+                        answers.push(tool_result_content(
+                            call_id.clone(),
+                            result.invocation.name.to_string(),
+                            serde_json::to_string(&result.output).unwrap_or_default(),
+                        ));
+                    }
+                    run.tool_results(answers)?;
                 }
                 AgentRunStep::Done(response) => {
                     final_response = response.output;
@@ -2350,18 +2620,13 @@ impl AgentOrchestrator {
         }
         session.add_turn(MessageRole::Assistant, &final_response);
 
+        // W1.4a: reconcile the turn-level reservation (with any per-round
+        // probe reservations dropped at scope end).
         let actual_tokens = (final_response.len() / 4 + user_query.len() / 4) as u64;
-        let reservation = self
-            .token_budget
-            .try_reserve_tokens(actual_tokens)
-            .await
-            .ok()
-            .flatten();
-        if let Some(res) = reservation {
-            self.token_budget
-                .record_usage(res, actual_tokens, actual_tokens)
-                .await;
-        }
+        self.token_budget
+            .record_usage(reservation, actual_tokens, actual_tokens)
+            .await;
+        drop(round_reservations);
 
         zen_agent.persist_turn(&session.session_id.to_string(), user_query, &final_response);
 
@@ -3575,6 +3840,152 @@ mod tests {
         zen_core::config::invalidate_config_cache();
     }
 
+    /// T220 (R2/P1) predicate unit shapes: a non-empty vec of structurally
+    /// empty notes (contentless-FTS snippets / unreadable canonical files)
+    /// is NOT pre-supplied knowledge; one entry with real content is.
+    #[test]
+    fn pre_supplied_predicate_requires_substantive_content() {
+        let note = |content: &str| RetrievedNote {
+            path: "p.md".to_string(),
+            content: content.to_string(),
+            sensitivity: Sensitivity::Public,
+            relevance: 1.0,
+        };
+        assert!(!has_substantive_knowledge(&[]));
+        assert!(
+            !has_substantive_knowledge(&[note(""), note("   "), note("\n\t ")]),
+            "all-empty/whitespace vec (TUI Fast pre-T222 shape) must not count as supplied"
+        );
+        assert!(has_substantive_knowledge(&[
+            note(""),
+            note("real knowledge")
+        ]));
+        assert!(has_substantive_knowledge(&[note("real knowledge")]));
+    }
+
+    /// T220 (R2/P1) harness: an all-empty pre-supplied vec must NOT skip
+    /// the default-ON injection (the TUI Fast false positive), while a
+    /// mixed vec with ≥1 real entry still skips (real knowledge honored,
+    /// no double retrieval). Audited reason strings unchanged.
+    #[tokio::test]
+    async fn empty_pre_supplied_knowledge_does_not_skip_injection() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let saved_home = std::env::var("ZEN_HOME").ok();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        set_knowledge_env("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT", Some("on"));
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        seed_knowledge_note(
+            &paths,
+            "zenwave",
+            "zenwave ownership keeps memory safe",
+            "zenwave.md",
+        )
+        .await;
+        let orchestrator = AgentOrchestrator::new(mock_knowledge_router());
+        let empty_note = |i: usize| RetrievedNote {
+            path: format!("empty-{i}.md"),
+            content: "  \n\t ".to_string(),
+            sensitivity: Sensitivity::Public,
+            relevance: 1.0,
+        };
+
+        // Phase 1 — the exact TUI Fast shape: 5 structurally empty tier-2
+        // notes ⇒ predicate false ⇒ injection RUNS (audited without a skip
+        // reason; pre-T220 this skipped with knowledge_pre_supplied).
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        session.knowledge = (0..5).map(empty_note).collect();
+        let pre_supplied = has_substantive_knowledge(&session.knowledge);
+        assert!(
+            !pre_supplied,
+            "5 empty notes are not pre-supplied knowledge"
+        );
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                pre_supplied,
+            )
+            .await;
+        let lines = knowledge_audit_lines(&paths);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].get("skipped_reason").is_none(),
+            "injection must RUN, not skip: {lines:?}"
+        );
+        assert_eq!(lines[0]["notes"].as_u64(), Some(1));
+
+        // Phase 2 — mixed vec (≥1 real entry) ⇒ skip with the unchanged
+        // audited reason; the surface's own notes are never double-retrieved
+        // over or reordered.
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        session.knowledge = vec![
+            empty_note(0),
+            RetrievedNote {
+                path: "supplied.md".to_string(),
+                content: "surface-supplied real knowledge".to_string(),
+                sensitivity: Sensitivity::Public,
+                relevance: 1.0,
+            },
+        ];
+        let before = session.knowledge.clone();
+        let pre_supplied = has_substantive_knowledge(&session.knowledge);
+        assert!(pre_supplied, "one real entry IS pre-supplied knowledge");
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                pre_supplied,
+            )
+            .await;
+        assert_eq!(
+            session.knowledge.len(),
+            before.len(),
+            "real pre-supplied knowledge is honored as-is"
+        );
+        let lines = knowledge_audit_lines(&paths);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["skipped_reason"], "knowledge_pre_supplied");
+        assert_eq!(lines[1]["notes"].as_u64(), Some(0));
+
+        // Phase 3 — a smaller all-empty vec (below M1_TOP_K) proves the run
+        // actually DELIVERS: the retrieved note lands in session.knowledge
+        // alongside the empties.
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        session.knowledge = (0..2).map(empty_note).collect();
+        let pre_supplied = has_substantive_knowledge(&session.knowledge);
+        orchestrator
+            .inject_knowledge_context(
+                Some(&paths),
+                &mut session,
+                "zenwave ownership",
+                intent::IntentCategory::Query,
+                pre_supplied,
+            )
+            .await;
+        assert!(
+            session
+                .knowledge
+                .iter()
+                .any(|n| n.content.contains("zenwave")),
+            "the injected note must be present, got: {:?}",
+            session.knowledge
+        );
+        let lines = knowledge_audit_lines(&paths);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[2].get("skipped_reason").is_none());
+
+        set_knowledge_env("ZEN_ORCHESTRATOR_KNOWLEDGE_INJECT", None);
+        match saved_home {
+            Some(home) => unsafe { std::env::set_var("ZEN_HOME", home) },
+            None => unsafe { std::env::remove_var("ZEN_HOME") },
+        }
+        zen_core::config::invalidate_config_cache();
+    }
+
     #[test]
     fn truncate_notes_to_budget_keeps_rank_order_and_char_boundaries() {
         let note = |content: &str| RetrievedNote {
@@ -3616,5 +4027,131 @@ mod tests {
         assert_eq!(resolve_knowledge_tier("llm"), Some(5));
         assert_eq!(resolve_knowledge_tier("banana"), None);
         assert_eq!(resolve_knowledge_tier(""), None);
+    }
+
+    // ── W4.5/W4.6: batch isolation, id-mapping, history ──────────────────
+
+    fn pending_call(id: &str, name: &str, args: serde_json::Value) -> PendingToolCall {
+        PendingToolCall {
+            tool_call: NativeToolCall::new(
+                rig_core::message::ToolCallId::new_or_mint(id),
+                rig_core::completion::message::ToolFunction::new(name.to_string(), args),
+            ),
+            preresolved_result: None,
+            internal_call_id: None,
+        }
+    }
+
+    fn test_agent() -> ZenAgent {
+        let wiring = ZenWiring::new();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        ZenAgent::builder("Sisyphus")
+            .with_tool("fs.read")
+            .build(&wiring, &router)
+            .expect("agent builds")
+    }
+
+    #[test]
+    fn dispatch_timed_isolates_per_invocation_error() {
+        let agent = test_agent();
+        let invocations = vec![
+            ToolInvocation::new("fs.read", serde_json::json!({})).expect("valid invocation"),
+            ToolInvocation::new("no.such.tool", serde_json::json!({}))
+                .expect("syntactically valid name"),
+        ];
+        let hooks: Vec<&dyn ToolDispatchHook> = Vec::new();
+        let (results, latencies) = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(dispatch_timed(agent.generic.tools(), &invocations, &hooks))
+            .expect("a per-invocation error must not abort the batch");
+        assert_eq!(results.len(), 2, "sibling result must survive");
+        assert_eq!(latencies.len(), 2);
+        assert!(
+            results[1].output.get("error").is_some(),
+            "missing tool synthesizes a structured error: {:?}",
+            results[1].output
+        );
+    }
+
+    #[test]
+    fn dispatch_timed_propagates_hook_termination() {
+        struct Terminator;
+        #[async_trait::async_trait]
+        impl ToolDispatchHook for Terminator {
+            async fn before_invocation(
+                &self,
+                _invocation: &ToolInvocation,
+            ) -> Result<rig_compose::normalizer::ToolDispatchAction, KernelError> {
+                Ok(rig_compose::normalizer::ToolDispatchAction::Terminate {
+                    reason: "seatbelt".to_string(),
+                })
+            }
+        }
+
+        let agent = test_agent();
+        let invocations =
+            vec![ToolInvocation::new("fs.read", serde_json::json!({})).expect("valid invocation")];
+        let hook = Terminator;
+        let hooks: Vec<&dyn ToolDispatchHook> = vec![&hook];
+        let result = tokio::runtime::Runtime::new()
+            .expect("rt")
+            .block_on(dispatch_timed(agent.generic.tools(), &invocations, &hooks));
+        assert!(
+            matches!(result, Err(KernelError::ToolDispatchTerminated(_))),
+            "hook termination must still abort the batch: {result:?}"
+        );
+    }
+
+    #[test]
+    fn plan_tool_batch_answers_normalizer_rejection_inline() {
+        let calls = vec![
+            pending_call("call_ok", "fs.read", serde_json::json!({})),
+            pending_call("call_bad", "", serde_json::json!({})),
+        ];
+        let plan = plan_tool_batch(&calls);
+        assert_eq!(plan.dispatch.len(), 1, "only the valid call dispatches");
+        assert_eq!(plan.rejected.len(), 1, "the empty name is rejected inline");
+        assert!(plan.rejected[0].result.contains("invalid arguments"));
+        assert_eq!(plan.answers.len(), 1, "the rejected call is answered by id");
+    }
+
+    #[test]
+    fn push_tool_results_history_drops_oldest_first() {
+        let mut history = Vec::new();
+        push_tool_results_history(&mut history, "A".repeat(10_000));
+        push_tool_results_history(&mut history, "B".repeat(10_000));
+        assert_eq!(history.len(), 1, "oldest round dropped at the cap");
+        assert!(history[0].starts_with('B'));
+        push_tool_results_history(&mut history, "C".repeat(10_000));
+        assert_eq!(history.len(), 1);
+        assert!(history[0].starts_with('C'));
+    }
+
+    #[test]
+    fn partition_granted_invocations_splits_by_grant() {
+        let granted = ToolInvocation::new("fs.read", serde_json::json!({})).expect("invocation");
+        let ungranted =
+            ToolInvocation::new("tier1_search", serde_json::json!({})).expect("invocation");
+        let names: BTreeSet<String> = ["fs.read".to_string()].into_iter().collect();
+        let (kept, rejected) = partition_granted_invocations(vec![granted, ungranted], &names);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name.as_str(), "fs.read");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].0, "tier1_search");
+    }
+
+    #[test]
+    fn dispatch_error_feedback_labels_termination_vs_failure() {
+        assert!(
+            dispatch_error_feedback(&KernelError::ToolDispatchTerminated("x".into()))
+                .contains("blocked")
+        );
+        assert!(
+            dispatch_error_feedback(&KernelError::BudgetFailed("cap".into())).contains("blocked")
+        );
+        assert!(
+            dispatch_error_feedback(&KernelError::ToolFailed("boom".into()))
+                .starts_with("tool failed")
+        );
     }
 }

@@ -1,0 +1,19 @@
+-- Migration 012: embedding freshness marker (O14, option A).
+--
+-- `notes_meta.content_hash` only proves the FTS row matches the file bytes; it
+-- says nothing about the vec0 vector. The only automatic production reindex
+-- (the zen-loop worker, every ~5 minutes) runs
+-- `Reindexer::without_embeddings()`: it advances `content_hash` but never
+-- touches `note_embeddings`, so a pipeline-rewritten page keeps an old vector
+-- and no later run can notice — the only dirty signal already matches.
+--
+-- `embedded_hash` records the content hash the stored vector was built from,
+-- so `embedded_hash == content_hash` iff that note's vector is current.
+-- Re-indexing always resets it to '' (dirty); only a successful vector write
+-- marks it fresh. An embedding-enabled `zen wiki reindex` therefore refreshes
+-- stale vectors even when the content gate reports "unchanged".
+--
+-- Constant default, no backfill: every pre-existing row's vector provenance is
+-- unknown, and '' means "re-embed me" — the safe state. Forward-only additive
+-- (Principle XIII): ADD COLUMN only; no existing column or row is altered.
+ALTER TABLE notes_meta ADD COLUMN embedded_hash TEXT NOT NULL DEFAULT '';

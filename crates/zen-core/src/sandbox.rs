@@ -74,6 +74,52 @@ pub fn is_zen_path(path: &Path) -> bool {
         .any(|c| c.as_os_str().to_string_lossy().as_ref() == ".zen")
 }
 
+/// Well-known subtrees of the zen global root that agent-facing tools may
+/// address by their documented relative spelling. `data` is deliberately
+/// absent — state.db has a sole-owner (the gateway daemon) and agent writes
+/// there are not a supported surface.
+const GLOBAL_ROOT_SUBTREES: &[&str] = &["vault", "memories", "logs", "skills"];
+
+/// Resolve a tool-supplied path string to the filesystem location a zen
+/// agent actually addresses. Absolute paths pass through unchanged.
+///
+/// Relative paths resolve in preference order:
+///   1. the process working directory, when the path exists there
+///      (project-directory workflows keep working unchanged);
+///   2. the zen global root (`user_root()`, production `~/.zen`) when the
+///      path exists there — daemon/hosted turns run with cwd `/`, so the
+///      documented relative spellings (`vault/...`, `memories/...`) must
+///      still address the knowledge base instead of resolving to `/vault`
+///      (ENOENT) the way the previous bare `PathBuf::from` did;
+///   3. new-file targets whose first component is a well-known global-root
+///      subtree ([`GLOBAL_ROOT_SUBTREES`]) anchor to the global root even
+///      though no existence probe can succeed — the file does not exist yet
+///      by definition.
+///
+/// Anything else stays cwd-relative and is judged by the sandbox policy as
+/// before. Resolution happens BEFORE validation so the sandbox judges the
+/// real target (symlink checks included).
+pub fn resolve_agent_path(input: &str) -> PathBuf {
+    let path = Path::new(input);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    let anchored = crate::paths::user_root().join(path);
+    if anchored.exists() {
+        return anchored;
+    }
+    if let Some(first) = path.components().next() {
+        let name = first.as_os_str().to_string_lossy();
+        if GLOBAL_ROOT_SUBTREES.contains(&name.as_ref()) {
+            return anchored;
+        }
+    }
+    path.to_path_buf()
+}
+
 pub fn is_metadata_path(path: &Path) -> bool {
     is_env_file(path)
         || path.components().any(|c| {
@@ -769,7 +815,7 @@ impl SandboxValidator {
 pub fn apply_resource_limits() -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
-        use libc::{RLIMIT_CORE, RLIMIT_NOFILE, RLIMIT_NPROC, getrlimit, rlimit, setrlimit};
+        use libc::{RLIMIT_CORE, RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
 
         // libc types the rlimit resource argument per-target: glibc Linux uses
         // `__rlimit_resource_t` (u32) for both the fns and the RLIMIT_* consts,
@@ -783,9 +829,9 @@ pub fn apply_resource_limits() -> Result<(), std::io::Error> {
         // Lower only the SOFT limit and keep the existing (or infinite) HARD
         // limit: setting rlim_max == rlim_cur made the cap irreversible, so a
         // busy process (tokio workers + reqwest pool + sqlx) that legitimately
-        // exceeded NOFILE=256 or NPROC=50 failed with EMFILE/EAGAIN forever.
-        // Soft-only caps still constrain the process and every descendant that
-        // does not explicitly raise them.
+        // exceeded NOFILE=256 failed with EMFILE forever. Soft-only caps still
+        // constrain the process and every descendant that does not explicitly
+        // raise them.
         fn soft_cap(resource: RlimitResource, cur: libc::rlim_t) -> Result<(), std::io::Error> {
             // SAFETY: getrlimit/setrlimit read/write the fully-initialized
             // stack struct below; no pointers escape. Return values checked.
@@ -810,8 +856,17 @@ pub fn apply_resource_limits() -> Result<(), std::io::Error> {
 
         // SAFETY: RLIMIT writes use the fully-initialized stack struct; the
         // core-dump hard-zero has no legitimate reason to be raisable.
+        // RLIMIT_NPROC is deliberately NOT capped. It counts processes/threads
+        // per REAL UID across the entire login session, not per subtree, so a
+        // soft cap of 50 made every posix_spawn fail with EAGAIN (os error 35)
+        // on a desktop where the user owns ~550 processes (measured 2026-10-17:
+        // every tier-1 `rg` spawn failed and silently fell back to the slower
+        // in-process walker; no child process could start at all). Subtlety:
+        // test harnesses hid this by setting ZEN_SKIP_RLIMIT and restoring the
+        // soft limits, so only the production daemon was affected. Subtree
+        // containment needs cgroups (Linux) / job objects, which rlimit cannot
+        // express.
         unsafe {
-            soft_cap(RLIMIT_NPROC, 50)?;
             soft_cap(RLIMIT_NOFILE, 256)?;
             let rlimit_core = rlimit {
                 rlim_cur: 0,

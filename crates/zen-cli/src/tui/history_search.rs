@@ -1,9 +1,16 @@
-//! W2+FUZZY: Reverse-i-search state for the inline TUI.
+//! W2+FUZZY: Reverse-i-search state for the TUI input prompts.
 //!
 //! Fuzzy matching via nucleo-matcher (fzf-v2 similarity algorithm, MPL-2.0):
 //! case-insensitive substring matches rank above fuzzy-only matches,
 //! newest-first deduped results, draft snapshot on enter, restore on cancel.
+//!
+//! The key handler ([`handle_key`]) is the SINGLE shared state machine called
+//! by both the inline prompt (`inline_handler`) and the fullscreen TUI
+//! (`handler`), so `Ctrl+R=search` behaves identically in both render paths.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use super::app::App;
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Substring matches always outrank fuzzy matches: substring score is a
@@ -176,6 +183,172 @@ impl HistorySearch {
         }
         self.match_index = 0;
     }
+}
+
+/// Handle one key event for reverse-i-search — the SINGLE shared state
+/// machine called by both the inline prompt (`inline_handler::handle_key`)
+/// and the fullscreen TUI (`handler::handle_key`), so `Ctrl+R=search` behaves
+/// identically in both render paths without duplicating the logic.
+///
+/// Two responsibilities, in order:
+///
+/// 1. **Active search** (`app.history_search.active`): route Ctrl+R/Up (cycle
+///    older), Down (cycle newer), Enter (accept match; restore draft on no
+///    match), Esc / Ctrl+C / Ctrl+D (cancel → restore draft), Backspace (edit
+///    query; empty query exits) and printable characters (narrow the query) —
+///    every other key is swallowed while the search owns input.
+/// 2. **Entry point** (not active): a Ctrl+R press snapshots the current
+///    composer text as the draft, recomputes matches over
+///    `app.command_history`, and previews the newest match in `app.input`.
+///    Suppressed while the slash popup is visible (the popup owns keys), but
+///    still swallowed so the key never reaches the composer.
+///
+/// Parameters: `key` — the crossterm key event; `app` — the shared TUI app
+/// (all search state lives on it: `history_search`, `command_history`,
+/// `slash_state`, `input`).
+///
+/// Returns: `true` when the key was consumed by the search (either branch),
+/// `false` when the caller must continue with normal dispatch.
+///
+/// Errors: none — every branch is an in-memory mutation of `App`.
+///
+/// Call sites (usage):
+/// ```text
+/// inline:    if history_search::handle_key(key, app) { return Continue; }
+/// fullscreen: while active → route every key here; Ctrl+R → delegate from
+///             the main match arm after the session-picker precedence check.
+/// ```
+pub fn handle_key(key: KeyEvent, app: &mut App) -> bool {
+    if app.history_search.active {
+        match (key.code, key.modifiers) {
+            // Ctrl+R or Up: cycle to older match
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) | (KeyCode::Up, KeyModifiers::NONE) => {
+                app.history_search.cycle_older();
+                if let Some(m) = app.history_search.current_match() {
+                    let text = m.to_string();
+                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
+                    app.input = App::create_input_textarea_at_end(text);
+                    app.input.enter_history_mode();
+                }
+            }
+            // Down: cycle to newer match
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                app.history_search.cycle_newer();
+                if let Some(m) = app.history_search.current_match() {
+                    let text = m.to_string();
+                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
+                    app.input = App::create_input_textarea_at_end(text);
+                    app.input.enter_history_mode();
+                } else {
+                    // No match — restore draft
+                    let draft = app.history_search.draft_snapshot.clone();
+                    // BUG-2+L3: Use new_at_end to position cursor at end of draft.
+                    app.input = App::create_input_textarea_at_end(draft);
+                    app.input.exit_mode();
+                }
+            }
+            // Enter: ACCEPT — set textarea to match, exit search.
+            // BUG-4: If no match, restore draft (same as Esc/cancel).
+            (KeyCode::Enter, _) => {
+                if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
+                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
+                    app.input = App::create_input_textarea_at_end(m);
+                    app.input.exit_mode();
+                } else {
+                    // No match — restore draft (bash semantics: failed search leaves line unchanged).
+                    let draft = app.history_search.draft_snapshot.clone();
+                    app.input = App::create_input_textarea_at_end(draft);
+                    app.input.exit_mode();
+                }
+                app.history_search.exit();
+                // Refresh slash state with the RESULTING textarea text.
+                // T084(d): dismissal-aware refresh (pure token equality).
+                app.refresh_slash_popup();
+            }
+            // Esc: CANCEL — restore draft, exit search
+            (KeyCode::Esc, _) => {
+                let draft = app.history_search.draft_snapshot.clone();
+                app.history_search.exit();
+                // BUG-2+L3: Use new_at_end to position cursor at end of draft.
+                app.input = App::create_input_textarea_at_end(draft);
+                app.input.exit_mode();
+            }
+            // Ctrl+C: exit search only (do not quit app)
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                let draft = app.history_search.draft_snapshot.clone();
+                app.history_search.exit();
+                // BUG-2+L3: Use new_at_end to position cursor at end of draft.
+                app.input = App::create_input_textarea_at_end(draft);
+                app.input.exit_mode();
+            }
+            // Ctrl+D: exit search (do not quit app)
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                let draft = app.history_search.draft_snapshot.clone();
+                app.history_search.exit();
+                // BUG-2+L3: Use new_at_end to position cursor at end of draft.
+                app.input = App::create_input_textarea_at_end(draft);
+                app.input.exit_mode();
+            }
+            // Backspace: remove char from query; empty query + Backspace → exit
+            (KeyCode::Backspace, _) => {
+                if app.history_search.query.is_empty() {
+                    let draft = app.history_search.draft_snapshot.clone();
+                    app.history_search.exit();
+                    // BUG-2+L3: Use new_at_end to position cursor at end of draft.
+                    app.input = App::create_input_textarea_at_end(draft);
+                    app.input.exit_mode();
+                } else {
+                    app.history_search.backspace(&app.command_history);
+                    if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
+                        // BUG-2+L3: Use new_at_end to position cursor at end of match.
+                        app.input = App::create_input_textarea_at_end(m);
+                        app.input.enter_history_mode();
+                    } else {
+                        // No matches — show query in textarea
+                        let q = app.history_search.query.clone();
+                        // BUG-2+L3: Use new_at_end to position cursor at end of query.
+                        app.input = App::create_input_textarea_at_end(q);
+                        app.input.enter_history_mode();
+                    }
+                }
+            }
+            // Printable char: push to query
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                app.history_search.push_char(c, &app.command_history);
+                if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
+                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
+                    app.input = App::create_input_textarea_at_end(m);
+                    app.input.enter_history_mode();
+                } else {
+                    let q = app.history_search.query.clone();
+                    // BUG-2+L3: Use new_at_end to position cursor at end of query.
+                    app.input = App::create_input_textarea_at_end(q);
+                    app.input.enter_history_mode();
+                }
+            }
+            // Everything else: swallow while search is active
+            _ => {}
+        }
+        return true;
+    }
+
+    // W2 entry: Ctrl+R in normal context → start reverse-i-search.
+    // L2: Guard against slash popup — swallow Ctrl+R while popup owns keys.
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if !app.slash_state.visible {
+            let current_text = app.input.lines().join("\n");
+            app.history_search.enter(&current_text);
+            app.history_search.recompute_matches(&app.command_history);
+            // Preview the first match (or full history if no query yet)
+            if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
+                // BUG-2+L3: Use new_at_end to position cursor at end of match.
+                app.input = App::create_input_textarea_at_end(m);
+                app.input.enter_history_mode();
+            }
+        }
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

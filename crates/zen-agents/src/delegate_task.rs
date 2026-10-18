@@ -8,6 +8,7 @@
 //! delegate.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -125,6 +126,8 @@ pub struct DelegateTaskTool {
     max_depth: u32,
     max_concurrent: u32,
     skill_router: SkillHitRouter,
+    /// D10 per-agent accuracy weights (empty = cold start ⇒ uniform).
+    weights: HashMap<String, f32>,
 }
 
 impl DelegateTaskTool {
@@ -154,7 +157,15 @@ impl DelegateTaskTool {
             max_depth,
             max_concurrent,
             skill_router: SkillHitRouter::new(),
+            weights: HashMap::new(),
         }
+    }
+
+    /// Inject D10 per-agent aggregation weights. An empty map (the default)
+    /// leaves multi-result batch ordering byte-identical (cold start).
+    pub fn with_weights(mut self, weights: HashMap<String, f32>) -> Self {
+        self.weights = weights;
+        self
     }
 
     /// 001 arch A.1 spawn-hierarchy rules: Orchestrator(L0) may spawn
@@ -244,8 +255,10 @@ impl DelegateTaskTool {
 
     /// Parse the single-task form (`agent`+`prompt`) or the fan-out form
     /// (`tasks: [...]`). Mixed forms prefer `tasks`. Fan-out batches are
-    /// hard-capped at [`FANOUT_MAX_TASKS`] (T216).
-    fn parse_requests(args: &serde_json::Value) -> Result<Vec<DelegateRequest>, String> {
+    /// hard-capped at [`FANOUT_MAX_TASKS`] (T216). The optional D9 contract
+    /// fields (`output_format`, `task_boundaries`) ride the top-level args for
+    /// the single form and each `tasks[]` item for the fan-out form.
+    fn parse_requests(args: &serde_json::Value) -> Result<Vec<ParsedDelegate>, String> {
         if let Some(arr) = args.get("tasks").and_then(|v| v.as_array()) {
             if arr.len() > FANOUT_MAX_TASKS {
                 return Err(format!(
@@ -261,17 +274,24 @@ impl DelegateTaskTool {
                 let Some(prompt) = item.get("prompt").and_then(|v| v.as_str()) else {
                     return Err("each tasks[] item requires a \"prompt\" string".to_string());
                 };
-                tasks.push(DelegateRequest {
-                    agent: agent.to_string(),
-                    prompt: prompt.to_string(),
-                    description: item
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    independent: item
-                        .get("independent")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
+                tasks.push(ParsedDelegate {
+                    request: DelegateRequest {
+                        agent: agent.to_string(),
+                        prompt: prompt.to_string(),
+                        description: item
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        independent: item
+                            .get("independent")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                        artifact: optional_nonempty_string(item, "artifact")?,
+                    },
+                    contract: DelegateContract {
+                        output_format: optional_nonempty_string(item, "output_format")?,
+                        task_boundaries: optional_nonempty_string(item, "task_boundaries")?,
+                    },
                 });
             }
             if tasks.is_empty() {
@@ -287,17 +307,24 @@ impl DelegateTaskTool {
             .get("prompt")
             .and_then(|v| v.as_str())
             .ok_or("delegate.task requires a \"prompt\" string argument (or tasks[])")?;
-        Ok(vec![DelegateRequest {
-            agent: agent.to_string(),
-            prompt: prompt.to_string(),
-            description: args
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            independent: args
-                .get("independent")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
+        Ok(vec![ParsedDelegate {
+            request: DelegateRequest {
+                agent: agent.to_string(),
+                prompt: prompt.to_string(),
+                description: args
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                independent: args
+                    .get("independent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                artifact: optional_nonempty_string(args, "artifact")?,
+            },
+            contract: DelegateContract {
+                output_format: optional_nonempty_string(args, "output_format")?,
+                task_boundaries: optional_nonempty_string(args, "task_boundaries")?,
+            },
         }])
     }
 
@@ -344,7 +371,38 @@ impl DelegateTaskTool {
                 "unbounded delegation rejected: prompt exceeds the bounded-task limit".to_string(),
             );
         }
+        if let Some(artifact) = task.artifact.as_deref()
+            && let Err(error) = self.validate_artifact_path(&task.agent, artifact)
+        {
+            return Some(error);
+        }
         None
+    }
+
+    /// W2.2 (D12): validate a declared artifact output path with the SAME
+    /// containment gate `fs.write` enforces. The sandbox mode + workspace
+    /// roots are derived exactly as `ZenWiring::new` derives them, so a path
+    /// accepted here is the path the sub-agent's `fs.write` will accept.
+    /// The permission matrix is unchanged: an agent without the `fs.write`
+    /// grant cannot declare an artifact.
+    pub(crate) fn validate_artifact_path(&self, agent: &str, path: &str) -> Result<(), String> {
+        if !delegate_tools::resolve_agent_tool_grants(agent, &self.overlay, &self.wiring.tools)
+            .iter()
+            .any(|g| g == "fs.write")
+        {
+            return Err(format!(
+                "agent \"{agent}\" has no fs.write grant; it cannot produce an artifact"
+            ));
+        }
+        let roots = zen_core::paths::ZenPaths::detect()
+            .ok()
+            .and_then(|p| p.workspace_root().cloned())
+            .map(|w| vec![w])
+            .unwrap_or_default();
+        let validator = zen_core::sandbox::SandboxValidator::new(self.wiring.sandbox_mode(), roots);
+        validator
+            .validate_path_for_write(std::path::Path::new(path))
+            .map_err(|denied| format!("artifact path rejected: {denied}"))
     }
 
     /// Current session sensitivity mirrored from the orchestrator — the
@@ -369,7 +427,7 @@ impl DelegateTaskTool {
         &self,
         parent: &str,
         depth: u32,
-        tasks: &[DelegateRequest],
+        tasks: &[ParsedDelegate],
         reports: &[GateReport],
         composed: &[Option<(SessionContext, SubAgentContext)>],
     ) {
@@ -383,8 +441,8 @@ impl DelegateTaskTool {
             .map(|((t, r), slot)| {
                 let ctx = slot.as_ref().map(|(_, c)| c);
                 serde_json::json!({
-                    "agent": t.agent,
-                    "prompt_chars": t.prompt.len(),
+                    "agent": t.request.agent,
+                    "prompt_chars": t.request.prompt.len(),
                     "independent": r.independent,
                     "consumer_decision": r.consumer_decision,
                     "bounded": r.bounded,
@@ -484,7 +542,8 @@ impl DelegateTaskTool {
     }
 
     /// Execute one validated delegation request (tier/depth/bounded checks
-    /// already passed in `invoke`). Always returns a readable Value.
+    /// already passed in `invoke`). Always returns a readable Value. Used by
+    /// `plan.execute`, which has no D9 contract (empty ⇒ pre-D9 prompt).
     pub(crate) async fn run_single(
         &self,
         req: &DelegateRequest,
@@ -492,8 +551,15 @@ impl DelegateTaskTool {
         parent: &str,
     ) -> serde_json::Value {
         let (session, sub) = self.compose_sub_session(&req.agent, &req.prompt, depth);
-        self.run_single_composed(req, depth, parent, session, sub)
-            .await
+        self.run_single_composed(
+            req,
+            depth,
+            parent,
+            session,
+            sub,
+            &DelegateContract::default(),
+        )
+        .await
     }
 
     /// `run_single` with a pre-composed sub-session — the `invoke` fan-out
@@ -508,10 +574,11 @@ impl DelegateTaskTool {
         parent: &str,
         session: SessionContext,
         sub: SubAgentContext,
+        contract: &DelegateContract,
     ) -> serde_json::Value {
         let started = Instant::now();
         let agent_name = req.agent.as_str();
-        let prompt = req.prompt.as_str();
+        let prompt = compose_sub_prompt(req, contract);
         let child_depth = depth + 1;
         let allow_child_delegation = child_depth < self.max_depth;
 
@@ -615,9 +682,7 @@ impl DelegateTaskTool {
                     feedback = crate::orchestrator::AgentOrchestrator::results_to_prompt(&results);
                 }
                 Err(e) => {
-                    feedback = format!(
-                        "tool dispatch blocked by sandbox: {e}\nAnswer the user with what you have."
-                    );
+                    feedback = dispatch_error_feedback(&e);
                 }
             }
         }
@@ -634,26 +699,40 @@ impl DelegateTaskTool {
             response.push_str("\n\n[delegate round cap reached; returning current answer]");
         }
 
-        let actual = (prompt.len() / 4 + response.len() / 4) as u64;
+        let (clean_response, reasoning, verification) = split_report_markers(&response);
+        let actual = (prompt.len() / 4 + clean_response.len() / 4) as u64;
         self.token_budget
             .record_usage(reservation, actual, actual)
             .await;
 
-        let output = match req.description {
-            Some(ref description) => serde_json::json!({
-                "agent": agent_name,
-                "response": response,
-                "rounds": rounds,
-                "duration_ms": started.elapsed().as_millis() as u64,
-                "description": description,
-            }),
-            None => serde_json::json!({
-                "agent": agent_name,
-                "response": response,
-                "rounds": rounds,
-                "duration_ms": started.elapsed().as_millis() as u64,
-            }),
-        };
+        // W2.2 (D12) artifact pattern: surface the declared output pointer
+        // and a bounded summary alongside the answer (additive — a request
+        // without an artifact keeps the pre-W2 shape byte-identical).
+        let artifact_summary = req
+            .artifact
+            .as_deref()
+            .map(|_| bounded_summary(&clean_response));
+        let mut output = serde_json::json!({
+            "agent": agent_name,
+            "response": clean_response,
+            "rounds": rounds,
+            "duration_ms": started.elapsed().as_millis() as u64,
+        });
+        if let Some(artifact) = req.artifact.as_deref() {
+            output["artifact_path"] = serde_json::json!(artifact);
+            if let Some(summary) = artifact_summary {
+                output["summary"] = serde_json::json!(summary);
+            }
+        }
+        if let Some(description) = req.description.as_ref() {
+            output["description"] = serde_json::json!(description);
+        }
+        if let Some(reasoning) = reasoning {
+            output["reasoning"] = serde_json::json!(reasoning);
+        }
+        if let Some(verification) = verification {
+            output["verification"] = serde_json::json!(verification);
+        }
         info!(
             agent = agent_name,
             rounds,
@@ -674,6 +753,168 @@ pub struct DelegateRequest {
     pub prompt: String,
     pub description: Option<String>,
     pub independent: bool,
+    /// W2.2 (D12): optional artifact output path the sub-agent should write
+    /// its deliverable to (sandbox-validated; NO new tool grants — only
+    /// agents already holding `fs.write` may declare one).
+    pub artifact: Option<String>,
+}
+
+/// D9 optional delegation contract (Anthropic 4-part shape). Carried beside
+/// each [`DelegateRequest`] so the sub-turn prompt assembly can inject the
+/// caller's `output_format` / `task_boundaries` in labeled sections. Both
+/// fields are optional; when present they must be non-empty (validated in
+/// `parse_requests`). Serde defaults keep older payloads decodable (`{}` ⇒
+/// all-`None`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DelegateContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_boundaries: Option<String>,
+}
+
+impl DelegateContract {
+    fn is_empty(&self) -> bool {
+        self.output_format.is_none() && self.task_boundaries.is_none()
+    }
+
+    /// The labeled contract section appended to the sub-agent brief, or
+    /// `None` when the contract is empty (⇒ prompt byte-identical to pre-D9).
+    fn labeled_section(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut section = String::from("\n\n---\nDelegation contract:");
+        if let Some(output_format) = &self.output_format {
+            section.push_str("\nOUTPUT FORMAT:\n");
+            section.push_str(output_format);
+        }
+        if let Some(task_boundaries) = &self.task_boundaries {
+            section.push_str("\nTASK BOUNDARIES:\n");
+            section.push_str(task_boundaries);
+        }
+        section.push_str("\n---");
+        Some(section)
+    }
+}
+
+/// One parsed request plus its optional D9 contract.
+#[derive(Debug)]
+struct ParsedDelegate {
+    request: DelegateRequest,
+    contract: DelegateContract,
+}
+
+/// D9 report-schema instruction appended to every sub-agent brief: the model
+/// is asked for optional `REASONING:` / `VERIFICATION:` lines that
+/// [`split_report_markers`] lifts into the result payload.
+const REPORT_REQUEST: &str = "\n\n---\nWhen you have finished, end your answer with two optional lines:\nREASONING: <one sentence on your approach>\nVERIFICATION: <how you checked the result>\n---";
+
+/// Assemble the sub-agent brief: the caller's prompt, the optional D9
+/// contract sections, the optional artifact-output instruction, then the
+/// report-schema request.
+fn compose_sub_prompt(req: &DelegateRequest, contract: &DelegateContract) -> String {
+    let mut prompt = req.prompt.clone();
+    if let Some(section) = contract.labeled_section() {
+        prompt.push_str(&section);
+    }
+    if let Some(artifact) = req.artifact.as_deref() {
+        prompt.push_str(&format!(
+            "\n\n---\nARTIFACT OUTPUT: write your full deliverable to the file at this exact path using the fs.write tool, then state the path in your answer: {artifact}\n---"
+        ));
+    }
+    prompt.push_str(REPORT_REQUEST);
+    prompt
+}
+
+/// W2.2 (D12): cap for the artifact-mode `summary` field (chars) so a
+/// downstream plan/parent prompt embedding it stays bounded — mirrors the
+/// plan-task upstream-snippet bound.
+pub(crate) const ARTIFACT_SUMMARY_MAX_CHARS: usize = 4000;
+
+/// Bounded form of a sub-agent answer for the artifact-mode `summary`.
+fn bounded_summary(text: &str) -> String {
+    let mut summary: String = text.chars().take(ARTIFACT_SUMMARY_MAX_CHARS).collect();
+    if text.chars().count() > ARTIFACT_SUMMARY_MAX_CHARS {
+        summary.push_str("…[truncated]");
+    }
+    summary
+}
+
+/// Lift optional `REASONING:` / `VERIFICATION:` report lines out of a
+/// sub-agent's final answer (D9). Markers are removed from the returned
+/// prose. When neither marker is present the answer is returned unchanged
+/// (byte-identical to the pre-D9 result path) with both fields `None`.
+fn split_report_markers(response: &str) -> (String, Option<String>, Option<String>) {
+    let mut reasoning = None;
+    let mut verification = None;
+    let mut prose: Vec<&str> = Vec::new();
+    let mut found = false;
+    for line in response.lines() {
+        if let Some(value) = take_marker(line, "reasoning:") {
+            reasoning = Some(value);
+            found = true;
+            continue;
+        }
+        if let Some(value) = take_marker(line, "verification:") {
+            verification = Some(value);
+            found = true;
+            continue;
+        }
+        prose.push(line);
+    }
+    if !found {
+        return (response.to_string(), None, None);
+    }
+    (
+        prose.join("\n").trim_end().to_string(),
+        reasoning,
+        verification,
+    )
+}
+
+/// If `line` starts with `marker` (ASCII, case-insensitive), return the
+/// trimmed remainder.
+fn take_marker(line: &str, marker: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.len() >= marker.len()
+        && trimmed.is_char_boundary(marker.len())
+        && trimmed[..marker.len()].eq_ignore_ascii_case(marker)
+    {
+        Some(trimmed[marker.len()..].trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Read an optional string argument; `None`/absent ⇒ `None`, present ⇒
+/// non-empty after trimming (D9 validation).
+fn optional_nonempty_string(args: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => {
+            if value.trim().is_empty() {
+                Err(format!("\"{key}\" must not be empty when present"))
+            } else {
+                Ok(Some(value.clone()))
+            }
+        }
+        Some(_) => Err(format!("\"{key}\" must be a string when present")),
+    }
+}
+
+/// G1-09: label a dispatch failure accurately. A hook `Terminate`
+/// (approval/seatbelt) or a budget failure is a *blocked* dispatch; every
+/// other kernel error is a tool-execution failure. The old single label
+/// ("blocked by sandbox") mislabeled every `ToolFailed`/`NotFound`.
+fn dispatch_error_feedback(error: &rig_compose::registry::KernelError) -> String {
+    use rig_compose::registry::KernelError;
+    match error {
+        KernelError::ToolDispatchTerminated(_) | KernelError::BudgetFailed(_) => format!(
+            "tool dispatch blocked (approval/seatbelt/budget): {error}\nAnswer the user with what you have."
+        ),
+        _ => format!("tool failed: {error}\nAnswer the user with what you have."),
+    }
 }
 
 /// Advisory pre-spawn gate verdicts (audited, T374).
@@ -710,6 +951,10 @@ impl Tool for DelegateTaskTool {
                  in its own context with its own tool grants and returns its final answer \
                  as this tool's result. Use for research sweeps, deep analysis, plan \
                  drafting, or review passes — one focused subtask per call. \
+                 Effort scaling: for a small task (1-3 tool calls) use ONE focused \
+                 sub-agent; for a research sweep (3-10 calls) parallelize the independent \
+                 calls with tasks[]; for a large or high-stakes task (>10 calls) escalate \
+                 quality by delegating to a specialist rather than widening the batch. \
                  Available agents: {agents}."
             ),
             args_schema: serde_json::json!({
@@ -727,16 +972,31 @@ impl Tool for DelegateTaskTool {
                         "type": "string",
                         "description": "Short (3-5 words) label for this delegation"
                     },
+                    "output_format": {
+                        "type": "string",
+                        "description": "Optional: the exact shape the sub-agent's answer should take (e.g. 'JSON with fields x,y', '3 bullets'). Non-empty when present."
+                    },
+                    "task_boundaries": {
+                        "type": "string",
+                        "description": "Optional: what is in and out of scope for this subtask. Non-empty when present."
+                    },
+                    "artifact": {
+                        "type": "string",
+                        "description": "Optional: workspace-relative path the sub-agent should write its full deliverable to (via fs.write) and return as a pointer. Only agents with the fs.write grant may declare one; the path is sandbox-validated."
+                    },
                     "tasks": {
                         "type": "array",
-                        "description": "Parallel fan-out (001 A.6 collect mode): run several independent subtasks concurrently. Each item: {\"agent\", \"prompt\", \"description?\", \"independent?\"}. Use for research sweeps / multi-file audits; results return as a batch.",
+                        "description": "Parallel fan-out (001 A.6 collect mode): run several independent subtasks concurrently. Each item: {\"agent\", \"prompt\", \"description?\", \"independent?\", \"output_format?\", \"task_boundaries?\", \"artifact?\"}. Use for research sweeps / multi-file audits; results return as a batch (at most 8).",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "agent": {"type": "string"},
                                 "prompt": {"type": "string"},
                                 "description": {"type": "string"},
-                                "independent": {"type": "boolean", "description": "true when this subtask needs no other subtask's output (pre-spawn gate)"}
+                                "independent": {"type": "boolean", "description": "true when this subtask needs no other subtask's output (pre-spawn gate)"},
+                                "output_format": {"type": "string", "description": "Optional output shape for this subtask"},
+                                "task_boundaries": {"type": "string", "description": "Optional scope bounds for this subtask"},
+                                "artifact": {"type": "string", "description": "Optional sandbox-validated artifact output path"}
                             },
                             "required": ["agent", "prompt"]
                         }
@@ -754,7 +1014,12 @@ impl Tool for DelegateTaskTool {
                     "agent": {"type": "string"},
                     "response": {"type": "string"},
                     "rounds": {"type": "integer"},
-                    "duration_ms": {"type": "integer"}
+                    "duration_ms": {"type": "integer"},
+                    "description": {"type": "string"},
+                    "reasoning": {"type": "string"},
+                    "verification": {"type": "string"},
+                    "artifact_path": {"type": "string"},
+                    "summary": {"type": "string"}
                 }
             }),
         }
@@ -775,14 +1040,14 @@ impl Tool for DelegateTaskTool {
         let (depth, parent) = Self::chain_position();
         let rejected: Vec<Option<String>> = tasks
             .iter()
-            .map(|task| self.validate_task(&parent, depth, task))
+            .map(|task| self.validate_task(&parent, depth, &task.request))
             .collect();
 
         // Codex-style pre-spawn gates (T374): bounded is a hard limit, the
         // rest are advisory heuristics logged to the audit trail.
         let reports: Vec<GateReport> = tasks
             .iter()
-            .map(|t| Self::evaluate_gates(t, tasks.len()))
+            .map(|t| Self::evaluate_gates(&t.request, tasks.len()))
             .collect();
 
         // Slot-ordered assembly: results[i] always corresponds to tasks[i],
@@ -791,12 +1056,13 @@ impl Tool for DelegateTaskTool {
         let mut runnable: Vec<usize> = Vec::with_capacity(tasks.len());
         for (i, task) in tasks.iter().enumerate() {
             if let Some(error) = &rejected[i] {
-                slots.push(Some(
-                    serde_json::json!({ "agent": task.agent, "error": error }),
-                ));
+                slots.push(Some(serde_json::json!({
+                    "agent": task.request.agent,
+                    "error": error
+                })));
             } else if !reports[i].bounded {
                 slots.push(Some(serde_json::json!({
-                    "agent": task.agent,
+                    "agent": task.request.agent,
                     "error": "unbounded delegation rejected: prompt exceeds the bounded-task limit"
                 })));
             } else {
@@ -811,7 +1077,11 @@ impl Tool for DelegateTaskTool {
         let mut composed: Vec<Option<(SessionContext, SubAgentContext)>> =
             (0..tasks.len()).map(|_| None).collect();
         for &i in &runnable {
-            composed[i] = Some(self.compose_sub_session(&tasks[i].agent, &tasks[i].prompt, depth));
+            composed[i] = Some(self.compose_sub_session(
+                &tasks[i].request.agent,
+                &tasks[i].request.prompt,
+                depth,
+            ));
         }
         self.append_gates_audit(&parent, depth, &tasks, &reports, &composed);
 
@@ -822,7 +1092,14 @@ impl Tool for DelegateTaskTool {
                     let (session, sub) = composed[i]
                         .take()
                         .expect("runnable slots are composed above");
-                    self.run_single_composed(&tasks[i], depth, &parent, session, sub)
+                    self.run_single_composed(
+                        &tasks[i].request,
+                        depth,
+                        &parent,
+                        session,
+                        sub,
+                        &tasks[i].contract,
+                    )
                 })
                 .collect();
             let results = futures::future::join_all(futures).await;
@@ -830,7 +1107,7 @@ impl Tool for DelegateTaskTool {
                 slots[i] = Some(outcome);
             }
         }
-        let results: Vec<serde_json::Value> = slots
+        let mut results: Vec<serde_json::Value> = slots
             .into_iter()
             .map(|slot| {
                 slot.unwrap_or_else(
@@ -838,6 +1115,13 @@ impl Tool for DelegateTaskTool {
                 )
             })
             .collect();
+
+        // D10: rank a multi-result batch by per-agent accuracy weight. A
+        // single result is never touched, and an empty weight map (cold
+        // start) leaves ordering byte-identical.
+        if tasks.len() > 1 {
+            crate::aggregate_weights::order_values_by_weight(&mut results, &self.weights);
+        }
 
         if tasks.len() == 1 {
             return Ok(results.into_iter().next().unwrap_or_else(
@@ -1115,6 +1399,7 @@ mod tests {
             prompt: "compact brief".into(),
             description: None,
             independent: true,
+            artifact: None,
         };
         let gates = DelegateTaskTool::evaluate_gates(&small, 2);
         assert!(gates.bounded && gates.worth_it && gates.independent && gates.consumer_decision);
@@ -1407,6 +1692,57 @@ mod tests {
         }
     }
 
+    /// D1-hazard regression pin (TODOS "D1-class Confidential async routing
+    /// hazard"): a Confidential delegate sub-turn routes through
+    /// `enforce_sensitivity → is_local_llm_available →
+    /// OllamaProvider::health_check` (`reqwest::blocking`) on a LIVE async
+    /// runtime — the nested-runtime panic class this test guards against.
+    /// The dedicated-thread guard inside `health_check` must turn the probe
+    /// into a local-unavailable routing failure, which `execute_round` fails
+    /// open from (mock fallback): a served response or a structured error,
+    /// never a panic, never a cloud route. Port 1 on loopback is
+    /// unassigned — connection-refused is immediate and deterministic, and
+    /// the provider pins `no_proxy` for loopback so a machine-level proxy
+    /// cannot intercept (T217 lesson). `plan.execute` batches through this
+    /// same `run_single` seam, so it inherits the guard by construction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn confidential_delegate_routing_on_async_runtime_does_not_panic() {
+        let config = zen_core::config::ZenConfig {
+            default_provider: Some("ollama".to_string()),
+            providers: std::collections::HashMap::from([(
+                "ollama".to_string(),
+                zen_core::config::ProviderConfig {
+                    provider_type: Some("ollama".to_string()),
+                    base_url: Some("http://127.0.0.1:1".to_string()),
+                    default_model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let tool = DelegateTaskTool::new(
+            Arc::new(ZenWiring::new()),
+            DefaultRouter::from_agentic(&config),
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(Sensitivity::Confidential)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+            Duration::from_secs(60),
+            1,
+            4,
+        );
+        let out = tool
+            .invoke(serde_json::json!({ "agent": "Explore", "prompt": "confidential subtask" }))
+            .await
+            .unwrap();
+        assert!(
+            out["response"].as_str().is_some_and(|s| !s.is_empty())
+                || out["error"].as_str().is_some(),
+            "the Confidential sub-turn must yield a served fallback or a typed error, never panic: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn fanout_parse_negatives_surface_readable_errors() {
         let tool = tool_with(
@@ -1515,12 +1851,10 @@ mod tests {
         budget: Arc<AtomicTokenBudget>,
         knowledge: SharedKnowledge,
     ) -> DelegateTaskTool {
-        // Public sensitivity in the async gate-on test: Confidential would
-        // trip the PRE-EXISTING sync-route hazard in async contexts
-        // (enforce_sensitivity → is_local_llm_available → reqwest-blocking
-        // health_check; the D1 hazard class), orthogonal to inheritance.
-        // Confidential mirroring is pinned by the sync gate-off test below
-        // (compose_sub_session never routes, so no hazard there).
+        // Public sensitivity keeps this test orthogonal to routing: the
+        // D1-class Confidential async-routing hazard is fixed (dedicated-
+        // thread guard in OllamaProvider::health_check) and pinned by
+        // `confidential_delegate_routing_on_async_runtime_does_not_panic`.
         DelegateTaskTool::new(
             Arc::new(ZenWiring::new()),
             mock_router(),
@@ -1729,5 +2063,273 @@ mod tests {
             None => unsafe { std::env::remove_var("ZEN_HOME") },
         }
         zen_core::config::invalidate_config_cache();
+    }
+
+    // ── W1.2 (D9): delegation contract + report schema ────────────────
+
+    #[test]
+    fn parse_requests_old_payload_decodes_with_empty_contract() {
+        let old = serde_json::json!({ "agent": "Explore", "prompt": "x" });
+        let parsed = DelegateTaskTool::parse_requests(&old).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].request.agent, "Explore");
+        assert_eq!(parsed[0].request.prompt, "x");
+        assert!(parsed[0].contract.output_format.is_none());
+        assert!(parsed[0].contract.task_boundaries.is_none());
+    }
+
+    #[test]
+    fn parse_requests_round_trips_contract_fields() {
+        let new = serde_json::json!({
+            "agent": "Explore",
+            "prompt": "x",
+            "output_format": "3 bullets",
+            "task_boundaries": "only the search layer"
+        });
+        let parsed = DelegateTaskTool::parse_requests(&new).unwrap();
+        assert_eq!(
+            parsed[0].contract.output_format.as_deref(),
+            Some("3 bullets")
+        );
+        assert_eq!(
+            parsed[0].contract.task_boundaries.as_deref(),
+            Some("only the search layer")
+        );
+    }
+
+    #[test]
+    fn parse_requests_carries_per_item_contract_in_fanout() {
+        let fanout = serde_json::json!({
+            "tasks": [
+                { "agent": "Explore", "prompt": "a", "output_format": "json" },
+                { "agent": "Librarian", "prompt": "b" }
+            ]
+        });
+        let parsed = DelegateTaskTool::parse_requests(&fanout).unwrap();
+        assert_eq!(parsed[0].contract.output_format.as_deref(), Some("json"));
+        assert!(parsed[1].contract.is_empty());
+    }
+
+    #[test]
+    fn contract_fields_must_be_non_empty_when_present() {
+        let empty = serde_json::json!({
+            "agent": "Explore", "prompt": "x", "output_format": "   "
+        });
+        assert!(
+            DelegateTaskTool::parse_requests(&empty)
+                .unwrap_err()
+                .contains("output_format"),
+            "blank output_format is rejected"
+        );
+        let wrong_type =
+            serde_json::json!({ "agent": "Explore", "prompt": "x", "task_boundaries": 7 });
+        assert!(
+            DelegateTaskTool::parse_requests(&wrong_type)
+                .unwrap_err()
+                .contains("task_boundaries"),
+            "non-string task_boundaries is rejected"
+        );
+    }
+
+    #[test]
+    fn delegate_contract_serde_is_additive() {
+        let empty: DelegateContract = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, DelegateContract::default());
+
+        let contract = DelegateContract {
+            output_format: Some("json".to_string()),
+            task_boundaries: None,
+        };
+        let encoded = serde_json::to_string(&contract).unwrap();
+        assert!(
+            !encoded.contains("task_boundaries"),
+            "None fields are omitted: {encoded}"
+        );
+        let decoded: DelegateContract = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, contract);
+    }
+
+    #[test]
+    fn compose_sub_prompt_labels_contract_and_requests_report() {
+        let req = DelegateRequest {
+            agent: "Explore".into(),
+            prompt: "do it".into(),
+            description: None,
+            independent: true,
+            artifact: None,
+        };
+        let bare = compose_sub_prompt(&req, &DelegateContract::default());
+        assert!(bare.starts_with("do it"));
+        assert!(bare.contains("REASONING:"), "{bare}");
+        assert!(
+            !bare.contains("OUTPUT FORMAT:"),
+            "no contract section when empty"
+        );
+
+        let contract = DelegateContract {
+            output_format: Some("3 bullets".into()),
+            task_boundaries: Some("search only".into()),
+        };
+        let full = compose_sub_prompt(&req, &contract);
+        assert!(full.contains("OUTPUT FORMAT:\n3 bullets"), "{full}");
+        assert!(full.contains("TASK BOUNDARIES:\nsearch only"), "{full}");
+    }
+
+    #[test]
+    fn compose_sub_prompt_instructs_artifact_output_only_when_declared() {
+        let base = DelegateRequest {
+            agent: "Hephaestus".into(),
+            prompt: "build it".into(),
+            description: None,
+            independent: true,
+            artifact: None,
+        };
+        let bare = compose_sub_prompt(&base, &DelegateContract::default());
+        assert!(
+            !bare.contains("ARTIFACT OUTPUT"),
+            "no artifact ⇒ no artifact section: {bare}"
+        );
+
+        let with_artifact = DelegateRequest {
+            artifact: Some("vault/resources/report.md".into()),
+            ..base
+        };
+        let prompt = compose_sub_prompt(&with_artifact, &DelegateContract::default());
+        assert!(prompt.contains("ARTIFACT OUTPUT"), "{prompt}");
+        assert!(
+            prompt.contains("vault/resources/report.md"),
+            "the declared path must reach the sub-agent brief: {prompt}"
+        );
+    }
+
+    #[test]
+    fn bounded_summary_truncates_at_the_cap() {
+        let short = bounded_summary("done");
+        assert_eq!(short, "done");
+        let long = "x".repeat(ARTIFACT_SUMMARY_MAX_CHARS + 10);
+        let summary = bounded_summary(&long);
+        assert!(summary.starts_with(&"x".repeat(ARTIFACT_SUMMARY_MAX_CHARS)));
+        assert!(summary.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn split_report_markers_lifts_and_removes_report_lines() {
+        let (clean, reasoning, verification) =
+            split_report_markers("answer body\nREASONING: because\nVERIFICATION: ran tests");
+        assert_eq!(clean, "answer body");
+        assert_eq!(reasoning.as_deref(), Some("because"));
+        assert_eq!(verification.as_deref(), Some("ran tests"));
+
+        let (unchanged, reasoning, verification) = split_report_markers("just prose");
+        assert_eq!(unchanged, "just prose", "no markers ⇒ byte-identical");
+        assert!(reasoning.is_none() && verification.is_none());
+    }
+
+    #[test]
+    fn delegate_description_pins_effort_scaling_and_result_contract() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("Effort scaling"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("parallelize"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("escalate quality"),
+            "{}",
+            schema.description
+        );
+        assert_eq!(
+            schema.args_schema["properties"]["output_format"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema.args_schema["properties"]["task_boundaries"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schema.args_schema["properties"]["tasks"]["items"]["properties"]["output_format"]["type"],
+            "string"
+        );
+    }
+
+    // ── W1.3 (D10): aggregation ordering ──────────────────────────────
+
+    #[tokio::test]
+    async fn cold_start_batch_order_is_byte_identical() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let out = tool
+            .invoke(serde_json::json!({ "tasks": [
+                { "agent": "Explore", "prompt": "a" },
+                { "agent": "Librarian", "prompt": "b" }
+            ]}))
+            .await
+            .unwrap();
+        let results = out["results"].as_array().expect("batch shape");
+        assert_eq!(
+            results[0]["agent"], "Explore",
+            "empty weights ⇒ input order"
+        );
+        assert_eq!(results[1]["agent"], "Librarian");
+    }
+
+    #[tokio::test]
+    async fn injected_weights_rank_batch_by_accuracy_without_dropping() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        )
+        .with_weights(HashMap::from([
+            ("Explore".to_string(), 0.2),
+            ("Librarian".to_string(), 0.9),
+        ]));
+        let out = tool
+            .invoke(serde_json::json!({ "tasks": [
+                { "agent": "Explore", "prompt": "a" },
+                { "agent": "Librarian", "prompt": "b" }
+            ]}))
+            .await
+            .unwrap();
+        let results = out["results"].as_array().expect("batch shape");
+        assert_eq!(results.len(), 2, "ordering never drops results: {out}");
+        assert_eq!(
+            results[0]["agent"], "Librarian",
+            "higher weight first: {out}"
+        );
+        assert_eq!(results[1]["agent"], "Explore");
+    }
+
+    // ── G1-09: accurate dispatch-failure labels ───────────────────────
+
+    #[test]
+    fn dispatch_error_feedback_distinguishes_blocked_from_failed() {
+        use rig_compose::registry::KernelError;
+        let terminated = dispatch_error_feedback(&KernelError::ToolDispatchTerminated(
+            "approval denied".into(),
+        ));
+        assert!(
+            terminated.starts_with("tool dispatch blocked"),
+            "{terminated}"
+        );
+        let budget = dispatch_error_feedback(&KernelError::BudgetFailed("cap".into()));
+        assert!(budget.starts_with("tool dispatch blocked"), "{budget}");
+        let failed = dispatch_error_feedback(&KernelError::ToolFailed("boom".into()));
+        assert!(failed.starts_with("tool failed:"), "{failed}");
+        let missing = dispatch_error_feedback(&KernelError::ToolNotFound("nope".into()));
+        assert!(missing.starts_with("tool failed:"), "{missing}");
     }
 }

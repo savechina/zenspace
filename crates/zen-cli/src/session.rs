@@ -5,6 +5,18 @@ use uuid::Uuid;
 use zen_core::types::{Sensitivity, Session, SessionStatus};
 use zen_memory::memory_service::IdentityContext;
 
+/// Estimate the token count of `text` for display purposes.
+///
+/// Character-based heuristic: `ceil(chars / 4)`, so any non-empty reply
+/// reports at least 1 token and an empty reply reports 0. Character count
+/// (not bytes) keeps CJK replies from being inflated by multi-byte UTF-8.
+///
+/// # Errors
+/// Never errors — pure computation.
+pub(crate) fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
 pub struct SessionContext {
     pub memory_context: IdentityContext,
 }
@@ -75,6 +87,14 @@ mod tests {
         assert_eq!(SessionStatus::Completed.to_string(), "Completed");
         assert_eq!(SessionStatus::Failed.to_string(), "Failed");
         assert_eq!(SessionStatus::Archived.to_string(), "Archived");
+    }
+
+    #[test]
+    fn test_estimate_tokens() {
+        assert_eq!(estimate_tokens("OK9"), 1);
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+        assert_eq!(estimate_tokens("你好世界"), 1);
     }
 
     #[test]

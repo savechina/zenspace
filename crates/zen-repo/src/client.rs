@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
@@ -78,8 +78,83 @@ async fn migration_guard(db_path: &Path) -> Result<std::fs::File> {
         .map_err(|e| SqliteError::MigrationLock(format!("migration lock task: {e}")))?
 }
 
+/// Rebuild the embedded migration set with `ignore_missing: true`.
+///
+/// Spec D16 (Runtime Compatibility Guard — Design, owner decision 2026-10-14:
+/// B+). An old binary opening a database already migrated by a newer build
+/// must keep working: zen's migrations are strictly additive (Principle XIII),
+/// so new-SQL-only objects are invisible to the old code's reads/writes and the
+/// old binary is safe. `Migrator` is not `Clone` and `sqlx::migrate!()` yields a
+/// const the macro cannot mark `ignore_missing`, so the set is rebuilt
+/// field-by-field after the codex-rs `state/src/migrations.rs`
+/// `runtime_migrator` pattern.
+///
+/// The six `sqlx::migrate::Migrator` fields (verified against sqlx-core
+/// 0.9.0 `src/migrate/migrator.rs`: `migrations`, `ignore_missing`,
+/// `locking`, `no_tx`, `table_name`, `create_schemas`) are copied verbatim
+/// from the embedded const; only `ignore_missing` is overridden.
+///
+/// Semantics preserved: `ignore_missing` short-circuits ONLY
+/// `validate_applied_migrations` (applied ⊋ embedded). Checksum validation for
+/// versions present in both sets (`VersionMismatch`) and the `Dirty` guard
+/// still fire in sqlx's apply loop — tolerance does NOT weaken them.
+fn runtime_migrator() -> sqlx::migrate::Migrator {
+    let embedded = sqlx::migrate!("./migrations");
+    sqlx::migrate::Migrator {
+        migrations: embedded.migrations,
+        ignore_missing: true,
+        locking: embedded.locking,
+        no_tx: embedded.no_tx,
+        table_name: embedded.table_name,
+        create_schemas: embedded.create_schemas,
+    }
+}
+
+/// Highest version recorded in the embedded migration set.
+///
+/// Spec D16 skew observability: paired with [`detect_schema_skew`] so a caller
+/// can compare the on-disk schema against the binary's embedded set. Built from
+/// the same `sqlx::migrate!()` const used by [`runtime_migrator`] and cached
+/// once per process (the set is static). Returns `0` for an empty set.
+pub fn embedded_migration_max() -> i64 {
+    static MAX: OnceLock<i64> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        sqlx::migrate!("./migrations")
+            .iter()
+            .map(|m| m.version)
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+/// Read-only applied-ahead skew probe.
+///
+/// Returns `Some((db_max, embedded_max))` ONLY when the database's highest
+/// applied migration exceeds the binary's embedded set — the
+/// old-binary-vs-newer-DB direction that [`runtime_migrator`] tolerates. A
+/// missing `_sqlx_migrations` table (fresh DB) or an empty table yields
+/// `None`, never an error: the query is wrapped to `None` so callers can run
+/// it on every startup without guarding.
+///
+/// **Callers own logging** — zen-repo has no `tracing` dependency and must stay
+/// that way, so this returns data only. The doctor probe and the gateway daemon
+/// startup line are the intended consumers (spec D16/D17), each emitting at most
+/// one informational line; under tolerance the state is benign, never a refusal.
+pub async fn detect_schema_skew(pool: &SqlitePool) -> Option<(i64, i64)> {
+    let db_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+        .ok()?;
+    let embedded_max = embedded_migration_max();
+    if db_max > embedded_max {
+        Some((db_max, embedded_max))
+    } else {
+        None
+    }
+}
+
 async fn run_migrations(pool: &SqlitePool) -> Result<()> {
-    let migrations = sqlx::migrate!("./migrations");
+    let migrations = runtime_migrator();
 
     match migrations.run(pool).await {
         Ok(_) => Ok(()),

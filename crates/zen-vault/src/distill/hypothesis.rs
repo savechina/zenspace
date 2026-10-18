@@ -429,16 +429,33 @@ pub fn generate_from_gaps(gaps: &[GapRecord]) -> Vec<HypothesisSlug> {
     out
 }
 
+/// Hard per-cycle cap on hypothesis generation — a runaway guard so a gap
+/// storm (whatever its source) can never write unbounded files per cycle
+/// (2026-10-15 incident class; `FANOUT_MAX_TASKS` precedent).
+pub const MAX_HYPOTHESES_PER_CYCLE: usize = 20;
+
 /// Generate hypotheses enriched with failure history: per-gap-type stepping
 /// stones (DGM: do not repeat a falsified claim) and recent reflection
 /// guidance (Reflexion) are appended to each exploration prompt. Missing
 /// history is a no-op — behaviour matches [`generate_from_gaps`].
+///
+/// Output is capped at [`MAX_HYPOTHESES_PER_CYCLE`] (deterministic input
+/// order, first N kept) — generation beyond the cap is a bug elsewhere, not
+/// throughput to preserve.
 pub fn generate_from_gaps_with_history(
     gaps: &[GapRecord],
     rejected_dir: &Path,
     reflections_dir: &Path,
 ) -> Vec<HypothesisSlug> {
     let mut hypotheses = generate_from_gaps(gaps);
+    if hypotheses.len() > MAX_HYPOTHESES_PER_CYCLE {
+        debug!(
+            generated = hypotheses.len(),
+            cap = MAX_HYPOTHESES_PER_CYCLE,
+            "hypothesis generation capped per cycle (runaway guard)"
+        );
+        hypotheses.truncate(MAX_HYPOTHESES_PER_CYCLE);
+    }
     if hypotheses.is_empty() {
         return hypotheses;
     }

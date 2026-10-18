@@ -1,5 +1,5 @@
 //! Retention strength — pure Ebbinghaus forgetting-curve model (Phase 31 T207,
-//! design `docs/designs/memory-strength-knowledge-wave.md` Feature 1).
+//! design `docs/designs/architecture.md §3.2/§5` Feature 1).
 //!
 //! Strength is NEVER persisted: it is a pure function of persisted inputs
 //! (content anchor, last reinforcement event, event count) evaluated lazily at

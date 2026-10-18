@@ -14,7 +14,9 @@ pub mod traits;
 pub mod types;
 
 pub use beliefs_repo::BeliefsRepo;
-pub use client::{SqliteClient, SqliteError, probe_latest_version};
+pub use client::{
+    SqliteClient, SqliteError, detect_schema_skew, embedded_migration_max, probe_latest_version,
+};
 pub use communities::{Adjacency, louvain_communities};
 pub use dispatch_repo::{DispatchRepo, DispatchTaskRow};
 pub use embeddings_repo::EmbeddingsRepo;

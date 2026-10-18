@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::{Input, Key};
 
 use super::app::App;
+use super::history_search;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InlineKeyAction {
@@ -110,133 +111,8 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
 
     // W2: Reverse-i-search mode — ALL keys route here before normal dispatch.
     // Pickers (model_picker, session_picker) are already guarded above.
-    if app.history_search.active {
-        match (key.code, key.modifiers) {
-            // Ctrl+R or Up: cycle to older match
-            (KeyCode::Char('r'), KeyModifiers::CONTROL) | (KeyCode::Up, KeyModifiers::NONE) => {
-                app.history_search.cycle_older();
-                if let Some(m) = app.history_search.current_match() {
-                    let text = m.to_string();
-                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
-                    app.input = App::create_input_textarea_at_end(text);
-                    app.input.enter_history_mode();
-                }
-            }
-            // Down: cycle to newer match
-            (KeyCode::Down, KeyModifiers::NONE) => {
-                app.history_search.cycle_newer();
-                if let Some(m) = app.history_search.current_match() {
-                    let text = m.to_string();
-                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
-                    app.input = App::create_input_textarea_at_end(text);
-                    app.input.enter_history_mode();
-                } else {
-                    // No match — restore draft
-                    let draft = app.history_search.draft_snapshot.clone();
-                    // BUG-2+L3: Use new_at_end to position cursor at end of draft.
-                    app.input = App::create_input_textarea_at_end(draft);
-                    app.input.exit_mode();
-                }
-            }
-            // Enter: ACCEPT — set textarea to match, exit search.
-            // BUG-4: If no match, restore draft (same as Esc/cancel).
-            (KeyCode::Enter, _) => {
-                if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
-                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
-                    app.input = App::create_input_textarea_at_end(m);
-                    app.input.exit_mode();
-                } else {
-                    // No match — restore draft (bash semantics: failed search leaves line unchanged).
-                    let draft = app.history_search.draft_snapshot.clone();
-                    app.input = App::create_input_textarea_at_end(draft);
-                    app.input.exit_mode();
-                }
-                app.history_search.exit();
-                // Refresh slash state with the RESULTING textarea text.
-                // T084(d): dismissal-aware refresh (pure token equality).
-                app.refresh_slash_popup();
-            }
-            // Esc: CANCEL — restore draft, exit search
-            (KeyCode::Esc, _) => {
-                let draft = app.history_search.draft_snapshot.clone();
-                app.history_search.exit();
-                // BUG-2+L3: Use new_at_end to position cursor at end of draft.
-                app.input = App::create_input_textarea_at_end(draft);
-                app.input.exit_mode();
-            }
-            // Ctrl+C: exit search only (do not quit app)
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                let draft = app.history_search.draft_snapshot.clone();
-                app.history_search.exit();
-                // BUG-2+L3: Use new_at_end to position cursor at end of draft.
-                app.input = App::create_input_textarea_at_end(draft);
-                app.input.exit_mode();
-            }
-            // Ctrl+D: exit search (do not quit app)
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                let draft = app.history_search.draft_snapshot.clone();
-                app.history_search.exit();
-                // BUG-2+L3: Use new_at_end to position cursor at end of draft.
-                app.input = App::create_input_textarea_at_end(draft);
-                app.input.exit_mode();
-            }
-            // Backspace: remove char from query; empty query + Backspace → exit
-            (KeyCode::Backspace, _) => {
-                if app.history_search.query.is_empty() {
-                    let draft = app.history_search.draft_snapshot.clone();
-                    app.history_search.exit();
-                    // BUG-2+L3: Use new_at_end to position cursor at end of draft.
-                    app.input = App::create_input_textarea_at_end(draft);
-                    app.input.exit_mode();
-                } else {
-                    app.history_search.backspace(&app.command_history);
-                    if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
-                        // BUG-2+L3: Use new_at_end to position cursor at end of match.
-                        app.input = App::create_input_textarea_at_end(m);
-                        app.input.enter_history_mode();
-                    } else {
-                        // No matches — show query in textarea
-                        let q = app.history_search.query.clone();
-                        // BUG-2+L3: Use new_at_end to position cursor at end of query.
-                        app.input = App::create_input_textarea_at_end(q);
-                        app.input.enter_history_mode();
-                    }
-                }
-            }
-            // Printable char: push to query
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                app.history_search.push_char(c, &app.command_history);
-                if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
-                    // BUG-2+L3: Use new_at_end to position cursor at end of match.
-                    app.input = App::create_input_textarea_at_end(m);
-                    app.input.enter_history_mode();
-                } else {
-                    let q = app.history_search.query.clone();
-                    // BUG-2+L3: Use new_at_end to position cursor at end of query.
-                    app.input = App::create_input_textarea_at_end(q);
-                    app.input.enter_history_mode();
-                }
-            }
-            // Everything else: swallow while search is active
-            _ => {}
-        }
-        return InlineKeyAction::Continue;
-    }
-
-    // W2 entry: Ctrl+R in normal context → start reverse-i-search.
-    // L2: Guard against slash popup — swallow Ctrl+R while popup owns keys.
-    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if !app.slash_state.visible {
-            let current_text = app.input.lines().join("\n");
-            app.history_search.enter(&current_text);
-            app.history_search.recompute_matches(&app.command_history);
-            // Preview the first match (or full history if no query yet)
-            if let Some(m) = app.history_search.current_match().map(|s| s.to_string()) {
-                // BUG-2+L3: Use new_at_end to position cursor at end of match.
-                app.input = App::create_input_textarea_at_end(m);
-                app.input.enter_history_mode();
-            }
-        }
+    // SINGLE shared state machine (also called by the fullscreen handler).
+    if history_search::handle_key(key, app) {
         return InlineKeyAction::Continue;
     }
 
@@ -436,16 +312,20 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
             });
             return InlineKeyAction::Continue;
         }
-        // A4: Execute selected slash command on Enter
+        // Enter completes the selected command into the composer WITHOUT
+        // submitting (fullscreen parity — handler.rs Enter arm). Executing
+        // immediately on a token-only buffer fired commands the user only
+        // meant to complete before typing arguments.
         if app.slash_state.visible
             && let Some(cmd) = app.slash_state.selected_command(&app.slash_registry)
         {
-            let text = format!("/{}", cmd);
+            let text = format!("/{} ", cmd);
             app.input.select_all();
             app.input.cut();
             app.input.insert_str(&text);
+            app.clear_paste_pills();
             app.slash_state.dismiss();
-            return InlineKeyAction::Submit;
+            return InlineKeyAction::Continue;
         }
         return InlineKeyAction::Submit;
     }
@@ -575,21 +455,27 @@ mod tests {
         assert_eq!(app.slash_state.selected, 0);
     }
 
-    /// Enter with a visible popup executes the SELECTED command (Codex
-    /// semantics) — the buffer is rewritten to the full command and submitted.
+    /// Enter with a visible popup COMPLETES the selected command into the
+    /// composer (fullscreen parity) without submitting — executing a bare
+    /// command on Enter fired commands the user only meant to complete
+    /// before typing arguments.
     #[test]
-    fn slash_popup_enter_executes_selected_command() {
+    fn slash_popup_enter_completes_without_submitting() {
         let mut app = test_app();
         for c in "/exi".chars() {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
         }
         assert!(app.slash_state.visible);
         let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(action, InlineKeyAction::Submit);
+        assert_eq!(action, InlineKeyAction::Continue);
         assert_eq!(
             app.input.lines().join("\n"),
-            "/exit",
-            "Enter must execute the selected command"
+            "/exit ",
+            "Enter must complete the selected command, not execute it"
+        );
+        assert!(
+            !app.slash_state.visible,
+            "completion must dismiss the popup"
         );
     }
 

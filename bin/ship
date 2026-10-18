@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PURPOSE: 通用发布提交：lint 门禁 + 拦截 AI 署名 + 安全暂存；脚本自身永不追加 trailer，默认不 push
-# USAGE: ./bin/ship.sh -m "subject" [-b "body"] [--all] [--no-verify] [--no-hooks] [--allow-main] [--allow-ai-trailer] [--dry-run] [--suggest] [--auto-message] [--type T] [-- path...]
+# USAGE: ./bin/ship -m "subject" [-b "body"] [--all] [--no-verify] [--no-hooks] [--allow-main] [--allow-ai-trailer] [--dry-run] [--suggest] [--auto-message] [--type T] [-- path...]
 #   -m SUBJECT            提交标题（缺省则调起编辑器手写）
 #   -b BODY               提交正文（可重复 -b 追加段落）
 #   -- path...            额外显式暂存路径（用于点名 untracked 新文件）
@@ -17,16 +17,17 @@
 # EXPECTED: 装好 .git/hooks/{pre-commit,commit-msg}（幂等，只碰自家标记的 hook）；1 个无 AI 署名、无明细、符合 Conventional Commits 的 commit；最后只提示 push 命令
 # ERRORS: lint 失败 → 修完重跑；有剩余 untracked 且无 --all → 中止并列出；消息命中 AI 署名、明细模式或格式不符 → hook 拦截
 # AGENT PROTOCOL (coding agent + summarizer skill):
-#   1. agent: ./bin/ship.sh --suggest [--all] [-- path...]  → 暂存 + 输出 [ship-suggest] 结构化摘要
+#   1. agent: ./bin/ship --suggest [--all] [-- path...]  → 暂存 + 输出 [ship-suggest] 结构化摘要
 #   2. skill: 按 Conventional Commits 精修标题/正文（type(scope): subject，subject<=120）。
 #      MESSAGE RULES（像人工提交）: 正文只写功能点（改了什么能力/为什么，≤5 个短 bullet）；
 #      禁止文件清单、diffstat、测试数、门禁结果——commit-msg hook 拦截这些明细模式
 #      （单次放行 SHIP_ALLOW_DETAIL=1 或 --allow-detail）；细节归档到 docs/designs/ 或 tasks.md ledger
-#   3. agent: ./bin/ship.sh -m "title" [-b "body"] [同上 flags]  → hooks(QA 门+格式门+AI 拦截+明细拦截)后提交
+#   3. agent: ./bin/ship -m "title" [-b "body"] [同上 flags]  → hooks(QA 门+格式门+AI 拦截+明细拦截)后提交
 #   QA 扩展点: SHIP_QA_EXTRA="cmd args..."（pre-commit 在 bin/lint 后追加执行）；SHIP_RUN_TESTS=1 时追加 cargo test --workspace（慢，默认关）
 set -euo pipefail
 
-MARKER="# managed by bin/ship.sh (zenspace-ship)"
+MARKER="# managed by bin/ship (zenspace-ship)"
+LEGACY_MARKER="# managed by bin/ship.sh (zenspace-ship)"
 MSG=""
 BODIES=()
 INCLUDE_ALL=0
@@ -85,7 +86,7 @@ echo "branch: $BRANCH"
 # 1. 安装 git hooks（幂等：缺失或带自家标记才写，不覆盖用户手写 hook）
 install_hook() {
   local name="$1" content="$2" target="$HOOK_DIR/$1"
-  if [ -f "$target" ] && ! grep -qF "$MARKER" "$target" 2>/dev/null; then
+  if [ -f "$target" ] && ! grep -qF "$MARKER" "$target" 2>/dev/null && ! grep -qF "$LEGACY_MARKER" "$target" 2>/dev/null; then
     echo "hooks: $name 已存在且非本脚本管理，跳过（手动处理）"
     return 0
   fi
@@ -115,7 +116,7 @@ SUBJECT=\$(head -n1 \"\$F\")
 case \"\$SUBJECT\" in Merge\\ *) exit 0;; esac
 if [ \"\${SHIP_ALLOW_AI_TRAILER:-0}\" != \"1\" ] && grep -Ei 'co-authored-by:[[:space:]]*.*(sisyphus|clio-agent|sisyphuslabs|claude|anthropic|openai|chatgpt|copilot|gemini|codex|cursor|aider|assistant@|\\[bot\\]|noreply)' \"\$F\"; then
   echo '[ship] BLOCKED: 检测到 AI 署名 trailer，拒绝提交。' >&2
-  echo '[ship] 人工合著署名不受影响；确需放行请用 ./bin/ship.sh --allow-ai-trailer 重试。' >&2
+  echo '[ship] 人工合著署名不受影响；确需放行请用 ./bin/ship --allow-ai-trailer 重试。' >&2
   exit 1
 fi
 if [ \"\${SHIP_ALLOW_DETAIL:-0}\" != \"1\" ]; then
@@ -124,7 +125,7 @@ if [ \"\${SHIP_ALLOW_DETAIL:-0}\" != \"1\" ]; then
   if [ \"\$DETAIL_HITS\" -gt 0 ] || [ \"\$CRATES_MENTIONS\" -ge 3 ]; then
     echo '[ship] BLOCKED: 提交消息包含文件/测试/门禁明细——只写功能点，像人工提交。' >&2
     echo '[ship] 规约: 标题 type(scope): 功能点；正文 ≤5 个短 bullet（改了什么能力/为什么）。明细归档 docs/designs/ 或 tasks.md ledger。' >&2
-    echo '[ship] 单次放行: SHIP_ALLOW_DETAIL=1 或 ./bin/ship.sh --allow-detail' >&2
+    echo '[ship] 单次放行: SHIP_ALLOW_DETAIL=1 或 ./bin/ship --allow-detail' >&2
     exit 1
   fi
 fi
@@ -152,7 +153,7 @@ if [ "$LEFTOVER" != "0" ] && [ "$DRY_RUN" != "1" ]; then
   else
     echo "ABORT: 仍有 $LEFTOVER 个 untracked 未暂存（git add -u 碰不到它们，漏提则提交树可能编译不过）：" >&2
     git status --porcelain | grep '^??' >&2
-    echo "处理：点名追加 ./bin/ship.sh ... -- <paths>，或确认无误后加 --all" >&2
+    echo "处理：点名追加 ./bin/ship ... -- <paths>，或确认无误后加 --all" >&2
     exit 1
   fi
 fi

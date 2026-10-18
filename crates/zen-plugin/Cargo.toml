@@ -43,6 +43,7 @@ landlock = { workspace = true }
 seccompiler = { workspace = true }
 
 [dev-dependencies]
+zen-core = { path = "../zen-core", features = ["test-support"] }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
 wat = "1"

@@ -65,6 +65,30 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Agent → granted tool manifest (authoritative builtin grant table).
+///
+/// The map below is the source of truth; this table is the derived view and
+/// is pinned by `agent_tools_grant_documentation_matches_map` so prose drift
+/// fails the build:
+///
+/// | Tool | Holders |
+/// |------|---------|
+/// | `tier2_search` | 12 of 13 — every agent except `Prometheus` (FTS reach) |
+/// | `tier3_search` | 6 — Sisyphus, Hermes, Momus, Oracle, Hephaestus, Zeus |
+/// | `tier4_search` | 6 — same six as `tier3_search` (graph reach) |
+/// | `compute_embeddings` | 6 — Sisyphus, Junior, Prometheus, Librarian, Hephaestus, Atlas |
+/// | `shell.exec` | 1 — Sisyphus only |
+///
+/// **There is no `tier1_search` agent tool.** Tier 1 is zen's internal ripgrep
+/// tier (`zen-vault/src/search/mod.rs`), reached through `SearchService` and
+/// never advertised to a model — a model that emits `tier1_search` therefore
+/// hits invalid-name suppression (G1-03/G1-06). Do not add it here.
+///
+/// The asymmetry is deliberate (G3-05): semantic/graph retrieval is granted
+/// to the search-capable agents only; `tier2_search` (FTS) is near-universal.
+/// Grants are further filtered to registry-present tools by
+/// `resolve_agent_tool_grants` (G3-01), and widened by the `[agents] tools`
+/// config overlay (FR-046).
 const AGENT_TOOLS: &[(&str, &[&str])] = &[
     (
         "Sisyphus",
@@ -555,6 +579,82 @@ mod tests {
             let mapped = AGENT_TOOLS.iter().any(|(n, _)| *n == *name);
             assert!(mapped, "agent {name} missing from AGENT_TOOLS");
         }
+    }
+
+    fn agents_holding(tool: &str) -> Vec<&'static str> {
+        AGENT_TOOLS
+            .iter()
+            .filter(|(_, tools)| tools.contains(&tool))
+            .map(|(name, _)| *name)
+            .collect()
+    }
+
+    /// G3-05: the prose grant table on [`AGENT_TOOLS`] must match the map.
+    #[test]
+    fn agent_tools_grant_documentation_matches_map() {
+        // tier2_search: documented "12 of 13 — every agent except Prometheus".
+        let tier2 = agents_holding("tier2_search");
+        assert_eq!(
+            tier2.len(),
+            BUILTIN_AGENT_NAMES.len() - 1,
+            "tier2_search documented as 12 holders"
+        );
+        assert!(!tier2.contains(&"Prometheus"));
+        for name in BUILTIN_AGENT_NAMES {
+            if *name != "Prometheus" {
+                assert!(tier2.contains(name), "tier2_search must be held by {name}");
+            }
+        }
+
+        // tier3_search / tier4_search: the same documented six holders.
+        const SIX: [&str; 6] = [
+            "Sisyphus",
+            "Hermes",
+            "Momus",
+            "Oracle",
+            "Hephaestus",
+            "Zeus",
+        ];
+        for tool in ["tier3_search", "tier4_search"] {
+            let holders = agents_holding(tool);
+            assert_eq!(holders.len(), 6, "{tool} documented as six holders");
+            for name in SIX {
+                assert!(holders.contains(&name), "{tool} must be held by {name}");
+            }
+        }
+        assert_eq!(
+            agents_holding("tier3_search"),
+            agents_holding("tier4_search")
+        );
+
+        // compute_embeddings: the documented six holders.
+        const EMBEDDERS: [&str; 6] = [
+            "Sisyphus",
+            "Junior",
+            "Prometheus",
+            "Librarian",
+            "Hephaestus",
+            "Atlas",
+        ];
+        let embedders = agents_holding("compute_embeddings");
+        assert_eq!(
+            embedders.len(),
+            6,
+            "compute_embeddings documented as six holders"
+        );
+        for name in EMBEDDERS {
+            assert!(
+                embedders.contains(&name),
+                "compute_embeddings must be held by {name}"
+            );
+        }
+
+        // No tier1 agent tool exists; shell.exec is Sisyphus-only.
+        assert!(
+            agents_holding("tier1_search").is_empty(),
+            "tier1 is internal ripgrep, never an agent tool"
+        );
+        assert_eq!(agents_holding("shell.exec"), vec!["Sisyphus"]);
     }
 
     #[test]

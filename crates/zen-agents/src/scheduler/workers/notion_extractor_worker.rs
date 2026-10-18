@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -14,6 +15,9 @@ use zen_vault::notion::{Notion, NotionKind, NotionService};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::marker_state::JournalEntryState;
+use super::zen_loop::log_once;
+
+static DB_OPEN_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 const TECH_KEYWORDS: &[&str] = &[
     "Rust",
@@ -108,7 +112,9 @@ impl ZenWorker for NotionExtractorWorker {
         let client = match zen_vault::SqliteClient::open(&state_db).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to open state.db, notion extraction aborted");
+                if log_once(&DB_OPEN_FAILED_LOGGED) {
+                    warn!(error = %e, "failed to open state.db, notion extraction aborted");
+                }
                 return Ok(WorkerReport {
                     worker_id: self.id().to_string(),
                     success: false,

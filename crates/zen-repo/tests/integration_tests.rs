@@ -232,6 +232,150 @@ async fn test_notes_search_limit_clamped_to_minimum() {
     let _results = repo.search("search", 0).await.unwrap();
 }
 
+// T222: notes_fts is contentless (migration 001 `content=''`) — it is the
+// ranking structure only, so search snippets are populated from the
+// canonical markdown file at notes_meta.file_path (size-capped, fail-open).
+
+#[tokio::test]
+async fn test_notes_search_snippet_carries_canonical_file_content() {
+    let (client, dir) = make_client().await;
+    let repo = zen_repo::NotesRepo::new(&client);
+
+    let note_path = dir.path().join("rust.md");
+    // The file body is deliberately DIFFERENT from the indexed FTS content:
+    // the snippet can only come from the file (the contentless FTS column is
+    // structurally empty), so the marker discriminates a real file read.
+    std::fs::write(&note_path, "CANONICAL-BODY-MARKER: rust systems language").unwrap();
+    repo.index_note(IndexNoteRequest {
+        id: "n1",
+        title: "Rust Basics",
+        content: "indexed-only fts tokens for ranking",
+        tags: "rust",
+        file_path: note_path.to_str().unwrap(),
+        source: "manual",
+    })
+    .await
+    .unwrap();
+
+    let results = repo.search("indexed", 10).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, note_path.to_str().unwrap());
+    assert!(
+        results[0].snippet.contains("CANONICAL-BODY-MARKER"),
+        "snippet must carry the canonical file content, got: {:?}",
+        results[0].snippet
+    );
+}
+
+#[tokio::test]
+async fn test_notes_search_unreadable_file_fails_open_to_empty_snippet() {
+    let (client, dir) = make_client().await;
+    let repo = zen_repo::NotesRepo::new(&client);
+
+    // (a) missing file
+    repo.index_note(IndexNoteRequest {
+        id: "missing",
+        title: "Missing",
+        content: "missingfiletoken body",
+        tags: "",
+        file_path: dir.path().join("does-not-exist.md").to_str().unwrap(),
+        source: "test",
+    })
+    .await
+    .unwrap();
+    let results = repo.search("missingfiletoken", 10).await.unwrap();
+    assert_eq!(results.len(), 1, "MATCH ranking is content-independent");
+    assert_eq!(results[0].snippet, "", "missing file ⇒ empty snippet");
+
+    // (b) non-UTF-8 (corrupt) file
+    let corrupt_path = dir.path().join("corrupt.md");
+    std::fs::write(&corrupt_path, b"\xff\xfe\x00garbage").unwrap();
+    repo.index_note(IndexNoteRequest {
+        id: "corrupt",
+        title: "Corrupt",
+        content: "corruptfiletoken body",
+        tags: "",
+        file_path: corrupt_path.to_str().unwrap(),
+        source: "test",
+    })
+    .await
+    .unwrap();
+    let results = repo.search("corruptfiletoken", 10).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].snippet, "", "corrupt file ⇒ empty snippet");
+
+    // (c) oversized file: not read at all (cap precedent: T093/T214 256 KiB)
+    let huge_path = dir.path().join("huge.md");
+    std::fs::write(
+        &huge_path,
+        "x".repeat(zen_repo::notes_repo::SNIPPET_FILE_MAX_BYTES as usize + 1),
+    )
+    .unwrap();
+    repo.index_note(IndexNoteRequest {
+        id: "huge",
+        title: "Huge",
+        content: "hugefiletoken body",
+        tags: "",
+        file_path: huge_path.to_str().unwrap(),
+        source: "test",
+    })
+    .await
+    .unwrap();
+    let results = repo.search("hugefiletoken", 10).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].snippet, "", "oversized file ⇒ empty snippet");
+}
+
+#[tokio::test]
+async fn test_notes_search_ranking_unchanged_by_snippet_population() {
+    let (client, dir) = make_client().await;
+    let repo = zen_repo::NotesRepo::new(&client);
+
+    // Different FTS match quality: bm25 must rank the term-dense note first,
+    // exactly as before the snippet fix (MATCH/ORDER BY untouched).
+    let strong_path = dir.path().join("strong.md");
+    let weak_path = dir.path().join("weak.md");
+    std::fs::write(&strong_path, "STRONG-FILE body").unwrap();
+    std::fs::write(&weak_path, "WEAK-FILE body").unwrap();
+    repo.index_note(IndexNoteRequest {
+        id: "strong",
+        title: "strong",
+        content: "alpha alpha alpha alpha alpha",
+        tags: "",
+        file_path: strong_path.to_str().unwrap(),
+        source: "test",
+    })
+    .await
+    .unwrap();
+    repo.index_note(IndexNoteRequest {
+        id: "weak",
+        title: "weak",
+        content: "alpha beta gamma delta",
+        tags: "",
+        file_path: weak_path.to_str().unwrap(),
+        source: "test",
+    })
+    .await
+    .unwrap();
+
+    let results = repo.search("alpha", 10).await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].path,
+        strong_path.to_str().unwrap(),
+        "bm25 ordering: term-dense note ranks first"
+    );
+    assert!(
+        results[0].score <= results[1].score,
+        "bm25 scores ascending (more negative = better): {} then {}",
+        results[0].score,
+        results[1].score
+    );
+    // Per-hit population: each snippet comes from its OWN canonical file.
+    assert!(results[0].snippet.contains("STRONG-FILE"));
+    assert!(results[1].snippet.contains("WEAK-FILE"));
+}
+
 // ===========================================================================
 // EmbeddingsRepo
 // ===========================================================================
@@ -245,75 +389,112 @@ async fn test_embeddings_search_empty_embedding_returns_empty() {
     assert!(r.is_empty());
 }
 
+/// Vec0 vectors must actually round-trip, including replacement of an existing
+/// `note_id` — vec0 ignores `INSERT OR REPLACE`, so a plain re-insert hits the
+/// shadow rowids table with a UNIQUE violation.
+///
+/// Replaces a vacuous predecessor that passed on `Ok(())` without asserting
+/// anything, so a silently dead store (semantic search never returning
+/// anything) looked green.
 #[tokio::test]
-async fn test_embeddings_insert_note_embedding_vec0_unavailable() {
+async fn test_embeddings_insert_note_embedding_round_trips_and_replaces() {
+    let (client, _dir) = make_client().await;
+    let repo = zen_repo::EmbeddingsRepo::new(&client);
+
+    let first = vec![0.1_f32; 4096];
+    repo.insert_note_embedding(InsertNoteEmbeddingRequest {
+        note_id: "note1",
+        embedding: &first,
+    })
+    .await
+    .expect("vec0 insert must succeed inside SqliteClient");
+    assert_eq!(
+        repo.get_note_embedding("note1").await.unwrap(),
+        Some(first),
+        "the stored vector must round-trip"
+    );
+
+    let second = vec![0.7_f32; 4096];
+    repo.insert_note_embedding(InsertNoteEmbeddingRequest {
+        note_id: "note1",
+        embedding: &second,
+    })
+    .await
+    .expect("replacing an existing note_id must not hit the shadow-rowid UNIQUE trap");
+    assert_eq!(
+        repo.get_note_embedding("note1").await.unwrap(),
+        Some(second),
+        "the replacement must win"
+    );
+}
+
+#[tokio::test]
+async fn test_embeddings_insert_entity_embedding_is_replaceable() {
     let (client, _dir) = make_client().await;
     let repo = zen_repo::EmbeddingsRepo::new(&client);
 
     let embedding = vec![0.1_f32; 4096];
-    let result = repo
-        .insert_note_embedding(InsertNoteEmbeddingRequest {
-            note_id: "note1",
-            embedding: &embedding,
-        })
-        .await;
-
-    // If vec0 extension isn't loaded, this will error — that's expected
-    match result {
-        Ok(()) => {}
-        Err(e) => {
-            let err_msg = e.to_string();
-            assert!(
-                err_msg.contains("no such table") || err_msg.contains("no such module"),
-                "unexpected error: {err_msg}"
-            );
-        }
-    }
+    repo.insert_entity_embedding(InsertNotionEmbeddingRequest {
+        notion_id: "ent1",
+        embedding: &embedding,
+    })
+    .await
+    .expect("vec0 insert must succeed inside SqliteClient");
+    repo.insert_entity_embedding(InsertNotionEmbeddingRequest {
+        notion_id: "ent1",
+        embedding: &embedding,
+    })
+    .await
+    .expect("re-inserting the same notion_id must be replaceable");
 }
 
+/// Tier-3 vec0 search must return the note AND its canonical file content.
+///
+/// Replaces a vacuous predecessor that accepted any error mentioning "no such
+/// table"/"no such module" — which meant it passed while the query failed in
+/// production on every single request (`no column found for name: file`, since
+/// the projection aliased `file_path` but `FromRow` maps by field name).
 #[tokio::test]
-async fn test_embeddings_insert_entity_embedding_vec0_unavailable() {
-    let (client, _dir) = make_client().await;
-    let repo = zen_repo::EmbeddingsRepo::new(&client);
+async fn test_embeddings_search_returns_canonical_content() {
+    let (client, dir) = make_client().await;
+    let note_path = dir.path().join("buffett-notes.md");
+    std::fs::write(
+        &note_path,
+        "# Buffett\n\ncircle of competence is the key idea\n",
+    )
+    .unwrap();
+    let note_path = note_path.to_string_lossy().to_string();
 
-    let embedding = vec![0.1_f32; 4096];
-    let result = repo
-        .insert_entity_embedding(InsertNotionEmbeddingRequest {
-            notion_id: "ent1",
-            embedding: &embedding,
+    zen_repo::NotesRepo::new(&client)
+        .index_note(IndexNoteRequest {
+            id: "note1",
+            title: "Buffett",
+            content: "circle of competence is the key idea",
+            tags: "",
+            file_path: &note_path,
+            source: "inbox",
         })
-        .await;
+        .await
+        .unwrap();
 
-    match result {
-        Ok(()) => {}
-        Err(e) => {
-            let err_msg = e.to_string();
-            assert!(
-                err_msg.contains("no such table") || err_msg.contains("no such module"),
-                "unexpected error: {err_msg}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_embeddings_search_nonempty_embedding_vec0_unavailable() {
-    let (client, _dir) = make_client().await;
     let repo = zen_repo::EmbeddingsRepo::new(&client);
-
     let embedding = vec![0.5_f32; 4096];
-    let result = repo.search(&embedding, 5).await;
+    repo.insert_note_embedding(InsertNoteEmbeddingRequest {
+        note_id: "note1",
+        embedding: &embedding,
+    })
+    .await
+    .unwrap();
 
-    match result {
-        Ok(_results) => {}
-        Err(e) => {
-            let err_msg = e.to_string();
-            assert!(
-                err_msg.contains("no such table") || err_msg.contains("no such module"),
-                "unexpected error: {err_msg}"
-            );
-        }
-    }
+    let hits = repo.search(&embedding, 5).await.unwrap();
+    assert_eq!(hits.len(), 1, "the vec0 hit must survive the query");
+    assert_eq!(hits[0].file, note_path);
+    assert_eq!(hits[0].line, 0);
+    assert!(
+        hits[0].content.contains("circle of competence"),
+        "content must come from the canonical file (notes_fts is contentless), got {:?}",
+        hits[0].content
+    );
 }
 
 // ===========================================================================

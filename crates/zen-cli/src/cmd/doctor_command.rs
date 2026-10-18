@@ -1,5 +1,6 @@
 use colored::Colorize;
 use serde::Serialize;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::path::Path;
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
@@ -60,6 +61,7 @@ fn run_all_checks() -> Vec<CheckResult> {
         check_provider(),
         check_vault(),
         check_outbox(),
+        check_schema_compat(),
     ]
 }
 
@@ -300,7 +302,13 @@ fn check_provider() -> CheckResult {
         }
     };
 
-    for (name, agent) in &config.agents {
+    // Deterministic probe order: config maps are HashMaps whose iteration
+    // order is randomized per process — without sorting, the first
+    // resolvable provider (and therefore this check's detail string)
+    // flips between runs (observed: ollama vs deepseek alternating).
+    let mut agents: Vec<_> = config.agents.iter().collect();
+    agents.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, agent) in agents {
         if let Some(provider) = &agent.provider {
             if provider == "ollama" {
                 return CheckResult {
@@ -320,7 +328,9 @@ fn check_provider() -> CheckResult {
         }
     }
 
-    for (name, prov) in &config.providers {
+    let mut providers: Vec<_> = config.providers.iter().collect();
+    providers.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, prov) in providers {
         if name == "ollama" {
             return CheckResult {
                 name: "provider".into(),
@@ -446,6 +456,115 @@ fn outbox_probe(outbox_dir: &Path, qqbot_live: bool) -> CheckResult {
         detail: format!(
             "{staged} staged briefs undeliverable: configure [channels.qqbot] or clear logs/outbox/"
         ),
+    }
+}
+
+/// Probe 10 (W4.3, spec D17): read-only applied-vs-embedded schema
+/// comparison.
+///
+/// Resolves the state.db path and delegates to the async, non-migrating
+/// [`schema_compat_for_path`]. An absent state.db is the normal
+/// fresh-install state (PASS), never a failure.
+fn check_schema_compat() -> CheckResult {
+    let paths = match ZenPaths::detect() {
+        Ok(p) => p,
+        Err(e) => {
+            return CheckResult {
+                name: "schema-compat".into(),
+                ok: false,
+                detail: format!("paths unavailable: {e}"),
+            };
+        }
+    };
+    let db_path = paths.data().join("state.db");
+    let probe = schema_compat_for_path(&db_path);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(probe)),
+        Err(_) => match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(probe),
+            Err(e) => CheckResult {
+                name: "schema-compat".into(),
+                ok: false,
+                detail: format!("runtime unavailable: {e}"),
+            },
+        },
+    }
+}
+
+/// Read-only schema-version probe for one state.db path.
+///
+/// Opens `sqlite://<path>?mode=ro` — deliberately NOT
+/// [`zen_repo::SqliteClient::open`], which migrates and takes the
+/// cross-process migration flock: the doctor must observe, never mutate,
+/// and must not stall behind a live migration. Errors are classified by
+/// message: a missing `_sqlx_migrations` table is a fresh install (PASS);
+/// any other query/open failure (corrupt file, unreadable) is a genuine
+/// FAIL naming the error.
+async fn schema_compat_for_path(db_path: &Path) -> CheckResult {
+    const NAME: &str = "schema-compat";
+    if !db_path.exists() {
+        return CheckResult {
+            name: NAME.into(),
+            ok: true,
+            detail: "state.db not created yet (fresh install)".into(),
+        };
+    }
+    let url = format!("sqlite://{}?mode=ro", db_path.display());
+    let pool = match SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(e) => {
+            return CheckResult {
+                name: NAME.into(),
+                ok: false,
+                detail: format!("cannot open state.db read-only: {e}"),
+            };
+        }
+    };
+    let applied = sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await;
+    pool.close().await;
+
+    match applied {
+        Ok(db_max) => {
+            let embedded_max = zen_repo::embedded_migration_max();
+            if db_max > embedded_max {
+                CheckResult {
+                    name: NAME.into(),
+                    ok: true,
+                    detail: format!(
+                        "db schema v{db_max} ahead of binary v{embedded_max} — \
+                         tolerated (additive-only); upgrade zen when convenient"
+                    ),
+                }
+            } else {
+                CheckResult {
+                    name: NAME.into(),
+                    ok: true,
+                    detail: format!("schema v{db_max} matches binary (supports v{embedded_max})"),
+                }
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                CheckResult {
+                    name: NAME.into(),
+                    ok: true,
+                    detail: "state.db not created yet (fresh install)".into(),
+                }
+            } else {
+                CheckResult {
+                    name: NAME.into(),
+                    ok: false,
+                    detail: format!("schema probe failed: {msg}"),
+                }
+            }
+        }
     }
 }
 
@@ -690,5 +809,119 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"ok\":true"));
         assert!(json.contains("\"name\":\"test\""));
+    }
+
+    #[test]
+    fn doctor_runs_ten_probes_including_schema_compat() {
+        let checks = run_all_checks();
+        assert_eq!(checks.len(), 10, "doctor must run 10 liveness probes");
+        assert!(
+            checks.iter().any(|c| c.name == "schema-compat"),
+            "probe #10 `schema-compat` must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_compat_missing_db_is_fresh_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = schema_compat_for_path(&dir.path().join("state.db")).await;
+        assert_eq!(r.name, "schema-compat");
+        assert!(r.ok, "a missing state.db is a fresh install: {}", r.detail);
+        assert!(r.detail.contains("fresh install"), "{}", r.detail);
+    }
+
+    #[tokio::test]
+    async fn schema_compat_equal_db_matches_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&db).await.unwrap();
+        drop(client);
+
+        let r = schema_compat_for_path(&db).await;
+        assert_eq!(r.name, "schema-compat");
+        assert!(r.ok, "equal schema must PASS: {}", r.detail);
+        assert!(
+            r.detail.contains("matches binary"),
+            "detail must state the match: {}",
+            r.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_compat_ahead_db_is_tolerated_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = build_skew_db(dir.path()).await;
+
+        let r = schema_compat_for_path(&db).await;
+        assert_eq!(r.name, "schema-compat");
+        assert!(
+            r.ok,
+            "applied-ahead schema is tolerated (ok=true), not refused: {}",
+            r.detail
+        );
+        assert!(
+            r.detail.contains("ahead")
+                && r.detail.contains("tolerated")
+                && r.detail.contains("upgrade zen when convenient"),
+            "detail must name the skew and the remedy: {}",
+            r.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_compat_corrupt_db_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        std::fs::write(&db, b"definitely not a sqlite database").unwrap();
+
+        let r = schema_compat_for_path(&db).await;
+        assert_eq!(r.name, "schema-compat");
+        assert!(
+            !r.ok,
+            "an unreadable/corrupt state.db must FAIL: {}",
+            r.detail
+        );
+    }
+
+    /// Materializes a state.db whose applied schema is one migration ahead
+    /// of this binary's embedded set: the real migration set plus a
+    /// fabricated next-version probe applied through a fixture `Migrator`
+    /// (mirrors `zen-repo/tests/schema_compat_tolerance.rs`). The warm open
+    /// registers sqlite-vec process-wide so `002_vec` can create the vec0 table.
+    async fn build_skew_db(dir: &Path) -> std::path::PathBuf {
+        let mig_dir = dir.join("fixture_migrations");
+        std::fs::create_dir(&mig_dir).unwrap();
+        let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("../zen-repo/migrations");
+        for entry in std::fs::read_dir(&real).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".sql") {
+                std::fs::copy(entry.path(), mig_dir.join(&name)).unwrap();
+            }
+        }
+        // Derived, never hardcoded: a literal version collides with the real
+        // migration of that number (`UNIQUE constraint failed:
+        // _sqlx_migrations.version`) and stops exercising the skew path.
+        let probe_version = zen_repo::embedded_migration_max() + 1;
+        std::fs::write(
+            mig_dir.join(format!("{probe_version:03}_future_probe.sql")),
+            "CREATE TABLE future_probe(x);\n",
+        )
+        .unwrap();
+
+        let warm = dir.join("warm.db");
+        let _warm = zen_repo::SqliteClient::open(&warm).await.unwrap();
+
+        let db = dir.join("state.db");
+        let url = format!("sqlite://{}?mode=rwc", db.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let migrator = sqlx::migrate::Migrator::new(mig_dir).await.unwrap();
+        migrator.run(&pool).await.unwrap();
+        pool.close().await;
+        db
     }
 }

@@ -2,7 +2,21 @@
 
 ## Review
 
-### Contentless FTS5 serves structurally-empty tier-2 content (found by Phase 31 T214, 2026-10-11)
+### Nightly memvid-indexer duplicates the entire corpus every run (found by 2026-10-11 /sdd-review GAN adjudication, P1 URGENT — compounds nightly at 01:00) — RESOLVED 2026-10-11 (Phase 32 T219)
+
+**What:** The memvid-indexer worker calls `index_all` (memvid_index.rs:141-185 — NO checksum skip; checksums exist only in `index_incremental` :193-241 which has ZERO production callers), and `persist_structured_turn_meta → put_text → put_bytes_with_options` passes default `PutOptions` with `dedup=false` (memvid-core's BLAKE3 content-dedup exists at mutation.rs:3316-3330 but zen never enables it). ⇒ Every nightly run re-appends the FULL M2/M3/M4 corpus as new frames PLUS a new MemoryCard per chunk. Latent no-op until T195 (`4529f1c`, 2026-10-10) fixed the indexer paths — now live against real data, compounding every night: store bloat + duplicate retrieval hits crowding top-K + duplicate card populations polluting `entity_memories` (the enriched path's source).
+
+**Why P1:** Fires again tonight 01:00 (daemon Full profile). Not gated by any Phase-31 config — indexing itself is unconditional. Degradation is user-visible (memory recall quality) regardless of memory_strength gates.
+
+**Fix (oracle-adjudicated):** worker switches to `index_incremental` — machinery complete incl. checksum persistence (:233) and index_all fallback on missing sidecar; this gives it its first production caller (inverts the FND-9 dormant-primitive finding). **Do NOT fix via `dedup(true)`** — content-hash dedup would block the T210 provenance flip from ever backfilling existing frames on re-index. Race safety verified: worker and daemon share the same-process singleton `Arc<Mutex<Memvid>>` (memvid.rs:129-141) — interleaving possible, corruption not. Tracked as tasks.md Phase 32 T219.
+
+**Effort:** S
+**Priority:** P1
+**Depends on:** none — one-line call switch + idempotency tests (second run adds zero frames)
+
+**Resolution (2026-10-11, T219):** worker switched to `index_incremental` (`memvid_indexer_worker.rs` — its first production caller; call-site comment records the R1 rationale + the `dedup(true)` prohibition). Proof: `two_worker_runs_over_unchanged_corpus_add_zero_frames` (zen-agents integration — discriminating: pre-fix `index_all` doubles frames on run 2) + 3 zen-memory inline idempotency tests (second-run zero frames / changed-file re-index / missing-sidecar full fallback). Gate bin/test 3109/0/25.
+
+### Contentless FTS5 serves structurally-empty tier-2 content (found by Phase 31 T214, 2026-10-11) — RESOLVED 2026-10-11 (Phase 32 T220+T222)
 
 **What:** `notes_fts` is a contentless FTS5 table (`content=''`, migration 001:27-31) ⇒ `NotesRepo::search`'s `SUBSTR(nf.content,…)` snippet returns `''` for EVERY tier-2 hit. Gateway `knowledge/search` RPC and TUI Fast-mode context injection serve empty `content` to consumers today. T214's `inject_knowledge_context` works around it by reading the canonical markdown file (256KiB cap + sanitize, wake-up-brief precedent) — the workaround should be generalized or the defect fixed at the source.
 
@@ -14,7 +28,11 @@
 **Priority:** P2
 **Depends on:** none — pre-existing defect, independent of Phase 31 (which routed around it)
 
-### D1-class Confidential async routing hazard — audit `enforce_sensitivity → reqwest::blocking` chain (re-observed by Phase 31 T215, 2026-10-11)
+**Review verdict (2026-10-11 /sdd-review, oracle-adjudicated):** severity escalated by a NEW conjunction — TUI Fast mode passes 5 empty-content notes into `session.knowledge`; Phase-31's `pre_supplied=!is_empty` predicate trusts them ⇒ the default-ON knowledge_inject gate (D-F) is structurally skipped on the primary interactive surface AND M1 renders empty bodies. Adjudicated fix split: **(1) P1 now** — predicate requires ≥1 non-empty trimmed-content entry (orchestrator.rs:1202/1971, T220); **(2) P2 root** — option (b) canonical-file read in `NotesRepo::search` (capped, fail-open; one fix serves gateway+TUI+tools+fusion, T222). Option (a) external-content FTS migration **REJECTED** (heaviest; FTS index remains the ranking structure either way — read-layer fix buys the same).
+
+**Resolution (2026-10-11):** both halves of the adjudicated split landed — **T220**: single-source predicate `has_substantive_knowledge` (orchestrator.rs:469) at both capture sites; the 5-empty TUI vec no longer suppresses the default-ON gate (injection-runs/skip-honored/off-mode byte-identity tests). **T222**: `NotesRepo::search` populates snippets from the canonical file (`read_canonical_snippet`, 256 KiB precedent cap, fail-open empty; MATCH/bm25/row-shape unchanged; 3 tests incl. file-sourced marker + ranking invariance). Option (a) remains rejected.
+
+### D1-class Confidential async routing hazard — audit `enforce_sensitivity → reqwest::blocking` chain (re-observed by Phase 31 T215, 2026-10-11) — RESOLVED 2026-10-13 (leaf fix: health_check dedicated-thread)
 
 **What:** Sensitivity routing in async contexts reaches `enforce_sensitivity → is_local_llm_available → OllamaProvider::health_check → reqwest::blocking` — the nested-runtime drop-panic class (D1, previously fixed at specific call sites via `spawn_blocking` guards: intent.rs, review_pipeline, semantic_lint). `DelegateTaskTool::run_single` has routed under mirrored sensitivity since 006 WITHOUT a spawn_blocking guard — re-observed (not introduced) by the wave-3 agent; async tests avoided Confidential for this reason.
 
@@ -26,17 +44,35 @@
 **Priority:** P2
 **Depends on:** none — audit + targeted guards
 
-### Memory-strength enriched-path symmetry decision (Phase 31 T209/T211 recorded limitation)
+**Resolution (2026-10-13):** root-cause LEAF fix — `OllamaProvider::health_check` (ollama.rs, the only calling-thread `reqwest::blocking` site in the `enforce_sensitivity → is_local_llm_available` chain) now runs its probe on a dedicated thread (the `complete()` pattern; join panic ⇒ `false` + warn, fail-safe: Confidential refuses cloud and surfaces the typed local-unavailable error). One leaf change covers every async-reachable chain end-to-end: delegate `run_single` (primary site; `plan.execute` inherits via the shared seam), orchestrator `execute`/redraft, zen_loop `resolve_model_tier`, plus out-of-scope-crate sites zen-vault `llm_distill::call_llm` and zen-cli `provider_command` (debug-build `zen provider route/test/list` panic also cured). No zen-agents/zen-gateway production change; no routing-decision change. Audit inventory: 7 UNGUARDED async-reachable sites (all covered by the leaf), 11 already-guarded verified (intent/deanchored/semantic_lint/5 worker complete_metered/sync complete+embed), gateway `.route(` hits are axum not LlmRouter. Pre-fix empirical panic verified ("Cannot drop a runtime in a context where blocking is not allowed"). Pins: `sync_complete_no_panic.rs` health_check ×2 runtime flavors + `confidential_delegate_routing_on_async_runtime_does_not_panic` (real run_single, current_thread, port-1 loopback no_proxy per T217) + `local_rung_probes_inside_runtime_abstain_without_panic`. Gate: bin/lint 0; bin/test 3113/0/25 (baseline 3109, +4). Recorded in 006 spec.md Convergence Record C4. **Spin-off finding filed below (trait-default shadowing, P3 owner decision).**
 
-**What:** Both the strength READ side (`card_retention_strength` in `retrieve_memories_structured`, T209) and the reward WRITE side (`increment_memvid_injection_rewards`, T211) live ONLY in the `structured` retrieve path — but the chain prefers `retrieve_memories_enriched`, so when enriched is populated neither fires. Read/write are symmetric (deliberate, recorded), but the strength/reward loop is dormant on the primary path.
+### L1 local rungs never probe — `is_local_llm_available` trait-default shadowing (found by the 2026-10-13 D1 audit, P3 owner decision) — RESOLVED 2026-10-13 (owner approved activation)
 
-**Why:** Deciding whether to extend both sides to the enriched path changes per-turn behavior on the primary retrieve chain — needs an explicit decision, not an implicit change (single-writer + gate discipline).
+**What:** The free function `zen_provider::is_local_llm_available(&dyn LlmRouter)` hits the TRAIT-DEFAULT `false` (router.rs:404) — `DefaultRouter`'s probing inherent method (router.rs:1243) is not in `impl LlmRouter`, reachable only from inside the router (`enforce_sensitivity`/`route_with_preferences`). Consequence: `orchestrator.rs:1090` (T170 review local-hop), `decision/mod.rs:541` (LocalClassifierRung), `decision/mod.rs:831` (LocalBinaryClassifier) NEVER probe — the L1 local rungs and the de-anchored review's local phase structurally always abstain/escalate-frontier. Proven empirically: the in-runtime rung test passed PRE-fix while direct `health_check` panicked.
 
-**Context:** Recorded in design doc Implementation Record wave 3 + tasks.md T211 closure note (`019861f`). If extended: enriched memories must expose the same card/source_path resolution T211 built (`resolve_card_source_path`), and T209's rerank must apply to the enriched formatter. Gate stays `memory_strength.enabled` (provably no-op when closed).
+**Why:** Dormant local-first capability — every L1 rung decision falls through to L2/frontier, defeating the T168-T171 decision ladder's local-first intent on these paths. Wiring the override into the trait impl is ~1 method, but it ACTIVATES the rungs (real probes, real local classifications) = behavior change ⇒ owner decision, not an audit side-fix. The runtime-safety pin (`local_rung_probes_inside_runtime_abstain_without_panic`) already guards the activation against the panic regression.
 
-**Effort:** M
-**Priority:** P3
-**Depends on:** owner decision — extend to enriched path, or document structured-only as the intended scope
+**Context:** crates/zen-provider/src/router.rs (:404 trait default, :1243 inherent), crates/zen-agents/src/decision/mod.rs, crates/zen-agents/src/orchestrator.rs:1090. Related latent (same audit): four dead cloud-provider `health_check`s (anthropic.rs:184, mistral.rs:141, cohere.rs:141, gemini.rs:141) use `reqwest::blocking`, zero callers — need the dedicated-thread guard (ollama.rs precedent) if ever exposed via `ProviderInstance`.
+
+**Effort:** S
+**Priority:** P3 (owner decision)
+**Depends on:** none
+
+**Resolution (2026-10-13, owner approved activation):** `impl LlmRouter for DefaultRouter` (router.rs:1541-1548) now overrides `is_local_llm_available` — pure delegation to the inherent probe (:1243, which reaches ONLY `provider_instance("ollama")` + the dedicated-threaded `health_check`; the 4 dead cloud-provider health_checks stay unreachable/dormant). The three dyn consumers (`orchestrator.rs:1090` T170 local-hop, `decision/mod.rs:541` LocalClassifierRung, `:831` LocalBinaryClassifier) now probe for real. Byte-identity holds: all three sit behind calibration τ gates that default closed (`None`) — the T169/T170/T171 no-τ pins passed with UNTOUCHED assertions. Pins: `zen-provider/tests/local_llm_probe_dyn.rs` (inherent + dyn path both probe-false for unreachable 127.0.0.1:1 loopback no_proxy) + `local_rung_probes_inside_runtime_abstain_without_panic` (doc-comment updated, assertion untouched). Gate: bin/lint 0; bin/test 3115/0/25 (baseline 3113, +2). Activation effect timeline: today zero behavioral change; once calibration thresholds land (`logs/decision-audit/thresholds.json`), the local-first L1 layer serves without further wiring.
+
+### Memory-strength enriched-path symmetry — RECLASSIFIED P1 premise-break-under-enable (Phase 31 T209/T211; adjudicated 2026-10-11 /sdd-review) — RESOLVED 2026-10-11 (Phase 32 T221)
+
+**What:** Both the strength READ side (`card_retention_strength` in `retrieve_memories_structured`, T209) and the reward WRITE side (`increment_memvid_injection_rewards`, T211) live ONLY in the `structured` retrieve path — but the chain prefers `retrieve_memories_enriched`. Decisive mechanical detail (oracle-verified): after a session's first persisted turn, `entity_memories(session_id)` is non-empty ⇒ enriched wins EVERY subsequent turn ⇒ the increment point runs ≈once per session lifetime ⇒ access events n≈0 ⇒ the recorded success criterion "排序反映年龄×使用" has its ×使用 half structurally dead when enabled.
+
+**Why:** No longer an open owner decision — the review reclassified this from "recorded limitation" to **premise-break under enable**: it is a REQUIRED FIX BEFORE flipping `[agentic.memory_strength].enabled`. Owner choice remains only on fix scope (increment-only vs full read/write symmetry on enriched).
+
+**Context:** Fix seam (oracle-shaped): the filtered cards are already in hand at memvid.rs:514-517 inside `retrieve_with_entity_context` — additively return them (or a sibling method) and run the same gated `increment_memvid_injection_rewards` (already takes caller-fetched cards). Gate stays `memory_strength.enabled` (provably no-op when closed). Tracked as tasks.md Phase 32 T221.
+
+**Effort:** S-M
+**Priority:** P1 (fix-before-enable)
+**Depends on:** adjudicated — no longer blocked on owner decision to WHETHER; owner may still scope
+
+**Resolution (2026-10-11, T221):** increment-only scope (the minimal oracle-shaped seam): sibling `retrieve_with_entity_context_and_cards` (memvid.rs) returns the filtered cards already in hand — positionally aligned; legacy method delegates unchanged; the enriched path runs the same `increment_memvid_injection_rewards` under the same fail-closed `memory_strength.enabled` gate (zen_agent.rs:1080-1084), flock + dedup-by-source_path identical to the structured path. Proof: gate-open ⇒ sidecar written with dedup (2 cards same source ⇒ access_count 1); gate-closed ⇒ zero writes. Read/write symmetry on the preferred path restored — the `enabled` flip precondition is met.
 
 ### QQBot outbox drainer (morning-brief push completion) — RESOLVED 2026-09-04 (005 T101)
 
@@ -230,4 +266,4 @@ Plan: `~/.gstack/projects/zenspace/ceo-plans/2026-09-27-openkb-compile-hygiene.m
 
 ### ⑥ scope note — PDF parsing (from same review) — RESOLVED 2026-09-29
 
-`ingest_local_file` was plain `read_to_string` — no PDF capability. **Resolved** by the all-format ingestion program (2026-09-29): `pdf_to_markdown` (in-process `pdf-extract` + panic containment, commit `1e8d73c`), office formats via `office_oxide` (`c5d8123`), and epub/odt/rtf via the pandoc sidecar (`172f2bb`); promote-time conversion with quarantine semantics per `docs/designs/doc-conversion.md`. The dependency audit Constitution XI required was performed per PR.
+`ingest_local_file` was plain `read_to_string` — no PDF capability. **Resolved** by the all-format ingestion program (2026-09-29): `pdf_to_markdown` (in-process `pdf-extract` + panic containment, commit `1e8d73c`), office formats via `office_oxide` (`c5d8123`), and epub/odt/rtf via the pandoc sidecar (`172f2bb`); promote-time conversion with quarantine semantics per `docs/designs/architecture.md §3.1/§5 (consolidated 2026-10-13)`. The dependency audit Constitution XI required was performed per PR.

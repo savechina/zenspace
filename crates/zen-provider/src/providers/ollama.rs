@@ -216,24 +216,47 @@ impl OllamaProvider {
         Ok(())
     }
 
+    /// Probe Ollama's `/api/tags` endpoint (5s timeout, loopback bypasses
+    /// proxies).
+    ///
+    /// The `reqwest::blocking` probe runs on a dedicated thread — the same
+    /// pattern as [`Self::complete`]. reqwest's blocking client must never
+    /// run inside an async runtime: it panics in debug builds ("Cannot drop
+    /// a runtime in a context where blocking is not allowed") and parks a
+    /// runtime worker in release. `enforce_sensitivity →
+    /// is_local_llm_available` reaches this probe from async callers
+    /// (delegate sub-turns, orchestrator turns, scheduler workers, CLI), so
+    /// the guard lives in the leaf itself. A fresh thread has no ambient
+    /// runtime; a thread panic maps to `false` (fail-safe: Confidential
+    /// routing then refuses cloud and surfaces the typed local-unavailable
+    /// error instead of panicking the turn).
     pub fn health_check(&self) -> bool {
-        let mut b = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
-        if is_loopback_url(&self.base_url) {
-            b = b.no_proxy();
-        }
-        let client = b.build().unwrap_or_default();
-        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        match client.get(&url).send() {
-            Ok(resp) => resp.status().is_success(),
-            Err(e) => {
-                warn!(error = %e, "Ollama health check failed");
-                false
+        let base_url = self.base_url.clone();
+        std::thread::spawn(move || {
+            let mut b =
+                reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
+            if is_loopback_url(&base_url) {
+                b = b.no_proxy();
             }
-        }
+            let client = b.build().unwrap_or_default();
+            let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+            match client.get(&url).send() {
+                Ok(resp) => resp.status().is_success(),
+                Err(e) => {
+                    warn!(error = %e, "Ollama health check failed");
+                    false
+                }
+            }
+        })
+        .join()
+        .unwrap_or_else(|e| {
+            warn!(error = ?e, "Ollama health check thread panicked; local LLM treated as unavailable");
+            false
+        })
     }
 }
 
-fn is_loopback_url(base_url: &str) -> bool {
+pub(crate) fn is_loopback_url(base_url: &str) -> bool {
     let host = url::Url::parse(base_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))

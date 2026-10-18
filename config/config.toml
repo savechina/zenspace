@@ -26,7 +26,7 @@ theme = "deep-ocean"
 # only) | full (TierSelector auto: RRF fusion over fts5+vec0+graph+ppr) | off.
 # Env override: ZEN_TUI_KNOWLEDGE_SEARCH (fast|full|off, case-insensitive).
 # Gates ONLY the TUI chat context injection — `zen chat` and TUI /search
-# always auto-select. See docs/designs/search-mode-defaults.md.
+# always auto-select. See docs/designs/architecture.md §5.
 # knowledge_search = "fast"
 
 # =============================================================================
@@ -487,6 +487,12 @@ max_rounds = 8
 # half_life_days = 30.0
 # search_rerank = false
 # eviction_report_size = 20
+# strength_floor = 0.0   # rank multiplier floor (T224): sort key is score × max(R, floor).
+#                        # Default 0.0 = byte-identical to unclamped score × R; raise it so a
+#                        # very old high-value memory never sinks below score × floor (mem0's
+#                        # 0.3 is deliberately NOT the default — the value is an operator
+#                        # choice, V13-A.3). Clamped 0.0..=1.0; ranking-only, never filters.
+#                        # Env: ZEN_MEMORY_STRENGTH_FLOOR. Applies only when enabled && search_rerank.
 
 # =============================================================================
 # Orchestrator knowledge injection (Phase 31 T206; injection code lands T214)

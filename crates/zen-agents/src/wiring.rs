@@ -46,6 +46,32 @@ pub use rig_compose::registry::KernelError as _KernelError;
 pub use rig_compose::registry::SkillRegistry as _SkillRegistry;
 pub use rig_compose::registry::ToolRegistry as _ToolRegistry;
 
+/// Whether the KB-backed tier tools (`tier2_search`, `tier3_search`,
+/// `tier4_search`) were registered during [`ZenWiring`] construction.
+///
+/// Set once per process by the `ZenPaths::detect()` branch in
+/// [`ZenWiring::with_sandbox_mode`]. When `false`, every agent granted a tier
+/// tool is stripped by `resolve_agent_tool_grants`'s registry filter and a
+/// model that emits the name hits invalid-name suppression (G1-03/G1-06), so
+/// the miss is logged loudly once. Read by a future `zen doctor` probe.
+static TIER_TOOLS_REGISTERED: AtomicBool = AtomicBool::new(false);
+static TIER_TOOLS_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the KB tier tools are registered in this process.
+///
+/// # Returns
+/// `true` when [`ZenWiring`] construction found a workspace and registered
+/// `tier2_search`/`tier3_search`/`tier4_search`; `false` when
+/// `ZenPaths::detect()` failed and the tools were skipped (G3-01).
+///
+/// # Errors
+/// Never fails — a process-global read, documented for a future `zen doctor`
+/// probe.
+#[must_use]
+pub fn tier_tools_registered() -> bool {
+    TIER_TOOLS_REGISTERED.load(Ordering::SeqCst)
+}
+
 // ---------------------------------------------------------------------------
 // Adapter: ZenTool → rig_compose::tool::Tool
 // ---------------------------------------------------------------------------
@@ -63,11 +89,29 @@ impl<T: ZenTool> ZenToolToolAdapter<T> {
     }
 }
 
-fn zen_error_to_kernel(error: ZenToolError) -> KernelError {
+/// Map a tier-tool [`ZenToolError`] into a rig-compose dispatch outcome.
+///
+/// **Functionality**: translates the tier-tool error taxonomy into the shape
+/// rig-compose's dispatch loop expects.
+/// **User impact**: a recoverable tier-tool failure (cold/corrupt `state.db`,
+/// provider error, missing result) is delivered back to the model as a
+/// structured result instead of aborting the whole round.
+/// **Default behavior**: `InvalidArgs` stays an `Err` (a caller error the
+/// orchestrator labels precisely); `ExecutionFailed` and `NotFound` become a
+/// structured `Ok({"error": …})`.
+/// **Interaction**: mirrors the `zen_plugin` precedent (`fs_delete.rs:99`,
+/// `shell_exec.rs:126`).
+///
+/// Returning `Err` for `ExecutionFailed`/`NotFound` would route through
+/// rig-compose's `dispatch_inner`, which aborts the **entire** dispatch batch
+/// and discards the results of already-executed siblings (G3-02/G1-02). A
+/// structured `Ok` keeps the batch alive and answers only the failing call;
+/// `InvalidArgs` remains a `KernelError` per the adapter-side design (G3-02).
+fn zen_error_to_dispatch(error: ZenToolError) -> Result<Value, KernelError> {
     match error {
-        ZenToolError::InvalidArgs(msg) => KernelError::InvalidArgument(msg),
-        ZenToolError::ExecutionFailed(msg) => KernelError::ToolFailed(msg),
-        ZenToolError::NotFound(msg) => KernelError::ToolNotFound(msg),
+        ZenToolError::InvalidArgs(msg) => Err(KernelError::InvalidArgument(msg)),
+        ZenToolError::ExecutionFailed(msg) => Ok(serde_json::json!({ "error": msg })),
+        ZenToolError::NotFound(msg) => Ok(serde_json::json!({ "error": msg })),
     }
 }
 
@@ -84,7 +128,10 @@ impl<T: ZenTool + Send + Sync> Tool for ZenToolToolAdapter<T> {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        self.inner.invoke(args).await.map_err(zen_error_to_kernel)
+        match self.inner.invoke(args).await {
+            Ok(value) => Ok(value),
+            Err(error) => zen_error_to_dispatch(error),
+        }
     }
 }
 
@@ -226,8 +273,9 @@ impl ZenWiring {
     /// - `zen-consolidation-pipeline` → `DistillationPipeline` (via adapter)
     ///
     /// # Tools registered
-    /// - `tier2_search` → `Tier2Search` (via adapter)
-    /// - `tier4_search` → `Tier4Search` (via adapter)
+    /// - `tier2_search` → `Tier2Search` (via adapter, requires a detected workspace)
+    /// - `tier3_search` → `Tier3Search` (via adapter, requires a detected workspace)
+    /// - `tier4_search` → `Tier4Search` (via adapter, requires a detected workspace)
     /// - `compute_embeddings` → `ComputeEmbeddings` (via adapter)
     #[must_use]
     pub fn new() -> Self {
@@ -256,12 +304,12 @@ impl ZenWiring {
         // forked processes) are resource-capped. Defense-in-depth — a
         // failure to set limits is logged but does not abort construction.
         //
-        // Test builds skip this: on Linux, RLIMIT_NPROC also constrains
-        // pthread_create, and nextest runs hundreds of test processes in
-        // parallel under one UID — a NPROC=50 soft cap makes thread spawn
-        // fail with EAGAIN ("Resource temporarily unavailable") once the
-        // user's aggregate task count exceeds 50. This is process hardening
-        // for the production binary only, never for the test harness.
+        // Test builds skip this: the NOFILE=256 soft cap suits the production
+        // daemon (one instance per host) but not a test process that embeds
+        // several daemons and hits EMFILE. The NPROC=50 cap this skip was
+        // originally written for is gone: RLIMIT_NPROC counts per real UID
+        // across the login session, so it made every child spawn fail with
+        // EAGAIN (see `zen_core::sandbox::apply_resource_limits`).
         //
         // NOTE: `#[cfg(test)]` only fires when *this* crate is the test
         // target. Downstream crates (zen-gateway) that depend on zen-agents
@@ -277,7 +325,7 @@ impl ZenWiring {
         } else {
             #[cfg(not(test))]
             match apply_resource_limits() {
-                Ok(()) => debug!("resource limits applied: NPROC=50, NOFILE=256, CORE=0"),
+                Ok(()) => debug!("resource limits applied: NOFILE=256, CORE=0"),
                 Err(e) => tracing::warn!("failed to apply resource limits: {}", e),
             }
         }
@@ -312,12 +360,19 @@ impl ZenWiring {
                 tools.register(Arc::new(ZenToolToolAdapter::new(
                     zen_vault::Tier4SearchTool::new(kb_db),
                 )));
+                TIER_TOOLS_REGISTERED.store(true, Ordering::SeqCst);
             }
             Err(e) => {
-                tracing::warn!(
-                    "workspace not detected ({}): tier2_search/tier3_search/tier4_search not registered",
-                    e
-                );
+                TIER_TOOLS_REGISTERED.store(false, Ordering::SeqCst);
+                if !TIER_TOOLS_MISSING_LOGGED.swap(true, Ordering::SeqCst) {
+                    tracing::error!(
+                        error = %e,
+                        "wiring: workspace not detected — tier2_search/tier3_search/tier4_search \
+                         are NOT registered; agents granted these names will be answered as \
+                         invalid tool calls at dispatch. Remediation: set ZEN_HOME to a valid \
+                         data directory, or run zen from a workspace containing a .zen/ marker."
+                    );
+                }
             }
         }
         tools.register(Arc::new(ZenToolToolAdapter::new(
@@ -390,6 +445,7 @@ impl ZenWiring {
 
         let mut tool_sensitivity = HashMap::new();
         tool_sensitivity.insert("tier2_search".to_string(), Sensitivity::Private);
+        tool_sensitivity.insert("tier3_search".to_string(), Sensitivity::Private);
         tool_sensitivity.insert("tier4_search".to_string(), Sensitivity::Private);
         tool_sensitivity.insert("compute_embeddings".to_string(), Sensitivity::Private);
         tool_sensitivity.insert("system.health".to_string(), Sensitivity::Public);
@@ -428,7 +484,7 @@ impl ZenWiring {
         // hook so denial records land in the same audit trail.
         let plugin_hook_sensitivity: Arc<HashMap<String, Sensitivity>> =
             Arc::new(tool_sensitivity.clone());
-        let plugin_audit_log_path = Self::audit_log_path(&workspace_roots);
+        let plugin_audit_log_path = Self::audit_log_path();
 
         // T088: resolve the plugin registry — self-discover from
         // `[plugin] base_path` when none is passed (production path);
@@ -604,14 +660,20 @@ impl ZenWiring {
         registry
     }
 
-    /// Resolve the dispatch audit log path for a workspace scope. Shared
-    /// by the builtin audit hook and the FR-048 plugin-hook isolation
-    /// adapter so denial records land in the same audit trail.
-    fn audit_log_path(workspace_roots: &[std::path::PathBuf]) -> std::path::PathBuf {
-        workspace_roots
-            .first()
-            .map(|root| root.join(LOGS_DIR).join("audit.jsonl"))
-            .unwrap_or_else(|| std::path::PathBuf::from("logs/audit.jsonl"))
+    /// Resolve the dispatch audit log path. Shared by the builtin audit
+    /// hook and the FR-048 plugin-hook isolation adapter so denial records
+    /// land in the same audit trail.
+    ///
+    /// Path Spec v2: logs are user_data under the GLOBAL root only — a
+    /// `.zen/` workspace marker is project context + sandbox allowlist,
+    /// never a log destination. The former resolution (first workspace
+    /// root, else cwd-relative `logs/audit.jsonl`) wrote tool audits into
+    /// the repo workspace's `logs/` dir — and to `/logs/` for the launchd
+    /// daemon (cwd=/) — while the global trail never saw a tool record.
+    fn audit_log_path() -> std::path::PathBuf {
+        zen_core::paths::user_root()
+            .join(LOGS_DIR)
+            .join("audit.jsonl")
     }
 
     /// Build the dispatch-time sandbox hook pipeline.
@@ -630,7 +692,7 @@ impl ZenWiring {
         let policy = SeatbeltPolicy::new(mode, workspace_roots.to_vec())
             .with_timeout(300)
             .with_arg_registry(Self::build_tool_arg_registry());
-        let audit_log_path = Self::audit_log_path(workspace_roots);
+        let audit_log_path = Self::audit_log_path();
 
         let confidentiality =
             zen_plugin::tools::confidentiality_hook::ConfidentialityHook::new(Sensitivity::Private);
@@ -1438,10 +1500,24 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn audit_log_path_is_global_not_workspace_or_cwd() {
+        let ws = tempfile::tempdir().unwrap();
+        let p = ZenWiring::audit_log_path();
+        assert_eq!(
+            p,
+            zen_core::paths::user_root()
+                .join(LOGS_DIR)
+                .join("audit.jsonl")
+        );
+        assert_ne!(p, ws.path().join(LOGS_DIR).join("audit.jsonl"));
+        assert!(p.is_absolute(), "audit path must never be cwd-relative");
+    }
+
     #[tokio::test]
     async fn t109_plugin_hook_error_denies_only_its_invocation() {
         let dir = tempfile::tempdir().unwrap();
-        let audit = ZenWiring::audit_log_path(&[dir.path().to_path_buf()]);
+        let audit = dir.path().join("logs").join("audit.jsonl");
         let (sandbox_hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
             SandboxMode::WorkspaceWrite,
             &[dir.path().to_path_buf()],
@@ -1504,7 +1580,7 @@ mod tests {
     #[tokio::test]
     async fn confidential_invocations_are_invisible_to_plugin_hooks() {
         let dir = tempfile::tempdir().unwrap();
-        let audit = ZenWiring::audit_log_path(&[dir.path().to_path_buf()]);
+        let audit = dir.path().join("logs").join("audit.jsonl");
         let (sandbox_hooks, _sensitivity) = ZenWiring::build_sandbox_hooks(
             SandboxMode::WorkspaceWrite,
             &[dir.path().to_path_buf()],
@@ -1644,5 +1720,74 @@ mod tests {
             "Confidential builtin must stay excluded from MCP exposure"
         );
         assert!(mcp.get("fs.read").is_ok());
+    }
+
+    // ── G3-02: ZenToolError → dispatch outcome mapping ───────────────────
+
+    struct TierErrorProbe(u8);
+
+    impl ZenTool for TierErrorProbe {
+        fn schema(&self) -> zen_vault::tools::ToolSchema {
+            zen_vault::tools::ToolSchema {
+                name: "tier_probe".to_string(),
+                description: "probe".to_string(),
+                args_schema: serde_json::json!({}),
+                result_schema: serde_json::json!({}),
+            }
+        }
+
+        fn invoke(
+            &self,
+            _args: Value,
+        ) -> impl std::future::Future<Output = Result<Value, ZenToolError>> + Send {
+            let error = match self.0 {
+                0 => ZenToolError::ExecutionFailed("db locked".into()),
+                1 => ZenToolError::NotFound("missing".into()),
+                _ => ZenToolError::InvalidArgs("bad".into()),
+            };
+            std::future::ready(Err(error))
+        }
+    }
+
+    #[test]
+    fn g302_execution_failed_maps_to_structured_ok_error() {
+        let out = zen_error_to_dispatch(ZenToolError::ExecutionFailed("state.db locked".into()))
+            .expect("ExecutionFailed must be a structured Ok result, not a batch-aborting Err");
+        assert_eq!(out["error"], "state.db locked");
+    }
+
+    #[test]
+    fn g302_not_found_maps_to_structured_ok_error() {
+        let out = zen_error_to_dispatch(ZenToolError::NotFound("no such note".into()))
+            .expect("NotFound must be a structured Ok result, not a batch-aborting Err");
+        assert_eq!(out["error"], "no such note");
+    }
+
+    #[test]
+    fn g302_invalid_args_stays_kernel_error() {
+        let err = zen_error_to_dispatch(ZenToolError::InvalidArgs("bad shape".into()))
+            .expect_err("InvalidArgs must remain a KernelError per the adapter-side design");
+        assert!(matches!(err, KernelError::InvalidArgument(msg) if msg == "bad shape"));
+    }
+
+    #[tokio::test]
+    async fn g302_adapter_invoke_dispatches_structured_errors() {
+        let failed = ZenToolToolAdapter::new(TierErrorProbe(0));
+        assert_eq!(
+            failed.invoke(Value::Null).await.unwrap()["error"],
+            "db locked"
+        );
+
+        let missing = ZenToolToolAdapter::new(TierErrorProbe(1));
+        assert_eq!(
+            missing.invoke(Value::Null).await.unwrap()["error"],
+            "missing"
+        );
+
+        let invalid = ZenToolToolAdapter::new(TierErrorProbe(2));
+        assert!(matches!(
+            invalid.invoke(Value::Null).await.unwrap_err(),
+            KernelError::InvalidArgument(_)
+        ));
     }
 }

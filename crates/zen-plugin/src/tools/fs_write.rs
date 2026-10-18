@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -57,20 +56,22 @@ impl Tool for FsWriteTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let path_str = args["path"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'path' field".into())
-        })?;
+        let path_str = match args["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(json!({ "error": "Missing or invalid 'path' field" })),
+        };
 
-        let content = args["content"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'content' field".into())
-        })?;
+        let content = match args["content"].as_str() {
+            Some(c) => c,
+            None => return Ok(json!({ "error": "Missing or invalid 'content' field" })),
+        };
 
         let create_dirs = args
             .get("create_dirs")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let path = PathBuf::from(path_str);
+        let path = zen_core::sandbox::resolve_agent_path(path_str);
         let existed = path.exists();
 
         self.validator
@@ -83,10 +84,11 @@ impl Tool for FsWriteTool {
         let is_vault =
             zen_core::sandbox::is_zen_path(&path) || path.to_string_lossy().contains("vault/");
 
-        if create_dirs && let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| KernelError::ToolFailed(format!("Failed to create dirs: {}", e)))?;
+        if create_dirs
+            && let Some(parent) = path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            return Ok(json!({ "error": format!("Failed to create dirs: {}", e) }));
         }
 
         let bytes = content.as_bytes();
@@ -95,7 +97,7 @@ impl Tool for FsWriteTool {
         if is_vault {
             let p = path.clone();
             let c = content.to_string();
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -108,13 +110,20 @@ impl Tool for FsWriteTool {
                 std::fs::rename(&tmp, &p)?;
                 Ok::<(), std::io::Error>(())
             })
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("vault write join failed: {}", e)))?
-            .map_err(|e| KernelError::ToolFailed(format!("Failed to write {}: {}", path_str, e)))?;
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Ok(json!({ "error": format!("Failed to write {}: {}", path_str, e) }));
+                }
+                Err(e) => {
+                    return Ok(json!({ "error": format!("vault write join failed: {}", e) }));
+                }
+            }
         } else {
-            tokio::fs::write(&path, bytes).await.map_err(|e| {
-                KernelError::ToolFailed(format!("Failed to write {}: {}", path_str, e))
-            })?;
+            if let Err(e) = tokio::fs::write(&path, bytes).await {
+                return Ok(json!({ "error": format!("Failed to write {}: {}", path_str, e) }));
+            }
         }
 
         Ok(json!({
@@ -122,5 +131,41 @@ impl Tool for FsWriteTool {
             "bytes_written": bytes_written,
             "created": !existed
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_validator(dir: &std::path::Path) -> SandboxValidator {
+        SandboxValidator::new(
+            zen_core::sandbox::SandboxMode::WorkspaceWrite,
+            vec![dir.to_path_buf()],
+        )
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn create_dirs_failure_returns_structured_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("blocker"), "x").unwrap();
+        let tool = FsWriteTool::new(make_validator(dir.path()));
+        let target = dir.path().join("blocker/child.txt");
+        let res = block_on(tool.invoke(json!({
+            "path": target.to_string_lossy(),
+            "content": "hi"
+        })))
+        .unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Failed to create dirs")),
+            "expected structured error, got: {res}"
+        );
     }
 }

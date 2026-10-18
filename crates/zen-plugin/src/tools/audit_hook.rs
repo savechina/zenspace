@@ -30,7 +30,14 @@ impl ToolAuditHook {
 
 impl Default for ToolAuditHook {
     fn default() -> Self {
-        Self::new(PathBuf::from("logs/audit.jsonl"))
+        // Path Spec v2: global-only. The former cwd-relative default
+        // silently created `logs/audit.jsonl` under whatever directory
+        // the process happened to start in.
+        Self::new(
+            zen_core::paths::user_root()
+                .join(zen_core::constants::LOGS_DIR)
+                .join("audit.jsonl"),
+        )
     }
 }
 

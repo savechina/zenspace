@@ -2,21 +2,190 @@
 set -euo pipefail
 set -x
 
-# Path Spec v2 (T17): default ZEN_HOME to ~/.zentest when unset.
-# This ensures integration tests never write to the developer's real ~/.zen.
+# The single test entry point. Every test layer hangs off this script's
+# subcommand family — no sibling wrappers.
+#
+# Subcommands:
+#   (default)      full workspace unit/integration suite (nextest pass-through)
+#   bench          divan micro-benches (zen-vault search_rrf + zen-cli markdown_render)
+#   bench-smoke    bench with -- --test (1-iteration dry run; CI gate shape)
+#   tui [...]      TUI pipeline (docs/specs/002-agentic-tui/test-design.md §4+§7):
+#                    tui               full pipeline: unit → guard → pty → tmux
+#                    tui quick         fast gate: unit + guard
+#                    tui unit          L1+L2 headless only
+#                    tui guard         scrolling-regions feature guard
+#                    tui pty [CASE]    L3 PTY e2e; CASE filters one test (e.g. `tui pty e10`)
+#                    tui tmux          L4 tmux smoke
+#                    tui copy          print the manual native-copy checklist
+#                    tui list          consolidated testcase registry (§7)
+#   skips (tui full mode only): ZEN_SKIP_PTY=1 / ZEN_SKIP_TMUX=1
+cd "$(dirname "$0")/.."
+
+# Path Spec v2 (T17): default ZEN_HOME to ~/.zentest when unset — integration
+# tests AND the tui pty/tmux layers (which spawn ../target/debug/zen) never
+# write to the developer's real ~/.zen.
 if [ -z "${ZEN_HOME:-}" ]; then
     export ZEN_HOME="$HOME/.zentest"
     mkdir -p "$ZEN_HOME"
 fi
 
 # Limit build-time link parallelism (the OOM vector on ARM CI) —
-# cargo honors CARGO_BUILD_JOBS, NOT nextest's --build-jobs.
+# cargo honors CARGO_BUILD_JOBS, NOT nextest's --build-jobs. Thread caps also
+# bound the PTY layer: unlimited parallelism there is the flake vector
+# (timing-sensitive cases, 4 of 6 PTY failures were load-correlated).
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export NEXTEST_TEST_THREADS="${NEXTEST_TEST_THREADS:-2}"
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-2}"
 
-# Full workspace unit/integration suite (nextest). Headless tui:: L1/L2 tests
-# are covered here on every platform; the TUI runtime layers (L3 PTY, L4 tmux,
-# T039 guard) are owned by bin/test-tui — running them here would duplicate the
-# tui job. See docs/specs/002-agentic-tui/test-design.md.
+# Script-global (not function-local): the tmux EXIT trap fires in whichever
+# subcommand reaches exit — `set -u` makes an unset reference there fatal,
+# so an empty default is defined once here and only tmux_smoke ever fills it.
+tui_session=""
+
+tui_unit() {
+  cargo test -p zen-cli --lib tui::
+}
+
+tui_guard() {
+  # Fail closed: a failed probe (offline cache, stale lock) must never read
+  # as "ok" — capture first, branch on content, error out on probe failure.
+  local feats
+  feats="$(cargo tree -p ratatui -e features 2>/dev/null)" || {
+    echo "ERROR: cargo tree probe failed — cannot verify scrolling-regions" >&2
+    exit 1
+  }
+  if grep -q "scrolling-regions" <<<"$feats"; then
+    echo "ERROR: 'scrolling-regions' is ENABLED — insert_before would discard rows" >&2
+    echo "       see docs/specs/002-agentic-tui/codex-inline-design.md §2.3" >&2
+    exit 1
+  fi
+  echo "    ok: scrolling-regions absent"
+}
+
+tui_pty() {
+  local case_filter="${1:-}"
+  cargo build -p zen >/dev/null
+  cargo test -p zen-cli --test tui_pty -- --ignored --test-threads=1 $case_filter
+}
+
+tui_tmux_smoke() {
+  # SC-009/NFR-003 automated portion: real multiplexer drives banner, input
+  # box, slash popup, and exit-keeps-scrollback. Mouse-copy stays manual
+  # (`tui copy`). Bare `bash --noprofile --norc`: an interactive login shell
+  # runs its update nag at startup and consumes the sent keystrokes (observed
+  # on macOS with oh-my-zsh).
+  local bin="./target/debug/zen"
+  [[ -x "$bin" ]] || cargo build -p zen >/dev/null
+  tui_session="zen-tui-smoke-$$"
+  # -e: with a pre-existing tmux server the pane inherits the SERVER env, not
+  # this script's exports — the ZEN_HOME test-home guarantee is conditional
+  # without it (CI's fresh server happened to pass).
+  tmux new-session -d -s "$tui_session" -x 120 -y 30 \
+    -e "ZEN_HOME=$ZEN_HOME" "bash --noprofile --norc"
+  trap 'tmux kill-session -t "$tui_session" 2>/dev/null || true' EXIT
+  tmux send-keys -t "$tui_session" "$bin" Enter
+  sleep 4
+  local pane
+  pane="$(tmux capture-pane -t "$tui_session" -p)"
+  grep -q "Zen REPL" <<<"$pane" || { echo "FAIL: intro line missing"; echo "$pane"; exit 1; }
+  grep -q "Input (Enter=send" <<<"$pane" || { echo "FAIL: input box missing"; echo "$pane"; exit 1; }
+  echo "    ok: banner + input box visible"
+  tmux send-keys -t "$tui_session" "/"
+  sleep 1
+  pane="$(tmux capture-pane -t "$tui_session" -p)"
+  grep -q "Commands" <<<"$pane" || { echo "FAIL: slash popup missing"; echo "$pane"; exit 1; }
+  grep -q "Input (Enter=send" <<<"$pane" ||
+    { echo "FAIL: input box crushed by popup (T059 regression)"; echo "$pane"; exit 1; }
+  echo "    ok: slash popup open, input box intact"
+  tmux send-keys -t "$tui_session" Escape
+  sleep 0.3
+  tmux send-keys -t "$tui_session" C-d
+  sleep 1.5
+  pane="$(tmux capture-pane -t "$tui_session" -p)"
+  grep -q "Zen REPL" <<<"$pane" || { echo "FAIL: scrollback lost after exit (FR-015)"; echo "$pane"; exit 1; }
+  echo "    ok: exit leaves scrollback intact"
+  echo "tmux smoke PASSED"
+}
+
+tui_copy_checklist() {
+  cat <<'EOS'
+──────────────────────────────────────────────────────────────
+ Zen TUI native-copy checklist (inline mode) — perform manually
+──────────────────────────────────────────────────────────────
+ 1. Run: ./target/debug/zen
+ 2. Send:  /help  → wait for output in scrollback
+ 3. Mouse-drag over the /help output text
+      EXPECT: terminal-native selection highlight appears
+ 4. Copy (Cmd+C / Ctrl+Shift+C) and paste anywhere
+      EXPECT: exact rendered text (no stray spaces after CJK)
+ 5. Scroll up with the terminal scrollbar / Shift+PageUp
+      EXPECT: banner + all prior output still present
+ 6. While scrolled UP, send another message (second terminal not
+    possible — return via PageDown) and verify the view did NOT
+    jump while you were reading (T062 reading mode)
+ 7. Press Ctrl+D
+      EXPECT: shell returns; scrollback retains everything (FR-015)
+ 8. CJK check: send  你好世界  and copy the rendered reply
+      EXPECT: no "你 好 世 界" spacing artifacts (T052)
+──────────────────────────────────────────────────────────────
+ Report results in docs/specs/002-agentic-tui/tasks.md (T065).
+EOS
+}
+
+tui_list() {
+  sed -n '/§7 TESTCASE REGISTRY/,$p' docs/specs/002-agentic-tui/test-design.md \
+    | sed -n '/^| Case/,$p'
+}
+
+tui() {
+  local mode="${1:-all}"
+  case "$mode" in
+    all|full|"")
+      echo "==> L1+L2 headless + guard"
+      tui_unit
+      tui_guard
+      if [[ "${ZEN_SKIP_PTY:-0}" == "1" ]]; then
+        echo "==> L3: skipped (ZEN_SKIP_PTY=1)"
+      else
+        echo "==> L3: PTY e2e"; tui_pty
+      fi
+      if [[ "${ZEN_SKIP_TMUX:-0}" == "1" ]]; then
+        echo "==> L4: skipped (ZEN_SKIP_TMUX=1)"
+      elif command -v tmux >/dev/null 2>&1; then
+        echo "==> L4: tmux smoke"; tui_tmux_smoke
+      else
+        echo "==> L4: tmux not installed — skipped"
+      fi
+      echo "ALL TUI CHECKS PASSED"
+      ;;
+    quick)
+      tui_unit
+      tui_guard
+      echo "QUICK TUI CHECKS PASSED"
+      ;;
+    unit)     tui_unit ;;
+    guard)    tui_guard ;;
+    pty)      shift || true; tui_pty "${1:-}" ;;
+    tmux)     tui_tmux_smoke ;;
+    copy)     tui_copy_checklist ;;
+    list)     tui_list ;;
+    *)        echo "unknown tui mode: $mode (valid: quick|unit|guard|pty|tmux|copy|list)" >&2; exit 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  tui)
+    shift
+    tui "$@"
+    exit 0
+    ;;
+  bench)
+    shift
+    exec cargo bench -p zen-vault -p zen-cli --features zen-cli/bench --bench '*' "$@"
+    ;;
+  bench-smoke)
+    shift
+    exec cargo bench -p zen-vault -p zen-cli --features zen-cli/bench --bench '*' -- --test "$@"
+    ;;
+esac
 cargo nextest run --no-fail-fast "$@"

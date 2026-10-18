@@ -309,10 +309,18 @@ impl ZenWorker for MemvidIndexerWorker {
         // Provenance metadata (T208/T210): frames carry {source_path, tier}
         // only when the strength subsystem is enabled — the wave-1 indexer
         // default stays OFF and this worker is the sole production flipper.
+        // Incremental, not full (T219 / review R1): the store is append-only
+        // with memvid-core dedup deliberately OFF (dedup(true) would block the
+        // T210/T211 provenance backfill on re-index), so a nightly `index_all`
+        // re-appended every M2/M3/M4 frame plus a fresh MemoryCard per chunk.
+        // `index_incremental` skips files whose mtime matches the checksum
+        // sidecar (`memories/.index-checksums.json`) and falls back to the
+        // full index when the sidecar is missing or unreadable. Report numbers
+        // are therefore per-run ADDITIONS — a quiet night honestly reports 0.
         let indexer = MemvidIndexer::new(paths.memory(), paths.wiki())
             .with_provenance_metadata(strength_cfg.enabled_or_default());
         let report = indexer
-            .index_all(&mut store)
+            .index_incremental(&mut store)
             .with_context(|| "memvid indexing failed")?;
 
         info!(

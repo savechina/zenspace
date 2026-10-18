@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use fastembed::{EmbeddingModel as FastEmbedModel, TextInitOptions};
 use serde::{Deserialize, Serialize};
@@ -7,10 +7,15 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 use zen_core::config::ZenConfig;
 
+use crate::providers::ollama::is_loopback_url;
 use crate::router::resolve_api_key;
 use rig_core::client::{EmbeddingsClient, Nothing};
 use rig_core::embeddings::EmbeddingModel as RigEmbeddingModel;
 use rig_core::providers::{ollama, openai};
+
+/// Bounds a local (Ollama) embed request so the blocking `.join()` below can
+/// never hang forever; absorbs a ~150s cold model load while staying finite.
+const EMBED_REQUEST_TIMEOUT_SECS: u64 = 240;
 
 pub trait EmbeddingProvider: Send + Sync + std::fmt::Debug {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
@@ -90,13 +95,31 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let client = ollama::Client::builder()
-                    .api_key(Nothing)
-                    .base_url(&base_url)
-                    .build()
-                    .map_err(|e| EmbeddingError::RequestFailed {
-                        reason: format!("Ollama client init error: {e}"),
-                    })?;
+                // Loopback MUST bypass HTTP(S)_PROXY: a system proxy (Privoxy
+                // et al) 500s and stalls every local embed, mirroring
+                // `providers::ollama::OllamaProvider::rig_client`.
+                let client = if is_loopback_url(&base_url) {
+                    let http = reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(std::time::Duration::from_secs(EMBED_REQUEST_TIMEOUT_SECS))
+                        .build()
+                        .map_err(|e| EmbeddingError::RequestFailed {
+                            reason: format!("Ollama embed http client init error: {e}"),
+                        })?;
+                    ollama::Client::builder()
+                        .api_key(Nothing)
+                        .base_url(&base_url)
+                        .http_client(http)
+                        .build()
+                } else {
+                    ollama::Client::builder()
+                        .api_key(Nothing)
+                        .base_url(&base_url)
+                        .build()
+                }
+                .map_err(|e| EmbeddingError::RequestFailed {
+                    reason: format!("Ollama client init error: {e}"),
+                })?;
 
                 let emb_model = client.embedding_model_with_ndims(&model, 4096);
                 let embedding = emb_model.embed_text(&text).await.map_err(|e| {
@@ -198,6 +221,31 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
 // Local fastembed provider — ONNX-based local inference (macOS M4 etc.)
 // ---------------------------------------------------------------------------
 
+/// Set once fastembed init has PANICKED (ort 2.0.0-rc.13 `expect`s the
+/// ONNX dylib dlopen inside `load_dynamic::init`, so a missing
+/// libonnxruntime aborts the process before any `Result` can surface —
+/// production 2026-10-15: an installed binary without the dylib killed
+/// `zen wiki reindex` mid-run). After the first contained panic every
+/// later call short-circuits to `Err` and the router degrades to the next
+/// provider (ollama → hash) instead of aborting the caller.
+/// Bounds fastembed init/`hf_hub` download so a stalled fetch (e.g. through a
+/// dead system proxy) degrades to the next provider instead of hanging; a
+/// cached init takes seconds, so anything longer means a remote download that
+/// local-first should not block on.
+const FASTEMBED_INIT_TIMEOUT_SECS: u64 = 60;
+
+static FASTEMBED_BROKEN: OnceLock<String> = OnceLock::new();
+
+fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalFastembedProvider {
     /// Optional override model name; `None` uses fastembed's default (BGESmallENV15).
@@ -246,6 +294,12 @@ impl LocalFastembedProvider {
 
 impl EmbeddingProvider for LocalFastembedProvider {
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        if let Some(reason) = FASTEMBED_BROKEN.get() {
+            return Err(EmbeddingError::RequestFailed {
+                reason: reason.clone(),
+            });
+        }
+
         // Set HF_ENDPOINT before fastembed init if configured.
         // Safety: set_var is unsafe in multithreaded contexts, but this runs
         // once during model init (or early in the process lifetime), and the
@@ -269,11 +323,46 @@ impl EmbeddingProvider for LocalFastembedProvider {
             }
         };
 
-        let mut embedder = fastembed::TextEmbedding::try_new(init_options).map_err(|e| {
-            EmbeddingError::RequestFailed {
-                reason: format!("fastembed init error: {e}"),
+        // Contain init-time panics (ort's dylib `expect`, see FASTEMBED_BROKEN)
+        // AND bound the `hf_hub` model download, which routes through the
+        // system proxy and can block indefinitely — `catch_unwind` cannot
+        // interrupt a hang. A timeout degrades to the next provider (ollama)
+        // instead of wedging the daemon while holding the router lock.
+        // AssertUnwindSafe is sound: nothing half-initialized escapes the thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fastembed::TextEmbedding::try_new(init_options)
+            }));
+            let _ = tx.send(result);
+        });
+        let mut embedder = match rx
+            .recv_timeout(std::time::Duration::from_secs(FASTEMBED_INIT_TIMEOUT_SECS))
+        {
+            Ok(Ok(Ok(embedder))) => embedder,
+            Ok(Ok(Err(e))) => {
+                return Err(EmbeddingError::RequestFailed {
+                    reason: format!("fastembed init error: {e}"),
+                });
             }
-        })?;
+            Ok(Err(payload)) => {
+                let reason = format!(
+                    "fastembed init panicked (missing onnxruntime dylib? set ORT_DYLIB_PATH): {}",
+                    panic_reason(&*payload)
+                );
+                warn!("{reason}");
+                let _ = FASTEMBED_BROKEN.set(reason.clone());
+                return Err(EmbeddingError::RequestFailed { reason });
+            }
+            Err(_) => {
+                let reason = format!(
+                    "fastembed init timed out after {FASTEMBED_INIT_TIMEOUT_SECS}s (model download stalled — dead proxy or offline?)"
+                );
+                warn!("{reason}");
+                let _ = FASTEMBED_BROKEN.set(reason.clone());
+                return Err(EmbeddingError::RequestFailed { reason });
+            }
+        };
 
         let input = vec![text.to_string()];
         let mut vecs = embedder
@@ -461,10 +550,13 @@ impl DefaultEmbeddingRouter {
     }
 
     fn embed_with_providers(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        let mut dead = self.dead.lock().unwrap();
+        // Snapshot the dead flags and RELEASE the lock before any provider
+        // call: holding it across `provider.embed()` serialized every
+        // concurrent embedder and let one stalled provider block them all.
+        let dead_snapshot: Vec<bool> = self.dead.lock().unwrap().clone();
 
         for (i, provider) in self.providers.iter().enumerate() {
-            if i < dead.len() && dead[i] {
+            if i < dead_snapshot.len() && dead_snapshot[i] {
                 continue;
             }
             match provider.embed(text) {
@@ -499,6 +591,7 @@ impl DefaultEmbeddingRouter {
                                 error = %e2,
                                 "DefaultEmbeddingRouter: retry also failed, marking dead"
                             );
+                            let mut dead = self.dead.lock().unwrap();
                             if i < dead.len() {
                                 dead[i] = true;
                             }
@@ -571,6 +664,27 @@ mod tests {
     }
 
     #[test]
+    fn test_fastembed_broken_short_circuits_without_panicking() {
+        // Once a contained init panic has been recorded, every later embed
+        // must return Err immediately — never re-enter fastembed/ort.
+        let reason = "dylib probe failure (test)";
+        let _ = FASTEMBED_BROKEN.set(reason.to_string());
+        let p = LocalFastembedProvider::new(None, None, None);
+        let err = p.embed("hello").expect_err("must short-circuit to Err");
+        match err {
+            EmbeddingError::RequestFailed { reason: r } => assert_eq!(r, reason),
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_panic_reason_downcasts_payloads() {
+        assert_eq!(panic_reason(&"boom"), "boom");
+        assert_eq!(panic_reason(&String::from("boom")), "boom");
+        assert_eq!(panic_reason(&42usize), "unknown panic payload");
+    }
+
+    #[test]
     fn test_router_tries_providers_in_order() {
         let p1: Box<dyn EmbeddingProvider> = Box::new(FailingProvider("first"));
         let p2: Box<dyn EmbeddingProvider> = Box::new(FailingProvider("second"));
@@ -616,5 +730,57 @@ mod tests {
         fn provider_name(&self) -> &str {
             "success"
         }
+    }
+
+    #[test]
+    fn concurrent_embeds_overlap_while_a_provider_is_running() {
+        // Regression: holding the dead-lock across `provider.embed()` serialized
+        // concurrent embedders, so one stalled provider blocked them all.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct GatedProvider {
+            inside: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        impl EmbeddingProvider for GatedProvider {
+            fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+                let n = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(n, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                self.inside.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![1.0])
+            }
+
+            fn provider_name(&self) -> &str {
+                "gated"
+            }
+        }
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let router = Arc::new(DefaultEmbeddingRouter::with_providers(vec![Box::new(
+            GatedProvider {
+                inside: Arc::new(AtomicUsize::new(0)),
+                peak: peak.clone(),
+            },
+        )]));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let router = router.clone();
+                std::thread::spawn(move || router.embed_sync("x").unwrap())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "embeds were serialized by the dead-lock instead of overlapping"
+        );
     }
 }

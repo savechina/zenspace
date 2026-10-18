@@ -46,6 +46,19 @@ impl KnowledgeState {
             scan_dirs,
         }
     }
+
+    /// Spec D16 skew probe over the owned pool: `Some((db_max, embedded_max))`
+    /// when the on-disk schema is ahead of this binary's embedded set (the
+    /// old-binary-vs-newer-DB direction), `None` otherwise — fresh/equal/behind
+    /// databases and a failed db client both read as "no signal".
+    ///
+    /// Read-only: `detect_schema_skew` runs a bare `SELECT MAX(version)`, never
+    /// migrates and never takes the write lock, so the daemon startup path can
+    /// call it without perturbing the sole-owner store discipline.
+    pub async fn detect_schema_skew(&self) -> Option<(i64, i64)> {
+        let client = self.client.as_ref()?;
+        zen_repo::detect_schema_skew(client.pool()).await
+    }
 }
 
 /// Maps contract tier names onto SearchService numeric tiers. The first
@@ -73,6 +86,10 @@ fn resolve_tier(tiers: Option<&Vec<Value>>) -> Result<Option<u8>, RpcError> {
 }
 
 /// knowledge/search handler per contracts/02 §Knowledge.
+///
+/// G4-01: a tier failure is no longer swallowed into a bare empty result
+/// set — it is collected into the additive `degraded` array (omitted when
+/// nothing failed, so the happy path stays byte-identical).
 pub async fn search(state: Arc<KnowledgeState>, params: Value) -> Result<Value, RpcError> {
     const METHOD: &str = "knowledge/search";
     let query = params
@@ -91,20 +108,26 @@ pub async fn search(state: Arc<KnowledgeState>, params: Value) -> Result<Value, 
 
     let mut seen = std::collections::HashSet::new();
     let mut notes = Vec::new();
-    for dir in &state.scan_dirs {
+    let mut degraded = Vec::new();
+    let mut query_embedding_degraded = false;
+    let mut query_embedding_unavailable = false;
+    'scan: for dir in &state.scan_dirs {
         if !dir.is_dir() {
             continue;
         }
-        let results = match service
-            .search(&query, dir, client, tier, None, Some(limit as usize))
+        let (results, diagnostics) = match service
+            .search_with_diagnostics(&query, dir, client, tier, None, Some(limit as usize))
             .await
         {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), error = %e, "knowledge/search tier failed");
+                degraded.push(degraded_entry(tier, &e.to_string()));
                 continue;
             }
         };
+        query_embedding_degraded |= diagnostics.query_embedding_degraded;
+        query_embedding_unavailable |= diagnostics.query_embedding_unavailable;
         for r in results {
             if seen.insert(normalize_path(&r.file)) {
                 notes.push(json!({
@@ -115,11 +138,81 @@ pub async fn search(state: Arc<KnowledgeState>, params: Value) -> Result<Value, 
                 }));
             }
             if notes.len() >= limit as usize {
-                return Ok(json!({ "notes": notes }));
+                break 'scan;
             }
         }
     }
-    Ok(json!({ "notes": notes }))
+    if let Some(entry) = query_embedding_degraded_entry(
+        query_embedding_degraded,
+        query_embedding_unavailable,
+        &degraded,
+    ) {
+        degraded.push(entry);
+    }
+    Ok(build_search_response(notes, degraded))
+}
+
+/// O16: turns a silent query-side embedding degradation into a `degraded`
+/// entry (the vec0 signal is fused but is not semantic, or was skipped).
+///
+/// Returns `None` on the healthy path and when the vec tier already reported
+/// an entry, so a successful search stays byte-identical. Public as the
+/// deterministic, I/O-free core of the decision so it can be pinned.
+pub fn query_embedding_degraded_entry(
+    degraded: bool,
+    unavailable: bool,
+    existing: &[Value],
+) -> Option<Value> {
+    let vec_already_reported = existing
+        .iter()
+        .any(|d| d.get("tier").and_then(Value::as_str) == Some("vec"));
+    if vec_already_reported {
+        return None;
+    }
+    if unavailable {
+        return Some(degraded_entry(
+            Some(3),
+            "query embedding unavailable; vec0 list skipped",
+        ));
+    }
+    degraded.then(|| {
+        degraded_entry(
+            Some(3),
+            "query embedding degraded to local hash fallback (no embedding provider \
+             reachable); vec0 list is not semantic",
+        )
+    })
+}
+
+/// Contract name for a resolved numeric tier (`auto` when the caller let the
+/// service auto-select). Mirrors [`resolve_tier`]'s mapping.
+fn tier_label(tier: Option<u8>) -> &'static str {
+    match tier {
+        Some(1) => "ripgrep",
+        Some(2) => "fts",
+        Some(3) => "vec",
+        Some(4) => "graph",
+        Some(5) => "llm",
+        _ => "auto",
+    }
+}
+
+/// One `{"tier": name, "error": msg}` record for the additive `degraded`
+/// array (G4-01).
+fn degraded_entry(tier: Option<u8>, error: &str) -> Value {
+    json!({ "tier": tier_label(tier), "error": error })
+}
+
+/// Assembles the knowledge/search response. `degraded` is OMITTED entirely
+/// when empty, so a fully successful search is byte-identical to the
+/// pre-G4-01 `{"notes":[...]}` shape. Public as the deterministic, I/O-free
+/// core of [`search`] so the present-only-on-failure contract can be pinned.
+pub fn build_search_response(notes: Vec<Value>, degraded: Vec<Value>) -> Value {
+    let mut response = json!({ "notes": notes });
+    if !degraded.is_empty() {
+        response["degraded"] = Value::Array(degraded);
+    }
+    response
 }
 
 /// Canonical dedupe key: canonicalized when possible, raw otherwise.

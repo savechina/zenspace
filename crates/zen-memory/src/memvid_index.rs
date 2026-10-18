@@ -1286,4 +1286,161 @@ mod tests {
             Some("m3")
         );
     }
+
+    // ── Phase 32 T219: incremental indexing (nightly dedup, review R1) ──
+    // The store is append-only with memvid-core dedup deliberately OFF
+    // (dedup(true) blocks the T208/T211 provenance backfill), so the nightly
+    // worker must run index_incremental: unchanged corpus ⇒ ZERO new frames,
+    // changed file ⇒ only that file re-indexed, missing sidecar ⇒ the
+    // index_all fallback (unchanged contract).
+
+    /// Pin a file's mtime to a fixed instant so the mtime-ms checksum
+    /// comparison is deterministic regardless of how fast the test runs.
+    fn set_mtime(path: &Path, millis_after_epoch: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let mut times = std::fs::FileTimes::new();
+        times = times.set_modified(
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis_after_epoch),
+        );
+        file.set_times(times).unwrap();
+    }
+
+    /// One file per tier (T195-style layout), all pinned to the same fixed
+    /// mtime. Returns the three file paths.
+    fn incremental_fixture(tmp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let journal = tmp
+            .path()
+            .join("memories")
+            .join("journal")
+            .join("2026-06-01.md");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(&journal, "## Facts\n- incfirst journal fact\n").unwrap();
+
+        let notion = tmp
+            .path()
+            .join("wiki")
+            .join("notions")
+            .join("technology")
+            .join("topic.md");
+        std::fs::create_dir_all(notion.parent().unwrap()).unwrap();
+        std::fs::write(&notion, "# Topic\n\nincfirst notion body.\n").unwrap();
+
+        let wisdom = tmp
+            .path()
+            .join("wiki")
+            .join("wisdom")
+            .join("reflections")
+            .join("lesson.md");
+        std::fs::create_dir_all(wisdom.parent().unwrap()).unwrap();
+        std::fs::write(&wisdom, "# Lesson\n\nincfirst wisdom body.\n").unwrap();
+
+        for p in [&journal, &notion, &wisdom] {
+            set_mtime(p, 1_700_000_000_000);
+        }
+        (journal, notion, wisdom)
+    }
+
+    fn incremental_indexer(tmp: &TempDir) -> MemvidIndexer {
+        MemvidIndexer::new(tmp.path().join("memories"), tmp.path().join("wiki"))
+    }
+
+    fn incremental_store(tmp: &TempDir, name: &str) -> ZenMemvidStore {
+        ZenMemvidStore::from_store(
+            crate::memvid_store::MemvidStore::open_or_create(&tmp.path().join(name)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn incremental_second_run_adds_zero_frames() {
+        let _guard = crate::memvid::lock_and_reset_singletons();
+        let tmp = TempDir::new().unwrap();
+        let _files = incremental_fixture(&tmp);
+        let indexer = incremental_indexer(&tmp);
+        let mut store = incremental_store(&tmp, "inc-dedup.mv2");
+
+        let first = indexer.index_incremental(&mut store).unwrap();
+        assert_eq!(first.files_scanned, 3, "cold start indexes every tier");
+        assert_eq!(first.chunks_indexed, 3);
+        assert!(first.errors.is_empty());
+        let frames_after_first = store.store().frame_count().unwrap();
+        assert!(frames_after_first > 0);
+
+        // The R1 duplication pin: unchanged corpus ⇒ the second run adds
+        // ZERO frames (index_all re-appended everything here).
+        let second = indexer.index_incremental(&mut store).unwrap();
+        assert_eq!(second.files_scanned, 0);
+        assert_eq!(second.chunks_indexed, 0);
+        assert!(second.errors.is_empty());
+        assert_eq!(
+            store.store().frame_count().unwrap(),
+            frames_after_first,
+            "frame count must be stable across a second run over an unchanged corpus"
+        );
+        assert!(
+            tmp.path()
+                .join("memories")
+                .join(".index-checksums.json")
+                .exists(),
+            "checksum sidecar persisted for the next incremental run"
+        );
+    }
+
+    #[test]
+    fn incremental_reindexes_only_the_changed_file() {
+        let _guard = crate::memvid::lock_and_reset_singletons();
+        let tmp = TempDir::new().unwrap();
+        let (journal, _notion, _wisdom) = incremental_fixture(&tmp);
+        let indexer = incremental_indexer(&tmp);
+        let mut store = incremental_store(&tmp, "inc-changed.mv2");
+
+        indexer.index_incremental(&mut store).unwrap();
+        let frames_before = store.store().frame_count().unwrap();
+
+        // Rewrite ONE file (new content + advanced mtime); the other two
+        // keep their recorded mtimes and must NOT be re-appended.
+        std::fs::write(&journal, "## Facts\n- incsecond changed fact\n").unwrap();
+        set_mtime(&journal, 1_700_000_999_000);
+
+        let report = indexer.index_incremental(&mut store).unwrap();
+        assert_eq!(report.files_scanned, 1, "only the changed file rescans");
+        assert_eq!(report.chunks_indexed, 1, "its single chunk re-appends");
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            store.store().frame_count().unwrap(),
+            frames_before + 1,
+            "frame count grows by exactly the changed file's frames"
+        );
+        // Append-only: the new content is searchable alongside the old copy.
+        let hit = find_hit(&store, "incsecond", "journal-2026-06-01");
+        assert!(hit.text.contains("changed fact"));
+    }
+
+    #[test]
+    fn incremental_missing_sidecar_falls_back_to_full_index() {
+        let _guard = crate::memvid::lock_and_reset_singletons();
+        let tmp = TempDir::new().unwrap();
+        let _files = incremental_fixture(&tmp);
+        let indexer = incremental_indexer(&tmp);
+        let mut store = incremental_store(&tmp, "inc-fallback.mv2");
+
+        let first = indexer.index_incremental(&mut store).unwrap();
+        assert_eq!(first.files_scanned, 3);
+        let frames_after_first = store.store().frame_count().unwrap();
+
+        let sidecar = tmp.path().join("memories").join(".index-checksums.json");
+        assert!(sidecar.exists());
+        std::fs::remove_file(&sidecar).unwrap();
+
+        // Missing sidecar ⇒ behaves like a full index (no error), then
+        // rewrites the sidecar so the next run is incremental again.
+        let fallback = indexer.index_incremental(&mut store).unwrap();
+        assert_eq!(fallback.files_scanned, 3, "fallback rescans every tier");
+        assert_eq!(fallback.chunks_indexed, 3);
+        assert!(fallback.errors.is_empty());
+        assert!(
+            store.store().frame_count().unwrap() > frames_after_first,
+            "fallback re-appends like index_all (rebuild semantics: manual, bounded)"
+        );
+        assert!(sidecar.exists(), "sidecar recreated after the fallback");
+    }
 }

@@ -921,7 +921,7 @@ pub enum KnowledgeInjectMode {
 }
 
 /// Default `knowledge_tiers` — FTS5-only per the T138 decision memo
-/// (`docs/designs/search-mode-defaults.md`): fusion stays opt-in.
+/// (`docs/designs/architecture.md §5`): fusion stays opt-in.
 pub const KNOWLEDGE_TIERS_DEFAULT: &str = "fts";
 /// Default total injection budget in chars — `UPSTREAM_SNIPPET_MAX_CHARS =
 /// 4000` precedent (zen-agents `plan_task.rs`).
@@ -1218,10 +1218,18 @@ pub const MEMORY_STRENGTH_HALF_LIFE_MAX: f64 = 365.0;
 /// Default nightly eviction-report length — `DEFAULT_SEARCH_LIMIT = 20`
 /// precedent (zen-vault `search/service.rs`). Structural: report length only.
 pub const MEMORY_STRENGTH_REPORT_SIZE_DEFAULT: usize = 20;
+/// Default strength rank floor (Phase 32 T224) — 0.0 makes the rank
+/// multiplier byte-identical to the unclamped `score × R` formula. The value
+/// is an OPERATOR choice (V13-A.3: no invented constants; mem0's 0.3 recency
+/// clamp is deliberately NOT hardcoded), so the default never lifts a rank.
+pub const MEMORY_STRENGTH_FLOOR_DEFAULT: f64 = 0.0;
+/// Clamp ceiling for `strength_floor` — a floor above 1.0 would invert ranks
+/// past the neutral multiplier (`R ∈ (0, 1]`), so it is structurally capped.
+pub const MEMORY_STRENGTH_FLOOR_MAX: f64 = 1.0;
 
 /// Memory strength (Ebbinghaus retention curve) — TOML
 /// `[agentic.memory_strength]` (Phase 31 T206, design
-/// `docs/designs/memory-strength-knowledge-wave.md` Feature 1).
+/// `docs/designs/architecture.md §5` Feature 1).
 ///
 /// Scope logic (Constitution XV):
 /// - Functionality: gates the derived retention-strength subsystem —
@@ -1234,13 +1242,16 @@ pub const MEMORY_STRENGTH_REPORT_SIZE_DEFAULT: usize = 20;
 ///   filters, gates, or deletes. The eviction report is report-only
 ///   (retention-quarantine precedent); no deletion path exists.
 /// - Default: enabled=false, half_life_days=30.0, search_rerank=false,
-///   eviction_report_size=20. Strength itself is never persisted — it is
-///   derived at read time, so the T153 compounding-decay bug class is
-///   structurally impossible.
+///   eviction_report_size=20, strength_floor=0.0. Strength itself is never
+///   persisted — it is derived at read time, so the T153 compounding-decay
+///   bug class is structurally impossible.
 /// - Interaction: env `ZEN_MEMORY_STRENGTH_ENABLED` /
 ///   `ZEN_MEMORY_STRENGTH_HALF_LIFE_DAYS` / `ZEN_MEMORY_STRENGTH_RERANK` /
-///   `ZEN_MEMORY_STRENGTH_REPORT_SIZE` (5th layer) override any config file
-///   layer.
+///   `ZEN_MEMORY_STRENGTH_REPORT_SIZE` / `ZEN_MEMORY_STRENGTH_FLOOR` (5th
+///   layer) override any config file layer. `strength_floor` clamps the rank
+///   multiplier to `max(R, floor)` at both strength rank sites (gateway
+///   `memory/search` + zen_agent card resolver) when `search_rerank` is on;
+///   floor=0.0 (default) is byte-identical to the unclamped ranking.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct MemoryStrengthConfig {
@@ -1256,6 +1267,12 @@ pub struct MemoryStrengthConfig {
     pub search_rerank: Option<bool>,
     /// Nightly lowest-strength report length (absent → 20).
     pub eviction_report_size: Option<usize>,
+    /// Strength rank floor (Phase 32 T224; absent → 0.0 = byte-identical to
+    /// the unclamped `score × R` ranking, clamped 0.0..=1.0). Operators may
+    /// raise it so a very old high-value memory never sinks below
+    /// `score × floor`; mem0's 0.3 is deliberately NOT the default (V13-A.3:
+    /// the value is an operator choice, not an invented constant).
+    pub strength_floor: Option<f64>,
 }
 
 impl MemoryStrengthConfig {
@@ -1295,6 +1312,29 @@ impl MemoryStrengthConfig {
     pub fn eviction_report_size_or_default(&self) -> usize {
         self.eviction_report_size
             .unwrap_or(MEMORY_STRENGTH_REPORT_SIZE_DEFAULT)
+    }
+
+    /// Effective strength rank floor (default 0.0 ⇒ byte-identical to the
+    /// unclamped `score × R` ranking; clamped 0.0..=1.0). Non-finite values
+    /// (TOML `nan`/`inf`) warn and fall back to the default — a typo must
+    /// never silently shift ranking (cron-timezone discipline). Consumers
+    /// clamp the rank multiplier to `max(R, floor)`; the reported `strength`
+    /// value stays the raw retention strength (the floor is a ranking policy,
+    /// never a claim about decay).
+    pub fn strength_floor_or_default(&self) -> f64 {
+        match self.strength_floor {
+            Some(v) if v.is_finite() => {
+                v.clamp(MEMORY_STRENGTH_FLOOR_DEFAULT, MEMORY_STRENGTH_FLOOR_MAX)
+            }
+            Some(_) => {
+                tracing::warn!(
+                    value = ?self.strength_floor,
+                    "non-finite [agentic.memory_strength] strength_floor; using 0.0"
+                );
+                MEMORY_STRENGTH_FLOOR_DEFAULT
+            }
+            None => MEMORY_STRENGTH_FLOOR_DEFAULT,
+        }
     }
 }
 
@@ -1355,7 +1395,7 @@ impl CompileConfig {
 ///   (contradictions/gaps/stale/redundant) inside `zen wiki lint`.
 /// - User impact: `semantic = true` adds one bounded LLM call per lint run;
 ///   findings are REPORTED (lint report + CLI counts), never written back
-///   to pages (read-only decision, docs/designs/e1-semantic-lint-writers.md).
+///   to pages (read-only decision, docs/designs/architecture.md §5).
 /// - Default: false — the gate ships closed; no LLM call happens unless the
 ///   operator opens it (T168 shadow-mode precedent).
 /// - Interaction: env `ZEN_LINT_SEMANTIC` (5th layer) overrides any config
@@ -1947,7 +1987,7 @@ pub struct TuiConfig {
 /// insensitive) overrides the TOML value in the env layer; unparsable
 /// values warn and keep the TOML-derived mode. Note this key gates ONLY
 /// the TUI chat context injection — `zen chat` and TUI `/search` always
-/// auto-select (see docs/designs/search-mode-defaults.md).
+/// auto-select (see docs/designs/architecture.md §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KnowledgeSearchMode {
@@ -2483,6 +2523,10 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
                 .memory_strength
                 .eviction_report_size
                 .or(base.memory_strength.eviction_report_size),
+            strength_floor: ov
+                .memory_strength
+                .strength_floor
+                .or(base.memory_strength.strength_floor),
         },
         lint: LintConfig {
             semantic: ov.lint.semantic.or(base.lint.semantic),
@@ -2881,6 +2925,15 @@ fn apply_memory_strength_env(cfg: &mut MemoryStrengthConfig) {
             Err(_) => tracing::warn!(
                 value = %v,
                 "ZEN_MEMORY_STRENGTH_REPORT_SIZE is not a number; ignoring (default 20 stays)"
+            ),
+        }
+    }
+    if let Some(v) = env_str("ZEN_MEMORY_STRENGTH_FLOOR") {
+        match v.trim().parse::<f64>() {
+            Ok(parsed) => cfg.strength_floor = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_MEMORY_STRENGTH_FLOOR is not a number; ignoring (0.0 default stays)"
             ),
         }
     }
@@ -4021,6 +4074,102 @@ provider = "anthropic"
         assert_eq!(ms.half_life_days, Some(20.0));
         assert_eq!(ms.search_rerank, Some(true));
         assert_eq!(ms.eviction_report_size, None);
+    }
+
+    #[test]
+    fn memory_strength_floor_default_zero_byte_identical() {
+        let config: ZenConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            config.agentic.memory_strength.strength_floor, None,
+            "absent by default"
+        );
+        assert_eq!(
+            config.agentic.memory_strength.strength_floor_or_default(),
+            0.0,
+            "T224: the default floor must never lift a rank (byte-identity)"
+        );
+    }
+
+    #[test]
+    fn memory_strength_floor_toml_sentinel_and_clamp_and_non_finite() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        assert_eq!(
+            parse("[agentic.memory_strength]\nstrength_floor = 0.4\n")
+                .agentic
+                .memory_strength
+                .strength_floor_or_default(),
+            0.4
+        );
+        assert_eq!(
+            parse("[agentic.memory_strength]\nstrength_floor = 1.7\n")
+                .agentic
+                .memory_strength
+                .strength_floor_or_default(),
+            1.0,
+            "clamped to 0.0..=1.0"
+        );
+        assert_eq!(
+            parse("[agentic.memory_strength]\nstrength_floor = -0.2\n")
+                .agentic
+                .memory_strength
+                .strength_floor_or_default(),
+            0.0,
+            "clamped to 0.0..=1.0"
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cfg = MemoryStrengthConfig {
+                strength_floor: Some(bad),
+                ..MemoryStrengthConfig::default()
+            };
+            assert_eq!(cfg.strength_floor_or_default(), 0.0, "bad: {bad}");
+        }
+    }
+
+    #[test]
+    fn memory_strength_floor_env_overrides_and_invalid_keeps_default() {
+        // SAFETY: test-only env mutation; ZEN_MEMORY_STRENGTH_FLOOR is read
+        // by no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_FLOOR", "0.25") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.memory_strength.strength_floor, Some(0.25));
+        assert_eq!(
+            cfg.agentic.memory_strength.strength_floor_or_default(),
+            0.25
+        );
+
+        unsafe { std::env::set_var("ZEN_MEMORY_STRENGTH_FLOOR", "abc") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.memory_strength.strength_floor, None,
+            "invalid env value must keep the default, never silently shift ranking"
+        );
+        assert_eq!(cfg.agentic.memory_strength.strength_floor_or_default(), 0.0);
+
+        unsafe { std::env::remove_var("ZEN_MEMORY_STRENGTH_FLOOR") };
+    }
+
+    #[test]
+    fn memory_strength_floor_merge_overlay_wins_base_survives_absent() {
+        let parse = |s: &str| -> ZenConfig { toml::from_str(s).unwrap() };
+        let merged = merge_configs(
+            parse("[agentic.memory_strength]\nenabled = true\n"),
+            parse("[agentic.memory_strength]\nstrength_floor = 0.6\n"),
+        )
+        .unwrap();
+        let ms = &merged.agentic.memory_strength;
+        assert_eq!(ms.enabled, Some(true));
+        assert_eq!(ms.strength_floor, Some(0.6));
+
+        let merged = merge_configs(
+            parse("[agentic.memory_strength]\n"),
+            parse("[agentic.memory_strength]\nstrength_floor = 0.6\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.agentic.memory_strength.strength_floor,
+            Some(0.6),
+            "base survives an absent overlay value"
+        );
     }
 
     #[test]

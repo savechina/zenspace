@@ -80,13 +80,15 @@ impl Tool for FsGrepTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let pattern_str = args["pattern"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'pattern' field".into())
-        })?;
+        let pattern_str = match args["pattern"].as_str() {
+            Some(p) => p,
+            None => return Ok(json!({ "error": "Missing or invalid 'pattern' field" })),
+        };
 
-        let path_str = args["path"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'path' field".into())
-        })?;
+        let path_str = match args["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(json!({ "error": "Missing or invalid 'path' field" })),
+        };
 
         let include_glob = args.get("include").and_then(|v| v.as_str());
         let max_matches = args
@@ -98,15 +100,19 @@ impl Tool for FsGrepTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let mut re_builder = Regex::new(pattern_str)
-            .map_err(|e| KernelError::InvalidArgument(format!("Invalid regex: {}", e)))?;
+        let mut re_builder = match Regex::new(pattern_str) {
+            Ok(re) => re,
+            Err(e) => return Ok(json!({ "error": format!("Invalid regex: {}", e) })),
+        };
         if case_insensitive {
-            re_builder = Regex::new(&format!("(?i){}", pattern_str))
-                .map_err(|e| KernelError::InvalidArgument(format!("Invalid regex: {}", e)))?;
+            re_builder = match Regex::new(&format!("(?i){}", pattern_str)) {
+                Ok(re) => re,
+                Err(e) => return Ok(json!({ "error": format!("Invalid regex: {}", e) })),
+            };
         }
         let re = re_builder;
 
-        let root = PathBuf::from(path_str);
+        let root = zen_core::sandbox::resolve_agent_path(path_str);
         self.validator
             .validate_path_for_read(&root)
             .map_err(KernelError::ToolFailed)?;
@@ -179,5 +185,40 @@ impl Tool for FsGrepTool {
             "count": count,
             "truncated": truncated
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_validator(dir: &std::path::Path) -> SandboxValidator {
+        SandboxValidator::new(
+            zen_core::sandbox::SandboxMode::WorkspaceWrite,
+            vec![dir.to_path_buf()],
+        )
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn invalid_regex_returns_structured_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let tool = FsGrepTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({
+            "pattern": "(",
+            "path": dir.path().to_string_lossy()
+        })))
+        .unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Invalid regex")),
+            "expected structured error, got: {res}"
+        );
     }
 }

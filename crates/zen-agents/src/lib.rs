@@ -1,4 +1,5 @@
 pub mod agent_profile;
+pub mod aggregate_weights;
 pub mod completion_model;
 pub mod context;
 pub mod decision;

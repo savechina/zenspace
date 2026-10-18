@@ -72,7 +72,12 @@ impl<'a> PluginApi<'a> {
             workspace_root,
             builtin_tool_names: Vec::new(),
             hook_sensitivity: Arc::new(HashMap::new()),
-            audit_log_path: PathBuf::from("logs/audit.jsonl"),
+            // Path Spec v2: global-only default (overridable via
+            // `with_isolation`); the former cwd-relative default created
+            // `logs/audit.jsonl` under whatever dir the process ran in.
+            audit_log_path: zen_core::paths::user_root()
+                .join(zen_core::constants::LOGS_DIR)
+                .join("audit.jsonl"),
         }
     }
 

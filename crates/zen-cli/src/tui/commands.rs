@@ -2,6 +2,123 @@ use ratatui::text::Line;
 
 use super::app::{App, MAX_QUEUE_SIZE};
 
+/// Truthful offline detail for `/search` (G4-02): the previous string
+/// promised a retry this path never performs.
+const SEARCH_OFFLINE_MSG: &str = "gateway: offline — search unavailable (daemon unreachable)";
+
+/// Display caps for one `/search` result's note content (G4-03). `/search`
+/// renders note bodies inline into the scrollback; a long note (or a fusion
+/// hit carrying a whole document) would flood the viewport. DISPLAY-only:
+/// the full content is untouched in the daemon response and the store.
+/// Fixed constants, no config key (T192: no dormant knobs).
+const SEARCH_CONTENT_MAX_LINES: usize = 40;
+const SEARCH_CONTENT_MAX_CHARS: usize = 2000;
+const SEARCH_TRUNCATION_MARKER: &str = " … [truncated]";
+
+/// Char-boundary-safe display truncation of a `/search` note body.
+fn truncate_search_content(content: &str) -> String {
+    let total_lines = content.lines().count();
+    let limited: String = content
+        .lines()
+        .take(SEARCH_CONTENT_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let truncated = if limited.chars().count() > SEARCH_CONTENT_MAX_CHARS {
+        limited.chars().take(SEARCH_CONTENT_MAX_CHARS).collect()
+    } else {
+        limited
+    };
+    if total_lines > SEARCH_CONTENT_MAX_LINES || content.chars().count() > SEARCH_CONTENT_MAX_CHARS
+    {
+        format!("{truncated}{SEARCH_TRUNCATION_MARKER}")
+    } else {
+        truncated
+    }
+}
+
+/// Renders the G4-01 degraded-tier warning line, or `None` when every tier
+/// answered. `names` are the contract tier names from the RPC `degraded`
+/// array (`fts`, `vec`, `graph`, ...).
+fn degraded_tiers_line(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        None
+    } else {
+        Some(format!("⚠ degraded tiers: {}", names.join(", ")))
+    }
+}
+
+/// Parses a raw `knowledge/search` result into `(notes, degraded tier
+/// names)`. Split out from [`App::execute_search`] for unit testing.
+fn parse_search_response(result: &serde_json::Value) -> (Vec<(String, String)>, Vec<String>) {
+    let notes = result
+        .get("notes")
+        .and_then(serde_json::Value::as_array)
+        .map(|notes| {
+            notes
+                .iter()
+                .map(|note| {
+                    let path = note
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let content = note
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    (path, content)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let degraded = result
+        .get("degraded")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("tier")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (notes, degraded)
+}
+
+/// Raw `knowledge/search` RPC so the additive `degraded` array is visible —
+/// [`zen_gateway::client::SurfaceClient::search_knowledge`] discards it.
+async fn raw_search_request(query: &str) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let client = zen_gateway::client::GatewayClient::connect(
+        zen_gateway::transport::uds::default_socket_path(),
+    )
+    .await
+    .map_err(|e| format!("gateway: search unavailable ({e})"))?;
+    let result = client
+        .request(
+            "knowledge/search",
+            serde_json::json!({ "query": query, "limit": 10 }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(parse_search_response(&result))
+}
+
+/// Split a stripped slash input into (command token, trimmed remainder).
+/// A double-space typo (`/search  letter`) must not leak a leading-space
+/// remainder (' letter') into the query shown to the user and sent to
+/// the search tiers; a trailing-space-only remainder yields `None`.
+pub(crate) fn split_slash_input(cmd: &str) -> (&str, Option<&str>) {
+    let mut parts = cmd.splitn(2, ' ');
+    let token = parts.next().unwrap_or("");
+    let rest = parts.next().map(str::trim).filter(|r| !r.is_empty());
+    (token, rest)
+}
+
 impl App {
     pub fn handle_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
@@ -41,12 +158,12 @@ impl App {
         // picker the command opened (render order: slash → session → model).
         self.slash_state.dismiss();
 
-        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+        let (token, rest) = split_slash_input(cmd);
         let command_name = self
             .slash_registry
-            .get_by_name_or_alias(parts[0])
+            .get_by_name_or_alias(token)
             .map(|c| c.name.clone())
-            .unwrap_or_else(|| parts[0].to_string());
+            .unwrap_or_else(|| token.to_string());
 
         match command_name.as_str() {
             "exit" => {
@@ -99,21 +216,21 @@ impl App {
                 );
             }
             "export" => self.execute_export(),
-            "note" => self.execute_note(parts.get(1).copied()),
-            "search" => self.execute_search(parts.get(1).copied().unwrap_or("")),
+            "note" => self.execute_note(rest),
+            "search" => self.execute_search(rest.unwrap_or("")),
             "session" => self.session_picker.show(),
             "new" => self.execute_new_session(),
-            "fork" => self.execute_fork_session(parts.get(1).copied()),
-            "rename" => self.execute_rename_session(parts.get(1).copied()),
+            "fork" => self.execute_fork_session(rest),
+            "rename" => self.execute_rename_session(rest),
             "archive" => self.execute_archive_session(),
-            "serve" => self.execute_serve(parts.get(1).copied()),
+            "serve" => self.execute_serve(rest),
             "config" => self.execute_config(),
-            "model" => self.execute_model(parts.get(1).copied()),
+            "model" => self.execute_model(rest),
             "variant" | "vc" | "variant_cycle" => self.execute_variant_cycle(),
             "distill" => self.execute_distill(),
             "lint" => self.execute_lint(),
             _ => self.push_output(
-                format!("Unknown command: /{}. Type /help for commands.", parts[0]),
+                format!("Unknown command: /{}. Type /help for commands.", token),
                 true,
             ),
         }
@@ -371,28 +488,49 @@ Use /thinking to show/hide thinking process."#;
         let query_owned = query.to_string();
         let outcome = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
+                // Ensure a gateway is up (connect-or-embed / spawn),
+                // preserving the pre-existing connection policy. The surface
+                // is then used only as a fallback: search_knowledge discards
+                // the additive `degraded` array this command must surface.
                 let surface = match super::prewarm::take_client() {
                     Some(surface) => Some(surface),
                     None => super::prewarm::resolve_client().await,
                 };
                 let Some(surface) = surface else {
-                    return Err("gateway: offline — search unavailable (retrying)".to_string());
+                    return Err(SEARCH_OFFLINE_MSG.to_string());
                 };
-                surface
-                    .search_knowledge(&query_owned, None, 10)
-                    .await
-                    .map_err(|e| e.to_string())
+                match raw_search_request(&query_owned).await {
+                    Ok(parsed) => Ok(parsed),
+                    Err(raw_err) => match surface.search_knowledge(&query_owned, None, 10).await {
+                        Ok(notes) => Ok((
+                            notes.into_iter().map(|n| (n.path, n.content)).collect(),
+                            Vec::new(),
+                        )),
+                        Err(e) => Err(format!("{raw_err}; {e}")),
+                    },
+                }
             })
         });
         match outcome {
-            Ok(notes) => {
+            Ok((notes, degraded)) => {
                 if notes.is_empty() {
                     self.push_output(format!("[gateway] No results for '{}'", query), false);
+                    self.push_output(
+                        "  Tip: `zen wiki reindex` refreshes FTS + semantic indexes over the vault."
+                            .to_string(),
+                        false,
+                    );
                 } else {
                     self.push_output(format!("[gateway] Found {} results:", notes.len()), false);
-                    for note in &notes {
-                        self.push_output(format!("  {} {}", note.path, note.content), false);
+                    for (path, content) in &notes {
+                        self.push_output(
+                            format!("  {} {}", path, truncate_search_content(content)),
+                            false,
+                        );
                     }
+                }
+                if let Some(line) = degraded_tiers_line(&degraded) {
+                    self.push_output(line, true);
                 }
             }
             Err(e) => self.push_output(format!("Search error: {}", e), true),
@@ -632,5 +770,99 @@ Use /thinking to show/hide thinking process."#;
                 Err(e) => self.push_output(format!("Lint error: {}", e), true),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod search_display_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_passes_short_content_through() {
+        let short = "first line\nsecond line";
+        assert_eq!(truncate_search_content(short), short);
+    }
+
+    #[test]
+    fn truncate_caps_line_count_with_marker() {
+        let long: String = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = truncate_search_content(&long);
+        assert!(out.ends_with(SEARCH_TRUNCATION_MARKER));
+        assert_eq!(
+            out.lines().count(),
+            SEARCH_CONTENT_MAX_LINES,
+            "line cap is a hard display bound"
+        );
+    }
+
+    #[test]
+    fn truncate_caps_char_count_on_a_single_long_line() {
+        let long = "x".repeat(SEARCH_CONTENT_MAX_CHARS * 2);
+        let out = truncate_search_content(&long);
+        assert!(out.ends_with(SEARCH_TRUNCATION_MARKER));
+        assert_eq!(
+            out.chars().count(),
+            SEARCH_CONTENT_MAX_CHARS + SEARCH_TRUNCATION_MARKER.chars().count()
+        );
+    }
+
+    #[test]
+    fn degraded_line_none_when_all_tiers_healthy() {
+        assert!(degraded_tiers_line(&[]).is_none());
+    }
+
+    #[test]
+    fn degraded_line_names_failing_tiers() {
+        let line = degraded_tiers_line(&["fts".to_string(), "vec".to_string()]).unwrap();
+        assert_eq!(line, "⚠ degraded tiers: fts, vec");
+    }
+
+    #[test]
+    fn parse_search_response_reads_notes_and_degraded() {
+        let result = serde_json::json!({
+            "notes": [{"path": "/a.md", "content": "hi"}],
+            "degraded": [{"tier": "vec", "error": "no model"}],
+        });
+        let (notes, degraded) = parse_search_response(&result);
+        assert_eq!(notes, vec![("/a.md".to_string(), "hi".to_string())]);
+        assert_eq!(degraded, vec!["vec".to_string()]);
+    }
+
+    #[test]
+    fn parse_search_response_absent_degraded_is_empty() {
+        let result = serde_json::json!({"notes": []});
+        let (notes, degraded) = parse_search_response(&result);
+        assert!(notes.is_empty());
+        assert!(degraded.is_empty());
+    }
+
+    #[test]
+    fn split_trims_double_space_typo() {
+        assert_eq!(
+            split_slash_input("search  letter"),
+            ("search", Some("letter"))
+        );
+    }
+
+    #[test]
+    fn split_preserves_internal_spaces() {
+        assert_eq!(
+            split_slash_input("fork my copied name"),
+            ("fork", Some("my copied name"))
+        );
+    }
+
+    #[test]
+    fn split_trailing_space_yields_none() {
+        assert_eq!(split_slash_input("clear "), ("clear", None));
+        assert_eq!(split_slash_input("search  "), ("search", None));
+    }
+
+    #[test]
+    fn split_bare_token_has_no_rest() {
+        assert_eq!(split_slash_input("exit"), ("exit", None));
     }
 }

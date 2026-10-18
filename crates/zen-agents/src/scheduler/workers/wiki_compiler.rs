@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -12,6 +13,9 @@ use zen_vault::{NotionData, NotionService, WikiCompiler, WikiPage};
 use zen_core::constants::WIKI_COMPILER_STATE_FILE;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
+use super::zen_loop::log_once;
+
+static DB_OPEN_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Persistent state for incremental wiki compilation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,7 +233,9 @@ impl ZenWorker for WikiCompilerWorker {
         let client = match zen_vault::SqliteClient::open(&state_db).await {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to open state.db, skipping wiki compilation");
+                if log_once(&DB_OPEN_FAILED_LOGGED) {
+                    warn!(error = %e, "failed to open state.db, skipping wiki compilation");
+                }
                 return Ok(WorkerReport {
                     worker_id: self.id().to_string(),
                     success: true,

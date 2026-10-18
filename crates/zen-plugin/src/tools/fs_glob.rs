@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -60,16 +59,20 @@ impl Tool for FsGlobTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let pattern = args["pattern"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'pattern' field".into())
-        })?;
+        let pattern = match args["pattern"].as_str() {
+            Some(p) => p,
+            None => return Ok(json!({ "error": "Missing or invalid 'pattern' field" })),
+        };
 
         let max_results = args
             .get("max_results")
             .and_then(|v| v.as_i64())
             .unwrap_or(DEFAULT_MAX_RESULTS as i64) as usize;
 
-        let base = args.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+        let base = args
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(zen_core::sandbox::resolve_agent_path);
 
         let full_pattern = match &base {
             Some(b) => {
@@ -84,9 +87,13 @@ impl Tool for FsGlobTool {
         let mut matches: Vec<String> = Vec::new();
         let mut truncated = false;
 
-        for entry in glob::glob(&full_pattern)
-            .map_err(|e| KernelError::InvalidArgument(format!("Invalid glob pattern: {}", e)))?
-        {
+        let glob_iter = match glob::glob(&full_pattern) {
+            Ok(it) => it,
+            Err(e) => {
+                return Ok(json!({ "error": format!("Invalid glob pattern: {}", e) }));
+            }
+        };
+        for entry in glob_iter {
             match entry {
                 Ok(path) => {
                     if matches.len() >= max_results {
@@ -109,5 +116,35 @@ impl Tool for FsGlobTool {
             "count": count,
             "truncated": truncated
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_validator(dir: &std::path::Path) -> SandboxValidator {
+        SandboxValidator::new(
+            zen_core::sandbox::SandboxMode::WorkspaceWrite,
+            vec![dir.to_path_buf()],
+        )
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(fut)
+    }
+
+    #[test]
+    fn invalid_glob_returns_structured_error() {
+        let dir = tempdir().unwrap();
+        let tool = FsGlobTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({ "pattern": "[" }))).unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Invalid glob pattern")),
+            "expected structured error, got: {res}"
+        );
     }
 }

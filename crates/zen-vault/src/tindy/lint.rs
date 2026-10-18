@@ -31,7 +31,7 @@ pub struct LintResult {
     /// LLM audit findings (compile-hygiene E1). Populated only when the
     /// `[agentic.lint] semantic` gate is open; findings are reported, never
     /// written back to pages (read-only contract,
-    /// docs/designs/e1-semantic-lint-writers.md).
+    /// docs/designs/architecture.md §5 (e1 entry)).
     pub semantic_findings: Vec<crate::tindy::semantic_lint::SemanticFinding>,
 }
 

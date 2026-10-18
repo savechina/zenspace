@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -74,9 +73,10 @@ impl Tool for FsListTool {
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
-        let path_str = args["path"].as_str().ok_or_else(|| {
-            KernelError::InvalidArgument("Missing or invalid 'path' field".into())
-        })?;
+        let path_str = match args["path"].as_str() {
+            Some(p) => p,
+            None => return Ok(json!({ "error": "Missing or invalid 'path' field" })),
+        };
 
         let recursive = args
             .get("recursive")
@@ -87,20 +87,19 @@ impl Tool for FsListTool {
             .and_then(|v| v.as_i64())
             .unwrap_or(DEFAULT_MAX_ENTRIES as i64) as usize;
         let depth = args.get("depth").and_then(|v| v.as_i64());
-        let glob_pattern = args
-            .get("glob")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                glob::Pattern::new(s)
-                    .map_err(|e| KernelError::InvalidArgument(format!("Invalid glob: {}", e)))
-            })
-            .transpose()?;
+        let glob_pattern = match args.get("glob").and_then(|v| v.as_str()) {
+            Some(s) => match glob::Pattern::new(s) {
+                Ok(p) => Some(p),
+                Err(e) => return Ok(json!({ "error": format!("Invalid glob: {}", e) })),
+            },
+            None => None,
+        };
         let include_hidden = args
             .get("include_hidden")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let path = PathBuf::from(path_str);
+        let path = zen_core::sandbox::resolve_agent_path(path_str);
 
         self.validator
             .validate_path_for_read(&path)
@@ -151,15 +150,17 @@ impl Tool for FsListTool {
                 }));
             }
         } else {
-            let mut reader = tokio::fs::read_dir(&path)
-                .await
-                .map_err(|e| KernelError::ToolFailed(format!("Failed to read dir: {}", e)))?;
+            let mut reader = match tokio::fs::read_dir(&path).await {
+                Ok(r) => r,
+                Err(e) => return Ok(json!({ "error": format!("Failed to read dir: {}", e) })),
+            };
 
-            while let Some(entry) = reader
-                .next_entry()
-                .await
-                .map_err(|e| KernelError::ToolFailed(format!("Failed to read entry: {}", e)))?
-            {
+            while let Some(entry) = match reader.next_entry().await {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return Ok(json!({ "error": format!("Failed to read entry: {}", e) }));
+                }
+            } {
                 if entries.len() >= max_entries {
                     truncated = true;
                     break;
@@ -273,5 +274,21 @@ mod tests {
             }),
         );
         assert_eq!(res2["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn missing_dir_returns_structured_error() {
+        let dir = tempdir().unwrap();
+        let tool = FsListTool::new(make_validator(dir.path()));
+        let res = invoke(
+            &tool,
+            json!({ "path": dir.path().join("does-not-exist").to_string_lossy() }),
+        );
+        assert!(
+            res["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("Failed to read dir")),
+            "expected structured error, got: {res}"
+        );
     }
 }

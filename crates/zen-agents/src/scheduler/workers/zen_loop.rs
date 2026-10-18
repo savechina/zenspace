@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -27,6 +27,22 @@ use zen_vault::{CommunitySummaryReport, DistillationPipeline, Reindexer};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 use super::promotion_worker::{PromotionTarget, PromotionWorker};
+
+/// Fail-loud-once gate for repeated DB-open failures (D18/W4.4).
+///
+/// The scheduler re-opens `state.db` every tick; a genuine failure (locked,
+/// corrupt, disk) would otherwise log the full error on every tick (~283
+/// lines/day for 5-min cycles). Callers hold one `AtomicBool` per site and
+/// log only when this returns `true` (the first observation in the process),
+/// then mute repeats — the worker's fail-open behavior is unchanged. Shared
+/// with the sibling workers (`dream`, `notion_extractor_worker`,
+/// `wiki_compiler`) so the once-discipline has a single implementation.
+pub(crate) fn log_once(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::SeqCst)
+}
+
+/// Once-per-process gate for the loop's `state.db` open failure.
+static DB_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Return the path to the last cycle report file.
 ///
@@ -1229,7 +1245,9 @@ impl ZenWorker for ZenLoopWorker {
         let db = match zen_repo::SqliteClient::open_lazy(&db_path).await {
             Ok(db) => Some(db),
             Err(e) => {
-                warn!(error = %e, "loop: DB unavailable — distill runs without graph persist");
+                if log_once(&DB_UNAVAILABLE_LOGGED) {
+                    warn!(error = %e, "loop: DB unavailable — distill runs without graph persist");
+                }
                 None
             }
         };
@@ -1431,7 +1449,7 @@ impl ZenWorker for ZenLoopWorker {
         // ── Stage 4: verify (T016) — GraphIntegrityVerifier + page lint ───
         if let Some(db) = db.as_ref() {
             let verifier = zen_vault::GraphIntegrityVerifier::new(db, &cycle_id);
-            let inventory = zen_vault::wiki_page_inventory(&paths.wiki());
+            let inventory = zen_vault::graph_verify::concept_page_inventory(&paths.wiki());
             match verifier.verify(&inventory).await {
                 Ok(mut graph_gaps) => gaps.append(&mut graph_gaps),
                 Err(e) => warn!(error = %e, "loop: graph verify failed (cycle continues)"),
@@ -1523,9 +1541,10 @@ impl ZenWorker for ZenLoopWorker {
         }
 
         // ── Stage 5: reindex (checksum-gated, same path as `zen wiki reindex`) ──
-        // without_embeddings: the 5-min hot chain stays offline-safe; vec0
-        // embeddings belong to the batch rhythms (wiki-compiler 30min /
-        // memvid-indexer nightly) per FR-027 rhythm separation.
+        // without_embeddings: this 5-min path never writes a vec0 vector. It
+        // does mark stale embeddings dirty (`embedded_hash = ''`), so the next
+        // embedding-enabled `zen wiki reindex` refreshes them (reported as
+        // `files_reembedded`). No other worker writes `note_embeddings`.
         if let Some(db) = db {
             let reindexer = Reindexer::with_client(db).without_embeddings();
             match reindexer.reindex(&paths.vault()).await {
@@ -2002,6 +2021,14 @@ mod tests {
         assert_eq!(worker.id(), "zen-loop");
         assert_eq!(worker.schedule(), "0 */5 * * * *");
         assert!(!worker.description().is_empty());
+    }
+
+    #[test]
+    fn log_once_fires_only_on_the_first_observation() {
+        let flag = AtomicBool::new(false);
+        assert!(log_once(&flag), "first observation must report should-log");
+        assert!(!log_once(&flag), "second observation must be muted");
+        assert!(!log_once(&flag), "subsequent observations stay muted");
     }
 
     #[test]

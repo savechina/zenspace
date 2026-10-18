@@ -56,6 +56,13 @@ pub(crate) struct StrengthContext {
     /// Reward sidecar directory (`memories/.reward`).
     reward_dir: PathBuf,
     half_life_days: f64,
+    /// Rank-multiplier floor (Phase 32 T224): the sort key uses
+    /// `score × max(R, strength_floor)` so a very old high-value memory never
+    /// sinks below `score × floor`. Default 0.0 ⇒ byte-identical to the
+    /// unclamped T209 ranking (`R ∈ (0, 1]`, so `max(R, 0.0) = R` exactly).
+    /// The emitted `strength` field stays the RAW R — the floor is a ranking
+    /// policy, never a claim about decay.
+    strength_floor: f64,
 }
 
 impl StrengthContext {
@@ -91,6 +98,7 @@ impl StrengthContext {
             wiki_root: paths.wiki(),
             reward_dir: paths.memory().join(".reward"),
             half_life_days: ms.half_life_days_or_default(),
+            strength_floor: ms.strength_floor_or_default(),
         })
     }
 
@@ -158,9 +166,11 @@ fn hit_strength(hit: &SearchHit, ctx: &StrengthContext, now: DateTime<Utc>) -> f
 
 /// Map memvid hits to the contract JSON. Gate OFF (`ctx = None`) is
 /// byte-identical to the pre-T209 mapping: same fields, same order, no
-/// `strength` key. Gate ON reorders by `score × R` DESC (stable — ties and
-/// NaN keep memvid's order; ranking-only, hits are never dropped or
-/// filtered) and adds the additive per-hit `strength` field.
+/// `strength` key. Gate ON reorders by `score × max(R, strength_floor)`
+/// DESC (T224 floor, default 0.0 ⇒ exactly the unclamped `score × R`;
+/// stable — ties and NaN keep memvid's order; ranking-only, hits are never
+/// dropped or filtered) and adds the additive per-hit `strength` field
+/// carrying the RAW R.
 fn render_hits(hits: Vec<SearchHit>, ctx: Option<&StrengthContext>) -> Vec<Value> {
     let Some(ctx) = ctx else {
         return hits
@@ -183,9 +193,10 @@ fn render_hits(hits: Vec<SearchHit>, ctx: Option<&StrengthContext>) -> Vec<Value
             (h, r)
         })
         .collect();
+    let floor = ctx.strength_floor;
     scored.sort_by(|a, b| {
-        let ra = f64::from(a.0.score.unwrap_or(0.0)) * a.1;
-        let rb = f64::from(b.0.score.unwrap_or(0.0)) * b.1;
+        let ra = f64::from(a.0.score.unwrap_or(0.0)) * a.1.max(floor);
+        let rb = f64::from(b.0.score.unwrap_or(0.0)) * b.1.max(floor);
         rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
     });
     scored
@@ -383,6 +394,7 @@ mod tests {
             wiki_root: root.join("wiki"),
             reward_dir: root.join(".reward"),
             half_life_days: 30.0,
+            strength_floor: 0.0,
         }
     }
 
@@ -448,6 +460,109 @@ mod tests {
         }
         assert!(
             rendered[0]["strength"].as_f64().unwrap() > rendered[1]["strength"].as_f64().unwrap()
+        );
+    }
+
+    #[test]
+    fn floor_zero_ranking_is_byte_identical_to_unclamped_formula() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        assert_eq!(ctx.strength_floor, 0.0);
+        let build = || {
+            vec![
+                make_hit(
+                    1,
+                    &journal_uri_days_ago(2000),
+                    Some(1.0),
+                    BTreeMap::new(),
+                    None,
+                ),
+                make_hit(
+                    2,
+                    &journal_uri_days_ago(1),
+                    Some(0.6),
+                    BTreeMap::new(),
+                    None,
+                ),
+                make_hit(
+                    3,
+                    &journal_uri_days_ago(30),
+                    Some(0.8),
+                    BTreeMap::new(),
+                    None,
+                ),
+            ]
+        };
+        let rendered = render_hits(build(), Some(&ctx));
+
+        // Reference: the unclamped T209 formula score × R, computed directly.
+        let now = Utc::now();
+        let mut reference: Vec<(u64, f64, f64)> = build()
+            .iter()
+            .map(|h| {
+                let r = hit_strength(h, &ctx, now);
+                (h.frame_id, f64::from(h.score.unwrap_or(0.0)) * r, r)
+            })
+            .collect();
+        reference.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let rendered_pairs: Vec<(u64, f64)> = rendered
+            .iter()
+            .map(|v| {
+                (
+                    v["frameId"].as_str().unwrap().parse().unwrap(),
+                    v["strength"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        let rendered_ids: Vec<u64> = rendered_pairs.iter().map(|(id, _)| *id).collect();
+        let reference_ids: Vec<u64> = reference.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            rendered_ids, reference_ids,
+            "floor=0.0 ⇒ ordering byte-identical to score × R"
+        );
+        for ((rid, r), (eid, _, expected_r)) in rendered_pairs.iter().zip(&reference) {
+            assert_eq!(rid, eid);
+            assert!(
+                (r - expected_r).abs() < 1e-6,
+                "strength field reports the raw R: {r} vs {expected_r}"
+            );
+        }
+    }
+
+    #[test]
+    fn strength_floor_lifts_old_high_score_hits_at_rank_time_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(dir.path());
+        ctx.strength_floor = 0.6;
+        let hits = vec![
+            // Old journal anchor: R ≈ 0.5^(2000/30) ≈ 0 despite the top score.
+            make_hit(
+                1,
+                &journal_uri_days_ago(2000),
+                Some(1.0),
+                BTreeMap::new(),
+                None,
+            ),
+            // Fresh anchor: 0.6 × R≈0.977 ≈ 0.586 < 1.0 × floor 0.6.
+            make_hit(
+                2,
+                &journal_uri_days_ago(1),
+                Some(0.6),
+                BTreeMap::new(),
+                None,
+            ),
+        ];
+
+        let rendered = render_hits(hits, Some(&ctx));
+        assert_eq!(
+            rendered[0]["frameId"], "1",
+            "floor rescues the old high-score hit: 1.0 × max(R, 0.6) beats 0.6 × 0.977"
+        );
+        assert_eq!(rendered[1]["frameId"], "2");
+        assert!(
+            rendered[0]["strength"].as_f64().unwrap() < 0.2,
+            "the strength field stays the RAW decayed R — the floor is rank-only"
         );
     }
 

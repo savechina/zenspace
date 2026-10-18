@@ -60,7 +60,7 @@ jobs:
       - name: TUI verification pipeline (L1 headless + L2 session + guard + L3 PTY + L4 tmux)
         env:
           TERM: xterm
-        run: bin/test-tui
+        run: bin/test tui
 
   build:
     runs-on: ${{ matrix.os }}
@@ -97,9 +97,10 @@ jobs:
           tool: nextest
       # No separate `bin/build` — `cargo nextest run` already produces
       # `target/debug/zen` as a build prerequisite of the `crates/zen/tests/*`
-      # integration tests (common.rs uses `env!("CARGO_BIN_EXE_zen")`), and no
-      # crate declares `[features]`, so `--all-features` is a no-op. Paying a
-      # second dev-profile compile here only doubles build time.
+      # integration tests (common.rs uses `env!("CARGO_BIN_EXE_zen")`), and the
+      # only `[features]` (zen-cli `bench`, a lib.rs visibility seam) is a
+      # no-op for the default-feature build. Paying a second dev-profile
+      # compile here only doubles build time.
       - name: Build & test (nextest produces target/debug/zen)
         # ARM runner (2 cores / 8 GB) OOMs on 2 concurrent nextest threads
         # — kernel SIGTERM manifests as exit 143. x86 (4 cores / 16 GB) is fine at 2.
