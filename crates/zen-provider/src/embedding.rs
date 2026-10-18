@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use fastembed::{EmbeddingModel as FastEmbedModel, TextInitOptions};
@@ -236,6 +237,8 @@ const FASTEMBED_INIT_TIMEOUT_SECS: u64 = 60;
 
 static FASTEMBED_BROKEN: OnceLock<String> = OnceLock::new();
 
+static HF_ENDPOINT_APPLIED: AtomicBool = AtomicBool::new(false);
+
 fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
@@ -300,11 +303,17 @@ impl EmbeddingProvider for LocalFastembedProvider {
             });
         }
 
-        // Set HF_ENDPOINT before fastembed init if configured.
-        // Safety: set_var is unsafe in multithreaded contexts, but this runs
-        // once during model init (or early in the process lifetime), and the
-        // fastembed crate reads HF_ENDPOINT at most once during download.
-        if let Some(endpoint) = &self.hf_endpoint {
+        // Set HF_ENDPOINT before fastembed init if configured — exactly ONCE
+        // per process (swap wins). The fastembed crate reads HF_ENDPOINT at
+        // most once during init; writing it on every embed call raced with
+        // the concurrent-embed overlap this router explicitly allows.
+        // Safety: set_var is unsafe in multithreaded contexts; the swap makes
+        // every later call a no-op, so the write happens at most one time.
+        if let Some(endpoint) = self
+            .hf_endpoint
+            .as_ref()
+            .filter(|_| !HF_ENDPOINT_APPLIED.swap(true, Ordering::SeqCst))
+        {
             unsafe { std::env::set_var("HF_ENDPOINT", endpoint) };
         }
 

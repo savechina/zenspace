@@ -6,8 +6,8 @@
 //! escape sequences, raw mode, bracketed paste, viewport anchoring, and the
 //! alternate-screen full TUI path.
 //!
-//! All tests are `#[ignore]`d — run via `bin/tui-pty-test` (needs a PTY and
-//! the debug binary; skipped automatically in `bin/test-tui` otherwise).
+//! All tests are `#[ignore]`d — run via `bin/test tui pty` (needs a PTY and the debug
+//! binary; skipped automatically in `bin/test tui` otherwise).
 
 #![allow(clippy::print_stdout)]
 

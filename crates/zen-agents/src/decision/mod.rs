@@ -1200,7 +1200,7 @@ pub fn run_minority_sentinel_shadow(paths: &ZenPaths, session_id: &str, quorum: 
 
 /// Map the production intent's provenance onto the ladder rung that produced
 /// it. The Conversation fallback is deterministic Rust, so it counts as L0.
-fn production_rung(source: IntentSource) -> &'static str {
+pub(crate) fn production_rung(source: IntentSource) -> &'static str {
     match source {
         IntentSource::L1 => DecisionRung::L1.as_str(),
         IntentSource::Llm => DecisionRung::L2.as_str(),

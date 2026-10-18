@@ -47,14 +47,17 @@ impl<'a> EmbeddingsRepo<'a> {
     /// the same batch so the reindex change gate cannot skip a file and cannot
     /// claim a vector is fresh: a re-embed interrupted mid-walk would otherwise
     /// leave the unprocessed files with matching hashes and no vector —
-    /// silently absent from semantic search forever. Drop and create also
-    /// share the batch so the tables are never absent across a crash.
+    /// silently absent from semantic search forever. The whole batch runs in
+    /// one explicit transaction so a crash can never leave the vec0 tables
+    /// DROPPED-but-not-recreated (`execute_batch` alone autocommits per
+    /// statement; SQLite DDL is transactional, so BEGIN/COMMIT is sound).
     pub async fn reset_embedding_tables(&self) -> Result<()> {
         self.client
             .writer()
             .call(|conn| {
                 conn.execute_batch(
-                    "DROP TABLE IF EXISTS note_embeddings;
+                    "BEGIN IMMEDIATE;
+                     DROP TABLE IF EXISTS note_embeddings;
                      DROP TABLE IF EXISTS notion_embeddings;
                      CREATE VIRTUAL TABLE IF NOT EXISTS note_embeddings USING vec0(
                          note_id TEXT PRIMARY KEY,
@@ -65,7 +68,8 @@ impl<'a> EmbeddingsRepo<'a> {
                          embedding FLOAT[4096]
                      );
                      UPDATE notes_meta SET content_hash = '';
-                     UPDATE notes_meta SET embedded_hash = '';",
+                     UPDATE notes_meta SET embedded_hash = '';
+                     COMMIT;",
                 )?;
                 Ok(())
             })
@@ -106,8 +110,19 @@ impl<'a> EmbeddingsRepo<'a> {
         .bind(top_k)
         .fetch_all(self.client.pool())
         .await?;
-        for result in &mut results {
-            result.content = crate::notes_repo::read_canonical_snippet(&result.file);
+        // Same blocking-read rationale as NotesRepo::search: canonical file
+        // reads (256KiB cap each) run off the async executor.
+        let paths: Vec<String> = results.iter().map(|r| r.file.clone()).collect();
+        let snippets = tokio::task::spawn_blocking(move || {
+            paths
+                .iter()
+                .map(|p| crate::notes_repo::read_canonical_snippet(p))
+                .collect::<Vec<String>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (result, content) in results.iter_mut().zip(snippets) {
+            result.content = content;
         }
         Ok(results)
     }
@@ -141,7 +156,9 @@ impl<'a> EmbeddingsRepo<'a> {
     /// vec0 does not honor `INSERT OR REPLACE` on an existing `note_id`: the
     /// insert reaches the shadow rowids table and fails with
     /// `UNIQUE constraint failed on note_embeddings primary key`. Replacement
-    /// is therefore delete-then-insert inside one writer call.
+    /// is therefore delete-then-insert inside one writer transaction (mid-walk
+    /// error or kill -9 between the two statements would otherwise delete the
+    /// vector with no insert to replace it).
     pub async fn insert_note_embedding(&self, req: InsertNoteEmbeddingRequest<'_>) -> Result<()> {
         let note_id = req.note_id.to_string();
         let blob: Vec<u8> = req
@@ -153,14 +170,16 @@ impl<'a> EmbeddingsRepo<'a> {
         self.client
             .writer()
             .call(move |conn| {
-                conn.execute(
+                let txn = conn.transaction()?;
+                txn.execute(
                     "DELETE FROM note_embeddings WHERE note_id = ?1",
                     rusqlite::params![note_id],
                 )?;
-                conn.execute(
+                txn.execute(
                     "INSERT INTO note_embeddings (note_id, embedding) VALUES (?1, ?2)",
                     rusqlite::params![note_id, blob],
                 )?;
+                txn.commit()?;
                 Ok(())
             })
             .await
@@ -188,14 +207,16 @@ impl<'a> EmbeddingsRepo<'a> {
         self.client
             .writer()
             .call(move |conn| {
-                conn.execute(
+                let txn = conn.transaction()?;
+                txn.execute(
                     "DELETE FROM notion_embeddings WHERE notion_id = ?1",
                     rusqlite::params![notion_id],
                 )?;
-                conn.execute(
+                txn.execute(
                     "INSERT INTO notion_embeddings (notion_id, embedding) VALUES (?1, ?2)",
                     rusqlite::params![notion_id, blob],
                 )?;
+                txn.commit()?;
                 Ok(())
             })
             .await

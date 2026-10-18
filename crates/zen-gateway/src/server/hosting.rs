@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
-use zen_core::types::{RetrievedNote, SessionContext};
+use zen_core::types::{MessageRole, RetrievedNote, SessionContext};
 
 use crate::protocol::RpcError;
 use crate::server::connection::OutboundFrame;
@@ -723,6 +723,62 @@ pub(crate) fn parse_knowledge(params: &Value) -> Result<Option<Vec<RetrievedNote
     Ok(Some(notes))
 }
 
+/// Bound on prior turns hydrated into a freshly adopted daemon session
+/// (FR-032 "memvid-compacted window"; conservative constant — deliberately
+/// not a config key per T192).
+const HYDRATION_MAX_TURNS: usize = 40;
+
+/// Hydrate a newly adopted session's conversation from the persisted
+/// session jsonl (T226).
+///
+/// Seam: the daemon holds session state in memory only, and implicit
+/// daemons self-exit after 30 idle minutes, so a restarted/idle-exited
+/// daemon would otherwise resume every `session/start` with an empty
+/// history (`AgentRun::with_history` sees nothing). When `session/start`
+/// first adopts a `sessionId` it reads at most [`HYDRATION_MAX_TURNS`]
+/// recent user/assistant turns from the same
+/// `{sessions}/YYYY/MM/DD/<id>.jsonl` the TUI persists each turn to —
+/// reusing `zen-memory`'s public [`ConversationStore`] plumbing, no new
+/// store.
+///
+/// Fail-open: a missing/corrupt file (or unresolvable paths) yields the
+/// empty context of today with one warn; the session is adopted unchanged.
+/// Only invoked on a session-map miss, so in-process state is never
+/// re-hydrated or overwritten (byte-identity for live sessions).
+///
+/// [`ConversationStore`]: zen_memory::conversation::ConversationStore
+fn hydrate_session(session_id: &str) -> SessionContext {
+    let mut ctx = SessionContext::new(session_id.to_string(), String::new());
+    match zen_memory::conversation::ConversationStore::open(session_id)
+        .and_then(|store| store.load_recent(HYDRATION_MAX_TURNS))
+    {
+        Ok(turns) => {
+            for (role, content) in turns {
+                match role.parse::<MessageRole>() {
+                    Ok(MessageRole::User) => ctx.add_turn(MessageRole::User, &content),
+                    Ok(MessageRole::Assistant) => ctx.add_turn(MessageRole::Assistant, &content),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            if !ctx.conversation.is_empty() {
+                tracing::debug!(
+                    session_id = %session_id,
+                    turns = ctx.conversation.len(),
+                    "hydrated session conversation from persisted jsonl"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "session hydration failed; adopting empty conversation"
+            );
+        }
+    }
+    ctx
+}
+
 /// session/start — `{sessionId?, agent?}` → `{sessionId, agent}`.
 /// Mints UUIDv7 ids and registers the hosted [`SessionContext`].
 pub async fn start(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcError> {
@@ -736,7 +792,7 @@ pub async fn start(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcEr
     };
     let session = sessions
         .entry(session_id.clone())
-        .or_insert_with(|| SessionContext::new(session_id.clone(), String::new()));
+        .or_insert_with(|| hydrate_session(&session_id));
     if let Some(agent) = agent {
         session.agent_name = agent.to_string();
     }

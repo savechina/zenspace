@@ -154,6 +154,13 @@ pub struct ZenScheduler {
     /// Timezone cron wall-clock fields are evaluated against (E11).
     /// Utc unless the caller wires `CronConfig::timezone_or_default()`.
     tz: chrono_tz::Tz,
+    /// Cross-worker concurrency cap on the fire path. `Some` gates how many
+    /// workers execute at once; `None` = unlimited. Wired by
+    /// `create_configured_scheduler` from `[cron] max_concurrent_workers`;
+    /// the config-free constructors leave it `None` so their behavior stays
+    /// byte-identical (same precedent as the Utc-on-purpose
+    /// `create_default_scheduler`).
+    limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// `"YYYY-MM"` (UTC) month key the cost cap window is scoped to.
@@ -248,6 +255,7 @@ impl ZenScheduler {
             )))),
             cost_cap_usd: 10.0,
             tz: chrono_tz::UTC,
+            limiter: None,
         }
     }
 
@@ -294,6 +302,15 @@ impl ZenScheduler {
     /// The timezone cron schedules are evaluated in.
     pub fn timezone(&self) -> chrono_tz::Tz {
         self.tz
+    }
+
+    /// Cap how many workers may execute at once on the fire path. Pairs with
+    /// `CronConfig::max_concurrent_workers_or_default()`; unlike `with_timezone`
+    /// there is no "off" value here because the config-free constructors simply
+    /// never call it (leaving the field `None` = unlimited).
+    pub fn with_limiter(mut self, permits: u32) -> Self {
+        self.limiter = Some(Arc::new(tokio::sync::Semaphore::new(permits as usize)));
+        self
     }
 
     /// Set the per-worker monthly LLM cost cap (USD).
@@ -463,7 +480,22 @@ impl ZenScheduler {
             let cost_cap = self.cost_cap_usd;
             let costs = Arc::clone(&self.worker_costs);
             let month = month_key(now);
+            let limiter = self.limiter.clone();
             tokio::spawn(async move {
+                // Acquire a cross-worker permit INSIDE the task, never on the
+                // tick loop: the fire decision and in-flight claim above stay
+                // synchronous, and a worker waiting for a permit keeps its
+                // in-flight flag claimed so its next tick skips instead of
+                // double-firing. The permit drops after execute returns;
+                // InFlightGuard is declared after it and clears on drop, so
+                // clearing is never skipped. Tokio's Semaphore is FIFO-fair,
+                // so waiters stagger in registry order (deterministic) — 3
+                // permits bound an LLM/embedding/db burst while a single long
+                // worker in a 4-way */5 co-fire never starves the rest.
+                let _permit = match limiter.as_deref() {
+                    Some(sem) => sem.acquire().await.ok(),
+                    None => None,
+                };
                 // F5: always clear the in-flight flag, success or failure.
                 let _clear = InFlightGuard(&in_flight);
                 match worker.execute(&ctx).await {
@@ -749,7 +781,9 @@ pub fn create_configured_scheduler_with(
     config: &CronConfig,
     profile: SchedulerProfile,
 ) -> ZenScheduler {
-    let mut scheduler = ZenScheduler::new().with_timezone(config.timezone_or_default());
+    let mut scheduler = ZenScheduler::new()
+        .with_timezone(config.timezone_or_default())
+        .with_limiter(config.max_concurrent_workers_or_default());
 
     // The monthly cost cap only means something across restarts: persist the
     // per-worker totals beside the other loop sidecars. Fail-open — an
@@ -856,15 +890,25 @@ pub fn create_configured_scheduler_with(
 
     // Knowledge-processing loop: interval + enabled come from
     // [agentic.loop]; disabled → manual-only (`zen wiki loop run`).
-    if let Ok(config) = zen_core::config::load_config() {
-        let loop_cfg = &config.agentic.loop_cfg;
-        let mut loop_worker = ZenLoopWorker::new().with_schedule(loop_cfg.interval_or_default());
-        if !loop_cfg.enabled_or_default() {
-            loop_worker = loop_worker.disabled();
+    match zen_core::config::load_config() {
+        Ok(config) => {
+            let loop_cfg = &config.agentic.loop_cfg;
+            let mut loop_worker =
+                ZenLoopWorker::new().with_schedule(loop_cfg.interval_or_default());
+            if !loop_cfg.enabled_or_default() {
+                loop_worker = loop_worker.disabled();
+            }
+            if let Err(e) = scheduler.register(loop_worker) {
+                warn!("scheduler: failed to register zen-loop worker (non-critical): {e}");
+            }
         }
-        if let Err(e) = scheduler.register(loop_worker) {
-            warn!("scheduler: failed to register zen-loop worker (non-critical): {e}");
-        }
+        // Fail-open: a config load failure must not abort scheduler
+        // construction, but the drop must be LOUD — unlike the sibling
+        // registrations above/below, a silent skip would leave background
+        // knowledge processing off with no trace (Phase 33 T232).
+        Err(e) => warn!(
+            "scheduler: zen-loop not registered: config load failed — background processing disabled for this session: {e}"
+        ),
     }
 
     scheduler
@@ -1020,6 +1064,113 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "in-window tick (08:59:50, 10s to cron) must fire after an out-of-window tick"
+        );
+    }
+
+    /// Worker that records live concurrency and blocks on a shared release
+    /// watch until the test flips it — observes the limiter without sleeps.
+    struct ConcurrencyWorker {
+        id: &'static str,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ZenWorker for ConcurrencyWorker {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn description(&self) -> &'static str {
+            "observes cross-worker concurrency"
+        }
+        fn schedule(&self) -> &'static str {
+            "0 */5 * * * *"
+        }
+        async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
+            use std::sync::atomic::Ordering;
+            let running = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.peak.fetch_max(running, Ordering::AcqRel);
+            self.started.fetch_add(1, Ordering::AcqRel);
+            let mut release = self.release.clone();
+            let _ = release.wait_for(|v| *v).await;
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            Ok(WorkerReport {
+                worker_id: self.id.to_string(),
+                success: true,
+                fact_count: 0,
+                duration_ms: 0,
+                llm_cost_usd: 0.0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn limiter_caps_cross_worker_concurrency() {
+        use chrono::TimeZone;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let mut sched = ZenScheduler::new().with_limiter(2);
+        for id in ["w1", "w2", "w3", "w4"] {
+            sched
+                .register(ConcurrencyWorker {
+                    id,
+                    active: Arc::clone(&active),
+                    peak: Arc::clone(&peak),
+                    started: Arc::clone(&started),
+                    release: release_rx.clone(),
+                })
+                .unwrap();
+        }
+
+        // 00:04:50 → every `0 */5` worker is due within the 30s tick window.
+        sched
+            .tick(Utc.with_ymd_and_hms(2026, 1, 1, 0, 4, 50).unwrap())
+            .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while started.load(Ordering::Acquire) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Give any excess admission a chance to (wrongly) slip through.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            2,
+            "only the cap (2) may run at once; the other two must be queued"
+        );
+        assert_eq!(
+            peak.load(Ordering::Acquire),
+            2,
+            "observed peak concurrency must never exceed the cap"
+        );
+
+        // Release: the queued two are admitted FIFO in registry order.
+        release_tx.send_replace(true);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while started.load(Ordering::Acquire) < 4 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::Acquire),
+            4,
+            "queued workers must eventually run once permits free"
+        );
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            0,
+            "every worker must release"
+        );
+        assert!(
+            peak.load(Ordering::Acquire) <= 2,
+            "concurrency never exceeded the cap across the whole run"
         );
     }
 

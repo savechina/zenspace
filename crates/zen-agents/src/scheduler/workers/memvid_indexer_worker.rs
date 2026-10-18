@@ -14,7 +14,7 @@ use zen_core::paths::ZenPaths;
 use zen_memory::memvid_index::extract_anchor_date;
 use zen_memory::strength::retention_strength;
 use zen_memory::{MemvidIndexer, ZenMemvidStore};
-use zen_vault::distill::{card_id_from_path, read_reward};
+use zen_vault::distill::{MemoryReward, card_id_from_path, read_reward};
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
@@ -47,6 +47,23 @@ pub struct MemoryStrengthItem {
     pub last_event: Option<String>,
 }
 
+/// FR-034 reward-coverage block (Phase 34 T241): share of scored cards whose
+/// sidecar carries real reward activity — the "≥80% carry reward data after
+/// 30 days" success metric, measured file-based off the same nightly walk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewardCoverage {
+    /// Cards whose sidecar recorded real activity (presence alone is not
+    /// carrying data — a zeroed sidecar would otherwise inflate coverage).
+    pub with_reward: usize,
+    /// Distinct cards the walk scored (denominator; truncation never shrinks
+    /// it — the report's bottom-N slice is a separate view).
+    pub scored_cards: usize,
+    /// `with_reward / scored_cards` as a percentage, one decimal.
+    pub pct: f64,
+    /// Measure timestamp (RFC3339).
+    pub recorded_at: String,
+}
+
 /// The nightly lowest-strength report (bottom-N by R, ascending).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryStrengthReport {
@@ -54,6 +71,10 @@ pub struct MemoryStrengthReport {
     pub half_life_days: f64,
     pub count: usize,
     pub items: Vec<MemoryStrengthItem>,
+    /// T241 additive coverage block. `None` only when decoding a pre-T241
+    /// report (merge-safe: the writer always populates it).
+    #[serde(default)]
+    pub reward_coverage: Option<RewardCoverage>,
 }
 
 /// Fail-open reader for `zen discover report` (T210): missing ⇒ `None`
@@ -108,7 +129,31 @@ pub fn build_strength_items(
     half_life_days: f64,
     now: DateTime<Utc>,
 ) -> Vec<MemoryStrengthItem> {
+    scan_strength_items(memory_root, reward_dir, half_life_days, now).items
+}
+
+/// FR-034 "carrying data" predicate (T241): a sidecar carries reward data only
+/// when a real event landed — presence alone is not carrying data, so a zeroed
+/// sidecar must not inflate coverage; a missing `last_reward_at` means zero.
+fn carries_reward(reward: &MemoryReward) -> bool {
+    reward.access_count > 0 || reward.downstream_citations > 0 || reward.correction_count > 0
+}
+
+/// The file-based walk plus its coverage tally (T241). Split from the public
+/// wrapper so the pre-T241 `build_strength_items` signature stays byte-identical.
+struct StrengthScan {
+    items: Vec<MemoryStrengthItem>,
+    with_reward: usize,
+}
+
+fn scan_strength_items(
+    memory_root: &Path,
+    reward_dir: &Path,
+    half_life_days: f64,
+    now: DateTime<Utc>,
+) -> StrengthScan {
     let mut items = Vec::new();
+    let mut with_reward = 0usize;
     let mut consumed_sidecars = std::collections::HashSet::new();
 
     let journal_dir = memory_root.join("journal");
@@ -132,6 +177,9 @@ pub fn build_strength_items(
             let card_id = card_id_from_path(&rel);
             consumed_sidecars.insert(card_id.clone());
             let reward = read_reward(reward_dir, &card_id);
+            if carries_reward(&reward) {
+                with_reward += 1;
+            }
             items.push(MemoryStrengthItem {
                 key: rel,
                 tier: Some("m2".to_string()),
@@ -163,6 +211,9 @@ pub fn build_strength_items(
             }
             // read_reward is fail-open on corrupt files (warn + defaults).
             let reward = read_reward(reward_dir, card_id);
+            if carries_reward(&reward) {
+                with_reward += 1;
+            }
             let anchor = reward.last_reward_at.or_else(|| file_mtime_utc(&path));
             let Some(anchor) = anchor else { continue };
             items.push(MemoryStrengthItem {
@@ -182,7 +233,7 @@ pub fn build_strength_items(
         }
     }
 
-    items
+    StrengthScan { items, with_reward }
 }
 
 /// Compute, sort (ascending R, ties by key), truncate to
@@ -198,7 +249,12 @@ pub fn write_strength_report(
     let memory_root = paths.memory();
     let reward_dir = memory_root.join(".reward");
 
-    let mut items = build_strength_items(&memory_root, &reward_dir, half_life_days, now);
+    let scan = scan_strength_items(&memory_root, &reward_dir, half_life_days, now);
+    // T241: coverage is measured over the FULL walk, before truncation, so a
+    // small eviction_report_size never shrinks the denominator.
+    let scored_cards = scan.items.len();
+    let with_reward = scan.with_reward;
+    let mut items = scan.items;
     items.sort_by(|a, b| {
         a.strength
             .total_cmp(&b.strength)
@@ -206,11 +262,26 @@ pub fn write_strength_report(
     });
     items.truncate(cfg.eviction_report_size_or_default());
 
+    // An empty store is honest 0.0% coverage (of nothing), not "insufficient":
+    // FR-034's metric stays recorded and comparable across quiet nights.
+    let pct = if scored_cards == 0 {
+        0.0
+    } else {
+        ((with_reward as f64 / scored_cards as f64) * 1000.0).round() / 10.0
+    };
+    let reward_coverage = RewardCoverage {
+        with_reward,
+        scored_cards,
+        pct,
+        recorded_at: now.to_rfc3339(),
+    };
+
     let report = MemoryStrengthReport {
         generated_at: now.to_rfc3339(),
         half_life_days,
         count: items.len(),
         items,
+        reward_coverage: Some(reward_coverage),
     };
 
     let logs = paths.logs();
@@ -220,12 +291,16 @@ pub fn write_strength_report(
         .context("write memory-strength report")?;
 
     if report.count > 0 {
+        let coverage = report.reward_coverage.as_ref();
         let audit = serde_json::json!({
             "kind": "loop.memory.strength",
             "ts": now.to_rfc3339(),
             "count": report.count,
             "lowest": report.items[0].strength,
             "half_life_days": report.half_life_days,
+            "with_reward": coverage.map(|c| c.with_reward),
+            "scored_cards": coverage.map(|c| c.scored_cards),
+            "pct": coverage.map(|c| c.pct),
         });
         let audit_path = logs.join("audit.jsonl");
         if let Err(e) = append_jsonl_line(&audit_path, &audit) {
@@ -541,6 +616,114 @@ mod tests {
         fs::create_dir_all(&logs).unwrap();
         fs::write(memory_strength_report_path(&logs), "{ broken").unwrap();
         assert!(read_memory_strength_report(&logs).is_none());
+    }
+
+    #[test]
+    fn reward_coverage_counts_only_activity_carrying_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let journal = paths.memory().join("journal");
+        let reward_dir = paths.memory().join(".reward");
+        fs::create_dir_all(&journal).unwrap();
+        fs::create_dir_all(&reward_dir).unwrap();
+        fs::write(journal.join("2020-01-01.md"), "# a\n").unwrap();
+        fs::write(journal.join("2020-01-02.md"), "# b\n").unwrap();
+        fs::write(journal.join("2020-01-03.md"), "# c\n").unwrap();
+        zen_vault::distill::write_reward(
+            &reward_dir,
+            &card_id_from_path("journal/2020-01-01.md"),
+            &reward(3, 0, None),
+        )
+        .unwrap();
+        // Present-but-zeroed sidecar: exists, carries NO reward data.
+        zen_vault::distill::write_reward(
+            &reward_dir,
+            &card_id_from_path("journal/2020-01-02.md"),
+            &reward(0, 0, None),
+        )
+        .unwrap();
+        // journal/2020-01-03.md has no sidecar; the standalone card cites twice.
+        zen_vault::distill::write_reward(
+            &reward_dir,
+            "vault_wiki_ref",
+            &reward(0, 2, Some(Utc::now())),
+        )
+        .unwrap();
+
+        let cfg = MemoryStrengthConfig {
+            enabled: Some(true),
+            ..MemoryStrengthConfig::default()
+        };
+        let report = write_strength_report(&paths, &cfg, Utc::now()).unwrap();
+        let coverage = report.reward_coverage.expect("coverage recorded");
+        assert_eq!(coverage.scored_cards, 4, "3 journal + 1 standalone scored");
+        assert_eq!(coverage.with_reward, 2, "only activity-carrying sidecars");
+        assert_eq!(coverage.pct, 50.0);
+
+        let audit = fs::read_to_string(paths.logs().join("audit.jsonl")).unwrap();
+        assert!(audit.contains("\"with_reward\":2"));
+        assert!(audit.contains("\"scored_cards\":4"));
+        assert!(audit.contains("\"pct\":50.0"));
+    }
+
+    #[test]
+    fn corrupt_reward_sidecar_excluded_from_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let reward_dir = paths.memory().join(".reward");
+        fs::create_dir_all(&reward_dir).unwrap();
+        fs::write(reward_dir.join("broken.json"), "{ not json").unwrap();
+        zen_vault::distill::write_reward(&reward_dir, "good_card", &reward(1, 0, None)).unwrap();
+
+        let cfg = MemoryStrengthConfig {
+            enabled: Some(true),
+            ..MemoryStrengthConfig::default()
+        };
+        let report = write_strength_report(&paths, &cfg, Utc::now()).unwrap();
+        let coverage = report.reward_coverage.unwrap();
+        assert_eq!(
+            coverage.scored_cards, 2,
+            "corrupt sidecar still scored (fail-open)"
+        );
+        assert_eq!(
+            coverage.with_reward, 1,
+            "corrupt sidecar defaults carry no activity"
+        );
+    }
+
+    #[test]
+    fn empty_walk_records_honest_zero_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let cfg = MemoryStrengthConfig {
+            enabled: Some(true),
+            ..MemoryStrengthConfig::default()
+        };
+        let report = write_strength_report(&paths, &cfg, Utc::now()).unwrap();
+        let coverage = report
+            .reward_coverage
+            .expect("coverage still recorded on an empty walk");
+        assert_eq!(coverage.scored_cards, 0);
+        assert_eq!(coverage.with_reward, 0);
+        assert_eq!(coverage.pct, 0.0);
+        assert!(!coverage.recorded_at.is_empty());
+        assert!(
+            !paths.logs().join("audit.jsonl").exists(),
+            "empty walk must not emit the audit line (flood discipline)"
+        );
+    }
+
+    #[test]
+    fn pre_t241_report_decodes_without_coverage_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path();
+        fs::write(
+            memory_strength_report_path(logs),
+            r#"{"generated_at":"2026-01-01T00:00:00Z","half_life_days":30.0,"count":0,"items":[]}"#,
+        )
+        .unwrap();
+        let report = read_memory_strength_report(logs).expect("old report still decodes");
+        assert!(report.reward_coverage.is_none());
     }
 
     fn now_minus_days(days: i64) -> DateTime<Utc> {

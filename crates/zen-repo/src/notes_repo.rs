@@ -75,8 +75,19 @@ impl<'a> NotesRepo<'a> {
         .bind(limit)
         .fetch_all(self.client.pool())
         .await?;
-        for result in &mut results {
-            result.snippet = read_canonical_snippet(&result.path);
+        // File reads are blocking std::fs (capped at 256KiB each) — take them
+        // off the async executor so a burst of hits cannot stall runtime workers.
+        let paths: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+        let snippets = tokio::task::spawn_blocking(move || {
+            paths
+                .iter()
+                .map(|p| read_canonical_snippet(p))
+                .collect::<Vec<String>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (result, snippet) in results.iter_mut().zip(snippets) {
+            result.snippet = snippet;
         }
         Ok(results)
     }

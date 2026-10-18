@@ -49,6 +49,7 @@ brew install savechina/tap/zenspace   # or: cargo install zen (needs bubblewrap 
 zen                                   # first run — opens the TUI, initializes ~/.zen
 zen doctor                            # 10 health probes
 zen wiki list                         # see the wiki that built itself
+zen serve start                       # background learning loop (wiki distill, memory, whitewatchers run here — recommended for daily use)
 ```
 
 [Full Quick Start Guide →](https://savechina.github.io/zenspace/quickstart.html)

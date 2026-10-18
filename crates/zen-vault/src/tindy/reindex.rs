@@ -295,10 +295,19 @@ impl Reindexer {
         }
 
         // Collect all .md files (recursive), pruning derived-artifact dirs.
+        // Walk errors go to the report: an unreadable subtree would otherwise
+        // silently vanish from FTS + vec0 (neither scanned nor counted).
         let md_files: Vec<_> = WalkDir::new(knowledge_dir)
             .into_iter()
             .filter_entry(|e| !is_excluded_entry(e, knowledge_dir))
-            .filter_map(|e| e.ok())
+            .filter_map(|e| match e {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    warn!("Reindex walk error: {}", err);
+                    report.errors.push(format!("walk: {}", err));
+                    None
+                }
+            })
             .filter(|e| e.file_type().is_file())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .map(|e| e.into_path())
@@ -535,7 +544,10 @@ impl Reindexer {
     /// reads as dirty and a later run with a working provider re-embeds it.
     /// Only a non-degraded (semantic) vector calls
     /// [`mark_embedded`](NotesRepo::mark_embedded); an insert or mark failure
-    /// likewise leaves `embedded_hash` dirty.
+    /// likewise leaves `embedded_hash` dirty. An all-zero vector (empty /
+    /// whitespace-only body) is neither inserted nor marked: it would pollute
+    /// KNN with a meaningless zero-norm row while reading as a healthy fresh
+    /// semantic vector.
     async fn store_embedding(
         &self,
         client: &SqliteClient,
@@ -545,8 +557,17 @@ impl Reindexer {
         checksum: &str,
         report: &mut ReindexReport,
     ) -> bool {
-        match compute_embeddings_for_text_tagged(body_content) {
-            Ok((embedding, degraded)) if !embedding.is_empty() => {
+        let content_owned = body_content.to_string();
+        // Provider embedding is sync and can hang; a reindex must not park the
+        // async worker driving it, so compute on a blocking thread.
+        let computed =
+            tokio::task::spawn_blocking(move || compute_embeddings_for_text_tagged(&content_owned))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("embedding task join failed: {e}")));
+        match computed {
+            Ok((embedding, degraded))
+                if !embedding.is_empty() && embedding.iter().any(|v| *v != 0.0) =>
+            {
                 match Tier3Search
                     .insert_embedding(client, note_id, &embedding)
                     .await

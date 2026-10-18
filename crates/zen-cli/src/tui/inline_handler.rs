@@ -118,6 +118,18 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
 
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // T228: Ctrl+C while a turn is streaming cancels the in-flight
+            // response (same cancel RPC path as Esc) instead of discarding it
+            // into a quit. A second consecutive Ctrl+C while still streaming
+            // quits. While idle, Ctrl+C keeps its long-standing quit
+            // semantics (never broken).
+            if app.is_streaming {
+                if app.cancel_requested {
+                    return InlineKeyAction::Quit;
+                }
+                app.cancel_requested = true;
+                return InlineKeyAction::CancelTurn;
+            }
             return InlineKeyAction::Quit;
         }
         (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
@@ -312,13 +324,30 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
             });
             return InlineKeyAction::Continue;
         }
-        // Enter completes the selected command into the composer WITHOUT
-        // submitting (fullscreen parity — handler.rs Enter arm). Executing
-        // immediately on a token-only buffer fired commands the user only
-        // meant to complete before typing arguments.
+        // Enter-with-popup contract (reconciles e2e e4/e10/e11/e14/e15/e18
+        // with the complete-not-submit rule): the user typed the FULL selected
+        // command (popup is only previewing it) OR explicitly arrow-navigated
+        // to a choice (`choice_locked`) → execute. Partial token ("/exi")
+        // still completes without submitting — the user may be about to type
+        // arguments.
         if app.slash_state.visible
             && let Some(cmd) = app.slash_state.selected_command(&app.slash_registry)
         {
+            let exact_match = text.trim() == format!("/{cmd}");
+            if exact_match || app.slash_state.choice_locked {
+                if !exact_match {
+                    // Arrow-locked execution targets the SELECTED command —
+                    // rewrite the raw token ("/") into it before submitting
+                    // (e15: "/" + Down + Enter must run /exit, not send "/").
+                    let full = format!("/{cmd}");
+                    app.input.select_all();
+                    app.input.cut();
+                    app.input.insert_str(&full);
+                    app.clear_paste_pills();
+                }
+                app.slash_state.dismiss();
+                return InlineKeyAction::Submit;
+            }
             let text = format!("/{} ", cmd);
             app.input.select_all();
             app.input.cut();
@@ -476,6 +505,39 @@ mod tests {
         assert!(
             !app.slash_state.visible,
             "completion must dismiss the popup"
+        );
+    }
+
+    /// Enter on a fully-typed command submits DIRECTLY (e2e e4/e18): the
+    /// popup is previewing what the user already finished typing, so the
+    /// complete-then-retype-Enter loop would be a regression.
+    #[test]
+    fn slash_popup_enter_exact_command_submits() {
+        let mut app = test_app();
+        for c in "/help".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.slash_state.visible);
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+    }
+
+    /// Arrow-navigated selection executes on Enter (e2e e15 contract): the
+    /// explicit choice inverts complete→execute even though the buffer ("/")
+    /// does not equal the selected command.
+    #[test]
+    fn slash_popup_enter_arrow_selected_command_submits() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(app.slash_state.visible);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.slash_state.choice_locked, "explicit move must lock");
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Submit);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "/exit",
+            "locked execution must rewrite the raw token into the selected command"
         );
     }
 
@@ -724,6 +786,41 @@ mod tests {
         app.is_streaming = true;
         let action = press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(action, InlineKeyAction::CancelTurn);
+    }
+
+    // === T228: Ctrl+C cancel-while-streaming ===
+
+    #[test]
+    fn t228_ctrl_c_streaming_first_press_cancels_and_keeps_buffer() {
+        let mut app = test_app();
+        app.is_streaming = true;
+        app.input.insert_str("draft text");
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, InlineKeyAction::CancelTurn);
+        assert!(app.cancel_requested);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "draft text",
+            "cancel must never silently lose the input buffer"
+        );
+    }
+
+    #[test]
+    fn t228_ctrl_c_streaming_second_press_quits() {
+        let mut app = test_app();
+        app.is_streaming = true;
+        let first = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(first, InlineKeyAction::CancelTurn);
+        let second = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(second, InlineKeyAction::Quit);
+    }
+
+    #[test]
+    fn t228_ctrl_c_idle_still_quits() {
+        let mut app = test_app();
+        app.is_streaming = false;
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, InlineKeyAction::Quit);
     }
 
     #[test]

@@ -13,8 +13,7 @@
 //! startup rather than processing. The normalised per-note ratio is the honest
 //! analogue available at this scale and still catches gross regressions.
 //!
-//! Ignored by default — it is a load test, not a unit gate. Run it with
-//! `bin/load-harness`, or
+//! Ignored by default — it is a load test, not a unit gate. Run it with:
 //! `cargo test -p zen --test load_harness -- --ignored --nocapture`.
 
 mod common;
@@ -120,7 +119,7 @@ fn metric(report: &Value, key: &str) -> usize {
 }
 
 #[test]
-#[ignore = "load harness: run explicitly via bin/load-harness"]
+#[ignore = "load harness: run explicitly with --ignored (see module docs)"]
 fn sc004_batch_of_100_notes_is_processed_without_degradation_or_loss() {
     let test = ZenTest::new();
     let init = test.zen(&["workspace", "init"]);

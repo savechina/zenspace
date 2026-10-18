@@ -103,6 +103,21 @@ pub enum LabelCommands {
     },
 }
 
+/// FR-034 reward-coverage section (T241) for `zen discover report`. Reads the
+/// same `logs/memory-strength-report.json` as the memory_strength section and
+/// mirrors its renderer exactly: a missing report, a pre-T241 report without
+/// the block, or a corrupt file all render `{"recorded": false}` — advisory,
+/// never an error (the replay-section fail-open precedent).
+fn render_reward_coverage(logs_dir: &std::path::Path) -> Result<serde_json::Value, ZenError> {
+    zen_agents::scheduler::read_memory_strength_report(logs_dir)
+        .and_then(|report| report.reward_coverage)
+        .map(|coverage| {
+            serde_json::to_value(&coverage).map_err(|e| ZenError::Message(e.to_string()))
+        })
+        .transpose()
+        .map(|coverage| coverage.unwrap_or_else(|| serde_json::json!({ "recorded": false })))
+}
+
 pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
     let map_err = |e: anyhow::Error| ZenError::Message(e.to_string());
@@ -308,6 +323,9 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 })
                 .transpose()?
                 .unwrap_or_else(|| serde_json::json!({ "recorded": false }));
+            // Phase 34 T241: additive FR-034 reward-coverage section read from
+            // the same report file — same fail-open shape as memory_strength.
+            let reward_coverage = render_reward_coverage(&paths.logs())?;
             let success_criteria = serde_json::json!({
                 "first_attempt_success": serde_json::to_value(&first_attempt_success)
                     .map_err(|e| ZenError::Message(e.to_string()))?,
@@ -325,6 +343,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     "vendor_eval": vendor_eval,
                     "skill_eval": skill_eval,
                     "memory_strength": memory_strength,
+                    "reward_coverage": reward_coverage,
                 }))
                 .map_err(|e| ZenError::Message(e.to_string()))?
             );
@@ -432,4 +451,41 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reward_coverage_section_missing_report_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = render_reward_coverage(dir.path()).unwrap();
+        assert_eq!(section, json!({ "recorded": false }));
+    }
+
+    #[test]
+    fn reward_coverage_section_corrupt_report_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("memory-strength-report.json"), "{ broken").unwrap();
+        let section = render_reward_coverage(dir.path()).unwrap();
+        assert_eq!(section, json!({ "recorded": false }));
+    }
+
+    #[test]
+    fn reward_coverage_section_renders_recorded_block() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("memory-strength-report.json"),
+            r#"{"generated_at":"2026-01-01T00:00:00Z","half_life_days":30.0,"count":0,"items":[],
+                "reward_coverage":{"with_reward":2,"scored_cards":4,"pct":50.0,"recorded_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let section = render_reward_coverage(dir.path()).unwrap();
+        assert_eq!(section["with_reward"], json!(2));
+        assert_eq!(section["scored_cards"], json!(4));
+        assert_eq!(section["pct"], json!(50.0));
+        assert_eq!(section["recorded"], serde_json::Value::Null);
+    }
 }

@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rig_core::message::ToolCall as NativeToolCall;
 use tracing::{info, instrument, warn};
 
@@ -176,22 +176,27 @@ impl AgentExecutor {
             budget_limit: None,
         };
 
-        let provider = self
+        let provider = match self
             .router
             .route_with_preferences(&requirements, &context.preferences)
-            .or_else(|e| {
-                info!("Preference routing failed: {e}, falling back");
-                self.router.route(&requirements)
-            })
-            .unwrap_or_else(|e| {
-                warn!("All routing failed: {e}, using mock fallback");
-                Provider::Mock
-            });
+        {
+            Ok(provider) => provider,
+            Err(primary_err) => match self.router.route(&requirements) {
+                Ok(provider) => {
+                    info!("Preference routing failed: {primary_err}, falling back");
+                    provider
+                }
+                Err(fallback_err) => {
+                    return Err(anyhow::anyhow!(
+                        "no provider resolved for {agent_name}: primary={primary_err}, fallback={fallback_err}"
+                    ));
+                }
+            },
+        };
 
         // Build prompt with agent identity (SOUL.md/MEMORY.md/AGENTS.md)
         let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
-        let (response, tokens, used_mock_fallback) =
-            self.execute_with_retry(&provider, &prompt, &agent_name)?;
+        let (response, tokens) = self.execute_with_retry(&provider, &prompt, &agent_name)?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let cost = tokens as f64 * 0.002 / 1000.0; // ~$0.002/1K tokens estimate
@@ -202,11 +207,7 @@ impl AgentExecutor {
             metadata: ExecutionMetadata {
                 tokens_used: tokens,
                 cost_estimate: (cost * 1000.0).round() / 1000.0,
-                model_used: if used_mock_fallback {
-                    format!("mock (fallback for {})", provider)
-                } else {
-                    provider.to_string()
-                },
+                model_used: provider.to_string(),
                 duration_ms,
                 sensitivity,
                 quality_notes: None,
@@ -342,7 +343,7 @@ impl AgentExecutor {
         provider: &Provider,
         prompt: &str,
         agent_name: &str,
-    ) -> Result<(String, u32, bool)> {
+    ) -> Result<(String, u32)> {
         let mut last_error = None;
 
         for attempt in 0..=self.retry_policy.max_retries {
@@ -354,8 +355,9 @@ impl AgentExecutor {
                     agent = agent_name,
                     "Retrying agent execution"
                 );
-                // Sync by design: execute/execute_round and router.call are
-                // blocking, so this thread is already off the async runtime.
+                // Blocking by contract: async callers reach this only via
+                // run_blocking_llm (block_in_place marks this thread blocking);
+                // sync callers run it directly.
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
 
@@ -365,7 +367,7 @@ impl AgentExecutor {
                     if attempt > 0 {
                         info!(attempt, agent = agent_name, "Retry succeeded");
                     }
-                    return Ok((response, estimated_tokens, false));
+                    return Ok((response, estimated_tokens));
                 }
                 Err(e) => {
                     let category = ErrorCategory::from_error_message(&e.to_string());
@@ -392,20 +394,10 @@ impl AgentExecutor {
             }
         }
 
-        warn!(
-            agent = agent_name,
-            retries = self.retry_policy.max_retries,
-            "All retries exhausted, falling back to mock"
-        );
-
-        let response = self.router.call(Provider::Mock, prompt).with_context(|| {
-            format!(
-                "Mock fallback also failed after {} retries. Last error: {:?}",
-                self.retry_policy.max_retries, last_error
-            )
-        })?;
-        let estimated_tokens = (prompt.len() + response.len()) as u32 / 4;
-        Ok((response, estimated_tokens, true))
+        Err(anyhow::anyhow!(
+            "no provider call succeeded for {agent_name} after {} retries: {last_error:?}",
+            self.retry_policy.max_retries
+        ))
     }
 
     /// Execute a single agent request with streaming.
@@ -459,20 +451,27 @@ impl AgentExecutor {
             budget_limit: None,
         };
 
-        let provider = self
+        let provider = match self
             .router
             .route_with_preferences(&requirements, &context.preferences)
-            .or_else(|e| {
-                info!("Preference routing failed: {e}, falling back");
-                self.router.route(&requirements)
-            })
-            .unwrap_or_else(|e| {
-                warn!("All routing failed: {e}, using mock fallback");
-                Provider::Mock
-            });
+        {
+            Ok(provider) => provider,
+            Err(primary_err) => match self.router.route(&requirements) {
+                Ok(provider) => {
+                    info!("Preference routing failed: {primary_err}, falling back");
+                    provider
+                }
+                Err(fallback_err) => {
+                    return Err(anyhow::anyhow!(
+                        "no provider resolved for {}: primary={primary_err}, fallback={fallback_err}",
+                        context.agent_profile.name
+                    ));
+                }
+            },
+        };
 
         let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
-        let (response, _tokens, _used_mock) =
+        let (response, _tokens) =
             self.execute_with_retry(&provider, &prompt, &context.agent_profile.name)?;
 
         let native_calls: Vec<NativeToolCall> = Vec::new();
@@ -498,28 +497,84 @@ mod tests {
     }
 
     #[test]
-    fn retry_exhaustion_flags_mock_fallback() {
+    fn retry_exhaustion_errors_instead_of_mock_fallback() {
         // Unknown provider: route-independent deterministic failure (no
-        // instance exists), offline-safe. Single attempt then mock fallback.
+        // instance exists), offline-safe. A single attempt must error.
         let executor = test_executor_no_retries();
-        let (response, _, used_mock) = executor
+        let err = executor
             .execute_with_retry(
                 &Provider::Unknown("definitely-not-a-provider".to_string()),
                 "hi",
                 "test",
             )
-            .expect("mock fallback succeeds");
-        assert!(used_mock, "fallback provenance must be flagged");
+            .expect_err("retry exhaustion must not silently fall back to mock");
+        let text = format!("{err:#}");
+        assert!(text.contains("test"), "error must name the agent: {text}");
+    }
+
+    #[test]
+    fn mock_provider_direct_succeeds() {
+        let executor = test_executor_no_retries();
+        let (response, _) = executor
+            .execute_with_retry(&Provider::Mock, "hi", "test")
+            .expect("mock direct succeeds");
         assert!(!response.is_empty());
     }
 
     #[test]
-    fn mock_provider_direct_has_no_fallback_flag() {
-        let executor = test_executor_no_retries();
-        let (_, _, used_mock) = executor
-            .execute_with_retry(&Provider::Mock, "hi", "test")
-            .expect("mock direct succeeds");
-        assert!(!used_mock, "direct mock is not a fallback");
+    fn routing_failure_errors_instead_of_mock_for_both_execution_paths() {
+        use crate::context::AgentContext;
+        use crate::registry::{AgentRegistry, DefaultAgentRegistry};
+        use crate::wiring::ZenWiring;
+        use crate::zen_agent::ZenAgent;
+        use zen_core::types::SessionContext;
+
+        let router = DefaultRouter::new(LlmConfig {
+            default_provider: None,
+            ..Default::default()
+        });
+        let wiring = ZenWiring::new();
+        let agent = ZenAgent::builder("Sisyphus")
+            .build(&wiring, &router)
+            .expect("agent builds");
+        let profile = DefaultAgentRegistry::new()
+            .find_by_name("Sisyphus")
+            .expect("profile")
+            .clone();
+        let context = AgentContext::new(
+            profile,
+            "read a file".to_string(),
+            SessionContext::new("Sisyphus".to_string(), String::new()),
+        );
+
+        let executor = AgentExecutor::new(router).with_retry_policy(RetryPolicy {
+            max_retries: 0,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter: false,
+        });
+
+        let round_err = executor
+            .execute_round(&context, &agent, "", "")
+            .expect_err("routing failure must not fall back to mock");
+        let round_text = format!("{round_err:#}");
+        assert!(
+            round_text.contains("Sisyphus")
+                && round_text.contains("primary=")
+                && round_text.contains("fallback="),
+            "execute_round must name the agent and both routes: {round_text}"
+        );
+
+        let call_err = executor
+            .execute_model_call(&context, &agent, "", "")
+            .expect_err("routing failure must not fall back to mock");
+        let call_text = format!("{call_err:#}");
+        assert!(
+            call_text.contains("Sisyphus")
+                && call_text.contains("primary=")
+                && call_text.contains("fallback="),
+            "execute_model_call must name the agent and both routes: {call_text}"
+        );
     }
 
     #[test]

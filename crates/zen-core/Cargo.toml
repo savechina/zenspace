@@ -25,6 +25,7 @@ notify-rust = { workspace = true }
 libc = { workspace = true }
 url = { workspace = true }
 rusqlite = { workspace = true }
+fs2 = { workspace = true }
 
 [features]
 # Test-only (T111/T118): makes `user_root()` read ZEN_HOME fresh on every

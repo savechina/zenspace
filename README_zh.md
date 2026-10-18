@@ -47,8 +47,9 @@
 ```bash
 brew install savechina/tap/zenspace   # Linux 亦可用 cargo install zen（需 bubblewrap）
 zen                                   # 首次运行 — 打开 TUI 并初始化 ~/.zen
-zen doctor                            # 系统健康检查（8 项探针）
+zen doctor                            # 系统健康检查（10 项探针）
 zen wiki list                         # 看看自动构建的 wiki
+zen serve start                       # 启动后台学习循环（wiki 蒸馏 / 记忆归档等在此运行 — 日常使用推荐）
 ```
 
 [完整指南 →](https://savechina.github.io/zenspace/quickstart.html)

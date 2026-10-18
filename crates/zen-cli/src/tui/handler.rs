@@ -9,6 +9,10 @@ use super::selection::{Selection, TextPosition};
 pub enum KeyAction {
     Submit,
     Quit,
+    /// T228 parity with inline: Ctrl+C while streaming requests an in-flight
+    /// turn cancel via the `session/cancel` RPC; the consumer in app.rs owns
+    /// the RPC + toast side effects (handler must stay surface-agnostic).
+    CancelTurn,
     Continue,
 }
 
@@ -207,6 +211,16 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.enter_selection();
                 app.yank_selected_cell();
                 return KeyAction::Continue;
+            }
+            // T228 parity with inline_handler: while streaming, first Ctrl+C
+            // cancels the in-flight turn (CancelTurn), a second consecutive
+            // press quits. Idle Ctrl+C keeps quit semantics.
+            if app.is_streaming {
+                if app.cancel_requested {
+                    return KeyAction::Quit;
+                }
+                app.cancel_requested = true;
+                return KeyAction::CancelTurn;
             }
             return KeyAction::Quit;
         }
@@ -760,6 +774,30 @@ mod tests {
         app.input.insert_str("hello");
         let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(action, KeyAction::Submit);
+    }
+
+    /// T228 parity: fullscreen Ctrl+C while streaming cancels (first press)
+    /// and quits (second consecutive press) — the RPC side effect lives in
+    /// the app.rs CancelTurn consumer, so this pins the state machine only.
+    #[test]
+    fn ctrl_c_streams_first_cancels_then_quits() {
+        let mut app = test_app();
+        app.is_streaming = true;
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::CancelTurn);
+        assert!(app.cancel_requested, "first Ctrl+C must flag cancel");
+
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_idle_quits_immediately() {
+        let mut app = test_app();
+        app.is_streaming = false;
+        app.cancel_requested = false;
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Quit);
     }
 
     #[test]

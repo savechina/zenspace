@@ -7,6 +7,8 @@ use super::app::{App, ECHO_SCRIPT, PendingCallKind, PendingLlmCallStream};
 use super::cell::{OutputCell, PlainCell};
 use crate::session::estimate_tokens;
 use zen_core::types::SessionContext;
+use zen_gateway::client::surface::TurnNotification;
+use zen_gateway::server::hosting::{TOOL_COMPLETED_MARKER, TOOL_STARTED_MARKER};
 
 impl App {
     /// T055/T056: async chat dispatch for inline mode.
@@ -31,6 +33,7 @@ impl App {
                 query: query.to_string(),
             }));
         self.is_streaming = true;
+        self.cancel_requested = false;
         self.stream_turn_seq += 1;
         if self.pending_calls.len() == 1 {
             self.stream_collector.clear();
@@ -142,12 +145,115 @@ impl App {
                 "TUI gateway chat: dispatching (hosted turn)"
             );
 
-            match surface
-                .turn_with_recovery(&session_id, &query_owned, knowledge)
-                .await
-            {
+            // FR-009: mint the turn id up front so the event subscription
+            // (which must predate the first emitted event) can filter this
+            // turn out of the surface-wide broadcast; the same id rides
+            // the turn RPC (opaque server-side).
+            let turn_id = format!("turn-{}", uuid::Uuid::now_v7());
+            let mut events = surface.subscribe_events();
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let forward_tx = tokens_tx.clone();
+            let forward_turn_id = turn_id.clone();
+            let forwarder = tokio::task::spawn(async move {
+                // (saw_delta, saw_lag, deltas_concat): saw_delta drives the
+                // no-event fallback gate; saw_lag + deltas_concat drive the
+                // lag repair below — dropped broadcast deltas would otherwise
+                // truncate the composed transcript with the authoritative
+                // response suppressed by the same gate.
+                let mut saw_delta = false;
+                let mut saw_lag = false;
+                let mut deltas_concat = String::new();
+                let mut stop_fired = false;
+                loop {
+                    let received = if stop_fired {
+                        // Bounded grace after the turn returns: the pump may
+                        // still be fanning this turn's queued frames (the
+                        // server emits the terminal event BEFORE the RPC
+                        // response), so drain until idle.
+                        match tokio::time::timeout(EVENT_DRAIN_GRACE, events.recv()).await {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            out = events.recv() => out,
+                            _ = &mut stop_rx => {
+                                stop_fired = true;
+                                continue;
+                            }
+                        }
+                    };
+                    match received {
+                        Ok(ev) => {
+                            if ev.turn_id != forward_turn_id {
+                                continue;
+                            }
+                            if ev.kind == "delta" {
+                                saw_delta = true;
+                                if let Some(text) = ev.payload["text"].as_str() {
+                                    deltas_concat.push_str(text);
+                                }
+                            }
+                            let terminal = ev.kind == "turn_completed" || ev.kind == "turn_error";
+                            if let Some(token) = event_to_stream_token(&forward_turn_id, &ev)
+                                && forward_tx.send(token).is_err()
+                            {
+                                break;
+                            }
+                            if terminal {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // Dropped frames are gone; record it so the caller
+                            // repairs the composed text from the authoritative
+                            // response instead of trusting the truncated prefix.
+                            saw_lag = true;
+                            tracing::warn!(
+                                lagged = n,
+                                "TUI gateway event stream lagged; dropped deltas will be repaired from the authoritative response"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                (saw_delta, saw_lag, deltas_concat)
+            });
+
+            let outcome = surface
+                .turn_with_recovery_with_id(&session_id, &turn_id, &query_owned, knowledge)
+                .await;
+            let _ = stop_tx.send(());
+            let (saw_delta, saw_lag, deltas_prefix) = forwarder.await.unwrap_or_default();
+
+            match outcome {
                 Ok(response) => {
-                    let _ = tokens_tx.send(response.clone());
+                    // Live deltas already composed the response in the
+                    // collector; only the no-event fallback re-sends the full
+                    // text as one token (byte-identical to the prior behavior).
+                    if !saw_delta {
+                        let _ = tokens_tx.send(response.clone());
+                    } else if saw_lag && response.starts_with(deltas_prefix.as_str()) {
+                        // Lag repair: dropped deltas left the composed prefix
+                        // short of the authoritative response. Deltas arrive
+                        // in order, so the received prefix aligns with the
+                        // response for single-attempt turns; append only the
+                        // missing suffix (token-compose contract intact).
+                        let suffix = &response[deltas_prefix.len()..];
+                        if !suffix.is_empty() {
+                            let _ = tokens_tx.send(suffix.to_string());
+                        }
+                    } else if saw_lag {
+                        // Prefix misalignment (recovery re-stream / multi-
+                        // attempt turns) — completion is not derivable; the
+                        // visible partial content is what the turn produced.
+                        // Logged rather than silently trusting a wrong base.
+                        tracing::warn!(
+                            prefix_len = deltas_prefix.len(),
+                            "lagged delta stream not prefix-aligned with the authoritative response; transcript may be incomplete"
+                        );
+                    }
                     let _ = done_tx.send((Ok(response), Some(session)));
                 }
                 Err(e) => {
@@ -528,6 +634,9 @@ impl App {
                                 self.status_hint = None;
                                 self.stream_collector.clear();
                                 self.push_output(format!("[LLM] Error: {}", e), true);
+                                if let Some(hint) = provider_error_hint(&e) {
+                                    self.push_output(hint.to_string(), false);
+                                }
                             }
                         }
                     }
@@ -541,6 +650,7 @@ impl App {
 
         if self.pending_calls.is_empty() {
             self.is_streaming = false;
+            self.cancel_requested = false;
             while let Some(queued) = self.message_queue.pop_front() {
                 // Inline-mode user echo for QUEUED messages: the immediate
                 // dispatch path in `handle_command` renders `> <query>` into
@@ -613,5 +723,200 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// Phase 33 T229: provider unavailable/unconfigured turn errors get ONE
+/// actionable hint appended (mirrors the `/search` Tip precedent in
+/// `commands.rs`). Matching is a case-insensitive substring against the real
+/// `LlmError` message forms — `provider unavailable: …`
+/// (`crates/zen-provider/src/errors.rs`), `Provider '…' not configured`
+/// (`router.rs`), and the transport-level `Connection refused`. Non-provider
+/// errors return `None`, so their rendering stays byte-identical.
+fn provider_error_hint(error: &str) -> Option<&'static str> {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("connection refused")
+        || lower.contains("not configured")
+        || lower.contains("unavailable")
+    {
+        Some(PROVIDER_UNAVAILABLE_HINT)
+    } else {
+        None
+    }
+}
+
+/// Phase 33 T229: fixed first-run remediation copy (Constitution XV / T192 —
+/// UX copy, not a config key). Kept consistent with `zen provider` and the
+/// embedded `config/config.toml` sample.
+const PROVIDER_UNAVAILABLE_HINT: &str = "Tip: configure a provider — run `zen provider` and set default_provider + [providers.<name>] in ~/.zen/config.toml (config/config.toml embedded sample included)";
+
+/// FR-009: how long the hosted-turn forwarder keeps draining the gateway
+/// event broadcast after the turn RPC returns, waiting for the notification
+/// pump to catch up. The server emits the terminal event before the RPC
+/// response, but the pump is a separate task, so a short bounded grace is
+/// needed to avoid dropping the turn's trailing frames; the normal path
+/// consumes the terminal event immediately and never waits the full budget.
+const EVENT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// FR-009: translate one gateway `session/event` notification into the
+/// delta-stream token the TUI `StreamCollector` already understands.
+///
+/// PURPOSE: A hosted turn's live progress arrives as structured
+/// `session/event` notifications (`delta`, `tool_started`, `tool_completed`).
+/// The collector renders assistant text and tool rounds from the existing
+/// `🔧`/`✅` marker grammar (`stream.rs`), so this is the ONE mapping seam —
+/// pure, channel-free, and unit-tested. The marker lines stop at the tool
+/// name so the collector's `🔧 <tool>[ args…]` grammar parses it cleanly and
+/// renders `🔧 <tool>: …` / `✅ <tool>: …` / `✅ <tool>: failed: <e>`.
+///
+/// USAGE: `event_to_stream_token(&turn_id, &ev)` where `turn_id` is the
+/// caller-minted id. The surface broadcast fans out every surface's turns,
+/// so notifications for any other turn return `None`.
+///
+/// EXPECTED: `Some(text)` for `delta`; `Some("🔧 <tool>\n")` /
+/// `Some("✅ <tool>\n")` / `Some("✅ <tool> failed: <e>\n")` for the tool
+/// kinds; `None` for foreign turns, terminal kinds
+/// (`turn_completed`/`turn_error`), and any unrecognized kind.
+///
+/// ERRORS: None — a total function over the notification shape.
+fn event_to_stream_token(turn_id: &str, ev: &TurnNotification) -> Option<String> {
+    if ev.turn_id != turn_id {
+        return None;
+    }
+    match ev.kind.as_str() {
+        "delta" => ev.payload["text"].as_str().map(str::to_string),
+        "tool_started" => {
+            let tool = ev.payload["tool"].as_str().unwrap_or("tool");
+            Some(format!("{TOOL_STARTED_MARKER} {tool}\n"))
+        }
+        "tool_completed" => {
+            let tool = ev.payload["tool"].as_str().unwrap_or("tool");
+            Some(match ev.payload["error"].as_str() {
+                Some(error) => {
+                    let error = error.replace('\n', " ");
+                    format!("{TOOL_COMPLETED_MARKER} {tool} failed: {error}\n")
+                }
+                None => format!("{TOOL_COMPLETED_MARKER} {tool}\n"),
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t229_hint_matches_connection_refused() {
+        assert_eq!(
+            provider_error_hint("Connection refused (os error 61)"),
+            Some(PROVIDER_UNAVAILABLE_HINT)
+        );
+    }
+
+    #[test]
+    fn t229_hint_matches_provider_unavailable_and_not_configured() {
+        assert!(provider_error_hint("provider unavailable: ollama — no route").is_some());
+        assert!(
+            provider_error_hint("Provider 'anthropic' not configured. Add to ~/.zen/config.toml")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn t229_hint_absent_for_non_provider_errors() {
+        assert!(
+            provider_error_hint("gateway: offline — memory & agent features degraded").is_none()
+        );
+        assert!(provider_error_hint("gateway rpc error -32603: internal").is_none());
+        assert!(provider_error_hint("disconnected").is_none());
+    }
+
+    fn ev(turn_id: &str, kind: &str, extra: serde_json::Value) -> TurnNotification {
+        let mut payload = serde_json::json!({ "turnId": turn_id, "seq": 1, "kind": kind });
+        if let (Some(obj), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        TurnNotification {
+            turn_id: turn_id.to_string(),
+            seq: 1,
+            kind: kind.to_string(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn event_to_stream_token_delta_maps_to_text() {
+        let token =
+            event_to_stream_token("t1", &ev("t1", "delta", serde_json::json!({"text": "hi"})));
+        assert_eq!(token.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn event_to_stream_token_tool_lifecycle_maps_to_markers() {
+        let started = event_to_stream_token(
+            "t1",
+            &ev(
+                "t1",
+                "tool_started",
+                serde_json::json!({"tool": "web.search"}),
+            ),
+        );
+        assert_eq!(started.as_deref(), Some("🔧 web.search\n"));
+
+        let done = event_to_stream_token(
+            "t1",
+            &ev(
+                "t1",
+                "tool_completed",
+                serde_json::json!({"tool": "web.search"}),
+            ),
+        );
+        assert_eq!(done.as_deref(), Some("✅ web.search\n"));
+    }
+
+    #[test]
+    fn event_to_stream_token_tool_error_includes_failure() {
+        let failed = event_to_stream_token(
+            "t1",
+            &ev(
+                "t1",
+                "tool_completed",
+                serde_json::json!({"tool": "shell.exec", "error": "boom\nbad"}),
+            ),
+        );
+        assert_eq!(failed.as_deref(), Some("✅ shell.exec failed: boom bad\n"));
+    }
+
+    #[test]
+    fn event_to_stream_token_ignores_foreign_turn_and_terminal_kinds() {
+        assert!(
+            event_to_stream_token("t1", &ev("t2", "delta", serde_json::json!({"text": "x"})))
+                .is_none()
+        );
+        assert!(
+            event_to_stream_token(
+                "t1",
+                &ev("t1", "turn_completed", serde_json::json!({"response": "x"}))
+            )
+            .is_none()
+        );
+        assert!(
+            event_to_stream_token(
+                "t1",
+                &ev("t1", "turn_error", serde_json::json!({"message": "x"}))
+            )
+            .is_none()
+        );
+        assert!(
+            event_to_stream_token(
+                "t1",
+                &ev("t1", "agent_status", serde_json::json!({"status": "busy"}))
+            )
+            .is_none()
+        );
     }
 }

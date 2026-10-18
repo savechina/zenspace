@@ -47,6 +47,17 @@ fn degraded_tiers_line(names: &[String]) -> Option<String> {
     }
 }
 
+/// Advisory for the `search_knowledge` fallback: the relayed path discards
+/// the O16 `degraded` array, so absent diagnostics there must be surfaced
+/// as uncertainty rather than silence. Split out for unit testing.
+fn relayed_degraded_advisory(relayed: bool, degraded: &[String]) -> Option<String> {
+    if relayed && degraded.is_empty() {
+        Some("⚠ degraded tiers unavailable (relayed search)".to_string())
+    } else {
+        None
+    }
+}
+
 /// Parses a raw `knowledge/search` result into `(notes, degraded tier
 /// names)`. Split out from [`App::execute_search`] for unit testing.
 fn parse_search_response(result: &serde_json::Value) -> (Vec<(String, String)>, Vec<String>) {
@@ -223,7 +234,6 @@ impl App {
             "fork" => self.execute_fork_session(rest),
             "rename" => self.execute_rename_session(rest),
             "archive" => self.execute_archive_session(),
-            "serve" => self.execute_serve(rest),
             "config" => self.execute_config(),
             "model" => self.execute_model(rest),
             "variant" | "vc" | "variant_cycle" => self.execute_variant_cycle(),
@@ -252,7 +262,6 @@ impl App {
   /fork [name]           Fork current session
   /rename <name>         Rename current session
   /archive               Archive current session
-  /serve                 Start gateway daemon
   /config                Show configuration
   /distill            Run distillation pipeline
   /lint                  Run knowledge lint
@@ -500,11 +509,12 @@ Use /thinking to show/hide thinking process."#;
                     return Err(SEARCH_OFFLINE_MSG.to_string());
                 };
                 match raw_search_request(&query_owned).await {
-                    Ok(parsed) => Ok(parsed),
+                    Ok(parsed) => Ok((parsed.0, parsed.1, false)),
                     Err(raw_err) => match surface.search_knowledge(&query_owned, None, 10).await {
                         Ok(notes) => Ok((
                             notes.into_iter().map(|n| (n.path, n.content)).collect(),
                             Vec::new(),
+                            true,
                         )),
                         Err(e) => Err(format!("{raw_err}; {e}")),
                     },
@@ -512,7 +522,7 @@ Use /thinking to show/hide thinking process."#;
             })
         });
         match outcome {
-            Ok((notes, degraded)) => {
+            Ok((notes, degraded, relayed)) => {
                 if notes.is_empty() {
                     self.push_output(format!("[gateway] No results for '{}'", query), false);
                     self.push_output(
@@ -528,6 +538,9 @@ Use /thinking to show/hide thinking process."#;
                             false,
                         );
                     }
+                }
+                if let Some(line) = relayed_degraded_advisory(relayed, &degraded) {
+                    self.push_output(line, true);
                 }
                 if let Some(line) = degraded_tiers_line(&degraded) {
                     self.push_output(line, true);
@@ -559,148 +572,6 @@ Use /thinking to show/hide thinking process."#;
             ),
             Err(e) => self.push_output(format!("Note error: {}", e), true),
         }
-    }
-
-    fn execute_serve(&mut self, args: Option<&str>) {
-        match args {
-            Some("start") => match self.spawn_gateway_daemon() {
-                Ok(msg) => self.push_output(msg, false),
-                Err(e) => self.push_output(format!("Gateway error: {}", e), true),
-            },
-            Some("stop") => match self.stop_gateway_daemon() {
-                Ok(msg) => self.push_output(msg, false),
-                Err(e) => self.push_output(format!("Gateway error: {}", e), true),
-            },
-            Some("status") => match self.check_gateway_status() {
-                Ok(msg) => self.push_output(msg, false),
-                Err(e) => self.push_output(format!("Gateway error: {}", e), true),
-            },
-            _ => self.push_output("Usage: /serve start|stop|status".into(), true),
-        }
-    }
-
-    fn spawn_gateway_daemon(&self) -> Result<String, String> {
-        use std::process::{Command, Stdio};
-
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let pid_path = zen_core::paths::ZenPaths::detect()
-            .map_err(|e| e.to_string())?
-            .global_root()
-            .join("daemon.pid");
-
-        // Read through the shared zen-gateway parser: the daemon writes a
-        // JSON record, and `read_pid` understands both that and the legacy
-        // bare-pid format.
-        if let Ok(pid) = zen_gateway::read_pid(&pid_path) {
-            #[cfg(unix)]
-            {
-                if unsafe { libc::kill(pid as i32, 0) == 0 } {
-                    return Err(format!("Gateway already running (pid: {})", pid));
-                }
-            }
-        }
-
-        let mut cmd = Command::new(&exe);
-        cmd.arg("serve").arg("start").arg("--foreground");
-        cmd.stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                });
-            }
-        }
-
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn: {}", e))?;
-        let child_pid = child.id();
-
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        #[cfg(unix)]
-        {
-            if unsafe { libc::kill(child_pid as i32, 0) != 0 } {
-                return Err("Gateway daemon failed to start".to_string());
-            }
-        }
-
-        // Single-writer invariant (NFR-010): the daemon.pid record is owned
-        // by the spawned child — `zen serve start --foreground` writes its
-        // own JSON record `{"pid": N, "start": ...}` via `write_pid`
-        // (tmp+rename, atomic) before entering the foreground loop. The TUI
-        // must NOT write a bare pid here: a non-atomic write ~500ms after
-        // spawn would clobber the child's record with a different format
-        // (bare pid vs JSON) and race it. The child is the single writer.
-
-        let config = zen_gateway::HttpConfig::default();
-        Ok(format!(
-            "Gateway started in background (pid: {}) on http://{}:{}",
-            child_pid, config.bind_addr, config.port
-        ))
-    }
-
-    fn stop_gateway_daemon(&self) -> Result<String, String> {
-        let pid_path = zen_core::paths::ZenPaths::detect()
-            .map_err(|e| e.to_string())?
-            .global_root()
-            .join("daemon.pid");
-
-        if !pid_path.exists() {
-            return Ok("Gateway not running (no PID file)".to_string());
-        }
-
-        let pid = zen_gateway::read_pid(&pid_path).map_err(|e| e.to_string())?;
-
-        #[cfg(unix)]
-        {
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if unsafe { libc::kill(pid as i32, 0) != 0 } {
-                    break;
-                }
-            }
-
-            if unsafe { libc::kill(pid as i32, 0) == 0 } {
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-
-        std::fs::remove_file(&pid_path).ok();
-        Ok(format!("Gateway stopped (pid: {})", pid))
-    }
-
-    fn check_gateway_status(&self) -> Result<String, String> {
-        let pid_path = zen_core::paths::ZenPaths::detect()
-            .map_err(|e| e.to_string())?
-            .global_root()
-            .join("daemon.pid");
-
-        if !pid_path.exists() {
-            return Ok("Gateway not running".to_string());
-        }
-
-        let pid = zen_gateway::read_pid(&pid_path).map_err(|e| e.to_string())?;
-
-        #[cfg(unix)]
-        {
-            if unsafe { libc::kill(pid as i32, 0) == 0 } {
-                let config = zen_gateway::HttpConfig::default();
-                return Ok(format!(
-                    "Gateway running (pid: {}) on http://{}:{}",
-                    pid, config.bind_addr, config.port
-                ));
-            }
-        }
-
-        Ok(format!("Gateway stale (pid: {} is dead)", pid))
     }
 
     fn execute_config(&mut self) {
@@ -818,6 +689,12 @@ mod search_display_tests {
     fn degraded_line_names_failing_tiers() {
         let line = degraded_tiers_line(&["fts".to_string(), "vec".to_string()]).unwrap();
         assert_eq!(line, "⚠ degraded tiers: fts, vec");
+    }
+
+    #[test]
+    fn relayed_search_warns_on_absent_diagnostics() {
+        assert!(relayed_degraded_advisory(true, &[]).is_some());
+        assert!(relayed_degraded_advisory(false, &[]).is_none());
     }
 
     #[test]

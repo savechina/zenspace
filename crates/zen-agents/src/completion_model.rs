@@ -94,6 +94,28 @@ impl ZenCompletionModel {
         }
     }
 
+    /// T225: construct from an ALREADY-ROUTED [`zen_provider::Provider`].
+    ///
+    /// The orchestrator resolves the generation provider through
+    /// sensitivity-aware routing (`route_with_preferences` over the session
+    /// sensitivity policy + the agent's `LlmPreference`) before building the
+    /// model, so the routed provider can differ from the configured default.
+    /// Taking the enum directly avoids re-parsing a name back into a provider.
+    pub fn from_provider(
+        router: zen_provider::DefaultRouter,
+        provider: zen_provider::Provider,
+    ) -> Self {
+        let model_name = match &provider {
+            zen_provider::Provider::Unknown(name) => name.clone(),
+            other => other.to_string(),
+        };
+        Self {
+            router: Arc::new(router),
+            provider,
+            model_name,
+        }
+    }
+
     pub fn provider_name(&self) -> &str {
         &self.model_name
     }
@@ -271,14 +293,14 @@ impl CompletionModel for ZenCompletionModel {
     }
 }
 
-fn parse_provider_name(name: &str) -> zen_provider::Provider {
+pub(crate) fn parse_provider_name(name: &str) -> zen_provider::Provider {
     match name.to_lowercase().as_str() {
         "openai" | "oa" => zen_provider::Provider::OpenAI,
         "anthropic" | "an" => zen_provider::Provider::Anthropic,
         "deepseek" | "ds" | "deep_seek" => zen_provider::Provider::DeepSeek,
         "qq" | "qqbot" | "qq_bot" => zen_provider::Provider::QQBot,
         "ollama" | "local" | "ollama-local" => zen_provider::Provider::Ollama,
-        "mock" => zen_provider::Provider::Unknown("mock".into()),
+        "mock" => zen_provider::Provider::Mock,
         other => zen_provider::Provider::Unknown(other.into()),
     }
 }

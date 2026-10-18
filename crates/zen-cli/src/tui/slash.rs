@@ -158,11 +158,6 @@ pub fn create_default_registry() -> SlashCommandRegistry {
         "Archive current session".to_string(),
     );
     registry.register(
-        "serve".to_string(),
-        vec![],
-        "Start gateway daemon".to_string(),
-    );
-    registry.register(
         "config".to_string(),
         vec![],
         "Show configuration".to_string(),
@@ -184,6 +179,11 @@ pub struct SlashState {
     pub filter: String,
     pub filtered_indices: Vec<usize>,
     pub selected: usize,
+    /// Arrow keys made an explicit choice (enter-side contract, e2e e15):
+    /// Enter must EXECUTE the selected command when the user navigated to it,
+    /// not just complete it. Reset whenever the filter text changes (the
+    /// selection reset in `on_input_change` also invalidates the choice).
+    pub choice_locked: bool,
 }
 
 impl SlashState {
@@ -193,6 +193,7 @@ impl SlashState {
             filter: String::new(),
             filtered_indices: Vec::new(),
             selected: 0,
+            choice_locked: false,
         }
     }
 
@@ -215,6 +216,7 @@ impl SlashState {
             self.recompute_filtered(registry);
             if changed {
                 self.selected = 0;
+                self.choice_locked = false;
             } else {
                 self.selected = self
                     .selected
@@ -235,6 +237,7 @@ impl SlashState {
         if self.filtered_indices.is_empty() {
             return;
         }
+        self.choice_locked = true;
         self.selected = if self.selected == 0 {
             self.filtered_indices.len() - 1
         } else {
@@ -246,6 +249,7 @@ impl SlashState {
         if self.filtered_indices.is_empty() {
             return;
         }
+        self.choice_locked = true;
         self.selected = (self.selected + 1) % self.filtered_indices.len();
     }
 
@@ -333,7 +337,7 @@ pub fn slash_group(name: &str) -> &'static str {
         "model" | "variant" => "Model",
         "export" | "note" | "search" => "Knowledge",
         "session" | "new" | "fork" | "rename" | "archive" => "Session",
-        "serve" | "config" | "distill" | "lint" => "System",
+        "config" | "distill" | "lint" => "System",
         _ => "Other",
     }
 }
@@ -1174,12 +1178,12 @@ mod tests {
 
     #[test]
     fn t084_popup_row_count_includes_headers_and_floors_at_one() {
-        // Registry order: Model → General(help) → System(serve): 3 items,
+        // Registry order: Model → General(help) → System(config): 3 items,
         // 3 groups → 3 header rows (every group change opens one).
         let mut registry = SlashCommandRegistry::new();
         registry.register("model".to_string(), vec![], "Model".to_string());
         registry.register("help".to_string(), vec![], "Help".to_string());
-        registry.register("serve".to_string(), vec![], "Serve".to_string());
+        registry.register("config".to_string(), vec![], "Config".to_string());
         let mut state = SlashState::new();
         state.on_input_change("/", &registry);
         assert_eq!(

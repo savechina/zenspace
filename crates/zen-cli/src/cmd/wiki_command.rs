@@ -120,7 +120,7 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
     match operation {
         WikiCommands::List => {
             let paths = ZenPaths::detect()?;
-            list_wiki_pages(&paths.wiki().join("notions"))
+            list_wiki_pages(&paths.wiki())
         }
         WikiCommands::RebuildMemory => {
             // D3=A RPC model: the rebuild runs inside the sole-owner
@@ -162,7 +162,7 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
         }
         WikiCommands::Show { name } => {
             let paths = ZenPaths::detect()?;
-            show_wiki_page(&paths.wiki().join("notions"), name)
+            show_wiki_page(&paths.wiki(), name)
         }
         WikiCommands::Reindex {
             path,
@@ -205,7 +205,33 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
             // would read every file as unchanged and leave search silently
             // broken. Reset first, then repopulate with a FORCED full reindex
             // in the same run (`force_full` bypasses the change gate).
+            // A `--path` subset leaves uncovered rows keeping their stale
+            // content_hash — their FTS rows are deleted here and never
+            // repopulated by any later gated run (review finding #11).
+            // Fail loud instead of permanent silent FTS loss.
+            if *rebuild_fts && path.is_some() {
+                return Err(ZenError::Message(
+                    "--rebuild-fts with --path would permanently lose FTS rows for notes outside \
+                     --path (their content_hash survives, so gated reindexes never restore them). \
+                     Drop --path for the full-vault rebuild, or reset content_hash explicitly."
+                        .to_string(),
+                ));
+            }
+
             if *reset_embeddings {
+                // O9 ops rule: the daemon is state.db's sole writer and an
+                // open vec0 writer turns DROP/CREATE into corruption. Refuse
+                // instead of trusting the ops checklist alone (same door as
+                // RebuildMemory above).
+                let socket = zen_gateway::transport::uds::default_socket_path();
+                let probe = zen_gateway::client::GatewayClient::connect(&socket).await;
+                if probe.is_ok() {
+                    return Err(ZenError::Message(format!(
+                        "gateway daemon is running at {} — it holds an open vec0 writer; \
+                         run `zen serve stop` first",
+                        socket.display()
+                    )));
+                }
                 zen_repo::EmbeddingsRepo::new(&db_client)
                     .reset_embedding_tables()
                     .await
@@ -357,44 +383,116 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
 fn list_wiki_pages(wiki_dir: &std::path::Path) -> Result<(), ZenError> {
     if !wiki_dir.is_dir() {
         println!("No wiki pages found. Run `zen wiki distill` first.");
+        // T230: first-run discoverability — the wiki only builds itself while
+        // a long-lived learning host (the serve daemon) is running; never let
+        // an empty wiki be a dead end with no actionable next step.
+        println!(
+            "Tip: run `zen serve start` for background learning — the distill loop self-builds the wiki."
+        );
         return Ok(());
     }
 
-    let mut pages: Vec<String> = Vec::new();
-    for entry in fs::read_dir(wiki_dir)
-        .map_err(|e| ZenError::Message(format!("failed to read wiki directory: {e}")))?
-    {
-        let entry =
-            entry.map_err(|e| ZenError::Message(format!("failed to read wiki entry: {e}")))?;
-        let path = entry.path();
-        if path.is_file()
-            && path.extension().is_some_and(|ext| ext == "md")
-            && let Some(name) = path.file_stem().and_then(|s| s.to_str())
-        {
-            pages.push(name.to_string());
-        }
-    }
+    let pages = enumerate_wiki_pages(wiki_dir);
 
     if pages.is_empty() {
         println!("No wiki pages found.");
+        println!(
+            "Tip: run `zen serve start` for background learning — the distill loop self-builds the wiki."
+        );
         return Ok(());
     }
 
-    pages.sort();
     debug!(count = pages.len(), "listing wiki pages");
 
     println!("Wiki Pages ({})", pages.len());
     println!("{}", "-".repeat(40));
-    for name in &pages {
-        let path = wiki_dir.join(format!("{name}.md"));
-        let summary = get_page_summary(&path).unwrap_or_default();
-        println!("  {name}");
+    let mut current_group: Option<WikiGroup> = None;
+    for page in &pages {
+        if current_group != Some(page.group) {
+            println!("[{}]", page.group.label());
+            current_group = Some(page.group);
+        }
+        let summary = get_page_summary(&page.path).unwrap_or_default();
+        println!("  {}", page.name);
         if !summary.is_empty() {
             println!("    {summary}");
         }
     }
 
     Ok(())
+}
+
+/// Phase 33 T231: top-level grouping for `zen wiki list`, in stable display
+/// order. Any top-level directory not listed falls through to [`Other`];
+/// root-level `.md` files (the machine-maintained `index.md`/`log.md`,
+/// OKF §6 exemption precedent) group under [`Indices`].
+///
+/// [`Other`]: WikiGroup::Other
+/// [`Indices`]: WikiGroup::Indices
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WikiGroup {
+    Notions,
+    Wisdom,
+    Communities,
+    Indices,
+    Other,
+}
+
+impl WikiGroup {
+    fn label(self) -> &'static str {
+        match self {
+            WikiGroup::Notions => "notions",
+            WikiGroup::Wisdom => "wisdom",
+            WikiGroup::Communities => "communities",
+            WikiGroup::Indices => "indices",
+            WikiGroup::Other => "other",
+        }
+    }
+}
+
+struct WikiPageEntry {
+    group: WikiGroup,
+    name: String,
+    path: PathBuf,
+}
+
+/// Phase 33 T231: enumerate EVERY markdown page under `wiki_dir`, recursively,
+/// grouped by top-level directory. Loop-written pages under `wiki/wisdom/**`
+/// and `wiki/communities/**` were previously invisible because `zen wiki list`
+/// read only the non-recursive `wiki/notions` directory. Hidden entries are
+/// pruned; ordering (group, name, path) is deterministic.
+fn enumerate_wiki_pages(wiki_dir: &std::path::Path) -> Vec<WikiPageEntry> {
+    let mut pages: Vec<WikiPageEntry> = walkdir::WalkDir::new(wiki_dir)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|e| {
+            let path = e.path().to_path_buf();
+            let rel = path.strip_prefix(wiki_dir).ok()?;
+            let name = path.file_stem()?.to_string_lossy().to_string();
+            let mut components = rel.components();
+            let group = match components.next() {
+                None => return None,
+                Some(_) if components.next().is_none() => WikiGroup::Indices,
+                Some(top) => match top.as_os_str().to_str() {
+                    Some("notions") => WikiGroup::Notions,
+                    Some("wisdom") => WikiGroup::Wisdom,
+                    Some("communities") => WikiGroup::Communities,
+                    _ => WikiGroup::Other,
+                },
+            };
+            Some(WikiPageEntry { group, name, path })
+        })
+        .collect();
+    pages.sort_by(|a, b| {
+        a.group
+            .cmp(&b.group)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    pages
 }
 
 fn show_wiki_page(wiki_dir: &std::path::Path, name: &str) -> Result<(), ZenError> {
@@ -405,6 +503,20 @@ fn show_wiki_page(wiki_dir: &std::path::Path, name: &str) -> Result<(), ZenError
         let exact_path = wiki_dir.join(format!("{name}.md"));
         if exact_path.exists() {
             print_page(&exact_path, name)?;
+            return Ok(());
+        }
+        // T231: pages are nested (notions/technology/rust.md et al.) — a bare
+        // "rust" must still open. Resolve against the same enumeration
+        // `zen wiki list` prints so listing and showing agree.
+        let match_stem = |entry: &&WikiPageEntry| {
+            entry.name.eq_ignore_ascii_case(&slug)
+                || entry.path.file_name().is_some_and(|f| {
+                    f.to_string_lossy()
+                        .eq_ignore_ascii_case(&format!("{name}.md"))
+                })
+        };
+        if let Some(entry) = enumerate_wiki_pages(wiki_dir).iter().find(match_stem) {
+            print_page(&entry.path, name)?;
             return Ok(());
         }
         println!("Wiki page not found: {name}");
@@ -654,5 +766,60 @@ mod tests {
             zen_vault::SkillExportTarget::from(SkillExportTargetArg::Zen),
             zen_vault::SkillExportTarget::Zen
         );
+    }
+
+    // === T231: whole-tree grouped enumeration ===
+
+    fn write(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn t231_enumerates_whole_tree_grouped_deterministically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        write(
+            &wiki.join("notions/technology/rust.md"),
+            "# Rust\n\nA language.",
+        );
+        write(&wiki.join("wisdom/hypotheses/late.md"), "# Late");
+        write(&wiki.join("wisdom/hypotheses/alpha.md"), "# Alpha");
+        write(&wiki.join("communities/group-a.md"), "# Group A");
+        write(&wiki.join("index.md"), "# Index");
+        write(&wiki.join("loose/misc.md"), "# Misc");
+        write(&wiki.join("notions/skip.txt"), "not markdown");
+
+        let pages = enumerate_wiki_pages(wiki);
+        let grouped: Vec<(&str, &str)> = pages
+            .iter()
+            .map(|p| (p.group.label(), p.name.as_str()))
+            .collect();
+        assert_eq!(
+            grouped,
+            vec![
+                ("notions", "rust"),
+                ("wisdom", "alpha"),
+                ("wisdom", "late"),
+                ("communities", "group-a"),
+                ("indices", "index"),
+                ("other", "misc"),
+            ]
+        );
+    }
+
+    #[test]
+    fn t231_prunes_hidden_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wiki = tmp.path();
+        write(&wiki.join("notions/visible.md"), "# V");
+        write(&wiki.join("notions/.hidden.md"), "# H");
+        write(&wiki.join(".obsidian/cache.md"), "# C");
+
+        let pages = enumerate_wiki_pages(wiki);
+        let names: Vec<&str> = pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["visible"]);
     }
 }

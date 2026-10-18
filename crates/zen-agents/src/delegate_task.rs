@@ -475,6 +475,48 @@ impl DelegateTaskTool {
         }
     }
 
+    /// One `loop.delegate.outcome` line PER executed task, right at its
+    /// completion (`ok = error field absent` on the structured result).
+    /// Purpose: the accuracy weights in `aggregate_weights` need a post-exec
+    /// verdict — the pre-spawn `loop.delegate.gates` line only ever carried
+    /// the `bounded` admit/deny (documented deviation there). Writing each
+    /// outcome stands alone so a crash between the two appends degrades to
+    /// the old gates-only derivation instead of block-mispairing.
+    fn append_outcomes_audit(
+        &self,
+        parent: &str,
+        depth: u32,
+        tasks: &[ParsedDelegate],
+        chunk: &[usize],
+        outcomes: &[serde_json::Value],
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+        let Ok(paths) = zen_core::paths::ZenPaths::detect() else {
+            return;
+        };
+        let log_path = paths.logs().join("audit.jsonl");
+        if let Some(dir) = log_path.parent()
+            && std::fs::create_dir_all(dir).is_ok()
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                for (&i, value) in chunk.iter().zip(outcomes) {
+                    let entry = serde_json::json!({
+                        "kind": "loop.delegate.outcome",
+                        "parent": parent,
+                        "depth": depth,
+                        "agent": tasks[i].request.agent,
+                        "ok": value.get("error").is_none(),
+                        "task_index": i,
+                    });
+                    let _ = writeln!(f, "{entry}");
+                }
+            }
+        }
+    }
+
     /// The SINGLE sub-session composition seam (Phase 31 T215, design
     /// F3-D1): used by `run_single`, therefore automatically by
     /// `plan.execute` AND resume (shared `Arc<DelegateTaskTool>`; replayed
@@ -646,10 +688,10 @@ impl DelegateTaskTool {
                 response.push_str(&format!("\n\n[{note}]"));
                 break;
             }
-            let Ok(execution) = self
-                .executor
-                .execute_round(&context, &agent, &manifest, &feedback)
-            else {
+            let Ok(execution) = crate::orchestrator::run_blocking_llm(|| {
+                self.executor
+                    .execute_round(&context, &agent, &manifest, &feedback)
+            }) else {
                 return (
                     Some(serde_json::json!({
                         "error": format!("delegate agent \"{agent_name}\" LLM round failed")
@@ -700,6 +742,7 @@ impl DelegateTaskTool {
         }
 
         let (clean_response, reasoning, verification) = split_report_markers(&response);
+        let response_chars = clean_response.chars().count();
         let actual = (prompt.len() / 4 + clean_response.len() / 4) as u64;
         self.token_budget
             .record_usage(reservation, actual, actual)
@@ -732,6 +775,21 @@ impl DelegateTaskTool {
         }
         if let Some(verification) = verification {
             output["verification"] = serde_json::json!(verification);
+        }
+        // T233 (006 D13/W3.1): post-`run_single` quality estimate — a
+        // record-only shadow observation (`loop.decision`, `rung:"shadow"`).
+        // It never gates or mutates the returned result.
+        if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+            let signal = crate::decision::QualitySignal {
+                has_error: output.get("error").is_some(),
+                response_chars,
+            };
+            crate::decision::run_qe_cascade_shadow(
+                &paths,
+                &context.session.session_id.to_string(),
+                &signal,
+                None,
+            );
         }
         info!(
             agent = agent_name,
@@ -1051,18 +1109,23 @@ impl Tool for DelegateTaskTool {
             .collect();
 
         // Slot-ordered assembly: results[i] always corresponds to tasks[i],
-        // whether the task was rejected, unbounded, or executed.
+        // whether the task was rejected, unbounded, or executed. Each result
+        // also carries `task_index` (0-based) so any post-hoc reordering
+        // (D10 weight ranking below) stays re-attributable by consumers —
+        // positional pairing is only guaranteed while no weights are set.
         let mut slots: Vec<Option<serde_json::Value>> = Vec::with_capacity(tasks.len());
         let mut runnable: Vec<usize> = Vec::with_capacity(tasks.len());
         for (i, task) in tasks.iter().enumerate() {
             if let Some(error) = &rejected[i] {
                 slots.push(Some(serde_json::json!({
                     "agent": task.request.agent,
+                    "task_index": i,
                     "error": error
                 })));
             } else if !reports[i].bounded {
                 slots.push(Some(serde_json::json!({
                     "agent": task.request.agent,
+                    "task_index": i,
                     "error": "unbounded delegation rejected: prompt exceeds the bounded-task limit"
                 })));
             } else {
@@ -1103,16 +1166,22 @@ impl Tool for DelegateTaskTool {
                 })
                 .collect();
             let results = futures::future::join_all(futures).await;
+            self.append_outcomes_audit(&parent, depth, &tasks, chunk, &results);
             for (&i, outcome) in chunk.iter().zip(results) {
                 slots[i] = Some(outcome);
             }
         }
         let mut results: Vec<serde_json::Value> = slots
             .into_iter()
-            .map(|slot| {
-                slot.unwrap_or_else(
+            .enumerate()
+            .map(|(i, slot)| {
+                let mut value = slot.unwrap_or_else(
                     || serde_json::json!({ "error": "delegation produced no result" }),
-                )
+                );
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("task_index".to_string(), serde_json::json!(i));
+                }
+                value
             })
             .collect();
 

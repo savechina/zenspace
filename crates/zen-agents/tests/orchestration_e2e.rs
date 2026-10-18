@@ -22,6 +22,7 @@
 
 use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 use tempfile::TempDir;
+use zen_agents::decision::SHADOW_RUNG;
 use zen_agents::execution::AgentExecution;
 use zen_agents::orchestrator::AgentOrchestrator;
 use zen_core::types::SessionContext;
@@ -130,6 +131,33 @@ fn e2e_delegation_sub_agent_turn_gated_and_audited() {
     assert_eq!(
         review["delivery_ready"].as_bool(),
         Some(execution.metadata.delivery_ready)
+    );
+}
+
+#[test]
+fn delegate_run_single_emits_shadow_observation() {
+    let _guard = begin();
+    let reply = fenced_tool_call("delegate.task", delegate_args());
+    let orchestrator = orchestrator(&reply);
+    let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+    let orchestrator_session_id = session.session_id.to_string();
+    let before = audit_jsonl().len();
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(orchestrator.execute(&mut session, "delegate the summary"))
+        .expect("turn completes");
+
+    let mut all = audit_jsonl();
+    let new_lines = all.split_off(before);
+    let delegate_shadow = new_lines.iter().any(|entry| {
+        entry["kind"] == "loop.decision"
+            && entry["decision_kind"] == "qe_cascade"
+            && entry["rung"] == SHADOW_RUNG
+            && entry["session_id"].as_str() != Some(orchestrator_session_id.as_str())
+    });
+    assert!(
+        delegate_shadow,
+        "a real delegate run_single must emit a rung:\"shadow\" loop.decision line"
     );
 }
 
@@ -280,5 +308,58 @@ fn e2e_streaming_turn_emits_tool_frames() {
     assert!(
         streamed.contains("✅ delegate.task"),
         "tool-completed frame must stream: {streamed}"
+    );
+}
+
+#[test]
+fn e2e_round_cap_answers_pending_tool_intent_and_marks_final() {
+    let _guard = begin();
+    let reply = fenced_tool_call("delegate.task", delegate_args());
+    let execution = run_turn(&reply, "delegate the summary");
+
+    assert!(
+        execution
+            .tool_calls
+            .iter()
+            .any(|c| c.result.contains("tool round cap reached")),
+        "pending tool intents must be answered with the cap error: {:?}",
+        execution.tool_calls
+    );
+    assert!(
+        execution.response.contains("⚠ tool round cap"),
+        "final response must carry the cap notice: {}",
+        execution.response
+    );
+    assert!(
+        !execution.response.contains("```json"),
+        "final response must not be raw tool-call JSON: {}",
+        execution.response
+    );
+}
+
+#[test]
+fn e2e_stream_round_cap_answers_pending_tool_intent_and_marks_final() {
+    let _guard = begin();
+    let reply = fenced_tool_call("delegate.task", delegate_args());
+    let orchestrator = orchestrator(&reply);
+    let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+
+    let mut streamed = String::new();
+    let response = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(
+            orchestrator.execute_stream(&mut session, "delegate the summary", |chunk| {
+                streamed.push_str(chunk)
+            }),
+        )
+        .expect("streaming turn must complete");
+
+    assert!(
+        streamed.contains("⚠ tool round cap"),
+        "cap notice must stream: {streamed}"
+    );
+    assert!(
+        !response.contains("```json"),
+        "final response must not be raw tool-call JSON: {response}"
     );
 }

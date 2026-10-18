@@ -159,7 +159,7 @@ impl NotionService {
         Ok(relationships)
     }
 
-    /// Load all known notion names from graph.db.
+    /// Load all known notion names from the unified graph store (state.db).
     /// Returns canonical names AND known aliases.
     /// Returns an empty set if the database does not exist yet.
     pub async fn load_known_notion_names(&self, client: &SqliteClient) -> Result<HashSet<String>> {
@@ -167,7 +167,7 @@ impl NotionService {
         Ok(names.into_iter().collect())
     }
 
-    /// Upsert an notion into graph.db.
+    /// Upsert an notion into the graph store (state.db).
     /// Normalizes the name and checks aliases before insert.
     /// Ensures the schema exists before writing.
     pub async fn upsert_entity(&self, client: &SqliteClient, notion: &Notion) -> Result<()> {
@@ -207,7 +207,7 @@ impl NotionService {
         Ok(())
     }
 
-    /// Insert a relationship into graph.db.
+    /// Insert a relationship into the graph store (state.db).
     /// Confidence defaults to 0.8 for auto-extracted edges.
     pub async fn insert_relationship(
         &self,

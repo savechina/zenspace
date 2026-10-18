@@ -2044,7 +2044,29 @@ impl ZenAgentBuilder {
     pub fn build(self, wiring: &ZenWiring, router: &DefaultRouter) -> Result<ZenAgent> {
         let completion_model =
             ZenCompletionModel::new(router.clone(), router.default_provider_name());
+        self.assemble(wiring, completion_model)
+    }
 
+    /// T225: like [`Self::build`], but with an explicitly routed completion
+    /// provider (session sensitivity policy + agent `LlmPreference` already
+    /// applied). The orchestrator uses this so `enforce_sensitivity` fires on
+    /// the generation path; `build` keeps the historical default-provider
+    /// behavior for callers that have not routed.
+    pub fn build_with_provider(
+        self,
+        wiring: &ZenWiring,
+        router: &DefaultRouter,
+        provider: zen_provider::Provider,
+    ) -> Result<ZenAgent> {
+        let completion_model = ZenCompletionModel::from_provider(router.clone(), provider);
+        self.assemble(wiring, completion_model)
+    }
+
+    fn assemble(
+        self,
+        wiring: &ZenWiring,
+        completion_model: ZenCompletionModel,
+    ) -> Result<ZenAgent> {
         let generic = GenericAgent::builder(&self.name)
             .with_skills(self.skill_ids.clone())
             .with_tools(self.tool_ids.clone())

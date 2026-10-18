@@ -5,11 +5,23 @@
 //! - `append_jsonl_line`: append one serializable value as a JSON line
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// Process-wide serialization for JSONL appends (audits, reports). Concurrent
+/// in-process writers interleaving raw bytes produced 5/3795 garbled lines in
+/// production audit.jsonl; the mutex closes the in-process gap, the fs2 flock
+/// below closes the cross-process one (daemon workers + CLI separate processes).
+static APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+const APPEND_LOCK_DEADLINE: Duration = Duration::from_secs(10);
+const APPEND_LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// Read all JSONL lines from a file, returning parsed `serde_json::Value` entries.
 ///
@@ -57,6 +69,9 @@ pub fn read_jsonl_lines(path: &Path) -> Result<Vec<Value>> {
 /// - Creates the file and parent directories if they don't exist.
 /// - Appends a trailing newline after the JSON.
 /// - Uses `serde_json::to_string` (compact, not pretty-printed) for one-line-per-entry.
+/// - Line-atomic under concurrency: an in-process mutex plus a cross-process
+///   flock (10s deadline) guarantee no interleaved partial lines from the
+///   daemon and CLI writing the same file simultaneously.
 pub fn append_jsonl_line(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -64,6 +79,10 @@ pub fn append_jsonl_line(path: &Path, value: &impl Serialize) -> Result<()> {
     }
 
     let json = serde_json::to_string(value).context("failed to serialize JSONL entry")?;
+    let line = format!("{json}\n").into_bytes();
+
+    let lock = APPEND_LOCK.get_or_init(|| Mutex::new(()));
+    let _in_process = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -71,9 +90,28 @@ pub fn append_jsonl_line(path: &Path, value: &impl Serialize) -> Result<()> {
         .open(path)
         .with_context(|| format!("failed to open JSONL file: {}", path.display()))?;
 
-    writeln!(file, "{json}").context("failed to write JSONL entry")?;
+    lock_exclusive_with_deadline(&file, path)?;
+    file.write_all(&line)
+        .with_context(|| format!("failed to write JSONL entry: {}", path.display()))?;
 
     Ok(())
+}
+
+fn lock_exclusive_with_deadline(file: &std::fs::File, path: &Path) -> Result<()> {
+    let deadline = Instant::now() + APPEND_LOCK_DEADLINE;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(APPEND_LOCK_POLL),
+            Err(_) => {
+                anyhow::bail!(
+                    "failed to acquire JSONL append lock within {:?}: {}",
+                    APPEND_LOCK_DEADLINE,
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -203,5 +241,41 @@ mod tests {
 
         // Clean up
         std::fs::remove_dir_all(&parent).ok();
+    }
+
+    #[test]
+    fn test_append_jsonl_concurrent_threads_no_interleaving() {
+        let path = tmp_path("append-concurrent");
+        std::fs::remove_file(&path).ok();
+
+        const THREADS: usize = 4;
+        const APPENDS: usize = 250;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..APPENDS {
+                        append_jsonl_line(&path, &serde_json::json!({"thread": t, "seq": i}))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), THREADS * APPENDS);
+        for line in &lines {
+            assert!(
+                serde_json::from_str::<Value>(line).is_ok(),
+                "malformed line: {line}"
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 }

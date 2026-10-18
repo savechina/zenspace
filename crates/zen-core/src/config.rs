@@ -425,6 +425,10 @@ impl std::fmt::Display for LlmPreference {
     }
 }
 
+const CRON_MAX_CONCURRENT_WORKERS_DEFAULT: u32 = 3;
+const CRON_MAX_CONCURRENT_WORKERS_MIN: u32 = 1;
+const CRON_MAX_CONCURRENT_WORKERS_MAX: u32 = 32;
+
 /// Cron scheduling config.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -445,6 +449,11 @@ pub struct CronConfig {
     /// false, learning runs only under an explicit `zen serve start`.
     /// Default: true.
     pub tui_scheduler: Option<bool>,
+    /// Cross-worker concurrency cap on the scheduler fire path.
+    /// Co-fired cron workers beyond the cap queue FIFO instead of running
+    /// at once (protects LLM/embedding/db-writer spikes at 5-min boundaries).
+    /// Default: 3, clamped 1..=32.
+    pub max_concurrent_workers: Option<u32>,
 }
 
 /// Agentic module sections — `[agentic.*]` (005-agentic-loop).
@@ -2219,6 +2228,7 @@ impl Default for CronConfig {
             fresh_eyes_mode: Some(false),
             llm_cost_cap_usd: Some(10.0),
             tui_scheduler: Some(true),
+            max_concurrent_workers: Some(CRON_MAX_CONCURRENT_WORKERS_DEFAULT),
         }
     }
 }
@@ -2722,6 +2732,7 @@ fn merge_cron(base: CronConfig, ov: CronConfig) -> CronConfig {
         fresh_eyes_mode: ov.fresh_eyes_mode.or(base.fresh_eyes_mode),
         llm_cost_cap_usd: ov.llm_cost_cap_usd.or(base.llm_cost_cap_usd),
         tui_scheduler: ov.tui_scheduler.or(base.tui_scheduler),
+        max_concurrent_workers: ov.max_concurrent_workers.or(base.max_concurrent_workers),
     }
 }
 
@@ -3203,6 +3214,15 @@ fn apply_cron_env(cron: &mut CronConfig) {
     if let Some(v) = env_bool("ZEN_TUI_SCHEDULER") {
         cron.tui_scheduler = Some(v);
     }
+    if let Some(raw) = env_str("ZEN_CRON_MAX_CONCURRENT_WORKERS") {
+        match raw.parse::<u32>() {
+            Ok(v) => cron.max_concurrent_workers = Some(v),
+            Err(_) => tracing::warn!(
+                value = %raw,
+                "invalid ZEN_CRON_MAX_CONCURRENT_WORKERS (expected an integer); keeping the configured [cron] max_concurrent_workers value"
+            ),
+        }
+    }
 }
 
 /// TUI env layer — `ZEN_TUI_KNOWLEDGE_SEARCH` (`fast` | `full` | `off`,
@@ -3446,6 +3466,31 @@ impl CronConfig {
         self.tui_scheduler.unwrap_or(true)
     }
 
+    /// Effective cross-worker concurrency cap on the scheduler fire path.
+    ///
+    /// Scope logic:
+    /// - Functionality: caps how many cron workers may execute at once;
+    ///   co-fired workers beyond the cap wait (FIFO) instead of all running
+    /// - User impact: a 4-worker 5-min co-fire (memory-curator,
+    ///   session-journaler, subconscious, zen-loop) no longer spikes
+    ///   LLM/embedding/db writers together — one long worker cannot starve
+    ///   the rest because each still gets its permit in registry order
+    /// - Default: 3 — enough headroom for the common co-fire while bounding
+    ///   a burst; `ZEN_CRON_MAX_CONCURRENT_WORKERS` overrides per standard
+    ///   5-layer config
+    /// - Interaction: a value below 1 clamps to 1 (a 0 must never deadlock
+    ///   the fire path); values above 32 clamp to 32; only the
+    ///   `create_configured_scheduler` path wires it — the dormant
+    ///   config-free constructors stay unlimited
+    pub fn max_concurrent_workers_or_default(&self) -> u32 {
+        self.max_concurrent_workers
+            .unwrap_or(CRON_MAX_CONCURRENT_WORKERS_DEFAULT)
+            .clamp(
+                CRON_MAX_CONCURRENT_WORKERS_MIN,
+                CRON_MAX_CONCURRENT_WORKERS_MAX,
+            )
+    }
+
     /// Generate a cron expression for the dream (nightly consolidation) worker.
     /// Produces `"0 0 {start}-{end} * * *"` from start and end hours, or `None` if invalid.
     pub fn night_dream_schedule(&self) -> Option<String> {
@@ -3550,6 +3595,49 @@ mod tests {
         assert_eq!(cfg.timezone_or_default(), chrono_tz::UTC);
         cfg.timezone = None;
         assert_eq!(cfg.timezone_or_default(), chrono_tz::UTC);
+    }
+
+    #[test]
+    fn cron_max_concurrent_workers_defaults_and_clamps() {
+        assert_eq!(CronConfig::default().max_concurrent_workers_or_default(), 3);
+
+        let unset = CronConfig {
+            max_concurrent_workers: None,
+            ..CronConfig::default()
+        };
+        assert_eq!(unset.max_concurrent_workers_or_default(), 3);
+
+        let zero = CronConfig {
+            max_concurrent_workers: Some(0),
+            ..CronConfig::default()
+        };
+        assert_eq!(
+            zero.max_concurrent_workers_or_default(),
+            1,
+            "0 must clamp to 1 — a zero-permit limiter would deadlock the fire path"
+        );
+
+        let huge = CronConfig {
+            max_concurrent_workers: Some(999),
+            ..CronConfig::default()
+        };
+        assert_eq!(huge.max_concurrent_workers_or_default(), 32);
+    }
+
+    #[test]
+    fn cron_max_concurrent_workers_env_override_respected() {
+        // SAFETY: test-only env mutation; ZEN_CRON_MAX_CONCURRENT_WORKERS is
+        // read by no sibling test in this binary and is removed at the end.
+        unsafe { std::env::set_var("ZEN_CRON_MAX_CONCURRENT_WORKERS", "5") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.cron.max_concurrent_workers_or_default(), 5);
+
+        // Unparsable → warn and keep the configured value (E11 discipline).
+        unsafe { std::env::set_var("ZEN_CRON_MAX_CONCURRENT_WORKERS", "three") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.cron.max_concurrent_workers_or_default(), 3);
+
+        unsafe { std::env::remove_var("ZEN_CRON_MAX_CONCURRENT_WORKERS") };
     }
 
     #[test]

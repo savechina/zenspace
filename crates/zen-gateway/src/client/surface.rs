@@ -665,32 +665,50 @@ impl SurfaceClient {
         }
     }
 
-    /// session/turn with a client-minted turnId, the full turn budget,
+    /// session/turn with a CALLER-MINTED turnId, the full turn budget,
     /// and reconnect-between-turns semantics: a dead link fails this
     /// turn as [`SurfaceError::Offline`] (banner-visible, FR-011/012)
     /// and the next call redials.
     ///
-    /// # Errors
-    /// [`SurfaceError::Rpc`] on catalog errors (including turn
-    /// failures with the link up);
-    /// [`SurfaceError::Offline`] when the link is dead or dies
-    /// mid-turn.
-    pub async fn turn_with_recovery(
+    /// PURPOSE: The body of [`SurfaceClient::turn_with_recovery`] minus
+    /// the internal id minting, so a surface can subscribe to
+    /// [`SurfaceClient::subscribe_events`] for this exact id BEFORE the
+    /// first event is emitted and observe the turn's live `session/event`
+    /// stream (FR-009 streamed progress). The id is opaque server-side —
+    /// any value is accepted, and a mid-turn `Offline` redial or a
+    /// `-32003` re-register retry reuses it byte-for-byte so retries stay
+    /// idempotent (one logical turn = at most two attempts on ONE id).
+    ///
+    /// USAGE: Mint `format!("turn-{}", uuid::Uuid::now_v7())`, call
+    /// [`SurfaceClient::subscribe_events`], then call this with the same
+    /// id. Prefer [`SurfaceClient::turn_with_recovery`] when no per-id
+    /// event filtering is needed.
+    ///
+    /// EXPECTED: Identical to [`SurfaceClient::turn_with_recovery`] except
+    /// the caller owns the id; the returned response is unchanged.
+    ///
+    /// ERRORS: [`SurfaceError::Rpc`] on catalog errors (including turn
+    /// failures with the link up — a `-32603` message carrying
+    /// "cancelled" becomes [`SurfaceError::Cancelled`]);
+    /// [`SurfaceError::Offline`] when the link is dead or dies mid-turn.
+    pub async fn turn_with_recovery_with_id(
         &self,
         session_id: &str,
+        turn_id: &str,
         prompt: &str,
         knowledge: Vec<RetrievedNote>,
     ) -> Result<String, SurfaceError> {
         // One logical turn = at most two attempts on ONE server-side id:
         // if the link died under us (embedded owner drained, daemon
-        // restarted), the fresh-link retry stays idempotent.
-        let turn_id = format!("turn-{}", uuid::Uuid::now_v7());
+        // restarted), the fresh-link retry stays idempotent. The caller
+        // minted the id so it can filter the broadcast event stream; the
+        // retry reuses it unchanged.
         self.active_turns
             .write()
             .expect("active turns lock")
-            .insert(turn_id.clone());
+            .insert(turn_id.to_string());
         let outcome = {
-            let run = || self.hosted_turn_once(session_id, &turn_id, prompt, &knowledge);
+            let run = || self.hosted_turn_once(session_id, turn_id, prompt, &knowledge);
             match run().await {
                 Ok(response) => Ok(response),
                 Err(SurfaceError::Offline(reason)) => {
@@ -724,8 +742,33 @@ impl SurfaceClient {
         self.active_turns
             .write()
             .expect("active turns lock")
-            .remove(&turn_id);
+            .remove(turn_id);
         outcome
+    }
+
+    /// session/turn with an internally minted turnId, the full turn budget,
+    /// and reconnect-between-turns semantics: a dead link fails this
+    /// turn as [`SurfaceError::Offline`] (banner-visible, FR-011/012)
+    /// and the next call redials.
+    ///
+    /// Delegates to [`SurfaceClient::turn_with_recovery_with_id`] after
+    /// minting the id, so callers that need to correlate the live event
+    /// stream can share that path by minting their own id.
+    ///
+    /// # Errors
+    /// [`SurfaceError::Rpc`] on catalog errors (including turn
+    /// failures with the link up);
+    /// [`SurfaceError::Offline`] when the link is dead or dies
+    /// mid-turn.
+    pub async fn turn_with_recovery(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        knowledge: Vec<RetrievedNote>,
+    ) -> Result<String, SurfaceError> {
+        let turn_id = format!("turn-{}", uuid::Uuid::now_v7());
+        self.turn_with_recovery_with_id(session_id, &turn_id, prompt, knowledge)
+            .await
     }
 
     /// Sends `session/cancel` for every turn currently tracked as
@@ -1560,5 +1603,107 @@ mod tests {
         bridge.response_tx.send(resp).unwrap();
         let received = sink.response_rx.try_lock().unwrap().try_recv().unwrap();
         assert_eq!(received.decision, "approve");
+    }
+
+    /// FR-009: a caller that mints the turn id, subscribes to the
+    /// `session/event` broadcast BEFORE the turn runs, and submits via
+    /// `turn_with_recovery_with_id` observes that turn's notifications.
+    /// Pins the additive carve end-to-end at the lowest layer that can
+    /// emit real events: a live surface pump over a scripted UDS server.
+    /// The turn handler parks until released so the delta + terminal
+    /// frames are written before the RPC response, mirroring the server's
+    /// emit-BEFORE-response ordering.
+    #[tokio::test]
+    async fn caller_minted_turn_receives_session_events() {
+        use crate::transport::Transport;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("events.sock");
+        let listener = uds::bind_socket(&sock).await.unwrap();
+
+        let turn_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_turn = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (side_tx, side_rx) = tokio::sync::oneshot::channel();
+        {
+            let turn_entered = std::sync::Arc::clone(&turn_entered);
+            let release_turn = std::sync::Arc::clone(&release_turn);
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let side = std::sync::Arc::new(uds::UdsTransport::from_stream(stream).unwrap());
+                let _ = side_tx.send(std::sync::Arc::clone(&side));
+                let server = crate::server::dispatch::DispatchServer::from_arc(side)
+                    .handle("session/start", |params| async move {
+                        let id = params
+                            .get("sessionId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("minted")
+                            .to_string();
+                        Ok(serde_json::json!({"sessionId": id, "agent": "auto"}))
+                    })
+                    .unwrap()
+                    .handle("session/turn", move |_params| {
+                        let turn_entered = std::sync::Arc::clone(&turn_entered);
+                        let release_turn = std::sync::Arc::clone(&release_turn);
+                        async move {
+                            turn_entered.notify_one();
+                            release_turn.notified().await;
+                            Ok(serde_json::json!({"turnId": "t", "response": "hello world"}))
+                        }
+                    })
+                    .unwrap();
+                let _ = server.run().await;
+            });
+        }
+
+        let surface = open_test_surface(&sock).await;
+        let turn_id = "turn-caller-minted";
+        // Subscription MUST predate the first emitted event.
+        let mut events = surface.subscribe_events();
+
+        let turn_id_owned = turn_id.to_string();
+        let turn = tokio::spawn(async move {
+            surface
+                .turn_with_recovery_with_id("s1", &turn_id_owned, "hi", Vec::new())
+                .await
+        });
+
+        turn_entered.notified().await;
+        let side = side_rx.await.unwrap();
+        side.send(crate::protocol::Frame::notification(
+            "session/event",
+            serde_json::json!({"turnId": turn_id, "seq": 1, "kind": "delta", "text": "hello"}),
+        ))
+        .await
+        .unwrap();
+        side.send(crate::protocol::Frame::notification(
+            "session/event",
+            serde_json::json!({
+                "turnId": turn_id, "seq": 2, "kind": "turn_completed", "response": "hello world",
+            }),
+        ))
+        .await
+        .unwrap();
+        release_turn.notify_one();
+
+        let response = turn.await.unwrap().unwrap();
+        assert_eq!(response, "hello world");
+
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while seen.len() < 2 {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Ok(n)) if n.turn_id == turn_id => seen.push(n.kind),
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            seen.contains(&"delta".to_string()),
+            "delta event must reach the caller subscription: {seen:?}"
+        );
+        assert!(
+            seen.contains(&"turn_completed".to_string()),
+            "terminal event must reach the caller subscription: {seen:?}"
+        );
     }
 }

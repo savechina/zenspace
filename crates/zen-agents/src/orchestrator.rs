@@ -16,12 +16,12 @@ use rig_core::completion::{AssistantContent, Usage, message::ToolCall as NativeT
 use rig_core::message::{Message, ToolResultContent, UserContent};
 use tracing::{debug, info, instrument, warn};
 
-use zen_core::config::KnowledgeInjectMode;
+use zen_core::config::{KnowledgeInjectMode, LlmPreference};
 use zen_core::sanitize::InputSanitizer;
 use zen_core::types::{MessageRole, RetrievedNote, Sensitivity, SessionContext};
 use zen_memory::ZenMemvidStore;
 use zen_memory::memvid_store::MemvidStore;
-use zen_provider::DefaultRouter;
+use zen_provider::{DefaultRouter, LlmRouter as _, Provider, TaskRequirements};
 
 use crate::delegate_tools;
 use crate::delegate_tools::ZenDelegateTools;
@@ -81,6 +81,32 @@ const TOOL_RESULTS_HISTORY_CAP_CHARS: usize = 16_000;
 struct KnowledgeStack {
     service: zen_vault::search::SearchService,
     client: Arc<zen_repo::SqliteClient>,
+}
+
+/// Run a synchronous, potentially blocking LLM call from an async caller
+/// without parking a tokio worker thread.
+///
+/// # Description
+/// `execute_model_call` / `execute_round` / the router's `call` are sync and
+/// reach the async runtime from `execute` and the delegate loop. On a
+/// multi-thread runtime `block_in_place` moves the call onto a blocking thread
+/// so the worker keeps serving other tasks; it PANICS on other flavors,
+/// notably the `current_thread` runtime every `#[tokio::test]` uses, so the
+/// flavor is checked first and every other case runs the closure inline.
+///
+/// # Parameters
+/// - `f`: the sync call to run, owning its own borrows (callers keep their
+///   `?` / `let-else` outside so the error path stays byte-identical).
+///
+/// # Returns
+/// Whatever `f` returns, unchanged.
+pub fn run_blocking_llm<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// Orchestrator manages agent lifecycle, registry, and execution flow.
@@ -174,6 +200,63 @@ fn shadow_embedding_enabled() -> bool {
             false
         }
     }
+}
+
+/// T225: resolve the provider for the hosted generation completion model.
+///
+/// Routes with the session sensitivity policy + the agent `LlmPreference` so
+/// `enforce_sensitivity` (local-first for Private/Confidential) gates the
+/// generation path exactly as it gates the executor path. Fail-open: when
+/// routing itself errors, the configured default provider is used and a
+/// single warning is logged.
+fn resolve_completion_provider(
+    router: &DefaultRouter,
+    preferences: &[LlmPreference],
+    sensitivity: Sensitivity,
+) -> anyhow::Result<Provider> {
+    let requirements = TaskRequirements {
+        max_tokens: None,
+        sensitivity,
+        preferred_model: None,
+        budget_limit: None,
+    };
+    if let Ok(provider) = router.route_with_preferences(&requirements, preferences) {
+        return Ok(provider);
+    }
+    if let Ok(provider) = router.route(&requirements) {
+        return Ok(provider);
+    }
+    // T225 / Constitution XIV: total routing failure means no local provider
+    // is reachable. `enforce_sensitivity`'s own contract ("Private data cannot
+    // be routed to cloud") must hold on the generation path too — a
+    // Private/Confidential turn ERRORS with the routing reason (the T229 Tip
+    // covers the banner UX) instead of falling open to a cloud default.
+    // Provider::Mock is the executor.rs:184 offline stand-in (canned local
+    // text, never a cloud egress) and stays allowed. Public turns keep the
+    // pre-T225 behavior: fall open to the configured default provider (cloud
+    // routing is allowed there), warn once.
+    let fallback = crate::completion_model::parse_provider_name(router.default_provider_name());
+    if matches!(
+        sensitivity,
+        Sensitivity::Private | Sensitivity::Confidential
+    ) && !matches!(fallback, Provider::Mock)
+    {
+        let err = router
+            .route_with_preferences(&requirements, preferences)
+            .err()
+            .or_else(|| router.route(&requirements).err());
+        return Err(err.map(anyhow::Error::from).unwrap_or_else(|| {
+            anyhow::anyhow!("no provider available for a {} turn", sensitivity)
+        }));
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        warn!(
+            default = %router.default_provider_name(),
+            "T225: sensitivity-aware provider routing failed; falling open to the configured default"
+        );
+    });
+    Ok(fallback)
 }
 
 /// FR-040: emit the memory nudge when `user_turns` hits the 10-turn
@@ -498,6 +581,78 @@ fn plan_tool_batch(calls: &[PendingToolCall]) -> BatchPlan {
         answers,
         rejected,
     }
+}
+
+/// F3: answer pending calls at the round cap so the transcript records the
+/// dropped intent instead of leaving raw tool-call JSON as the final answer.
+fn answer_pending_at_round_cap(
+    calls: &[PendingToolCall],
+    max_tool_rounds: usize,
+    final_response: &mut String,
+    tool_calls: &mut Vec<ToolCall>,
+    accumulated_results: &mut Vec<String>,
+) -> (Vec<UserContent>, String) {
+    let error = serde_json::json!({
+        "error": format!(
+            "tool round cap reached ({max_tool_rounds}) — tool intent not executed"
+        )
+    })
+    .to_string();
+    let mut answers = Vec::with_capacity(calls.len());
+    let mut round_entry = String::new();
+    for pending in calls {
+        let call = &pending.tool_call;
+        answers.push(tool_result_content(
+            call.id.to_string(),
+            call.function.name.clone(),
+            error.clone(),
+        ));
+        tool_calls.push(ToolCall {
+            tool_name: call.function.name.clone(),
+            arguments: call.function.arguments.to_string(),
+            result: error.clone(),
+        });
+        round_entry.push_str(&format!(
+            "tool: {}\nargs: {}\nresult: {error}\n---\n",
+            call.function.name, call.function.arguments
+        ));
+    }
+    if !round_entry.is_empty() {
+        push_tool_results_history(accumulated_results, round_entry);
+    }
+    let notice = format!(
+        "⚠ tool round cap ({max_tool_rounds}) reached, {} tool intent(s) not executed",
+        calls.len()
+    );
+    // Annotate, never replace: the final response may also carry real content
+    // (e.g. the mock echo prompt_len marker) that must survive; only the
+    // tool-call JSON fences are stripped from the display.
+    let stripped = strip_fenced_tool_blocks(final_response);
+    if stripped.is_empty() {
+        *final_response = notice.clone();
+    } else {
+        *final_response = format!("{notice}\n\n{stripped}");
+    }
+    (answers, notice)
+}
+
+/// Removes ```json fenced blocks from display text — used at the round cap
+/// so the delivered response never reads as a raw tool-call envelope.
+fn strip_fenced_tool_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("```json") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start..];
+        match after_open.find("```").filter(|&end| end > 0) {
+            Some(close) => {
+                rest = &after_open[close + 3..];
+            }
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 /// FR-034: derive a citation fingerprint from a note's body — the first
@@ -1247,6 +1402,36 @@ impl AgentOrchestrator {
         }
     }
 
+    /// T233 (006 D13/W3): record-only shadow observations at turn completion.
+    ///
+    /// Emits the W3.1 QE-cascade estimate, the W3.2 Bayesian escalation
+    /// comparison and the W3.3 minority sentinel as `loop.decision` lines with
+    /// `rung:"shadow"`. They accrue (prediction, actual-outcome) pairs for a
+    /// future calibrated threshold; none gates or mutates the turn (the
+    /// never-mutates pins live in `crate::decision`).
+    fn emit_shadow_observations(
+        paths: &ZenPaths,
+        session_id: &str,
+        intent: &intent::Intent,
+        delivery_ready: bool,
+        response_chars: usize,
+    ) {
+        let signal = crate::decision::QualitySignal {
+            has_error: !delivery_ready,
+            response_chars,
+        };
+        crate::decision::run_qe_cascade_shadow(paths, session_id, &signal, Some(!delivery_ready));
+        let stats = crate::decision::load_intent_l1_competence(paths);
+        crate::decision::run_bayesian_escalation_shadow(
+            paths,
+            session_id,
+            &stats,
+            crate::decision::production_rung(intent.source),
+            !delivery_ready,
+        );
+        crate::decision::run_minority_sentinel_shadow(paths, session_id, 0);
+    }
+
     /// 006 US2 (D5) / T170: semantic reviewer for HIGH blast-radius turns.
     ///
     /// The frontier judge is the pre-T170 single-call reviewer, preserved
@@ -1329,7 +1514,7 @@ impl AgentOrchestrator {
         self
     }
 
-    async fn build_agent(&self, agent_name: &str) -> Result<ZenAgent> {
+    async fn build_agent(&self, agent_name: &str, sensitivity: Sensitivity) -> Result<ZenAgent> {
         let skills = delegate_tools::resolve_skill_ids_for_agent(agent_name);
         let mut tools = delegate_tools::resolve_agent_tool_grants(
             agent_name,
@@ -1377,7 +1562,14 @@ impl AgentOrchestrator {
         if let Some(store) = self.memvid_store.clone() {
             builder = builder.with_memvid_store(store);
         }
-        builder.build(&self.wiring, self.executor.router())
+        let preferences = self
+            .registry
+            .find_by_name(agent_name)
+            .map(|profile| profile.llm_preferences.clone())
+            .unwrap_or_else(|_| vec![LlmPreference::Any]);
+        let provider =
+            resolve_completion_provider(self.executor.router(), &preferences, sensitivity)?;
+        builder.build_with_provider(&self.wiring, self.executor.router(), provider)
     }
 
     /// Keyword intent routing (synchronous `route()` facade) — the
@@ -1386,6 +1578,31 @@ impl AgentOrchestrator {
         intent::keyword_route(query)
             .map(|i| i.agent)
             .unwrap_or_else(|| "Sisyphus".to_string())
+    }
+
+    /// T227: honor a user-chosen session agent (`zen chat --agent X` /
+    /// `session/start {agent}` records the choice in `SessionContext::agent_name`).
+    ///
+    /// A name that resolves in the registry routes the turn to that agent
+    /// (with its own tool grants); an unknown non-empty name is a structured
+    /// error surfaced through the turn-error path. An empty name — and the
+    /// gateway's auto placeholder, which `hydrate_session` stores as the
+    /// session-id UUID — keeps the intent ladder unchanged.
+    fn resolve_agent_name(
+        &self,
+        session: &SessionContext,
+        intent: &intent::Intent,
+    ) -> Result<String> {
+        let chosen = session.agent_name.trim();
+        if chosen.is_empty() || uuid::Uuid::parse_str(chosen).is_ok() {
+            return Ok(intent.agent.clone());
+        }
+        self.registry
+            .find_by_name(chosen)
+            .map(|profile| profile.name.clone())
+            .map_err(|e| {
+                anyhow::anyhow!("unknown agent \"{chosen}\" selected for this session: {e}")
+            })
     }
 
     #[instrument(skip(self, session), fields(session_id = %session.session_id))]
@@ -1439,7 +1656,7 @@ impl AgentOrchestrator {
         }
         let intent = ladder.intent;
         let llm_telemetry = ladder.telemetry;
-        let agent_name = intent.agent.clone();
+        let agent_name = self.resolve_agent_name(session, &intent)?;
         info!(
             agent = agent_name,
             source = ?intent.source,
@@ -1461,9 +1678,12 @@ impl AgentOrchestrator {
         )
         .await;
 
-        let zen_agent = self.build_agent(&agent_name).await?;
-        session.agent_name.clone_from(&agent_name);
-
+        let zen_agent = self
+            .build_agent(&agent_name, session.sensitivity_policy)
+            .await?;
+        // T227: the resolved agent is deliberate turn-local state — writing it
+        // back would freeze intent routing (turn 2 would honor turn 1's choice
+        // as if user-pinned). session.agent_name remains the USER's --agent pick.
         let profile = self
             .registry
             .find_by_name(&agent_name)
@@ -1577,12 +1797,14 @@ impl AgentOrchestrator {
                     }
 
                     let history_text = join_tool_results_history(&accumulated_results);
-                    let (response_text, native_calls) = self.executor.execute_model_call(
-                        &context,
-                        &zen_agent,
-                        &tool_manifest,
-                        &history_text,
-                    )?;
+                    let (response_text, native_calls) = run_blocking_llm(|| {
+                        self.executor.execute_model_call(
+                            &context,
+                            &zen_agent,
+                            &tool_manifest,
+                            &history_text,
+                        )
+                    })?;
 
                     let (invocations, parse_errors, _degraded) =
                         Self::resolve_invocations(&response_text, &native_calls);
@@ -1684,6 +1906,16 @@ impl AgentOrchestrator {
                 AgentRunStep::CallTools { calls } => {
                     dispatch_round += 1;
                     if dispatch_round > self.max_tool_rounds {
+                        let (answers, _notice) = answer_pending_at_round_cap(
+                            &calls,
+                            self.max_tool_rounds,
+                            &mut final_response,
+                            &mut tool_calls,
+                            &mut accumulated_results,
+                        );
+                        if !answers.is_empty() {
+                            run.tool_results(answers)?;
+                        }
                         break;
                     }
                     let BatchPlan {
@@ -1895,8 +2127,10 @@ impl AgentOrchestrator {
                 &review_task,
                 &final_response,
                 |feedback| {
-                    self.executor
-                        .execute_round(&context, &zen_agent, &tool_manifest, &feedback)
+                    run_blocking_llm(|| {
+                        self.executor
+                            .execute_round(&context, &zen_agent, &tool_manifest, &feedback)
+                    })
                 },
             )
             .await?
@@ -1923,6 +2157,13 @@ impl AgentOrchestrator {
                 &review,
                 feedback_rounds,
                 user_query,
+            );
+            Self::emit_shadow_observations(
+                &paths,
+                &session.session_id.to_string(),
+                &intent,
+                review.delivery_ready,
+                final_response.chars().count(),
             );
         }
 
@@ -2229,7 +2470,7 @@ impl AgentOrchestrator {
         }
         let intent = ladder.intent;
         let llm_telemetry = ladder.telemetry;
-        let agent_name = intent.agent.clone();
+        let agent_name = self.resolve_agent_name(session, &intent)?;
         info!(
             agent = agent_name,
             source = ?intent.source,
@@ -2251,8 +2492,9 @@ impl AgentOrchestrator {
         )
         .await;
 
-        let zen_agent = self.build_agent(&agent_name).await?;
-        session.agent_name.clone_from(&agent_name);
+        let zen_agent = self
+            .build_agent(&agent_name, session.sensitivity_policy)
+            .await?;
 
         self.wiring.connect_mcp_servers().await;
         self.wiring.set_sensitivity(session.sensitivity_policy);
@@ -2464,6 +2706,17 @@ impl AgentOrchestrator {
                 AgentRunStep::CallTools { calls } => {
                     dispatch_round += 1;
                     if dispatch_round > self.max_tool_rounds {
+                        let (answers, notice) = answer_pending_at_round_cap(
+                            &calls,
+                            self.max_tool_rounds,
+                            &mut final_response,
+                            &mut tool_calls,
+                            &mut accumulated_results,
+                        );
+                        if !answers.is_empty() {
+                            run.tool_results(answers)?;
+                        }
+                        callback(&format!("{notice}\n"));
                         break;
                     }
                     let BatchPlan {
@@ -2664,6 +2917,13 @@ impl AgentOrchestrator {
                 &review,
                 0,
                 user_query,
+            );
+            Self::emit_shadow_observations(
+                &paths,
+                &session.session_id.to_string(),
+                &intent,
+                review.delivery_ready,
+                final_response.chars().count(),
             );
         }
 
@@ -2934,7 +3194,7 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(router);
         orchestrator.ensure_delegate_tool();
         let agent = orchestrator
-            .build_agent("Sisyphus")
+            .build_agent("Sisyphus", Sensitivity::Public)
             .await
             .expect("agent builds");
         let tools = agent.generic.tools();
@@ -2967,7 +3227,7 @@ mod tests {
         let orchestrator = AgentOrchestrator::new(router);
         orchestrator.ensure_delegate_tool();
         let agent = orchestrator
-            .build_agent("Sisyphus")
+            .build_agent("Sisyphus", Sensitivity::Public)
             .await
             .expect("agent builds");
         let tools = agent.generic.tools();
@@ -3170,6 +3430,173 @@ mod tests {
             Box::pin(async move { verdict })
         });
         AgentOrchestrator::with_token_budget(router, 10_000_000).with_quality_pipeline(pipeline)
+    }
+
+    /// Serves `200 OK` on `/api/tags` so `OllamaProvider::health_check`
+    /// reports the local provider as reachable without a real daemon.
+    fn spawn_healthy_ollama() -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "[]";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn private_sensitivity_routes_completion_provider_local_not_default() {
+        let base_url = spawn_healthy_ollama();
+        let config = zen_core::config::ZenConfig {
+            default_provider: Some("openai".to_string()),
+            providers: std::collections::HashMap::from([
+                (
+                    "openai".to_string(),
+                    zen_core::config::ProviderConfig {
+                        provider_type: Some("openai-compatible".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "ollama".to_string(),
+                    zen_core::config::ProviderConfig {
+                        provider_type: Some("ollama".to_string()),
+                        base_url: Some(base_url),
+                        default_model: Some("test-model".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            agents: std::collections::HashMap::from([(
+                "default".to_string(),
+                zen_core::config::AgentConfig {
+                    provider: Some("ollama".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let router = DefaultRouter::from_agentic(&config);
+        assert_eq!(router.default_provider_name(), "openai");
+
+        let provider =
+            resolve_completion_provider(&router, &[LlmPreference::Any], Sensitivity::Private)
+                .expect("reachable local provider routes the Private turn");
+        assert_eq!(
+            provider,
+            Provider::Ollama,
+            "T225: Private turns must resolve to the reachable local provider, not the cloud default"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_session_errors_when_no_local_provider_is_reachable() {
+        // T225 / Constitution XIV: total routing failure on a Private turn
+        // must ERROR — never fall open to a cloud default provider.
+        let config = zen_core::config::ZenConfig {
+            default_provider: Some("openai".to_string()),
+            providers: std::collections::HashMap::from([
+                (
+                    "openai".to_string(),
+                    zen_core::config::ProviderConfig {
+                        provider_type: Some("openai-compatible".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "ollama".to_string(),
+                    zen_core::config::ProviderConfig {
+                        provider_type: Some("ollama".to_string()),
+                        base_url: Some("http://127.0.0.1:1".to_string()),
+                        default_model: Some("test".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            agents: std::collections::HashMap::from([(
+                "default".to_string(),
+                zen_core::config::AgentConfig {
+                    provider: Some("ollama".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let router = DefaultRouter::from_agentic(&config);
+        let err = resolve_completion_provider(&router, &[LlmPreference::Any], Sensitivity::Private)
+            .expect_err("a Private turn with no reachable local provider must error");
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("openai"),
+            "the error must not name a cloud provider as the route: {text}"
+        );
+        assert!(
+            text.contains("unavailable") || text.contains("LLM unavailable"),
+            "the error must carry the routing reason (actionable Tip match): {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_agent_name_is_honored_and_unknown_is_an_error() {
+        let orchestrator = reviewing_orchestrator(crate::review::SemanticVerdict::approve("ok"));
+
+        let mut empty = SessionContext::new(String::new(), String::new());
+        let via_ladder = orchestrator
+            .execute(&mut empty, "implement a function")
+            .await
+            .expect("empty agent_name routes through the intent ladder");
+        assert_eq!(
+            via_ladder.agent_name, "Hephaestus",
+            "empty agent_name must follow the intent ladder"
+        );
+        assert!(
+            empty.agent_name.is_empty(),
+            "T227: the intent's resolved agent is turn-local — persisting it would freeze the ladder for the session lifetime"
+        );
+
+        let mut chosen = SessionContext::new("Momus".to_string(), String::new());
+        let forced = orchestrator
+            .execute(&mut chosen, "implement a function")
+            .await
+            .expect("known agent_name is honored");
+        assert_eq!(
+            forced.agent_name, "Momus",
+            "a session agent name must override the intent ladder"
+        );
+
+        let mut unknown = SessionContext::new("NotAnAgent".to_string(), String::new());
+        let err = orchestrator
+            .execute(&mut unknown, "hello")
+            .await
+            .expect_err("unknown agent_name must be a structured error");
+        assert!(
+            format!("{err:#}").contains("NotAnAgent"),
+            "the error must name the unknown agent: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn uuid_session_placeholder_keeps_intent_ladder() {
+        let orchestrator = reviewing_orchestrator(crate::review::SemanticVerdict::approve("ok"));
+        let mut session = SessionContext::new(uuid::Uuid::now_v7().to_string(), String::new());
+        let execution = orchestrator
+            .execute(&mut session, "implement a function")
+            .await
+            .expect("uuid placeholder is treated as absent");
+        assert_eq!(
+            execution.agent_name, "Hephaestus",
+            "the gateway's uuid placeholder must not override the ladder"
+        );
     }
 
     #[test]

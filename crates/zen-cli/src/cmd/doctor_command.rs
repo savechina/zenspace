@@ -541,11 +541,23 @@ async fn schema_compat_for_path(db_path: &Path) -> CheckResult {
                          tolerated (additive-only); upgrade zen when convenient"
                     ),
                 }
+            } else if db_max < embedded_max {
+                // Binary ahead of the db (reachable right after an upgrade,
+                // before any open() applies migrations): the db does NOT
+                // match — migrations are merely pending, so still a PASS.
+                CheckResult {
+                    name: NAME.into(),
+                    ok: true,
+                    detail: format!(
+                        "db schema v{db_max} pending migrations to v{embedded_max} — \
+                         applied on next open"
+                    ),
+                }
             } else {
                 CheckResult {
                     name: NAME.into(),
                     ok: true,
-                    detail: format!("schema v{db_max} matches binary (supports v{embedded_max})"),
+                    detail: format!("schema v{db_max} matches binary v{embedded_max}"),
                 }
             }
         }

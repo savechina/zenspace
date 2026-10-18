@@ -338,6 +338,10 @@ pub struct App {
     pub memory_count: usize,
     pub show_thinking: bool,
     pub is_streaming: bool,
+    /// T228: a cancel was already requested (Ctrl+C or Esc) during the
+    /// current streaming turn. First Ctrl+C while streaming cancels; a
+    /// second Ctrl+C while still streaming quits. Reset at turn start/end.
+    pub cancel_requested: bool,
     pub chat_history: Vec<(String, String)>,
     pub pending_calls: Vec<PendingCallKind>,
     pub message_queue: VecDeque<String>,
@@ -453,6 +457,7 @@ impl App {
             memory_count: 0,
             show_thinking: false,
             is_streaming: false,
+            cancel_requested: false,
             chat_history: Vec::new(),
             pending_calls: Vec::new(),
             message_queue: VecDeque::new(),
@@ -1357,6 +1362,33 @@ pub fn run_app(
                         crate::tui::handler::KeyAction::Quit => {
                             app.save_session_state();
                             app.running = false;
+                        }
+                        crate::tui::handler::KeyAction::CancelTurn => {
+                            // T228: mirror the inline Esc-interrupt path —
+                            // clear the queue, cancel the in-flight turn via RPC.
+                            let queued_count = app.message_queue.len();
+                            app.message_queue.clear();
+                            if let Some(surface) = crate::tui::prewarm::take_client() {
+                                let surface = surface.clone();
+                                tokio::spawn(async move {
+                                    let count = surface.cancel_active_turns().await;
+                                    tracing::info!(
+                                        cancelled_turns = count,
+                                        "Ctrl+C: cancel RPC sent"
+                                    );
+                                });
+                                if queued_count > 0 {
+                                    app.show_toast(format!(
+                                        "turn cancelled \u{2014} {queued_count} queued discarded"
+                                    ));
+                                } else {
+                                    app.show_toast("turn cancelled".to_string());
+                                }
+                            } else {
+                                app.show_toast(
+                                    "cancel unavailable \u{2014} gateway offline".to_string(),
+                                );
+                            }
                         }
                         crate::tui::handler::KeyAction::Continue => {}
                     }

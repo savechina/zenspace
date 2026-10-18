@@ -348,6 +348,10 @@ timezone = "Asia/Shanghai"
 subconscious_interval_minutes = 5
 dream_start_hour = 2
 dream_end_hour = 4
+# Cross-worker concurrency cap on the fire path: co-fired cron workers beyond
+# the cap queue FIFO instead of flooding LLM/embedding/db-writer bursts.
+# Default 3; clamp 1..=32; env ZEN_CRON_MAX_CONCURRENT_WORKERS (5-layer).
+# max_concurrent_workers = 3
 
 # =============================================================================
 # Plugin system — flat [plugin.{id}] layout

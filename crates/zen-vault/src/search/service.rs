@@ -94,16 +94,34 @@ impl SearchService {
         let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
         let mut diagnostics = SearchDiagnostics::default();
 
-        let embedding = match crate::tindy::compute_embeddings_for_text_tagged(query) {
-            Ok((embedding, degraded)) => {
+        let query_owned = query.to_string();
+        // Owned payload on a blocking thread: the embedding providers are sync
+        // and a dead/hung one would otherwise park a tokio worker for its full
+        // (240s) timeout. spawn_blocking (unlike a dropped future) runs the
+        // call to completion on the blocking pool even if this task is
+        // cancelled. A join failure is treated exactly like a compute error.
+        let embedding = match tokio::task::spawn_blocking(move || {
+            crate::tindy::compute_embeddings_for_text_tagged(&query_owned)
+        })
+        .await
+        {
+            Ok(Ok((embedding, degraded))) => {
                 diagnostics.query_embedding_degraded = degraded;
                 Some(embedding)
+            }
+            Ok(Err(e)) => {
+                diagnostics.query_embedding_unavailable = true;
+                warn!(
+                    error = %e,
+                    "tier3 (vec0) unavailable for fusion: query embedding failed"
+                );
+                None
             }
             Err(e) => {
                 diagnostics.query_embedding_unavailable = true;
                 warn!(
                     error = %e,
-                    "tier3 (vec0) unavailable for fusion: query embedding failed"
+                    "tier3 (vec0) unavailable for fusion: query embedding task failed"
                 );
                 None
             }
@@ -281,13 +299,22 @@ impl SearchService {
                         .collect()
                 }),
             3 => {
-                let (query_embedding, degraded) =
-                    crate::tindy::compute_embeddings_for_text_tagged(query).map_err(|e| {
-                        anyhow::anyhow!(
-                            "Tier 3 search failed: embedding computation error for query ({} chars): {e}",
-                            query.len()
-                        )
-                    })?;
+                let query_owned = query.to_string();
+                // Same blocking-thread discipline as the fused path above: the
+                // sync embedding call must never park this worker.
+                let (query_embedding, degraded) = tokio::task::spawn_blocking(move || {
+                    crate::tindy::compute_embeddings_for_text_tagged(&query_owned)
+                })
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Tier 3 search failed: query embedding task join error: {e}")
+                })?
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Tier 3 search failed: embedding computation error for query ({} chars): {e}",
+                        query.len()
+                    )
+                })?;
                 query_embedding_degraded = degraded;
                 self.tier3.search(client, &query_embedding, limit).await
             }
