@@ -32,7 +32,13 @@ async fn query_embedding_cannot_hang_the_fused_search() {
         zen_vault::tindy::compute_embeddings_for_text_tagged("buffett").expect("probe");
 
     let outcome = tokio::time::timeout(
-        Duration::from_secs(2),
+        // Statically-linked ort means the query embedding really computes
+        // (no degraded fast-fail); on CI runners a warm BGE-M3 encode under
+        // nextest parallel load can exceed 2s. The pinned regression was a
+        // dead provider parking the executor for 240s+ — a 60s budget (the
+        // z-provider FASTEMBED_INIT_TIMEOUT_SECS ceiling) still catches any
+        // true hang while being immune to slow-runner compute.
+        Duration::from_secs(60),
         service.search_fused_with_diagnostics("buffett", tmp.path(), &client, Some(10)),
     )
     .await;
