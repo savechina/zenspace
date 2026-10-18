@@ -1,0 +1,94 @@
+#!/bin/bash
+# PURPOSE: Aggregate orchestration usage telemetry from the zen audit log —
+#          intent routing, delegate gates, plan-DAG, and quality-gate distributions.
+#          Keeps V13 vision decisions measured (V8.md §1 principles 2/5 baselines).
+# USAGE: bin/orchestration-stats [path-to-audit.jsonl]
+#        default: $ZEN_HOME/logs/audit.jsonl, fallback ~/.zen/logs/audit.jsonl
+# EXPECTED: Per-section counts + percentage distributions; exit 0 even with zero events.
+# ERRORS: Missing file → exit 1 with a hint. Fields absent from a line are skipped.
+
+set -euo pipefail
+
+AUDIT="${1:-${ZEN_HOME:-$HOME/.zen}/logs/audit.jsonl}"
+if [ ! -f "$AUDIT" ]; then
+  echo "audit log not found: $AUDIT (run 'zen serve start' first, or pass a path)" >&2
+  exit 1
+fi
+
+LINES=$(wc -l < "$AUDIT" | tr -d ' ')
+echo "# zen orchestration stats"
+echo "# source: $AUDIT ($LINES lines)"
+echo
+
+# Shared awk helper: extract a scalar field (string or number) from one JSON line.
+AWK_HELPER='
+function val(line, key,  re, m) {
+  re = "\"" key "\":\"[^\"]*\""
+  if (match(line, re)) { m = substr(line, RSTART, RLENGTH); sub("^\"" key "\":\"", "", m); sub("\"$", "", m); return m }
+  re = "\"" key "\":[0-9]+"
+  if (match(line, re)) { m = substr(line, RSTART, RLENGTH); sub("^\"" key "\":", "", m); return m + 0 }
+  return ""
+}'
+
+# --- Section 1: turns + intent routing + quality gate (loop.turn.review) ---
+awk "$AWK_HELPER"'
+/"kind":"loop.turn.review"/ {
+  turns++
+  cat = val($0, "intent_category"); if (cat != "") CAT[cat]++
+  src = val($0, "intent_source");   if (src != "") SRC[src]++
+  if ($0 ~ /"delivery_ready":false/) not_ready++
+  if ($0 ~ /"plan_approved":false/)  vetoed++
+  fb += val($0, "feedback_rounds")
+}
+END {
+    printf "[turn.review] turns=%d  delivery_not_ready=%d(%.0f%%)  plan_vetoed=%d  feedback_rounds_total=%d\n", \
+      turns, not_ready, (turns ? not_ready/turns*100 : 0), vetoed, fb
+    for (k in CAT) printf "  intent %-14s %4d (%.0f%%)\n", k, CAT[k], (turns ? CAT[k]/turns*100 : 0)
+    for (k in SRC) printf "  source %-14s %4d\n",     k, SRC[k], ""
+  }' "$AUDIT"
+
+# --- Section 2: gateway turn baseline ---
+awk '
+/"kind":"gateway.turn.started"/   { started++ }
+/"kind":"gateway.turn.completed"/ { completed++ }
+END { printf "[gateway] turns_started=%d  turns_completed=%d\n", started+0, completed+0 }' "$AUDIT"
+
+echo
+
+# --- Section 3: delegation gates (loop.delegate.gates) ---
+awk "$AWK_HELPER"'
+/"kind":"loop.delegate.gates"/ {
+  lines++
+  w = val($0, "batch_width"); if (w > 1) batched++
+  d = val($0, "depth");       if (d != "") DEPTH[d]++
+  if ($0 ~ /"independent":false/)        blocked_independent++
+  if ($0 ~ /"bounded":false/)            blocked_unbounded++
+  if ($0 ~ /"consumer_decision":false/)  blocked_consumer++
+  if ($0 ~ /"worth_it":false/)           blocked_not_worth++
+}
+END {
+    printf "[delegate.gates] events=%d  batched(width>1)=%d(%.0f%%)\n", lines, batched, (lines ? batched/lines*100 : 0)
+    printf "  blocked: independent=%d unbounded=%d consumer=%d not_worth=%d\n", \
+      blocked_independent+0, blocked_unbounded+0, blocked_consumer+0, blocked_not_worth+0
+    for (k in DEPTH) printf "  depth %s: %d\n", k, DEPTH[k]
+  }' "$AUDIT"
+
+# delegate target agents (each gates[].agent occurrence)
+grep '"kind":"loop.delegate.gates"' "$AUDIT" \
+  | grep -o '"agent":"[^"]*"' | sed 's/"agent":"//;s/"//' \
+  | sort | uniq -c | sort -rn | awk '{ printf "  target %-12s %s\n", $2, $1 }' || true
+
+echo
+
+# --- Section 4: plan-DAG executions (loop.plan.completed) ---
+awk "$AWK_HELPER"'
+/"kind":"loop.plan.completed"/ {
+  plans++
+  ok += val($0, "tasks_ok"); fail += val($0, "tasks_failed"); skip += val($0, "tasks_skipped")
+  dur += val($0, "duration_ms")
+  if ($0 ~ /"delivery_ready":false/) not_ready++
+}
+END {
+    printf "[plan.completed] plans=%d  tasks ok=%d failed=%d skipped=%d  avg_duration=%dms  not_ready=%d(%.0f%%)\n", \
+      plans, ok, fail, skip, (plans ? dur/plans : 0), not_ready, (plans ? not_ready/plans*100 : 0)
+  }' "$AUDIT"
