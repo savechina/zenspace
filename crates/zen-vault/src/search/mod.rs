@@ -36,8 +36,8 @@ pub struct SearchResult {
 const TIER1_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Explicit override for the ripgrep binary location, checked before PATH
-/// and well-known install locations (same operational pattern as ort's
-/// `ORT_DYLIB_PATH`).
+/// and well-known install locations (same shape as a `*_PATH` env override on
+/// a library's default resource location).
 const RG_PATH_ENV: &str = "ZEN_RG_PATH";
 
 /// Well-known install locations probed when `rg` is not on the process

@@ -222,11 +222,11 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
 // Local fastembed provider — ONNX-based local inference (macOS M4 etc.)
 // ---------------------------------------------------------------------------
 
-/// Set once fastembed init has PANICKED (ort 2.0.0-rc.13 `expect`s the
-/// ONNX dylib dlopen inside `load_dynamic::init`, so a missing
-/// libonnxruntime aborts the process before any `Result` can surface —
-/// production 2026-10-15: an installed binary without the dylib killed
-/// `zen wiki reindex` mid-run). After the first contained panic every
+/// Set once fastembed init has PANICKED (with the `ort-load-dynamic` variant of
+/// ort, a missing libonnxruntime aborts the process before any `Result` can
+/// surface — production 2026-10-15: an installed binary without the dylib killed
+/// `zen wiki reindex` mid-run; fixed 2026-10-18 by switching fastembed to the
+/// `ort-download-binaries` build-time fetch, closing this at compile time). After the first contained panic every
 /// later call short-circuits to `Err` and the router degrades to the next
 /// provider (ollama → hash) instead of aborting the caller.
 /// Bounds fastembed init/`hf_hub` download so a stalled fetch (e.g. through a
@@ -356,7 +356,7 @@ impl EmbeddingProvider for LocalFastembedProvider {
             }
             Ok(Err(payload)) => {
                 let reason = format!(
-                    "fastembed init panicked (missing onnxruntime dylib? set ORT_DYLIB_PATH): {}",
+                    "fastembed init panicked while loading the bundled onnxruntime: {}",
                     panic_reason(&*payload)
                 );
                 warn!("{reason}");

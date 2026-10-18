@@ -176,7 +176,12 @@ jsonschema = "0.29"
 futures = "0.3"
 
 # Fast embed: local ONNX inference for async batch embedding + Rerank pipeline
-fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "image-models", "ort-load-dynamic"] }
+# ort-download-binaries-rustls-tls (not ort-load-dynamic): build-time fetch +
+# static link of a prebuilt ONNX Runtime, so no machine needs a system
+# libonnxruntime / ORT_DYLIB_PATH (ort 2.0.0-rc.13 aborts at process exit when
+# its dlopen of libonnxruntime fails — linux CI ubuntu-latest observed
+# SIGABRT-at-exit on every test that ever touched the fastembed init path).
+fastembed = { version = "5.17", default-features = false, features = ["hf-hub-rustls-tls", "image-models", "ort-download-binaries-rustls-tls"] }
 
 # Plugin system: WASM sandbox + MCP server
 wasmtime = { version = "47", features = ["component-model"] }
