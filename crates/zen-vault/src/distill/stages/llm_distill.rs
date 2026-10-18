@@ -82,15 +82,19 @@ array — no prose, no code fence. Each element: \
 {\"name\": string, \"kind\": one of function|class|module|concept|person|\
 organization|event|product|technology|other, \"description\": one sentence, \
 \"aliases\": [alternative names], \"topics\": [themes]}. Extract at most 8 \
-notions. Never invent facts absent from the note.";
+notions. Never invent facts absent from the note. Keep distinctive names \
+exactly as written in the note (proper nouns, code identifiers, file paths) — \
+do not paraphrase them; lexical search must still be able to hit them verbatim.";
 
 /// Stable, cacheable merge-assist system prompt.
 const MERGE_SYSTEM: &str = "You are a wiki merge assistant. You receive a \
 target page title, a source page name, and the source lines that are new to \
 the target. Rewrite the new lines as one cohesive markdown section body \
 (sub-headings allowed, NO top-level title), preserving facts verbatim where \
-possible and dropping redundancy. Reply with ONLY the section body — no \
-prose, no code fence.";
+possible and dropping redundancy. Keep distinctive nouns, code identifiers, \
+and file paths exactly as written — never paraphrase them into generic \
+wording; lexical retrieval depends on exact matches. Reply with ONLY the \
+section body — no prose, no code fence.";
 
 /// LLM-enhanced distillation stage (FR-003, T046).
 ///

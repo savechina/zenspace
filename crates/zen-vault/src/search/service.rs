@@ -592,4 +592,53 @@ mod tests {
         assert!(!d.query_embedding_degraded);
         assert!(!d.query_embedding_unavailable);
     }
+
+    /// A degraded query embedding must not close the lexical tiers: in unit
+    /// tests the embedding router is empty, so every query degrades to the
+    /// hash fallback — Given: one stale-indexed FTS row (invisible to ripgrep) and one
+    /// unindexed on-disk file (invisible to FTS).
+    /// When: the fused pipeline runs with the degraded query vector.
+    /// Then: both files surface through fusion AND the diagnostics say
+    /// degraded — proving degradation only gates vec0, never tier1/tier2.
+    #[tokio::test]
+    async fn degraded_query_embedding_still_fuses_lexical_hits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("unindexed.md"),
+            "buffett letters archive reading notes\n",
+        )
+        .unwrap();
+        let stale = tmp.path().join("indexed.md");
+        std::fs::write(&stale, "plain text nothing special\n").unwrap();
+        let client = temp_client(tmp.path()).await;
+        zen_repo::NotesRepo::new(&client)
+            .index_note(zen_repo::types::IndexNoteRequest {
+                id: "n1",
+                title: "Stale row",
+                content: "xylophone zanzibar quixotic",
+                tags: "[]",
+                file_path: stale.to_str().unwrap(),
+                source: "test",
+            })
+            .await
+            .unwrap();
+
+        let (fused, diagnostics) = test_service()
+            .search_fused_with_diagnostics("xylophone", tmp.path(), &client, Some(10))
+            .await
+            .unwrap();
+
+        assert!(
+            diagnostics.query_embedding_degraded,
+            "unit-test env has no embedding provider: query must run degraded"
+        );
+        assert!(
+            !diagnostics.query_embedding_unavailable,
+            "the infallible hash fallback means the flag stays false"
+        );
+        assert!(
+            fused.iter().any(|f| f.result.file.ends_with("indexed.md")),
+            "FTS5 lexical hits must survive a degraded query embedding, got {fused:?}"
+        );
+    }
 }

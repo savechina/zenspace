@@ -79,6 +79,9 @@ impl Tier5Search {
              - Answer based ONLY on the provided search results\n\
              - If the results don't contain enough information, say so\n\
              - Cite sources by filename where possible\n\
+             - Quote distinctive nouns, code identifiers, and file paths \
+             verbatim from the results — do not paraphrase them; lexical \
+             search depends on exact matches\n\
              - Be concise (2-3 paragraphs max unless the query demands more)",
             query = sanitized_query,
             context_text = context_text
