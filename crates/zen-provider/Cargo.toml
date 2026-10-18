@@ -24,5 +24,14 @@ rig-compose = { workspace = true }
 fastembed = { workspace = true }
 home = { workspace = true }
 
+# Intel macOS has no prebuilt ONNX Runtime since ort-sys 2.0.0-rc.12
+# (Microsoft ended x64 macOS support at 1.24.1; pykeio/ort#556) — the
+# download-binaries config above fails to build on x86_64-apple-darwin.
+# Fall that target back to runtime dlopen: compile always succeeds, and the
+# embedding router degrades when no libonnxruntime is present at runtime.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies.fastembed]
+workspace = true
+features = ["ort-load-dynamic"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
