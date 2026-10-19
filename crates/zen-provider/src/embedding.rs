@@ -24,6 +24,11 @@ pub trait EmbeddingProvider: Send + Sync + std::fmt::Debug {
     fn expected_dimension(&self) -> usize {
         0
     }
+    /// (engine, model/config) identity of the backing engine — describes
+    /// configuration, not health.
+    fn engine_descriptor(&self) -> Option<(String, String)> {
+        None
+    }
 }
 
 pub trait EmbeddingRouter: Send + Sync + std::fmt::Debug {
@@ -113,9 +118,16 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
                         .http_client(http)
                         .build()
                 } else {
+                    let http = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(EMBED_REQUEST_TIMEOUT_SECS))
+                        .build()
+                        .map_err(|e| EmbeddingError::RequestFailed {
+                            reason: format!("Ollama embed http client init error: {e}"),
+                        })?;
                     ollama::Client::builder()
                         .api_key(Nothing)
                         .base_url(&base_url)
+                        .http_client(http)
                         .build()
                 }
                 .map_err(|e| EmbeddingError::RequestFailed {
@@ -146,6 +158,10 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
         // System dimension is 4096 — shorter vectors (e.g. 384-dim
         // from nomic-embed-text) are zero-padded at the application layer.
         4096
+    }
+
+    fn engine_descriptor(&self) -> Option<(String, String)> {
+        Some(("ollama".into(), self.model.clone()))
     }
 }
 
@@ -185,7 +201,23 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let mut builder = openai::Client::builder().api_key(&api_key);
+                let http = if is_loopback_url(&base_url) {
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(std::time::Duration::from_secs(EMBED_REQUEST_TIMEOUT_SECS))
+                        .build()
+                } else {
+                    reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(EMBED_REQUEST_TIMEOUT_SECS))
+                        .build()
+                }
+                .map_err(|e| EmbeddingError::RequestFailed {
+                    reason: format!("OpenAI embed http client init error: {e}"),
+                })?;
+
+                let mut builder = openai::Client::builder()
+                    .api_key(&api_key)
+                    .http_client(http);
                 if base_url != zen_core::constants::OPENAI_API_URL {
                     builder = builder.base_url(&base_url);
                 }
@@ -215,6 +247,10 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
 
     fn expected_dimension(&self) -> usize {
         384
+    }
+
+    fn engine_descriptor(&self) -> Option<(String, String)> {
+        Some((self.name.clone(), self.model.clone()))
     }
 }
 
@@ -392,6 +428,15 @@ impl EmbeddingProvider for LocalFastembedProvider {
     fn expected_dimension(&self) -> usize {
         // BGESmallENV15 (fastembed default) outputs 384-dim.
         384
+    }
+
+    fn engine_descriptor(&self) -> Option<(String, String)> {
+        Some((
+            "fastembed".to_string(),
+            self.model
+                .clone()
+                .unwrap_or_else(|| "BGESmallENV15".to_string()),
+        ))
     }
 }
 
@@ -615,6 +660,12 @@ impl DefaultEmbeddingRouter {
     pub fn embed_sync(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         self.embed_with_providers(text)
     }
+
+    /// First registered provider's engine identity; intentionally ignores the
+    /// dead flags — the descriptor reports configuration, not health.
+    pub fn engine_descriptor(&self) -> Option<(String, String)> {
+        self.providers.iter().find_map(|p| p.engine_descriptor())
+    }
 }
 
 impl EmbeddingRouter for DefaultEmbeddingRouter {
@@ -643,6 +694,10 @@ mod tests {
         assert_eq!(p.provider_name(), "ollama");
         // System embedding dimension is 4096; shorter vectors are padded.
         assert_eq!(p.expected_dimension(), 4096);
+        assert_eq!(
+            p.engine_descriptor(),
+            Some(("ollama".to_string(), "nomic-embed-text".to_string()))
+        );
     }
 
     #[test]
@@ -654,6 +709,57 @@ mod tests {
         );
         assert_eq!(p.provider_name(), "openai");
         assert_eq!(p.expected_dimension(), 384);
+        assert_eq!(
+            p.engine_descriptor(),
+            Some(("openai".to_string(), "text-embedding-3-small".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_openai_engine_descriptor_uses_override_name() {
+        let p = OpenAiEmbeddingProvider::new(
+            "test-key".into(),
+            "text-embedding-v3".into(),
+            "https://dashscope.aliyuncs.com".into(),
+        )
+        .with_name("aliyun");
+        assert_eq!(
+            p.engine_descriptor(),
+            Some(("aliyun".to_string(), "text-embedding-v3".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_fastembed_engine_descriptor_without_model_load() {
+        let configured =
+            LocalFastembedProvider::new(Some("NomicEmbedTextV15".to_string()), None, None);
+        assert_eq!(
+            configured.engine_descriptor(),
+            Some(("fastembed".to_string(), "NomicEmbedTextV15".to_string()))
+        );
+
+        let default_model = LocalFastembedProvider::new(None, None, None);
+        assert_eq!(
+            default_model.engine_descriptor(),
+            Some(("fastembed".to_string(), "BGESmallENV15".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_router_engine_descriptor_skips_none_and_ignores_dead_flags() {
+        let p1: Box<dyn EmbeddingProvider> = Box::new(FailingProvider("first"));
+        let p2: Box<dyn EmbeddingProvider> = Box::new(OllamaEmbeddingProvider::new(
+            "http://localhost:11434".into(),
+            "qwen3-embedding".into(),
+        ));
+        let router = DefaultEmbeddingRouter::with_providers(vec![p1, p2]);
+        assert_eq!(
+            router.engine_descriptor(),
+            Some(("ollama".to_string(), "qwen3-embedding".to_string()))
+        );
+
+        let empty = DefaultEmbeddingRouter::with_providers(vec![]);
+        assert_eq!(empty.engine_descriptor(), None);
     }
 
     #[test]

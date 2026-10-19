@@ -51,6 +51,11 @@ impl<'a> EmbeddingsRepo<'a> {
     /// one explicit transaction so a crash can never leave the vec0 tables
     /// DROPPED-but-not-recreated (`execute_batch` alone autocommits per
     /// statement; SQLite DDL is transactional, so BEGIN/COMMIT is sound).
+    ///
+    /// The `embedding_engine` fingerprint is deleted in the same transaction:
+    /// it describes vectors that no longer exist, so letting it outlive the
+    /// reset would let a later comparison certify an empty index as belonging
+    /// to the recorded engine.
     pub async fn reset_embedding_tables(&self) -> Result<()> {
         self.client
             .writer()
@@ -69,12 +74,56 @@ impl<'a> EmbeddingsRepo<'a> {
                      );
                      UPDATE notes_meta SET content_hash = '';
                      UPDATE notes_meta SET embedded_hash = '';
+                     DELETE FROM embedding_engine;
                      COMMIT;",
                 )?;
                 Ok(())
             })
             .await
             .map_err(SqliteError::TokioRusqlite)
+    }
+
+    /// Read the stored embedding engine fingerprint `(backend, model, dim)`.
+    ///
+    /// Returns `Ok(None)` when the table has no row (fresh database, or after
+    /// [`Self::reset_embedding_tables`] cleared it) — the caller must treat
+    /// that as "unknown provenance", i.e. re-embed before trusting vectors.
+    pub async fn engine_fingerprint(&self) -> Result<Option<(String, String, i64)>> {
+        let row = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT backend, model, dim FROM embedding_engine WHERE id = 1",
+        )
+        .fetch_optional(self.client.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Record the active embedding engine (single-row UPSERT on `id = 1`).
+    ///
+    /// Overwrites any previous fingerprint and bumps `updated_at`; call after
+    /// a successful full re-embed so the next reindex can compare this stored
+    /// tuple against the active engine and refuse to mix vector spaces.
+    pub async fn set_engine_fingerprint(&self, backend: &str, model: &str, dim: i64) -> Result<()> {
+        // `writer().call` needs a 'static closure — own the params (as mark_embedded does).
+        let backend = backend.to_string();
+        let model = model.to_string();
+        self.client
+            .writer()
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO embedding_engine(id, backend, model, dim) \
+                     VALUES(1, ?1, ?2, ?3) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         backend = excluded.backend, \
+                         model = excluded.model, \
+                         dim = excluded.dim, \
+                         updated_at = datetime('now')",
+                    rusqlite::params![backend, model, dim],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)?;
+        Ok(())
     }
 
     /// KNN over the vec0 note embeddings (tier-3 semantic retrieval).

@@ -59,9 +59,18 @@ fn get_embedding_router() -> &'static DefaultEmbeddingRouter {
     })
 }
 
+/// Active embedding engine `(backend, model)`; `None` when the router is
+/// empty (test env / config load failure).
+pub fn embedding_engine_descriptor() -> Option<(String, String)> {
+    get_embedding_router().engine_descriptor()
+}
+
 /// System-wide embedding dimension. All vectors are padded to this
 /// dimension before insert / search to support multiple providers with
 /// different native dimensionalities.
+/// Migration-locked: the stored vec0 `FLOAT[4096]` DDL is fixed in zen-repo
+/// migrations 002 and the reset path, so changing this value requires a vec0
+/// reset (drop/recreate via `zen wiki reindex --reset-embeddings`).
 pub const SYSTEM_EMBEDDING_DIM: usize = 4096;
 
 /// Pad or trim a vector to the target dimension.
@@ -77,11 +86,24 @@ fn compute_embedding_with_fallback(text: &str) -> (Vec<f32>, bool) {
     let router = get_embedding_router();
 
     if let Ok(embedding) = router.embed_sync(text) {
+        // Degenerate provider output must never reach vec0: a zero-norm or
+        // non-finite vector inserts successfully but poisons L2-distance KNN
+        // (HTTP-200 zero vectors, ollama#17878 class).
+        if embedding.iter().any(|v| !v.is_finite())
+            || embedding.iter().map(|v| v * v).sum::<f32>() < 1e-12
+        {
+            warn!(
+                "degenerate embedding (zero-norm or non-finite); falling back to hash — see ollama#17878 class"
+            );
+            return (hash_embedding(text), true);
+        }
         info!(
             "ComputeEmbeddings: provider returns {}-dim",
             embedding.len()
         );
-        return (pad_to_dim(&embedding, SYSTEM_EMBEDDING_DIM), false);
+        let mut v = pad_to_dim(&embedding, SYSTEM_EMBEDDING_DIM);
+        l2_normalize(&mut v);
+        return (v, false);
     }
 
     warn!("ComputeEmbeddings: provider embedding failed, using hash fallback (degraded)");

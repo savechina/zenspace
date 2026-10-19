@@ -5,10 +5,12 @@ use std::path::Path;
 use anyhow::Result;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
-use zen_repo::{IndexNoteRequest, NotesRepo, SqliteClient};
+use zen_repo::{EmbeddingsRepo, IndexNoteRequest, NotesRepo, SqliteClient};
 
 use super::checksum;
-use super::embeddings::compute_embeddings_for_text_tagged;
+use super::embeddings::{
+    SYSTEM_EMBEDDING_DIM, compute_embeddings_for_text_tagged, embedding_engine_descriptor,
+};
 use crate::note;
 use crate::search::Tier3Search;
 
@@ -290,6 +292,42 @@ impl Reindexer {
                         "Reindex gate: could not preload embedded hashes ({e}) — \
                          every vector will be treated as stale"
                     );
+                }
+            }
+        }
+
+        // ── Engine-fingerprint gate ───────────────────────────────────────
+        if let Some(client) = &self.db_client {
+            let active = embedding_engine_descriptor()
+                .map(|(backend, model)| (backend, model, SYSTEM_EMBEDDING_DIM as i64));
+            match EmbeddingsRepo::new(client).engine_fingerprint().await {
+                Ok(stored) => match fingerprint_gate(stored, active.clone()) {
+                    GateDecision::Proceed => {}
+                    GateDecision::Write => {
+                        if let Some((backend, model, dim)) = active.as_ref() {
+                            let set = EmbeddingsRepo::new(client)
+                                .set_engine_fingerprint(backend, model, *dim)
+                                .await;
+                            if let Err(e) = set {
+                                warn!("Fingerprint write failed ({e}) — proceeding unrecorded");
+                            }
+                        }
+                    }
+                    GateDecision::UnknownEngine => {
+                        warn!("Embedding engine unknown (empty router) — gate skipped");
+                    }
+                    GateDecision::Mismatch(stored_fp, active_fp) => {
+                        return Err(anyhow::anyhow!(
+                            "embedding engine fingerprint mismatch: stored {stored_fp:?} \
+                             vs active {active_fp:?} — mixing embedding engines in one vec0 \
+                             table makes KNN distances meaningless; run \
+                             `zen wiki reindex --reset-embeddings` to reset the vec0 tables, \
+                             then reindex to rebuild every vector with the active engine"
+                        ));
+                    }
+                },
+                Err(e) => {
+                    warn!("Engine fingerprint read failed ({e}) — gate skipped");
                 }
             }
         }
@@ -650,4 +688,71 @@ impl Reindexer {
 pub async fn reindex_all(knowledge_dir: &Path) -> Result<ReindexReport> {
     let reindexer = Reindexer::new();
     reindexer.reindex(knowledge_dir).await
+}
+
+// ── Engine-fingerprint gate (pure decision seam) ─────────────────────
+
+#[derive(Debug, PartialEq)]
+enum GateDecision {
+    Write,
+    Proceed,
+    Mismatch((String, String, i64), (String, String, i64)),
+    UnknownEngine,
+}
+
+fn fingerprint_gate(
+    stored: Option<(String, String, i64)>,
+    active: Option<(String, String, i64)>,
+) -> GateDecision {
+    match (stored, active) {
+        (None, Some(_)) => GateDecision::Write,
+        (Some(stored), Some(active)) if stored == active => GateDecision::Proceed,
+        (Some(stored), Some(active)) => GateDecision::Mismatch(stored, active),
+        (None, None) | (Some(_), None) => GateDecision::UnknownEngine,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fp(backend: &str, model: &str) -> (String, String, i64) {
+        (backend.to_string(), model.to_string(), 4096)
+    }
+
+    #[test]
+    fn fingerprint_gate_writes_when_stored_missing() {
+        assert_eq!(
+            fingerprint_gate(None, Some(fp("ollama", "bge-m3"))),
+            GateDecision::Write
+        );
+    }
+
+    #[test]
+    fn fingerprint_gate_proceeds_on_matching_fingerprint() {
+        let engine = fp("ollama", "bge-m3");
+        assert_eq!(
+            fingerprint_gate(Some(engine.clone()), Some(engine)),
+            GateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn fingerprint_gate_rejects_mismatched_engines() {
+        let stored = fp("ollama", "bge-m3");
+        let active = fp("openai", "text-embedding-3-small");
+        assert_eq!(
+            fingerprint_gate(Some(stored.clone()), Some(active.clone())),
+            GateDecision::Mismatch(stored, active)
+        );
+    }
+
+    #[test]
+    fn fingerprint_gate_fails_open_when_engine_unknown() {
+        assert_eq!(
+            fingerprint_gate(Some(fp("ollama", "bge-m3")), None),
+            GateDecision::UnknownEngine
+        );
+        assert_eq!(fingerprint_gate(None, None), GateDecision::UnknownEngine);
+    }
 }
