@@ -79,17 +79,28 @@ fn sc007_typed_signals_route_to_wisdom_surfaces() {
     let journal_dir = test.cwd.join("memories").join("journal");
     fs::create_dir_all(&journal_dir).expect("create journal dir");
 
+    // Clock-derived stem: the anti-talk scan parses journal filename dates
+    // against a 90-day window, so a hardcoded date would age out of it.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
     // Section-headed entry: Facts/Reflections/Commitments buckets.
     fs::write(
-        journal_dir.join("2026-08-30-session.md"),
-        "---\nsession_id: s1\njournaled_at: 2026-08-30T10:00:00Z\n---\n\n## Facts\n\n- Tokio powers the async runtime\n- SQLite stores the knowledge graph\n\n## Reflections\n\n- the loop converges\n",
+        journal_dir.join(format!("{today}-session.md")),
+        format!(
+            "---\nsession_id: s1\njournaled_at: {today}T10:00:00Z\n---\n\n## Facts\n\n\
+             - Tokio powers the async runtime\n\
+             - SQLite stores the knowledge graph\n\n## Reflections\n\n- the loop converges\n"
+        ),
     )
     .expect("write journal entry 1");
 
     // kind-tagged entry: decision signals (same convention zen_loop greps).
     fs::write(
-        journal_dir.join("2026-08-30-decisions.md"),
-        "---\nsession_id: s2\njournaled_at: 2026-08-30T11:00:00Z\nkind: decision\n---\n\n- Use SQLite over Postgres|||offline-first|||lower ops cost\n",
+        journal_dir.join(format!("{today}-decisions.md")),
+        format!(
+            "---\nsession_id: s2\njournaled_at: {today}T11:00:00Z\nkind: decision\n---\n\n\
+             - Use SQLite over Postgres|||offline-first|||lower ops cost\n"
+        ),
     )
     .expect("write journal entry 2");
 

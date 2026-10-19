@@ -10444,6 +10444,7 @@ dependencies = [
 name = "zen"
 version = "0.0.9"
 dependencies = [
+ "chrono",
  "dotenvy",
  "rig-compose",
  "serde_json",
