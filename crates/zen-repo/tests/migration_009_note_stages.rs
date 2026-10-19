@@ -119,8 +119,10 @@ async fn test_load_note_stages_filters_by_stage() {
 async fn test_prune_note_stages_removes_absent_paths_capped_by_age() {
     let (client, dir) = make_client().await;
     let repo = NotionsRepo::new(&client);
-    let old = "2026-01-01T00:00:00Z";
-    let recent = "2026-09-19T00:00:00Z";
+    // Stamps derive from the clock (mirroring the `now - max_age_days`
+    // cutoff) so the age-cap boundary can never time-bomb.
+    let old = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+    let recent = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
 
     // Path that still exists on disk → kept even when old.
     let existing = dir.path().join("still-here.md");
@@ -129,20 +131,25 @@ async fn test_prune_note_stages_removes_absent_paths_capped_by_age() {
         existing.display().to_string().as_str(),
         HASH_A,
         "archived",
-        old,
+        old.as_str(),
     )
     .await
     .unwrap();
 
     // Path absent from the vault AND old → pruned.
-    repo.record_note_stage("/vault/inbox/gone.md", HASH_B, "archived", old)
+    repo.record_note_stage("/vault/inbox/gone.md", HASH_B, "archived", old.as_str())
         .await
         .unwrap();
 
     // Path absent but recent → kept (age cap).
-    repo.record_note_stage("/vault/inbox/recent.md", "cccc", "archived", recent)
-        .await
-        .unwrap();
+    repo.record_note_stage(
+        "/vault/inbox/recent.md",
+        "cccc",
+        "archived",
+        recent.as_str(),
+    )
+    .await
+    .unwrap();
 
     let pruned = repo.prune_note_stages(30).await.unwrap();
     assert_eq!(pruned, 1, "only the old + absent row must be pruned");
