@@ -138,8 +138,18 @@ impl ZenTool for Tier3SearchTool {
         })?;
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
 
-        let embedding = crate::tindy::compute_embeddings_for_text(query)
-            .map_err(|e| ZenToolError::ExecutionFailed(format!("query embedding failed: {e}")))?;
+        // Same blocking-thread discipline as SearchService's tier paths: the
+        // sync provider call (up to its 240s timeout) must never park this
+        // async worker.
+        let query_owned = query.to_string();
+        let embedding = tokio::task::spawn_blocking(move || {
+            crate::tindy::compute_embeddings_for_text(&query_owned)
+        })
+        .await
+        .map_err(|e| {
+            ZenToolError::ExecutionFailed(format!("query embedding task join failed: {e}"))
+        })?
+        .map_err(|e| ZenToolError::ExecutionFailed(format!("query embedding failed: {e}")))?;
 
         let client = self.db.get().await.map_err(ZenToolError::ExecutionFailed)?;
 

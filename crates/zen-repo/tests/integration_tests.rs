@@ -267,6 +267,103 @@ async fn test_notes_search_snippet_carries_canonical_file_content() {
     );
 }
 
+// ── Perf review 2026-10-20: snippet char cap + dir-scoped search ─────────
+
+#[tokio::test]
+async fn test_notes_search_snippet_truncated_at_char_cap() {
+    let (client, dir) = make_client().await;
+    let repo = zen_repo::NotesRepo::new(&client);
+
+    // >8192 chars of multi-byte CJK: the cut must land on a char boundary
+    // (a byte-index cut would split a codepoint), and the truncation must be
+    // visible to consumers instead of silently masquerading as full content.
+    let body: String = "禅意知识库条目 ".repeat(3000);
+    let note_path = dir.path().join("long.md");
+    std::fs::write(&note_path, &body).unwrap();
+    repo.index_note(IndexNoteRequest {
+        id: "long",
+        title: "Long",
+        content: "longtrunctoken body",
+        tags: "",
+        file_path: note_path.to_str().unwrap(),
+        source: "test",
+    })
+    .await
+    .unwrap();
+
+    let results = repo.search("longtrunctoken", 10).await.unwrap();
+    assert_eq!(results.len(), 1);
+    let snippet = &results[0].snippet;
+    assert!(snippet.ends_with("\n…[truncated]"), "got: {snippet:?}");
+    let marker_chars = "\n…[truncated]".chars().count();
+    assert_eq!(snippet.chars().count(), 8192 + marker_chars);
+}
+
+#[tokio::test]
+async fn test_notes_search_scoped_filters_and_caps() {
+    let (client, dir) = make_client().await;
+    let repo = zen_repo::NotesRepo::new(&client);
+
+    let dir_a = dir.path().join("a");
+    let dir_b = dir.path().join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    for i in 0..3 {
+        let p = dir_a.join(format!("a{i}.md"));
+        std::fs::write(&p, format!("SCOPED-A-{i} scopedtoken")).unwrap();
+        repo.index_note(IndexNoteRequest {
+            id: &format!("a{i}"),
+            title: &format!("A{i}"),
+            content: "scopedtoken body",
+            tags: "",
+            file_path: p.to_str().unwrap(),
+            source: "test",
+        })
+        .await
+        .unwrap();
+    }
+    let p_b = dir_b.join("other.md");
+    std::fs::write(&p_b, "SCOPED-B scopedtoken").unwrap();
+    repo.index_note(IndexNoteRequest {
+        id: "b0",
+        title: "B",
+        content: "scopedtoken body",
+        tags: "",
+        file_path: p_b.to_str().unwrap(),
+        source: "test",
+    })
+    .await
+    .unwrap();
+
+    // Scoped to a/: only a-rows, snippets populated for survivors.
+    let rows = repo
+        .search_scoped("scopedtoken", dir_a.to_str().unwrap(), 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "all a-rows, b excluded");
+    assert!(rows.iter().all(|r| r.path.contains("/a/")));
+    assert!(
+        rows.iter().all(|r| r.snippet.contains("SCOPED-A")),
+        "snippets must be backfilled from canonical files"
+    );
+
+    // Cap applies after the filter.
+    let capped = repo
+        .search_scoped("scopedtoken", dir_a.to_str().unwrap(), 2)
+        .await
+        .unwrap();
+    assert_eq!(capped.len(), 2);
+
+    // Scoped to b/: only the b-row.
+    let rows_b = repo
+        .search_scoped("scopedtoken", dir_b.to_str().unwrap(), 10)
+        .await
+        .unwrap();
+    assert_eq!(rows_b.len(), 1);
+    assert!(rows_b[0].snippet.contains("SCOPED-B"));
+}
+
 #[tokio::test]
 async fn test_notes_search_unreadable_file_fails_open_to_empty_snippet() {
     let (client, dir) = make_client().await;

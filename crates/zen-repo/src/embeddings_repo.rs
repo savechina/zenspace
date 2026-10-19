@@ -1,6 +1,19 @@
 use crate::client::{Result, SqliteClient, SqliteError};
 use crate::types::{InsertNoteEmbeddingRequest, InsertNotionEmbeddingRequest, VecSearchResult};
 
+/// Serialize an f32 slice into the little-endian vec0 blob format.
+///
+/// Single-allocation conversion: the former `flat_map(|f| f.to_le_bytes().to_vec())`
+/// produced one heap Vec per dimension (4096 per 4096-dim vector, per query
+/// and per insert).
+fn embedding_blob(v: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        blob.extend_from_slice(&f.to_le_bytes());
+    }
+    blob
+}
+
 pub struct EmbeddingsRepo<'a> {
     client: &'a SqliteClient,
 }
@@ -143,10 +156,7 @@ impl<'a> EmbeddingsRepo<'a> {
             return Ok(Vec::new());
         }
         let top_k = top_k.max(1) as i64;
-        let blob: Vec<u8> = query_embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes().to_vec())
-            .collect();
+        let blob = embedding_blob(query_embedding);
 
         let mut results = sqlx::query_as::<_, VecSearchResult>(
             "SELECT nm.file_path AS file, 0 AS line, '' AS content \
@@ -210,11 +220,7 @@ impl<'a> EmbeddingsRepo<'a> {
     /// vector with no insert to replace it).
     pub async fn insert_note_embedding(&self, req: InsertNoteEmbeddingRequest<'_>) -> Result<()> {
         let note_id = req.note_id.to_string();
-        let blob: Vec<u8> = req
-            .embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes().to_vec())
-            .collect();
+        let blob = embedding_blob(req.embedding);
 
         self.client
             .writer()
@@ -247,11 +253,7 @@ impl<'a> EmbeddingsRepo<'a> {
         req: InsertNotionEmbeddingRequest<'_>,
     ) -> Result<()> {
         let notion_id = req.notion_id.to_string();
-        let blob: Vec<u8> = req
-            .embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes().to_vec())
-            .collect();
+        let blob = embedding_blob(req.embedding);
 
         self.client
             .writer()

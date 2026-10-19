@@ -1172,13 +1172,29 @@ impl AgentOrchestrator {
             )
             .await?;
         let sanitizer = InputSanitizer::new();
+        // Off-runtime batch read: the per-result metadata+read syscalls are
+        // blocking std::fs and must not park this async worker (same
+        // discipline as the zen-repo snippet backfills). A join failure
+        // degrades to zero file reads — each note then falls back to its
+        // search snippet, matching the fail-open read-error path.
+        let files: Vec<std::path::PathBuf> = results.iter().map(|r| r.file.clone()).collect();
+        let from_files = tokio::task::spawn_blocking(move || {
+            files
+                .iter()
+                .map(|f| {
+                    fs::metadata(f)
+                        .ok()
+                        .filter(|m| m.len() <= WAKE_UP_BRIEF_MAX_BYTES)
+                        .and_then(|_| fs::read_to_string(f).ok())
+                })
+                .collect::<Vec<Option<String>>>()
+        })
+        .await
+        .unwrap_or_default();
         Ok(results
             .into_iter()
-            .filter_map(|r| {
-                let from_file = fs::metadata(&r.file)
-                    .ok()
-                    .filter(|m| m.len() <= WAKE_UP_BRIEF_MAX_BYTES)
-                    .and_then(|_| fs::read_to_string(&r.file).ok());
+            .zip(from_files)
+            .filter_map(|(r, from_file)| {
                 let raw = from_file.unwrap_or_else(|| r.content.clone());
                 if raw.trim().is_empty() {
                     return None;

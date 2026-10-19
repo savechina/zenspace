@@ -100,39 +100,37 @@ impl SearchService {
         // (240s) timeout. spawn_blocking (unlike a dropped future) runs the
         // call to completion on the blocking pool even if this task is
         // cancelled. A join failure is treated exactly like a compute error.
-        let embedding = match tokio::task::spawn_blocking(move || {
+        // The task is STARTED here but only awaited INSIDE the join below, so
+        // tiers 1/2/4 (which need no embedding) run concurrently with the
+        // provider call instead of serializing behind it.
+        let embedding_task = tokio::task::spawn_blocking(move || {
             crate::tindy::compute_embeddings_for_text_tagged(&query_owned)
-        })
-        .await
-        {
-            Ok(Ok((embedding, degraded))) => {
-                diagnostics.query_embedding_degraded = degraded;
-                Some(embedding)
-            }
-            Ok(Err(e)) => {
-                diagnostics.query_embedding_unavailable = true;
-                warn!(
-                    error = %e,
-                    "tier3 (vec0) unavailable for fusion: query embedding failed"
-                );
-                None
-            }
-            Err(e) => {
-                diagnostics.query_embedding_unavailable = true;
-                warn!(
-                    error = %e,
-                    "tier3 (vec0) unavailable for fusion: query embedding task failed"
-                );
-                None
-            }
-        };
+        });
 
         let (fts, semantic, graph, ppr, raw) = tokio::join!(
             self.tier2.search_in_dir(client, query, base_dir, limit),
             async {
-                match &embedding {
-                    Some(embedding) => self.tier3.search(client, embedding, limit).await,
-                    None => Ok(Vec::new()),
+                match embedding_task.await {
+                    Ok(Ok((embedding, degraded))) => {
+                        diagnostics.query_embedding_degraded = degraded;
+                        self.tier3.search(client, &embedding, limit).await
+                    }
+                    Ok(Err(e)) => {
+                        diagnostics.query_embedding_unavailable = true;
+                        warn!(
+                            error = %e,
+                            "tier3 (vec0) unavailable for fusion: query embedding failed"
+                        );
+                        Ok(Vec::new())
+                    }
+                    Err(e) => {
+                        diagnostics.query_embedding_unavailable = true;
+                        warn!(
+                            error = %e,
+                            "tier3 (vec0) unavailable for fusion: query embedding task failed"
+                        );
+                        Ok(Vec::new())
+                    }
                 }
             },
             self.tier4.search(client, query, 3),
@@ -284,7 +282,18 @@ impl SearchService {
 
         let mut query_embedding_degraded = false;
         let results = match selected {
-            1 => Tier1Search::search(query, base_dir, limit),
+            // Same off-runtime discipline as the fused path: tier-1 spawns an
+            // rg process and blocks on it (up to its 10s timeout), so it must
+            // never run inline on this async worker.
+            1 => {
+                let query = query.to_string();
+                let dir = base_dir.to_path_buf();
+                tokio::task::spawn_blocking(move || Tier1Search::search(&query, &dir, limit))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(anyhow::anyhow!("Tier 1 search failed: join error: {e}"))
+                    })
+            }
             2 => self
                 .tier2
                 .search_in_dir(client, query, base_dir, limit)

@@ -111,14 +111,27 @@ pub async fn search(state: Arc<KnowledgeState>, params: Value) -> Result<Value, 
     let mut degraded = Vec::new();
     let mut query_embedding_degraded = false;
     let mut query_embedding_unavailable = false;
-    'scan: for dir in &state.scan_dirs {
-        if !dir.is_dir() {
-            continue;
-        }
-        let (results, diagnostics) = match service
-            .search_with_diagnostics(&query, dir, client, tier, None, Some(limit as usize))
-            .await
-        {
+    // Each dir runs a full independent pipeline (fused tiers per dir), so the
+    // scans are run CONCURRENTLY: wall time is max(dirs) instead of the sum,
+    // and the duplicated embedding/ripgrep work across dirs overlaps instead
+    // of stacking. Results still merge in scan_dirs order with the same
+    // dedup, cap, and degraded semantics as the former sequential loop.
+    let scans: Vec<_> = state
+        .scan_dirs
+        .iter()
+        .filter(|d| d.is_dir())
+        .map(|dir| {
+            let dir = dir.clone();
+            async {
+                let r = service
+                    .search_with_diagnostics(&query, &dir, client, tier, None, Some(limit as usize))
+                    .await;
+                (dir, r)
+            }
+        })
+        .collect();
+    for (dir, outcome) in futures_util::future::join_all(scans).await {
+        let (results, diagnostics) = match outcome {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), error = %e, "knowledge/search tier failed");
@@ -129,6 +142,12 @@ pub async fn search(state: Arc<KnowledgeState>, params: Value) -> Result<Value, 
         query_embedding_degraded |= diagnostics.query_embedding_degraded;
         query_embedding_unavailable |= diagnostics.query_embedding_unavailable;
         for r in results {
+            // Quota check BEFORE the push (the sequential version exited the
+            // whole scan via `break 'scan`; per-dir loops must not let a later
+            // dir's first hit exceed the cap while breaking).
+            if notes.len() >= limit as usize {
+                break;
+            }
             if seen.insert(normalize_path(&r.file)) {
                 notes.push(json!({
                     "path": r.file.display().to_string(),
@@ -136,9 +155,6 @@ pub async fn search(state: Arc<KnowledgeState>, params: Value) -> Result<Value, 
                     "sensitivity": "public",
                     "relevance": 1.0,
                 }));
-            }
-            if notes.len() >= limit as usize {
-                break 'scan;
             }
         }
     }

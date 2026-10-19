@@ -18,6 +18,18 @@ use crate::types::{FtsResult, IndexNoteRequest};
 /// a config key (T192 no-dormant-key discipline).
 pub const SNIPPET_FILE_MAX_BYTES: u64 = 256 * 1024;
 
+/// Character cap on the returned snippet (perf review 2026-10-20).
+///
+/// `read_canonical_snippet` used to return the WHOLE file (up to the 256 KiB
+/// read cap); that full text was then cloned per hit through RRF fusion and
+/// serialized into `knowledge/search` responses — up to ~5 MB of String
+/// traffic per query. No consumer uses more than the first few KB (TUI
+/// renders 2000 chars, orchestrator injection budget is 4000 chars and
+/// re-reads the file itself), so the snippet is cut at 8192 CHARS
+/// (char-boundary safe for CJK, so ≤32 KiB memory) with an explicit
+/// truncation marker. Const for the same T192 reason as the byte cap.
+pub(crate) const SNIPPET_MAX_CHARS: usize = 8 * 1024;
+
 /// Read the canonical markdown file behind a search hit (T222).
 ///
 /// `notes_fts` is a CONTENTLESS fts5 table (`content=''`, migration
@@ -37,6 +49,14 @@ pub(crate) fn read_canonical_snippet(file_path: &str) -> String {
         .ok()
         .filter(|m| m.is_file() && m.len() <= SNIPPET_FILE_MAX_BYTES)
         .and_then(|_| std::fs::read_to_string(file_path).ok())
+        .map(|content| {
+            if content.chars().count() <= SNIPPET_MAX_CHARS {
+                return content;
+            }
+            let mut truncated: String = content.chars().take(SNIPPET_MAX_CHARS).collect();
+            truncated.push_str("\n…[truncated]");
+            truncated
+        })
         .unwrap_or_default()
 }
 
@@ -75,8 +95,52 @@ impl<'a> NotesRepo<'a> {
         .bind(limit)
         .fetch_all(self.client.pool())
         .await?;
-        // File reads are blocking std::fs (capped at 256KiB each) — take them
-        // off the async executor so a burst of hits cannot stall runtime workers.
+        self.populate_snippets(&mut results).await;
+        Ok(results)
+    }
+
+    /// [`Self::search`] restricted to files under `base_dir` (perf review
+    /// 2026-10-20).
+    ///
+    /// The FTS index is global, so the former flow (fetch `limit*2`, read
+    /// snippet files for EVERY row, then drop out-of-dir rows in the caller)
+    /// paid canonical-file reads for rows it was about to discard. Here the
+    /// prefix filter + `take(limit)` run BEFORE the snippet backfill, so at
+    /// most `limit` files are read. Row selection is byte-identical to the
+    /// old `search(limit*2)` + `starts_with` + `take(limit)` pipeline.
+    pub async fn search_scoped(
+        &self,
+        query: &str,
+        base_dir: &str,
+        limit: usize,
+    ) -> Result<Vec<FtsResult>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let fetch = (limit.saturating_mul(2)).max(1) as i64;
+        let mut results = sqlx::query_as::<_, FtsResult>(
+            "SELECT nm.file_path as path, bm25(notes_fts) as score, '' as snippet \
+             FROM notes_fts nf \
+             JOIN notes_meta nm ON nf.rowid = nm.rowid \
+             WHERE notes_fts MATCH ?1 \
+             ORDER BY score LIMIT ?2",
+        )
+        .bind(query)
+        .bind(fetch)
+        .fetch_all(self.client.pool())
+        .await?;
+        results.retain(|r| r.path.starts_with(base_dir));
+        results.truncate(limit);
+        self.populate_snippets(&mut results).await;
+        Ok(results)
+    }
+
+    /// Backfill `snippet` from the canonical files (shared by
+    /// [`Self::search`] and [`Self::search_scoped`]).
+    ///
+    /// File reads are blocking std::fs (capped at 256 KiB each) — taken off
+    /// the async executor so a burst of hits cannot stall runtime workers.
+    async fn populate_snippets(&self, results: &mut [FtsResult]) {
         let paths: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
         let snippets = tokio::task::spawn_blocking(move || {
             paths
@@ -89,7 +153,6 @@ impl<'a> NotesRepo<'a> {
         for (result, snippet) in results.iter_mut().zip(snippets) {
             result.snippet = snippet;
         }
-        Ok(results)
     }
 
     /// Index (or re-index) one note into `notes_meta` + the contentless
