@@ -84,29 +84,47 @@ impl Tool for FsGlobTool {
             None => pattern.to_string(),
         };
 
-        let mut matches: Vec<String> = Vec::new();
-        let mut truncated = false;
+        // The glob iterator walks the filesystem synchronously — under the
+        // shared daemon runtime it has to run on the blocking pool
+        // (fs_write vault-write seam precedent).
+        let validator = self.validator.clone();
+        let (matches, truncated, invalid) = tokio::task::spawn_blocking(move || {
+            let mut matches: Vec<String> = Vec::new();
+            let mut truncated = false;
 
-        let glob_iter = match glob::glob(&full_pattern) {
-            Ok(it) => it,
-            Err(e) => {
-                return Ok(json!({ "error": format!("Invalid glob pattern: {}", e) }));
-            }
-        };
-        for entry in glob_iter {
-            match entry {
-                Ok(path) => {
-                    if matches.len() >= max_results {
-                        truncated = true;
-                        break;
-                    }
-                    if self.validator.validate_path_for_read(&path).is_err() {
-                        continue;
-                    }
-                    matches.push(path.to_string_lossy().to_string());
+            let glob_iter = match glob::glob(&full_pattern) {
+                Ok(it) => it,
+                Err(e) => {
+                    // Surfaced as the legacy structured error, not a
+                    // KernelError.
+                    return (
+                        matches,
+                        truncated,
+                        Some(format!("Invalid glob pattern: {}", e)),
+                    );
                 }
-                Err(_) => continue,
+            };
+            for entry in glob_iter {
+                match entry {
+                    Ok(path) => {
+                        if matches.len() >= max_results {
+                            truncated = true;
+                            break;
+                        }
+                        if validator.validate_path_for_read(&path).is_err() {
+                            continue;
+                        }
+                        matches.push(path.to_string_lossy().to_string());
+                    }
+                    Err(_) => continue,
+                }
             }
+            (matches, truncated, None)
+        })
+        .await
+        .map_err(|e| KernelError::ToolFailed(format!("fs.glob blocking scan failed: {e}")))?;
+        if let Some(message) = invalid {
+            return Ok(json!({ "error": message }));
         }
 
         let count = matches.len();

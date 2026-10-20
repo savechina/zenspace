@@ -61,6 +61,24 @@ impl FsListTool {
 
 const DEFAULT_MAX_ENTRIES: usize = 200;
 
+/// Shared entry filter for both the recursive walk and read_dir branches.
+fn entry_visible(
+    include_hidden: bool,
+    pattern: Option<&glob::Pattern>,
+    name: &std::ffi::OsStr,
+) -> bool {
+    let name_str = name.to_string_lossy();
+    if !include_hidden && name_str.starts_with('.') {
+        return false;
+    }
+    if let Some(pattern) = pattern
+        && !pattern.matches(name_str.as_ref())
+    {
+        return false;
+    }
+    true
+}
+
 #[async_trait]
 impl Tool for FsListTool {
     fn schema(&self) -> ToolSchema {
@@ -105,50 +123,51 @@ impl Tool for FsListTool {
             .validate_path_for_read(&path)
             .map_err(KernelError::ToolFailed)?;
 
-        let should_include = |name: &std::ffi::OsStr| -> bool {
-            let name_str = name.to_string_lossy();
-            if !include_hidden && name_str.starts_with('.') {
-                return false;
-            }
-            if let Some(pattern) = &glob_pattern
-                && !pattern.matches(name_str.as_ref())
-            {
-                return false;
-            }
-            true
-        };
-
         let mut entries: Vec<Value> = Vec::new();
         let mut truncated = false;
 
         if recursive {
-            let mut walker = walkdir::WalkDir::new(&path);
-            if let Some(d) = depth {
-                walker = walker.max_depth(d as usize);
-            }
-            for entry in walker.into_iter().filter_map(|e| e.ok()) {
-                if entries.len() >= max_entries {
-                    truncated = true;
-                    break;
+            // walkdir is a synchronous iterator: under the shared daemon
+            // runtime a deep recursive walk has to run on the blocking pool
+            // (fs_write vault-write seam precedent).
+            let walk_root = path.clone();
+            let walk_glob = glob_pattern.clone();
+            let (walk_entries, walk_truncated) = tokio::task::spawn_blocking(move || {
+                let mut entries: Vec<Value> = Vec::new();
+                let mut truncated = false;
+                let mut walker = walkdir::WalkDir::new(&walk_root);
+                if let Some(d) = depth {
+                    walker = walker.max_depth(d as usize);
                 }
-                let entry_path = entry.path();
-                if entry_path == path {
-                    continue;
+                for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                    if entries.len() >= max_entries {
+                        truncated = true;
+                        break;
+                    }
+                    let entry_path = entry.path();
+                    if entry_path == walk_root {
+                        continue;
+                    }
+                    if !entry_visible(include_hidden, walk_glob.as_ref(), entry.file_name()) {
+                        continue;
+                    }
+                    // entry.file_type() is symlink_metadata-based (does not
+                    // follow symlinks), matching the non-recursive path below.
+                    let ft = entry.file_type();
+                    let meta = entry.metadata().ok();
+                    entries.push(json!({
+                        "name": entry.file_name().to_string_lossy(),
+                        "path": entry_path.to_string_lossy(),
+                        "is_dir": ft.is_dir(),
+                        "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                    }));
                 }
-                if !should_include(entry.file_name()) {
-                    continue;
-                }
-                // entry.file_type() is symlink_metadata-based (does not follow
-                // symlinks), matching the non-recursive path below.
-                let ft = entry.file_type();
-                let meta = entry.metadata().ok();
-                entries.push(json!({
-                    "name": entry.file_name().to_string_lossy(),
-                    "path": entry_path.to_string_lossy(),
-                    "is_dir": ft.is_dir(),
-                    "size_bytes": meta.as_ref().map(|m| m.len()).unwrap_or(0)
-                }));
-            }
+                (entries, truncated)
+            })
+            .await
+            .map_err(|e| KernelError::ToolFailed(format!("fs.list blocking walk failed: {e}")))?;
+            entries = walk_entries;
+            truncated = walk_truncated;
         } else {
             let mut reader = match tokio::fs::read_dir(&path).await {
                 Ok(r) => r,
@@ -165,7 +184,11 @@ impl Tool for FsListTool {
                     truncated = true;
                     break;
                 }
-                if !should_include(entry.file_name().as_os_str()) {
+                if !entry_visible(
+                    include_hidden,
+                    glob_pattern.as_ref(),
+                    entry.file_name().as_os_str(),
+                ) {
                     continue;
                 }
                 // symlink_metadata (not metadata) so symlink-to-dir reports the

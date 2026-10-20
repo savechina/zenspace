@@ -793,6 +793,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **Agent 侧搜索路径性能深审 + fs 工具阻塞清零（2026-10-21 续；`bin/lint` 0；`bin/test` 3340/0/25 基线 3339 +1 钉）** — 修改文件与新增功能：
+  - **fs_grep/fs_list/fs_glob spawn_blocking**（zen-plugin tools/）：三个 `async fn invoke` 的同步体（walkdir 递归遍历、glob 迭代、逐文件 `std::fs::read_to_string`）原样跑在 async worker 上——daemon 共享 runtime 下每次 grep/list/glob 停一个 worker（fs_write tunnel 先例接入；fs_read 本已是 tokio::fs 模范未动）。
+  - **fs_grep 顺带两修**：`glob::Pattern::new` 从逐文件循环提升为一次性编译（非法 include glob 原本逐文件 `unwrap_or(false)` 排除一切 ⇒ 早返回空结果字节等同）；逐文件读加 1 MiB `Read::take` 帽（镜像 tier-1 `TIER1_OUTPUT_CAP_BYTES`，strict-UTF-8 解码语义保持——非法 UTF-8 文件照旧静默跳过）。
+  - **深审结论（agent 检索链验证非问题清单）**：orchestrator `knowledge_stack` OnceCell 缓存（每 orchestrator 一次开库）+ 知识注入 per-turn 非 per-round + 批文件读已 spawn_blocking（T160 前波）；`connect_mcp_servers` AtomicBool 幂等；FR-034 奖励写 tunnel 已 spawn_blocking；tier 工具体薄 + `SharedSqliteClient` OnceCell（进程一次开库）；tier4 seeded_ranking 种子解析有界（≤6 token × 点查询）+ PPR 走已缓存 GraphCore；gateway `hit_strength` 装饰排序（每 hit 一次，非比较器重算）；strength 纯函数无 I/O；TUI 知识搜索已 spawn_blocking + gateway 侧 join_all（前波已修）；scheduler workers 无 ad-hoc SearchService。
+  - **评审后不改（backlog 留档）**：memvid 同步 seam（`zen_agent.rs:1076` 已文档化的刻意决策；`#[tokio::main]` 多线程 runtime 下爆炸半径=单 worker 停摆，非 daemon 级）；`memory/search` 每 hit 一次 reward sidecar 读（ms 级、dedup 有界）；audit.jsonl 每 line open+flock+close（µs 级 vs LLM 秒级）；build_agent 每 turn 重建（身份新鲜度契约）。
+  - **钉**：`grep_caps_per_file_read_at_the_memory_bound`（帽内 needle 命中 + 帽外 needle 不可见，双面契约）。
+
 - **搜索性能 backlog 收口 + sole_owner 负载 flake 修复（2026-10-20 续；`bin/lint` 0；`bin/test` 3339/0/25 基线 3337 +2 钉）** — 修改文件与新增功能：
   - **tier-1 rg stdout 帽**（zen-vault search/mod.rs）：读取线程消费 stdout 至 1 MiB 常量帽即 kill rg（原 `wait_with_output` 无界缓冲整段输出——`--max-count` 只按文件封顶，全局匹配爆发时无上限）；stderr 独立线程排空（防 rg 写 stderr 阻塞 × 读 stdout 阻塞的死锁形状）；输出改 lossy 解码（帽可切多字节中间，且杂散非 UTF-8 行只降级该行不再整层失败）；in-process 兜底整文件读同帽（`Read::take`）。
   - **PPR 全图缓存**（zen-repo notions_repo.rs + client.rs）：`GraphCoreCache`（TTL 60s）挂 `SqliteClient` 字段——per-database 槽位杜绝测试群跨库串图；`load_graph_core` 返回 `Arc<GraphCore>` 命中即免全量 notions+edges 加载。选 TTL 而非写侧失效的依据：~12 个图写方法逐个 bump 漏一即永久陈旧，TTL 有界陈旧（≤60s）对 0.9 权重 RRF 排名信号可接受（distill 周期本身分钟级）。`PageRankResult` 补 `PartialEq` 派生（幂等钉需要）。

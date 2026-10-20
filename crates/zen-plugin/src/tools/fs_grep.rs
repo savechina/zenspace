@@ -61,6 +61,11 @@ impl FsGrepTool {
 
 const DEFAULT_MAX_MATCHES: usize = 50;
 
+/// Per-file read bound (mirror of tier-1's `TIER1_OUTPUT_CAP_BYTES`): one
+/// giant file must not blow the memory of a single grep call — bytes beyond
+/// the cap are invisible to the match scan.
+const MAX_GREP_FILE_READ_BYTES: u64 = 1024 * 1024;
+
 #[derive(serde::Serialize)]
 struct GrepMatch {
     file: String,
@@ -117,61 +122,98 @@ impl Tool for FsGrepTool {
             .validate_path_for_read(&root)
             .map_err(KernelError::ToolFailed)?;
 
-        let mut results: Vec<GrepMatch> = Vec::new();
-        let mut truncated = false;
-
-        let files: Vec<PathBuf> = if root.is_file() {
-            vec![root.clone()]
-        } else {
-            walkdir::WalkDir::new(&root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-                .map(|e| e.into_path())
-                .collect()
+        // Hoisted from the per-file loop. A glob that fails to compile
+        // excluded every file before (per-file `unwrap_or(false)`), so the
+        // early empty result preserves that behavior byte-exactly.
+        let include_pattern = match include_glob {
+            Some(glob_pat) => match glob::Pattern::new(glob_pat) {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return Ok(json!({
+                        "pattern": pattern_str,
+                        "matches": [],
+                        "count": 0,
+                        "truncated": false
+                    }));
+                }
+            },
+            None => None,
         };
 
-        for file_path in files {
-            if truncated {
-                break;
-            }
+        // The walk + per-file read scan is fully synchronous (walkdir and
+        // std::fs reads) — under the shared daemon runtime it has to run on
+        // the blocking pool, mirroring the fs_write vault-write seam.
+        let validator = self.validator.clone();
+        let (results, truncated) = tokio::task::spawn_blocking(move || {
+            let mut results: Vec<GrepMatch> = Vec::new();
+            let mut truncated = false;
 
-            if let Some(glob_pat) = include_glob {
-                let file_name = file_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if !glob::Pattern::new(glob_pat)
-                    .map(|p| p.matches(&file_name))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-            }
-
-            if self.validator.validate_path_for_read(&file_path).is_err() {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let files: Vec<PathBuf> = if root.is_file() {
+                vec![root.clone()]
+            } else {
+                walkdir::WalkDir::new(&root)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .map(|e| e.into_path())
+                    .collect()
             };
 
-            for (line_num, line) in content.lines().enumerate() {
-                if re.is_match(line) {
-                    if results.len() >= max_matches {
-                        truncated = true;
-                        break;
+            for file_path in files {
+                if truncated {
+                    break;
+                }
+
+                if let Some(pattern) = &include_pattern {
+                    let file_name = file_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if !pattern.matches(&file_name) {
+                        continue;
                     }
-                    results.push(GrepMatch {
-                        file: file_path.to_string_lossy().to_string(),
-                        line: line_num + 1,
-                        content: line.to_string(),
-                    });
+                }
+
+                if validator.validate_path_for_read(&file_path).is_err() {
+                    continue;
+                }
+
+                {
+                    use std::io::Read;
+                    let bytes = match std::fs::File::open(&file_path) {
+                        Ok(f) => {
+                            let mut buf = Vec::new();
+                            let _ = f.take(MAX_GREP_FILE_READ_BYTES).read_to_end(&mut buf);
+                            buf
+                        }
+                        Err(_) => continue,
+                    };
+                    // Strict UTF-8 as before: read_to_string failed the file
+                    // silently and so does this decode.
+                    let content = match String::from_utf8(bytes) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+
+                    for (line_num, line) in content.lines().enumerate() {
+                        if re.is_match(line) {
+                            if results.len() >= max_matches {
+                                truncated = true;
+                                break;
+                            }
+                            results.push(GrepMatch {
+                                file: file_path.to_string_lossy().to_string(),
+                                line: line_num + 1,
+                                content: line.to_string(),
+                            });
+                        }
+                    }
                 }
             }
-        }
+            (results, truncated)
+        })
+        .await
+        .map_err(|e| KernelError::ToolFailed(format!("fs.grep blocking scan failed: {e}")))?;
 
         let count = results.len();
         let matches_json: Vec<Value> = results
@@ -219,6 +261,34 @@ mod tests {
                 .as_str()
                 .is_some_and(|m| m.contains("Invalid regex")),
             "expected structured error, got: {res}"
+        );
+    }
+
+    #[test]
+    fn grep_caps_per_file_read_at_the_memory_bound() {
+        // The per-file read cap: a needle inside the first MAX bytes is
+        // found; the same needle beyond the cap is invisible. This pins
+        // BOTH the bounded-memory contract and its match-scan consequence.
+        let dir = tempdir().unwrap();
+        let inside = "needle-inside";
+        let beyond = "needle-beyond";
+        let mut body = String::new();
+        body.push_str(inside);
+        body.push('\n');
+        body.push_str(&"x".repeat(MAX_GREP_FILE_READ_BYTES as usize + 4096));
+        body.push_str(beyond);
+        std::fs::write(dir.path().join("big.md"), &body).unwrap();
+
+        let tool = FsGrepTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({
+            "pattern": "needle-\\w+",
+            "path": dir.path().to_string_lossy()
+        })))
+        .unwrap();
+        assert_eq!(res["count"], 1, "only the in-cap needle matches: {res}");
+        assert_eq!(
+            res["matches"][0]["content"], inside,
+            "found the in-cap hit, not the beyond-cap one"
         );
     }
 }
