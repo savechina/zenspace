@@ -80,7 +80,7 @@ pub struct GraphSearchResult {
     pub direction: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PageRankResult {
     pub notion: String,
     pub score: f64,

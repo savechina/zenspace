@@ -267,6 +267,61 @@ async fn test_notes_search_snippet_carries_canonical_file_content() {
     );
 }
 
+// ── Perf review 2026-10-20: per-client GraphCore TTL cache ────────────────
+
+#[tokio::test]
+async fn graph_core_cache_does_not_leak_across_databases() {
+    // The cache lives on SqliteClient precisely so this holds: a STATIC
+    // cache would serve database A's graph to database B (the test-herd
+    // failure mode), permanently poisoning PPR with foreign nodes.
+    let (client_a, _dir_a) = make_client().await;
+    let (client_b, _dir_b) = make_client().await;
+
+    let repo_a = NotionsRepo::new(&client_a);
+    repo_a
+        .insert_entity("e1", "Rust", "concept", "2026-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    repo_a
+        .insert_entity("e2", "Tokio", "tool", "2026-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    repo_a
+        .insert_relationship(&InsertRelationshipRequest {
+            id: "r1",
+            source_id: "e1",
+            target_id: "e2",
+            rel_type: "depends_on",
+            confidence: 0.9,
+            source_note_ids: None,
+            created_at: "2026-01-01T00:00:00Z",
+            description: None,
+            valid_from: None,
+            valid_until: None,
+            weight: None,
+        })
+        .await
+        .unwrap();
+
+    // Prime A's cache, then ask B: B must see its own (empty) graph.
+    let ranked_a = repo_a.pagerank(20, 0.85).await.unwrap();
+    assert_eq!(ranked_a.len(), 2, "A ranks its own two nodes");
+
+    let ranked_b = NotionsRepo::new(&client_b)
+        .pagerank(20, 0.85)
+        .await
+        .unwrap();
+    assert!(
+        ranked_b.is_empty(),
+        "B must never observe A's cached graph, got: {ranked_b:?}"
+    );
+
+    // TTL idempotence: a second load within the TTL serves the same
+    // snapshot — identical ranking, no drift from a reload race.
+    let ranked_a_again = repo_a.pagerank(20, 0.85).await.unwrap();
+    assert_eq!(ranked_a, ranked_a_again);
+}
+
 // ── Perf review 2026-10-20: snippet char cap + dir-scoped search ─────────
 
 #[tokio::test]

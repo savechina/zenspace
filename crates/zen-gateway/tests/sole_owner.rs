@@ -23,7 +23,13 @@ use zen_gateway::transport::Transport;
 use zen_gateway::transport::uds::UdsTransport;
 use zen_gateway::{GatewayDaemonConfig, GatewayService};
 
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+// Test-scaffolding bound, not a protocol contract: the daemon task shares
+// this test's current-thread runtime, so a machine fully loaded by parallel
+// nextest binaries (qqbot 12-14s, memory-rebuild 60s cases) starves the
+// handshake well past 5s — observed as `initialize reply timeout` at :71.
+// The V1 pins are the FUNCTIONAL assertions below; 15s still bounds the
+// true-hang class (a dead daemon never replies at all).
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn daemon_config(dir: &std::path::Path) -> GatewayDaemonConfig {
     GatewayDaemonConfig {
@@ -38,8 +44,10 @@ fn daemon_config(dir: &std::path::Path) -> GatewayDaemonConfig {
 }
 
 async fn connect_client(socket: &std::path::Path) -> UdsTransport {
-    // Retry-dial until the listener is up (≤2s per quickstart cold-start).
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Same load rationale as CLIENT_TIMEOUT: daemon bind competes with
+    // parallel nextest binaries for CPU, so the dial budget is generous —
+    // the pin is that the socket COMES UP, not how fast on a loaded machine.
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match UdsTransport::connect(socket).await {
             Ok(t) => return t,
@@ -138,9 +146,10 @@ async fn two_clients_cross_visibility_and_sole_owner() {
     handshake(&client_b).await;
 
     // A writes; B must observe promptly (shared store, instant in-process).
-    // 1s is the ideal, but CI runners (esp. x64 mac) can be ~2-3s under load
-    // with cold memvid/tantivy init — gate on ≤5s to avoid flake, keep the
-    // functional assertion (B sees A's entry) as the real signal.
+    // 1s is the ideal, but loaded CI runners starve this test's shared
+    // current-thread runtime (same rationale as CLIENT_TIMEOUT) — gate on
+    // ≤15s to avoid flake; the functional assertion (B sees A's entry) is
+    // the real signal.
     let put_at = Instant::now();
     let put = rpc(
         &client_a,
@@ -166,8 +175,8 @@ async fn two_clients_cross_visibility_and_sole_owner() {
     .await
     .expect("retrieve ok");
     assert!(
-        put_at.elapsed() < Duration::from_secs(5),
-        "cross-visibility exceeded 5s (put+retrieve took {:?})",
+        put_at.elapsed() < Duration::from_secs(15),
+        "cross-visibility exceeded 15s (put+retrieve took {:?})",
         put_at.elapsed()
     );
     assert!(

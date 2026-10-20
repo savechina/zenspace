@@ -56,6 +56,59 @@ struct GraphCore {
     inbound: Vec<Vec<usize>>,
 }
 
+/// How long a cached [`GraphCore`] snapshot stays served (perf review
+/// 2026-10-20).
+///
+/// The full notions+edges load is the dominant per-query cost of seeded PPR
+/// fusion (gateway runs it per scan dir). TTL instead of write-side
+/// invalidation: the ~12 NotionsRepo write paths that mutate the graph are
+/// individually enumerable but easy to miss one of, and a missed bump would
+/// serve a PERMANENTLY stale graph. A TTL bounds staleness at 60s instead —
+/// acceptable for a 0.9-weight RRF ranking signal whose upstream (distill
+/// cycles) mutates the graph on minute-scale periods anyway. The cache lives
+/// on [`SqliteClient`](crate::SqliteClient), so snapshots can never leak
+/// across databases (each test/open gets its own slot).
+const GRAPH_CORE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-client TTL cache for the [`GraphCore`] snapshot (see
+/// [`GRAPH_CORE_CACHE_TTL`] for the staleness contract).
+pub(crate) struct GraphCoreCache {
+    slot: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<GraphCore>)>>,
+}
+
+impl GraphCoreCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn get_fresh(&self) -> Option<std::sync::Arc<GraphCore>> {
+        let guard = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            Some((at, core)) if at.elapsed() < GRAPH_CORE_CACHE_TTL => Some(core.clone()),
+            _ => None,
+        }
+    }
+
+    fn store(&self, core: std::sync::Arc<GraphCore>) {
+        let mut guard = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some((std::time::Instant::now(), core));
+    }
+}
+
+impl Default for GraphCoreCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Power-iteration core: `pr` starts at `teleport`, then each round applies
 /// `pr[i] ← restart·teleport[i] + damping·(dangling_sum·teleport[i] +
 /// Σ_{src→i} pr[src]/out[src])`. Dangling mass (nodes without out-edges)
@@ -741,7 +794,13 @@ impl<'a> NotionsRepo<'a> {
         Ok(results)
     }
 
-    async fn load_graph_core(&self) -> Result<GraphCore> {
+    /// Load the directed valid-edge snapshot, served from the per-client
+    /// TTL cache when fresh (see [`GRAPH_CORE_CACHE_TTL`]).
+    async fn load_graph_core(&self) -> Result<std::sync::Arc<GraphCore>> {
+        if let Some(fresh) = self.client.graph_core_cache.get_fresh() {
+            return Ok(fresh);
+        }
+
         let notion_rows = sqlx::query("SELECT id, name FROM notions ORDER BY name")
             .fetch_all(self.client.pool())
             .await?;
@@ -780,13 +839,15 @@ impl<'a> NotionsRepo<'a> {
             }
         }
 
-        Ok(GraphCore {
+        let core = std::sync::Arc::new(GraphCore {
             name_by_idx,
             name_to_idx,
             id_to_idx,
             out_degree,
             inbound,
-        })
+        });
+        self.client.graph_core_cache.store(core.clone());
+        Ok(core)
     }
 
     /// Global PageRank over currently-valid edges.

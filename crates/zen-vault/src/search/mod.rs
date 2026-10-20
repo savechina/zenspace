@@ -35,6 +35,16 @@ pub struct SearchResult {
 /// caller indefinitely.
 const TIER1_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hard cap on rg stdout consumed by one query (perf review 2026-10-20).
+///
+/// rg's `--max-count limit` caps matches PER FILE, so a vault-wide match
+/// burst streams limit×N-files lines; the former `wait_with_output` buffered
+/// ALL of it into one String before truncating to `limit`. The reader thread
+/// now stops at the cap and kills rg — 1 MiB is ≫ the `limit` result lines
+/// ever needed (20 results × generous path+line width), bounding memory
+/// without ever starving a legitimate query.
+const TIER1_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
+
 /// Explicit override for the ripgrep binary location, checked before PATH
 /// and well-known install locations (same shape as a `*_PATH` env override on
 /// a library's default resource location).
@@ -124,7 +134,7 @@ fn search_via_rg(
                 .context("base_dir contains invalid UTF-8")?,
         );
 
-    let child = match cmd
+    let mut child = match cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -140,26 +150,83 @@ fn search_via_rg(
         }
     };
 
+    // Take the pipes BEFORE moving the child into the reader thread. stderr
+    // drains on its own thread: a flood there (>64 KiB pipe buffer) would
+    // otherwise block rg mid-write while the stdout reader blocks mid-read —
+    // the same deadlock shape std's `read2` exists to prevent.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        use std::io::Read;
+        let mut stdout = Vec::new();
+        let mut capped = false;
+        if let Some(out) = stdout_pipe.as_mut() {
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                match out.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        stdout.extend_from_slice(&chunk[..n]);
+                        if stdout.len() >= TIER1_OUTPUT_CAP_BYTES {
+                            capped = true;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::Error::new(e)));
+                        return;
+                    }
+                }
+            }
+        }
+        if capped {
+            // The consumer will never need more than the cap — stop the
+            // producer instead of letting it stream the whole vault.
+            let _ = child.kill();
+        }
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::Error::new(e)));
+                return;
+            }
+        };
+        let _ = tx.send(Ok((status, stdout, capped)));
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Some(err) = stderr_pipe.as_mut() {
+            let _ = err.read_to_end(&mut buf);
+        }
+        buf
     });
 
-    let output = rx
+    let (status, stdout_bytes, capped) = rx
         .recv_timeout(TIER1_TIMEOUT)
         .context("ripgrep timed out")?
         .context("failed to execute ripgrep")?;
+    let stderr_bytes = stderr_reader.join().unwrap_or_default();
 
-    if !output.status.success() && output.stdout.is_empty() {
+    if capped {
+        warn!(
+            cap = TIER1_OUTPUT_CAP_BYTES,
+            "ripgrep output exceeded cap — stream truncated"
+        );
+    }
+    if !capped && !status.success() && stdout_bytes.is_empty() {
         // ripgrep returns exit code 1 when no matches found — that's fine
-        if output.status.code() == Some(1) {
+        if status.code() == Some(1) {
             return Ok(Vec::new());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         anyhow::bail!("ripgrep failed: {stderr}");
     }
 
-    let stdout = String::from_utf8(output.stdout)?;
+    // Lossy (not strict) decode: the cap can cut mid-UTF-8, and a stray
+    // non-UTF-8 match line must degrade that line, not fail the whole tier.
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     // rg's --max-count caps per FILE; enforce the global limit post-hoc.
     let mut results: Vec<SearchResult> = stdout.lines().filter_map(parse_rg_line).collect();
     results.truncate(limit);
@@ -204,7 +271,14 @@ fn search_in_process(query: &str, base_dir: &Path, limit: usize) -> Result<Vec<S
         if !entry.file_type().is_file() {
             continue;
         }
-        let bytes = match std::fs::read(entry.path()) {
+        // Same memory bound as the rg path: a huge file must not be fully
+        // buffered — read at most the cap bytes and scan those.
+        let bytes = match std::fs::File::open(entry.path()).map(|f| {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = f.take(TIER1_OUTPUT_CAP_BYTES as u64).read_to_end(&mut buf);
+            buf
+        }) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -360,6 +434,23 @@ mod tests {
         let resolved = resolve_rg_binary_uncached();
         unsafe { std::env::remove_var(RG_PATH_ENV) };
         assert_eq!(resolved, Some(PathBuf::from("/bin/cat")));
+    }
+
+    #[test]
+    fn test_tier1_output_cap_bounds_burst_without_losing_results() {
+        // Perf-review pin: `--max-count` is per FILE, so this fixture streams
+        // >1 MiB of matches. The capped reader must complete, return exactly
+        // `limit` parsed results, and never surface the truncation as an
+        // error (the cap is invisible to legitimate queries).
+        let tmp = TempDir::new().unwrap();
+        let burst: String = "match token 0123456789 abcdefghijklmnopqrstuvwxyz\n".repeat(21_000);
+        assert!(burst.len() > TIER1_OUTPUT_CAP_BYTES);
+        fs::write(tmp.path().join("burst.md"), &burst).unwrap();
+        fs::write(tmp.path().join("second.md"), "match tail\n").unwrap();
+
+        let results = Tier1Search::search("match", tmp.path(), 5).unwrap();
+        assert_eq!(results.len(), 5, "global limit honored under burst");
+        assert!(results.iter().all(|r| r.content.contains("match")));
     }
 
     #[test]

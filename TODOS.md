@@ -8,5 +8,5 @@
 
 ## Open items
 
-- [ ] perf: tier-1 rg stdout 无上限 — `--max-count limit` 只按文件封顶（zen-vault/src/search/mod.rs），大 vault 全局匹配爆发时整段 stdout 读进一个 String 再截断。修法形状：读取线程按字节帽读满即 kill rg。2026-10-20 评审后推迟（实际输出小；kill-on-limit 需重做等待线程）。
-- [ ] perf: PPR `load_graph_core` 每次命中 seed 的融合查询全量加载 notions+edges（zen-repo/src/notions_repo.rs）并 20 轮迭代。修法形状：TTL/版本键缓存，distill 图写入侧失效。2026-10-20 评审后推迟（失效语义 vs 图写入正确性需设计）。
+- [x] perf: tier-1 rg stdout 无上限 — 已修（2026-10-20 同日落地）：读取线程 1 MiB 帽到量即 kill rg，stderr 并行排空防死锁，输出 lossy 解码（帽可能切在多字节中间）；in-process 兜底的整文件读同帽。钉 `test_tier1_output_cap_bounds_burst_without_losing_results`。
+- [x] perf: PPR `load_graph_core` 每次融合查询全量加载 — 已修（2026-10-20 同日落地）：`GraphCoreCache` 挂 `SqliteClient`（per-database，杜绝跨库串图），TTL 60s（写侧失效需枚举 ~12 个写方法、漏一个即永久陈旧；TTL 有界陈旧对 0.9 权重排名信号可接受）。钉 `graph_core_cache_does_not_leak_across_databases`。

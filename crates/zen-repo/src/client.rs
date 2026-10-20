@@ -193,6 +193,10 @@ async fn connect_pool(db_path: &Path, lazy: bool) -> Result<SqlitePool> {
 pub struct SqliteClient {
     writer: Connection,
     pool: SqlitePool,
+    /// Per-database [`GraphCore`](crate::notions_repo::GraphCoreCache)
+    /// snapshot cache — a field (not a static) so concurrent clients on
+    /// DIFFERENT databases (tests) can never serve each other's graph.
+    pub(crate) graph_core_cache: crate::notions_repo::GraphCoreCache,
 }
 
 /// How long a process waits for another process to finish migrating before
@@ -254,7 +258,11 @@ impl SqliteClient {
         let pool = connect_pool(db_path, false).await?;
         let _migration_lock = migration_guard(db_path).await?;
         run_migrations(&pool).await?;
-        Ok(Self { writer, pool })
+        Ok(Self {
+            writer,
+            pool,
+            graph_core_cache: crate::notions_repo::GraphCoreCache::new(),
+        })
     }
 
     pub async fn open_lazy(db_path: &Path) -> Result<Self> {
@@ -263,7 +271,11 @@ impl SqliteClient {
         let pool = connect_pool(db_path, true).await?;
         let _migration_lock = migration_guard(db_path).await?;
         run_migrations(&pool).await?;
-        Ok(Self { writer, pool })
+        Ok(Self {
+            writer,
+            pool,
+            graph_core_cache: crate::notions_repo::GraphCoreCache::new(),
+        })
     }
 
     /// Open a versioned SQLite database with automatic schema migration.

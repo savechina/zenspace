@@ -793,6 +793,12 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **搜索性能 backlog 收口 + sole_owner 负载 flake 修复（2026-10-20 续；`bin/lint` 0；`bin/test` 3339/0/25 基线 3337 +2 钉）** — 修改文件与新增功能：
+  - **tier-1 rg stdout 帽**（zen-vault search/mod.rs）：读取线程消费 stdout 至 1 MiB 常量帽即 kill rg（原 `wait_with_output` 无界缓冲整段输出——`--max-count` 只按文件封顶，全局匹配爆发时无上限）；stderr 独立线程排空（防 rg 写 stderr 阻塞 × 读 stdout 阻塞的死锁形状）；输出改 lossy 解码（帽可切多字节中间，且杂散非 UTF-8 行只降级该行不再整层失败）；in-process 兜底整文件读同帽（`Read::take`）。
+  - **PPR 全图缓存**（zen-repo notions_repo.rs + client.rs）：`GraphCoreCache`（TTL 60s）挂 `SqliteClient` 字段——per-database 槽位杜绝测试群跨库串图；`load_graph_core` 返回 `Arc<GraphCore>` 命中即免全量 notions+edges 加载。选 TTL 而非写侧失效的依据：~12 个图写方法逐个 bump 漏一即永久陈旧，TTL 有界陈旧（≤60s）对 0.9 权重 RRF 排名信号可接受（distill 周期本身分钟级）。`PageRankResult` 补 `PartialEq` 派生（幂等钉需要）。
+  - **sole_owner 负载 flake**（zen-gateway tests/sole_owner.rs）：断点实锤 `:71 initialize reply timeout`——测试自担的 5s 握手超时在跨 crate 满载（qqbot 12-14s/memory_rebuild 60s 并行）下饿死共享 current-thread 运行时。脚手架超时放宽：CLIENT_TIMEOUT 5→15s、拨号 2→10s、可见性墙钟断言 5→15s；功能性 V1 断言（交叉可见内容/独占拒绝/标志位）原样。原触发场景三 crate 满载复跑 1666/1666 绿。
+  - **钉**：`test_tier1_output_cap_bounds_burst_without_losing_results`（21k 行爆发 fixture：完成 + 恰 limit 条 + 截断不冒泡为错误）、`graph_core_cache_does_not_leak_across_databases`（跨库不串图 + TTL 内幂等）。
+
 - **搜索/向量查询路径性能收口（2026-10-20，plan-eng-review D1=B；`bin/lint` 0；`bin/test` 3337/0/25 基线 3335 +2 钉）** — 修改文件与新增功能：
   - **并发化**：`search_fused_with_diagnostics` 的查询 embed spawn_blocking 移入 `tokio::join!` 内（tier1/2/4 不再串行等 embed——挂死 provider 240s 死气不再阻塞 rg/FTS/graph 起跑，zen-vault service.rs）；gateway `knowledge/search` scan_dirs（inbox+wiki 各跑全管线）从串行 for 改 `futures_util::future::join_all` 并发（wall=max(dirs) 而非求和；合并顺序/dedup/degraded 语义保持，配额检查移到 push 前防 limit+1 超发）。
   - **阻塞清零（4 处 off-runtime）**：explicit tier-1 rg 调用、`tier3_search` 工具的查询 embed、orchestrator `retrieve_knowledge_notes` 逐结果文件重读（改批量 spawn_blocking；join 失败降级为 snippet 兜底=旧读失败路径）——全部镜像既有 spawn_blocking 纪律。
