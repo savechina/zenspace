@@ -793,6 +793,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **backlog 三项落地：gateway memory RPC 阻塞清零 + 审计热路径惰性化（2026-10-21 续；`bin/lint` 0；`bin/test` 3340/0/25 持平）** — 修改文件与新增功能：
+  - **gateway memory 四处理器 spawn_blocking**（zen-gateway server/memory.rs）：`memory/{retrieve,putEntry,search,stats}` 的同步引擎调用（entity_memories/BM25 search/frame stats/sidecar 写）原样跑在 async worker 上且持读锁——新 `require_store_owned`（`ZenMemvidStore` 两-Arc 廉价克隆）在 async 侧取走 owned store 即释放 RwLock（guard 持锁跨全调用会 stall `memory/rebuild` 写者），工作体移入阻塞池。
+  - **memory/search 单跳合并**：`search` 闭包内一次完成引擎查询 + `render_hits`（含 per-hit mtime stat + reward sidecar open/read，C2 的 ms 级 I/O 一并离 runtime）；`StrengthContext::resolve()` 留 async 侧（config 缓存读取）。
+  - **审计热路径惰性化**（zen-core jsonl.rs `append_jsonl_line`）：无条件 `create_dir_all` 预扫降为 NotFound 回退（每次审计 append 省一次目录 stat 走）；序列化移到进程锁之前（持锁窗口缩短）。
+  - **负载 flake 记录**（复现 ×4 非固定测试：spawn_race broken pipe / turn_lifecycle 缺 started 行；均孤立 5/5 绿）：失败只在 zen-gateway 三 crate 满载窗口出现——处理模式沿用「满载复跑绿 + 留档」，系统性根因（跨 crate 负载下 gateway 测试群资源竞争）留 backlog 观察。
+  - **未动**：zen_agent.rs 检索 seam（`zen_agent.rs:1076` 文档化决策保持——reward 递增 ride 已持锁 sync seam，dedup 有界）；build_agent 每 turn 重建（身份新鲜度契约）；audit 每 line open+flock（正确性语义，不批处理）。
+
 - **Agent 侧搜索路径性能深审 + fs 工具阻塞清零（2026-10-21 续；`bin/lint` 0；`bin/test` 3340/0/25 基线 3339 +1 钉）** — 修改文件与新增功能：
   - **fs_grep/fs_list/fs_glob spawn_blocking**（zen-plugin tools/）：三个 `async fn invoke` 的同步体（walkdir 递归遍历、glob 迭代、逐文件 `std::fs::read_to_string`）原样跑在 async worker 上——daemon 共享 runtime 下每次 grep/list/glob 停一个 worker（fs_write tunnel 先例接入；fs_read 本已是 tokio::fs 模范未动）。
   - **fs_grep 顺带两修**：`glob::Pattern::new` 从逐文件循环提升为一次性编译（非法 include glob 原本逐文件 `unwrap_or(false)` 排除一切 ⇒ 早返回空结果字节等同）；逐文件读加 1 MiB `Read::take` 帽（镜像 tier-1 `TIER1_OUTPUT_CAP_BYTES`，strict-UTF-8 解码语义保持——非法 UTF-8 文件照旧静默跳过）。

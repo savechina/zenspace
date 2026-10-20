@@ -212,15 +212,17 @@ fn render_hits(hits: Vec<SearchHit>, ctx: Option<&StrengthContext>) -> Vec<Value
         .collect()
 }
 
-/// Resolves the live store or fails with -32002.
-async fn require_store(
-    store: &SharedStore,
-) -> Result<tokio::sync::RwLockReadGuard<'_, Option<ZenMemvidStore>>, RpcError> {
+/// Clone the live store out of its read lock (`ZenMemvidStore` is a cheap
+/// two-Arc clone) so the blocking engine work — BM25 search, frame scans,
+/// sidecar reads — can run on the blocking pool WITHOUT holding the guard
+/// open: the guard would otherwise stall `memory/rebuild`'s writer for the
+/// whole call, and the sync body would park an async worker.
+async fn require_store_owned(store: &SharedStore) -> Result<ZenMemvidStore, RpcError> {
     let guard = store.read().await;
-    if guard.is_none() {
-        return Err(RpcError::store_unavailable("unavailable"));
-    }
-    Ok(guard)
+    guard
+        .as_ref()
+        .ok_or_else(|| RpcError::store_unavailable("unavailable"))
+        .cloned()
 }
 
 fn required_str(method: &str, params: &Value, key: &str) -> Result<String, RpcError> {
@@ -237,12 +239,15 @@ pub async fn retrieve(store: SharedStore, params: Value) -> Result<Value, RpcErr
     let session_id = required_str(METHOD, &params, "sessionId")?;
     let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
 
-    let guard = require_store(&store).await?;
-    let zstore = guard.as_ref().expect("checked non-None");
-    let cards = zstore
-        .store()
-        .entity_memories(&session_id)
-        .map_err(|e| RpcError::internal(&format!("memory read failed: {e}")))?;
+    let zstore = require_store_owned(&store).await?;
+    let cards = tokio::task::spawn_blocking(move || {
+        zstore
+            .store()
+            .entity_memories(&session_id)
+            .map_err(|e| RpcError::internal(&format!("memory read failed: {e}")))
+    })
+    .await
+    .map_err(|e| RpcError::internal(&format!("memory read task failed: {e}")))??;
     let entries: Vec<Value> = cards
         .into_iter()
         .filter(|c| c.confidence.unwrap_or(1.0) >= TRIPLET_MIN_CONFIDENCE)
@@ -291,11 +296,14 @@ pub async fn put_entry(store: SharedStore, params: Value) -> Result<Value, RpcEr
         metadata,
     };
 
-    let guard = require_store(&store).await?;
-    let zstore = guard.as_ref().expect("checked non-None");
-    let frame_id = zstore
-        .put_entry(&entry)
-        .map_err(|e| RpcError::internal(&format!("memory write failed: {e}")))?;
+    let zstore = require_store_owned(&store).await?;
+    let frame_id = tokio::task::spawn_blocking(move || {
+        zstore
+            .put_entry(&entry)
+            .map_err(|e| RpcError::internal(&format!("memory write failed: {e}")))
+    })
+    .await
+    .map_err(|e| RpcError::internal(&format!("memory write task failed: {e}")))??;
     Ok(json!({ "frameId": frame_id.to_string() }))
 }
 
@@ -317,25 +325,34 @@ pub async fn search(store: SharedStore, params: Value) -> Result<Value, RpcError
         }))
         .map_err(|e| RpcError::invalid_params(METHOD, &format!("bad search request: {e}")))?;
 
-    let guard = require_store(&store).await?;
-    let zstore = guard.as_ref().expect("checked non-None");
-    let response = zstore
-        .store()
-        .search(request)
-        .map_err(|e| RpcError::internal(&format!("memory search failed: {e}")))?;
-    Ok(json!({
-        "hits": render_hits(response.hits, StrengthContext::resolve().as_ref())
-    }))
+    // Strength context resolves on the async side (config is cached);
+    // the sync engine search AND the per-hit provenance stats/sidecar
+    // reads inside render_hits run together on the blocking pool.
+    let strength = StrengthContext::resolve();
+    let zstore = require_store_owned(&store).await?;
+    let hits = tokio::task::spawn_blocking(move || {
+        let response = zstore
+            .store()
+            .search(request)
+            .map_err(|e| RpcError::internal(&format!("memory search failed: {e}")))?;
+        Ok::<_, RpcError>(render_hits(response.hits, strength.as_ref()))
+    })
+    .await
+    .map_err(|e| RpcError::internal(&format!("memory search task failed: {e}")))??;
+    Ok(json!({ "hits": hits }))
 }
 
 /// memory/stats — archive counters for observability surfaces.
 pub async fn stats(store: SharedStore, _params: Value) -> Result<Value, RpcError> {
-    let guard = require_store(&store).await?;
-    let zstore = guard.as_ref().expect("checked non-None");
-    let s = zstore
-        .store()
-        .stats()
-        .map_err(|e| RpcError::internal(&format!("memory stats failed: {e}")))?;
+    let zstore = require_store_owned(&store).await?;
+    let s = tokio::task::spawn_blocking(move || {
+        zstore
+            .store()
+            .stats()
+            .map_err(|e| RpcError::internal(&format!("memory stats failed: {e}")))
+    })
+    .await
+    .map_err(|e| RpcError::internal(&format!("memory stats task failed: {e}")))??;
     Ok(json!({
         "frames": s.frame_count,
         "capacityBytes": s.capacity_bytes,

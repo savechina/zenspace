@@ -73,22 +73,34 @@ pub fn read_jsonl_lines(path: &Path) -> Result<Vec<Value>> {
 ///   flock (10s deadline) guarantee no interleaved partial lines from the
 ///   daemon and CLI writing the same file simultaneously.
 pub fn append_jsonl_line(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory: {}", parent.display()))?;
-    }
-
     let json = serde_json::to_string(value).context("failed to serialize JSONL entry")?;
     let line = format!("{json}\n").into_bytes();
 
     let lock = APPEND_LOCK.get_or_init(|| Mutex::new(()));
     let _in_process = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let mut file = std::fs::OpenOptions::new()
+    // Hot path: open directly and only fall back to create_dir_all when the
+    // parent genuinely does not exist — the unconditional pre-pass made
+    // every audit append pay a directory-stat walk on an already-cached
+    // filesystem.
+    let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("failed to open JSONL file: {}", path.display()))?;
+    {
+        Ok(file) => file,
+        Err(_) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("failed to open JSONL file: {}", path.display()))?
+        }
+    };
 
     lock_exclusive_with_deadline(&file, path)?;
     file.write_all(&line)
