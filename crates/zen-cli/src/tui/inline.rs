@@ -1147,6 +1147,37 @@ mod tests {
         assert!(!app.is_streaming);
     }
 
+    /// Submitting a follow-up while a turn streams: the message is
+    /// accepted into the queue AND its `> text` echo renders immediately
+    /// (echo-on-enqueue) — exactly once, since the drain no longer re-echoes.
+    #[test]
+    fn submit_during_streaming_enqueues_and_echoes_immediately() {
+        let (mut app, _tokens_tx, _done_tx) = scripted_stream("first");
+        let mut terminal = anchored_terminal(80, 24);
+        let mut state = InlineLoopState::new();
+
+        app.handle_command("queued later");
+        assert_eq!(
+            app.message_queue
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["queued later"],
+            "streaming submission must enqueue"
+        );
+
+        unthrottle(&mut state);
+        inline_tick(&mut app, &mut terminal, &mut state, None).expect("tick");
+        let echo_count = history(&terminal)
+            .iter()
+            .filter(|r| r.contains("> queued later"))
+            .count();
+        assert_eq!(
+            echo_count, 1,
+            "queued message echo must render exactly once at enqueue time"
+        );
+    }
+
     /// Esc-to-interrupt: CancelTurn clears the message queue.
     #[test]
     fn cancel_turn_clears_message_queue() {

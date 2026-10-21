@@ -250,6 +250,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // Queued-message count while streaming: the footer also carries the
+        // queue depth because inline mode has no queue side panel (full-screen
+        // renders one in ui.rs).
+        if app.is_streaming && !app.message_queue.is_empty() {
+            spans.push(Span::styled(
+                format!(" | \u{21c5} {} queued", app.message_queue.len()),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         // T084(c): live working indicator — `● working Ns` while streaming
         // (elapsed since the turn start), else `● streaming` when the start
         // instant is unavailable. Width pressure drops the indicator FIRST
@@ -1185,6 +1194,41 @@ mod tests {
         assert!(
             !footer.contains("working"),
             "idle footer must not show the working indicator: {footer:?}"
+        );
+    }
+
+    /// While streaming with queued messages, the footer shows `⇅ N queued`;
+    /// an empty queue or idle mode renders none.
+    #[test]
+    fn footer_queue_count_iff_streaming_with_backlog() {
+        let mut app = test_app();
+        app.is_streaming = true;
+        app.message_queue.push_back("queued1".to_string());
+        app.message_queue.push_back("queued2".to_string());
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("\u{21c5} 2 queued"),
+            "streaming footer must show queued count: {footer:?}"
+        );
+
+        // Drain emptied the queue -> the count disappears while streaming.
+        app.message_queue.clear();
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            !footer.contains("queued"),
+            "empty queue must not show the queued count: {footer:?}"
+        );
+
+        // Idle with a residual backlog (cancel-miss shape) also renders none.
+        app.is_streaming = false;
+        app.message_queue.push_back("stale".to_string());
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            !footer.contains("queued"),
+            "idle footer must not show the queued count: {footer:?}"
         );
     }
 }

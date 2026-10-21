@@ -793,6 +793,11 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **TUI 流式消息队列集成收口（2026-10-21 续；`bin/lint` 0；`bin/test` 3342/0/25 = 基线 3340 +2）** — 用户要求「运行中任务可接受消息请求放队列处理」；裁定范围 = TUI 客户端输入（gateway 层已有 per-session permit 串行 + qqbot 16 深 per-chat FIFO，无需改）。修改文件与新增功能：
+  - **echo-on-enqueue 契约**（zen-cli tui/commands.rs + chat.rs）：流式期间提交的消息入队时立即渲染 `> <text>` 进 inline scrollback（原入队静默 = 读起来像丢消息，drain 时才补 echo）；chat.rs drain 路径的 T077 补 echo 删除——回显单次渲染契约（enqueue 渲染、drain 不再渲染）。
+  - **inline footer 队列计数**（zen-cli tui/inline_ui.rs）：流式且队列非空时 footer 追加 ` | ⇅ N queued`（黄色，压缩宽度压力下遵从既有丢弃优先级规则）；inline 模式无全屏 ui.rs 的队列侧面板，footer 是唯一常驻回执。
+  - **钉**：`submit_during_streaming_enqueues_and_echoes_immediately`（入队 + echo 恰一次）、`footer_queue_count_iff_streaming_with_backlog`（流式×排队三态）。
+
 - **backlog 三项落地：gateway memory RPC 阻塞清零 + 审计热路径惰性化（2026-10-21 续；`bin/lint` 0；`bin/test` 3340/0/25 持平）** — 修改文件与新增功能：
   - **gateway memory 四处理器 spawn_blocking**（zen-gateway server/memory.rs）：`memory/{retrieve,putEntry,search,stats}` 的同步引擎调用（entity_memories/BM25 search/frame stats/sidecar 写）原样跑在 async worker 上且持读锁——新 `require_store_owned`（`ZenMemvidStore` 两-Arc 廉价克隆）在 async 侧取走 owned store 即释放 RwLock（guard 持锁跨全调用会 stall `memory/rebuild` 写者），工作体移入阻塞池。
   - **memory/search 单跳合并**：`search` 闭包内一次完成引擎查询 + `render_hits`（含 per-hit mtime stat + reward sidecar open/read，C2 的 ms 级 I/O 一并离 runtime）；`StrengthContext::resolve()` 留 async 侧（config 缓存读取）。

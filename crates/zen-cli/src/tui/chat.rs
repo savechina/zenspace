@@ -652,17 +652,9 @@ impl App {
             self.is_streaming = false;
             self.cancel_requested = false;
             while let Some(queued) = self.message_queue.pop_front() {
-                // Inline-mode user echo for QUEUED messages: the immediate
-                // dispatch path in `handle_command` renders `> <query>` into
-                // scrollback, but this deferred path skipped it, so a message
-                // typed while the previous turn was finishing silently
-                // vanished from the transcript (exposed by T077's faster
-                // scrollback inserts shrinking the streaming→queued window;
-                // e13 follow-up regression).
-                if self.is_inline_mode() {
-                    let user_lines = self.render_user_lines_for_scrollback(&queued);
-                    self.enqueue_scrollback(user_lines);
-                }
+                // Echo happens at ENQUEUE time (commands.rs) — the drain
+                // path must not re-render, or queued lines appear twice.
+                // (T077's drain-time echo was superseded by echo-on-enqueue.)
                 self.current_query = queued.clone();
                 self.start_async_chat(&queued);
                 if !self.pending_calls.is_empty() {

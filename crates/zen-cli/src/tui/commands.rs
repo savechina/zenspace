@@ -145,6 +145,15 @@ impl App {
                     true,
                 );
             } else {
+                // Echo-on-enqueue: the queued message renders into inline
+                // scrollback the moment it lands, so a submission during a
+                // live stream is visibly accepted (silent enqueue previously
+                // read as lost input; the echo at drain time duplicated
+                // nothing because only ONE of the two paths ever rendered).
+                if self.is_inline_mode() {
+                    let user_lines = self.render_user_lines_for_scrollback(cmd);
+                    self.enqueue_scrollback(user_lines);
+                }
                 self.message_queue.push_back(cmd.to_string());
             }
         } else {
