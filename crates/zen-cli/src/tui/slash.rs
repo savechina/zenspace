@@ -5,6 +5,8 @@ use unicode_width::UnicodeWidthStr;
 
 use std::collections::HashMap;
 
+use nucleo::{Config, Matcher, Utf32Str};
+
 pub struct SlashCommand {
     pub name: String,
     pub aliases: Vec<String>,
@@ -45,22 +47,50 @@ impl SlashCommandRegistry {
     }
 
     /// Codex-parity ranking (`bottom_pane/command_popup.rs::filtered`):
-    /// exact name matches hoist above prefix matches; each tier keeps
-    /// registration (presentation) order. Case-insensitive on the lowercase
-    /// command names; an empty filter keeps pure registration order.
+    /// exact name matches hoist above prefix matches, and both outrank
+    /// fuzzy-only subsequence matches (nucleo, fzf-v2 engine). The
+    /// exact/prefix tiers keep registration (presentation) order; fuzzy-only
+    /// candidates sort by descending nucleo score, then by the stable
+    /// description column, then registration index. Case-insensitive on the
+    /// lowercase command names; an empty filter keeps pure registration order.
     pub fn filter_indices(&self, prefix: &str) -> Vec<usize> {
         let needle = prefix.to_lowercase();
+        if needle.is_empty() {
+            return (0..self.commands.len()).collect();
+        }
+
         let mut exact = Vec::new();
         let mut prefixed = Vec::new();
+        let mut fuzzy = Vec::new();
+        let mut matcher = Matcher::new(Config::DEFAULT);
         for (idx, cmd) in self.commands.iter().enumerate() {
             let name = cmd.name.to_lowercase();
             if name == needle {
                 exact.push(idx);
             } else if name.starts_with(&needle) {
                 prefixed.push(idx);
+            } else {
+                let mut haystack_buf = Vec::new();
+                let haystack = Utf32Str::new(&name, &mut haystack_buf);
+                let mut needle_buf = Vec::new();
+                let needle_str = Utf32Str::new(&needle, &mut needle_buf);
+                if let Some(score) = matcher.fuzzy_match(haystack, needle_str) {
+                    fuzzy.push((u32::from(score), idx));
+                }
             }
         }
+        fuzzy.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| {
+                    self.commands[a.1]
+                        .description
+                        .cmp(&self.commands[b.1].description)
+                })
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
         exact.extend(prefixed);
+        exact.extend(fuzzy.into_iter().map(|(_, idx)| idx));
         exact
     }
 
@@ -1067,6 +1097,69 @@ mod tests {
             state.selected_command(&registry),
             Some("model"),
             "exact match must hoist above the earlier-registered prefix match"
+        );
+    }
+
+    // T026 fuzz pin
+    #[test]
+    fn t026_exact_and_prefix_outrank_fuzzy_only_matches() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("tonote".to_string(), vec![], "Zzz fuzzy".to_string());
+        registry.register("note".to_string(), vec![], "Create a note".to_string());
+        registry.register("notes".to_string(), vec![], "List notes".to_string());
+
+        let names: Vec<&str> = registry
+            .filter_indices("note")
+            .into_iter()
+            .map(|idx| registry.all_commands()[idx].name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["note", "notes", "tonote"],
+            "exact then prefixed matches must outrank the fuzzy-only subsequence"
+        );
+    }
+
+    // T026 fuzz pin
+    #[test]
+    fn t026_empty_query_keeps_registration_order() {
+        let registry = create_default_registry();
+        let indices = registry.filter_indices("");
+        assert_eq!(
+            indices,
+            (0..registry.all_commands().len()).collect::<Vec<_>>(),
+            "empty query must stay byte-identical to registration order"
+        );
+        let filtered: Vec<&str> = indices
+            .iter()
+            .map(|&idx| registry.all_commands()[idx].name.as_str())
+            .collect();
+        let registered: Vec<&str> = registry
+            .all_commands()
+            .iter()
+            .map(|cmd| cmd.name.as_str())
+            .collect();
+        assert_eq!(filtered, registered);
+    }
+
+    // T026 fuzz pin
+    #[test]
+    fn t026_fuzzy_ties_break_on_description_then_registration_order() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register("abxc".to_string(), vec![], "zebra".to_string());
+        registry.register("abyc".to_string(), vec![], "alpha".to_string());
+
+        let names: Vec<&str> = registry
+            .filter_indices("abc")
+            .into_iter()
+            .map(|idx| registry.all_commands()[idx].name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["abyc", "abxc"],
+            "equal fuzzy scores must tie-break on the description column"
         );
     }
 

@@ -1,16 +1,22 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::tool::{Tool, ToolSchema};
-use rig_mcp::{McpTransport, StdioTransport};
+use rig_mcp::McpTransport;
+use rmcp::ClientHandler;
+use rmcp::model::{CallToolRequestParams, Tool as RmcpTool};
+use rmcp::service::{NotificationContext, Peer, RoleClient, RunningService, ServiceExt};
+use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 3;
@@ -20,11 +26,10 @@ const BACKOFF_SECS: &[u64] = zen_core::retry::BACKOFF_SECS;
 
 type SpawnFuture = Pin<Box<dyn Future<Output = Result<Arc<dyn McpTransport>, String>> + Send>>;
 
-/// Re-spawns the MCP subprocess on demand. A factory is needed because
-/// `StdioTransport` exposes neither its child handle nor a `clone`/`restart`
-/// method — the only way to recover from a crash is to call
-/// `StdioTransport::spawn` again with the original args, which this closure
-/// captures.
+/// Re-spawns the MCP subprocess on demand. A factory is needed because the
+/// transport exposes neither its child handle nor a `clone`/`restart` method —
+/// the only way to recover from a crash is to spawn again with the original
+/// command, args, and scrubbed env, which this closure captures.
 type SpawnFactory = Arc<dyn Fn() -> SpawnFuture + Send + Sync>;
 
 /// First-run trust prompt (FR-018): called with a server config, returns
@@ -33,19 +38,75 @@ type SpawnFactory = Arc<dyn Fn() -> SpawnFuture + Send + Sync>;
 pub type TrustPrompt =
     Option<Arc<dyn Fn(&zen_core::config::McpServerConfig) -> bool + Send + Sync>>;
 
+/// One registered MCP tool. The schema is behind an `RwLock` so a
+/// `notifications/tools/list_changed` refresh can update the live
+/// registration in place (T079) without re-registering or restarting the
+/// session; `removed` tombstones a tool the server no longer offers because
+/// rig-compose's `ToolRegistry` has no unregister.
 struct McpProxyTool {
     transport: Arc<dyn McpTransport>,
+    server_name: String,
     original_name: String,
-    schema: ToolSchema,
+    schema: RwLock<ToolSchema>,
+    removed: AtomicBool,
+}
+
+impl McpProxyTool {
+    fn new(
+        transport: Arc<dyn McpTransport>,
+        server_name: impl Into<String>,
+        original_name: impl Into<String>,
+        schema: ToolSchema,
+    ) -> Self {
+        Self {
+            transport,
+            server_name: server_name.into(),
+            original_name: original_name.into(),
+            schema: RwLock::new(schema),
+            removed: AtomicBool::new(false),
+        }
+    }
+
+    fn schema_snapshot(&self) -> ToolSchema {
+        self.schema
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn replace_schema(&self, schema: ToolSchema) {
+        *self
+            .schema
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = schema;
+    }
+
+    fn mark_removed(&self) {
+        self.removed.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_active(&self) {
+        self.removed.store(false, Ordering::Relaxed);
+    }
+
+    fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
 impl Tool for McpProxyTool {
     fn schema(&self) -> ToolSchema {
-        self.schema.clone()
+        self.schema_snapshot()
     }
 
     async fn invoke(&self, args: Value) -> Result<Value, KernelError> {
+        if self.is_removed() {
+            return Err(KernelError::ToolFailed(format!(
+                "MCP tool '{}' is no longer offered by server '{}' (tools/list_changed)",
+                self.original_name, self.server_name
+            )));
+        }
         self.transport.call_tool(&self.original_name, args).await
     }
 }
@@ -54,6 +115,163 @@ impl Tool for McpProxyTool {
 /// their source server **without** an `mcp.` prefix, e.g. `brave.web_search`.
 fn namespaced_tool_name(server: &str, tool: &str) -> String {
     format!("{}.{}", server, tool)
+}
+
+/// Delta produced by applying a fresh `tools/list` snapshot to a live
+/// registry. All-zero means the server's tool catalog is byte-identical.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ToolUpdate {
+    added: usize,
+    removed: usize,
+    updated: usize,
+}
+
+impl ToolUpdate {
+    fn changed(&self) -> bool {
+        self.added + self.removed + self.updated > 0
+    }
+}
+
+/// Deterministic digest of a `tools/list` snapshot (names + schemas) used to
+/// drop `list_changed` notifications that carry no actual change (T079).
+fn tool_list_fingerprint(schemas: &[ToolSchema]) -> u64 {
+    let mut items: Vec<(&str, &str, String, String)> = schemas
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.description.as_str(),
+                s.args_schema.to_string(),
+                s.result_schema.to_string(),
+            )
+        })
+        .collect();
+    items.sort();
+    let mut hasher = DefaultHasher::new();
+    items.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Live registration surface for one MCP server (T079). Owns the proxy
+/// handles so a `notifications/tools/list_changed` can re-list and hot-swap
+/// schemas, register newly discovered tools, and tombstone removed ones —
+/// without restarting the session or re-bootstrapping the client.
+struct McpToolSet {
+    server_name: String,
+    registry: ToolRegistry,
+    transport: Arc<dyn McpTransport>,
+    proxies: Mutex<HashMap<String, Arc<McpProxyTool>>>,
+    fingerprint: Mutex<Option<u64>>,
+}
+
+impl McpToolSet {
+    fn new(
+        server_name: impl Into<String>,
+        registry: ToolRegistry,
+        transport: Arc<dyn McpTransport>,
+    ) -> Self {
+        Self {
+            server_name: server_name.into(),
+            registry,
+            transport,
+            proxies: Mutex::new(HashMap::new()),
+            fingerprint: Mutex::new(None),
+        }
+    }
+
+    async fn list_and_apply(&self) -> Result<ToolUpdate, KernelError> {
+        let schemas = self.transport.list_tools().await?;
+        Ok(self.apply(schemas).await)
+    }
+
+    async fn apply(&self, schemas: Vec<ToolSchema>) -> ToolUpdate {
+        let digest = tool_list_fingerprint(&schemas);
+        let mut last = self.fingerprint.lock().await;
+        if *last == Some(digest) {
+            return ToolUpdate::default();
+        }
+        *last = Some(digest);
+
+        let mut proxies = self.proxies.lock().await;
+        let mut seen: HashSet<String> = HashSet::with_capacity(schemas.len());
+        let mut update = ToolUpdate::default();
+
+        for schema in schemas {
+            let original = schema.name.clone();
+            seen.insert(original.clone());
+            let namespaced = ToolSchema {
+                name: namespaced_tool_name(&self.server_name, &original),
+                description: schema.description,
+                args_schema: schema.args_schema,
+                result_schema: schema.result_schema,
+            };
+
+            match proxies.get(&original) {
+                Some(proxy) => {
+                    if proxy.is_removed() {
+                        proxy.replace_schema(namespaced);
+                        proxy.mark_active();
+                        update.updated += 1;
+                    } else if proxy.schema_snapshot() != namespaced {
+                        proxy.replace_schema(namespaced);
+                        update.updated += 1;
+                    }
+                }
+                None => {
+                    let proxy = Arc::new(McpProxyTool::new(
+                        self.transport.clone(),
+                        self.server_name.clone(),
+                        original.clone(),
+                        namespaced,
+                    ));
+                    self.registry.register(proxy.clone());
+                    proxies.insert(original, proxy);
+                    update.added += 1;
+                }
+            }
+        }
+
+        for (name, proxy) in proxies.iter() {
+            if !seen.contains(name) && !proxy.is_removed() {
+                proxy.mark_removed();
+                update.removed += 1;
+            }
+        }
+
+        update
+    }
+}
+
+/// Background consumer for MCP `tools/list_changed` signals (T079). The rmcp
+/// client handler only forwards a wake-up; this worker owns the re-list so the
+/// protocol reader is never blocked on `list_tools` round-trips (D5: all pipe
+/// I/O stays with the rmcp service task, never inline on the call path).
+fn spawn_tool_refresh_worker(
+    mut signals: mpsc::UnboundedReceiver<()>,
+    tools: Arc<McpToolSet>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while signals.recv().await.is_some() {
+            match tools.list_and_apply().await {
+                Ok(update) if update.changed() => info!(
+                    server = %tools.server_name,
+                    added = update.added,
+                    removed = update.removed,
+                    updated = update.updated,
+                    "MCP tools/list_changed applied in place"
+                ),
+                Ok(_) => info!(
+                    server = %tools.server_name,
+                    "MCP tools/list_changed with identical catalog ignored"
+                ),
+                Err(e) => warn!(
+                    server = %tools.server_name,
+                    error = %e,
+                    "MCP tools/list_changed refresh failed"
+                ),
+            }
+        }
+    })
 }
 
 /// Crash-recovering MCP transport (FR-013). On a `call_tool`/`list_tools`
@@ -70,13 +288,6 @@ struct ReconnectingMcpTransport {
     /// Per-attempt delays before each re-spawn (FR-013). Injectable so tests
     /// can exercise the full retry sequence without real sleeping.
     backoffs: Vec<Duration>,
-    /// Last-known tool set from `tools/list`, used by [`Self::refresh_tools`]
-    /// to diff added/removed tools after a `notifications/tools/list_changed`.
-    ///
-    /// `#[allow(dead_code)]`: only read by `refresh_tools`, which is exercised
-    /// by tests but not yet wired to a notification reader (FR-015 hook point).
-    #[allow(dead_code)]
-    last_tools: Mutex<Vec<ToolSchema>>,
 }
 
 impl ReconnectingMcpTransport {
@@ -96,7 +307,6 @@ impl ReconnectingMcpTransport {
             spawn,
             current: Mutex::new(Some(initial)),
             backoffs,
-            last_tools: Mutex::new(Vec::new()),
         }
     }
 
@@ -108,43 +318,6 @@ impl ReconnectingMcpTransport {
                 self.server_name, MAX_RECONNECT_ATTEMPTS
             ))),
         }
-    }
-
-    /// Re-issue `tools/list` and diff the result against the last-known tool
-    /// set, logging added/removed tools at info level (FR-015).
-    ///
-    /// The registered `McpProxyTool` set lives in the shared `ToolRegistry`,
-    /// which rig-compose exposes no `unregister` for — so this method cannot
-    /// mutate the live tool set. It is the honest partial: it detects and
-    /// reports the change; a full re-registration requires a reconnect +
-    /// re-bootstrap of the server.
-    ///
-    /// `#[allow(dead_code)]`: exercised by tests but not yet wired to a
-    /// notification reader (FR-015 hook point).
-    #[allow(dead_code)]
-    async fn refresh_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
-        let transport = self.current_transport().await?;
-        let schemas = transport.list_tools().await?;
-
-        let mut known = self.last_tools.lock().await;
-        let prev: HashSet<String> = known.iter().map(|s| s.name.clone()).collect();
-        let next: HashSet<String> = schemas.iter().map(|s| s.name.clone()).collect();
-        for added in next.difference(&prev) {
-            info!(
-                server = %self.server_name,
-                tool = %added,
-                "MCP tool added after list_changed — refresh requires reconnect"
-            );
-        }
-        for removed in prev.difference(&next) {
-            info!(
-                server = %self.server_name,
-                tool = %removed,
-                "MCP tool removed after list_changed — refresh requires reconnect"
-            );
-        }
-        *known = schemas.clone();
-        Ok(schemas)
     }
 
     async fn reconnect(&self) -> Result<Arc<dyn McpTransport>, KernelError> {
@@ -380,7 +553,8 @@ fn parse_sse_response(body: &str, expected_id: u64) -> Result<Value, KernelError
                 Ok(r) => return Ok(r),
                 Err(e) => last_err = Some(e.to_string()),
             }
-            // Notifications are ignored — FR-015 future work.
+            // Notifications in a request-response stream are ignored — this
+            // transport has no long-lived SSE subscription (T079 covers stdio).
         }
     }
 
@@ -571,9 +745,20 @@ pub async fn bootstrap_mcp_clients(
                     }
                 };
                 let args: Vec<String> = server.args.clone().unwrap_or_default();
+                let env: HashMap<String, String> = server.env.clone().unwrap_or_default();
                 let endpoint = format!("stdio://{}", server.name);
 
-                match connect_stdio(registry, &server.name, &endpoint, &command, &args).await {
+                let connected = connect_stdio(
+                    registry,
+                    &server.name,
+                    &endpoint,
+                    &command,
+                    &args,
+                    &env,
+                    server.auto_refresh,
+                )
+                .await;
+                match connected {
                     Ok(count) => {
                         info!(server = %server.name, tools = count, "MCP client connected");
                     }
@@ -631,9 +816,12 @@ async fn connect_stdio(
     endpoint: &str,
     program: &str,
     args: &[String],
+    env: &HashMap<String, String>,
+    auto_refresh: bool,
 ) -> Result<usize, String> {
+    let (notify, signals) = mpsc::unbounded_channel();
     let initial: Arc<dyn McpTransport> = Arc::new(
-        spawn_stdio(endpoint, program, args)
+        ZenStdioTransport::spawn(endpoint, program, args, env, Some(notify.clone()))
             .await
             .map_err(|e| format!("spawn failed: {}", e))?,
     );
@@ -647,15 +835,20 @@ async fn connect_stdio(
     let endpoint_factory = endpoint.to_string();
     let program_factory = program.to_string();
     let args_factory = args.to_vec();
+    let env_factory = env.clone();
     let spawn: SpawnFactory = Arc::new(move || {
         let endpoint = endpoint_factory.clone();
         let program = program_factory.clone();
         let args = args_factory.clone();
+        let env = env_factory.clone();
+        let notify = notify.clone();
         Box::pin(async move {
-            spawn_stdio(&endpoint, &program, &args)
-                .await
-                .map(|t| Arc::new(t) as Arc<dyn McpTransport>)
-                .map_err(|e| e.to_string())
+            let transport =
+                ZenStdioTransport::spawn(&endpoint, &program, &args, &env, Some(notify))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let transport: Arc<dyn McpTransport> = Arc::new(transport);
+            Ok(transport)
         })
     });
 
@@ -666,42 +859,23 @@ async fn connect_stdio(
         initial,
     ));
 
-    // TODO(FR-015): list_changed auto-refresh. rig-mcp 0.2.5's
-    // `McpTransport` has no subscription/notification API (no
-    // `notifications/tools/list_changed`, no `subscribe`). When a future
-    // rig-mcp adds it: expose a watch channel on the transport, spawn a
-    // background task that re-runs `list_tools()`, diffs old vs new
-    // schemas, and registers/unregisters `McpProxyTool` entries to keep
-    // the tool set live without a restart.
-    //
-    // D5 note — stdout deadlock avoidance: `ReconnectingMcpTransport`
-    // deliberately does NOT read child stdout directly; all pipe I/O is
-    // delegated to `StdioTransport` (rig-mcp), which owns the child
-    // handle and its stdout drain. Any future implementation that
-    // subscribes to server notifications (FR-015) MUST spawn a dedicated
-    // tokio reader task that continuously drains the child stdout pipe
-    // into a channel — reading inline on the call path would block on
-    // pipe-buffer fill (64 KiB on most OSes) and deadlock the transport.
-    let count = schemas.len();
-    for schema in schemas {
-        let original_name = schema.name.clone();
-        let namespaced_schema = ToolSchema {
-            name: namespaced_tool_name(server_name, &original_name),
-            description: schema.description,
-            args_schema: schema.args_schema,
-            result_schema: schema.result_schema,
-        };
+    let tools = Arc::new(McpToolSet::new(
+        server_name,
+        registry.clone(),
+        reconnecting.clone(),
+    ));
+    let update = tools.apply(schemas).await;
+    if auto_refresh {
+        let worker = spawn_tool_refresh_worker(signals, tools);
 
-        let proxy = Arc::new(McpProxyTool {
-            transport: reconnecting.clone(),
-            original_name,
-            schema: namespaced_schema,
-        });
-
-        registry.register(proxy);
+        // The worker lives exactly as long as this server's notification
+        // sender: every transport spawned by the factory (including crash
+        // re-spawns) carries a clone, so the receiver stays attached across
+        // reconnects.
+        drop(worker);
     }
 
-    Ok(count)
+    Ok(update.added)
 }
 
 /// Connect to an HTTP/HTTPS MCP server, wrap in [`ReconnectingMcpTransport`]
@@ -745,26 +919,12 @@ async fn connect_http(
         initial,
     ));
 
-    let count = schemas.len();
-    for schema in schemas {
-        let original_name = schema.name.clone();
-        let namespaced_schema = ToolSchema {
-            name: namespaced_tool_name(server_name, &original_name),
-            description: schema.description,
-            args_schema: schema.args_schema,
-            result_schema: schema.result_schema,
-        };
+    // HTTP carries no server-initiated `tools/list_changed` stream in this
+    // minimal transport (one POST per call), so the set is seeded once.
+    let tools = McpToolSet::new(server_name, registry.clone(), reconnecting.clone());
+    let update = tools.apply(schemas).await;
 
-        let proxy = Arc::new(McpProxyTool {
-            transport: reconnecting.clone(),
-            original_name,
-            schema: namespaced_schema,
-        });
-
-        registry.register(proxy);
-    }
-
-    Ok(count)
+    Ok(update.added)
 }
 
 /// Smoke-test connectivity to a single MCP server (D4 / `zen plugin mcp
@@ -785,9 +945,10 @@ pub async fn reconnect_mcp_server(
                 .clone()
                 .ok_or_else(|| format!("server '{}' (stdio) has no 'command'", server.name))?;
             let args = server.args.clone().unwrap_or_default();
+            let env = server.env.clone().unwrap_or_default();
             let endpoint = format!("stdio://{}", server.name);
             let transport: Arc<dyn McpTransport> = Arc::new(
-                spawn_stdio(&endpoint, &command, &args)
+                ZenStdioTransport::spawn(&endpoint, &command, &args, &env, None)
                     .await
                     .map_err(|e| format!("spawn failed: {}", e))?,
             );
@@ -822,18 +983,144 @@ pub async fn reconnect_mcp_server(
     }
 }
 
-async fn spawn_stdio(
-    endpoint: &str,
-    program: &str,
-    args: &[String],
-) -> Result<StdioTransport, KernelError> {
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    // TODO(FR-037): rig-mcp StdioTransport does not expose env control; the
-    // child inherits the parent env (secrets included). Blocked upstream —
-    // rig-mcp 0.2.5 `StdioTransport::spawn` builds its own
-    // `tokio::process::Command` with no env parameter. Revisit when rig-mcp
-    // adds env support.
-    StdioTransport::spawn(endpoint, program, &arg_refs).await
+/// Environment for a spawned MCP stdio child (FR-037 / T074).
+///
+/// Parent secrets are stripped by the shared `zen_core::env_scrub` rules.
+/// Per-server `env` entries from `[mcp_servers]` are user-authoritative: they
+/// are allowlisted so a legitimately secret-named variable configured for the
+/// server (e.g. `GITHUB_TOKEN`) survives the pattern sweep, while
+/// loader-injection vars stay blocked even when configured (SC-017).
+fn child_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
+    let scrub = zen_core::env_scrub::EnvScrubConfig {
+        extra_scrub: Vec::new(),
+        allowlist: config_env.keys().cloned().collect(),
+    };
+    zen_core::env_scrub::scrubbed_env(config_env, &scrub)
+}
+
+/// rmcp client handler that only forwards `notifications/tools/list_changed`
+/// as a wake-up for [`spawn_tool_refresh_worker`].
+struct ToolChangeNotifier {
+    notify: Option<mpsc::UnboundedSender<()>>,
+}
+
+impl ClientHandler for ToolChangeNotifier {
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        if let Some(tx) = &self.notify {
+            // A dropped receiver means no refresh worker is attached (one-shot
+            // connectivity probes): discarding the wake-up is correct there.
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Stdio MCP transport that owns its client layer so the child can be
+/// spawned with a scrubbed environment (T074) and can surface
+/// `notifications/tools/list_changed` (T079) — neither is possible through
+/// rig-mcp 0.2.5's `StdioTransport`, which exposes no env control and no
+/// notification hook. Protocol framing and the stdout drain remain rmcp's.
+struct ZenStdioTransport {
+    endpoint: String,
+    peer: Peer<RoleClient>,
+    _service: Arc<RunningService<RoleClient, ToolChangeNotifier>>,
+}
+
+impl ZenStdioTransport {
+    async fn spawn(
+        endpoint: &str,
+        program: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        notify: Option<mpsc::UnboundedSender<()>>,
+    ) -> Result<Self, KernelError> {
+        let mut command = tokio::process::Command::new(program);
+        command.args(args);
+        command.env_clear();
+        command.envs(child_env(env));
+
+        let transport = TokioChildProcess::new(command)
+            .map_err(|e| KernelError::ToolFailed(format!("mcp.spawn: {}", e)))?;
+        let service = ToolChangeNotifier { notify }
+            .serve(transport)
+            .await
+            .map_err(|e| KernelError::ToolFailed(format!("mcp.connect: {}", e)))?;
+        let peer = service.peer().clone();
+        Ok(Self {
+            endpoint: endpoint.to_string(),
+            peer,
+            _service: Arc::new(service),
+        })
+    }
+}
+
+fn rmcp_tool_to_schema(tool: RmcpTool) -> ToolSchema {
+    ToolSchema {
+        name: tool.name.to_string(),
+        description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
+        args_schema: Value::Object((*tool.input_schema).clone()),
+        result_schema: tool
+            .output_schema
+            .map(|s| Value::Object((*s).clone()))
+            .unwrap_or(Value::Null),
+    }
+}
+
+#[async_trait]
+impl McpTransport for ZenStdioTransport {
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    async fn list_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
+        let tools = self
+            .peer
+            .list_all_tools()
+            .await
+            .map_err(|e| KernelError::ToolFailed(format!("tools/list: {}", e)))?;
+        Ok(tools.into_iter().map(rmcp_tool_to_schema).collect())
+    }
+
+    async fn call_tool(&self, name: &str, args: Value) -> Result<Value, KernelError> {
+        let arguments = match args {
+            Value::Object(map) => Some(map),
+            Value::Null => None,
+            other => {
+                return Err(KernelError::InvalidArgument(format!(
+                    "tools/call requires an object or null arguments, got {other}"
+                )));
+            }
+        };
+        let mut params = CallToolRequestParams::new(name.to_string());
+        params.arguments = arguments;
+        let result = self
+            .peer
+            .call_tool(params)
+            .await
+            .map_err(|e| KernelError::ToolFailed(format!("tools/call: {}", e)))?;
+
+        if result.is_error.unwrap_or(false) {
+            let msg = result
+                .content
+                .iter()
+                .find_map(|c| c.as_text().map(|t| t.text.clone()))
+                .unwrap_or_else(|| "tool returned error".to_string());
+            return Err(KernelError::ToolFailed(msg));
+        }
+        if let Some(value) = result.structured_content {
+            return Ok(value);
+        }
+        if let Some(text) = result
+            .content
+            .iter()
+            .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                return Ok(parsed);
+            }
+            return Ok(Value::String(text.to_string()));
+        }
+        Ok(Value::Null)
+    }
 }
 
 #[cfg(test)]
@@ -915,7 +1202,6 @@ mod tests {
             spawn,
             current: Mutex::new(Some(failing_transport())),
             backoffs: instant_backoffs(),
-            last_tools: Mutex::new(Vec::new()),
         };
 
         let err = transport.call_tool("ping", Value::Null).await.unwrap_err();
@@ -949,7 +1235,6 @@ mod tests {
             spawn,
             current: Mutex::new(Some(failing_transport())),
             backoffs: instant_backoffs(),
-            last_tools: Mutex::new(Vec::new()),
         };
 
         let result = transport.call_tool("ping", Value::Null).await;
@@ -974,7 +1259,6 @@ mod tests {
             spawn,
             current: Mutex::new(Some(healthy_transport())),
             backoffs: instant_backoffs(),
-            last_tools: Mutex::new(Vec::new()),
         };
 
         let result = transport.call_tool("ping", Value::Null).await;
@@ -982,10 +1266,10 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 0, "no spawn should occur");
     }
 
-    /// Mock transport whose `tools/list` result is driven by a shared list of
-    /// tool names, so a test can mutate the server's tool set between calls.
+    /// In-memory transport whose `tools/list` is driven by a shared snapshot,
+    /// so a test can play the server's `list_changed` role.
     struct ListMock {
-        tools: Arc<Mutex<Vec<String>>>,
+        tools: Arc<Mutex<Vec<ToolSchema>>>,
     }
 
     #[async_trait]
@@ -995,18 +1279,7 @@ mod tests {
         }
 
         async fn list_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
-            Ok(self
-                .tools
-                .lock()
-                .await
-                .iter()
-                .map(|n| ToolSchema {
-                    name: n.clone(),
-                    description: String::new(),
-                    args_schema: Value::Null,
-                    result_schema: Value::Null,
-                })
-                .collect())
+            Ok(self.tools.lock().await.clone())
         }
 
         async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, KernelError> {
@@ -1014,42 +1287,166 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn refresh_tools_diffs_and_updates_known_set() {
-        let tools = Arc::new(Mutex::new(vec!["a".to_string(), "b".to_string()]));
-        let transport = ReconnectingMcpTransport {
-            server_name: "srv-list".into(),
-            endpoint: "stdio://srv-list".into(),
-            spawn: Arc::new(|| {
-                Box::pin(async { Err::<Arc<dyn McpTransport>, String>("unused".into()) })
+    fn schema(name: &str, description: &str) -> ToolSchema {
+        ToolSchema {
+            name: name.to_string(),
+            description: description.to_string(),
+            args_schema: Value::Null,
+            result_schema: Value::Null,
+        }
+    }
+
+    struct SeededSet {
+        schemas: Arc<Mutex<Vec<ToolSchema>>>,
+        registry: ToolRegistry,
+        tools: Arc<McpToolSet>,
+    }
+
+    fn seeded_set(server: &str, initial: Vec<ToolSchema>) -> SeededSet {
+        let schemas = Arc::new(Mutex::new(initial));
+        let registry = ToolRegistry::new();
+        let tools = Arc::new(McpToolSet::new(
+            server,
+            registry.clone(),
+            Arc::new(ListMock {
+                tools: schemas.clone(),
             }),
-            current: Mutex::new(Some(Arc::new(ListMock {
-                tools: tools.clone(),
-            }) as Arc<dyn McpTransport>)),
-            backoffs: instant_backoffs(),
-            last_tools: Mutex::new(Vec::new()),
-        };
+        ));
+        SeededSet {
+            schemas,
+            registry,
+            tools,
+        }
+    }
 
-        let first = transport.refresh_tools().await.unwrap();
-        assert_eq!(first.len(), 2);
+    #[test]
+    fn child_env_scrubs_parent_secrets_and_keeps_config_env() {
+        // GIVEN a parent process carrying a secret and a per-server env map
+        // SAFETY: unique process-global key mutated only by this test.
+        unsafe {
+            std::env::set_var("ZEN_MCP_TEST_PARENT_API_KEY", "leak-me");
+        }
+        let mut config_env = HashMap::new();
+        config_env.insert("ZEN_MCP_FEATURE".to_string(), "on".to_string());
+        config_env.insert("GITHUB_TOKEN".to_string(), "configured".to_string());
 
-        *tools.lock().await = vec!["b".to_string(), "c".to_string()];
-        let second = transport.refresh_tools().await.unwrap();
-        let names: Vec<String> = second.iter().map(|s| s.name.clone()).collect();
-        assert_eq!(names, vec!["b", "c"]);
+        // WHEN the child environment is derived
+        let env = child_env(&config_env);
+        unsafe {
+            std::env::remove_var("ZEN_MCP_TEST_PARENT_API_KEY");
+        }
 
-        let known: Vec<String> = transport
-            .last_tools
-            .lock()
-            .await
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
+        // THEN parent secrets are gone and configured entries are authoritative
+        assert!(!env.contains_key("ZEN_MCP_TEST_PARENT_API_KEY"));
+        assert_eq!(env.get("ZEN_MCP_FEATURE").map(String::as_str), Some("on"));
         assert_eq!(
-            known,
-            vec!["b", "c"],
-            "last-known set must track the latest list"
+            env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("configured"),
+            "per-server config env must survive the pattern sweep"
         );
+    }
+
+    #[test]
+    fn child_env_rejects_loader_injection_even_when_configured() {
+        // GIVEN a server env map trying to re-arm a loader hook
+        let mut config_env = HashMap::new();
+        config_env.insert("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string());
+
+        // WHEN the child environment is derived
+        let env = child_env(&config_env);
+
+        // THEN the loader var is dropped despite the config allowlist
+        assert!(!env.contains_key("LD_PRELOAD"));
+    }
+
+    #[tokio::test]
+    async fn list_changed_refreshes_proxy_registry_in_place() {
+        // GIVEN a server exposing a and b, both registered
+        let SeededSet {
+            schemas,
+            registry,
+            tools,
+        } = seeded_set("srv", vec![schema("a", ""), schema("b", "")]);
+        let seeded = tools.list_and_apply().await.unwrap();
+        assert_eq!(seeded.added, 2);
+        assert!(registry.get("srv.a").is_ok());
+
+        // WHEN the server drops a and adds c
+        *schemas.lock().await = vec![schema("b", ""), schema("c", "")];
+        let update = tools.list_and_apply().await.unwrap();
+
+        // THEN c is registered live, a is tombstoned, b is untouched
+        let expected = ToolUpdate {
+            added: 1,
+            removed: 1,
+            updated: 0,
+        };
+        assert_eq!(update, expected);
+        assert!(registry.get("srv.c").is_ok());
+        let removed = registry.get("srv.a").unwrap();
+        let err = removed.invoke(Value::Null).await.unwrap_err();
+        assert!(err.to_string().contains("no longer offered"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_changed_updates_schema_in_place() {
+        // GIVEN a registered tool with an old description
+        let SeededSet {
+            schemas,
+            registry,
+            tools,
+        } = seeded_set("srv", vec![schema("a", "old")]);
+        tools.list_and_apply().await.unwrap();
+
+        // WHEN the server changes only the schema
+        *schemas.lock().await = vec![schema("a", "new")];
+        let update = tools.list_and_apply().await.unwrap();
+
+        // THEN the same registry entry serves the refreshed schema
+        assert_eq!(update.updated, 1);
+        assert_eq!(registry.get("srv.a").unwrap().schema().description, "new");
+    }
+
+    #[tokio::test]
+    async fn unchanged_tool_list_is_a_noop() {
+        // GIVEN a seeded tool set
+        let SeededSet { tools, .. } = seeded_set("srv", vec![schema("a", "same")]);
+        tools.list_and_apply().await.unwrap();
+
+        // WHEN the server re-lists an identical catalog
+        let second = tools.list_and_apply().await.unwrap();
+
+        // THEN the refresh reports no delta
+        assert_eq!(second, ToolUpdate::default());
+        assert!(!second.changed());
+    }
+
+    #[tokio::test]
+    async fn notification_signal_triggers_relist_and_registration() {
+        // GIVEN a live tool set and an attached refresh worker
+        let SeededSet {
+            schemas,
+            registry,
+            tools,
+        } = seeded_set("srv", vec![schema("a", "")]);
+        tools.list_and_apply().await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = spawn_tool_refresh_worker(rx, tools.clone());
+
+        // WHEN the server gains tool b and emits tools/list_changed
+        *schemas.lock().await = vec![schema("a", ""), schema("b", "")];
+        tx.send(()).unwrap();
+
+        // THEN the worker re-lists and registers b without a session restart
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while registry.get("srv.b").is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refresh worker never registered the new tool"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        worker.abort();
     }
 
     #[test]

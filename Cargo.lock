@@ -4918,6 +4918,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleo"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c28316df514918915799651c5a1cc8f1dd33a9294e1cc22f27fd19453fd62c"
+dependencies = [
+ "nucleo-matcher",
+ "parking_lot",
+ "rayon",
+]
+
+[[package]]
 name = "nucleo-matcher"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10544,6 +10555,7 @@ dependencies = [
  "dotenvy",
  "libc",
  "mdstream",
+ "nucleo",
  "nucleo-matcher",
  "portable-pty",
  "ratatui",
@@ -10690,12 +10702,14 @@ dependencies = [
  "reqwest 0.13.4",
  "rig-compose",
  "rig-mcp",
+ "rmcp",
  "schemars",
  "scraper 0.27.0",
  "seccompiler",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "shlex",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.19",

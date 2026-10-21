@@ -69,6 +69,9 @@ clap-verbosity-flag = { version = "3.0.4", features = ["tracing"] }
 
 # Fuzzy matching for Ctrl+R history search (Constitution XI: reuse fzf-v2 engine)
 nucleo-matcher = "0.3.1"
+# High-level nucleo crate (MPL-2.0) re-exports the same matcher engine; used by
+# the slash popup to rank exact/prefix above fuzzy-only matches.
+nucleo = "0.3"
 
 # Scheduler (ZenScheduler — cron expression parsing, D11)
 cron = "0.17"
@@ -129,6 +132,9 @@ pdf-extract = "0.10"
 # alternatives (undoc 20k dl, anytomd 9k dl) lack real-world consumers.
 office_oxide = "0.1"
 regex = "1"
+# FR-042 shell `-c` decomposition: POSIX quote-aware tokenization. Pinned to
+# the 2.0 line already present in the tree (transitive) so no version island.
+shlex = "2"
 
 # WebSocket client for QQ Bot
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }

@@ -4,12 +4,16 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use rig_compose::normalizer::{ToolDispatchAction, ToolInvocation};
 use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zen_core::sandbox::SandboxValidator;
-use zen_core::sandbox::{OsSandboxProfile, is_likely_sandbox_denied, sandbox_spawn};
+use zen_core::sandbox::{
+    OsSandboxProfile, PROTECTED_PATHS, SandboxMode, SeatbeltPolicy, ToolArgRegistry, is_env_file,
+    is_likely_sandbox_denied, sandbox_spawn,
+};
 
 #[derive(Clone)]
 pub struct ShellExecTool {
@@ -69,6 +73,267 @@ const MAX_OUTPUT_CHARS: usize = 10_000;
 // runaway children.
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
+const SHELL_BINARIES: &[&str] = &["sh", "bash", "zsh", "dash"];
+const MAX_SUBSTITUTION_DEPTH: usize = 16;
+
+/// One command unit extracted from a compound shell `-c` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompoundSegment {
+    /// Trimmed source text, used verbatim in denial messages.
+    pub(crate) text: String,
+    /// POSIX tokens (quotes resolved) used for path inspection.
+    pub(crate) tokens: Vec<String>,
+}
+
+/// Decompose a shell `-c` command string into independently validatable units.
+///
+/// GIVEN an embedded `sh -c` command string,
+/// WHEN it is lexically decomposable with POSIX quote rules,
+/// THEN each command joined by `&&`, `||`, `;`, `|`, `&`, or a newline becomes
+/// its own [`CompoundSegment`], and each `$(...)` / backtick substitution body
+/// is flattened into additional units while the enclosing command keeps the
+/// original text (so the outer head command is still inspected).
+///
+/// Returns `None` when a high-confidence split is impossible — unmatched
+/// quotes, a trailing escape, heredocs, or process/arithmetic substitution.
+/// Callers must then evaluate the whole string as a single unit.
+pub(crate) fn decompose_compound(cmd: &str) -> Option<Vec<CompoundSegment>> {
+    let chars: Vec<char> = cmd.chars().collect();
+    decompose_chars(&chars, 0)
+}
+
+fn decompose_chars(chars: &[char], depth: usize) -> Option<Vec<CompoundSegment>> {
+    if depth > MAX_SUBSTITUTION_DEPTH {
+        return None;
+    }
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if in_single {
+            current.push(c);
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            match c {
+                '\\' => {
+                    current.push(c);
+                    current.push(*chars.get(i + 1)?);
+                    i += 2;
+                }
+                '"' => {
+                    current.push(c);
+                    in_double = false;
+                    i += 1;
+                }
+                '`' => {
+                    let (end, inner) = scan_backtick(chars, i)?;
+                    segments.extend(decompose_chars(&inner, depth + 1)?);
+                    current.push_str(&chars[i..end].iter().collect::<String>());
+                    i = end;
+                }
+                '$' if chars.get(i + 1) == Some(&'(') => {
+                    if chars.get(i + 2) == Some(&'(') {
+                        return None;
+                    }
+                    let (end, inner) = scan_dollar_paren(chars, i)?;
+                    segments.extend(decompose_chars(&inner, depth + 1)?);
+                    current.push_str(&chars[i..end].iter().collect::<String>());
+                    i = end;
+                }
+                _ => {
+                    current.push(c);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        match c {
+            '\'' => {
+                in_single = true;
+                current.push(c);
+                i += 1;
+            }
+            '"' => {
+                in_double = true;
+                current.push(c);
+                i += 1;
+            }
+            '\\' => {
+                current.push(c);
+                current.push(*chars.get(i + 1)?);
+                i += 2;
+            }
+            '`' => {
+                let (end, inner) = scan_backtick(chars, i)?;
+                segments.extend(decompose_chars(&inner, depth + 1)?);
+                current.push_str(&chars[i..end].iter().collect::<String>());
+                i = end;
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                if chars.get(i + 2) == Some(&'(') {
+                    return None;
+                }
+                let (end, inner) = scan_dollar_paren(chars, i)?;
+                segments.extend(decompose_chars(&inner, depth + 1)?);
+                current.push_str(&chars[i..end].iter().collect::<String>());
+                i = end;
+            }
+            '<' if chars.get(i + 1) == Some(&'<') => return None,
+            '<' | '>' if chars.get(i + 1) == Some(&'(') => return None,
+            '\n' | '\r' | ';' => {
+                flush_segment(&mut segments, &mut current)?;
+                i += 1;
+            }
+            '&' => {
+                if chars.get(i + 1) == Some(&'&') {
+                    flush_segment(&mut segments, &mut current)?;
+                    i += 2;
+                } else if current.trim_end().ends_with('>') || chars.get(i + 1) == Some(&'>') {
+                    current.push(c);
+                    i += 1;
+                } else {
+                    flush_segment(&mut segments, &mut current)?;
+                    i += 1;
+                }
+            }
+            '|' => {
+                flush_segment(&mut segments, &mut current)?;
+                if chars.get(i + 1) == Some(&'|') {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                current.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    if in_single || in_double {
+        return None;
+    }
+    flush_segment(&mut segments, &mut current)?;
+    Some(segments)
+}
+
+fn flush_segment(segments: &mut Vec<CompoundSegment>, current: &mut String) -> Option<()> {
+    let raw = current.trim();
+    if raw.is_empty() {
+        current.clear();
+        return Some(());
+    }
+    let tokens = shlex::split(raw)?;
+    segments.push(CompoundSegment {
+        text: raw.to_string(),
+        tokens,
+    });
+    current.clear();
+    Some(())
+}
+
+fn scan_dollar_paren(chars: &[char], start: usize) -> Option<(usize, Vec<char>)> {
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut j = start + 2;
+    while j < chars.len() {
+        let c = chars[j];
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if c == '\\' {
+                    j += 1;
+                } else if c == '"' {
+                    quote = None;
+                }
+            }
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => j += 1,
+                '`' => {
+                    let (end, _) = scan_backtick(chars, j)?;
+                    j = end;
+                    continue;
+                }
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((j + 1, chars[start + 2..j].to_vec()));
+                    }
+                }
+                _ => {}
+            },
+        }
+        j += 1;
+    }
+    None
+}
+
+fn scan_backtick(chars: &[char], start: usize) -> Option<(usize, Vec<char>)> {
+    let mut j = start + 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '`' => return Some((j + 1, chars[start + 1..j].to_vec())),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Return the embedded command string when `binary` is a shell invoked with a
+/// `-c`-style flag (`-c`, `-lc`, `-ec`, …) whose value follows it.
+fn shell_command_string<'a>(binary: &str, argv: &'a [String]) -> Option<&'a str> {
+    let shell = Path::new(binary).file_name()?.to_string_lossy();
+    if !SHELL_BINARIES.contains(&shell.as_ref()) {
+        return None;
+    }
+    let flag = argv.iter().position(|arg| {
+        arg.strip_prefix('-')
+            .filter(|cluster| !cluster.is_empty() && !cluster.starts_with('-'))
+            .is_some_and(|cluster| cluster.contains('c'))
+    })?;
+    argv.get(flag + 1).map(String::as_str)
+}
+
+/// Tokens naming a protected metadata path or env file, which the sandbox
+/// validator must reject (`cat ~/.ssh/id_ed25519`, `cat .env`).
+fn protected_path_candidate(token: &str) -> Option<&str> {
+    let value = match token.split_once('=') {
+        Some((flag, value)) if flag.starts_with('-') => value,
+        _ => token,
+    };
+    if value.is_empty() {
+        return None;
+    }
+    let path = Path::new(value);
+    let protected = is_env_file(path)
+        || path.components().any(|component| {
+            let name = component.as_os_str().to_string_lossy();
+            PROTECTED_PATHS.contains(&name.as_ref())
+        });
+    protected.then_some(value)
+}
+
 impl ShellExecTool {
     pub fn new(
         workspace_root: PathBuf,
@@ -81,6 +346,70 @@ impl ShellExecTool {
             sandbox_profile,
         }
     }
+
+    /// Gate every sub-command of an embedded `sh -c` string through the same
+    /// checks the seatbelt applies to the `binary` arg (FR-042).
+    fn validate_embedded_command(&self, command: &str) -> Result<(), KernelError> {
+        let segments = decompose_compound(command).unwrap_or_else(|| {
+            vec![CompoundSegment {
+                text: command.trim().to_string(),
+                tokens: shlex::split(command).unwrap_or_default(),
+            }]
+        });
+        let policy = self.segment_gate();
+
+        for segment in &segments {
+            if segment.text.is_empty() {
+                continue;
+            }
+            let invocation = ToolInvocation {
+                name: NAME.to_string(),
+                args: json!({ "binary": segment.text.as_str() }),
+            };
+            if let ToolDispatchAction::Terminate { reason } = policy
+                .validate_invocation(&invocation)
+                .map_err(|e| KernelError::ToolFailed(format!("segment gate failed: {e}")))?
+            {
+                return Err(segment_denied(segment, reason));
+            }
+            for token in &segment.tokens {
+                let Some(path) = protected_path_candidate(token) else {
+                    continue;
+                };
+                let check = self
+                    .sandbox_validator
+                    .validate_path_for_read(Path::new(path));
+                if let Err(reason) = check {
+                    return Err(segment_denied(segment, reason));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The seatbelt gate mirrors wiring: `shell.exec` maps its command-bearing
+    /// arg `binary` to the command check. `sandboxed` is false only for
+    /// `DangerFullAccess`, which is also the only mode where the seatbelt skips
+    /// the network-target check.
+    fn segment_gate(&self) -> SeatbeltPolicy {
+        let mode = if self.sandbox_profile.sandboxed {
+            SandboxMode::WorkspaceWrite
+        } else {
+            SandboxMode::DangerFullAccess
+        };
+        let mut registry = ToolArgRegistry::new();
+        registry.register_tool_args(NAME, &[], &["binary"]);
+        SeatbeltPolicy::new(mode, self.sandbox_profile.readable_roots.clone())
+            .with_arg_registry(registry)
+    }
+}
+
+fn segment_denied(segment: &CompoundSegment, reason: impl AsRef<str>) -> KernelError {
+    KernelError::InvalidArgument(format!(
+        "shell.exec embedded command rejected at sub-command \"{}\": {}",
+        segment.text,
+        reason.as_ref()
+    ))
 }
 
 /// Resolve a binary: absolute paths pass through, otherwise search PATH.
@@ -165,6 +494,10 @@ impl Tool for ShellExecTool {
         self.sandbox_validator
             .validate_path_for_read(&cwd)
             .map_err(|e| KernelError::InvalidArgument(format!("invalid cwd: {e}")))?;
+
+        if let Some(embedded) = shell_command_string(binary, &argv) {
+            self.validate_embedded_command(embedded)?;
+        }
 
         let mut cmd = std::process::Command::new(&resolved);
         cmd.args(&argv)
@@ -441,5 +774,140 @@ mod tests {
             }))
             .await;
         assert!(res.is_err(), "cwd on a protected path must be rejected");
+    }
+
+    fn segment_texts(cmd: &str) -> Vec<String> {
+        decompose_compound(cmd)
+            .unwrap()
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect()
+    }
+
+    #[test]
+    fn compound_operators_split_and_validate_each_segment() {
+        let segments = decompose_compound("ps aux && grep secret").unwrap();
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["ps aux", "grep secret"]
+        );
+        assert_eq!(segments[0].tokens, vec!["ps", "aux"]);
+        assert_eq!(segments[1].tokens, vec!["grep", "secret"]);
+        assert!(
+            tool()
+                .validate_embedded_command("ps aux && grep secret")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn one_denied_segment_denies_the_whole_compound() {
+        use zen_core::sandbox::SandboxMode;
+        let dir = tempfile::tempdir().unwrap();
+        let validator =
+            SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![dir.path().to_path_buf()]);
+        let profile = OsSandboxProfile::from_mode(SandboxMode::WorkspaceWrite, vec![], false);
+        let t = ShellExecTool::new(dir.path().to_path_buf(), validator, profile);
+
+        let err = t
+            .validate_embedded_command("echo safe; cat ~/.ssh/id_ed25519")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cat ~/.ssh/id_ed25519"), "{err}");
+        assert!(err.contains("protected metadata path"), "{err}");
+    }
+
+    #[test]
+    fn quoted_operator_does_not_split() {
+        let segments = decompose_compound(r#"echo "a && b""#).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].tokens, vec!["echo", "a && b"]);
+    }
+
+    #[test]
+    fn unmatched_quote_falls_back_to_whole_string_evaluation() {
+        let cmd = r#"echo "unterminated && sudo id"#;
+        assert!(decompose_compound(cmd).is_none());
+        let err = tool()
+            .validate_embedded_command(cmd)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sudo id"), "{err}");
+    }
+
+    #[test]
+    fn subscripted_commands_are_decomposed_as_separate_units() {
+        let cmd = r#"echo "$(cd /tmp && rm -rf /build)""#;
+        let texts = segment_texts(cmd);
+        assert!(texts.iter().any(|text| text == "cd /tmp"), "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text == "rm -rf /build"),
+            "{texts:?}"
+        );
+        let err = tool()
+            .validate_embedded_command(cmd)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rm -rf /build"), "{err}");
+    }
+
+    #[test]
+    fn backtick_substitution_is_decomposed_as_a_separate_unit() {
+        let texts = segment_texts("echo `true && sudo id`");
+        assert!(texts.iter().any(|text| text == "sudo id"), "{texts:?}");
+    }
+
+    #[test]
+    fn heredoc_is_not_decomposed() {
+        assert!(decompose_compound("cat <<EOF\npayload\nEOF").is_none());
+    }
+
+    #[test]
+    fn shell_flag_cluster_detection() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            shell_command_string("/bin/sh", &argv(&["-c", "echo hi"])),
+            Some("echo hi")
+        );
+        assert_eq!(
+            shell_command_string("bash", &argv(&["-lc", "echo hi"])),
+            Some("echo hi")
+        );
+        assert_eq!(
+            shell_command_string("zsh", &argv(&["--noprofile", "-c", "echo hi"])),
+            Some("echo hi")
+        );
+        assert_eq!(shell_command_string("dash", &argv(&["-s"])), None);
+        assert_eq!(
+            shell_command_string("/bin/echo", &argv(&["-c", "hi"])),
+            None
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sh_dash_c_compound_is_denied_before_spawn() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo safe && sudo id"]
+            }))
+            .await;
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("sudo id"), "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sh_dash_c_benign_compound_runs() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo one && echo two"]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["exit_code"], 0);
+        assert!(res["stdout"].as_str().unwrap().contains("one"));
     }
 }

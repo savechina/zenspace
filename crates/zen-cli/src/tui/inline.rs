@@ -21,11 +21,29 @@ use super::inline_handler::InlineKeyAction;
 use super::theme::auto_select as theme_auto_select;
 use super::theme::no_color as theme_no_color;
 
-/// Height (rows) of the bottom inline viewport. FIXED at 12 rows (ADR-006).
+/// Preferred height (rows) of the bottom inline viewport (ADR-006).
 /// Budget: tail (2–4) + popup (≤6) + input (3) + toast (0–1) + footer (1) = 12.
-/// The tail region is dynamic; the outer height must NOT change at streaming time
-/// (ratatui Inline height is construction-fixed; recreation reopens T038 drift).
+/// `inline_viewport_height` clamps this to the live terminal height (T038).
 pub(crate) const INLINE_VIEWPORT_ROWS: u16 = 12;
+
+const MIN_INLINE_VIEWPORT_ROWS: u16 = 3;
+
+/// Rows reserved above the viewport so the cursor and the last scrollback line
+/// stay visible while the inline UI hugs the bottom of the screen.
+const INLINE_VIEWPORT_HEADROOM: u16 = 2;
+
+/// Adaptive inline viewport height (T038).
+///
+/// Keeps [`INLINE_VIEWPORT_ROWS`] on normal/large terminals, shrinks to
+/// `terminal_rows - INLINE_VIEWPORT_HEADROOM` on short ones, and never exceeds
+/// the available rows. The minimum keeps the composer usable; on terminals too
+/// short for headroom the viewport may use all available rows.
+pub(crate) fn inline_viewport_height(terminal_rows: u16) -> u16 {
+    INLINE_VIEWPORT_ROWS
+        .min(terminal_rows.saturating_sub(INLINE_VIEWPORT_HEADROOM))
+        .max(MIN_INLINE_VIEWPORT_ROWS)
+        .min(terminal_rows.max(1))
+}
 
 const STREAMING_RENDER_INTERVAL_MS: u128 = 33;
 const POLL_INTERVAL_ACTIVE_MS: u64 = 16;
@@ -118,20 +136,22 @@ pub fn run_inline(config: &'static zen_core::config::ZenConfig) -> Result<()> {
     let result = (|| {
         // Anchor the inline viewport to the bottom of the screen instead of the
         // current cursor row; otherwise rows below the viewport stay blank.
-        if let Ok((_, rows)) = crossterm::terminal::size() {
+        let terminal_size = crossterm::terminal::size().ok();
+        let terminal_rows = terminal_size.map_or(INLINE_VIEWPORT_ROWS, |(_, rows)| rows);
+        if let Some((_, rows)) = terminal_size {
             execute!(
                 io::stdout(),
                 crossterm::cursor::MoveTo(0, rows.saturating_sub(1)),
             )?;
         }
         let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::with_options(
+        let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(INLINE_VIEWPORT_ROWS),
+                viewport: Viewport::Inline(inline_viewport_height(terminal_rows)),
             },
         )?;
-        run_inline_session(&mut terminal, app)
+        run_inline_session(terminal, app)
     })();
 
     // Normal exit: put the previous panic hook back so repeated run_inline
@@ -505,8 +525,19 @@ pub(crate) fn inline_tick<B: Backend>(
 
 /// Production session runner: initial scrollback flush, then the
 /// crossterm poll/read loop around `inline_tick`, then the exit flush.
+fn open_inline_terminal(
+    terminal_rows: u16,
+) -> io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(inline_viewport_height(terminal_rows)),
+        },
+    )
+}
+
 fn run_inline_session(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
     mut app: App,
 ) -> Result<()> {
     let config = app.config;
@@ -525,9 +556,10 @@ fn run_inline_session(
         app.gateway_banner = super::banner::GatewayBannerState::OfflineDegraded;
     }
 
-    if let Err(e) =
-        super::scrollback_inserter::insert_scrollback_queue(terminal, &mut app.scrollback_queue)
-    {
+    if let Err(e) = super::scrollback_inserter::insert_scrollback_queue(
+        &mut terminal,
+        &mut app.scrollback_queue,
+    ) {
         // D2: same contract as the in-loop flush -- never kill the session.
         tracing::error!(error = %e, "scrollback insert failed; deferring blocks");
         while let Some(entry) = app.scrollback_queue.pop_front() {
@@ -543,7 +575,7 @@ fn run_inline_session(
                 break;
             };
             if let Err(e2) =
-                super::scrollback_inserter::insert_lines(terminal, &oldest.lines, oldest.wrap)
+                super::scrollback_inserter::insert_lines(&mut terminal, &oldest.lines, oldest.wrap)
             {
                 tracing::error!(error = %e2, "deferred overflow flush failed; keeping entry (queue temporarily over cap)");
                 app.deferred_scrollback.push_front(oldest);
@@ -563,7 +595,7 @@ fn run_inline_session(
         } else {
             POLL_INTERVAL_IDLE_MS
         };
-        let event = if crossterm::event::poll(Duration::from_millis(poll_ms))? {
+        let mut event = if crossterm::event::poll(Duration::from_millis(poll_ms))? {
             Some(crossterm::event::read()?)
         } else {
             None
@@ -576,7 +608,19 @@ fn run_inline_session(
         {
             panic!("T075 seam: deliberate panic on first key (ZEN_TEST_PANIC_ON_FIRST_KEY)");
         }
-        if inline_tick(&mut app, terminal, &mut state, event)? {
+        if let Some(Event::Resize(_, height)) = event.as_ref() {
+            let height = *height;
+            if terminal.get_frame().area().height != inline_viewport_height(height) {
+                execute!(
+                    io::stdout(),
+                    crossterm::cursor::MoveTo(0, height.saturating_sub(1)),
+                )?;
+                terminal = open_inline_terminal(height)?;
+                state.dirty = true;
+                event = None;
+            }
+        }
+        if inline_tick(&mut app, &mut terminal, &mut state, event)? {
             break;
         }
     }
@@ -586,7 +630,7 @@ fn run_inline_session(
     app.exit_reading_mode();
     if !app.scrollback_queue.is_empty() {
         let _ = super::scrollback_inserter::insert_scrollback_queue(
-            terminal,
+            &mut terminal,
             &mut app.scrollback_queue,
         );
     }
@@ -876,6 +920,36 @@ mod tests {
         let area = terminal.get_frame().area();
         assert_eq!(area.bottom(), 6, "viewport must clamp to shrunken screen");
         assert_eq!(area.height, 6);
+    }
+
+    // T038 viewport pin
+    #[test]
+    fn t038_viewport_height_clamps_to_terminal_rows() {
+        assert_eq!(inline_viewport_height(8), 6, "8-row mock: rows-2 headroom");
+        assert_eq!(inline_viewport_height(12), 10);
+        assert_eq!(inline_viewport_height(24), INLINE_VIEWPORT_ROWS);
+        assert_eq!(inline_viewport_height(100), INLINE_VIEWPORT_ROWS);
+        assert_eq!(inline_viewport_height(5), 3, "minimum composer height");
+        assert_eq!(inline_viewport_height(1), 1, "never exceed available rows");
+
+        for rows in 1..=64 {
+            let height = inline_viewport_height(rows);
+            assert!(height <= rows, "viewport {height} exceeds {rows} rows");
+            assert!(height <= INLINE_VIEWPORT_ROWS);
+        }
+    }
+
+    // T038 viewport pin
+    #[test]
+    fn t038_resize_recomputes_viewport_height_from_terminal_rows() {
+        let short = inline_viewport_height(8);
+        let tall = inline_viewport_height(40);
+        assert_eq!(short, 6);
+        assert_eq!(tall, INLINE_VIEWPORT_ROWS);
+        assert_ne!(
+            short, tall,
+            "a resize event must produce a new viewport height"
+        );
     }
 
     /// S6 (FR-011): NO_COLOR forces the accent-less theme regardless of
