@@ -223,6 +223,31 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 recursive: false,
             },
         },
+        // T-found: `logs/zen.log` (the sync-processring debug log written by
+        // every phase cron cycle) reached 954 MiB in production — it had NO
+        // rotation and no retention home. Size-rotate keeps the working
+        // set bounded at ~40 MiB while degenerate-cycle forensics stay on
+        // disk for one extra generation.
+        Policy {
+            home: "logs/zen.log",
+            root: logs.join("zen.log"),
+            action: Action::Rotate {
+                max_bytes: 20 * MIB,
+                keep: 2,
+            },
+        },
+        // Compile-history: `logs/raw/*.jsonl` (host_stage staging logscan)
+        // accumulates per-distill distillation receipts; the crash-replay
+        // window is hours, so 14 days is a generous net.
+        Policy {
+            home: "logs/raw",
+            root: logs.join("raw"),
+            action: Action::DeleteOlder {
+                pattern: None,
+                days: 14,
+                recursive: true,
+            },
+        },
         Policy {
             home: "vault/archive/quarantine",
             root: paths.archive().join("quarantine"),

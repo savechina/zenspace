@@ -105,8 +105,34 @@ fn merge_slot(disk: &GraphPlaceholder, incoming: &GraphPlaceholder) -> GraphPlac
     }
 }
 
+/// Slug prefix of the hypothesis-pipeline gap slugs (`hypothesis.rs`
+/// `slug_for` fallback chain).
+const GHOST_PREFIX: &str = "missing_entity-";
+
+/// A slug that starts with the two-generation chain `missing_entity-missing-entity-`
+/// is a machine-generated artifact of the 2026-10-15 hypothesis explosion
+/// (see `graph_verify.rs::concept_page_inventory`): each nesting cycle kebab-
+/// case-copies its parent ([`GHOST_PREFIX`] keeps the underscore, the re-copied
+/// stem becomes hyphenated), so generations 2+ start with
+/// `missing_entity-missing-entity-`. These can never be claimed or merged —
+/// the claim/merge protocol only serves concept pages, and the hypothesis
+/// pages that minted these slugs live under `wisdom/`, which the verifier
+/// excludes. Holding them in the union registry leaks them forever
+/// (38,772 stale slots / ~10 MB observed in production `placeholders.json`).
+///
+/// First-generation hypothesis slugs (`missing_entity-<stem>`) are NOT ghosts:
+/// the bounded post-fix pipeline mints ≤20 per cycle and they keep a live
+/// claim/merge lifecycle.
+pub fn is_ghost_generation_slug(slug: &str) -> bool {
+    slug.starts_with(GHOST_PREFIX)
+        && slug
+            .strip_prefix(GHOST_PREFIX)
+            .is_some_and(|rest| rest == "missing-entity" || rest.starts_with("missing-entity-"))
+}
+
 /// Pure merge of two registries (no I/O): union keyed by slug, collisions
-/// resolved per the [module-level merge rule](self#merge-rule-deterministic-reproducible-from-this-doc-alone).
+/// resolved per the [module-level merge rule](self#merge-rule-deterministic-reproducible-from-this-doc-alone),
+/// chained ghost-generation slugs dropped on merge (never persisted again).
 ///
 /// # Examples
 ///
@@ -119,17 +145,30 @@ fn merge_slot(disk: &GraphPlaceholder, incoming: &GraphPlaceholder) -> GraphPlac
 /// disk.declare("foreign", "agent-x");
 /// let mut ours = PlaceholderRegistry::new();
 /// ours.declare("mine", "agent-y");
+/// ours.declare("missing_entity-missing-entity-old-hash", "zen-loop");
 ///
 /// let merged = merge_placeholders(&disk, &ours);
 /// assert_eq!(merged.lookup("foreign").unwrap().status, PlaceholderStatus::Placeholder);
 /// assert_eq!(merged.lookup("mine").unwrap().status, PlaceholderStatus::Placeholder);
+/// assert!(
+///     merged.lookup("missing_entity-missing-entity-old-hash").is_none(),
+///     "chained ghost generations must not survive a merge"
+/// );
 /// ```
 pub fn merge_placeholders(
     disk: &PlaceholderRegistry,
     ours: &PlaceholderRegistry,
 ) -> PlaceholderRegistry {
-    let mut slots: HashMap<String, GraphPlaceholder> = disk.slots().clone();
+    let mut slots: HashMap<String, GraphPlaceholder> = disk
+        .slots()
+        .iter()
+        .filter(|(slug, _)| !is_ghost_generation_slug(slug))
+        .map(|(slug, slot)| (slug.clone(), slot.clone()))
+        .collect();
     for (slug, incoming) in ours.slots() {
+        if is_ghost_generation_slug(slug) {
+            continue;
+        }
         match slots.get(slug) {
             Some(existing) => {
                 let merged = merge_slot(existing, incoming);

@@ -142,3 +142,55 @@ fn lock_file_lives_beside_registry() {
     merge_save_placeholders(logs, &PlaceholderRegistry::new()).unwrap();
     assert!(Path::new(&logs.join("placeholders.lock")).exists());
 }
+
+/// Chained `missing_entity-missing_entity-…` generations (the 2026-10-15
+/// hypothesis-explosion artifacts) must not survive a merge-save —
+/// single-generation hypothesis slugs and legit slots do.
+#[test]
+fn merge_save_prunes_chained_ghost_generations_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = tmp.path();
+    let path = registry_path(logs);
+
+    let mut disk = PlaceholderRegistry::new();
+    // Pre-explosion pollution on disk: nested generations of every depth.
+    disk.declare("missing_entity-rust-concurrency", "zen-loop");
+    disk.declare("missing_entity-missing-entity-rust-concurrency", "zen-loop");
+    disk.declare(
+        "missing_entity-missing-entity-missing-entity-ent-3c01f35e",
+        "zen-loop",
+    );
+    // Legit slots in the same registry that must survive.
+    disk.declare("rust-ownership", "zen-loop");
+    disk.save(&path).unwrap();
+
+    let mut ours = PlaceholderRegistry::new();
+    ours.declare("missing_entity-fresh-gap", "zen-loop");
+    ours.declare("missing_entity-missing-entity-staged-today", "zen-loop");
+    let merged = merge_save_placeholders(logs, &ours).unwrap();
+
+    assert!(merged.lookup("rust-ownership").is_some());
+    assert!(merged.lookup("missing_entity-rust-concurrency").is_some());
+    assert!(merged.lookup("missing_entity-fresh-gap").is_some());
+    assert!(
+        merged
+            .lookup("missing_entity-missing-entity-staged-today")
+            .is_none(),
+        "incoming chained ghosts are dropped at merge time"
+    );
+
+    // The persisted file is swept too, not just the returned registry.
+    let reloaded = PlaceholderRegistry::load(&path).unwrap();
+    assert!(reloaded.lookup("rust-ownership").is_some());
+    assert!(
+        reloaded
+            .lookup("missing_entity-missing-entity-missing-entity-ent-3c01f35e")
+            .is_none(),
+        "disk-side chained generations are swept on merge-save"
+    );
+    assert!(
+        reloaded
+            .lookup("missing_entity-missing-entity-rust-concurrency")
+            .is_none()
+    );
+}

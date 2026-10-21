@@ -90,11 +90,19 @@ impl ZenDream {
     ) -> Result<DreamReport, DreamError> {
         info!("dream cycle started for {date}");
 
+        // Log compression runs BEFORE the empty-extraction early return:
+        // the empty-journal day is the common case, and compressing would
+        // otherwise never execute in production (subconscious.md grows
+        // unbounded behind this early return).
+        let logs_compressed = compress_old_logs(zen_paths)?;
+
         let extracted = extract_facts_from_journal_entries(zen_paths, date)?;
 
         if extracted.is_empty() {
             debug!("no durable facts extracted for {date}, skipping memory update");
-            return Ok(DreamReport::empty(date));
+            let mut empty = DreamReport::empty(date);
+            empty.logs_compressed = logs_compressed;
+            return Ok(empty);
         }
 
         // T073: M2→M3 promotion gate (contracts/memory-grade.json) — only
@@ -132,7 +140,6 @@ impl ZenDream {
             warn!(error = %e, "wake-up brief write failed; dream cycle unaffected");
         }
 
-        let logs_compressed = compress_old_logs(zen_paths)?;
         let entities_recomputed =
             recompute_entities(zen_paths, self.notion_graph.as_deref()).await?;
 

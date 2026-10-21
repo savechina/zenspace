@@ -251,14 +251,14 @@ fn init_tracing(filter: EnvFilter, use_file: bool) -> Result<(), ZenError> {
             .map(|p| p.logs())
             .unwrap_or_else(|_| std::env::temp_dir().join("zen-logs"));
         std::fs::create_dir_all(&log_dir).ok();
-        let log_path = log_dir.join("zen.log");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|e| ZenError::Message(format!("Failed to open log file: {}", e)))?;
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("zen.log")
+            .max_log_files(3)
+            .build(&log_dir)
+            .map_err(|e| ZenError::Message(format!("Failed to build log appender: {e}")))?;
         tracing_subscriber::registry()
-            .with(layer.with_writer(std::sync::Mutex::new(file)))
+            .with(layer.with_writer(appender))
             .with(filter)
             .init();
     } else {

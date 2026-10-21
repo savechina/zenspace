@@ -793,6 +793,14 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **数据目录审计四修（2026-10-21 续，/.zen/.zentest 生产数据分析；`bin/lint` 0；`bin/test` 3343/0/25 = 基线 3342 +1）** — 用户要求「分析 .zen/.zentest 数据目录与处理输出文件，分析 bug 并修复」；sdd-review 问题（Phase 31 R1-R8 + Phase 34 T234-T241）经核对已全实现 converged。数据目录发现 4 实锤并修复：
+  - **F1 zen.log 无界膨胀（954MB）**：`zen-cli` `init_tracing` 裸 append fd 无轮转——owner 决策 D-A = `tracing_appender` 按日轮转（`zen.log.yyyy-MM-dd`，`max_log_files(3)`；理由：时间轮转留 3 天调试史零自定义代码，可审计记录本在 audit.jsonl 独立轮转）。
+  - **F2 subconscious.md 永不归档（25,283 行/950KB，compress 0 触发）**：`zen-memory` dream `run_cycle` 在「当天无可提取 facts」（常见态）提前 return 绕过 `compress_old_logs`——compress 移至提前 return 之前（空报告继承 `logs_compressed` 字段，真值渗透到 worker 报告）；500 行/100KB 归档阈值恢复生效。
+  - **F3 subconscious 仪式噪声洪水（3,917 ticks 全量持久化）**：worker `evaluate_tick` 每次无条件发出 ≥2 条噪声（空日 Remind + Identity loaded + Tick complete），使 `!actions.is_empty()` 门恒真——删除唯时间性仪式行，仅保留状态信号（Suggest 无身份/Organize 挂起/Err 求证），结构与条数不变；growth 由 F2 兜底。
+  - **F4 placeholders.json 幽灵槽（38,772 slots/10MB，`missing_entity-missing-entity-…` 嵌套分代）**：registry union-only 永无 prune 缝——`placeholders_store::merge_placeholders` 加 `is_ghost_generation_slug`（双代签名 `missing_entity-missing-entity-` 起头；单代 `missing_entity-<stem>` 非 ghost 保留——kebab 拷贝机制见注释）；merge-save 时 disk+incoming 双侧清扫，下一 distill 周期生产文件自然收缩。钉 `merge_save_prunes_chained_ghost_generations_only`（disk 侧 3 深度 + incoming 双态 + legit 存活三面）。
+  - **顺带**：retention policy 表补 `logs/zen.log` Rotate{20MiB, keep 2} 兜底行（进程 fd 持有的 inode 不会被 rename 轮转真绑——真实防线在 D-A appender；此行为 CLI 冷进程场景生效）。
+  - **顺带**：F5 = serve.err ort panic 循环（intel mac `ort-load-dynamic` 已知 fail-soft 降级，见 2026-10-18 分轨条目）确认非新 bug 留档。
+
 - **TUI 流式消息队列集成收口（2026-10-21 续；`bin/lint` 0；`bin/test` 3342/0/25 = 基线 3340 +2）** — 用户要求「运行中任务可接受消息请求放队列处理」；裁定范围 = TUI 客户端输入（gateway 层已有 per-session permit 串行 + qqbot 16 深 per-chat FIFO，无需改）。修改文件与新增功能：
   - **echo-on-enqueue 契约**（zen-cli tui/commands.rs + chat.rs）：流式期间提交的消息入队时立即渲染 `> <text>` 进 inline scrollback（原入队静默 = 读起来像丢消息，drain 时才补 echo）；chat.rs drain 路径的 T077 补 echo 删除——回显单次渲染契约（enqueue 渲染、drain 不再渲染）。
   - **inline footer 队列计数**（zen-cli tui/inline_ui.rs）：流式且队列非空时 footer 追加 ` | ⇅ N queued`（黄色，压缩宽度压力下遵从既有丢弃优先级规则）；inline 模式无全屏 ui.rs 的队列侧面板，footer 是唯一常驻回执。

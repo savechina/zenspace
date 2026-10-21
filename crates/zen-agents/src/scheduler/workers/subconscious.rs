@@ -6,7 +6,6 @@ use chrono::NaiveDate;
 use tracing::{debug, info};
 
 use zen_core::paths::ZenPaths;
-use zen_memory::journal::Journal;
 use zen_memory::memory_service::IdentityContext;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
@@ -77,24 +76,15 @@ impl ZenWorker for SubconsciousWorker {
     }
 }
 
-fn evaluate_tick(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<MicroAction>> {
+/// Evaluate workspace state every cycle. Static per-tick info (timestamps,
+/// "Identity loaded: N files") is omitted so the `!actions.is_empty()` gate
+/// in `execute` actually fires — otherwise every 5-minute tick appends 5-6
+/// lines and the artifact grows without signalling anything new.
+fn evaluate_tick(zen_paths: &ZenPaths, _date: NaiveDate) -> Result<Vec<MicroAction>> {
     let mut actions = Vec::new();
 
-    let today_entries = Journal::read_entries(zen_paths, date)?;
-
-    if today_entries.is_empty() {
-        actions.push(MicroAction::Remind(
-            "No log entries today. Consider recording your activities.".to_string(),
-        ));
-    }
-
     match load_identity(zen_paths) {
-        Ok(ctx) if ctx.has_content() => {
-            actions.push(MicroAction::Log(format!(
-                "Identity loaded: {} files",
-                ctx.file_count()
-            )));
-        }
+        Ok(ctx) if ctx.has_content() => {}
         Ok(_) => {
             actions.push(MicroAction::Suggest(
                 "No identity context found. Consider creating SOUL.md / MEMORY.md.".to_string(),
@@ -111,11 +101,6 @@ fn evaluate_tick(zen_paths: &ZenPaths, date: NaiveDate) -> Result<Vec<MicroActio
             "{pending_notes} inbox notes are pending consolidation"
         )));
     }
-
-    actions.push(MicroAction::Log(format!(
-        "Tick complete at {date}: {} log entries, {pending_notes} inbox notes",
-        today_entries.len()
-    )));
 
     Ok(actions)
 }
