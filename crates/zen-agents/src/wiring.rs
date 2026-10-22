@@ -36,6 +36,7 @@ use zen_core::types::Sensitivity;
 use zen_memory::ZenMemvidStore;
 use zen_memory::memvid_store::MemvidStore;
 use zen_plugin::registry::{Lifecycle, PluginEntry};
+use zen_plugin::tools::mcp_client::McpToolSet;
 use zen_plugin::wasm_sandbox::{WasmPermissions, WasmSandbox};
 use zen_plugin::{Plugin, PluginApi, WasmPlugin};
 use zen_vault::tools::{ZenTool, ZenToolError};
@@ -253,6 +254,11 @@ pub struct ZenWiring {
     sandbox_mode: SandboxMode,
     sandbox_hooks: Vec<Box<dyn ToolDispatchHook>>,
     mcp_connected: Arc<AtomicBool>,
+    /// Strong refs to live MCP toolsets (T243). The refresh worker holds only
+    /// a `Weak`, so retaining these here is what keeps `tools/list_changed`
+    /// refreshes alive; dropping the wiring frees the toolsets and the worker
+    /// exits naturally.
+    mcp_toolsets: Mutex<Vec<Arc<McpToolSet>>>,
     confidentiality_sensitivity: Arc<Mutex<Sensitivity>>,
 }
 
@@ -553,6 +559,7 @@ impl ZenWiring {
             sandbox_mode: mode,
             sandbox_hooks,
             mcp_connected: Arc::new(AtomicBool::new(false)),
+            mcp_toolsets: Mutex::new(Vec::new()),
             confidentiality_sensitivity,
         }
     }
@@ -832,7 +839,7 @@ impl ZenWiring {
 
         // The orchestrator is headless — pass `None` for the trust prompt so
         // untrusted servers are skipped (non-fatally) rather than blocking.
-        zen_plugin::tools::mcp_client::bootstrap_mcp_clients(
+        let toolsets = zen_plugin::tools::mcp_client::bootstrap_mcp_clients(
             &self.tools,
             &config.mcp_servers,
             &mut trust_store,
@@ -840,6 +847,11 @@ impl ZenWiring {
             None,
         )
         .await;
+
+        *self
+            .mcp_toolsets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = toolsets;
     }
 
     /// Build the MCP-exposed tool registry (FR-016/FR-017).

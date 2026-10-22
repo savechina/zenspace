@@ -4,6 +4,7 @@ use tui_textarea::{Input, Key};
 use super::app::InputMode;
 use super::history_search;
 use super::selection::{Selection, TextPosition};
+use super::slash::{EnterAction, enter_decision};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum KeyAction {
@@ -354,19 +355,33 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 }
                 return KeyAction::Continue;
             }
-            if app.slash_state.visible {
-                if let Some(cmd) = app.slash_state.selected_command(&app.slash_registry) {
-                    let text = format!("/{} ", cmd);
+            let text = app.input.lines().join("\n");
+            match enter_decision(
+                app.slash_state.visible,
+                app.slash_state.choice_locked,
+                app.slash_state.selected_command(&app.slash_registry),
+                &text,
+            ) {
+                EnterAction::Execute { rewrite } => {
+                    if let Some(full) = rewrite {
+                        app.input.select_all();
+                        app.input.cut();
+                        app.input.insert_str(&full);
+                        app.clear_paste_pills();
+                    }
+                    app.slash_state.dismiss();
+                    return KeyAction::Submit;
+                }
+                EnterAction::Complete(full) => {
                     app.input.select_all();
                     app.input.cut();
-                    app.input.insert_str(&text);
-                    // T084(b): wholesale rewrite drops any pill tokens.
+                    app.input.insert_str(&full);
                     app.clear_paste_pills();
                     app.slash_state.dismiss();
+                    return KeyAction::Continue;
                 }
-                return KeyAction::Continue;
+                EnterAction::Submit => {}
             }
-            let text = app.input.lines().join("\n");
             let is_single_line = !text.contains('\n');
             let is_empty = text.trim().is_empty();
             app.input.input(Input {
@@ -766,6 +781,47 @@ mod tests {
         let action = press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
         assert_eq!(action, KeyAction::Continue);
         assert_eq!(app.input.lines(), vec!["hello", ""]);
+    }
+
+    /// T246 unification: a fully typed `/name` executes on the first Enter in
+    /// fullscreen too (previously it only completed and needed a second Enter).
+    #[test]
+    fn slash_popup_enter_exact_command_submits() {
+        let mut app = test_app();
+        for c in "/help".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.slash_state.visible);
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, KeyAction::Submit);
+    }
+
+    /// T246 unification: an arrow-locked selection executes on Enter in
+    /// fullscreen too, rewriting the bare token into the selected command.
+    #[test]
+    fn slash_popup_enter_arrow_selected_command_submits() {
+        let mut app = test_app();
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(app.slash_state.visible);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.slash_state.choice_locked);
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, KeyAction::Submit);
+        assert_eq!(app.input.lines().join("\n"), "/exit");
+    }
+
+    /// T246 unification: a partial token still completes without submitting.
+    #[test]
+    fn slash_popup_enter_partial_completes_without_submitting() {
+        let mut app = test_app();
+        for c in "/exi".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(app.slash_state.visible);
+        let action = press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(action, KeyAction::Continue);
+        assert_eq!(app.input.lines().join("\n"), "/exit ");
+        assert!(!app.slash_state.visible);
     }
 
     #[test]

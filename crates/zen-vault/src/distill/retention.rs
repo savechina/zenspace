@@ -223,19 +223,13 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 recursive: false,
             },
         },
-        // T-found: `logs/zen.log` (the sync-processring debug log written by
-        // every phase cron cycle) reached 954 MiB in production — it had NO
-        // rotation and no retention home. Size-rotate keeps the working
-        // set bounded at ~40 MiB while degenerate-cycle forensics stay on
-        // disk for one extra generation.
-        Policy {
-            home: "logs/zen.log",
-            root: logs.join("zen.log"),
-            action: Action::Rotate {
-                max_bytes: 20 * MIB,
-                keep: 2,
-            },
-        },
+        // P3 (oracle A10 verdict, 2026-10-22): no retention row for
+        // `logs/zen.log`. tracing-appender (daily rotation, max_log_files(3))
+        // is the sole owner of the zen.log lifecycle — the bare file name
+        // never exists under rotation (files are `zen.log.YYYY-MM-dd`, and a
+        // rotate() row matched only the exact bare path), while dated files
+        // are count-bounded every time a writer constructs its appender.
+        // Retention rows for zen.log are therefore de-facto no-ops.
         // Compile-history: `logs/raw/*.jsonl` (host_stage staging logscan)
         // accumulates per-distill distillation receipts; the crash-replay
         // window is hours, so 14 days is a generous net.
@@ -548,5 +542,29 @@ fn matches_glob(name: &str, pattern: &str) -> bool {
                 && name.ends_with(suffix)
                 && name.len() >= prefix.len() + suffix.len()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T249b: tracing-appender owns the `zen.log` lifecycle, so no retention
+    /// policy may target the bare path (a Rotate row there never fires).
+    #[test]
+    fn policy_table_has_no_zen_log_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
+        let table = policies(&paths);
+        assert!(
+            table.iter().all(|p| p.home != "logs/zen.log"),
+            "no retention home may claim logs/zen.log"
+        );
+        assert!(
+            table
+                .iter()
+                .all(|p| p.root.file_name() != Some(std::ffi::OsStr::new("zen.log"))),
+            "no policy may point its root at the bare zen.log path"
+        );
     }
 }

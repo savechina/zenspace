@@ -8,14 +8,14 @@ use rig_compose::context::InvestigationContext;
 use rig_compose::registry::{KernelError, ToolRegistry};
 use rig_compose::skill::Skill;
 use rig_compose::workflow::Workflow;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zen_repo::{NotionsRepo, SqliteClient};
 
 use super::checkpoint::Checkpoint;
 use super::checkpoint::CheckpointManager;
 use super::contradiction::ContradictionDetector;
 use super::notion_extraction::NotionExtractor;
-use super::placeholders_store::merge_save_placeholders;
+use super::placeholders_store::{is_ghost_generation_slug, merge_save_placeholders};
 use super::recovery::RecoveryManager;
 use super::stages::LlmDistillStage;
 use super::transaction::TransactionScope;
@@ -692,6 +692,15 @@ impl DistillationPipeline {
                 PlaceholderRegistry::new()
             }
         };
+        // T242: ghost-generation slugs (38k observed in production) can only
+        // be dropped by a merge-save, and the dirty flag alone never fires on
+        // converged cycles (no notes → no compiled page → no merge). Detect
+        // their presence at cycle start so the sweep below runs even when the
+        // cycle produces no new content.
+        let has_ghosts_at_start = registry
+            .slots()
+            .keys()
+            .any(|slug| is_ghost_generation_slug(slug));
         let mut registry_dirty = false;
 
         // FR-032 (T033): capture the wiki working set BEFORE any stage runs so
@@ -820,8 +829,19 @@ impl DistillationPipeline {
                 }
                 // T180: read-merge-write under the cross-process lock so a
                 // concurrent zen-loop declaration cannot be dropped.
-                if registry_dirty && let Err(e) = merge_save_placeholders(logs_dir, &registry) {
-                    warn!(error = %e, "Failed to save placeholder registry");
+                // T242: also merge-save when ghosts were present at cycle
+                // start, so a converged cycle still prunes them on disk.
+                if registry_dirty || has_ghosts_at_start {
+                    match merge_save_placeholders(logs_dir, &registry) {
+                        Ok(merged) => {
+                            registry = merged;
+                            debug!(
+                                slots = registry.slots().len(),
+                                "placeholder registry merge-saved"
+                            );
+                        }
+                        Err(e) => warn!(error = %e, "Failed to save placeholder registry"),
+                    }
                 }
                 Ok(outcome)
             }
@@ -2655,6 +2675,92 @@ updated_at: "2026-05-23T15:00:00+00:00"
             reloaded.lookup("rust-project").unwrap().status,
             PlaceholderStatus::Merged,
             "saved registry must show the slot merged"
+        );
+    }
+
+    /// T242: a converged cycle (empty inbox → no compiled page → registry
+    /// never marked dirty) must still merge-save when ghost-generation slugs
+    /// are already on disk, pruning them without touching live slots.
+    #[tokio::test]
+    async fn converged_cycle_sweeps_ghosts_from_disk() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir(&wiki_dir).unwrap();
+
+        let logs_dir = tmp.path().join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let placeholders_path = logs_dir.join("placeholders.json");
+        let mut reg = PlaceholderRegistry::new();
+        reg.declare("missing_entity-missing-entity-ghost-one", "zen-loop");
+        reg.declare("missing_entity-ghost-stem", "zen-loop");
+        reg.declare("foreign-slot", "agent-z");
+        reg.save(&placeholders_path).unwrap();
+
+        let pipeline = DistillationPipeline::new();
+        let outcome = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.report.notes_processed, 0,
+            "converged cycle must produce no new content"
+        );
+
+        let reloaded = PlaceholderRegistry::load(&placeholders_path).unwrap();
+        assert!(
+            reloaded
+                .lookup("missing_entity-missing-entity-ghost-one")
+                .is_none(),
+            "dual-generation ghost must be swept on a converged cycle"
+        );
+        assert!(
+            reloaded.lookup("missing_entity-ghost-stem").is_some(),
+            "single-generation hypothesis slug must survive"
+        );
+        assert!(
+            reloaded.lookup("foreign-slot").is_some(),
+            "foreign declaration must survive the sweep"
+        );
+    }
+
+    /// T242: once the ghosts are gone and the cycle is converged, the gate
+    /// must stay closed — no merge-save, so the registry file is untouched.
+    #[tokio::test]
+    async fn steady_state_second_cycle_writes_nothing() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir(&wiki_dir).unwrap();
+
+        let logs_dir = tmp.path().join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let placeholders_path = logs_dir.join("placeholders.json");
+        let mut reg = PlaceholderRegistry::new();
+        reg.declare("missing_entity-missing-entity-ghost-one", "zen-loop");
+        reg.declare("missing_entity-ghost-stem", "zen-loop");
+        reg.save(&placeholders_path).unwrap();
+
+        let pipeline = DistillationPipeline::new();
+        run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+
+        // Sentinel: merge-save rewrites the whole file atomically, so any
+        // gate misfire in cycle 2 would replace these deliberately-invalid
+        // bytes. Unchanged bytes prove the write did not happen.
+        let sentinel = b"{ corrupt-sentinel: no merge-save expected }";
+        fs::write(&placeholders_path, sentinel).unwrap();
+
+        let outcome = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+        assert_eq!(outcome.report.notes_processed, 0);
+        assert_eq!(
+            fs::read(&placeholders_path).unwrap(),
+            sentinel,
+            "steady state (no ghosts, not dirty) must not merge-save"
         );
     }
 

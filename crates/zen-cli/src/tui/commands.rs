@@ -1,6 +1,20 @@
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 
 use super::app::{App, MAX_QUEUE_SIZE};
+use super::theme::OutputTheme;
+
+/// Echo-on-enqueue marker (T247): a message queued mid-stream renders with a
+/// dim `⇅` prefix in inline scrollback. Applied to render-only line clones
+/// after the queue accepts the raw text, so the marker never reaches
+/// `message_queue`, the session jsonl, or the model payload.
+fn mark_queued_echo(mut lines: Vec<Line<'static>>, theme: &dyn OutputTheme) -> Vec<Line<'static>> {
+    if let Some(first) = lines.first_mut() {
+        let mut spans = vec![Span::styled("⇅ ", theme.text_muted())];
+        spans.append(&mut first.spans);
+        first.spans = spans;
+    }
+    lines
+}
 
 /// Truthful offline detail for `/search` (G4-02): the previous string
 /// promised a retry this path never performs.
@@ -152,6 +166,7 @@ impl App {
                 // nothing because only ONE of the two paths ever rendered).
                 if self.is_inline_mode() {
                     let user_lines = self.render_user_lines_for_scrollback(cmd);
+                    let user_lines = mark_queued_echo(user_lines, self.theme.as_ref());
                     self.enqueue_scrollback(user_lines);
                 }
                 self.message_queue.push_back(cmd.to_string());
@@ -750,5 +765,61 @@ mod search_display_tests {
     #[test]
     fn split_bare_token_has_no_rest() {
         assert_eq!(split_slash_input("exit"), ("exit", None));
+    }
+}
+
+#[cfg(test)]
+mod enqueue_echo_tests {
+    use super::*;
+    use crate::tui::app::App;
+
+    fn test_config() -> &'static zen_core::config::ZenConfig {
+        Box::leak(Box::default())
+    }
+
+    fn rendered_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn enqueue_echo_carries_scrollback_only_queue_marker() {
+        let mut app = App::new(test_config());
+        app.inline_mode = true;
+        app.is_streaming = true;
+        app.scrollback_queue.clear();
+
+        app.handle_command("queued later");
+
+        assert_eq!(
+            app.message_queue
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["queued later"],
+            "the queue must hold the raw text (session/model payload)"
+        );
+        assert!(
+            !app.message_queue.iter().any(|queued| queued.contains('⇅')),
+            "the scrollback marker must never enter the submitted payload"
+        );
+
+        let echo = app
+            .scrollback_queue
+            .iter()
+            .flat_map(|entry| entry.lines.iter())
+            .map(rendered_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            echo.contains('⇅'),
+            "enqueue echo must carry the queue marker: {echo:?}"
+        );
+        assert!(
+            echo.contains("> queued later"),
+            "enqueue echo must still render the user line: {echo:?}"
+        );
     }
 }

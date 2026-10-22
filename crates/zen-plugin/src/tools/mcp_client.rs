@@ -4,7 +4,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -156,12 +156,15 @@ fn tool_list_fingerprint(schemas: &[ToolSchema]) -> u64 {
 /// handles so a `notifications/tools/list_changed` can re-list and hot-swap
 /// schemas, register newly discovered tools, and tombstone removed ones —
 /// without restarting the session or re-bootstrapping the client.
-struct McpToolSet {
+pub struct McpToolSet {
     server_name: String,
     registry: ToolRegistry,
     transport: Arc<dyn McpTransport>,
     proxies: Mutex<HashMap<String, Arc<McpProxyTool>>>,
     fingerprint: Mutex<Option<u64>>,
+    /// Set by the refresh worker when the transport reports itself unavailable;
+    /// cleared by the next successful catalog apply (T244).
+    degraded: AtomicBool,
 }
 
 impl McpToolSet {
@@ -176,7 +179,22 @@ impl McpToolSet {
             transport,
             proxies: Mutex::new(HashMap::new()),
             fingerprint: Mutex::new(None),
+            degraded: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the last refresh attempt left this server's transport
+    /// unavailable (T244). Cleared on the next successful catalog apply.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    fn mark_degraded(&self) {
+        self.degraded.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_healthy(&self) {
+        self.degraded.store(false, Ordering::Relaxed);
     }
 
     async fn list_and_apply(&self) -> Result<ToolUpdate, KernelError> {
@@ -246,32 +264,71 @@ impl McpToolSet {
 /// client handler only forwards a wake-up; this worker owns the re-list so the
 /// protocol reader is never blocked on `list_tools` round-trips (D5: all pipe
 /// I/O stays with the rmcp service task, never inline on the call path).
+///
+/// T243: the worker holds only a [`Weak`] reference. The wiring keeps the sole
+/// strong `Arc<McpToolSet>`; when it is dropped the transport (and with it the
+/// spawn factory's notification sender) is freed, the channel closes, and the
+/// loop exits naturally — no `JoinHandle` management or shutdown channel.
 fn spawn_tool_refresh_worker(
     mut signals: mpsc::UnboundedReceiver<()>,
-    tools: Arc<McpToolSet>,
+    tools: Weak<McpToolSet>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while signals.recv().await.is_some() {
-            match tools.list_and_apply().await {
-                Ok(update) if update.changed() => info!(
-                    server = %tools.server_name,
-                    added = update.added,
-                    removed = update.removed,
-                    updated = update.updated,
-                    "MCP tools/list_changed applied in place"
-                ),
-                Ok(_) => info!(
-                    server = %tools.server_name,
-                    "MCP tools/list_changed with identical catalog ignored"
-                ),
-                Err(e) => warn!(
-                    server = %tools.server_name,
-                    error = %e,
-                    "MCP tools/list_changed refresh failed"
-                ),
+            // A signal can outlive the toolset; stop rather than refresh a
+            // registration surface nobody owns anymore.
+            let Some(tools) = tools.upgrade() else {
+                break;
+            };
+
+            // Signals are edge-triggered: one bounded retry keeps a transient
+            // failure from swallowing a wake-up until the server next changes.
+            let mut result = tools.list_and_apply().await;
+            if result.is_err() {
+                result = tools.list_and_apply().await;
+            }
+
+            match result {
+                Ok(update) if update.changed() => {
+                    tools.mark_healthy();
+                    info!(
+                        server = %tools.server_name,
+                        added = update.added,
+                        removed = update.removed,
+                        updated = update.updated,
+                        "MCP tools/list_changed applied in place"
+                    );
+                }
+                Ok(_) => {
+                    tools.mark_healthy();
+                    info!(
+                        server = %tools.server_name,
+                        "MCP tools/list_changed with identical catalog ignored"
+                    );
+                }
+                Err(e) => {
+                    let unavailable = is_transport_unavailable(&e);
+                    if unavailable {
+                        tools.mark_degraded();
+                    }
+                    warn!(
+                        target: "zen_mcp_degraded",
+                        server = %tools.server_name,
+                        error = %e,
+                        degraded = unavailable,
+                        "MCP tools/list_changed refresh failed"
+                    );
+                }
             }
         }
     })
+}
+
+/// Whether a refresh error came from the fail-fast gate in
+/// [`ReconnectingMcpTransport::current_transport`] or from reconnect
+/// exhaustion — both name the server as "unavailable".
+fn is_transport_unavailable(error: &KernelError) -> bool {
+    error.to_string().contains("unavailable")
 }
 
 /// Crash-recovering MCP transport (FR-013). On a `call_tool`/`list_tools`
@@ -695,13 +752,18 @@ async fn spawn_http(
 /// case the decision is persisted via `trust_store.save(paths)`. When
 /// `prompt` is `None` (headless orchestrator), untrusted servers are
 /// skipped with a warning — never fatal.
+///
+/// Returns the strong stdio toolset handles (T243). The refresh worker only
+/// holds a `Weak`; the caller is responsible for retaining these for as long
+/// as it wants `tools/list_changed` refreshes to keep working.
 pub async fn bootstrap_mcp_clients(
     registry: &ToolRegistry,
     mcp_servers: &[zen_core::config::McpServerConfig],
     trust_store: &mut zen_core::config::McpTrustStore,
     paths: &zen_core::paths::ZenPaths,
     prompt: TrustPrompt,
-) {
+) -> Vec<Arc<McpToolSet>> {
+    let mut toolsets = Vec::new();
     for server in mcp_servers {
         if !server.enabled {
             continue;
@@ -759,8 +821,9 @@ pub async fn bootstrap_mcp_clients(
                 )
                 .await;
                 match connected {
-                    Ok(count) => {
+                    Ok((count, toolset)) => {
                         info!(server = %server.name, tools = count, "MCP client connected");
+                        toolsets.push(toolset);
                     }
                     Err(e) => {
                         warn!(server = %server.name, error = %e, "MCP connection failed");
@@ -808,6 +871,7 @@ pub async fn bootstrap_mcp_clients(
             }
         }
     }
+    toolsets
 }
 
 async fn connect_stdio(
@@ -818,7 +882,7 @@ async fn connect_stdio(
     args: &[String],
     env: &HashMap<String, String>,
     auto_refresh: bool,
-) -> Result<usize, String> {
+) -> Result<(usize, Arc<McpToolSet>), String> {
     let (notify, signals) = mpsc::unbounded_channel();
     let initial: Arc<dyn McpTransport> = Arc::new(
         ZenStdioTransport::spawn(endpoint, program, args, env, Some(notify.clone()))
@@ -844,9 +908,13 @@ async fn connect_stdio(
         let notify = notify.clone();
         Box::pin(async move {
             let transport =
-                ZenStdioTransport::spawn(&endpoint, &program, &args, &env, Some(notify))
+                ZenStdioTransport::spawn(&endpoint, &program, &args, &env, Some(notify.clone()))
                     .await
                     .map_err(|e| e.to_string())?;
+            // T244: a re-spawn gets a fresh peer, so re-apply the catalog now
+            // rather than waiting for the server to emit its own
+            // `tools/list_changed`. Failed spawns never send.
+            let _ = notify.send(());
             let transport: Arc<dyn McpTransport> = Arc::new(transport);
             Ok(transport)
         })
@@ -866,16 +934,14 @@ async fn connect_stdio(
     ));
     let update = tools.apply(schemas).await;
     if auto_refresh {
-        let worker = spawn_tool_refresh_worker(signals, tools);
+        let worker = spawn_tool_refresh_worker(signals, Arc::downgrade(&tools));
 
-        // The worker lives exactly as long as this server's notification
-        // sender: every transport spawned by the factory (including crash
-        // re-spawns) carries a clone, so the receiver stays attached across
-        // reconnects.
+        // Intentionally detached: the worker holds a `Weak` toolset and exits
+        // once the caller drops its strong ref — no handle plumbing needed.
         drop(worker);
     }
 
-    Ok(update.added)
+    Ok((update.added, tools))
 }
 
 /// Connect to an HTTP/HTTPS MCP server, wrap in [`ReconnectingMcpTransport`]
@@ -1431,7 +1497,7 @@ mod tests {
         } = seeded_set("srv", vec![schema("a", "")]);
         tools.list_and_apply().await.unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
-        let worker = spawn_tool_refresh_worker(rx, tools.clone());
+        let worker = spawn_tool_refresh_worker(rx, Arc::downgrade(&tools));
 
         // WHEN the server gains tool b and emits tools/list_changed
         *schemas.lock().await = vec![schema("a", ""), schema("b", "")];
@@ -1443,6 +1509,167 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "refresh worker never registered the new tool"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        worker.abort();
+    }
+
+    /// Dead subprocess: both listing and calls fail, so a reconnect must
+    /// replace it wholesale.
+    struct DeadMock;
+
+    #[async_trait]
+    impl McpTransport for DeadMock {
+        fn endpoint(&self) -> &str {
+            "mock://dead"
+        }
+
+        async fn list_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
+            Err(KernelError::ToolFailed("mock transport dead".into()))
+        }
+
+        async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, KernelError> {
+            Err(KernelError::ToolFailed("mock transport dead".into()))
+        }
+    }
+
+    /// List mock whose availability can be flipped at runtime, so a test can
+    /// drive the worker through unavailable → healthy transitions.
+    struct FlakyListMock {
+        tools: Arc<Mutex<Vec<ToolSchema>>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl McpTransport for FlakyListMock {
+        fn endpoint(&self) -> &str {
+            "mock://flaky"
+        }
+
+        async fn list_tools(&self) -> Result<Vec<ToolSchema>, KernelError> {
+            if self.fail.load(Ordering::Relaxed) {
+                Err(KernelError::ToolFailed(
+                    "MCP server 'srv' is unavailable (marked down after 3 failed re-spawn attempts)"
+                        .into(),
+                ))
+            } else {
+                Ok(self.tools.lock().await.clone())
+            }
+        }
+
+        async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, KernelError> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_exits_when_toolset_dropped() {
+        // GIVEN a worker holding only a Weak toolset ref
+        let SeededSet { tools, .. } = seeded_set("srv", vec![schema("a", "")]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = spawn_tool_refresh_worker(rx, Arc::downgrade(&tools));
+
+        // WHEN the strong owner and the signal sender are both dropped
+        drop(tools);
+        drop(tx);
+
+        // THEN the channel closes and the worker exits instead of leaking
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("refresh worker must exit after the toolset is dropped")
+            .expect("refresh worker task must not panic");
+    }
+
+    #[tokio::test]
+    async fn respawn_notify_triggers_relist() {
+        // GIVEN a catalog seeded from before the crash
+        let registry = ToolRegistry::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let initial: Arc<dyn McpTransport> = Arc::new(DeadMock);
+        let respawned: Arc<dyn McpTransport> = Arc::new(ListMock {
+            tools: Arc::new(Mutex::new(vec![schema("b", "")])),
+        });
+        let notify = tx.clone();
+        let spawn: SpawnFactory = Arc::new(move || {
+            let fresh = respawned.clone();
+            let notify = notify.clone();
+            Box::pin(async move {
+                // Mirrors connect_stdio's factory (T244): a successful
+                // re-spawn wakes the worker so the catalog is re-applied.
+                let _ = notify.send(());
+                Ok(fresh)
+            })
+        });
+        let reconnecting = Arc::new(ReconnectingMcpTransport {
+            server_name: "srv".into(),
+            endpoint: "stdio://srv".into(),
+            spawn,
+            current: Mutex::new(Some(initial)),
+            backoffs: instant_backoffs(),
+        });
+        let tools = Arc::new(McpToolSet::new(
+            "srv",
+            registry.clone(),
+            reconnecting.clone(),
+        ));
+        tools.apply(vec![schema("a", "")]).await;
+        assert!(registry.get("srv.a").is_ok());
+        let worker = spawn_tool_refresh_worker(rx, Arc::downgrade(&tools));
+
+        // WHEN a call crashes, reconnects, and the transport is re-spawned
+        // (no tools/list_changed is emitted by the test)
+        reconnecting.call_tool("ping", Value::Null).await.unwrap();
+
+        // THEN the respawn wake-up alone makes the worker apply the new catalog
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while registry.get("srv.b").is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "respawn did not re-apply the catalog"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let removed = registry.get("srv.a").unwrap();
+        let err = removed.invoke(Value::Null).await.unwrap_err();
+        assert!(err.to_string().contains("no longer offered"), "got: {err}");
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn degraded_set_after_unavailable() {
+        // GIVEN a toolset whose transport reports itself unavailable
+        let fail = Arc::new(AtomicBool::new(true));
+        let tools = Arc::new(McpToolSet::new(
+            "srv",
+            ToolRegistry::new(),
+            Arc::new(FlakyListMock {
+                tools: Arc::new(Mutex::new(vec![schema("a", "")])),
+                fail: fail.clone(),
+            }),
+        ));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = spawn_tool_refresh_worker(rx, Arc::downgrade(&tools));
+
+        // WHEN a refresh fails on the unavailable transport
+        tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !tools.is_degraded() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not mark the server degraded"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // THEN the next successful apply clears the flag
+        fail.store(false, Ordering::Relaxed);
+        tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while tools.is_degraded() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not clear the degraded flag"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

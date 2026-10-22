@@ -3,6 +3,7 @@ use tui_textarea::{Input, Key};
 
 use super::app::App;
 use super::history_search;
+use super::slash::{EnterAction, enter_decision};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InlineKeyAction {
@@ -324,22 +325,18 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
             });
             return InlineKeyAction::Continue;
         }
-        // Enter-with-popup contract (reconciles e2e e4/e10/e11/e14/e15/e18
-        // with the complete-not-submit rule): the user typed the FULL selected
-        // command (popup is only previewing it) OR explicitly arrow-navigated
-        // to a choice (`choice_locked`) → execute. Partial token ("/exi")
-        // still completes without submitting — the user may be about to type
-        // arguments.
-        if app.slash_state.visible
-            && let Some(cmd) = app.slash_state.selected_command(&app.slash_registry)
-        {
-            let exact_match = text.trim() == format!("/{cmd}");
-            if exact_match || app.slash_state.choice_locked {
-                if !exact_match {
-                    // Arrow-locked execution targets the SELECTED command —
-                    // rewrite the raw token ("/") into it before submitting
-                    // (e15: "/" + Down + Enter must run /exit, not send "/").
-                    let full = format!("/{cmd}");
+        // Enter-with-popup contract (T246): the shared pure decision keeps
+        // inline and fullscreen byte-identical. A fully typed `/name` or an
+        // arrow-locked choice executes; a partial token completes to
+        // "/name " without submitting (arguments may follow).
+        match enter_decision(
+            app.slash_state.visible,
+            app.slash_state.choice_locked,
+            app.slash_state.selected_command(&app.slash_registry),
+            &text,
+        ) {
+            EnterAction::Execute { rewrite } => {
+                if let Some(full) = rewrite {
                     app.input.select_all();
                     app.input.cut();
                     app.input.insert_str(&full);
@@ -348,15 +345,16 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                 app.slash_state.dismiss();
                 return InlineKeyAction::Submit;
             }
-            let text = format!("/{} ", cmd);
-            app.input.select_all();
-            app.input.cut();
-            app.input.insert_str(&text);
-            app.clear_paste_pills();
-            app.slash_state.dismiss();
-            return InlineKeyAction::Continue;
+            EnterAction::Complete(full) => {
+                app.input.select_all();
+                app.input.cut();
+                app.input.insert_str(&full);
+                app.clear_paste_pills();
+                app.slash_state.dismiss();
+                return InlineKeyAction::Continue;
+            }
+            EnterAction::Submit => return InlineKeyAction::Submit,
         }
-        return InlineKeyAction::Submit;
     }
 
     if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {

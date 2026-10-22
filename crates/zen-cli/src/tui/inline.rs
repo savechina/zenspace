@@ -263,6 +263,31 @@ pub(crate) fn reanchor_viewport<B: Backend>(
     Ok(())
 }
 
+/// Map a resize I/O outcome to "did the viewport update succeed?".
+///
+/// T250: a terminal I/O hiccup during resize must not kill the REPL (same
+/// contract as the D2 scrollback paths below). On `Err` this warns and returns
+/// `false`; the caller keeps its previous viewport and the next `Resize` event
+/// retries.
+fn degrade_io_outcome(result: io::Result<()>, operation: &str) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                operation,
+                "resize I/O failed; keeping previous viewport (next resize retries)"
+            );
+            false
+        }
+    }
+}
+
+/// Best-effort viewport re-anchor; see [`degrade_io_outcome`].
+fn best_effort_reanchor<B: Backend>(terminal: &mut Terminal<B>, width: u16, height: u16) -> bool {
+    degrade_io_outcome(reanchor_viewport(terminal, width, height), "reanchor")
+}
+
 /// One iteration of the inline event loop: advance streaming state, flush
 /// committed blocks into native scrollback, process one terminal event (if
 /// any), and redraw the bottom viewport. Returns `true` when the session
@@ -435,7 +460,9 @@ pub(crate) fn inline_tick<B: Backend>(
                 }
             }
             Event::Resize(width, height) => {
-                reanchor_viewport(terminal, width, height)?;
+                // T250: best-effort — a failed reanchor keeps the old viewport
+                // and the next resize retries instead of killing the session.
+                best_effort_reanchor(terminal, width, height);
                 state.dirty = true;
             }
             // H1 fix (analyze-report.md): bracketed paste is ENABLED at
@@ -536,6 +563,36 @@ fn open_inline_terminal(
     )
 }
 
+/// Best-effort viewport rebuild after a terminal height change.
+///
+/// T250: on failure the caller keeps the existing terminal and the next
+/// `Resize` event retries — never propagate the error out of the REPL.
+fn best_effort_rebuild_inline_terminal(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    height: u16,
+) -> bool {
+    let moved = execute!(
+        io::stdout(),
+        crossterm::cursor::MoveTo(0, height.saturating_sub(1)),
+    );
+    if !degrade_io_outcome(moved, "resize cursor move") {
+        return false;
+    }
+    match open_inline_terminal(height) {
+        Ok(new_terminal) => {
+            *terminal = new_terminal;
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "viewport rebuild failed; keeping previous viewport (next resize retries)"
+            );
+            false
+        }
+    }
+}
+
 fn run_inline_session(
     mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
     mut app: App,
@@ -610,12 +667,9 @@ fn run_inline_session(
         }
         if let Some(Event::Resize(_, height)) = event.as_ref() {
             let height = *height;
-            if terminal.get_frame().area().height != inline_viewport_height(height) {
-                execute!(
-                    io::stdout(),
-                    crossterm::cursor::MoveTo(0, height.saturating_sub(1)),
-                )?;
-                terminal = open_inline_terminal(height)?;
+            if terminal.get_frame().area().height != inline_viewport_height(height)
+                && best_effort_rebuild_inline_terminal(&mut terminal, height)
+            {
                 state.dirty = true;
                 event = None;
             }
@@ -920,6 +974,21 @@ mod tests {
         let area = terminal.get_frame().area();
         assert_eq!(area.bottom(), 6, "viewport must clamp to shrunken screen");
         assert_eq!(area.height, 6);
+    }
+
+    // T250 pin: a resize I/O failure degrades to "skip this tick" — the
+    // sentinel (standing in for the previous viewport) must stay unchanged.
+    #[test]
+    fn t250_resize_io_failure_keeps_previous_viewport() {
+        let mut sentinel = "old-terminal";
+        if degrade_io_outcome(Err(io::Error::other("EIO")), "t250-test") {
+            sentinel = "rebuilt";
+        }
+        assert_eq!(sentinel, "old-terminal", "Err must map to a skipped update");
+        assert!(
+            degrade_io_outcome(Ok(()), "t250-test"),
+            "Ok must map to a successful update"
+        );
     }
 
     // T038 viewport pin

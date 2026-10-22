@@ -1,6 +1,5 @@
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use clap::Subcommand;
 use colored::Colorize;
@@ -117,8 +116,10 @@ pub fn execute_show(
     json: bool,
 ) -> Result<(), ZenError> {
     if follow {
-        tail_logs(lines, level)?;
-        return Ok(());
+        // T252: `agent-session.jsonl` has no producer anywhere in the workspace,
+        // so the old follow path tailed a file that never exists. Follow now
+        // renders the tracing-log tail instead.
+        return show_zen_log_tail(lines, level, json);
     }
 
     debug!("showing logs: lines={} level={:?}", lines, level);
@@ -156,23 +157,23 @@ pub fn execute_show(
     Ok(())
 }
 
-/// Read all log entries from agent-session.jsonl and safety-audit.jsonl.
+/// Read all log entries from safety-audit.jsonl.
+///
+/// T252: `agent-session.jsonl` is intentionally NOT read — it has no producer
+/// anywhere in the workspace (the only references were this reader and its
+/// tests), so it could only ever return an empty contribution.
 fn read_all_log_entries() -> Result<Vec<serde_json::Value>, ZenError> {
     let paths = ZenPaths::detect()
         .map_err(|e| ZenError::Message(format!("failed to resolve paths: {e}")))?;
     let log_dir = paths.logs();
 
-    let agent_log = log_dir.join("agent-session.jsonl");
     let safety_log = log_dir.join("safety-audit.jsonl");
 
     let mut entries = Vec::new();
 
-    if let Ok(agent_entries) = jsonl::read_jsonl_lines(&agent_log) {
-        entries.extend(agent_entries);
-    }
-
-    if let Ok(safety_entries) = jsonl::read_jsonl_lines(&safety_log) {
-        entries.extend(safety_entries);
+    match jsonl::read_jsonl_lines(&safety_log) {
+        Ok(safety_entries) => entries.extend(safety_entries),
+        Err(e) => eprintln!("warn: skip {}: {e}", safety_log.display()),
     }
 
     // Sort by timestamp descending (most recent first)
@@ -220,67 +221,6 @@ fn print_log_entry(entry: &serde_json::Value) {
         duration.to_string().yellow(),
         sensitivity.magenta(),
     );
-}
-
-fn tail_logs(lines: usize, level_filter: Option<&str>) -> Result<(), ZenError> {
-    let paths = ZenPaths::detect()
-        .map_err(|e| ZenError::Message(format!("failed to resolve paths: {e}")))?;
-    let log_file = paths.logs().join("agent-session.jsonl");
-
-    if !log_file.exists() {
-        println!("No log entries found");
-        return Ok(());
-    }
-
-    let existing = jsonl::read_jsonl_lines(&log_file).unwrap_or_default();
-    for entry in existing.iter().rev().take(lines).rev() {
-        if should_show_entry(entry, level_filter) {
-            print_log_entry(entry);
-        }
-    }
-
-    let file = std::fs::File::open(&log_file)
-        .map_err(|e| ZenError::Message(format!("failed to open log file: {e}")))?;
-    let mut reader = BufReader::new(file);
-    reader.seek(SeekFrom::End(0)).ok();
-
-    println!(
-        "{} Following {} (Ctrl-C to stop)",
-        "⏳".yellow(),
-        log_file.display().to_string().dimmed()
-    );
-
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-            Ok(_) => {
-                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim())
-                    && should_show_entry(&entry, level_filter)
-                {
-                    print_log_entry(&entry);
-                }
-            }
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
-}
-
-fn should_show_entry(entry: &serde_json::Value, level_filter: Option<&str>) -> bool {
-    if let Some(lvl) = level_filter {
-        entry
-            .get("sensitivity")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_lowercase() == lvl.to_lowercase())
-            .unwrap_or(false)
-    } else {
-        true
-    }
 }
 
 fn output_entries(entries: &[serde_json::Value], json: bool) -> Result<(), ZenError> {
@@ -533,12 +473,11 @@ fn format_relative_time(mtime: SystemTime) -> String {
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
-    use zen_core::jsonl;
 
     /// Serializes tests that mutate `ZEN_HOME`. Rust runs test threads in
-    /// parallel by default; without this lock, `test_logs_show_reads_entries`
-    /// and `test_logs_read_empty_dir` race on the process environment and the
-    /// empty-dir assertion reads the other test's fixture.
+    /// parallel by default; without this lock, the log-read tests race on the
+    /// process environment and the empty-dir assertion reads another test's
+    /// fixture.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -549,16 +488,6 @@ mod tests {
         let dir = std::env::temp_dir().join("zen-test-logs");
         let log_dir = dir.join("logs");
         std::fs::create_dir_all(&log_dir).ok();
-
-        let agent_log = log_dir.join("agent-session.jsonl");
-        std::fs::write(
-            &agent_log,
-            r#"{"timestamp":"2026-06-15T10:00:00Z","agent":"Sisyphus","session_id":"abc","query_len":50,"response_len":200,"duration_ms":1200,"sensitivity":"Public"}
-{"timestamp":"2026-06-15T11:00:00Z","agent":"Hermes","session_id":"def","query_len":30,"response_len":100,"duration_ms":800,"sensitivity":"Private"}
-{"timestamp":"2026-06-15T12:00:00Z","agent":"Sisyphus","session_id":"ghi","query_len":40,"response_len":300,"duration_ms":2000,"sensitivity":"Confidential"}
-"#,
-        )
-        .unwrap();
 
         let safety_log = log_dir.join("safety-audit.jsonl");
         std::fs::write(
@@ -572,16 +501,39 @@ mod tests {
     }
 
     #[test]
-    fn test_logs_show_reads_entries() {
+    fn test_logs_show_reads_safety_audit_entries() {
         let _env = env_lock();
         let dir = setup_test_logs();
         // SAFETY: env_lock() ensures no concurrent env access in this module;
         // ZEN_HOME is removed explicitly at the end (no implicit restore).
         unsafe { std::env::set_var("ZEN_HOME", dir.to_str().unwrap()) };
+        let entries = read_all_log_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["content_id"], "sha256:abc");
+        assert_eq!(entries[0]["status"], "pass");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // T252 pin: agent-session.jsonl has no producer; a stale file on disk must
+    // contribute nothing to `zen logs` (safety-audit stays the only JSONL face).
+    #[test]
+    fn read_all_log_entries_ignores_dead_agent_session_face() {
+        let _env = env_lock();
+        let dir = setup_test_logs();
         let agent_log = dir.join("logs").join("agent-session.jsonl");
-        let entries = jsonl::read_jsonl_lines(&agent_log).unwrap();
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0]["agent"], "Sisyphus");
+        std::fs::write(
+            &agent_log,
+            r#"{"timestamp":"2026-06-15T12:00:00Z","agent":"Sisyphus","session_id":"ghi"}
+"#,
+        )
+        .unwrap();
+        // SAFETY: env_lock() ensures no concurrent env access in this module;
+        // ZEN_HOME is removed explicitly at the end (no implicit restore).
+        unsafe { std::env::set_var("ZEN_HOME", dir.to_str().unwrap()) };
+        let entries = read_all_log_entries().unwrap();
+        assert_eq!(entries.len(), 1, "only safety-audit.jsonl may contribute");
+        assert_eq!(entries[0]["content_id"], "sha256:abc");
         unsafe { std::env::remove_var("ZEN_HOME") };
         std::fs::remove_dir_all(&dir).ok();
     }

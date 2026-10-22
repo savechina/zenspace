@@ -1034,8 +1034,6 @@ impl GatewayService {
     async fn memory_rebuild(
         self: std::sync::Arc<Self>,
     ) -> Result<serde_json::Value, crate::protocol::RpcError> {
-        use zen_memory::MemvidIndexer;
-
         if self.store_health().await == "unavailable" {
             return Err(crate::protocol::RpcError::store_unavailable("unavailable"));
         }
@@ -1066,18 +1064,16 @@ impl GatewayService {
                 false
             }
         };
-        let report = {
-            let mut guard = self.store.write().await;
-            let Some(store) = guard.as_mut() else {
-                return Err(crate::protocol::RpcError::store_unavailable("unavailable"));
-            };
-            MemvidIndexer::new(paths.memory(), paths.wiki())
-                .with_provenance_metadata(provenance_enabled)
-                .index_all(store)
-                .map_err(|e| {
-                    crate::protocol::RpcError::internal(&format!("memvid reindex failed: {e}"))
-                })?
-        };
+        // T245: the owned store clone is taken under a short read lock and the
+        // guard is dropped BEFORE spawn_blocking — the reindex body (60s+ wall
+        // clock) must never pin the shared RwLock or an async worker.
+        let report = memory_handlers::rebuild_blocking(
+            &self.store,
+            paths.memory(),
+            paths.wiki(),
+            provenance_enabled,
+        )
+        .await?;
         tracing::info!(
             filesScanned = report.files_scanned,
             chunksIndexed = report.chunks_indexed,

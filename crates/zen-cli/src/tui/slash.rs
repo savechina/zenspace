@@ -3,6 +3,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use nucleo::{Config, Matcher, Utf32Str};
@@ -16,6 +17,13 @@ pub struct SlashCommand {
 pub struct SlashCommandRegistry {
     commands: Vec<SlashCommand>,
     alias_index: HashMap<String, usize>,
+    /// T248: persistent nucleo matcher. `Matcher::new(Config::DEFAULT)` costs
+    /// a large scratch buffer (~135KB, same shape as `history_search`'s
+    /// `fuzzy_matcher`), so it is built once here instead of per keystroke.
+    /// `RefCell` because `filter_indices` is a `&self` query but nucleo's
+    /// `fuzzy_match` needs `&mut`; the registry is single-threaded (TUI main
+    /// thread), matching the `history_search` precedent.
+    matcher: RefCell<Matcher>,
 }
 
 impl SlashCommandRegistry {
@@ -23,6 +31,7 @@ impl SlashCommandRegistry {
         Self {
             commands: Vec::new(),
             alias_index: HashMap::new(),
+            matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
         }
     }
 
@@ -62,7 +71,7 @@ impl SlashCommandRegistry {
         let mut exact = Vec::new();
         let mut prefixed = Vec::new();
         let mut fuzzy = Vec::new();
-        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut matcher = self.matcher.borrow_mut();
         for (idx, cmd) in self.commands.iter().enumerate() {
             let name = cmd.name.to_lowercase();
             if name == needle {
@@ -200,6 +209,55 @@ pub fn create_default_registry() -> SlashCommandRegistry {
     registry.register("lint".to_string(), vec![], "Run knowledge lint".to_string());
 
     registry
+}
+
+/// Enter outcome while the slash popup is in play (T246). Both TUI surfaces
+/// (inline + fullscreen) derive it from [`enter_decision`], so the contract
+/// cannot drift between them again.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnterAction {
+    /// Submit the composer. `rewrite` is `Some("/name")` when the raw token
+    /// is not the exact command (arrow-locked selection): the caller replaces
+    /// the input with it (and drops paste pills) before submitting.
+    Execute { rewrite: Option<String> },
+    /// Replace the composer with `"/name "` (selected command + trailing
+    /// space) and keep editing — do NOT submit.
+    Complete(String),
+    /// Popup contract does not apply; the caller runs its normal submit path.
+    Submit,
+}
+
+/// Pure Enter decision shared by `inline_handler` and `handler`.
+///
+/// - `popup_visible`: the slash popup is showing.
+/// - `choice_locked`: the user arrow-navigated to an explicit selection.
+/// - `selected`: the highlighted command name, if any.
+/// - `input`: the raw composer text.
+///
+/// Rules (e2e e4/e10/e11/e14/e15/e18): a fully typed `/name` executes (raw
+/// text preserved); an arrow-locked selection executes the selected command
+/// (rewritten when the buffer is a bare token such as `/`); otherwise a
+/// visible popup completes to `"/name "` without submitting. A closed popup,
+/// or a visible popup with zero matches, falls through to `Submit`.
+pub(crate) fn enter_decision(
+    popup_visible: bool,
+    choice_locked: bool,
+    selected: Option<&str>,
+    input: &str,
+) -> EnterAction {
+    if popup_visible && let Some(name) = selected {
+        let exact = format!("/{name}");
+        if input.trim() == exact {
+            return EnterAction::Execute { rewrite: None };
+        }
+        if choice_locked {
+            return EnterAction::Execute {
+                rewrite: Some(exact),
+            };
+        }
+        return EnterAction::Complete(format!("/{name} "));
+    }
+    EnterAction::Submit
 }
 
 pub const MAX_POPUP_ROWS: usize = 8;
@@ -670,6 +728,48 @@ fn render_slash_popup_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t246_exact_command_executes_without_rewrite() {
+        assert_eq!(
+            enter_decision(true, false, Some("exit"), "/exit"),
+            EnterAction::Execute { rewrite: None }
+        );
+    }
+
+    #[test]
+    fn t246_arrow_locked_selection_executes_selected_command() {
+        assert_eq!(
+            enter_decision(true, true, Some("exit"), "/"),
+            EnterAction::Execute {
+                rewrite: Some("/exit".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn t246_partial_token_completes_without_submitting() {
+        assert_eq!(
+            enter_decision(true, false, Some("exit"), "/exi"),
+            EnterAction::Complete("/exit ".to_string())
+        );
+    }
+
+    #[test]
+    fn t246_closed_popup_falls_through_to_normal_submit() {
+        assert_eq!(
+            enter_decision(false, false, None, "hello"),
+            EnterAction::Submit
+        );
+    }
+
+    #[test]
+    fn t246_visible_popup_without_matches_falls_through_to_submit() {
+        assert_eq!(
+            enter_decision(true, false, None, "/zzz"),
+            EnterAction::Submit
+        );
+    }
 
     // === UX4: No-matches empty state ===
 

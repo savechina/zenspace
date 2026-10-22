@@ -230,11 +230,28 @@ pub async fn shell() -> Result<(), ZenError> {
             crate::tui::run(config).map_err(|e| ZenError::Message(format!("TUI error: {}", e)))
         }
     } else if let Some(cmd) = cli.command {
-        init_tracing(filter, true)?;
+        init_tracing(filter, logs_to_file(&cmd))?;
         dispatch_command(cmd).await
     } else {
         unreachable!("clap parse: command is neither None nor Some")
     }
+}
+
+/// Whether this invocation should open the file log appender.
+///
+/// The appender enforces `max_log_files(3)` at construction, which makes
+/// opening it a mutating operation. Diagnosis surfaces (`zen logs`,
+/// `zen doctor`, `zen serve status`) must stay read-only and therefore log to
+/// stderr; all other commands keep file logging.
+fn logs_to_file(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Logs { .. }
+            | Commands::Doctor { .. }
+            | Commands::Serve {
+                operation: ServeCommands::Status { .. },
+            }
+    )
 }
 
 fn init_tracing(filter: EnvFilter, use_file: bool) -> Result<(), ZenError> {
@@ -328,6 +345,49 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Discover { ref operation } => discover_command::execute_command(operation).await,
         Commands::Sandbox { ref args } => sandbox_command::execute_command(args),
         Commands::Doctor { json } => doctor_command::execute_command(json),
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tracing_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn logs(args: bool) -> Commands {
+        Commands::Logs {
+            lines: 50,
+            level: None,
+            follow: args,
+            json: false,
+            operation: None,
+        }
+    }
+
+    #[test]
+    fn t249a_readers_never_open_the_pruning_file_appender() {
+        assert!(!logs_to_file(&logs(false)), "zen logs must log to stderr");
+        assert!(
+            !logs_to_file(&Commands::Doctor { json: false }),
+            "zen doctor must log to stderr"
+        );
+        assert!(
+            !logs_to_file(&Commands::Serve {
+                operation: ServeCommands::Status { json: false },
+            }),
+            "zen serve status must log to stderr"
+        );
+    }
+
+    #[test]
+    fn t249a_writers_keep_file_logging() {
+        assert!(logs_to_file(&Commands::Version));
+        assert!(logs_to_file(&Commands::Clean {
+            operation: None,
+            dry_run: false,
+        }));
+        assert!(logs_to_file(&Commands::Chat {
+            args: ChatArgs::parse_from(["chat", "hello"]),
+        }));
     }
 }
 

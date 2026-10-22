@@ -225,6 +225,56 @@ async fn require_store_owned(store: &SharedStore) -> Result<ZenMemvidStore, RpcE
         .cloned()
 }
 
+/// Run a synchronous store body on the blocking pool with an OWNED store
+/// clone, never across the shared `RwLock` guard (T245).
+///
+/// PURPOSE: the [`SharedStore`] guard is taken only long enough to clone the
+/// cheap two-Arc [`ZenMemvidStore`]; it is dropped before `spawn_blocking`.
+/// A guard held across the blocking call would stall every other handler for
+/// the whole body (the old `memory/rebuild` write-guard shape parked an async
+/// worker for 60s+).
+///
+/// USAGE: `memory/rebuild`'s full-reindex body. The same shape the read-side
+/// handlers (retrieve/putEntry/search/stats) use via [`require_store_owned`].
+///
+/// ERRORS: -32002 `store-unavailable` when the handle is absent; -32603 when
+/// the blocking task itself is cancelled/panics (`{label}` names the op).
+pub(crate) async fn offload_store_blocking<T, F>(
+    store: &SharedStore,
+    label: &str,
+    body: F,
+) -> Result<T, RpcError>
+where
+    T: Send + 'static,
+    F: FnOnce(ZenMemvidStore) -> Result<T, RpcError> + Send + 'static,
+{
+    let zstore = require_store_owned(store).await?;
+    tokio::task::spawn_blocking(move || body(zstore))
+        .await
+        .map_err(|e| RpcError::internal(&format!("memory {label} task failed: {e}")))?
+}
+
+/// `memory/rebuild` engine body (T245): full `MemvidIndexer` reindex on the
+/// blocking pool.
+///
+/// The T223 provenance gate (`[agentic.memory_strength] enabled`) is applied
+/// inside the moved body unchanged; the caller keeps checkpoint reset and the
+/// replay tick in their existing order (reindex → reset → replay).
+pub(crate) async fn rebuild_blocking(
+    store: &SharedStore,
+    memory_root: PathBuf,
+    wiki_root: PathBuf,
+    provenance_enabled: bool,
+) -> Result<zen_memory::MemvidIndexReport, RpcError> {
+    offload_store_blocking(store, "rebuild", move |mut owned| {
+        zen_memory::MemvidIndexer::new(memory_root, wiki_root)
+            .with_provenance_metadata(provenance_enabled)
+            .index_all(&mut owned)
+            .map_err(|e| RpcError::internal(&format!("memvid reindex failed: {e}")))
+    })
+    .await
+}
+
 fn required_str(method: &str, params: &Value, key: &str) -> Result<String, RpcError> {
     params
         .get(key)
@@ -668,5 +718,43 @@ mod tests {
         // (Env-driven enablement is covered by the config crate's own tests;
         // here we only pin that resolve() cannot panic and honors the gate.)
         let _ = StrengthContext::resolve();
+    }
+
+    /// T245 pin: while the blocking body is running, the shared `RwLock` must
+    /// be free. The pre-T245 `memory/rebuild` shape held the write guard across
+    /// the reindex body, so this read would never complete. The channel
+    /// handshake makes the overlap deterministic — no sleeps.
+    #[tokio::test]
+    async fn offload_store_blocking_releases_shared_lock_before_the_body_runs() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ZenMemvidStore::new(dir.path().join("memory.mv2")).unwrap();
+        let shared: SharedStore = Arc::new(RwLock::new(Some(store)));
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let task = tokio::spawn({
+            let shared = Arc::clone(&shared);
+            async move {
+                offload_store_blocking(&shared, "test rebuild", move |_owned| {
+                    entered_tx.send(()).expect("body-started signal");
+                    release_rx.recv().expect("body release signal");
+                    Ok::<u8, RpcError>(7)
+                })
+                .await
+            }
+        });
+
+        entered_rx.await.expect("blocking body started");
+        let guard = tokio::time::timeout(Duration::from_secs(1), shared.read())
+            .await
+            .expect("shared lock must be free while the blocking body runs");
+        assert!(guard.is_some(), "store stays installed for the body");
+        drop(guard);
+
+        release_tx.send(()).expect("release body");
+        assert_eq!(task.await.unwrap().unwrap(), 7);
     }
 }

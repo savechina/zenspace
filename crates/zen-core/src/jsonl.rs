@@ -2,6 +2,8 @@
 //!
 //! Used by `zen logs` command and agent audit logging. Provides:
 //! - `read_jsonl_lines`: read all lines, skip malformed entries with warning
+//! - `read_jsonl_lines_with_first_error`: same, plus the first malformed line's
+//!   number and serde error text (the warning carries both)
 //! - `append_jsonl_line`: append one serializable value as a JSON line
 
 use anyhow::{Context, Result};
@@ -29,8 +31,20 @@ const APPEND_LOCK_POLL: Duration = Duration::from_millis(50);
 /// - Skips malformed lines (logs a warning with the skip count).
 /// - Handles trailing empty lines gracefully.
 pub fn read_jsonl_lines(path: &Path) -> Result<Vec<Value>> {
+    read_jsonl_lines_with_first_error(path).map(|(entries, _first_error)| entries)
+}
+
+/// Full outcome of tolerating a JSONL read: entries plus, when any line failed
+/// to parse, the first malformed `(1-based line number, error text)`.
+pub type JsonlReadOutcome = (Vec<Value>, Option<(usize, String)>);
+
+/// Read all JSONL lines plus the first malformed line's `(line_number, error)`
+/// (see [`JsonlReadOutcome`]). Line numbers are 1-based physical lines (blank
+/// lines count); the error is `None` when every non-empty line parsed. Skip
+/// semantics and the partial entry return match [`read_jsonl_lines`].
+pub fn read_jsonl_lines_with_first_error(path: &Path) -> Result<JsonlReadOutcome> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
 
     let content = std::fs::read_to_string(path)
@@ -38,30 +52,47 @@ pub fn read_jsonl_lines(path: &Path) -> Result<Vec<Value>> {
 
     let mut entries = Vec::new();
     let mut skipped = 0u32;
+    let mut first_error: Option<(usize, String)> = None;
 
-    for line in content.lines() {
+    for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => entries.push(value),
-            Err(_) => {
+            Err(e) => {
                 skipped += 1;
+                if first_error.is_none() {
+                    first_error = Some((idx + 1, e.to_string()));
+                }
             }
         }
     }
 
     if skipped > 0 {
-        warn!(
-            path = %path.display(),
-            skipped,
-            total = entries.len() + skipped as usize,
-            "skipped malformed JSONL lines"
-        );
+        if let Some((line_no, err)) = &first_error {
+            warn!(
+                path = %path.display(),
+                skipped,
+                total = entries.len() + skipped as usize,
+                first_error_line = line_no,
+                first_error = %err,
+                "skipped malformed JSONL lines"
+            );
+        } else {
+            // `skipped > 0` always populates `first_error`; keep the count-only
+            // warning shape as a fail-safe.
+            warn!(
+                path = %path.display(),
+                skipped,
+                total = entries.len() + skipped as usize,
+                "skipped malformed JSONL lines"
+            );
+        }
     }
 
-    Ok(entries)
+    Ok((entries, first_error))
 }
 
 /// Append a single JSON line to a file.
@@ -176,6 +207,29 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["a"], 1);
         assert_eq!(entries[1]["c"], 3);
+
+        // T251: the first malformed line and its serde detail must surface
+        // instead of being discarded by the skip counter.
+        let (entries, first_error) = read_jsonl_lines_with_first_error(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        let (line_no, err) = first_error.expect("first malformed line must be captured");
+        assert_eq!(line_no, 2, "1-based physical line number");
+        assert!(
+            err.to_lowercase().contains("expected"),
+            "serde error text expected, got: {err}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_read_jsonl_first_error_none_when_clean() {
+        let path = tmp_path("read-clean-first-error");
+        std::fs::write(&path, "{\"a\":1}\n\n{\"b\":2}\n").unwrap();
+
+        let (entries, first_error) = read_jsonl_lines_with_first_error(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(first_error.is_none());
 
         std::fs::remove_file(&path).ok();
     }
