@@ -497,6 +497,25 @@ impl Tool for ShellExecTool {
 
         if let Some(embedded) = shell_command_string(binary, &argv) {
             self.validate_embedded_command(embedded)?;
+        } else {
+            // Oracle A4 (2026-10-22): structured args bypassed every
+            // protected-path check — the seatbelt hook reads string keys only,
+            // the OS profile allows all reads, so `{"binary":"cat",
+            // "args":["~/.ssh/id_ed25519"]}` returned credentials to the model
+            // unreviewed. The direct-args run here mirrors the embedded
+            // path's protected-class scan.
+            for arg in &argv {
+                let Some(path) = protected_path_candidate(arg) else {
+                    continue;
+                };
+                self.sandbox_validator
+                    .validate_path_for_read(Path::new(path))
+                    .map_err(|e| {
+                        KernelError::InvalidArgument(format!(
+                            "shell.exec arg \"{arg}\" rejected: {e}"
+                        ))
+                    })?;
+            }
         }
 
         let mut cmd = std::process::Command::new(&resolved);
@@ -909,5 +928,44 @@ mod tests {
             .unwrap();
         assert_eq!(res["exit_code"], 0);
         assert!(res["stdout"].as_str().unwrap().contains("one"));
+    }
+
+    // Oracle A4 fix pin: structured args of a NON-shell binary get the same
+    // protected-class path scan as the embedded-command path.
+    // WorkspaceWrite validator: the shared `tool()` helper is DangerFullAccess
+    // by design (validator is a pass-through there), which would make this pin
+    // vacuous.
+    fn scope_tool() -> ShellExecTool {
+        let validator =
+            zen_core::sandbox::SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![]);
+        let profile = OsSandboxProfile::from_mode(SandboxMode::WorkspaceWrite, vec![], false);
+        ShellExecTool::new(PathBuf::from("/"), validator, profile)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn direct_args_protected_path_is_denied() {
+        let res = scope_tool()
+            .invoke(json!({
+                "binary": "cat",
+                "args": ["/Users/me/.ssh/id_ed25519"]
+            }))
+            .await;
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("id_ed25519"), "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn direct_args_benign_path_runs() {
+        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let res = scope_tool()
+            .invoke(json!({
+                "binary": "cat",
+                "args": [home.join(".gitconfig").to_string_lossy().to_string()]
+            }))
+            .await
+            .unwrap();
+        assert_ne!(res["error"].as_str(), Some("invalid argument"));
     }
 }

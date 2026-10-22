@@ -93,8 +93,17 @@ impl ZenDream {
         // Log compression runs BEFORE the empty-extraction early return:
         // the empty-journal day is the common case, and compressing would
         // otherwise never execute in production (subconscious.md grows
-        // unbounded behind this early return).
-        let logs_compressed = compress_old_logs(zen_paths)?;
+        // unbounded behind this early return). Best-effort hygiene only —
+        // a compress failure must never abort the cycle, because the
+        // extraction leg is date-prefix-scoped and a skipped day is not
+        // retried by the nightly worker (oracle A1 arbitration 2026-10-22).
+        let logs_compressed = match compress_old_logs(zen_paths) {
+            Ok(compressed) => compressed,
+            Err(e) => {
+                warn!(error = %e, "log compression failed; continuing dream cycle (retried next cycle)");
+                false
+            }
+        };
 
         let extracted = extract_facts_from_journal_entries(zen_paths, date)?;
 

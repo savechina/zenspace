@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use clap::Subcommand;
@@ -297,18 +298,53 @@ fn output_entries(entries: &[serde_json::Value], json: bool) -> Result<(), ZenEr
     Ok(())
 }
 
+/// Enumerate tracing-appender rollover files, newest dated first.
+///
+/// `init_tracing` rotates daily as `zen.log.YYYY-MM-dd`; the bare `zen.log`
+/// name never exists for rotation installs, so readers must scan the dated
+/// set. The legacy bare file is appended as a fallback for old trees.
+fn zen_log_files(log_dir: &Path) -> Vec<PathBuf> {
+    let mut dated: Vec<(String, PathBuf)> = Vec::new();
+    let mut legacy: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if name == "zen.log" {
+                legacy = Some(path);
+            } else if let Some(date) = name.strip_prefix("zen.log.") {
+                dated.push((date.to_string(), path));
+            }
+        }
+    }
+    dated.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut files: Vec<PathBuf> = dated.into_iter().map(|(_, p)| p).collect();
+    if let Some(legacy) = legacy {
+        files.push(legacy);
+    }
+    files
+}
+
 fn grep_zen_log(pattern: &str, json: bool) -> Result<(), ZenError> {
     let paths = ZenPaths::detect()
         .map_err(|e| ZenError::Message(format!("failed to resolve paths: {e}")))?;
-    let zen_log = paths.logs().join("zen.log");
+    let files = zen_log_files(&paths.logs());
 
-    if !zen_log.exists() {
+    if files.is_empty() {
         println!("No log entries found");
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&zen_log)
-        .map_err(|e| ZenError::Message(format!("failed to read zen.log: {e}")))?;
+    let mut content = String::new();
+    for file in &files {
+        match std::fs::read_to_string(file) {
+            Ok(text) => content.push_str(&text),
+            Err(e) => eprintln!("warn: skip {}: {e}", file.display()),
+        }
+    }
 
     let pattern_lower = pattern.to_lowercase();
     let matches: Vec<&str> = content
@@ -350,23 +386,30 @@ fn grep_zen_log(pattern: &str, json: bool) -> Result<(), ZenError> {
 fn show_zen_log_tail(lines: usize, level: Option<&str>, json: bool) -> Result<(), ZenError> {
     let paths = ZenPaths::detect()
         .map_err(|e| ZenError::Message(format!("failed to resolve paths: {e}")))?;
-    let zen_log = paths.logs().join("zen.log");
+    let files = zen_log_files(&paths.logs());
 
-    if !zen_log.exists() {
+    if files.is_empty() {
         println!("No log entries found");
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&zen_log)
-        .map_err(|e| ZenError::Message(format!("failed to read zen.log: {e}")))?;
-
-    let all_lines: Vec<&str> = content.lines().collect();
+    let mut all_lines: Vec<String> = Vec::new();
+    for file in &files {
+        match std::fs::read_to_string(file) {
+            Ok(text) => {
+                for line in text.lines() {
+                    all_lines.push(line.to_string());
+                }
+            }
+            Err(e) => eprintln!("warn: skip {}: {e}", file.display()),
+        }
+    }
     if all_lines.is_empty() {
         println!("No log entries found");
         return Ok(());
     }
 
-    let mut filtered: Vec<&&str> = all_lines.iter().collect();
+    let mut filtered: Vec<&String> = all_lines.iter().collect();
 
     if let Some(lvl) = level {
         let target = format!(" {} ", lvl.to_uppercase());
@@ -553,5 +596,36 @@ mod tests {
         let entries = read_all_log_entries().unwrap();
         assert!(entries.is_empty());
         unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // P1.8 pin (eng-review 2026-10-22 A2): with daily rollover, only bare
+    // `zen.log` exists for pre-rotation installs (legacy fallback last); a
+    // rotation tree must resolve dated files newest-first and tail from the
+    // latest.
+    #[test]
+    fn zen_log_files_prefers_dated_rotations_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path();
+        std::fs::write(log_dir.join("zen.log.20261020"), "old").unwrap();
+        std::fs::write(log_dir.join("zen.log.20261022"), "new").unwrap();
+        std::fs::write(log_dir.join("zen.log"), "legacy").unwrap();
+        std::fs::write(log_dir.join("audit.jsonl"), "x").unwrap();
+
+        let files = zen_log_files(log_dir);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["zen.log.20261022", "zen.log.20261020", "zen.log"]
+        );
+    }
+
+    #[test]
+    fn zen_log_files_empty_when_no_rotation_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audit.jsonl"), "x").unwrap();
+        assert!(zen_log_files(dir.path()).is_empty());
     }
 }

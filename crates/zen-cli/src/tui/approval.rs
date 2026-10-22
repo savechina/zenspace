@@ -43,6 +43,18 @@ pub struct ApprovalRequest {
 }
 
 impl ApprovalRequest {
+    /// Compact a detail string to at most `max_chars` visible characters.
+    /// Byte-slice truncation would panic when the cut lands inside a
+    /// multi-byte UTF-8 char (CJK arguments in shell.exec args).
+    fn truncate_char_safe(s: &str, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
+            s.to_string()
+        } else {
+            let head: String = s.chars().take(max_chars.saturating_sub(3)).collect();
+            format!("{head}...")
+        }
+    }
+
     /// Render the action details for the popup. Shows binary+args for
     /// shell.exec, path for fs.*, generic tool name + JSON args otherwise.
     /// Truncated to fit within popup row budget.
@@ -60,8 +72,8 @@ impl ApprovalRequest {
                     if !args_str.is_empty() {
                         let joined = args_str.join(" ");
                         // Truncate to 60 chars to fit popup
-                        if joined.len() > 60 {
-                            lines.push(format!("Args: {}...", &joined[..57]));
+                        if joined.chars().count() > 60 {
+                            lines.push(format!("Args: {}", Self::truncate_char_safe(&joined, 60)));
                         } else {
                             lines.push(format!("Args: {joined}"));
                         }
@@ -73,8 +85,8 @@ impl ApprovalRequest {
                     lines.push(format!("Path: {path}"));
                 } else {
                     let args_str = serde_json::to_string(&self.invocation).unwrap_or_default();
-                    if args_str.len() > 60 {
-                        lines.push(format!("Args: {}...", &args_str[..57]));
+                    if args_str.chars().count() > 60 {
+                        lines.push(format!("Args: {}", Self::truncate_char_safe(&args_str, 60)));
                     } else if args_str != "null" {
                         lines.push(format!("Args: {args_str}"));
                     }
@@ -82,8 +94,8 @@ impl ApprovalRequest {
             }
             _ => {
                 let args_str = serde_json::to_string(&self.invocation).unwrap_or_default();
-                if args_str.len() > 60 {
-                    lines.push(format!("Args: {}...", &args_str[..57]));
+                if args_str.chars().count() > 60 {
+                    lines.push(format!("Args: {}", Self::truncate_char_safe(&args_str, 60)));
                 } else if args_str != "null" {
                     lines.push(format!("Args: {args_str}"));
                 }
@@ -291,6 +303,32 @@ mod tests {
         let lines = req.detail_lines();
         assert!(lines.iter().any(|l| l.contains("shell.exec")));
         assert!(lines.iter().any(|l| l.contains("/bin/sh")));
+    }
+
+    // Oracle A4 fix pins: the old `&joined[..57]` byte-slice panic'd when the
+    // cut landed inside a multi-byte CJK char; detail lines must stay
+    // char-safe and must actually surface binary/args (cal tie-in: escaping
+    // to inline_ui rendering).
+    #[test]
+    fn detail_lines_cjk_args_never_panic_and_truncate() {
+        let mut req = make_request("shell.exec");
+        req.invocation = serde_json::json!({
+            "binary": "/bin/echo",
+            "args": ["思".repeat(120)]
+        });
+        let lines = req.detail_lines();
+        let args_line = lines.iter().find(|l| l.starts_with("Args: ")).unwrap();
+        assert!(args_line.chars().count() <= 66);
+        assert!(args_line.ends_with("..."));
+    }
+
+    #[test]
+    fn detail_lines_cjk_bytes_boundary_is_valid_utf8() {
+        let mut req = make_request("fs.delete");
+        // 20 CJK chars = 60 bytes: the old byte-slice would cut at 57 mid-char.
+        req.invocation = serde_json::json!({"paths": ["思".repeat(20)]});
+        let lines = req.detail_lines();
+        assert!(lines.iter().any(|l| l.starts_with("Args: ")));
     }
 
     #[test]

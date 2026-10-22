@@ -366,12 +366,19 @@ fn render_approval_popup_inline(
     };
     lines.push(Line::from(Span::styled(header, header_style)));
 
-    // Tool name + reason
+    // detail_lines() renders the Tool line itself; binary/args are shown so
+    // the approver is not approving blind (eng-review 2026-10-22 P1).
     let tool_style = Style::default().fg(theme.info_accent());
-    lines.push(Line::from(vec![
-        Span::styled("Tool: ", theme.text_muted()),
-        Span::styled(request.tool_name.clone(), tool_style),
-    ]));
+    for detail in request.detail_lines() {
+        let line = match detail.split_once(": ") {
+            Some((label, value)) => Line::from(vec![
+                Span::styled(format!("{label}: "), theme.text_muted()),
+                Span::styled(value.to_string(), Style::default()),
+            ]),
+            None => Line::from(Span::styled(detail.clone(), tool_style)),
+        };
+        lines.push(line);
+    }
     if !request.reason.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("Reason: ", theme.text_muted()),
