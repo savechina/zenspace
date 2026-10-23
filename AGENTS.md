@@ -783,6 +783,8 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 - Karpathy guidelines skill installed at `.opencode/skills/karpathy-guidelines/`
 - zen-llm exists in directory but is not a workspace member (staged for integration)
 
+- **FR-041 tool-layer hardening & hot-path wave（2026-10-24，`2be0fcd`；`bin/lint` 0；`bin/test` 3407/0/25 = 基线 3403 +4 钉）** — 澄清 Session 2026-10-24 五答入 spec（并 005 / MCP 观察驱动 / shell 安全优先 / 热路径性能 / codex-pi 先调研）；FR-041 + SC-012/SC-013 + Non-Goals 写入；research.md D31 Research Record（codex `3985001` 机制盘点 adopt-3/reject-4/present-1）。落地：shell_exec G1 shlex 辞败回退粗 tokens 保 protected/eval 扫描、G2 glob 隐藏 protected component 保守拒（`~/.[s]sh/*` 形，path-anchored 门 + fail-closed 编译错，裸 `ls *` 保留）、G3 反斜杠续行合同钉；MCP bootstrap 两阶段化（并行 open join_all sum→max + 串行 apply 保序）+ stdio `serve()` 60s 握手超时 + `spawn_ms/list_ms/connect_ms` 计量（SC-013）。eval/heredoc/ANSI-C 等词法面审计后确认 fail-closed 无改。prewarm 不做（daemon orchestrator 进程级，boot 一次）。
+
 ## Active Technologies
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
 - No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)
