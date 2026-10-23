@@ -793,6 +793,17 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **plan-eng-review 分支 diff 四节审阅 + 外部声音七项收账（2026-10-23，`0860c6f`；`bin/lint` 0；`bin/test` **3403/0/25** = 基线 3390 +13）** — 评审目标 = 分支 diff（`3d35e39..a0260bf`，23 文件）；Codex outside voice 3 次超时（deepseek-flash provider 慢）→ Claude subagent 兜底 13 findings，AUQ 逐项裁决（9 修 2 defer 2 keep-nuclear）：
+  - **D3（P1，9/10）`zen logs` tail 取到最旧行**（logs_command.rs）——A2 修复自引回归：`zen_log_files` newest-first + tail 取拼接尾部 = 旧轮转文件首部。修 = `files.iter().rev()` 时间序拼接 + 纯函数 `concat_log_lines`（`grep_zen_log` 共用：文件间无尾换行不再粘接两行）；钉 ×2（tail 窗口最新行为末元素 / grep 分隔）。
+  - **D4（P2-high，8/10）分段闸门被运行期展开静态击败**（shell_exec.rs）——`{"-c":"$P","env":{"P":"<体>"}}` 逐 token 面过、运行期展开执行。修 = `unquoted_expansion_reason`（quote-state 扫描器：单引号内字面量放行、未引号/双引号内 `$`/backtick 拒、未闭合引号回退全文本保守）+ `eval` 词拒 + **env+shell-c 组合直拒**（FR-037 env 是 shell 展开注入唯一路径）。
+  - **D11（P3，8/10）sudo 类误报**——`grep "sudo " log` 整段含扫描误拦。修 = `unquoted_remainder`（剥引号 span 后再 pattern 扫描；`is_blocked_command` 的 `"sudo "` 子串模式对未引号残留仍命中——整段 spirit 保留、引号内容豁免）+ flag-value token 跳过（`find . -name .git`）；钉 ×7（含回退契约钉 `unmatched_quote_falls_back…` 保持绿）。
+  - **D5**：`--follow` 帮助文案诚实化（"freshest tail snapshot, not a live tail"；clap help 在 cli.rs:130 —— logs_command 单文件约束的必要 deviation）；**D6**：inline 审批弹窗 Reason 双渲染去重（approval.rs `detail_lines()` 为唯一来源）。
+  - **D7**：MCP 通知通道 `unbounded → channel(1) + try_send`（edge-trigger 合并语义；误 server 信号洪峰不再赢内存）+ 合并钉。
+  - **D2**：T250 resize 降级补 `FailingBackend`（定制 ratatui::Backend）真路径集成钉——cursor-move EIO ⇒ degrade 保 viewport；**诚实边界钉**：draw-EIO 在 render `?`（`inline_tick` 返回 Err）传播——预存设计，降级合同只覆盖 reanchor/rebuild 两点（升格触发器 = 生产再现 draw 类 EIO 冻结）。
+  - **D10**：placeholders 稳态零写钉两个 fixture 分离——旧钉（corrupt sentinel = fail-open 分支）保留，新钉 `legit_registry_steady_state_not_rewritten`（合法 registry 两轮零写 + slot 存活）。
+  - **Deferred on record（tasks.md Phase 36 尾）**：D8 delegate 工具面不含 MCP（wiring 构造期快照早于 lazy connect；触发器 = delegate 真实需要 MCP 工具）、D9 slash fuzzy 高亮 prefix 假设（触发器 = 视觉复现/渲染管道重构顺带）。
+  - **代理基建故障记录**：junior 代理对 C2/D lane 3 次空返回（0-3s 无 assistant 响应）→ 主会话亲修 D7/D10；Lane A 初派 dead → 亲修后首颗测试暴露 sig：首 token 门回归旧 `"sudo "` 模式扫描语义 → 改未引号残留方案（vs 最初纯首 token）。
+
 - **分支全量评审 backlog 波 Phase 35 T242-T252（2026-10-22 续；六 PR / 互斥三 lane×两波 + oracle 仲裁 `ses_e9ec33d3bffdPFfovBprjbWBrf`；`bin/lint` 0；`bin/test` 3390/0/25 = 基线 3369 +21。两前提被 oracle 勘误入 review 工件 Stage 6 Addendum：daemon 单 orchestrator 共享（no per-session 累积）/ current_transport fail-fast => timer-poll 形状不可达）** —
   - **MCP 簇（T243/T244，zen-plugin/mcp_client.rs + zen-agents/wiring.rs）**：tombstone 前提勘误后落 A6-lite 结构性拆除——`McpToolSet` pub + `bootstrap_mcp_clients` 返回 `Vec<Arc<McpToolSet>>`，`ZenWiring::mcp_toolsets: Mutex<Vec<_>>` 持强引用，refresh worker 改持 `Weak` + upgrade-None 退出（teardown 链 wiring→toolset→transport→factory→sender→channel 自然闭合，无 Drop/shutdown-channel）；A7 = factory 重生成功即 `notify.send(())`（reconnect 触发的目录变更即刻 re-apply，fingerprint 未变更时廉价兜底）+ worker 持 `degraded: AtomicBool`（unavailable 置位/Ok 清除/`zen_mcp_degraded` 告警 target）+ Err 后单次有界重试（edge-triggered signal 防丢失）。钉 exit-on-drop / respawn-notify-relist / degraded 双态；`Notification_signal_triggers_relist` 适配 Weak。
   - **T242 F4 幽灵槽收敛清扫**（`zen-vault/distill/pipeline.rs`）：`run_scoped_inner` registry load 后 `has_ghosts_at_start` precheck，merge-save 门扩为 `registry_dirty || has_ghosts_at_start`，采纳 merge_save 返回的 merged registry（附 debug! 读合并后槽位数，顺带规避 unused_assignments 隐患）＋钉 converged-cycle sweep（空 inbox + 磁盘鬼槽 ⇒ 文件收缩，单代 legit/foreign 槽存活）+ 稳态零写。首次 pin fixture 分隔符错（`missing_entity-missing_entity-` 应为 `_`+`-` 混代）主会话修正。
