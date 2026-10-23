@@ -430,6 +430,34 @@ fn protected_path_candidate(token: &str) -> Option<&str> {
 }
 
 impl ShellExecTool {
+    /// A token that reads as a path AND carries glob metachars could shell-
+    /// expand onto a protected path whose literal component the token hides
+    /// (`~/.[s]sh/id_rsa` has no literal `.ssh` component). Conservative:
+    /// reject when any component, read as a glob pattern, matches a protected
+    /// name; an uncompilable pattern is treated as a match (fail-closed).
+    fn glob_protected_rejection(raw_token: &str) -> Result<(), KernelError> {
+        // Path-anchored only: a bare `ls *` stays allowed; relative/absolute
+        // tokens are the ones a shell can expand onto protected names.
+        if !(raw_token.contains('/') || raw_token.starts_with('~')) {
+            return Ok(());
+        }
+        let hit = Path::new(raw_token).components().any(|component| {
+            let name = component.as_os_str().to_string_lossy();
+            match glob::Pattern::new(&name) {
+                Ok(pattern) => PROTECTED_PATHS
+                    .iter()
+                    .any(|protected| pattern.matches(protected)),
+                Err(_) => true,
+            }
+        });
+        if hit {
+            return Err(KernelError::InvalidArgument(
+                "shell.exec path token uses glob characters that can select a protected path (e.g. ~/.ssh); use explicit literal paths instead".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         sandbox_validator: SandboxValidator,
@@ -446,9 +474,14 @@ impl ShellExecTool {
     /// checks the seatbelt applies to the `binary` arg (FR-042).
     fn validate_embedded_command(&self, command: &str) -> Result<(), KernelError> {
         let segments = decompose_compound(command).unwrap_or_else(|| {
+            // shlex failure must never narrow the gate: fall back to rough
+            // whitespace tokens so eval/protected scans still see candidates
+            // (conservative — rough tokens may over-match a flag value).
+            let tokens = shlex::split(command)
+                .unwrap_or_else(|| command.split_whitespace().map(str::to_string).collect());
             vec![CompoundSegment {
                 text: command.trim().to_string(),
-                tokens: shlex::split(command).unwrap_or_default(),
+                tokens,
             }]
         });
         let policy = self.segment_gate();
@@ -496,6 +529,7 @@ impl ShellExecTool {
                     continue;
                 }
                 let Some(path) = protected_path_candidate(token) else {
+                    Self::glob_protected_rejection(token)?;
                     continue;
                 };
                 let check = self
@@ -1003,6 +1037,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("rm -rf /build"), "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fr041_shlex_failure_still_scans_protected_paths() {
+        let tool = scope_tool();
+        // Force the fallback: an unclosed quote makes shlex::split fail.
+        let err = tool
+            .validate_embedded_command("cat ~/.ssh/id && echo \"unterminated")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("protected metadata path") || err.contains(".ssh"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fr041_glob_hidden_protected_component_rejected() {
+        let err = scope_tool()
+            .validate_embedded_command("cat ~/.[s]sh/id_rsa")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("protected path"), "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fr041_glob_on_bare_words_still_passes() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo /tmp/*glob-pin-nonexistent*"]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["exit_code"], 0);
+        assert!(res["error"].as_str().is_none());
+    }
+
+    #[test]
+    fn fr041_backslash_newline_continuation_joins_words_and_still_gates() {
+        let cmd = "echo a \\\n sudo id";
+        let segments = decompose_compound(cmd).unwrap();
+        assert_eq!(segments.len(), 1);
+        let err = tool()
+            .validate_embedded_command(cmd)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sudo id"), "{err}");
     }
 
     #[test]

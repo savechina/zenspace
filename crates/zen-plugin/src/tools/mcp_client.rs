@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rig_compose::registry::{KernelError, ToolRegistry};
@@ -763,7 +763,8 @@ pub async fn bootstrap_mcp_clients(
     paths: &zen_core::paths::ZenPaths,
     prompt: TrustPrompt,
 ) -> Vec<Arc<McpToolSet>> {
-    let mut toolsets = Vec::new();
+    // Phase 1 (sequential, no network): trust gate + config validation.
+    let mut plans = Vec::new();
     for server in mcp_servers {
         if !server.enabled {
             continue;
@@ -806,29 +807,14 @@ pub async fn bootstrap_mcp_clients(
                         continue;
                     }
                 };
-                let args: Vec<String> = server.args.clone().unwrap_or_default();
-                let env: HashMap<String, String> = server.env.clone().unwrap_or_default();
-                let endpoint = format!("stdio://{}", server.name);
-
-                let connected = connect_stdio(
-                    registry,
-                    &server.name,
-                    &endpoint,
-                    &command,
-                    &args,
-                    &env,
-                    server.auto_refresh,
-                )
-                .await;
-                match connected {
-                    Ok((count, toolset)) => {
-                        info!(server = %server.name, tools = count, "MCP client connected");
-                        toolsets.push(toolset);
-                    }
-                    Err(e) => {
-                        warn!(server = %server.name, error = %e, "MCP connection failed");
-                    }
-                }
+                plans.push(ConnectPlan::Stdio {
+                    name: server.name.clone(),
+                    endpoint: format!("stdio://{}", server.name),
+                    command,
+                    args: server.args.clone().unwrap_or_default(),
+                    env: server.env.clone().unwrap_or_default(),
+                    auto_refresh: server.auto_refresh,
+                });
             }
             "http" | "https" => {
                 // D25 / FR-014: HTTP transport via HttpMcpTransport (see above).
@@ -844,24 +830,11 @@ pub async fn bootstrap_mcp_clients(
                         continue;
                     }
                 };
-                match connect_http(registry, &server.name, &url, server.headers.as_ref()).await {
-                    Ok(count) => {
-                        info!(
-                            server = %server.name,
-                            url = %url,
-                            tools = count,
-                            "MCP HTTP client connected"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            server = %server.name,
-                            url = %url,
-                            error = %e,
-                            "MCP HTTP connection failed"
-                        );
-                    }
-                }
+                plans.push(ConnectPlan::Http {
+                    name: server.name.clone(),
+                    url,
+                    headers: server.headers.clone(),
+                });
             }
             other => {
                 warn!(
@@ -871,30 +844,146 @@ pub async fn bootstrap_mcp_clients(
             }
         }
     }
+
+    // Phase 2 (parallel): sub-process spawn / TCP connect + initialize
+    // handshake + tools/list. The wall-clock collapses from sum(N) to
+    // max(N); a hung server is bounded by the stdio handshake timeout.
+    let opened = futures_util::future::join_all(plans.iter().map(|plan| async move {
+        match plan {
+            ConnectPlan::Stdio {
+                name,
+                endpoint,
+                command,
+                args,
+                env,
+                ..
+            } => open_stdio_initial(name, endpoint, command, args, env).await,
+            ConnectPlan::Http { name, url, headers } => {
+                open_http_initial(name, url, headers.as_ref()).await
+            }
+        }
+    }))
+    .await;
+
+    // Phase 3 (sequential, plan order preserved): registry apply + reconnect
+    // wrapper + refresh worker. Registry mutation stays off the concurrent
+    // path on purpose — only the network phase above is parallel.
+    let mut toolsets = Vec::new();
+    for (plan, open) in plans.into_iter().zip(opened) {
+        match (plan, open) {
+            (
+                ConnectPlan::Stdio {
+                    name,
+                    endpoint,
+                    auto_refresh,
+                    ..
+                },
+                Ok(Opened::Stdio(opened)),
+            ) => {
+                let result = connect_stdio(registry, &name, &endpoint, opened, auto_refresh).await;
+                match result {
+                    Ok((count, toolset)) => {
+                        info!(server = %name, tools = count, "MCP client connected");
+                        toolsets.push(toolset);
+                    }
+                    Err(e) => {
+                        warn!(server = %name, error = %e, "MCP connection failed");
+                    }
+                }
+            }
+            (ConnectPlan::Stdio { name, .. }, Err(e)) => {
+                warn!(server = %name, error = %e, "MCP connection failed");
+            }
+            (ConnectPlan::Http { name, url, .. }, Ok(Opened::Http(opened))) => {
+                match connect_http(registry, &name, &url, opened).await {
+                    Ok(count) => {
+                        info!(server = %name, url = %url, tools = count, "MCP HTTP client connected");
+                    }
+                    Err(e) => {
+                        warn!(server = %name, url = %url, error = %e, "MCP HTTP connection failed");
+                    }
+                }
+            }
+            (ConnectPlan::Http { name, url, .. }, Err(e)) => {
+                warn!(server = %name, url = %url, error = %e, "MCP HTTP connection failed");
+            }
+            (ConnectPlan::Stdio { .. }, Ok(Opened::Http(_)))
+            | (ConnectPlan::Http { .. }, Ok(Opened::Stdio(_))) => {
+                unreachable!("open phase mirrors the plan variant");
+            }
+        }
+    }
     toolsets
 }
 
-async fn connect_stdio(
-    registry: &ToolRegistry,
+enum ConnectPlan {
+    Stdio {
+        name: String,
+        endpoint: String,
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        auto_refresh: bool,
+    },
+    Http {
+        name: String,
+        url: String,
+        headers: Option<HashMap<String, String>>,
+    },
+}
+
+enum Opened {
+    Stdio(StdioOpen),
+    Http(HttpOpen),
+}
+
+/// Parallel-open artifacts for one stdio server: the live transport plus the
+/// pieces [`connect_stdio`] needs to materialize the reconnecting wrapper.
+struct StdioOpen {
+    transport: Arc<dyn McpTransport>,
+    spawn: SpawnFactory,
+    schemas: Vec<ToolSchema>,
+    signals: tokio::sync::mpsc::Receiver<()>,
+    spawn_ms: u64,
+    list_ms: u64,
+}
+
+/// Parallel-open artifacts for the HTTP path (mirror of [`StdioOpen`]).
+struct HttpOpen {
+    transport: Arc<dyn McpTransport>,
+    spawn: SpawnFactory,
+    schemas: Vec<ToolSchema>,
+    connect_ms: u64,
+    list_ms: u64,
+}
+
+/// Spawn the stdio child and fetch its initial `tools/list` — the two slow
+/// awaits of [`connect_stdio`], extracted so the bootstrap phase can run
+/// them concurrently across servers (FR-041).
+#[allow(clippy::too_many_arguments)]
+async fn open_stdio_initial(
     server_name: &str,
     endpoint: &str,
     program: &str,
     args: &[String],
     env: &HashMap<String, String>,
-    auto_refresh: bool,
-) -> Result<(usize, Arc<McpToolSet>), String> {
+) -> Result<Opened, String> {
     let (notify, signals) = mpsc::channel(1);
-    let initial: Arc<dyn McpTransport> = Arc::new(
+    let started = Instant::now();
+    let transport: Arc<dyn McpTransport> = Arc::new(
         ZenStdioTransport::spawn(endpoint, program, args, env, Some(notify.clone()))
             .await
             .map_err(|e| format!("spawn failed: {}", e))?,
     );
-    info!(server = server_name, "MCP subprocess spawned");
+    let spawn_ms = started.elapsed().as_millis() as u64;
+    info!(server = server_name, spawn_ms, "MCP subprocess spawned");
 
-    let schemas = initial
+    let list_started = Instant::now();
+    let schemas = transport
         .list_tools()
         .await
         .map_err(|e| format!("list_tools failed: {}", e))?;
+    let list_ms = list_started.elapsed().as_millis() as u64;
 
     let endpoint_factory = endpoint.to_string();
     let program_factory = program.to_string();
@@ -922,50 +1011,39 @@ async fn connect_stdio(
         })
     });
 
-    let reconnecting = Arc::new(ReconnectingMcpTransport::new(
-        server_name,
-        endpoint,
+    Ok(Opened::Stdio(StdioOpen {
+        transport,
         spawn,
-        initial,
-    ));
-
-    let tools = Arc::new(McpToolSet::new(
-        server_name,
-        registry.clone(),
-        reconnecting.clone(),
-    ));
-    let update = tools.apply(schemas).await;
-    if auto_refresh {
-        let worker = spawn_tool_refresh_worker(signals, Arc::downgrade(&tools));
-
-        // Intentionally detached: the worker holds a `Weak` toolset and exits
-        // once the caller drops its strong ref — no handle plumbing needed.
-        drop(worker);
-    }
-
-    Ok((update.added, tools))
+        schemas,
+        signals,
+        spawn_ms,
+        list_ms,
+    }))
 }
 
-/// Connect to an HTTP/HTTPS MCP server, wrap in [`ReconnectingMcpTransport`]
-/// (so FR-013 crash recovery applies), and register all discovered tools.
-/// Mirrors [`connect_stdio`] structurally.
-async fn connect_http(
-    registry: &ToolRegistry,
+/// Spawn the HTTP transport and fetch its initial `tools/list` — the two
+/// slow awaits of [`connect_http`], extracted for the parallel bootstrap
+/// phase (FR-041).
+async fn open_http_initial(
     server_name: &str,
     url: &str,
     extra_headers: Option<&HashMap<String, String>>,
-) -> Result<usize, String> {
-    let initial: Arc<dyn McpTransport> = Arc::new(
+) -> Result<Opened, String> {
+    let started = Instant::now();
+    let transport: Arc<dyn McpTransport> = Arc::new(
         spawn_http(url, extra_headers)
             .await
             .map_err(|e| format!("spawn failed: {}", e))?,
     );
-    info!(server = server_name, url = %url, "MCP HTTP transport connected");
+    let connect_ms = started.elapsed().as_millis() as u64;
+    info!(server = server_name, url = %url, connect_ms, "MCP HTTP transport connected");
 
-    let schemas = initial
+    let list_started = Instant::now();
+    let schemas = transport
         .list_tools()
         .await
         .map_err(|e| format!("list_tools failed: {}", e))?;
+    let list_ms = list_started.elapsed().as_millis() as u64;
 
     let url_factory = url.to_string();
     let headers_factory: HashMap<String, String> = extra_headers.cloned().unwrap_or_default();
@@ -980,17 +1058,84 @@ async fn connect_http(
         })
     });
 
+    Ok(Opened::Http(HttpOpen {
+        transport,
+        spawn,
+        schemas,
+        connect_ms,
+        list_ms,
+    }))
+}
+
+async fn connect_stdio(
+    registry: &ToolRegistry,
+    server_name: &str,
+    endpoint: &str,
+    opened: StdioOpen,
+    auto_refresh: bool,
+) -> Result<(usize, Arc<McpToolSet>), String> {
+    info!(
+        server = server_name,
+        spawn_ms = opened.spawn_ms,
+        list_ms = opened.list_ms,
+        tools = opened.schemas.len(),
+        "MCP stdio opened (FR-041 hot-path metrics)"
+    );
+
+    let reconnecting = Arc::new(ReconnectingMcpTransport::new(
+        server_name,
+        endpoint,
+        opened.spawn,
+        opened.transport,
+    ));
+
+    let tools = Arc::new(McpToolSet::new(
+        server_name,
+        registry.clone(),
+        reconnecting.clone(),
+    ));
+    let update = tools.apply(opened.schemas).await;
+    if auto_refresh {
+        let worker = spawn_tool_refresh_worker(opened.signals, Arc::downgrade(&tools));
+
+        // Intentionally detached: the worker holds a `Weak` toolset and exits
+        // once the caller drops its strong ref — no handle plumbing needed.
+        drop(worker);
+    }
+
+    Ok((update.added, tools))
+}
+
+/// Materialize the HTTP/HTTPS MCP server connection: wrap the opened
+/// transport in [`ReconnectingMcpTransport`] (so FR-013 crash recovery
+/// applies) and register all discovered tools. Mirrors [`connect_stdio`]
+/// structurally.
+async fn connect_http(
+    registry: &ToolRegistry,
+    server_name: &str,
+    url: &str,
+    opened: HttpOpen,
+) -> Result<usize, String> {
+    info!(
+        server = server_name,
+        url = %url,
+        connect_ms = opened.connect_ms,
+        list_ms = opened.list_ms,
+        tools = opened.schemas.len(),
+        "MCP HTTP opened (FR-041 hot-path metrics)"
+    );
+
     let reconnecting = Arc::new(ReconnectingMcpTransport::new(
         server_name,
         url,
-        spawn,
-        initial,
+        opened.spawn,
+        opened.transport,
     ));
 
     // HTTP carries no server-initiated `tools/list_changed` stream in this
     // minimal transport (one POST per call), so the set is seeded once.
     let tools = McpToolSet::new(server_name, registry.clone(), reconnecting.clone());
-    let update = tools.apply(schemas).await;
+    let update = tools.apply(opened.schemas).await;
 
     Ok(update.added)
 }
@@ -1097,6 +1242,8 @@ struct ZenStdioTransport {
     _service: Arc<RunningService<RoleClient, ToolChangeNotifier>>,
 }
 
+const MCP_STDIO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl ZenStdioTransport {
     async fn spawn(
         endpoint: &str,
@@ -1112,10 +1259,20 @@ impl ZenStdioTransport {
 
         let transport = TokioChildProcess::new(command)
             .map_err(|e| KernelError::ToolFailed(format!("mcp.spawn: {}", e)))?;
-        let service = ToolChangeNotifier { notify }
-            .serve(transport)
-            .await
-            .map_err(|e| KernelError::ToolFailed(format!("mcp.connect: {}", e)))?;
+        // Bounded handshake, mirrored from the HTTP path's 60s reqwest
+        // timeout: rmcp's plain `serve()` has no startup deadline, so a hung
+        // stdio server would otherwise stall bootstrap unboundedly.
+        let service = tokio::time::timeout(
+            MCP_STDIO_HANDSHAKE_TIMEOUT,
+            ToolChangeNotifier { notify }.serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            KernelError::ToolFailed(format!(
+                "mcp.connect: no initialize reply within {MCP_STDIO_HANDSHAKE_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(|e| KernelError::ToolFailed(format!("mcp.connect: {}", e)))?;
         let peer = service.peer().clone();
         Ok(Self {
             endpoint: endpoint.to_string(),

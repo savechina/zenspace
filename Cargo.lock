@@ -10690,6 +10690,7 @@ dependencies = [
  "base64 0.23.0",
  "chrono",
  "diffy",
+ "futures-util",
  "glob",
  "home",
  "htmd",
