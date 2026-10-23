@@ -127,7 +127,7 @@ enum Commands {
         /// Filter by sensitivity level (public, private, confidential)
         #[arg(short = 'l', long)]
         level: Option<String>,
-        /// Follow log output in real time (like tail -f)
+        /// Show the freshest tail snapshot of the newest rotation (not a live tail)
         #[arg(short = 'f', long)]
         follow: bool,
         /// Output as JSON

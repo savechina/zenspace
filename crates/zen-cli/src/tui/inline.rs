@@ -704,8 +704,9 @@ mod tests {
     use crate::tui::app::{PendingCallKind, PendingLlmCallStream};
     use crate::tui::scrollback_inserter::insert_scrollback_queue;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
+    use ratatui::backend::{ClearType, TestBackend, WindowSize};
+    use ratatui::buffer::{Buffer, Cell};
+    use ratatui::layout::Size;
     use std::sync::mpsc;
 
     type TokenSender = mpsc::Sender<String>;
@@ -988,6 +989,183 @@ mod tests {
         assert!(
             degrade_io_outcome(Ok(()), "t250-test"),
             "Ok must map to a successful update"
+        );
+    }
+
+    // T250/D2 integration helper: a backend whose terminal I/O fails with EIO.
+    //
+    // Honest boundary (verified against ratatui-core 0.1.2 sources): the
+    // Resize degrade seam (`best_effort_reanchor` → `reanchor_viewport`)
+    // never calls `Backend::draw` — it exercises `set_cursor_position` /
+    // `get_cursor_position` / `append_lines` (via `Terminal::resize` →
+    // `compute_inline_size`). A draw-only failure surfaces at inline_tick's
+    // separate `terminal.draw(...)?` render call, which propagates by design
+    // (pre-existing `?`; the degrade contract covers the reanchor/rebuild `?`
+    // points only). The helper therefore fails BOTH `draw` (per the D2 spec)
+    // and `set_cursor_position` (the real first choke point of the resize
+    // path); each pin selects the knob it needs.
+    struct FailingBackend {
+        size: Size,
+        cursor: Position,
+        fail_draw: bool,
+        fail_cursor_move: bool,
+    }
+
+    impl FailingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                size: Size::new(width, height),
+                cursor: Position::new(0, height.saturating_sub(1)),
+                fail_draw: false,
+                fail_cursor_move: false,
+            }
+        }
+
+        fn with_failing_draw(mut self) -> Self {
+            self.fail_draw = true;
+            self
+        }
+
+        fn with_failing_cursor_move(mut self) -> Self {
+            self.fail_cursor_move = true;
+            self
+        }
+    }
+
+    impl Backend for FailingBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, _content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            if self.fail_draw {
+                Err(io::Error::other("EIO"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            Ok(self.cursor)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            if self.fail_cursor_move {
+                return Err(io::Error::other("EIO"));
+            }
+            self.cursor = position.into();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn clear_region(&mut self, _clear_type: ClearType) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Inline terminal over a `FailingBackend`, mirroring `anchored_terminal`.
+    fn failing_inline_terminal(backend: FailingBackend) -> Terminal<FailingBackend> {
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(INLINE_VIEWPORT_ROWS),
+            },
+        )
+        .expect("terminal")
+    }
+
+    // T250/D2 integration pin: a real EIO on the Resize path degrades through
+    // `degrade_io_outcome` — the tick returns Ok, the session stays alive, and
+    // the previous viewport is retained verbatim (the next Resize retries).
+    // Supplements the pure-mapping pin above by driving the REAL path the
+    // Resize arm takes: inline_tick → best_effort_reanchor → reanchor_viewport.
+    #[test]
+    fn t250_resize_eio_backend_degrades_and_keeps_previous_viewport() {
+        let mut app = prepare_inline_app(test_config());
+        let mut terminal =
+            failing_inline_terminal(FailingBackend::new(60, 20).with_failing_cursor_move());
+        let before = terminal.get_frame().area();
+        let mut state = InlineLoopState::new();
+
+        let exit = inline_tick(
+            &mut app,
+            &mut terminal,
+            &mut state,
+            Some(Event::Resize(60, 24)),
+        )
+        .expect("resize EIO must degrade, not propagate out of the tick");
+        assert!(!exit, "a degraded resize must not exit the session");
+        assert_eq!(
+            terminal.get_frame().area(),
+            before,
+            "failed reanchor must retain the previous viewport"
+        );
+
+        // The same choke point in isolation: `best_effort_reanchor` is the
+        // exact fn the Resize arm calls; EIO maps to `false` (degrade), never
+        // a panic or an Err.
+        assert!(
+            !best_effort_reanchor(&mut terminal, 60, 24),
+            "EIO at the reanchor choke point must degrade to false"
+        );
+        assert_eq!(
+            terminal.get_frame().area(),
+            before,
+            "degraded reanchor must leave the viewport untouched"
+        );
+    }
+
+    // T250/D2 boundary pin (honest scope): with ONLY `Backend::draw` failing,
+    // the resize degrade seam is never reached — `reanchor_viewport` succeeds
+    // (it never draws) and the EIO surfaces at inline_tick's render call
+    // (`terminal.draw(...)?`), which propagates by design. Pinned to state the
+    // boundary: the degrade contract covers the reanchor/rebuild `?` points,
+    // not the render `?`.
+    #[test]
+    fn t250_draw_eio_surfaces_at_render_call_not_degrade_seam() {
+        let mut app = prepare_inline_app(test_config());
+        let mut terminal = failing_inline_terminal(FailingBackend::new(60, 20).with_failing_draw());
+        let mut state = InlineLoopState::new();
+
+        let result = inline_tick(
+            &mut app,
+            &mut terminal,
+            &mut state,
+            Some(Event::Resize(60, 24)),
+        );
+        assert!(
+            result.is_err(),
+            "draw EIO must surface at the render call site (not the degrade seam)"
         );
     }
 

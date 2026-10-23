@@ -270,7 +270,7 @@ impl McpToolSet {
 /// spawn factory's notification sender) is freed, the channel closes, and the
 /// loop exits naturally — no `JoinHandle` management or shutdown channel.
 fn spawn_tool_refresh_worker(
-    mut signals: mpsc::UnboundedReceiver<()>,
+    mut signals: mpsc::Receiver<()>,
     tools: Weak<McpToolSet>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -883,7 +883,7 @@ async fn connect_stdio(
     env: &HashMap<String, String>,
     auto_refresh: bool,
 ) -> Result<(usize, Arc<McpToolSet>), String> {
-    let (notify, signals) = mpsc::unbounded_channel();
+    let (notify, signals) = mpsc::channel(1);
     let initial: Arc<dyn McpTransport> = Arc::new(
         ZenStdioTransport::spawn(endpoint, program, args, env, Some(notify.clone()))
             .await
@@ -913,8 +913,10 @@ async fn connect_stdio(
                     .map_err(|e| e.to_string())?;
             // T244: a re-spawn gets a fresh peer, so re-apply the catalog now
             // rather than waiting for the server to emit its own
-            // `tools/list_changed`. Failed spawns never send.
-            let _ = notify.send(());
+            // `tools/list_changed`. Failed spawns never send. Coalescing:
+            // try_send drops the signal if one is already queued — the
+            // worker will relist regardless.
+            let _ = notify.try_send(());
             let transport: Arc<dyn McpTransport> = Arc::new(transport);
             Ok(transport)
         })
@@ -1067,7 +1069,7 @@ fn child_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
 /// rmcp client handler that only forwards `notifications/tools/list_changed`
 /// as a wake-up for [`spawn_tool_refresh_worker`].
 struct ToolChangeNotifier {
-    notify: Option<mpsc::UnboundedSender<()>>,
+    notify: Option<mpsc::Sender<()>>,
 }
 
 impl ClientHandler for ToolChangeNotifier {
@@ -1075,7 +1077,11 @@ impl ClientHandler for ToolChangeNotifier {
         if let Some(tx) = &self.notify {
             // A dropped receiver means no refresh worker is attached (one-shot
             // connectivity probes): discarding the wake-up is correct there.
-            let _ = tx.send(());
+            // Bounded(1) + try_send: the worker contract is edge-triggered, so
+            // the queued signal already guarantees a relist; a second signal
+            // adds nothing — drop it instead of buffering a flood from a
+            // misbehaving server.
+            let _ = tx.try_send(());
         }
     }
 }
@@ -1097,7 +1103,7 @@ impl ZenStdioTransport {
         program: &str,
         args: &[String],
         env: &HashMap<String, String>,
-        notify: Option<mpsc::UnboundedSender<()>>,
+        notify: Option<mpsc::Sender<()>>,
     ) -> Result<Self, KernelError> {
         let mut command = tokio::process::Command::new(program);
         command.args(args);
@@ -1496,12 +1502,12 @@ mod tests {
             tools,
         } = seeded_set("srv", vec![schema("a", "")]);
         tools.list_and_apply().await.unwrap();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         let worker = spawn_tool_refresh_worker(rx, Arc::downgrade(&tools));
 
         // WHEN the server gains tool b and emits tools/list_changed
         *schemas.lock().await = vec![schema("a", ""), schema("b", "")];
-        tx.send(()).unwrap();
+        tx.try_send(()).unwrap();
 
         // THEN the worker re-lists and registers b without a session restart
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1567,7 +1573,7 @@ mod tests {
     async fn worker_exits_when_toolset_dropped() {
         // GIVEN a worker holding only a Weak toolset ref
         let SeededSet { tools, .. } = seeded_set("srv", vec![schema("a", "")]);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         let worker = spawn_tool_refresh_worker(rx, Arc::downgrade(&tools));
 
         // WHEN the strong owner and the signal sender are both dropped
@@ -1585,7 +1591,7 @@ mod tests {
     async fn respawn_notify_triggers_relist() {
         // GIVEN a catalog seeded from before the crash
         let registry = ToolRegistry::new();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         let initial: Arc<dyn McpTransport> = Arc::new(DeadMock);
         let respawned: Arc<dyn McpTransport> = Arc::new(ListMock {
             tools: Arc::new(Mutex::new(vec![schema("b", "")])),
@@ -1597,7 +1603,8 @@ mod tests {
             Box::pin(async move {
                 // Mirrors connect_stdio's factory (T244): a successful
                 // re-spawn wakes the worker so the catalog is re-applied.
-                let _ = notify.send(());
+                // Bounded(1): coalesces like the production send site.
+                let _ = notify.try_send(());
                 Ok(fresh)
             })
         });
@@ -1637,6 +1644,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_notify_channel_coalesces_signals() {
+        // D7 pin: the notify channel is bounded(1); try_send DROPS a signal
+        // when one is already queued instead of buffering a flood from a
+        // misbehaving server. The refresh worker relists on every received
+        // signal, so the dropped duplicate is redundant by contract.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(())
+            .expect("first signal fits the empty channel");
+        tx.try_send(())
+            .expect_err("second unprocessed signal coalesces (Full)");
+        // Exactly one wake-up survives for the worker to consume.
+        rx.recv().await.expect("the queued signal is delivered");
+        tx.try_send(())
+            .expect("channel frees again after the worker drains");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the post-drain signal is buffered and will wake the worker"
+        );
+    }
+
+    #[tokio::test]
     async fn degraded_set_after_unavailable() {
         // GIVEN a toolset whose transport reports itself unavailable
         let fail = Arc::new(AtomicBool::new(true));
@@ -1648,11 +1676,11 @@ mod tests {
                 fail: fail.clone(),
             }),
         ));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         let worker = spawn_tool_refresh_worker(rx, Arc::downgrade(&tools));
 
         // WHEN a refresh fails on the unavailable transport
-        tx.send(()).unwrap();
+        tx.try_send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !tools.is_degraded() {
             assert!(
@@ -1664,7 +1692,7 @@ mod tests {
 
         // THEN the next successful apply clears the flag
         fail.store(false, Ordering::Relaxed);
-        tx.send(()).unwrap();
+        tx.try_send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while tools.is_degraded() {
             assert!(

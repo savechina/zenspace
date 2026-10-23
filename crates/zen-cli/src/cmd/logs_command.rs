@@ -118,7 +118,8 @@ pub fn execute_show(
     if follow {
         // T252: `agent-session.jsonl` has no producer anywhere in the workspace,
         // so the old follow path tailed a file that never exists. Follow now
-        // renders the tracing-log tail instead.
+        // renders the freshest tail snapshot of the tracing log — a snapshot,
+        // not a live tail: no polling, re-run the command to refresh.
         return show_zen_log_tail(lines, level, json);
     }
 
@@ -278,17 +279,18 @@ fn grep_zen_log(pattern: &str, json: bool) -> Result<(), ZenError> {
         return Ok(());
     }
 
-    let mut content = String::new();
+    let mut contents: Vec<String> = Vec::new();
     for file in &files {
         match std::fs::read_to_string(file) {
-            Ok(text) => content.push_str(&text),
+            Ok(text) => contents.push(text),
             Err(e) => eprintln!("warn: skip {}: {e}", file.display()),
         }
     }
 
+    let all_lines = concat_log_lines(&contents);
     let pattern_lower = pattern.to_lowercase();
-    let matches: Vec<&str> = content
-        .lines()
+    let matches: Vec<&String> = all_lines
+        .iter()
         .filter(|line| line.to_lowercase().contains(&pattern_lower))
         .collect();
 
@@ -323,6 +325,22 @@ fn grep_zen_log(pattern: &str, json: bool) -> Result<(), ZenError> {
     Ok(())
 }
 
+/// Concatenate ordered file contents into lines.
+///
+/// A `\n` separator is inserted between files when the accumulated content
+/// does not already end with one, so a file lacking a trailing newline cannot
+/// glue its last line to the next file's first line.
+fn concat_log_lines(contents: &[String]) -> Vec<String> {
+    let mut joined = String::new();
+    for text in contents {
+        if !joined.is_empty() && !joined.ends_with('\n') {
+            joined.push('\n');
+        }
+        joined.push_str(text);
+    }
+    joined.lines().map(str::to_string).collect()
+}
+
 fn show_zen_log_tail(lines: usize, level: Option<&str>, json: bool) -> Result<(), ZenError> {
     let paths = ZenPaths::detect()
         .map_err(|e| ZenError::Message(format!("failed to resolve paths: {e}")))?;
@@ -333,17 +351,17 @@ fn show_zen_log_tail(lines: usize, level: Option<&str>, json: bool) -> Result<()
         return Ok(());
     }
 
-    let mut all_lines: Vec<String> = Vec::new();
-    for file in &files {
+    // `zen_log_files` is newest-first (dated desc, legacy last); iterate in
+    // reverse so the concatenation is chronological (legacy → oldest dated →
+    // newest dated) and the last-N tail window holds the freshest lines.
+    let mut contents: Vec<String> = Vec::new();
+    for file in files.iter().rev() {
         match std::fs::read_to_string(file) {
-            Ok(text) => {
-                for line in text.lines() {
-                    all_lines.push(line.to_string());
-                }
-            }
+            Ok(text) => contents.push(text),
             Err(e) => eprintln!("warn: skip {}: {e}", file.display()),
         }
     }
+    let all_lines = concat_log_lines(&contents);
     if all_lines.is_empty() {
         println!("No log entries found");
         return Ok(());
@@ -579,5 +597,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("audit.jsonl"), "x").unwrap();
         assert!(zen_log_files(dir.path()).is_empty());
+    }
+
+    // P1 pin (eng-review 2026-10-22 D3): the tail window must hold the freshest
+    // lines. Files reach the helper in chronological order (`zen_log_files`
+    // reversed: legacy → oldest dated → newest dated); taking the last N of the
+    // concatenation must end on the newest line, even when the newest file
+    // lacks a trailing newline.
+    #[test]
+    fn tail_window_last_n_ends_on_newest_line_across_rotations() {
+        let contents = vec![
+            "legacy-oldest line\n".to_string(),
+            "20261020 older line\n".to_string(),
+            "20261022 newest line".to_string(),
+        ];
+        let all_lines = concat_log_lines(&contents);
+        assert_eq!(all_lines.len(), 3);
+
+        let n = 2;
+        let start = all_lines.len().saturating_sub(n);
+        let tail = &all_lines[start..];
+        assert_eq!(tail.len(), n);
+        assert_eq!(tail[0], "20261020 older line");
+        assert_eq!(
+            tail[tail.len() - 1],
+            "20261022 newest line",
+            "newest line must be the LAST element of the tail window"
+        );
+    }
+
+    // P1 pin (eng-review 2026-10-22 grep separator): a file lacking a trailing
+    // newline must not glue its last line to the next file's first line — the
+    // separator keeps them as two separate match lines.
+    #[test]
+    fn grep_concat_separator_keeps_unterminated_lines_separate() {
+        let contents = vec!["ERROR alpha hit".to_string(), "ERROR beta hit".to_string()];
+        let all_lines = concat_log_lines(&contents);
+        let matches: Vec<&String> = all_lines
+            .iter()
+            .filter(|line| line.to_lowercase().contains("error"))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            2,
+            "unterminated line must not glue to the next file's first line"
+        );
+        assert_eq!(matches[0].as_str(), "ERROR alpha hit");
+        assert_eq!(matches[1].as_str(), "ERROR beta hit");
     }
 }

@@ -368,6 +368,8 @@ fn render_approval_popup_inline(
 
     // detail_lines() renders the Tool line itself; binary/args are shown so
     // the approver is not approving blind (eng-review 2026-10-22 P1).
+    // Reason is included by detail_lines() itself (D6 fix) — this renderer
+    // must not push it again or the popup shows "Reason:" twice.
     let tool_style = Style::default().fg(theme.info_accent());
     for detail in request.detail_lines() {
         let line = match detail.split_once(": ") {
@@ -378,12 +380,6 @@ fn render_approval_popup_inline(
             None => Line::from(Span::styled(detail.clone(), tool_style)),
         };
         lines.push(line);
-    }
-    if !request.reason.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Reason: ", theme.text_muted()),
-            Span::styled(request.reason.clone(), Style::default()),
-        ]));
     }
 
     // Key hint

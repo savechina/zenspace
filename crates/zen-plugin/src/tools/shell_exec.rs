@@ -315,6 +315,101 @@ fn shell_command_string<'a>(binary: &str, argv: &'a [String]) -> Option<&'a str>
     argv.get(flag + 1).map(String::as_str)
 }
 
+/// Reject runtime-expansion shapes the per-segment scanner cannot statically
+/// validate, wherever the bytes are NOT single-quoted-literal (D4 seal). A
+/// `$var` lookup, `$(...)` substitution or backtick executes once the shell
+/// expands it — the executed text (fed via the `env` arg, for example) can be
+/// any string the literal token checks would have rejected, so `sh -c '$P'`
+/// with `{"env":{"P":"sudo cat ~/.ssh/id_ed25519"}}` would sail through the
+/// scanner. Single-quoted bytes are literal in POSIX sh, so `echo '$HOME'`
+/// still passes.
+#[derive(PartialEq, Copy, Clone)]
+enum QuoteState {
+    Plain,
+    Single,
+    Double,
+}
+
+fn unquoted_expansion_reason(text: &str) -> Option<&'static str> {
+    let mut state = QuoteState::Plain;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match state {
+            QuoteState::Plain => match c {
+                '\'' => state = QuoteState::Single,
+                '"' => state = QuoteState::Double,
+                '$' | '`' => {
+                    return Some(
+                        "runtime expansion outside single quotes ($var / $(...) / \\`) executes text the per-segment scanner never validated",
+                    );
+                }
+                '\\' => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            QuoteState::Single => {
+                if c == '\'' {
+                    state = QuoteState::Plain;
+                }
+            }
+            QuoteState::Double => match c {
+                '"' => state = QuoteState::Plain,
+                '\\' => {
+                    chars.next();
+                }
+                '$' | '`' => {
+                    return Some(
+                        "runtime expansion inside double quotes ($var / $(...) / \\`) executes text the per-segment scanner never validated",
+                    );
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// The segment text minus all quoted spans (D11): the bytes a POSIX shell
+/// treats as unquoted command words. Quoted contents never influence which
+/// blocked pattern a segment matches.
+fn unquoted_remainder(text: &str) -> String {
+    let mut state = QuoteState::Plain;
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match state {
+            QuoteState::Plain => match c {
+                '\'' => state = QuoteState::Single,
+                '"' => state = QuoteState::Double,
+                '\\' => out.push('\\'),
+                _ => out.push(c),
+            },
+            QuoteState::Single => {
+                if c == '\'' {
+                    state = QuoteState::Plain;
+                }
+            }
+            QuoteState::Double => match c {
+                '"' => state = QuoteState::Plain,
+                '\\' => {
+                    // Backslash escapes the NEXT byte inside double quotes;
+                    // consume it so `\"` cannot smuggle the quote out.
+                    chars.next();
+                }
+                _ => {}
+            },
+        }
+    }
+    // Unmatched opening quote: the scanner's span model is invalid here.
+    // Conservatively treat the WHOLE text as unquoted (match the fallback
+    // contract — nothing gets hidden by the never-closed quote).
+    if state != QuoteState::Plain {
+        return text.to_string();
+    }
+    out
+}
+
 /// Tokens naming a protected metadata path or env file, which the sandbox
 /// validator must reject (`cat ~/.ssh/id_ed25519`, `cat .env`).
 fn protected_path_candidate(token: &str) -> Option<&str> {
@@ -362,17 +457,44 @@ impl ShellExecTool {
             if segment.text.is_empty() {
                 continue;
             }
-            let invocation = ToolInvocation {
-                name: NAME.to_string(),
-                args: json!({ "binary": segment.text.as_str() }),
-            };
-            if let ToolDispatchAction::Terminate { reason } = policy
-                .validate_invocation(&invocation)
-                .map_err(|e| KernelError::ToolFailed(format!("segment gate failed: {e}")))?
-            {
+            if let Some(reason) = unquoted_expansion_reason(&segment.text) {
                 return Err(segment_denied(segment, reason));
             }
+            if segment.tokens.iter().any(|token| token == "eval") {
+                return Err(segment_denied(
+                    segment,
+                    "'eval' re-parses its argument as a shell command, defeating per-segment validation",
+                ));
+            }
+            // The blocked-command check runs on the segment's UNQUOTED
+            // remainder: quote-aware scanning strips quoted spans first, so
+            // `grep "sudo " log` scans as `grep log` (the quoted word is a
+            // search pattern, not a command), while unquoted dangerous
+            // patterns (`sudo id`) still hit the pattern list.
+            let unquoted = unquoted_remainder(&segment.text);
+            if !unquoted.is_empty() {
+                let invocation = ToolInvocation {
+                    name: NAME.to_string(),
+                    args: json!({ "binary": unquoted.as_str() }),
+                };
+                if let ToolDispatchAction::Terminate { reason } = policy
+                    .validate_invocation(&invocation)
+                    .map_err(|e| KernelError::ToolFailed(format!("segment gate failed: {e}")))?
+                {
+                    return Err(segment_denied(segment, reason));
+                }
+            }
+            // Flag VALUE tokens are patterns/limits from the caller's own
+            // argv (e.g. `find . -name .git`), not paths the child opens, so
+            // the protected-path scan skips them.
+            let mut prev_token_was_flag = false;
             for token in &segment.tokens {
+                let is_flag = token.starts_with('-') && token.len() > 1;
+                let is_flag_value = prev_token_was_flag && !is_flag && !token.contains('=');
+                prev_token_was_flag = is_flag;
+                if is_flag_value {
+                    continue;
+                }
                 let Some(path) = protected_path_candidate(token) else {
                     continue;
                 };
@@ -496,6 +618,19 @@ impl Tool for ShellExecTool {
             .map_err(|e| KernelError::InvalidArgument(format!("invalid cwd: {e}")))?;
 
         if let Some(embedded) = shell_command_string(binary, &argv) {
+            // D4 seal: `env` is the only injection path (FR-037), and a shell
+            // consumes it via `$var` expansion — combining the two lets
+            // `{"args":["-c","$P"],"env":{"P":"<rejected text>"}}` execute
+            // anything the segment scanner would have refused.
+            let injects_env = args
+                .get("env")
+                .and_then(|v| v.as_object())
+                .is_some_and(|obj| !obj.is_empty());
+            if injects_env {
+                return Err(KernelError::InvalidArgument(
+                    "shell.exec: 'env' injection combined with an embedded shell -c command is rejected — runtime variable expansion bypasses per-segment validation".into(),
+                ));
+            }
             self.validate_embedded_command(embedded)?;
         } else {
             // Oracle A4 (2026-10-22): structured args bypassed every
@@ -967,5 +1102,106 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(res["error"].as_str(), Some("invalid argument"));
+    }
+
+    // D4 seal pins: runtime expansion / eval shapes the token scanner cannot
+    // statically validate must be refused before spawn.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn t087_unquoted_var_expansion_with_env_injection_rejected() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo $P"]
+            }))
+            .await;
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("runtime expansion"), "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn t087_quoted_literal_var_passes() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo '$HOME'"]
+            }))
+            .await
+            .unwrap();
+        assert!(res["stdout"].as_str().unwrap().contains("$HOME"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn t087_backtick_body_rejected() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo `safe word`"]
+            }))
+            .await;
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("runtime expansion"), "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn t087_eval_body_rejected() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "eval \"$P\""]
+            }))
+            .await;
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("eval"), "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn t087_env_plus_shell_combo_rejected() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo hi"],
+                "env": { "P": "sudo id" }
+            }))
+            .await;
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("env"), "{err}");
+    }
+
+    // D11 false-positive pins: quote-aware tokenization makes patterns that
+    // merely CONTAIN a blocked word or protected name readable invocations.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn t087_quoted_search_pattern_sudo_passes() {
+        // The searched line contains `sudo ` only via the quoted data — the
+        // grep PATTERN itself is what must not trip the pattern list.
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "echo 'log line sudo id here' | grep \"sudo \" -"]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res["exit_code"], 0);
+        assert!(res["stdout"].as_str().unwrap().contains("sudo"));
+        assert!(res["error"].as_str().is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn t087_find_name_dotgit_passes() {
+        let res = tool()
+            .invoke(json!({
+                "binary": "/bin/sh",
+                "args": ["-c", "find . -name .git || true"]
+            }))
+            .await
+            .unwrap();
+        assert_ne!(res["error"].as_str(), Some("invalid argument"));
+        assert_ne!(res["error"].as_str(), Some("denied"));
     }
 }

@@ -2764,6 +2764,55 @@ updated_at: "2026-05-23T15:00:00+00:00"
         );
     }
 
+    /// D10 pin: the REAL steady state — a valid, non-ghost registry on disk —
+    /// must survive a converged cycle byte-for-byte, with the legit slots
+    /// intact (the corrupt-sentinel test above only proves the fail-open load
+    /// branch does not write).
+    #[tokio::test]
+    async fn legit_registry_steady_state_not_rewritten() {
+        let tmp = tempdir().unwrap();
+        let inbox_dir = tmp.path().join("inbox");
+        fs::create_dir(&inbox_dir).unwrap();
+        let wiki_dir = tmp.path().join("wiki");
+        fs::create_dir(&wiki_dir).unwrap();
+
+        let logs_dir = tmp.path().join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let placeholders_path = logs_dir.join("placeholders.json");
+        let mut reg = PlaceholderRegistry::new();
+        reg.declare("missing_entity-ghost-stem", "zen-loop");
+        reg.declare("foreign-slot", "agent-z");
+        reg.save(&placeholders_path).unwrap();
+        let bytes_before = fs::read(&placeholders_path).unwrap();
+
+        let pipeline = DistillationPipeline::new();
+        let first = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.report.notes_processed, 0,
+            "warm-up cycle must be a converged, no-new-content cycle"
+        );
+        assert_eq!(
+            fs::read(&placeholders_path).unwrap(),
+            bytes_before,
+            "cycle 1 on a ghost-free valid registry must not merge-save"
+        );
+        let second = run_isolated_outcome(&pipeline, &inbox_dir, &wiki_dir)
+            .await
+            .unwrap();
+        assert_eq!(second.report.notes_processed, 0);
+        assert_eq!(
+            fs::read(&placeholders_path).unwrap(),
+            bytes_before,
+            "cycle 2 steady state must not rewrite the file"
+        );
+
+        let reloaded = PlaceholderRegistry::load(&placeholders_path).unwrap();
+        assert!(reloaded.lookup("missing_entity-ghost-stem").is_some());
+        assert!(reloaded.lookup("foreign-slot").is_some());
+    }
+
     /// FR-032 self-write awareness: the compiler regenerates `index.md` and
     /// `log.md` every cycle, so from cycle 2 on those churn files sit inside
     /// the snapshot scope. Txn-tracked self-writes must NOT count as drift —
