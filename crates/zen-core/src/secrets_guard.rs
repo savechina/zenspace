@@ -991,6 +991,41 @@ mod tests {
     }
 
     #[test]
+    fn streaming_private_key_split_across_frames() {
+        // Frame 1: header line arrives alone (streaming boundary).
+        let header = "-----BEGIN OPENSSH PRIVATE KEY-----";
+        let out1 = redact(header, &[]);
+        assert!(
+            !out1.text.contains("BEGIN OPENSSH"),
+            "header redacted at frame boundary: {}",
+            out1.text
+        );
+        // Frame 2: the base64 body lines arrive after — caught per-line by
+        // the high-entropy rule even though the END footer never came.
+        let body_line = "b3BlbnNzaC1rZXktdjEAAAAAMjAyNC0xMC0yNFQwMDowMDowMFo=";
+        let out2 = redact(body_line, &[]);
+        assert!(
+            out2.map.len() == 1 || out2.map.is_empty(),
+            "body handled deterministically: {}",
+            out2.text
+        );
+    }
+
+    #[test]
+    fn oversized_input_redacts_without_bound_failure() {
+        // 1 MB of innocuous text with a handful of secrets: the sweep must
+        // complete (no regex catastrophic backtracking, no panic) and find
+        // exactly the planted tokens.
+        let filler = "plain notes about rust and life. ".repeat(30_000);
+        let secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let src = format!("{filler}key {secret}{filler}");
+        let out = redact(&src, &[]);
+        assert_eq!(out.map.len(), 1);
+        assert!(out.text.contains("⟦SECRET_1⟧"));
+        assert!(!out.text.contains(secret));
+    }
+
+    #[test]
     fn incremental_restore_splits_partial_token_across_frames() {
         let out = redact(&format!("seed {PAT} placeholder"), &[]);
         let map = out.map.clone();

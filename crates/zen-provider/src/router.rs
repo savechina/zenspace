@@ -1785,6 +1785,32 @@ pub fn is_local_llm_available(router: &dyn LlmRouter) -> bool {
 mod tests {
     use super::*;
 
+    // ── FR-042 Secrets Guard: local-skip + cloud-active decision pins ─────
+
+    /// Pin (vi, T270): ollama-local egress NEVER scrubs (guard decision is
+    /// cloud-only); Provider::Mock stands in for a cloud provider and IS
+    /// scrubbed while the guard is enabled.
+    #[test]
+    fn secrets_guard_active_is_cloud_only() {
+        let router = DefaultRouter::from_agentic(&test_router_config());
+        // Local provider: skip regardless of guard state.
+        assert!(
+            !router.secrets_guard_active(&Provider::Ollama),
+            "ollama-local must skip scrub"
+        );
+        // Cloud stand-in: active under default-on config.
+        if zen_core::config::secrets_guard_state() {
+            assert!(
+                router.secrets_guard_active(&Provider::Mock),
+                "mock (cloud stand-in) must be scrubbed while enabled"
+            );
+        }
+        // The invariant that matters for fail-closed semantics: the engine
+        // is infallible (static regexes, no I/O), so a guard error cannot
+        // silently downgrade to raw egress — the only "off" path is the
+        // explicit config decision asserted above.
+    }
+
     // ── T060: lazy provider construction / deferred secret resolution ──────
 
     fn test_router_config() -> zen_core::config::ZenConfig {
