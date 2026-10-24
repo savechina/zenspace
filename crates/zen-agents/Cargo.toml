@@ -33,6 +33,8 @@ schemars = { workspace = true }
 arrow = { workspace = true }
 fs2 = { workspace = true }
 jsonschema = { workspace = true }
+# prod sha2 consumer: content_sha8 (scheduler workers, CSO log-leak mask)
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # T111/T118: test builds must never resolve the real ~/.zen — the

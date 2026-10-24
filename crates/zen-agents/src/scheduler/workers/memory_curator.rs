@@ -375,7 +375,12 @@ fn route_typed_signals(paths: &ZenPaths, typed: &TypedJournalSignals) -> usize {
         decision.goal = context.to_string();
         match decision.save(&dir) {
             Ok(()) => routed += 1,
-            Err(e) => warn!(error = %e, text = %text, "failed to route decision"),
+            Err(e) => warn!(
+                error = %e,
+                chars = text.chars().count(),
+                sha = content_sha8(text),
+                "failed to route decision"
+            ),
         }
     }
 
@@ -570,6 +575,21 @@ fn append_memory_updated_marker(path: &std::path::Path) -> Result<()> {
         ..Default::default()
     };
     state.save(path)
+}
+
+/// First 8 hex chars of the SHA-256 of `text` — a stable, non-content
+/// identifier for log lines that must not carry user text (CSO audit).
+/// Shared with `session_journaler_signals` (same crate).
+pub(crate) fn content_sha8(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()[..8]
+        .to_string()
 }
 
 #[cfg(test)]
@@ -791,5 +811,14 @@ mod tests {
             "diligence|||unknown-status".to_string(),
         ];
         assert_eq!(route_virtue_logs(tmp.path(), &raws), 0);
+    }
+
+    #[test]
+    fn content_sha8_is_stable_short_and_known_vector() {
+        assert_eq!(content_sha8("hello"), "2cf24dba");
+        assert_eq!(content_sha8("hello"), content_sha8("hello"));
+        assert_ne!(content_sha8("hello"), content_sha8("hellp"));
+        assert_eq!(content_sha8("").len(), 8);
+        assert_eq!(content_sha8("你好世界").len(), 8);
     }
 }

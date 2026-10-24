@@ -242,6 +242,123 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 recursive: true,
             },
         },
+        // CSO audit #2/#12: session conversation archives were the last
+        // full-content homes with no retention row — `sessions/YYYY/MM/DD/<id>.jsonl`
+        // (ConversationStore::open date layout), the flat `<id>.jsonl` fallback,
+        // and dream-compression `.jsonl.zst` twins accumulate forever. 90d
+        // mirrors the journal policy. Interplay: dream's
+        // `prune_expired_sessions(30d)` already removes TERMINAL sessions'
+        // `<id>/tool_calls.jsonl`; this row is the backstop for the
+        // conversation content itself, which nothing else bounds. A
+        // tool_calls.jsonl older than 90d is outside the 30d aggregation
+        // window either way, so deleting it here is inert.
+        Policy {
+            home: "sessions",
+            root: paths.sessions(),
+            action: Action::DeleteOlder {
+                pattern: None,
+                days: 90,
+                recursive: true,
+            },
+        },
+        // WikiLog (zen-vault wiki.rs `WikiLog::append`) appends one entry per
+        // compile via OpenOptions append — append-only, unbounded.
+        Policy {
+            home: "vault/wiki/log.md",
+            root: paths.wiki().join("log.md"),
+            action: Action::Rotate {
+                max_bytes: MIB,
+                keep: 2,
+            },
+        },
+        // ContradictionDetector::log_contradictions (distill/contradiction.rs)
+        // appends per distill cycle — append-only, unbounded.
+        Policy {
+            home: "vault/wiki/contradictions.md",
+            root: paths.wiki().join("contradictions.md"),
+            action: Action::Rotate {
+                max_bytes: MIB,
+                keep: 2,
+            },
+        },
+        // emit_memory_nudge_if_due (zen-agents orchestrator.rs) appends every
+        // ~10 user turns — append-only, unbounded.
+        Policy {
+            home: "logs/memory-nudges.jsonl",
+            root: logs.join("memory-nudges.jsonl"),
+            action: Action::Rotate {
+                max_bytes: 512 * 1024,
+                keep: 2,
+            },
+        },
+        // PromotionWorker BeliefEvidence/WikiPage handoff appends one line per
+        // confirmed promotion — append-only, unbounded.
+        Policy {
+            home: "logs/promotion-confirmed.jsonl",
+            root: logs.join("promotion-confirmed.jsonl"),
+            action: Action::Rotate {
+                max_bytes: 512 * 1024,
+                keep: 2,
+            },
+        },
+        // decision_audit::append_label training data — manual CLI
+        // adjudications, generous 365d window. Pattern targets labels.jsonl
+        // only; dataset.jsonl (the labeled dataset itself) is never touched.
+        Policy {
+            home: "logs/decision-audit/labels.jsonl",
+            root: logs.join("decision-audit"),
+            action: Action::DeleteOlder {
+                pattern: Some("labels.jsonl"),
+                days: 365,
+                recursive: false,
+            },
+        },
+        // SkillHistory (zen-agents skill_history.rs) appends per-skill
+        // `<skill>-history.jsonl` files under the skills root. Rotate is
+        // single-file and skill names are dynamic, so the dir-level
+        // age-delete is the shape-consistent bound ("AgeDelete for dirs");
+        // 365d is generous for training-history data. Non-history skill
+        // files (SKILL.md etc.) never match the pattern.
+        Policy {
+            home: "skills",
+            root: paths.skills(),
+            action: Action::DeleteOlder {
+                pattern: Some("*-history.jsonl"),
+                days: 365,
+                recursive: false,
+            },
+        },
+        // record_rewind / record_reflection (zen-vault distill/reflection.rs)
+        // write one md per event — plan-DAG rollbacks and failed-attempt
+        // lessons; 90d matches the journal/iterations window.
+        Policy {
+            home: "vault/wiki/wisdom/rewinds",
+            root: paths.wiki().join("wisdom/rewinds"),
+            action: Action::DeleteOlder {
+                pattern: Some("*.md"),
+                days: 90,
+                recursive: false,
+            },
+        },
+        Policy {
+            home: "vault/wiki/wisdom/reflections",
+            root: paths.wiki().join("wisdom/reflections"),
+            action: Action::DeleteOlder {
+                pattern: Some("*.md"),
+                days: 90,
+                recursive: false,
+            },
+        },
+        // zen-core PromptAuditLogger appends one line per screened prompt
+        // (safety sanitization audit) — append-only, unbounded.
+        Policy {
+            home: "logs/safety-audit.jsonl",
+            root: logs.join("safety-audit.jsonl"),
+            action: Action::Rotate {
+                max_bytes: MIB,
+                keep: 2,
+            },
+        },
         Policy {
             home: "vault/archive/quarantine",
             root: paths.archive().join("quarantine"),

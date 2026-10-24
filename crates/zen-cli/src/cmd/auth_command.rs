@@ -38,6 +38,18 @@ fn service_name(provider: &str) -> String {
     format!("zen-{}-api-key", provider.to_lowercase())
 }
 
+/// Mask a stored secret for display: only the final 4 characters are
+/// revealed (e.g. `••••••••ab12`); keys of 8 characters or fewer render
+/// as `set` — the key body is never shown (CSO audit: first-8 leak).
+fn mask_secret_tail(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        return "set".to_string();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("••••••••{tail}")
+}
+
 pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
     match operation {
         AuthCommands::List => {
@@ -53,11 +65,7 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
                 let keychain_status = match Keychain::retrieve(&service, "zen") {
                     Ok(key) => {
                         found_count += 1;
-                        let masked = if key.len() > 12 {
-                            format!("{}...{}", &key[..8], &key[key.len() - 4..])
-                        } else {
-                            "****".to_string()
-                        };
+                        let masked = mask_secret_tail(&key);
                         format!("{} {}", "✓".green(), masked.dimmed())
                     }
                     Err(AuthError::CredentialNotFound { .. }) => {
@@ -167,13 +175,13 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
             for provider in providers {
                 let service = service_name(provider);
                 match Keychain::retrieve(&service, "zen") {
-                    Ok(_) => {
+                    Ok(key) => {
                         any_found = true;
                         println!(
                             "  {} {} — {}",
                             "✓".green(),
                             provider.cyan(),
-                            "logged in (Keychain)".dimmed()
+                            format!("logged in (Keychain), {}", mask_secret_tail(&key)).dimmed()
                         );
                     }
                     Err(AuthError::CredentialNotFound { .. }) => {
@@ -245,5 +253,18 @@ mod tests {
         assert_eq!(service_name("openai"), "zen-openai-api-key");
         assert_eq!(service_name("ALIYUN"), "zen-aliyun-api-key");
         assert_eq!(service_name("DeepSeek"), "zen-deepseek-api-key");
+    }
+
+    #[test]
+    fn mask_secret_tail_shows_only_last_four() {
+        assert_eq!(mask_secret_tail("sk-abcdefghijklmnop"), "••••••••mnop");
+        assert_eq!(mask_secret_tail("123456789"), "••••••••6789");
+    }
+
+    #[test]
+    fn mask_secret_tail_short_keys_render_set() {
+        assert_eq!(mask_secret_tail(""), "set");
+        assert_eq!(mask_secret_tail("short"), "set");
+        assert_eq!(mask_secret_tail("12345678"), "set");
     }
 }

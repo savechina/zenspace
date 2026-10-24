@@ -236,7 +236,10 @@ impl AnthropicProvider {
         })?;
         if !status.is_success() {
             return Err(LlmError::Call {
-                reason: format!("Anthropic cached completion status {status}: {payload}"),
+                reason: format!(
+                    "Anthropic cached completion status {status}: {}",
+                    truncate_payload(&payload.to_string())
+                ),
             });
         }
 
@@ -331,6 +334,18 @@ fn parse_cache_usage(payload: &serde_json::Value) -> CacheUsage {
     }
 }
 
+/// Char-boundary-safe cap for response payloads embedded in error reasons
+/// (CSO audit: upstream error bodies may echo request/user content).
+/// Mirrors the per-crate `truncate_chars` precedent (zen-gateway hosting.rs).
+const ERROR_PAYLOAD_MAX_CHARS: usize = 200;
+
+fn truncate_payload(s: &str) -> String {
+    match s.char_indices().nth(ERROR_PAYLOAD_MAX_CHARS) {
+        Some((at, _)) => s[..at].to_string(),
+        None => s.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +435,17 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, Some(80));
         assert_eq!(usage.output_tokens, None);
         assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn truncate_payload_caps_at_char_boundary() {
+        let long = "x".repeat(500);
+        assert_eq!(truncate_payload(&long).chars().count(), 200);
+        let cjk: String = "中".repeat(300);
+        let cut = truncate_payload(&cjk);
+        assert_eq!(cut.chars().count(), 200);
+        assert!(cut.is_char_boundary(cut.len()));
+        assert_eq!(truncate_payload("short"), "short");
+        assert_eq!(truncate_payload(""), "");
     }
 }

@@ -282,7 +282,6 @@ impl MorningBriefWorker {
         let date = ctx.now.format("%Y-%m-%d").to_string();
 
         let lines = compose_brief(paths);
-        let body = render_brief(&lines);
         let outbox = outbox_path(paths, &date);
         if let Some(parent) = outbox.parent()
             && let Err(e) = fs::create_dir_all(parent)
@@ -305,7 +304,10 @@ impl MorningBriefWorker {
             }
             Err(e) => warn!(error = %e, "morning-brief outbox write failed; brief logged only"),
         }
-        info!("morning brief:\n{body}");
+        // CSO audit: the brief body is journal/memory-derived — it must not
+        // flow into zen.log. It is staged in the outbox above for inspection;
+        // here we log only the location and the already-computed sensitivity.
+        info!(outbox = %outbox.display(), hour = ctx.now.hour(), sensitivity = %sensitivity, "morning brief body staged in outbox");
 
         Ok(WorkerReport {
             worker_id: self.id().to_string(),

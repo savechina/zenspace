@@ -198,6 +198,10 @@ struct GatewayBridge {
     /// status render must fail fast even while chat turns are slow.
     health_http: reqwest::Client,
     chat_base: String,
+    /// Bearer secret for the carrier auth layer (CSO audit #1);
+    /// `None` = no header (loopback-only posture). `/health` is exempt
+    /// from the gate, so only the chat POST carries it.
+    bearer: Option<String>,
 }
 
 /// One completed chat round-trip.
@@ -209,7 +213,7 @@ struct ChatOutcome {
 }
 
 impl GatewayBridge {
-    fn new(chat_base: String) -> Result<Self> {
+    fn new(chat_base: String, bearer: Option<String>) -> Result<Self> {
         Ok(Self {
             chat_http: reqwest::Client::builder()
                 .no_proxy()
@@ -221,6 +225,7 @@ impl GatewayBridge {
                 .timeout(Duration::from_secs(10))
                 .build()?,
             chat_base,
+            bearer,
         })
     }
 
@@ -243,7 +248,11 @@ impl GatewayBridge {
         tokio::time::timeout(deadline, async {
             let mut last_err = None;
             for attempt in 1..=GATEWAY_ATTEMPTS {
-                match self.chat_http.post(&url).json(&body).send().await {
+                let mut request = self.chat_http.post(&url).json(&body);
+                if let Some(secret) = &self.bearer {
+                    request = request.bearer_auth(secret);
+                }
+                match request.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let body: serde_json::Value = resp.json().await.unwrap_or_default();
                         return Ok(ChatOutcome {
@@ -349,13 +358,32 @@ impl QqBotAdapter {
             options.client_secret.clone(),
             options.token_url.clone(),
         ));
-        let bridge = GatewayBridge::new(options.chat_base.clone())?;
+        let bridge = GatewayBridge::new(options.chat_base.clone(), None)?;
         Ok(Self {
             api: Arc::new(QqBotApi::new(Arc::clone(&auth), options.api_base.clone())),
             auth,
             bridge: Arc::new(bridge),
             options,
         })
+    }
+
+    /// Attaches the gateway carrier's bearer secret (CSO audit #1) so
+    /// bridge POSTs clear the HTTP auth layer. A builder step after
+    /// [`Self::new`] rather than an options field because the CLI
+    /// constructs `QqBotAdapterOptions` with a field-exact literal —
+    /// the secret rides the daemon wiring, not the options struct.
+    /// Empty secrets normalize to `None` (no header).
+    ///
+    /// # Errors
+    /// Bridge rebuild failure (reqwest client construction).
+    pub fn with_gateway_bearer(mut self, secret: Option<String>) -> Result<Self> {
+        if let Some(secret) = secret.filter(|s| !s.is_empty()) {
+            self.bridge = Arc::new(GatewayBridge::new(
+                self.options.chat_base.clone(),
+                Some(secret),
+            )?);
+        }
+        Ok(self)
     }
 
     /// Fast admission gates — allowlist, idempotency-key presence,
@@ -870,7 +898,7 @@ mod tests {
             _ => (axum::http::StatusCode::OK, json!({"reply": "ok"})),
         })
         .await;
-        let bridge = GatewayBridge::new(base).unwrap();
+        let bridge = GatewayBridge::new(base, None).unwrap();
         let outcome = bridge
             .chat("hi", None, None, Duration::from_secs(30))
             .await
@@ -889,9 +917,68 @@ mod tests {
             )
         })
         .await;
-        let bridge = GatewayBridge::new(base).unwrap();
+        let bridge = GatewayBridge::new(base, None).unwrap();
         let result = bridge.chat("hi", None, None, Duration::from_secs(30)).await;
         assert!(result.is_err(), "4xx must surface immediately");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// CSO #1: a tiny carrier fixture capturing the Authorization
+    /// header the bridge actually sends.
+    async fn serve_chat_capture_auth() -> (String, Arc<std::sync::Mutex<Option<String>>>) {
+        let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let cap = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/api/v1/chat",
+            post(move |headers: axum::http::HeaderMap| {
+                let cap = Arc::clone(&cap);
+                async move {
+                    *cap.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    (axum::http::StatusCode::OK, Json(json!({"reply": "ok"})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    #[tokio::test]
+    async fn bridge_attaches_bearer_header_when_secret_present() {
+        let (base, captured) = serve_chat_capture_auth().await;
+        let bridge = GatewayBridge::new(base, Some("s3cret".into())).unwrap();
+        let outcome = bridge
+            .chat("hi", None, None, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(outcome.reply, "ok");
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("Bearer s3cret"));
+    }
+
+    #[tokio::test]
+    async fn bridge_omits_bearer_header_without_secret() {
+        let (base, captured) = serve_chat_capture_auth().await;
+        let bridge = GatewayBridge::new(base, None).unwrap();
+        let outcome = bridge
+            .chat("hi", None, None, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(outcome.reply, "ok");
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn with_gateway_bearer_wires_secret_into_bridge() {
+        let adapter = test_adapter()
+            .with_gateway_bearer(Some("k".into()))
+            .unwrap();
+        assert_eq!(adapter.bridge.bearer.as_deref(), Some("k"));
+        assert!(test_adapter().bridge.bearer.is_none());
     }
 }

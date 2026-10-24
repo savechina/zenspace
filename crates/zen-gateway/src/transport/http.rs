@@ -27,8 +27,10 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, WebSocketUpgrade},
-    response::IntoResponse,
+    extract::{RawQuery, Request, State, WebSocketUpgrade},
+    http::{HeaderMap, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -266,6 +268,108 @@ fn replayed_reply(error: &RpcErrorBody) -> Option<String> {
         .map(str::to_string)
 }
 
+// ─────────────────────── Carrier auth (CSO audit #1) ───────────────────────
+
+/// Origins allowed to send cross-origin requests at the carrier. Exact
+/// match only: a browser page served from any other origin (including
+/// other ports) is rejected — drive-by defense independent of token
+/// auth. Loopback-only bind means same-origin tooling (curl, reqwest,
+/// the qqbot bridge) sends no `Origin` header at all and is unaffected.
+const ALLOWED_ORIGINS: [&str; 3] = ["http://127.0.0.1", "http://localhost", "http://[::1]"];
+
+/// Short-circuit-free byte comparison for bearer secrets (timing-safe
+/// equality; `subtle`-crate parity without the dependency). Length
+/// mismatch returns early — length is not secret-bearing (standard
+/// practice, documented in the `subtle` crate itself).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// `Some` only for non-empty secrets: an empty string would otherwise
+/// demand `Bearer ` with nothing after it and match any empty token.
+fn normalize_secret(secret: Option<String>) -> Option<String> {
+    secret.filter(|s| !s.is_empty())
+}
+
+/// Extracts the raw bearer token from an `Authorization: Bearer <token>`
+/// header (exact scheme spelling, per the carrier contract).
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string)
+}
+
+/// Extracts `?token=` from a raw query string (WS clients — browsers —
+/// cannot set custom headers on upgrades). Values are taken verbatim:
+/// secrets are generated hex/uuid shapes with no percent-encoding.
+fn query_token(query: Option<&str>) -> Option<String> {
+    query.and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == "token").then(|| v.to_string())
+        })
+    })
+}
+
+/// Carrier auth gate (CSO audit #1), applied to every route:
+///
+/// 1. `/health` is the unauthenticated liveness probe — exempt from
+///    both gates.
+/// 2. A foreign `Origin` header is rejected regardless of auth state
+///    (browser drive-by defense, independent of token).
+/// 3. `/api/v1/ws` enforces its own token check in [`ws_handler`]
+///    (header OR `?token=` — browsers cannot set headers on upgrades),
+///    so the header-only gate here would strand the query-param path.
+/// 4. When `jwt_secret` is `Some(non-empty)`, every other route
+///    requires `Authorization: Bearer <secret>` (constant-time
+///    compare); `None` keeps the historical loopback-only posture
+///    byte-for-byte.
+async fn auth_middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if path == "/health" {
+        return next.run(req).await;
+    }
+    let origin_header = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    if let Some(origin) = origin_header
+        && !ALLOWED_ORIGINS.contains(&origin)
+    {
+        tracing::warn!(origin, "http carrier rejected cross-origin request");
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "forbidden origin"})),
+        )
+            .into_response();
+    }
+    if path == "/api/v1/ws" {
+        return next.run(req).await;
+    }
+    if let Some(secret) = &state.jwt_secret {
+        let ok = bearer_token(req.headers())
+            .map(|tok| constant_time_eq(tok.as_bytes(), secret.as_bytes()))
+            .unwrap_or(false);
+        if !ok {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 // ─────────────────────── Legacy REST shims (T041 parity) ───────────────────────
 
 /// Shared router state: the live service plus the filtered MCP registry.
@@ -273,6 +377,9 @@ fn replayed_reply(error: &RpcErrorBody) -> Option<String> {
 pub(crate) struct AppState {
     pub service: Arc<crate::GatewayService>,
     pub mcp: Arc<rig_compose::registry::ToolRegistry>,
+    /// Bearer secret for [`auth_middleware`]; `None` = loopback-only
+    /// posture (no auth required).
+    pub jwt_secret: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -448,8 +555,27 @@ async fn agents_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 // ─────────────────────── WS bridge (token streaming parity) ───────────────────────
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Some(secret) = &state.jwt_secret {
+        let ok = bearer_token(&headers)
+            .or_else(|| query_token(query.as_deref()))
+            .map(|tok| constant_time_eq(tok.as_bytes(), secret.as_bytes()))
+            .unwrap_or(false);
+        if !ok {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response();
+        }
+    }
     ws.on_upgrade(move |socket| run_ws_bridge(socket, state.service))
+        .into_response()
 }
 
 async fn run_ws_bridge(socket: axum::extract::ws::WebSocket, service: Arc<crate::GatewayService>) {
@@ -627,6 +753,12 @@ async fn mcp_handler(
 // ─────────────────────── Router + server lifecycle ───────────────────────
 
 /// Loopback-only HTTP carrier options (config key `[gateway.http]`).
+///
+/// The bearer secret is NOT carried here on purpose: the CLI
+/// construction sites build this struct with field-exact literals, so
+/// the auth secret rides [`crate::daemon::GatewayDaemonConfig::
+/// http_jwt_secret`] instead and is passed to [`router_with_auth`] /
+/// [`serve_http`] separately.
 #[derive(Clone, Debug)]
 pub struct HttpCarrierConfig {
     pub bind_addr: String,
@@ -652,16 +784,34 @@ impl HttpCarrierConfig {
     }
 }
 
-/// Builds the carrier router over a live [`GatewayService`].
+/// Builds the carrier router over a live [`GatewayService`] with no
+/// auth (historical loopback-only posture).
 pub fn router(service: Arc<crate::GatewayService>) -> Router {
+    router_with_auth(service, None)
+}
+
+/// Builds the carrier router with the auth gate armed when `jwt_secret`
+/// is `Some(non-empty)`: every route except `/health` requires
+/// `Authorization: Bearer <secret>` (constant-time compare), and any
+/// request bearing a foreign `Origin` header is rejected regardless of
+/// auth state. `None` keeps the loopback-only posture byte-for-byte.
+pub fn router_with_auth(service: Arc<crate::GatewayService>, jwt_secret: Option<String>) -> Router {
     let mcp = Arc::new(crate::mcp_registry_for_http());
-    let state = AppState { service, mcp };
+    let state = AppState {
+        service,
+        mcp,
+        jwt_secret: normalize_secret(jwt_secret),
+    };
     Router::new()
         .route("/health", get(health_handler))
         .route("/api/v1/chat", post(chat_handler))
         .route("/api/v1/ws", get(ws_handler))
         .route("/api/v1/agents", get(agents_handler))
         .route("/api/v1/mcp", post(mcp_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -673,6 +823,7 @@ pub fn router(service: Arc<crate::GatewayService>) -> Router {
 pub async fn serve_http(
     service: Arc<crate::GatewayService>,
     config: HttpCarrierConfig,
+    jwt_secret: Option<String>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     config.validate_loopback()?;
@@ -681,10 +832,13 @@ pub async fn serve_http(
         .map_err(|e| anyhow::anyhow!("http bind addr: {e}"))?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "loopback http carrier listening");
-    axum::serve(listener, router(service).into_make_service())
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router_with_auth(service, jwt_secret).into_make_service(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown.changed().await;
+    })
+    .await?;
     Ok(())
 }

@@ -26,6 +26,8 @@ use zen_memory::quality_gate::{
 use zen_provider::DefaultRouter;
 use zen_vault::wiki::AtomicWikiWriter;
 
+use crate::scheduler::workers::memory_curator::content_sha8;
+
 // ─── Types ─────────────────────────────────────────────────────────────
 
 pub(crate) struct PromptContext {
@@ -745,10 +747,16 @@ fn route_stop_doing_candidate(vault: &std::path::Path, text: &str) {
     }
     match signal.save(&dir) {
         Ok(_) => debug!(
-            pattern = %text,
+            chars = text.chars().count(),
+            sha = content_sha8(text),
             "unverified stop-doing signal routed to anti-patterns (reduced weight)"
         ),
-        Err(e) => warn!(error = %e, pattern = %text, "failed to route stop-doing candidate"),
+        Err(e) => warn!(
+            error = %e,
+            chars = text.chars().count(),
+            sha = content_sha8(text),
+            "failed to route stop-doing candidate"
+        ),
     }
 }
 
@@ -770,7 +778,12 @@ pub(crate) fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
         let mut decision = Decision::new(id, text.to_string(), "session".to_string());
         decision.goal = context.to_string();
         if let Err(e) = decision.save(&vault.join("wiki/wisdom/decisions")) {
-            warn!(error = %e, text = %text, "failed to save decision");
+            warn!(
+                error = %e,
+                chars = text.chars().count(),
+                sha = content_sha8(text),
+                "failed to save decision"
+            );
         }
     }
 
@@ -866,6 +879,12 @@ pub(crate) fn save_typed_signals(paths: &ZenPaths, signals: &ExtractedSignals) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_sha8_shared_helper_matches_known_vector() {
+        assert_eq!(content_sha8("hello"), "2cf24dba");
+        assert_eq!(content_sha8("secret decision text").len(), 8);
+    }
 
     #[test]
     fn test_build_journal_entry() {

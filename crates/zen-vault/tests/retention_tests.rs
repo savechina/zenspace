@@ -380,3 +380,175 @@ fn stale_txn_tracking_files_age_out_but_fresh_ones_stay() {
         "a tracking file within the age window must stay (live-cycle guard)"
     );
 }
+
+#[test]
+fn stale_session_archives_age_out_and_fresh_sessions_survive() {
+    let (_dir, paths) = setup();
+    let sessions = paths.sessions();
+    // ConversationStore::open date layout + dream-compression .jsonl.zst twin.
+    write_aged(
+        &sessions.join("2026/06/old-session.jsonl"),
+        "{\"turn\":1}",
+        Duration::days(91),
+    );
+    write_aged(
+        &sessions.join("2026/06/old-session.jsonl.zst"),
+        "zst",
+        Duration::days(91),
+    );
+    write_aged(
+        &sessions.join("2026/09/fresh-session.jsonl"),
+        "{\"turn\":2}",
+        Duration::days(1),
+    );
+    // Dream's prune_expired_sessions(30d) owns terminal sessions'
+    // tool_calls.jsonl; the 90d retention row is only the backstop for
+    // content nothing else bounds (a >90d tool log is outside the 30d
+    // aggregation window, so removal here is inert).
+    write_aged(
+        &sessions.join("stale-session/tool_calls.jsonl"),
+        "{}",
+        Duration::days(91),
+    );
+
+    let report = apply_policies(&paths, &cfg(), now());
+    let home = &report.homes["sessions"];
+    assert_eq!(home.removed_files, 3);
+    assert!(!sessions.join("2026/06/old-session.jsonl").exists());
+    assert!(!sessions.join("2026/06/old-session.jsonl.zst").exists());
+    assert!(!sessions.join("stale-session/tool_calls.jsonl").exists());
+    assert!(sessions.join("2026/09/fresh-session.jsonl").exists());
+}
+
+#[test]
+fn wiki_log_md_rotates_at_cap_keeping_two_siblings() {
+    let (_dir, paths) = setup();
+    let log = paths.wiki().join("log.md");
+    write_file(&log, &"l".repeat(MIB));
+    write_file(&paths.wiki().join("log.md.1"), "one");
+    write_file(&paths.wiki().join("log.md.2"), "two");
+
+    let report = apply_policies(&paths, &cfg(), now());
+    let home = &report.homes["vault/wiki/log.md"];
+    assert_eq!(home.rotated, 1);
+    assert_eq!(
+        fs::metadata(&log).unwrap().len(),
+        0,
+        "fresh empty live file"
+    );
+    assert_eq!(
+        fs::read_to_string(paths.wiki().join("log.md.2")).unwrap(),
+        "one"
+    );
+    assert!(!paths.wiki().join("log.md.3").exists());
+}
+
+#[test]
+fn wiki_contradictions_md_rotates_at_cap() {
+    let (_dir, paths) = setup();
+    let contra = paths.wiki().join("contradictions.md");
+    write_file(&contra, &"c".repeat(MIB));
+
+    let report = apply_policies(&paths, &cfg(), now());
+    assert_eq!(report.homes["vault/wiki/contradictions.md"].rotated, 1);
+    assert!(paths.wiki().join("contradictions.md.1").exists());
+    assert_eq!(fs::metadata(&contra).unwrap().len(), 0);
+}
+
+#[test]
+fn decision_labels_window_boundary_and_dataset_immunity() {
+    let (_dir, paths) = setup();
+    let dir = paths.logs().join("decision-audit");
+    write_aged(&dir.join("labels.jsonl"), "old", Duration::days(366));
+    write_aged(&dir.join("dataset.jsonl"), "d", Duration::days(400));
+
+    let report = apply_policies(&paths, &cfg(), now());
+    assert_eq!(
+        report.homes["logs/decision-audit/labels.jsonl"].removed_files,
+        1
+    );
+    assert!(!dir.join("labels.jsonl").exists());
+    assert!(
+        dir.join("dataset.jsonl").exists(),
+        "dataset.jsonl is not this row's target"
+    );
+
+    write_aged(&dir.join("labels.jsonl"), "fresh", Duration::days(364));
+    let report = apply_policies(&paths, &cfg(), now());
+    assert_eq!(
+        report.homes["logs/decision-audit/labels.jsonl"].removed_files, 0,
+        "labels within the 365d window survive"
+    );
+    assert!(dir.join("labels.jsonl").exists());
+}
+
+#[test]
+fn cso_audit_rotate_homes_fire_at_their_caps() {
+    let (_dir, paths) = setup();
+    let logs = paths.logs();
+    let caps: &[(&str, u64)] = &[
+        ("memory-nudges.jsonl", 512 * 1024),
+        ("promotion-confirmed.jsonl", 512 * 1024),
+        ("safety-audit.jsonl", 1024 * 1024),
+    ];
+    for (name, cap) in caps {
+        write_file(&logs.join(name), &"x".repeat(*cap as usize));
+    }
+
+    let report = apply_policies(&paths, &cfg(), now());
+    for (file, home) in [
+        ("memory-nudges.jsonl", "logs/memory-nudges.jsonl"),
+        (
+            "promotion-confirmed.jsonl",
+            "logs/promotion-confirmed.jsonl",
+        ),
+        ("safety-audit.jsonl", "logs/safety-audit.jsonl"),
+    ] {
+        assert_eq!(report.homes[home].rotated, 1, "{home} must rotate");
+        assert!(logs.join(format!("{file}.1")).exists());
+    }
+}
+
+#[test]
+fn skills_history_and_wisdom_event_dirs_age_out() {
+    let (_dir, paths) = setup();
+    let skills = paths.skills();
+    write_aged(
+        &skills.join("zen-wiki-history.jsonl"),
+        "h",
+        Duration::days(366),
+    );
+    write_aged(
+        &skills.join("zen-search-history.jsonl"),
+        "h",
+        Duration::days(10),
+    );
+    write_aged(&skills.join("SKILL.md"), "keep", Duration::days(400));
+
+    let rewinds = paths.wiki().join("wisdom/rewinds");
+    write_aged(&rewinds.join("old.md"), "r", Duration::days(91));
+    write_aged(&rewinds.join("new.md"), "r", Duration::days(10));
+
+    let reflections = paths.wiki().join("wisdom/reflections");
+    write_aged(&reflections.join("ancient.md"), "f", Duration::days(91));
+    write_aged(&reflections.join("recent.md"), "f", Duration::days(10));
+
+    let report = apply_policies(&paths, &cfg(), now());
+    assert_eq!(report.homes["skills"].removed_files, 1);
+    assert!(!skills.join("zen-wiki-history.jsonl").exists());
+    assert!(skills.join("zen-search-history.jsonl").exists());
+    assert!(
+        skills.join("SKILL.md").exists(),
+        "non-history skill files never match the pattern"
+    );
+
+    assert_eq!(report.homes["vault/wiki/wisdom/rewinds"].removed_files, 1);
+    assert!(!rewinds.join("old.md").exists());
+    assert!(rewinds.join("new.md").exists());
+    assert_eq!(
+        report.homes["vault/wiki/wisdom/reflections"].removed_files,
+        1
+    );
+    assert!(!reflections.join("ancient.md").exists());
+    assert!(reflections.join("recent.md").exists());
+}

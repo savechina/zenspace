@@ -19,6 +19,18 @@ use super::auth::QqBotAuth;
 /// minutes wide — a hung request must never pin a chat worker that long.
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Char-boundary-safe cap for response bodies carried in error logs
+/// (CSO audit: upstream bodies may echo user message content). Mirrors
+/// the per-crate `truncate_chars` precedent (server/hosting.rs, adapter.rs).
+const ERROR_BODY_MAX_CHARS: usize = 200;
+
+fn truncate_body(s: &str) -> String {
+    match s.char_indices().nth(ERROR_BODY_MAX_CHARS) {
+        Some((at, _)) => s[..at].to_string(),
+        None => s.to_string(),
+    }
+}
+
 pub struct QqBotApi {
     auth: Arc<QqBotAuth>,
     api_base: String,
@@ -95,9 +107,26 @@ impl QqBotApi {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            error!(status = %status, body = %text, "qq api send failed");
+            error!(status = %status, body = %truncate_body(&text), "qq api send failed");
             bail!("qq api {status}: {text}");
         }
         serde_json::from_str(&text).with_context(|| format!("parse {text}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_body_caps_at_char_boundary() {
+        let long = "a".repeat(500);
+        assert_eq!(truncate_body(&long).chars().count(), ERROR_BODY_MAX_CHARS);
+        let cjk: String = "中".repeat(300);
+        let cut = truncate_body(&cjk);
+        assert_eq!(cut.chars().count(), 200);
+        assert!(cut.is_char_boundary(cut.len()));
+        assert_eq!(truncate_body("ok"), "ok");
+        assert_eq!(truncate_body(""), "");
     }
 }

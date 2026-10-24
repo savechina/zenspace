@@ -26,7 +26,17 @@ use crate::server::hosting::{
 pub struct HttpConfig {
     pub bind_addr: String,
     pub port: u16,
+    /// Bearer secret for the loopback HTTP carrier auth layer (CSO
+    /// audit #1). `Some(non-empty)` → every carrier route except
+    /// `/health` requires `Authorization: Bearer <secret>`; `None`
+    /// keeps the loopback-only posture. The value flows to the carrier
+    /// through [`GatewayDaemonConfig::http_jwt_secret`] (the CLI
+    /// construction sites build `HttpCarrierConfig` with field-exact
+    /// literals, so the secret cannot ride that struct).
     pub jwt_secret: Option<String>,
+    /// Reserved; not enforced (C3 backlog) — the carrier is
+    /// loopback-only, so a per-IP fixed window would collapse to a
+    /// single global bucket shared by every loopback peer.
     pub rate_limit_rpm: u32,
 }
 
@@ -336,6 +346,14 @@ pub struct GatewayDaemonConfig {
     /// (FR-019 default). Auto-enabled when `qqbot` is set — channels
     /// bridge through the HTTP surface.
     pub http: Option<crate::transport::http::HttpCarrierConfig>,
+    /// Bearer secret for the loopback HTTP carrier auth layer (CSO
+    /// audit #1). `Some(non-empty)` → every carrier route except
+    /// `/health` requires `Authorization: Bearer <secret>` (constant-
+    /// time compare) and the qqbot bridge attaches the same header on
+    /// its POSTs; `None` (default) keeps the loopback-only posture
+    /// unchanged. Declared on the config surface as
+    /// [`HttpConfig::jwt_secret`].
+    pub http_jwt_secret: Option<String>,
     /// QQBot channel options (FR-021 stage b); `Some` implies the
     /// loopback HTTP carrier. The daemon resolves `chat_base` from
     /// the effective HTTP carrier before spawning.
@@ -377,6 +395,7 @@ impl Default for GatewayDaemonConfig {
             drain_window: std::time::Duration::from_secs(10),
             idle_exit: None,
             http: None,
+            http_jwt_secret: None,
             qqbot: None,
             turn_executor: None,
             scheduler_hosted: false,
@@ -1313,9 +1332,15 @@ impl GatewayService {
         let http_task = effective_http.clone().map(|http_cfg| {
             let http_service = std::sync::Arc::clone(&service);
             let http_shutdown = service.shutdown_tx.subscribe();
+            let jwt_secret = config.http_jwt_secret.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::transport::http::serve_http(http_service, http_cfg, http_shutdown).await
+                if let Err(e) = crate::transport::http::serve_http(
+                    http_service,
+                    http_cfg,
+                    jwt_secret,
+                    http_shutdown,
+                )
+                .await
                 {
                     tracing::warn!(error = %e, "loopback http carrier stopped");
                 }
@@ -1332,9 +1357,12 @@ impl GatewayService {
             // so IM events correlate with turn records in one file
             // (resolved by the service constructor, same as hosting).
             opts.audit_path = service.hosting.audit_path.clone();
+            let bearer = config.http_jwt_secret.clone();
             let qq_shutdown = service.shutdown_tx.subscribe();
             tokio::spawn(async move {
-                match crate::channel::qqbot::QqBotAdapter::new(opts) {
+                match crate::channel::qqbot::QqBotAdapter::new(opts)
+                    .and_then(|ch| ch.with_gateway_bearer(bearer))
+                {
                     Ok(ch) => {
                         if let Err(e) = ch.run(qq_shutdown).await {
                             tracing::warn!(error = %e, "qqbot channel stopped");
