@@ -117,4 +117,26 @@ reverify_older_than_days = 3
         "agentic.loop.reverify_older_than_days",
         |c| c.agentic.loop_cfg.reverify_older_than_days == Some(3),
     );
+
+    // Secrets Guard kill-switch ([security.secrets_guard] — FR-042).
+    assert_key_lands(
+        r#"
+[security.secrets_guard]
+enabled = false
+"#,
+        "security.secrets_guard.enabled=false",
+        |c| c.security.secrets_guard.enabled == Some(false) && !c.secrets_guard_enabled(),
+    );
+    assert_key_lands(
+        r#"
+[security.secrets_guard]
+enabled = true
+"#,
+        "security.secrets_guard.enabled=true",
+        |c| c.security.secrets_guard.enabled == Some(true) && c.secrets_guard_enabled(),
+    );
+    // Absent key = guard enabled by default (FR-042 default-on).
+    assert_key_lands("", "security.secrets_guard.enabled(absent)", |c| {
+        c.security.secrets_guard.enabled.is_none() && c.secrets_guard_enabled()
+    });
 }

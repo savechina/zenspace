@@ -11,11 +11,97 @@ use tracing::{info, warn};
 pub use zen_core::config::{LlmConfig, ProviderConfig, ZenConfig};
 use zen_core::errors::ZenError;
 use zen_core::secrets::SecretRef;
+use zen_core::secrets_guard::SecretMap;
 use zen_core::types::Sensitivity;
 
 // ---------------------------------------------------------------------------
 // API Key Resolution (FR-061c)
 // ---------------------------------------------------------------------------
+
+// Guarded streaming call (FR-042): producer keeps pushing tokens to an
+// inner channel at full streaming pace; a forwarder task restores
+// placeholders per frame (partial tokens carried) and re-detects
+// invented tokens on the final assembly.
+fn guarded_stream_call<F, Fut>(
+    produce: F,
+    outer_token_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    outer_done_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    map: SecretMap,
+) -> Result<crate::stream::StreamResponse, LlmError>
+where
+    F: FnOnce(
+            tokio::sync::mpsc::UnboundedSender<String>,
+            tokio::sync::oneshot::Sender<Result<(), String>>,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (stream_resp, outer_token_tx_dup, unused) = crate::stream::StreamResponse::new();
+    drop(unused);
+    let _ = outer_token_tx_dup;
+
+    let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (inner_done_tx, mut inner_done_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
+    tokio::spawn(produce(inner_tx, inner_done_tx));
+
+    tokio::spawn(async move {
+        let mut carry = String::new();
+        let mut pending_done = Some(outer_done_tx);
+        loop {
+            tokio::select! {
+                biased;
+                tok = inner_rx.recv() => {
+                    match tok {
+                        Some(tok) => {
+                            let buf = format!("{carry}{tok}");
+                            let (emit, c) =
+                                zen_core::secrets_guard::restore_incremental(&buf, &map);
+                            carry = c;
+                            if !emit.is_empty() {
+                                let ignored = outer_token_tx.send(emit);
+                                let _ = ignored;
+                            }
+                        }
+                        None => {
+                            let done =
+                                zen_core::secrets_guard::restore_finalize("", &carry, &map);
+                            if !done.text.is_empty() {
+                                let ignored = outer_token_tx.send(done.text);
+                                let _ = ignored;
+                            }
+                            if !done.leftovers.is_empty() {
+                                warn!(
+                                    leftovers = done.leftovers.len(),
+                                    tokens = ?done.leftovers,
+                                    "secrets guard: unmapped placeholder tokens left visible"
+                                );
+                            }
+                            if let Some(done_tx) = pending_done.take() {
+                                let _ = done_tx.send(Err(
+                                    "stream closed before done signal".into(),
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                }
+                res = &mut inner_done_rx => {
+                    let inner_result = res.unwrap_or_else(|e| {
+                        Err(format!("producer dropped done channel: {e}"))
+                    });
+                    if let Some(done_tx) = pending_done.take() {
+                        let _ = done_tx.send(inner_result);
+                    }
+                    // keep draining tokens to closure (handled by the other arm)
+                }
+            }
+        }
+    });
+
+    Ok(stream_resp)
+}
 
 /// Resolve API key from ProviderConfig using Keychain-first fallback chain.
 ///
@@ -662,8 +748,76 @@ pub struct DefaultRouter {
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ProviderInstance>>>,
     current_variant: Option<String>,
 }
-
 impl DefaultRouter {
+    /// Secrets Guard active for this egress (FR-042): enabled AND the
+    /// resolved provider is NOT local (ollama). Fail-closed之名 note: the
+    /// engine module is infallible (no I/O, static regexes), so the only
+    /// failure mode left to the caller is "guard off" — an explicit config
+    /// decision, not a silent bypass.
+    fn secrets_guard_active(&self, provider: &Provider) -> bool {
+        zen_core::config::secrets_guard_state() && !self.is_local(provider)
+    }
+
+    /// Redacts secrets from `prompt` (FR-042). Returns the (owned) guarded
+    /// prompt plus the mapping snapshot to restore downstream outputs with;
+    /// `None` map = nothing replaced = byte-identical passthrough.
+    fn secrets_guard_redact(
+        &self,
+        provider: &Provider,
+        prompt: &str,
+    ) -> (String, Option<SecretMap>) {
+        if !self.secrets_guard_active(provider) {
+            return (prompt.to_string(), None);
+        }
+        let mut redactor =
+            zen_core::secrets_guard::Redactor::new(zen_core::secrets_guard::env_corpus());
+        let out = redactor.redact(prompt);
+        if out.map.is_empty() {
+            return (out.text, None);
+        }
+        let fingerprints = out.map.fingerprints();
+        info!(
+            count = fingerprints.len(),
+            fingerprints = ?fingerprints,
+            "secrets guard: placeholders substituted before cloud egress"
+        );
+        // Best-effort audit line (fingerprint-only, never the value).
+        if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+            let line = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "kind": "gateway.secrets.redacted",
+                "provider": provider.to_string(),
+                "fingerprints": fingerprints,
+                "count": fingerprints.len(),
+            });
+            if let Err(e) =
+                zen_core::jsonl::append_jsonl_line(&paths.logs().join("audit.jsonl"), &line)
+            {
+                tracing::warn!(reason = %e, "secrets guard audit line append failed");
+            }
+        }
+        (out.text, Some(out.map))
+    }
+
+    /// Restores mapped placeholders in a provider response (FR-042).
+    /// `None` map = passthrough byte-identical. Leftover/paraphrased
+    /// placeholder-shaped tokens stay VISIBLE and are logged (never
+    /// fabricated over).
+    fn secrets_guard_restore(&self, text: String, map: Option<SecretMap>) -> String {
+        let Some(map) = map else {
+            return text;
+        };
+        let out = zen_core::secrets_guard::restore(&text, &map);
+        if !out.leftovers.is_empty() {
+            warn!(
+                leftovers = out.leftovers.len(),
+                tokens = ?out.leftovers,
+                "secrets guard: unmapped placeholder tokens left visible in reply"
+            );
+        }
+        out.text
+    }
+
     /// Create from a full [`zen_core::config::AgenticConfig`].
     pub fn from_agentic(agentic: &zen_core::config::ZenConfig) -> Self {
         let mut provider_cache = std::collections::HashMap::new();
@@ -933,6 +1087,7 @@ impl DefaultRouter {
                 web_search: zen_core::config::WebSearchConfig::default(),
                 mcp_servers: Vec::new(),
                 sandbox: zen_core::config::SandboxConfig::default(),
+                security: zen_core::config::SecurityConfig::default(),
                 agentic: zen_core::config::AgenticConfig::default(),
                 skills: zen_core::config::SkillsConfig::default(),
                 gateway: zen_core::config::GatewayConfig::default(),
@@ -1359,6 +1514,8 @@ impl LlmRouter for DefaultRouter {
     }
 
     fn call(&self, provider: Provider, prompt: &str) -> Result<String, LlmError> {
+        let (guarded, secret_map) = self.secrets_guard_redact(&provider, prompt);
+        let prompt: &str = guarded.as_str();
         let provider_name = match &provider {
             Provider::Unknown(name) => name.clone(),
             _ => provider.to_string(),
@@ -1369,7 +1526,8 @@ impl LlmRouter for DefaultRouter {
                 prompt_len = prompt.len(),
                 "DefaultRouter: delegating to MockProvider"
             );
-            return self.mock.complete("call", prompt);
+            let text = self.mock.complete("call", prompt)?;
+            return Ok(self.secrets_guard_restore(text, secret_map));
         }
 
         let options = self
@@ -1387,7 +1545,8 @@ impl LlmRouter for DefaultRouter {
                 prompt_len = prompt.len(),
                 "DefaultRouter: calling provider"
             );
-            instance.complete(prompt, &options)
+            let text = instance.complete(prompt, &options)?;
+            Ok(self.secrets_guard_restore(text, secret_map))
         } else {
             Err(LlmError::ProviderUnavailable {
                 provider: provider_name.clone(),
@@ -1404,6 +1563,8 @@ impl LlmRouter for DefaultRouter {
         provider: Provider,
         prompt: &str,
     ) -> Result<UsedCompletion, LlmError> {
+        let (guarded, secret_map) = self.secrets_guard_redact(&provider, prompt);
+        let prompt: &str = guarded.as_str();
         let provider_name = match &provider {
             Provider::Unknown(name) => name.clone(),
             _ => provider.to_string(),
@@ -1415,7 +1576,10 @@ impl LlmRouter for DefaultRouter {
                 "DefaultRouter: delegating to MockProvider"
             );
             let text = self.mock.complete("call", prompt)?;
-            return Ok(UsedCompletion { text, usage: None });
+            return Ok(UsedCompletion {
+                text: self.secrets_guard_restore(text, secret_map),
+                usage: None,
+            });
         }
 
         let options = self
@@ -1429,7 +1593,11 @@ impl LlmRouter for DefaultRouter {
                 prompt_len = prompt.len(),
                 "DefaultRouter: calling provider (usage-bearing)"
             );
-            instance.complete_with_usage(prompt, &options)
+            let completion = instance.complete_with_usage(prompt, &options)?;
+            Ok(UsedCompletion {
+                text: self.secrets_guard_restore(completion.text, secret_map),
+                usage: completion.usage,
+            })
         } else {
             Err(LlmError::ProviderUnavailable {
                 provider: provider_name.clone(),
@@ -1446,6 +1614,8 @@ impl LlmRouter for DefaultRouter {
         provider: Provider,
         prompt: &str,
     ) -> Result<crate::stream::StreamResponse, LlmError> {
+        let (guarded, secret_map) = self.secrets_guard_redact(&provider, prompt);
+        let prompt: &str = guarded.as_str();
         let (stream_resp, token_tx, done_tx) = crate::stream::StreamResponse::new();
 
         let provider_name = match &provider {
@@ -1459,6 +1629,21 @@ impl LlmRouter for DefaultRouter {
                 prompt_len = prompt.len(),
                 "DefaultRouter: MockProvider stream"
             );
+            if let Some(map) = secret_map {
+                let mock = self.mock.clone();
+                let prompt = prompt.to_string();
+                return guarded_stream_call(
+                    move |inner_tx, inner_done| async move {
+                        let result = mock.complete_streaming("call", &prompt, inner_tx).await;
+                        if let Err(e) = inner_done.send(result.map_err(|e| e.to_string())) {
+                            warn!("mock provider done channel closed: {:?}", e);
+                        }
+                    },
+                    token_tx,
+                    done_tx,
+                    map,
+                );
+            }
             let mock = self.mock.clone();
             tokio::spawn(async move {
                 let result = mock.complete_streaming("call", &prompt, token_tx).await;
@@ -1481,6 +1666,23 @@ impl LlmRouter for DefaultRouter {
                 "DefaultRouter: provider stream"
             );
             let instance = instance.clone();
+            if let Some(map) = secret_map {
+                let instance = instance.clone();
+                let prompt = prompt.to_string();
+                return guarded_stream_call(
+                    move |inner_tx, inner_done| async move {
+                        let result = instance
+                            .complete_streaming(&prompt, inner_tx, &options)
+                            .await;
+                        if let Err(e) = inner_done.send(result.map_err(|e| e.to_string())) {
+                            warn!("provider done channel closed: {:?}", e);
+                        }
+                    },
+                    token_tx,
+                    done_tx,
+                    map,
+                );
+            }
             tokio::spawn(async move {
                 let result = instance
                     .complete_streaming(&prompt, token_tx, &options)
@@ -1610,6 +1812,7 @@ mod tests {
         providers.insert("ollama".to_string(), ollama);
 
         ZenConfig {
+            security: zen_core::config::SecurityConfig::default(),
             default_provider: Some("openai".into()),
             default_model: Some("gpt-4o-mini".into()),
             providers,
@@ -1683,6 +1886,7 @@ mod tests {
             },
         );
         let cfg = ZenConfig {
+            security: zen_core::config::SecurityConfig::default(),
             providers,
             ..ZenConfig::default()
         };

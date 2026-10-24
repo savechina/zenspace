@@ -15,6 +15,7 @@ pub mod review;
 pub mod sandbox;
 pub mod sanitize;
 pub mod secrets;
+pub mod secrets_guard;
 pub mod session_index;
 pub mod tempfile_lifecycle;
 pub mod types;

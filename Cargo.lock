@@ -10610,6 +10610,7 @@ dependencies = [
  "libc",
  "notify",
  "notify-rust",
+ "regex",
  "rig-compose",
  "rusqlite",
  "serde",

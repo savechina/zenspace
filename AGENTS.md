@@ -792,6 +792,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
   - **T265**：`.gitleaks.toml` + CI `secrets` job（fetch-depth: 0）；本地 gitleaks 359 commits 0 泄漏。
   - T261 留档（TempfileDropGuard 升格触发器未到）；T263 checkbox 已翻转。
 
+- **FR-042 Secrets Guard placeholder round-trip（2026-10-24 续；`bin/lint` 0；`bin/test` **3462/0/25** = 基线 3442 +20）** — owner 术语 "vibeguard"；clarify 5 答入 spec（FR-042 + Clarifications Session 2026-10-24）；tasks.md Phase 41 T267-T271 全 [X]。新功能：
+  - **zen-core `secrets_guard.rs`**（T267）：gitleaks/detect-secrets 规则集（ghp_/AKIA/sk-…T3BlbkFJ 两种/JWT/stripe/bearer 仅值/generic key=value 熵门 3.5/base64 4.5/hex 3.0）+ Shannon 熵 + `env_corpus()`（FR-037 命名法环境变量值 = 已知密钥语料，优先占位）+ `redact`/`restore`（RAISE/KEEP：invented ⟦SECRET_n⟧ 可见不留痕不伪造）+ `restore_incremental`/`restore_finalize`（流式帧边界 carry 前缀回滞：⟦SECR 帧分裂跨帧续接）+ `fingerprint`（sha256 头 8 hex，审计唯一暴露面）。钉 ×16（规则 FN/FP 矩阵、熵门双侧、语料优先、去重、幂等、 invented leftover、会话级 token 复用）。
+  - **config `[security.secrets_guard]`**（T268）：`enabled` 缺省 true（Option<bool> None=on）、env `ZEN_SECRETS_GUARD` 三态解析（true/1/yes/on | false/0/no/off，非法 warn 不静默 E11）、`secrets_guard_state()` 全局 chokepoint（load_config 内 5 层已含 env）。sentinel 3 断言。
+  - **router last-mile**（T269）：`DefaultRouter::call`/`call_with_usage`/`call_stream` 三缝 scrub — guard 开 AND 非 ollama-local（enforce_sensitivity 保持 PRIMARY；Public 夹带秘密的安全网）；无占位 = 字节等同零开销路径；流式双任务 forwarder（producer 全速推 token，forwarder 帧级 restore + biased select + done-first drain + finalize）；fail-closed 语义落点 = 引擎 infallible（静态 regex 无 I/O），guard-off 是显式配置决策非静默绕过；审计 `gateway.secrets.redacted {fingerprints, count}`（仅 sha8 指纹，jsonl best-effort）。
+  - **集成钉**（T270，`tests/secrets_guard_router.rs` ×4）：payload redact 可观测（mock prompt_len 回声 48→19）、reply 占位还原、invented token 可见、kill-switch env 字节等同直通。**坑**：kill-switch pin 进程级 env 突变与兄弟 pin 并发竞态（cargo test 同进程线程）——TEST_LOCK 串行化（nextest 进程隔离下本无此题）。
+  - **实测彩蛋**：`env_corpus()` 首跑即捞出生产行程真实驻留的 5 组 sk-sp-*/token 值——语料通道首日即工作。
+
 ## Active Technologies
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
 - No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)

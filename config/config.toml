@@ -354,6 +354,18 @@ dream_end_hour = 4
 # max_concurrent_workers = 3
 
 # =============================================================================
+# Security — Secrets Guard (FR-042 placeholder round-trip)
+# =============================================================================
+
+# Scan content flowing to CLOUD LLM providers for secrets and substitute
+# reversible `⟦SECRET_n⟧` placeholders before egress; restore in the reply.
+# Enabled by default. Env kill-switch ZEN_SECRETS_GUARD (true/false/1/0/yes/
+# no/on/off) overrides per standard 5-layer config. Local (ollama) egress
+# is never scrubbed.
+# [security.secrets_guard]
+# enabled = true
+
+# =============================================================================
 # Plugin system — flat [plugin.{id}] layout
 # =============================================================================
 #

@@ -80,6 +80,8 @@ pub struct ZenConfig {
     pub sandbox: SandboxConfig,
     /// Agentic module sections (`[agentic.*]`, 005-agentic-loop).
     pub agentic: AgenticConfig,
+    /// Data-safety sections (`[security.*]`, FR-042 Secrets Guard).
+    pub security: SecurityConfig,
     /// Skill auto-routing (`[skills.*]`, 005-agentic-loop T076).
     pub skills: SkillsConfig,
     /// Gateway daemon section (`[gateway]`, Phase 30 G3).
@@ -128,6 +130,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             web_search: WebSearchConfig,
             mcp_servers: Vec<McpServerConfig>,
             sandbox: SandboxConfig,
+            security: SecurityConfig,
             agentic: AgenticConfig,
             skills: SkillsConfig,
             gateway: GatewayConfig,
@@ -152,6 +155,7 @@ impl<'de> Deserialize<'de> for ZenConfig {
             web_search: shadow.web_search,
             mcp_servers: shadow.mcp_servers,
             sandbox: shadow.sandbox,
+            security: shadow.security,
             agentic: shadow.agentic,
             skills: shadow.skills,
             gateway: shadow.gateway,
@@ -454,6 +458,29 @@ pub struct CronConfig {
     /// at once (protects LLM/embedding/db-writer spikes at 5-min boundaries).
     /// Default: 3, clamped 1..=32.
     pub max_concurrent_workers: Option<u32>,
+}
+
+/// Data-safety sections — `[security.*]` (FR-042 Secrets Guard).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Placeholder round-trip anti-leak guard — `[security.secrets_guard]`.
+    pub secrets_guard: SecretsGuardConfig,
+}
+
+/// Secrets Guard kill-switch — `[security.secrets_guard]` (FR-042).
+///
+/// On by default: content flowing to cloud LLM providers is scanned for
+/// secrets and placeholder-substituted before egress. `None` (absent key)
+/// resolves to enabled via [`ZenConfig::secrets_guard_enabled`].
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SecretsGuardConfig {
+    /// Kill switch. `None`/absent = enabled (`true` semantics).
+    /// Env override `ZEN_SECRETS_GUARD` (5-layer) accepts
+    /// `true/1/yes/on` (enable) and `false/0/no/off` (kill),
+    /// anything else warns and keeps the configured value.
+    pub enabled: Option<bool>,
 }
 
 /// Agentic module sections — `[agentic.*]` (005-agentic-loop).
@@ -2459,6 +2486,7 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
         web_search: merge_web_search(base.web_search, override_cfg.web_search),
         mcp_servers: merge_mcp_servers(base.mcp_servers, override_cfg.mcp_servers),
         sandbox: merge_sandbox(base.sandbox, override_cfg.sandbox),
+        security: merge_security(base.security, override_cfg.security),
         agentic: merge_agentic(base.agentic, override_cfg.agentic),
         skills: merge_skills(base.skills, override_cfg.skills),
         gateway: GatewayConfig {
@@ -2621,6 +2649,34 @@ fn merge_loop(base: LoopConfig, ov: LoopConfig) -> LoopConfig {
 
 /// Grants accumulate across config layers: any layer enabling a WASM
 /// permission keeps it enabled (absent sections parse as all-false).
+/// Layered merge for `[security.*]` — override layer wins when set.
+fn merge_security(base: SecurityConfig, ov: SecurityConfig) -> SecurityConfig {
+    SecurityConfig {
+        secrets_guard: SecretsGuardConfig {
+            enabled: ov.secrets_guard.enabled.or(base.secrets_guard.enabled),
+        },
+    }
+}
+
+/// Env layer — `ZEN_SECRETS_GUARD` kill-switch. Three-state parse with the
+/// E11 warn-not-silent discipline: `true/1/yes/on` enables, `false/0/no/off`
+/// kills, anything else warns and keeps the configured value.
+fn apply_security_env(security: &mut SecurityConfig) {
+    if let Ok(raw) = std::env::var("ZEN_SECRETS_GUARD") {
+        if raw.is_empty() {
+            return;
+        }
+        match raw.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => security.secrets_guard.enabled = Some(true),
+            "false" | "0" | "no" | "off" => security.secrets_guard.enabled = Some(false),
+            _ => tracing::warn!(
+                value = %raw,
+                "invalid ZEN_SECRETS_GUARD (expected true/false/1/0/yes/no/on/off); keeping the configured [security.secrets_guard] enabled value"
+            ),
+        }
+    }
+}
+
 fn merge_sandbox(base: SandboxConfig, ov: SandboxConfig) -> SandboxConfig {
     SandboxConfig {
         wasm: WasmSandboxConfig {
@@ -2870,6 +2926,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     }
     apply_agent_env(&mut config.agents);
     apply_cron_env(&mut config.cron);
+    apply_security_env(&mut config.security);
     apply_plugin_env(&mut config.plugin);
     apply_channels_env(&mut config.channels);
     apply_history_env(&mut config.history);
@@ -3358,6 +3415,42 @@ impl ZenConfig {
     /// Resolve theme from TUI section.
     pub fn tui_theme(&self) -> Option<&str> {
         self.tui.theme.as_deref()
+    }
+
+    /// Secrets Guard enabled state (FR-042): absent key/env = enabled.
+    ///
+    /// - `true` when `[security.secrets_guard] enabled` is absent OR true;
+    /// - `false` only when explicitly disabled (config or env kill-switch).
+    pub fn secrets_guard_enabled(&self) -> bool {
+        self.security.secrets_guard.enabled.unwrap_or(true)
+    }
+}
+
+/// Fully-resolved Secrets Guard state for ANY caller (FR-042 chokepoint
+/// helper): the env kill-switch and config key both live inside
+/// [`load_config`]'s 5-layer application, so callers consult this once
+/// and never re-parse env themselves.
+///
+/// - Parameters: none.
+/// - Returns: `true` unless explicitly disabled.
+/// - Errors: config load failure degrades fail-safe (warn + `true`) —
+///   the guard being on is the safe default.
+///
+/// # Examples
+///
+/// ```text
+/// assert!(zen_core::config::secrets_guard_state()); // default-on
+/// ```
+pub fn secrets_guard_state() -> bool {
+    match load_config() {
+        Ok(c) => c.secrets_guard_enabled(),
+        Err(e) => {
+            tracing::warn!(
+                reason = %e,
+                "config load failed; defaulting Secrets Guard to enabled (fail-safe)"
+            );
+            true
+        }
     }
 }
 
