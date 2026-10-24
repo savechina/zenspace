@@ -18,6 +18,11 @@ description = "Test fixtures with synthetic key shapes; docs examples"
 paths = [
   '''(^|/)tests/.*''',
   '''(^|/)benches/.*''',
+  # Secrets Guard (FR-042) pins live in-file under #[cfg(test)]: the engine's
+  # own fixtures (ghp_/AKIA/jwt/private-key/npm_ shapes, all synthetic) must
+  # be scannable by zen yet invisible to this scanner. Single exact file —
+  # never a src/ wildcard, so real leaks elsewhere still fail CI.
+  '''crates/zen-core/src/secrets_guard\.rs$''',
 ]
 regexes = [
   # Local placeholder / obviously-fake literals used in examples and configs.
