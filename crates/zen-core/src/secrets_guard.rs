@@ -56,6 +56,9 @@ struct SecretRule {
     /// Entropy evaluated over the whole match (`false`) or over the
     /// capture group named `value` (`true`).
     group: bool,
+    /// Multi-line block rules (PEM/SSH key bodies) may span lines; all
+    /// other rules reject newline-bearing values.
+    allow_newlines: bool,
 }
 
 impl SecretRules {
@@ -74,12 +77,14 @@ impl SecretRules {
                 re: compile(r"(?i)\bghp_[0-9a-zA-Z]{36}\b"),
                 min_entropy: 0.0,
                 group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "aws_access_key",
                 re: compile(r"(?i)\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Za-z2-7]{16}\b"),
                 min_entropy: 0.0,
                 group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "openai_key",
@@ -88,24 +93,28 @@ impl SecretRules {
                 ),
                 min_entropy: 0.0,
                 group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "openai_legacy_key",
                 re: compile(r"(?i)\bsk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}\b"),
                 min_entropy: 0.0,
                 group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "jwt",
                 re: compile(r"(?i)\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{10,}\b"),
                 min_entropy: 0.0,
                 group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "stripe_key",
                 re: compile(r"(?i)\bsk_(?:test|live|prod)_[a-zA-Z0-9]{10,}\b"),
                 min_entropy: 0.0,
                 group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "bearer_token",
@@ -114,6 +123,7 @@ impl SecretRules {
                 re: compile(r"(?i)bearer\s+[A-Za-z0-9_\-.~+/=]{16,}"),
                 min_entropy: 0.0,
                 group: true,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "generic_credential",
@@ -121,10 +131,114 @@ impl SecretRules {
                 // entropy gate (3.5, gitleaks generic threshold) rejects
                 // placeholder values like "my-secret" and most prose.
                 re: compile(
-                    r#"(?i)[\w.\-]{0,30}(?:api|access|auth|credential|creds|secret|token|password|key)[\w.\-]{0,10}["']?\s*[:=]\s*["']?(?<value>[A-Za-z0-9_\-/+=]{16,})"#,
+                    r#"(?i)[\w.\-]{0,30}(?:api|access|auth|credential|creds|secret|token|password|passwd|pwd|pass|key)[\w.\-]{0,10}["']?\s*[:=]\s*["']?(?<value>[A-Za-z0-9_\-/+=]{16,})"#,
                 ),
                 min_entropy: 3.5,
                 group: true,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "private_key_block",
+                // Whole PEM/SSH/PGP private-key block: header, base64 body,
+                // footer. Multiline on purpose (only rule allowed to span
+                // lines) — a body going out is the worst-case leak.
+                re: compile(
+                    r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]{10,}?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+                ),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: true,
+            },
+            SecretRule {
+                kind: "private_key_header",
+                // A BEGIN header whose body did not arrive yet (streaming
+                // frame boundary, or truncated dump): the marker itself is
+                // redacted; body lines are caught per-line by the base64
+                // high-entropy rule.
+                re: compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "url_credentials",
+                // scheme://user:PASSWORD@host — the password part only;
+                // scheme/user/host survive so the reply stays readable.
+                re: compile(
+                    r#"(?i)\b[a-z][a-z0-9+.-]{1,15}://[^\s:/@\x22'\x60]+:(?<value>[^\s:@/\x22'\x60]{3,})@"#,
+                ),
+                min_entropy: 0.0,
+                group: true,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "basic_auth_header",
+                // Authorization: Basic <b64-credentials>.
+                re: compile(
+                    r#"(?i)authorization['\x22]?\s*[:=]\s*['\x22]?basic\s+(?<value>[A-Za-z0-9+/=]{8,})"#,
+                ),
+                min_entropy: 0.0,
+                group: true,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "github_fine_grained_pat",
+                re: compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "github_app_token",
+                // gho_ (OAuth) / ghr_ (refresh) / ghs_ (server) / ghu_ (user)
+                re: compile(r"\bgh[oprsu]_[0-9A-Za-z]{20,}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "gitlab_pat",
+                re: compile(r"(?i)\bglpat-[A-Za-z0-9_-]{15,}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "slack_token",
+                re: compile(r"(?i)\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "anthropic_key",
+                re: compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "huggingface_token",
+                re: compile(r"\bhf_[A-Za-z0-9]{20,}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "npm_token",
+                re: compile(r"(?i)\bnpm_[a-z0-9]{36}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
+            },
+            SecretRule {
+                kind: "discord_bot_token",
+                // 3-part JWT-ish shape (id.base64.tag); modern tokens are
+                // base64(JSON id) + "." + 6 + "." + 27 chars.
+                re: compile(r"\b[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}\b"),
+                min_entropy: 0.0,
+                group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "base64_high_entropy",
@@ -132,6 +246,7 @@ impl SecretRules {
                 re: compile(r"\b[A-Za-z0-9+/=]{20,}\b"),
                 min_entropy: 4.5,
                 group: false,
+                allow_newlines: false,
             },
             SecretRule {
                 kind: "hex_high_entropy",
@@ -139,6 +254,7 @@ impl SecretRules {
                 re: compile(r"\b[A-Fa-f0-9]{20,}\b"),
                 min_entropy: 3.0,
                 group: false,
+                allow_newlines: false,
             },
         ];
         SecretRules { rules }
@@ -167,7 +283,7 @@ impl SecretRules {
                 } else {
                     (m.as_str(), m.range())
                 };
-                if value.is_empty() || value.contains('\n') {
+                if value.is_empty() || (!rule.allow_newlines && value.contains('\n')) {
                     continue;
                 }
                 if rule.min_entropy > 0.0 && shannon_entropy(value) < rule.min_entropy {
@@ -751,6 +867,127 @@ mod tests {
         let out = redact(&format!("auth {JWT_RAW} tail"), &[]);
         assert!(!out.text.contains(JWT_RAW));
         assert!(out.text.contains(PLACEHOLDER_PREFIX));
+    }
+
+    #[test]
+    fn ssh_private_key_block_redacts_whole_block() {
+        let block = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----";
+        let out = redact(&format!("key here: {block} done"), &[]);
+        assert!(
+            !out.text.contains("BEGIN OPENSSH"),
+            "block gone: {}",
+            out.text
+        );
+        assert!(!out.text.contains("b3BlbnNzaC1rZXktdjE"), "body gone");
+        assert!(
+            out.text.contains("⟦SECRET_1⟧ done"),
+            "placeholder inline: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn lone_private_key_header_redacted() {
+        let out = redact("-----BEGIN RSA PRIVATE KEY-----", &[]);
+        assert!(!out.text.contains("BEGIN RSA"), "header gone: {}", out.text);
+    }
+
+    #[test]
+    fn url_credentials_redact_password_only() {
+        let out = redact(
+            "connect postgres://admin:S3cr3tPassw0rd@db.internal/prod",
+            &[],
+        );
+        assert!(
+            !out.text.contains("S3cr3tPassw0rd"),
+            "password gone: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("postgres://admin:"),
+            "scheme+user intact: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("@db.internal/prod"),
+            "host intact: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn basic_auth_header_redacts_credentials() {
+        let out = redact("Authorization: Basic dXNlcjpwYXNzd29yZDEyMzQ1Njc4", &[]);
+        assert!(
+            !out.text.contains("dXNlcjpwYXNzd29yZDEyMzQ1Njc4"),
+            "creds gone: {}",
+            out.text
+        );
+        assert!(
+            out.text.to_lowercase().contains("basic"),
+            "scheme intact: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn provider_prefixed_tokens_detected() {
+        let cases = [
+            (
+                "github fine-grained",
+                "github_pat_11AAAAAAA0abcdefghijklmnopqrstuv",
+            ),
+            ("github app", "gho_16CharsMinimumOkFineYes12"),
+            ("gitlab", "GLPAT-abcd1234EFGH5678ijkl"),
+            ("slack", "XOXB-1234567890-abcdefghijklmnop"),
+            ("anthropic", "sk-ant-api03-abcdefghijklmnopqrst"),
+            ("huggingface", "hf_ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        ];
+        for (name, token) in cases {
+            let out = redact(&format!("token {token} end"), &[]);
+            assert_eq!(
+                out.map.len(),
+                1,
+                "{name} detected: {} -> {}",
+                token,
+                out.text
+            );
+            assert!(!out.text.contains(token), "{name} redacted");
+        }
+    }
+
+    #[test]
+    fn npm_and_discord_tokens_detected() {
+        let npm = "npm_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+        let out = redact(&format!("npm token {npm}"), &[]);
+        assert_eq!(out.map.len(), 1, "npm detected: {}", out.text);
+        // discord 24.6.27 three-part shape
+        let discord = "mta4nzy1ndmymta5odc2ntqz.gX8M2A.ABCDEFGHIJKLMNOPQRSTUVWXYZ1";
+        let out2 = redact(&format!("discord {discord}"), &[]);
+        assert_eq!(out2.map.len(), 1, "discord detected: {}", out2.text);
+        assert!(
+            !out2.text.contains("Gx8m2a"),
+            "token body gone: {}",
+            out2.text
+        );
+    }
+
+    #[test]
+    fn yaml_username_password_pair_detected() {
+        let out = redact(
+            "db:\n  username: admin\n  password: \"xK9mPp2Qq8Rr4Tt6Vv\"\n",
+            &[],
+        );
+        assert!(
+            !out.text.contains("xK9mPp2Qq8Rr4Tt6Vv"),
+            "password redacted: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("username: admin"),
+            "username left (not secret): {}",
+            out.text
+        );
     }
 
     #[test]

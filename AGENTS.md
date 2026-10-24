@@ -798,6 +798,7 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
   - **router last-mile**（T269）：`DefaultRouter::call`/`call_with_usage`/`call_stream` 三缝 scrub — guard 开 AND 非 ollama-local（enforce_sensitivity 保持 PRIMARY；Public 夹带秘密的安全网）；无占位 = 字节等同零开销路径；流式双任务 forwarder（producer 全速推 token，forwarder 帧级 restore + biased select + done-first drain + finalize）；fail-closed 语义落点 = 引擎 infallible（静态 regex 无 I/O），guard-off 是显式配置决策非静默绕过；审计 `gateway.secrets.redacted {fingerprints, count}`（仅 sha8 指纹，jsonl best-effort）。
   - **集成钉**（T270，`tests/secrets_guard_router.rs` ×4）：payload redact 可观测（mock prompt_len 回声 48→19）、reply 占位还原、invented token 可见、kill-switch env 字节等同直通。**坑**：kill-switch pin 进程级 env 突变与兄弟 pin 并发竞态（cargo test 同进程线程）——TEST_LOCK 串行化（nextest 进程隔离下本无此题）。
   - **实测彩蛋**：`env_corpus()` 首跑即捞出生产行程真实驻留的 5 组 sk-sp-*/token 值——语料通道首日即工作。
+  - **规则面扩展 T272**：+`private_key_block`（PEM/SSH 整块 (?s) 跨行 = 唯一 allow_newlines 规则）+`private_key_header`（孤立 BEGIN 行流式兜底）+`url_credentials`（仅摘 ://user:PASSWORD@host 口令段）+`basic_auth_header`+provider 前缀五类（github_pat_/gh[oprsu]_/glpat-/xox[baprs]-/sk-ant-/hf_）+generic 关键词补 passwd|pwd|pass（username 非密钥不摘）。钉 22。
 
 ## Active Technologies
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
