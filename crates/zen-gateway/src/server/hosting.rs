@@ -50,6 +50,7 @@ use zen_core::types::{MessageRole, RetrievedNote, SessionContext};
 
 use crate::protocol::RpcError;
 use crate::server::connection::OutboundFrame;
+use crate::server::guards::lock_ok;
 
 /// Per-turn event ring capacity (design §5.3).
 pub const RING_CAPACITY: usize = 2048;
@@ -173,13 +174,13 @@ impl Turn {
     }
 
     pub fn state(&self) -> TurnState {
-        *self.state.lock().expect("turn state lock")
+        *lock_ok(&self.state, "turn state lock")
     }
 
     fn set_state(&self, s: TurnState) {
-        let mut state = self.state.lock().expect("turn state lock");
+        let mut state = lock_ok(&self.state, "turn state lock");
         if s.is_terminal() && !state.is_terminal() {
-            *self.terminal_at.lock().expect("terminal-at lock") = Some(Instant::now());
+            *lock_ok(&self.terminal_at, "terminal-at lock") = Some(Instant::now());
         }
         *state = s;
     }
@@ -189,14 +190,12 @@ impl Turn {
     }
 
     pub fn final_response(&self) -> Option<String> {
-        self.response.lock().expect("response lock").clone()
+        lock_ok(&self.response, "response lock").clone()
     }
 
     /// Snapshot of buffered events with `seq > after` (resume replay).
     pub fn events_after(&self, after: u64) -> Vec<TurnEvent> {
-        self.events
-            .lock()
-            .expect("events lock")
+        lock_ok(&self.events, "events lock")
             .iter()
             .filter(|e| e.seq > after)
             .cloned()
@@ -204,11 +203,7 @@ impl Turn {
     }
 
     pub fn oldest_seq(&self) -> Option<u64> {
-        self.events
-            .lock()
-            .expect("events lock")
-            .front()
-            .map(|e| e.seq)
+        lock_ok(&self.events, "events lock").front().map(|e| e.seq)
     }
 
     /// Requests cancellation; idempotent.
@@ -226,7 +221,7 @@ impl Turn {
     /// and returns its assigned seq.
     fn push_event(&self, kind: &'static str, payload: Value) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let mut ring = self.events.lock().expect("events lock");
+        let mut ring = lock_ok(&self.events, "events lock");
         ring.push_back(TurnEvent {
             seq,
             kind,
@@ -290,7 +285,7 @@ impl Turn {
     }
 
     fn send_frame(&self, frame: OutboundFrame, kind: &'static str) {
-        let queue = self.origin.lock().expect("origin lock").clone();
+        let queue = lock_ok(&self.origin, "origin lock").clone();
         if let Some(queue) = queue {
             let turn = self.turn_id.clone();
             tokio::spawn(async move {
@@ -524,7 +519,7 @@ impl TurnRegistry {
     /// plain `get`-then-`insert` would let two racing submissions both
     /// execute (HashMap::insert overwrites the loser's record).
     fn insert_if_absent(&self, record: Arc<Turn>) -> Option<Arc<Turn>> {
-        let mut turns = self.turns.lock().expect("registry lock");
+        let mut turns = lock_ok(&self.turns, "registry lock");
         if let Some(existing) = turns.get(&record.turn_id) {
             return Some(Arc::clone(existing));
         }
@@ -534,22 +529,16 @@ impl TurnRegistry {
 
     /// Looks up a turn record by id (`None` when GC'd or unknown).
     pub fn get(&self, turn_id: &str) -> Option<Arc<Turn>> {
-        self.turns
-            .lock()
-            .expect("registry lock")
-            .get(turn_id)
-            .cloned()
+        lock_ok(&self.turns, "registry lock").get(turn_id).cloned()
     }
 
     fn remove(&self, turn_id: &str) {
-        self.turns.lock().expect("registry lock").remove(turn_id);
+        lock_ok(&self.turns, "registry lock").remove(turn_id);
     }
 
     /// Number of turns currently in a non-terminal state.
     pub fn active_count(&self) -> usize {
-        self.turns
-            .lock()
-            .expect("registry lock")
+        lock_ok(&self.turns, "registry lock")
             .values()
             .filter(|t| !t.state().is_terminal())
             .count()
@@ -559,11 +548,11 @@ impl TurnRegistry {
     /// called periodically so the idempotency map stays bounded without
     /// dropping recently-finished turns a client may still retry.
     pub fn reap_terminal(&self, retain: usize) {
-        let mut turns = self.turns.lock().expect("registry lock");
+        let mut turns = lock_ok(&self.turns, "registry lock");
         let mut terminal: Vec<(String, Option<Instant>)> = turns
             .iter()
             .filter(|(_, t)| t.state().is_terminal())
-            .map(|(id, t)| (id.clone(), *t.terminal_at.lock().expect("terminal-at lock")))
+            .map(|(id, t)| (id.clone(), *lock_ok(&t.terminal_at, "terminal-at lock")))
             .collect();
         terminal.sort_by_key(|&(_, at)| at);
         let excess = terminal.len().saturating_sub(retain);
@@ -575,10 +564,7 @@ impl TurnRegistry {
     /// Requests cancellation on every non-terminal turn (drain path);
     /// each turn's finalize writes its own cancelled audit.
     pub async fn cancel_all_active(&self) {
-        let active: Vec<Arc<Turn>> = self
-            .turns
-            .lock()
-            .expect("registry lock")
+        let active: Vec<Arc<Turn>> = lock_ok(&self.turns, "registry lock")
             .values()
             .filter(|t| !t.state().is_terminal())
             .cloned()
@@ -589,9 +575,7 @@ impl TurnRegistry {
     }
 
     async fn permit(&self, session_id: &str) -> Arc<Mutex<()>> {
-        self.permits
-            .lock()
-            .expect("permit lock")
+        lock_ok(&self.permits, "permit lock")
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
@@ -958,7 +942,7 @@ pub async fn turn_with(
     };
 
     let record = Arc::new(Turn::new(turn_id.clone(), session_id.clone()));
-    *record.origin.lock().expect("origin lock") = origin;
+    *lock_ok(&record.origin, "origin lock") = origin;
     if let Some(existing) = deps.turns.insert_if_absent(Arc::clone(&record)) {
         // Registration race lost: mirror the winner (no double-exec).
         if !existing.state().is_terminal() {
@@ -1078,7 +1062,7 @@ pub async fn turn_with(
         if token_record.state() == TurnState::Running {
             token_record.set_state(TurnState::Streaming);
         }
-        token_pending.lock().expect("pending lock").push_str(&text);
+        lock_ok(&*token_pending, "pending lock").push_str(&text);
         token_notify.notify_one();
     };
 
@@ -1122,7 +1106,7 @@ pub async fn turn_with(
             merge_ctx = Some(ctx);
             deps.guards.record_success(&session_id);
             record.set_state(TurnState::Completed);
-            *record.response.lock().expect("response lock") = Some(response.clone());
+            *lock_ok(&record.response, "response lock") = Some(response.clone());
             record.emit_structural("turn_completed", json!({ "response": response }));
             emit_agent_status(&record, "idle");
             release_done(&record);
@@ -1234,7 +1218,7 @@ fn release_done(record: &Arc<Turn>) {
 
 /// Flushes accumulated token text as one merged delta frame.
 fn drain_pending(record: &Arc<Turn>, pending: &Arc<StdMutex<String>>) {
-    let drained: String = std::mem::take(&mut *pending.lock().expect("pending lock"));
+    let drained: String = std::mem::take(&mut *lock_ok(pending.as_ref(), "pending lock"));
     if !drained.is_empty() {
         record.emit_delta(&drained);
     }
@@ -1263,7 +1247,8 @@ fn spawn_flusher(
                 }
             }
             drain_pending(&record, &pending);
-            if record.state().is_terminal() && pending.lock().expect("pending lock").is_empty() {
+            if record.state().is_terminal() && lock_ok(pending.as_ref(), "pending lock").is_empty()
+            {
                 break;
             }
         }

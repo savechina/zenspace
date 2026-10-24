@@ -30,6 +30,7 @@ use crate::protocol::{
     SERVER_PROTOCOL_VERSION, handle_initialize,
 };
 use crate::server::connection::ClientIdentity;
+use crate::server::guards::lock_ok;
 use crate::transport::Transport;
 
 /// Default Q3 deadline (data-model E7 ApprovalTimeout: 120s).
@@ -144,11 +145,7 @@ impl DispatchServer {
         self,
         hook: impl Fn(ClientIdentity, Capabilities) + Send + Sync + 'static,
     ) -> Self {
-        self.shared
-            .on_client_ready
-            .lock()
-            .expect("on_client_ready lock poisoned")
-            .replace(Box::new(hook));
+        lock_ok(&self.shared.on_client_ready, "on_client_ready lock").replace(Box::new(hook));
         self
     }
 
@@ -241,18 +238,9 @@ impl DispatchServer {
             Frame::Notification { method, .. } => {
                 if method == "initialized" {
                     *this.shared.state.lock().await = HandshakeState::Initialized;
-                    let ready = this
-                        .shared
-                        .last_handshake
-                        .lock()
-                        .expect("handshake lock")
-                        .take();
+                    let ready = lock_ok(&this.shared.last_handshake, "handshake lock").take();
                     if let (Some(hook), Some((identity, caps))) = (
-                        this.shared
-                            .on_client_ready
-                            .lock()
-                            .expect("hook lock")
-                            .as_ref(),
+                        lock_ok(&this.shared.on_client_ready, "hook lock").as_ref(),
                         ready,
                     ) {
                         hook(identity, caps);
@@ -307,7 +295,7 @@ impl DispatchServer {
                             .unwrap_or("0")
                             .to_string(),
                     };
-                    *this.shared.last_handshake.lock().expect("handshake lock") =
+                    *lock_ok(&this.shared.last_handshake, "handshake lock") =
                         Some((identity, result.capabilities));
                     Frame::response(id, serde_json::to_value(result).expect("serialize result"))
                 }

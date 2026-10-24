@@ -182,6 +182,10 @@ fn apply_seccomp(allow_network: bool) -> Result<(), zen_core::errors::ZenError> 
 fn apply_no_new_privs() -> Result<(), zen_core::errors::ZenError> {
     use libc::{PR_SET_NO_NEW_PRIVS, c_int, prctl};
 
+    // SAFETY: PR_SET_NO_NEW_PRIVS with arg 1 and three zero args is the
+    // documented kernel contract (no pointers, no derived state). Called in
+    // the single-purpose launcher process before spawning the wrapped binary;
+    // the flag is intentionally irreversible for this process lifetime.
     let ret = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1 as c_int, 0, 0, 0) };
 
     if ret != 0 {

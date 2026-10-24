@@ -21,12 +21,47 @@
 //! failures never propagate.
 
 use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
+use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use crate::protocol::RpcError;
+
+/// Poison-tolerant `Mutex::lock` for request-path code (CSO T264): a
+/// prior panic while holding the lock must not cascade-panic every
+/// subsequent request. Recovers the guard via [`PoisonError::into_inner`]
+/// (the data-intact contract — the critical section left consistent
+/// state or panicked mid-update, and callers already tolerate partial
+/// writes) and logs one `zen_gateway_poison` warning per recovery. The
+/// non-poisoned fast path is a plain `match` on `Result` — no
+/// allocation, no extra locking, no widening of lock-hold windows.
+///
+/// `what` names the lock site (reuses the historical `.expect(...)`
+/// message strings) so poison recoveries are attributable in logs.
+///
+/// # Examples
+/// ```
+/// use std::sync::Mutex;
+/// use zen_gateway::server::guards::lock_ok;
+///
+/// let m = Mutex::new(41);
+/// *lock_ok(&m, "demo lock") += 1; // fast path, byte-equal to .lock().unwrap()
+/// assert_eq!(*m.lock().unwrap(), 42);
+/// ```
+pub fn lock_ok<'a, T>(mutex: &'a StdMutex<T>, what: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(
+                target: "zen_gateway_poison",
+                lock = what,
+                "recovered poisoned mutex (prior panic while held)"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
 
 /// Per-turn deadline default (data-model E7 TurnWatchdog). Must exceed
 /// the client's first-token budget (zen-agents
@@ -52,16 +87,13 @@ fn guard_rejected(guard: &'static str, reason: &str) -> RpcError {
 /// `ZEN_TURN_WATCHDOG_SECS` overrides it (parsed once per process).
 pub fn watchdog_timeout() -> Duration {
     static OVERRIDE: StdMutex<Option<Duration>> = StdMutex::new(None);
-    *OVERRIDE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(|| {
-            std::env::var("ZEN_TURN_WATCHDOG_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(WATCHDOG_TIMEOUT)
-        })
+    *lock_ok(&OVERRIDE, "watchdog override").get_or_insert_with(|| {
+        std::env::var("ZEN_TURN_WATCHDOG_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(WATCHDOG_TIMEOUT)
+    })
 }
 
 /// Watchdog expiry surfaced as a catalog rejection to the turn caller.
@@ -93,7 +125,7 @@ impl Guards {
     }
 
     fn check_breaker(&self, session_id: &str) -> Result<(), RpcError> {
-        let mut breakers = self.breakers.lock().expect("breaker lock");
+        let mut breakers = lock_ok(&self.breakers, "breaker lock");
         let state = breakers.entry(session_id.to_string()).or_default();
         if let Some(until) = state.open_until {
             if Instant::now() < until {
@@ -113,7 +145,7 @@ impl Guards {
 
     fn record_doom_turn(&self, session_id: &str) -> Result<(), RpcError> {
         let now = Instant::now();
-        let mut doom = self.doom.lock().expect("doom lock");
+        let mut doom = lock_ok(&self.doom, "doom lock");
         let window = doom.entry(session_id.to_string()).or_default();
         window.retain(|t| now.duration_since(*t) < DOOM_WINDOW);
         if window.len() >= DOOM_MAX_TURNS {
@@ -132,7 +164,7 @@ impl Guards {
     /// Records a completed turn: resets the failure streak and prunes
     /// the doom window entry set.
     pub fn record_success(&self, session_id: &str) {
-        let mut breakers = self.breakers.lock().expect("breaker lock");
+        let mut breakers = lock_ok(&self.breakers, "breaker lock");
         if let Some(state) = breakers.get_mut(session_id) {
             state.consecutive_failures = 0;
             state.open_until = None;
@@ -141,7 +173,7 @@ impl Guards {
 
     /// Records a failed turn; opens the breaker at threshold.
     pub fn record_failure(&self, session_id: &str) {
-        let mut breakers = self.breakers.lock().expect("breaker lock");
+        let mut breakers = lock_ok(&self.breakers, "breaker lock");
         let state = breakers.entry(session_id.to_string()).or_default();
         state.consecutive_failures += 1;
         if state.consecutive_failures >= BREAKER_THRESHOLD {

@@ -11,6 +11,19 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # T265 (CSO audit 2026-10-24): secret-leak gate. Cheap action-scanner job;
+  # rules + allowlist live in .gitleaks.toml (history verified clean at
+  # enactment). Run locally: gitleaks detect --no-banner
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0 # full history so `detect` scans commits, not just worktree
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   lint:
     runs-on: ${{ matrix.os }}
     strategy:

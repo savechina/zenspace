@@ -249,6 +249,59 @@ pub fn remove_pid<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
         .inspect(|_| tracing::debug!(path = %path.as_ref().display(), "PID file removed"))
 }
 
+// ─────────────────── FR-040 boot-time tempfile sweep ───────────────────
+
+/// Blocking body of the daemon boot-time sweep (FR-040): resolves the
+/// global root (`~/.zen` — a launchd daemon runs with cwd=/ and never
+/// resolves a workspace_root, so stale `.bak`/`.tmp` artifacts from
+/// crashed `fs.edit` / wiki-writer operations accumulate there) and runs
+/// [`zen_core::tempfile_lifecycle::boot_time_sweep`] over it.
+///
+/// Returns the swept root, or `None` when ZenPaths cannot resolve —
+/// fail-soft: the caller logs and startup continues. The sweep itself is
+/// infallible (per-file failures log internally and never abort).
+fn sweep_global_root_blocking() -> Option<PathBuf> {
+    let started = std::time::Instant::now();
+    match zen_core::paths::ZenPaths::detect() {
+        Ok(paths) => {
+            let root = paths.global_root().clone();
+            tracing::info!(
+                root = %root.display(),
+                "boot_time_sweep: sweeping global root for stale tempfiles"
+            );
+            zen_core::tempfile_lifecycle::boot_time_sweep(&root);
+            tracing::debug!(
+                root = %root.display(),
+                ms = started.elapsed().as_millis() as u64,
+                "boot_time_sweep: global-root sweep complete"
+            );
+            Some(root)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "boot_time_sweep: ZenPaths unavailable; skipping tempfile sweep"
+            );
+            None
+        }
+    }
+}
+
+/// Fire-and-forget boot-time sweep: the recursive walk runs on the
+/// blocking pool so daemon startup never waits on it. Called once per
+/// daemon start, before the accept loop begins.
+fn spawn_boot_time_sweep() {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(sweep_global_root_blocking).await {
+            Ok(Some(_root)) => {}
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "boot_time_sweep task failed");
+            }
+        }
+    });
+}
+
 // ─────────────────── UDS gateway service (US1, T012) ───────────────────
 
 use crate::server::knowledge::{KnowledgeState, search as knowledge_search};
@@ -1216,6 +1269,10 @@ impl GatewayService {
         {
             tracing::warn!(error = %e, path = %pid_path.display(), "pid file write failed");
         }
+        // FR-040: sweep stale tempfiles left by crashed operations before
+        // the accept loop starts. Fire-and-forget on the blocking pool —
+        // a sweep failure (paths unavailable) only warns, never aborts.
+        spawn_boot_time_sweep();
         let mut shutdown_rx = service.shutdown_tx.subscribe();
         tracing::info!(
             socket = %config.socket_path.display(),
@@ -1602,5 +1659,42 @@ mod schema_skew_tests {
             "guard is per-process, not per-value"
         );
         SCHEMA_SKEW_LOGGED.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod boot_sweep_tests {
+    use super::*;
+
+    /// FR-040 pin: the daemon's boot-time sweep is idempotent — a second
+    /// pass over an already-swept tree changes nothing and never panics.
+    #[test]
+    fn boot_time_sweep_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.md.bak"), b"x").unwrap();
+        std::fs::write(root.join("b.md.tmp"), b"x").unwrap();
+        std::fs::write(root.join("keep.md"), b"x").unwrap();
+
+        for _ in 0..2 {
+            zen_core::tempfile_lifecycle::boot_time_sweep(root);
+        }
+
+        assert!(!root.join("a.md.bak").exists(), "stale .bak must be swept");
+        assert!(!root.join("b.md.tmp").exists(), "stale .tmp must be swept");
+        assert!(root.join("keep.md").exists(), "regular files must survive");
+    }
+
+    /// FR-040 pin: the wiring helper exists, compiles, and resolves the
+    /// global root in the test env (test-support build: ZEN_HOME or the
+    /// per-process temp fallback — never the developer's real ~/.zen).
+    /// `None` is the documented fail-soft outcome; both branches are
+    /// non-panicking, which reaching the assert proves.
+    #[test]
+    fn sweep_global_root_blocking_resolves_or_fails_soft() {
+        let swept = sweep_global_root_blocking();
+        if let Some(root) = swept {
+            assert!(root.is_absolute(), "sweep root must be an absolute path");
+        }
     }
 }

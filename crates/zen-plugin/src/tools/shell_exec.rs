@@ -815,6 +815,12 @@ impl Tool for ShellExecTool {
                 // Kill the whole process group first so descendants die too.
                 #[cfg(unix)]
                 if let Some(pid) = child_pid {
+                    // SAFETY: negative pid targets the group led by our own
+                    // spawned child (spawned with process_group(0) above, so
+                    // pgid == child pid); permission is guaranteed because the
+                    // child is our descendant. This is the timeout-enforcement
+                    // path (FR-038) — a pid-reuse race is bounded because we
+                    // reap the child immediately after.
                     unsafe {
                         libc::kill(-(pid as i32), libc::SIGKILL);
                     }

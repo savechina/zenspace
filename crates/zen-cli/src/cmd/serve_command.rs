@@ -547,6 +547,12 @@ async fn stop_daemon(quiet: bool) -> Result<bool, ZenError> {
 
     #[cfg(unix)]
     {
+        // SAFETY: `pid` comes from our own pid-record file and was just
+        // verified by `pid_record_alive`, which matches the kernel process
+        // start-time token — a recycled pid fails the match and is reported
+        // stale before this point. Legacy records without a start token fall
+        // back to liveness-only: TOCTOU on pid reuse is then accepted, with
+        // the drain-first SIGTERM stop as the mitigation.
         let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if result == 0 {
             info!("Sent SIGTERM to gateway (pid: {})", pid);
@@ -569,6 +575,9 @@ async fn stop_daemon(quiet: bool) -> Result<bool, ZenError> {
                 quiet,
                 "Process not responding, force killing...".to_string(),
             );
+            // SAFETY: same pid-record-verified pid as the SIGTERM above; the
+            // escalation chain already waited TERM_GRACE for a clean drain, so
+            // the residual reuse window noted there still applies unchanged.
             unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             if !wait_exit(pid, KILL_GRACE).await {
                 return Err(ZenError::Service(format!(
@@ -1226,6 +1235,11 @@ async fn run_background(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // SAFETY: pre_exec runs in the forked child before exec, where only
+        // async-signal-safe calls are permitted — setsid(2) is a single
+        // syscall with no allocation. Honest note: the setsid result is
+        // ignored here; a failure would leave the daemon in the caller's
+        // session (terminal hangup risk), accepted for the manual-spawn path.
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();

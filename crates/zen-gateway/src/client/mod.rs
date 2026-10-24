@@ -241,6 +241,9 @@ fn default_spawn() -> anyhow::Result<()> {
     }
     #[cfg(unix)]
     {
+        // SAFETY: pre_exec runs in the forked child before exec — only
+        // async-signal-safe calls allowed, and setsid(2) is a single syscall.
+        // The -1 return is propagated as a spawn error (no silent failure).
         // New SESSION (codex app-server-daemon pattern): the daemon must
         // survive terminal hangup entirely — process_group(0) only leaves
         // the foreground group, setsid() leaves the controlling terminal.

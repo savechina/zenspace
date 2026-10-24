@@ -785,6 +785,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 - **FR-041 tool-layer hardening & hot-path wave（2026-10-24，`2be0fcd`；`bin/lint` 0；`bin/test` 3407/0/25 = 基线 3403 +4 钉）** — 澄清 Session 2026-10-24 五答入 spec（并 005 / MCP 观察驱动 / shell 安全优先 / 热路径性能 / codex-pi 先调研）；FR-041 + SC-012/SC-013 + Non-Goals 写入；research.md D31 Research Record（codex `3985001` 机制盘点 adopt-3/reject-4/present-1）。落地：shell_exec G1 shlex 辞败回退粗 tokens 保 protected/eval 扫描、G2 glob 隐藏 protected component 保守拒（`~/.[s]sh/*` 形，path-anchored 门 + fail-closed 编译错，裸 `ls *` 保留）、G3 反斜杠续行合同钉；MCP bootstrap 两阶段化（并行 open join_all sum→max + 串行 apply 保序）+ stdio `serve()` 60s 握手超时 + `spawn_ms/list_ms/connect_ms` 计量（SC-013）。eval/heredoc/ANSI-C 等词法面审计后确认 fail-closed 无改。prewarm 不做（daemon orchestrator 进程级，boot 一次）。
 
+- **触发器波二期 T260-T266 全清账 + poison 挂死根因（2026-10-24 续；`bin/lint` 0；`bin/test` **3442/0/25** = 基线 3435 +7）** — owner 指令 "all"；tasks.md Phase 40 ledger：
+  - **T260**：FR-040 boot sweep 接线 daemon（`spawn_boot_time_sweep` → `boot_time_sweep(user_root)`，spawn_blocking，fail-soft warn，每进程至多一次）+ TUI `run()`/`run_startup()` 双入口。
+  - **T264**：共享 `guards::lock_ok`（warn-on-poison + `into_inner`），http.rs/guards.rs/dispatch.rs/hosting.rs 全热路径 `.lock().unwrap()/expect` 转换；钉套件 `tests/poison_tolerance.rs` ×3。**坑**：fast-path 钉首版 `assert_eq!` 左 guard 跨右同锁 = 测试二进制永久挂死（>420s，cargo test 卡死根因，已 scoped-block 修正）。
+  - **T262/T266 verified no-work-needed**：7 处生产 unsafe 早已 SAFETY-tagged，ledger 陈旧；剩余未标 = 测试 env-var 惯例。
+  - **T265**：`.gitleaks.toml` + CI `secrets` job（fetch-depth: 0）；本地 gitleaks 359 commits 0 泄漏。
+  - T261 留档（TempfileDropGuard 升格触发器未到）；T263 checkbox 已翻转。
+
 ## Active Technologies
 - Rust edition 2024 (MSRV 1.80+, stable toolchain) (003-agentic-plugin)
 - No new database tables. Tool audit records → existing `logs/audit.jsonl` (append-only JSONL). MCP server config → existing 5-layer config inheritance (config.toml `[mcp_servers]` section). Jina/Brave/Tavily API keys → `.env` via `dotenvy`. (003-agentic-plugin)

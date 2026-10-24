@@ -38,6 +38,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tracing::warn;
 
 use crate::protocol::{Frame, RpcErrorBody};
+use crate::server::guards::lock_ok;
 use crate::server::{ClientConnection, OUTBOUND_CAPACITY, OutboundFrame};
 use crate::transport::Transport;
 
@@ -69,7 +70,7 @@ impl SessionWire {
     }
 
     fn push_client_frame(&self, frame: Frame) {
-        self.inbound.lock().unwrap().push_back(frame);
+        lock_ok(&self.inbound, "http inbound queue").push_back(frame);
         self.inbound_ready.notify_one();
     }
 
@@ -129,7 +130,7 @@ impl crate::transport::Transport for SessionWire {
 
     async fn recv(&self) -> anyhow::Result<Frame> {
         loop {
-            if let Some(frame) = self.inbound.lock().unwrap().pop_front() {
+            if let Some(frame) = lock_ok(&self.inbound, "http inbound queue").pop_front() {
                 return Ok(frame);
             }
             self.inbound_ready.notified().await;

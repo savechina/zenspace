@@ -33,6 +33,13 @@ static REGISTER_VEC_EXTENSION: Once = Once::new();
 fn register_sqlite_vec() {
     REGISTER_VEC_EXTENSION.call_once(|| {
         #[allow(clippy::missing_transmute_annotations)]
+        // SAFETY: `sqlite3_auto_extension` takes a `*const ()`-erased C-ABI
+        // init fn (`int(*)(sqlite3*, char**, void**)`); `sqlite3_vec_init`
+        // matches that signature for the pinned sqlite-vec version, which
+        // guarantees the symbol layout. Registration runs once (Once) and
+        // the fn pointer stays valid for the process lifetime. Residual
+        // risk: a sqlite-vec upgrade changing the init signature would
+        // need a matching update at this transmute site.
         unsafe {
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
                 sqlite_vec::sqlite3_vec_init as *const (),

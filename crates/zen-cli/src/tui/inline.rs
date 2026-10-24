@@ -102,6 +102,10 @@ pub fn run_inline(config: &'static zen_core::config::ZenConfig) -> Result<()> {
         let _ = paths.ensure_runtime_dirs();
     }
 
+    // FR-040: sweep stale tempfiles left by crashed operations. Detached
+    // background thread — the first paint never waits on the walk.
+    super::spawn_boot_time_sweep();
+
     let app = prepare_inline_app(config);
 
     crossterm::terminal::enable_raw_mode()?;
