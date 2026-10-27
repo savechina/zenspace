@@ -3,15 +3,33 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use mdstream::{BlockId, BlockKind, DocumentState, MdStream, Options};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use tui_markdown::StyleSheet;
 
+/// Zen's style sheet for tui-markdown: headings keep their marker stripped
+/// (codex-convention per-level hierarchy from theme.rs), links use accent +
+/// underline with the renderer's ` (url)` suffix stripped post-render, and
+/// blockquotes stay deliberately plain (style freeze — line-style
+/// preservation below would otherwise surface the vendored default green).
 #[derive(Clone, Copy)]
 struct NoMarkerStyleSheet;
 
 impl StyleSheet for NoMarkerStyleSheet {
+    fn heading(&self, level: u8) -> Style {
+        crate::tui::theme::markdown_heading_style(level)
+    }
+
     fn heading_marker(&self, _level: u8) -> &str {
         ""
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::new()
+    }
+
+    fn link(&self) -> Style {
+        crate::tui::theme::markdown_link_style()
     }
 }
 
@@ -30,21 +48,77 @@ fn convert_text_to_owned_lines(text: ratatui::text::Text) -> Vec<Line<'static>> 
                 .into_iter()
                 .map(|span| Span::styled(span.content.to_string(), span.style))
                 .collect();
-            Line::from(spans)
+            let mut out = Line::from(spans);
+            // tui-markdown styles whole elements at the line level (headings,
+            // blockquotes, alerts, metadata blocks all ride on `line.style`
+            // while their text spans stay plain) — dropping it silently
+            // stripped every one of those styles. Preserve it verbatim so the
+            // stylesheet's choices actually reach the terminal.
+            out.style = line.style;
+            out
         })
         .collect()
 }
 
 /// Render one top-level markdown block.
 ///
-/// Code fences go through syntect/two-face highlighting (T028 / FR-012) so
-/// the inline streaming path matches the full-screen TUI; everything else
-/// stays on `tui_markdown`.
+/// Standalone thematic breaks render as a dim em-dash rule (codex
+/// convention — tui-markdown hardcodes a plain `---` line with no
+/// stylesheet hook), code fences go through syntect/two-face highlighting
+/// (T028 / FR-012) so the inline streaming path matches the full-screen
+/// TUI; everything else stays on `tui_markdown`.
 fn render_block_dispatch(raw: &str) -> Vec<Line<'static>> {
+    if let Some(lines) = render_rule_block(raw) {
+        return lines;
+    }
     if let Some(lines) = render_code_fence_block(raw) {
         return lines;
     }
     render_block_via_tui_markdown(raw)
+}
+
+/// HR intercept: a block that is exactly one thematic-break line
+/// (`---` / `***` / `___`) renders as a dim em-dash x3 rule.
+/// tui-markdown's `Rule` renderer emits a hardcoded plain `---` line, so a
+/// block-level intercept is the only clean hook. Multi-line `---`-led
+/// blocks (YAML metadata, setext headings) fall through untouched.
+fn render_rule_block(raw: &str) -> Option<Vec<Line<'static>>> {
+    render_rule_block_with(raw, no_color_enabled())
+}
+
+/// `no_color` seam so tests can pin both degradation branches without
+/// mutating process env (tests run concurrently).
+fn render_rule_block_with(raw: &str, no_color: bool) -> Option<Vec<Line<'static>>> {
+    let mut lines = raw.lines();
+    let first = lines.next()?;
+    if lines.next().is_some() || !is_thematic_break_line(first) {
+        return None;
+    }
+    // FR-011: color degrades under NO_COLOR — plain Reset style, the rule
+    // glyph itself still marks the break.
+    let style = if no_color {
+        Style::default()
+    } else {
+        Style::default()
+            .fg(ratatui::style::Color::DarkGray)
+            .add_modifier(ratatui::style::Modifier::DIM)
+    };
+    Some(vec![Line::styled("———".to_string(), style)])
+}
+
+/// CommonMark thematic break: 0-3 leading spaces (4+ would be an indented
+/// code block), then a run of >= 3 identical `-` / `*` / `_`. Spaced forms
+/// (`- - -`) intentionally don't match — they keep the tui-markdown
+/// fallback rather than widening the intercept.
+fn is_thematic_break_line(line: &str) -> bool {
+    let stripped = line.trim_start_matches(' ');
+    if line.len() - stripped.len() > 3 {
+        return false;
+    }
+    let core = stripped.trim_end().as_bytes();
+    core.len() >= 3
+        && (core[0] == b'-' || core[0] == b'*' || core[0] == b'_')
+        && core.iter().all(|&c| c == core[0])
 }
 
 /// Parse a fenced code block: ```` ```lang ```` opener, content, optional
@@ -64,14 +138,21 @@ fn parse_code_fence(raw: &str) -> Option<(String, String)> {
     Some((lang, content.join("\n")))
 }
 
+/// FR-011 NO_COLOR probe shared by the markdown render paths. Cached per
+/// process (env is never mutated at runtime; tests pin degradation through
+/// explicit `*_with(no_color)` seams instead of env mutation).
+fn no_color_enabled() -> bool {
+    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_COLOR.get_or_init(|| std::env::var("NO_COLOR").is_ok())
+}
+
 /// Highlighted, framed code fence for the inline scrollback path. Mirrors
 /// `CodeCell` framing (`┌─ lang` / `└─`). Respects `NO_COLOR` (FR-011) by
 /// falling back to plain text.
 fn render_code_fence_block(raw: &str) -> Option<Vec<Line<'static>>> {
     let (lang, code) = parse_code_fence(raw)?;
 
-    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let no_color = *NO_COLOR.get_or_init(|| std::env::var("NO_COLOR").is_ok());
+    let no_color = no_color_enabled();
 
     let header_style = ratatui::style::Style::default()
         .fg(ratatui::style::Color::DarkGray)
@@ -115,7 +196,49 @@ fn render_diff_line(line: &str) -> Line<'static> {
 fn render_block_via_tui_markdown(raw: &str) -> Vec<Line<'static>> {
     let options = tui_markdown::Options::new(NoMarkerStyleSheet);
     let text = tui_markdown::from_str_with_options(raw, &options);
-    convert_text_to_owned_lines(text)
+    let mut lines = convert_text_to_owned_lines(text);
+    replace_unordered_list_markers(&mut lines);
+    strip_link_destinations(&mut lines, crate::tui::theme::markdown_link_style());
+    lines
+}
+
+/// Unordered list markers render as the `• ` bullet glyph (codex/hermes
+/// convention). tui-markdown hardcodes `"- "` and emits the marker as its
+/// own span shaped `"<indent>- "` (indent = nested-list padding), so an
+/// exact-match span swap can never touch body text. Fenced code never
+/// reaches this path (`render_code_fence_block` intercepts first). Ordered
+/// `{n}. ` markers don't match the shape and stay untouched.
+fn replace_unordered_list_markers(lines: &mut [Line<'static>]) {
+    for line in lines {
+        for span in &mut line.spans {
+            let indent_len = span.content.len() - span.content.trim_start_matches(' ').len();
+            if &span.content[indent_len..] == "- " {
+                span.content = format!("{}\u{2022} ", " ".repeat(indent_len)).into();
+            }
+        }
+    }
+}
+
+/// Remove the ` (destination)` suffix tui-markdown appends after every link
+/// label (`label (url)` -> `label`; deliberate zen divergence from codex,
+/// which keeps the destination). The renderer emits the suffix as a rigid
+/// three-span group — exact `" ("`, the destination span carrying exactly
+/// the link style, exact `")"` — so shape-matching is precise; the link
+/// style never occurs on other span boundaries.
+fn strip_link_destinations(lines: &mut [Line<'static>], link_style: Style) {
+    for line in lines {
+        let mut i = 0;
+        while i + 2 < line.spans.len() {
+            if line.spans[i].content.as_ref() == " ("
+                && line.spans[i + 1].style == link_style
+                && line.spans[i + 2].content.as_ref() == ")"
+            {
+                let _ = line.spans.drain(i..i + 3);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 struct RenderedBlock {
@@ -141,26 +264,24 @@ impl IncrementalMarkdownRenderer {
         for (i, raw) in raw_blocks.iter().enumerate() {
             let h = hash_string(raw);
 
-            if let Some(cached) = self.blocks.get(i)
+            let lines: Vec<Line<'static>> = if let Some(cached) = self.blocks.get(i)
                 && cached.hash == h
             {
-                result.extend(cached.lines.iter().cloned());
-                new_blocks.push(RenderedBlock {
-                    hash: h,
-                    lines: cached.lines.clone(),
-                });
-                continue;
-            }
-
-            let is_last_block = i == raw_blocks.len() - 1;
-            let render_content = if is_last_block {
-                maybe_close_unclosed_fences(raw)
+                cached.lines.clone()
             } else {
-                raw.clone()
+                let is_last_block = i == raw_blocks.len() - 1;
+                let render_content = if is_last_block {
+                    maybe_close_unclosed_fences(raw)
+                } else {
+                    raw.clone()
+                };
+                render_block_dispatch(&render_content)
             };
 
-            let lines = render_block_dispatch(&render_content);
-            result.extend(lines.iter().cloned());
+            // Gap rhythm is applied at assembly (single code path for fresh
+            // and cached lines) so it never desyncs from the block cache.
+            let insert_gap = i > 0 && raw_block_kind(&raw_blocks[i - 1]) != raw_block_kind(raw);
+            join_block_lines(&mut result, &lines, insert_gap);
             new_blocks.push(RenderedBlock { hash: h, lines });
         }
 
@@ -178,6 +299,79 @@ impl Default for IncrementalMarkdownRenderer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Block kinds for gap-rhythm classification (hermes `gap()` convention:
+/// exactly one blank line between adjacent rendered blocks of DIFFERENT
+/// kinds; same-kind adjacency keeps prior behavior — no inserted gap).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawBlockKind {
+    Heading,
+    List,
+    Quote,
+    Fence,
+    Table,
+    Rule,
+    Paragraph,
+}
+
+/// Classify a raw top-level block from its first line. Only feeds gap
+/// insertion — a conservative miss just changes whether one blank line is
+/// inserted at a join.
+fn raw_block_kind(raw: &str) -> RawBlockKind {
+    let first = raw.lines().next().unwrap_or("").trim_start();
+    if first.starts_with("```") {
+        return RawBlockKind::Fence;
+    }
+    if raw.lines().count() == 1 && is_thematic_break_line(first) {
+        return RawBlockKind::Rule;
+    }
+    if first.starts_with('#') && first.trim_start_matches('#').starts_with(' ') {
+        return RawBlockKind::Heading;
+    }
+    if first.starts_with("- ")
+        || first.starts_with("* ")
+        || first.starts_with("+ ")
+        || (first.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) && first.contains(". "))
+    {
+        return RawBlockKind::List;
+    }
+    if first.starts_with('>') {
+        return RawBlockKind::Quote;
+    }
+    if first.starts_with('|') {
+        return RawBlockKind::Table;
+    }
+    RawBlockKind::Paragraph
+}
+
+fn is_blank_line(line: &Line<'static>) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// Append one block's rendered lines with gap rhythm: insert exactly one
+/// blank line at different-kind joins (skipped when either side already
+/// ends/starts blank), squeeze incoming leading blanks when the previous
+/// block already ended blank, so a join never produces two consecutive
+/// blank lines. Same-kind joins keep prior adjacency.
+fn join_block_lines(result: &mut Vec<Line<'static>>, lines: &[Line<'static>], insert_gap: bool) {
+    if result.is_empty() {
+        result.extend(lines.iter().cloned());
+        return;
+    }
+    let prev_blank = result.last().is_some_and(is_blank_line);
+    if insert_gap && !prev_blank && !lines.first().is_some_and(is_blank_line) {
+        result.push(Line::raw(String::new()));
+    }
+    let start = if prev_blank {
+        lines
+            .iter()
+            .position(|l| !is_blank_line(l))
+            .unwrap_or(lines.len())
+    } else {
+        0
+    };
+    result.extend(lines[start..].iter().cloned());
 }
 
 fn is_continuation_line(line: &str) -> bool {
@@ -233,7 +427,12 @@ fn split_top_level_blocks(content: &str) -> Vec<String> {
         if !in_code_block && line.trim().is_empty() {
             let next_non_empty = lines[i + 1..].iter().find(|l| !l.trim().is_empty());
             if let Some(next) = next_non_empty {
-                let current_has_continuation = current.iter().any(|l| is_continuation_line(l));
+                // Loose-list merging must never pull content into a block
+                // that contains a fence: `parse_code_fence` stops at the
+                // closing fence, so anything merged after it would be
+                // silently dropped. A list following a fence splits instead.
+                let current_has_continuation = current.iter().any(|l| is_continuation_line(l))
+                    && !current.iter().any(|l| l.trim_start().starts_with("```"));
                 let next_is_continuation = is_continuation_line(next);
                 if current_has_continuation && next_is_continuation {
                     current.push(line);
@@ -371,6 +570,7 @@ fn block_to_lines(block_display_text: &str) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     #[test]
     fn parse_code_fence_extracts_lang_and_code() {
@@ -795,6 +995,260 @@ mod tests {
         assert!(
             lines.iter().any(|l| line_text(l).contains("let x = 1;")),
             "fence body must render"
+        );
+    }
+    // === codex/hermes convergence pins (002-agentic-tui) ===
+
+    fn line_text(l: &Line<'static>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn find_line<'a>(lines: &'a [Line<'static>], text: &str) -> &'a Line<'static> {
+        lines
+            .iter()
+            .find(|l| line_text(l) == text)
+            .unwrap_or_else(|| panic!("line {text:?} must render, got {lines:?}"))
+    }
+
+    /// (a) Heading hierarchy: H1 bold+underlined, H2 bold, H3 bold+italic,
+    /// H4-H6 italic — modifier-only (no fg), markers stay stripped.
+    #[test]
+    fn heading_hierarchy_h1_to_h4() {
+        let lines = render_markdown("# H1\n\n## H2\n\n### H3\n\n#### H4");
+        let cases = [
+            ("H1", Modifier::BOLD | Modifier::UNDERLINED),
+            ("H2", Modifier::BOLD),
+            ("H3", Modifier::BOLD | Modifier::ITALIC),
+            ("H4", Modifier::ITALIC),
+        ];
+        for (text, mods) in cases {
+            let line = find_line(&lines, text);
+            assert!(
+                line.style.add_modifier.contains(mods),
+                "{text} must carry {mods:?}, got {:?}",
+                line.style
+            );
+            // Modifier-only styling: no fg color on any level, so NO_COLOR
+            // degradation is structural (nothing to strip).
+            assert_eq!(line.style.fg, None, "{text} must carry no fg color");
+        }
+    }
+
+    /// (b) Unordered bullets render as `• ` (codex/hermes glyph).
+    #[test]
+    fn unordered_bullets_use_bullet_glyph() {
+        let lines = render_markdown("- One\n- Two");
+        assert_eq!(line_text(&lines[0]), "\u{2022} One");
+        assert_eq!(line_text(&lines[1]), "\u{2022} Two");
+        for l in &lines {
+            for s in &l.spans {
+                assert!(
+                    !s.content.contains("- "),
+                    "no dash marker may remain: {s:?}"
+                );
+            }
+        }
+    }
+
+    /// (b) Ordered `{n}. ` markers are untouched by the bullet swap.
+    #[test]
+    fn ordered_list_markers_unchanged() {
+        let lines = render_markdown("1. First");
+        assert_eq!(line_text(&lines[0]), "1. First");
+        let marker = &lines[0].spans[0];
+        assert_eq!(marker.content.as_ref(), "1. ");
+        assert_eq!(
+            marker.style.fg,
+            Some(ratatui::style::Color::LightBlue),
+            "ordered marker keeps the vendored light-blue"
+        );
+    }
+
+    /// (b) Nested-list indentation is preserved by the glyph swap (the
+    /// vendored renderer flattens 2-space nesting to siblings — pinned).
+    #[test]
+    fn nested_bullet_indent_preserved() {
+        let lines = render_markdown("- Top\n  - Nested");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            vec!["\u{2022} Top".to_string(), "\u{2022} Nested".to_string()]
+        );
+    }
+
+    /// (d) Standalone rule renders as dim em-dash x3 with exactly one blank
+    /// line before and after (join-supplied), never `---`.
+    #[test]
+    fn hr_renders_em_dash_rule_dim() {
+        let lines = render_markdown("Above\n\n---\n\nBelow");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Above".to_string(),
+                String::new(),
+                "\u{2014}\u{2014}\u{2014}".to_string(),
+                String::new(),
+                "Below".to_string()
+            ]
+        );
+        let rule = find_line(&lines, "\u{2014}\u{2014}\u{2014}");
+        if std::env::var("NO_COLOR").is_err() {
+            assert_eq!(rule.style.fg, Some(ratatui::style::Color::DarkGray));
+            assert!(rule.style.add_modifier.contains(Modifier::DIM));
+        }
+    }
+
+    /// (d)/(h) HR intercept degradation: plain Reset style under NO_COLOR;
+    /// only exact single-line breaks intercept (`***`/`___` yes; 4-space
+    /// indented code and setext `Title\n---` no).
+    #[test]
+    fn hr_no_color_renders_plain_reset() {
+        let lines = render_rule_block_with("---", true).expect("rule");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "\u{2014}\u{2014}\u{2014}");
+        assert_eq!(lines[0].style, ratatui::style::Style::default());
+        for form in ["***", "___"] {
+            assert!(
+                render_rule_block_with(form, true).is_some(),
+                "{form} is a break"
+            );
+        }
+        assert!(
+            render_rule_block_with("    ---", true).is_none(),
+            "indented code"
+        );
+        assert!(
+            render_rule_block_with("Title\n---", true).is_none(),
+            "setext H2"
+        );
+    }
+
+    /// (f) Strikethrough parses (vendored pulldown-cmark
+    /// ENABLE_STRIKETHROUGH) and renders with the CROSSED_OUT modifier,
+    /// markers stripped.
+    #[test]
+    fn strikethrough_enabled_pin() {
+        let lines = render_markdown("Hello ~~gone~~ world");
+        let text = extract_text(&lines);
+        assert_eq!(text, "Hello gone world");
+        assert!(!text.contains('~'), "tildes must be stripped: {text:?}");
+        let struck = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.as_ref() == "gone")
+            .expect("struck span");
+        assert!(
+            struck.style.add_modifier.contains(Modifier::CROSSED_OUT),
+            "gone must be crossed out, got {:?}",
+            struck.style
+        );
+    }
+
+    /// (g) Blockquote freeze: `>` prefix kept, body preserved, deliberately
+    /// plain styling (no fg anywhere — pins NoMarkerStyleSheet::blockquote).
+    #[test]
+    fn blockquote_rendering_pin() {
+        let lines = render_markdown("> quoted text");
+        assert_eq!(lines.len(), 1, "single quote line, got {lines:?}");
+        let line = &lines[0];
+        assert_eq!(line_text(line), "> quoted text");
+        assert_eq!(line.spans[0].content.as_ref(), ">");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "quoted text");
+        assert_eq!(line.style.fg, None, "blockquote stays plain (style freeze)");
+        for s in &line.spans {
+            assert_eq!(s.style.fg, None, "no fg on quote spans");
+        }
+    }
+
+    /// (c) Link label keeps the accent+underline style; the renderer's
+    /// appended ` (url)` destination is stripped (deliberate divergence).
+    #[test]
+    fn link_label_underlined_no_url() {
+        let lines = render_markdown("See [docs](https://example.com) now");
+        let text = extract_text(&lines);
+        assert_eq!(text, "See docs now", "destination must be stripped");
+        let label = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.as_ref() == "docs")
+            .expect("label span");
+        assert!(
+            label.style.add_modifier.contains(Modifier::UNDERLINED),
+            "label must be underlined, got {:?}",
+            label.style
+        );
+        // Env-independent equality: the render path computes the style with
+        // the same function this assertion uses.
+        assert_eq!(label.style, crate::tui::theme::markdown_link_style());
+    }
+
+    /// (h) Link style degradation seams: underline-only (no fg) under
+    /// NO_COLOR, accent+underline otherwise.
+    #[test]
+    fn link_no_color_degrades_to_underline_only() {
+        let degraded = crate::tui::theme::markdown_link_style_with(true);
+        assert_eq!(degraded.fg, None, "NO_COLOR must drop the accent color");
+        assert!(degraded.add_modifier.contains(Modifier::UNDERLINED));
+
+        let colored = crate::tui::theme::markdown_link_style_with(false);
+        assert_eq!(colored.fg, Some(ratatui::style::Color::Rgb(90, 143, 110)));
+        assert!(colored.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    /// (e) Gap rhythm: exactly one blank line between different-kind blocks.
+    #[test]
+    fn gap_rhythm_exactly_one_blank_between_kinds() {
+        let lines = render_markdown("Para.\n\n- Item\n\n> Quote");
+        let blankness: Vec<bool> = lines.iter().map(is_blank_line).collect();
+        assert_eq!(
+            blankness,
+            vec![false, true, false, true, false],
+            "para/blank/list/blank/quote, got {blankness:?}"
+        );
+    }
+
+    /// (e) No two consecutive blank lines across a rule join chain.
+    #[test]
+    fn no_double_blank_at_joins_with_rule() {
+        let lines = render_markdown("Above\n\n---\n\nBelow\n\n- x");
+        let blankness: Vec<bool> = lines.iter().map(is_blank_line).collect();
+        // Above/blank/rule/blank/Below — then Below→list is itself a
+        // different-kind join and gets its own single blank.
+        assert_eq!(
+            blankness,
+            vec![false, true, false, true, false, true, false]
+        );
+        for w in blankness.windows(2) {
+            assert!(!(w[0] && w[1]), "double blank at join: {blankness:?}");
+        }
+    }
+
+    /// (e) Same-kind adjacency keeps current behavior (no inserted gap).
+    #[test]
+    fn same_kind_adjacency_keeps_current_behavior() {
+        let lines = render_markdown("First.\n\nSecond.");
+        assert_eq!(lines.len(), 2, "no gap between same-kind blocks");
+        assert!(!is_blank_line(&lines[0]) && !is_blank_line(&lines[1]));
+    }
+
+    /// (b) Fenced code content is byte-identical — the bullet swap never
+    /// touches fence bodies (they intercept before the tui-markdown path).
+    #[test]
+    fn fence_content_untouched_by_bullet_rewrite() {
+        let lines = render_markdown("```\n- item one\n- item two\n```\n\n- Real");
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            texts.contains(&"- item one".to_string()) && texts.contains(&"- item two".to_string()),
+            "fence body must stay byte-identical, got {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("\u{2022} item")),
+            "bullet swap must not reach fence body"
+        );
+        assert!(
+            texts.iter().any(|t| t == "\u{2022} Real"),
+            "real list outside the fence still gets the glyph, got {texts:?}"
         );
     }
 }

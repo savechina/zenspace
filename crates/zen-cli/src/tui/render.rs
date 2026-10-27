@@ -72,6 +72,11 @@ fn unwrap_md_table_fence(content: &str) -> &str {
 /// Handles headings (`#`), code fences (` ``` `), list items (`- `, `* `, `+ `, `N. `),
 /// blockquotes (`>`), and table rows (`|`). Respects inline code boundaries and avoids
 /// false positives like `this - that` being turned into list items.
+///
+/// Rendered gap rhythm (exactly one blank line between different-kind
+/// blocks, never two consecutive blanks) is enforced later, at block-join
+/// assembly in `tui/markdown.rs` (`join_block_lines`); this function only
+/// guarantees that block boundaries exist for the splitter.
 pub fn normalize_compact_markdown(content: &str) -> String {
     // W4b: whole-content ```md fence containing a table → strip fence so
     // tui-markdown renders a native table instead of a code block.
