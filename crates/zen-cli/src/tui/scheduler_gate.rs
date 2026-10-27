@@ -182,7 +182,15 @@ pub(crate) fn spawn(config: &ZenConfig) {
         // BEFORE dropping the lease so the daemon's Full profile takes over
         // without double-firing cron workers.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        #[cfg(not(feature = "shuttle"))]
         let scheduler_task = tokio::spawn(scheduler.run_with_shutdown(shutdown_rx));
+        #[cfg(feature = "shuttle")]
+        let scheduler_task = {
+            // zen-agents' scheduler takes a real-tokio watch receiver; the
+            // DST build never drives the in-app scheduler loop.
+            let _ = (&scheduler, shutdown_rx);
+            tokio::spawn(async {})
+        };
         let watcher = spawn_yield_watcher(shutdown_tx);
         let _ = scheduler_task.await;
         watcher.abort();

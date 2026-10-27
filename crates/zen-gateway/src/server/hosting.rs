@@ -1842,3 +1842,286 @@ mod tests {
         }
     }
 }
+
+// ── FR-009 DST (bbtree Guard-3): turn-terminal race sweep ─
+// The three-completer race (execution / client cancel / watchdog) plus the
+// duplicate-registration mirror path, over the REAL Turn state machine
+// (`set_state`, `claim_terminal_audit`, `release_done`,
+// `TurnRegistry::insert_if_absent`) and the production outcome-match
+// skeleton. The watchdog deadline is modeled with shuttle's explicit
+// timeout trigger (its timeouts never fire on their own). Under every
+// schedule: exactly one started audit, exactly one terminal audit
+// ("double emission is impossible by construction" — pinned, not
+// assumed), a terminal state, a released done watch, and a race loser
+// that always resolves.
+#[cfg(all(test, feature = "shuttle"))]
+mod dst_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct RacePlan {
+        name: &'static str,
+        exec_steps: ExecPace,
+        cancel_after: Option<usize>,
+        watchdog_after: Option<usize>,
+        duplicate: bool,
+    }
+
+    /// Executor pacing: N cooperative yields then a response, or never
+    /// resolving at all (the hung-LLM shape the watchdog exists for).
+    #[derive(Clone, Copy)]
+    enum ExecPace {
+        Steps(usize),
+        Never,
+    }
+
+    async fn run_schedule(plan: RacePlan, seed: u64) {
+        let registry = Arc::new(TurnRegistry {
+            turns: StdMutex::new(HashMap::new()),
+            permits: StdMutex::new(HashMap::new()),
+        });
+        let record = Arc::new(Turn::new("turn-dst".into(), "sess".into()));
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mirrored = Arc::new(StdMutex::new(None::<String>));
+        let response = "the answer".to_string();
+
+        // Duplicate-registration racer: production mirror arm verbatim —
+        // insert, and on losing subscribe to the winner's done watch,
+        // wait for release, then read the final response.
+        if plan.duplicate {
+            let registry2 = Arc::clone(&registry);
+            let record2 = Arc::new(Turn::new("turn-dst".into(), "sess".into()));
+            let mirrored2 = Arc::clone(&mirrored);
+            tokio::task::spawn(async move {
+                tokio::task::yield_now().await;
+                if let Some(existing) = registry2.insert_if_absent(record2) {
+                    if !existing.state().is_terminal() {
+                        let mut done = existing.done_tx.subscribe();
+                        while !*done.borrow_and_update() {
+                            if done.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    *mirrored2.lock().unwrap() = existing.final_response();
+                }
+            });
+        }
+
+        // Registered-execution audit: fires exactly once per winner (T054).
+        if registry.insert_if_absent(Arc::clone(&record)).is_none() {
+            started.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Watchdog racer: yields then advances shuttle's virtual clock so
+        // the deadline fires mid-race (or never, when not armed).
+        if let Some(steps) = plan.watchdog_after {
+            tokio::task::spawn(async move {
+                for _ in 0..steps {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::trigger_timeouts(|_| true);
+            });
+        }
+
+        // Approval-broker stand-in: requests cancellation after N yields.
+        if let Some(steps) = plan.cancel_after {
+            let cancel_record = Arc::clone(&record);
+            tokio::task::spawn(async move {
+                for _ in 0..steps {
+                    tokio::task::yield_now().await;
+                }
+                cancel_record.request_cancel();
+            });
+        }
+
+        // Execution future (dropped mid-flight when a completer wins —
+        // that cancellation-safety is part of the race).
+        let exec = async move {
+            match plan.exec_steps {
+                ExecPace::Steps(n) => {
+                    for _ in 0..n {
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(response)
+                }
+                ExecPace::Never => {
+                    let () = std::future::pending().await;
+                    Err(())
+                }
+            }
+        };
+
+        let cancel_record = Arc::clone(&record);
+        let cancelled = async move {
+            loop {
+                cancel_record.notify_cancel.notified().await;
+                if cancel_record.is_cancelled() {
+                    break;
+                }
+            }
+        };
+
+        let raced = async {
+            tokio::select! {
+                res = exec => Ok(res),
+                () = cancelled => Err(CancelReason::Client),
+            }
+        };
+        let watchdog = std::time::Duration::from_secs(900);
+        let outcome = tokio::time::timeout(watchdog, raced).await;
+
+        // Production outcome-match skeleton: every terminal arm routes
+        // through set_state + claim_terminal_audit + release_done.
+        match outcome {
+            Ok(Ok(Ok(resp))) => {
+                record.set_state(TurnState::Completed);
+                *lock_ok(&record.response, "response lock") = Some(resp);
+                if record.claim_terminal_audit() {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+                release_done(&record);
+            }
+            Ok(Ok(Err(_))) => {
+                record.set_state(TurnState::Completed);
+                if record.claim_terminal_audit() {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+                release_done(&record);
+            }
+            Ok(Err(_reason)) => {
+                record.set_state(TurnState::Cancelled);
+                if record.claim_terminal_audit() {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+                release_done(&record);
+            }
+            Err(_elapsed) => {
+                record.emit_structural(
+                    "turn_error",
+                    json!({ "code": -32020, "message": "watchdog timeout" }),
+                );
+                record.set_state(TurnState::Cancelled);
+                if record.claim_terminal_audit() {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+                release_done(&record);
+            }
+        }
+
+        // ── Invariants under every schedule ──
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "started audit must fire exactly once, seed={seed} plan={}",
+            plan.name
+        );
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "terminal audit must fire exactly once, seed={seed} plan={}",
+            plan.name
+        );
+        assert!(
+            record.state().is_terminal(),
+            "turn must end terminal, seed={seed} plan={}",
+            plan.name
+        );
+        assert!(
+            lock_ok(&record.terminal_at, "terminal-at lock").is_some(),
+            "terminal_at must be stamped once, seed={seed} plan={}",
+            plan.name
+        );
+        assert!(
+            *record.done_tx.subscribe().borrow(),
+            "done watch must be released, seed={seed} plan={}",
+            plan.name
+        );
+        if plan.duplicate {
+            assert_eq!(
+                *mirrored.lock().unwrap(),
+                record.final_response(),
+                "duplicate must mirror the winner's response, seed={seed} plan={}",
+                plan.name
+            );
+        }
+    }
+
+    /// Sweep: 8 race plans × 40 seeded schedules. A sweep failure is a
+    /// real terminal-race bug (double audit, lost done release, hung
+    /// race loser) — shuttle panics `deadlock` on lost progress.
+    #[test]
+    fn dst_turn_terminal_race_sweep() {
+        let plans = vec![
+            RacePlan {
+                name: "exec-only",
+                exec_steps: ExecPace::Steps(2),
+                cancel_after: None,
+                watchdog_after: None,
+                duplicate: false,
+            },
+            RacePlan {
+                name: "cancel-before-exec",
+                exec_steps: ExecPace::Steps(3),
+                cancel_after: Some(0),
+                watchdog_after: None,
+                duplicate: false,
+            },
+            RacePlan {
+                name: "cancel-after-exec",
+                exec_steps: ExecPace::Steps(1),
+                cancel_after: Some(5),
+                watchdog_after: None,
+                duplicate: false,
+            },
+            RacePlan {
+                name: "exec-never-watchdog",
+                exec_steps: ExecPace::Never,
+                cancel_after: None,
+                watchdog_after: Some(2),
+                duplicate: false,
+            },
+            RacePlan {
+                name: "watchdog-early",
+                exec_steps: ExecPace::Steps(4),
+                cancel_after: None,
+                watchdog_after: Some(0),
+                duplicate: false,
+            },
+            RacePlan {
+                name: "all-three",
+                exec_steps: ExecPace::Steps(2),
+                cancel_after: Some(1),
+                watchdog_after: Some(3),
+                duplicate: false,
+            },
+            RacePlan {
+                name: "duplicate-exec",
+                exec_steps: ExecPace::Steps(2),
+                cancel_after: None,
+                watchdog_after: None,
+                duplicate: true,
+            },
+            RacePlan {
+                name: "duplicate-chaos",
+                exec_steps: ExecPace::Steps(3),
+                cancel_after: Some(1),
+                watchdog_after: Some(4),
+                duplicate: true,
+            },
+        ];
+        for plan in &plans {
+            for seed in 0..40u64 {
+                let scheduler = shuttle::scheduler::RandomScheduler::new_from_seed(seed, 1);
+                let runner = shuttle::Runner::new(scheduler, shuttle::Config::new());
+                let plan = plan.clone();
+                runner.run(move || {
+                    let plan = plan.clone();
+                    shuttle::future::block_on(run_schedule(plan, seed));
+                });
+            }
+        }
+    }
+}

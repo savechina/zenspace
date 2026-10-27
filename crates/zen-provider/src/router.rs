@@ -78,10 +78,21 @@ where
                                     "secrets guard: unmapped placeholder tokens left visible"
                                 );
                             }
+                            // A done signal may already be queued even though
+                            // the frame channel closed in the same poll
+                            // instant (producer: last frames + done-send +
+                            // close in one schedule step). The biased select
+                            // reaches this arm first — so DRAIN the real
+                            // queued result before synthesizing an Err, or a
+                            // legitimate Ok would be silently overwritten.
+                            let drained = inner_done_rx.try_recv().ok();
                             if let Some(done_tx) = pending_done.take() {
-                                let _ = done_tx.send(Err(
-                                    "stream closed before done signal".into(),
-                                ));
+                                let _ = match drained {
+                                    Some(res) => done_tx.send(res),
+                                    None => done_tx.send(Err(
+                                        "stream closed before done signal".into(),
+                                    )),
+                                };
                             }
                             break;
                         }
@@ -1784,6 +1795,150 @@ pub fn is_local_llm_available(router: &dyn LlmRouter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── FR-042 DST (bbtree Guard-3 pattern): deterministic schedule sweep ─
+    // Feature-gated (`--features shuttle`): shuttle swaps tokio primitives
+    // for seeded deterministic ones; feature OFF = pure re-export, zero
+    // production change. Every schedule reruns the whole test body, so the
+    // frame set stays small (bbtree design rule: "the tests keep their
+    // trees and threads small").
+    #[cfg(feature = "shuttle")]
+    mod dst_tests {
+        use crate::stream::StreamResponse;
+        use zen_core::secrets_guard::SecretMap;
+        use zen_core::secrets_guard::redact;
+
+        /// One schedule: producer streams the pre-redacted reply in fixed
+        /// frames (cuts inside BOTH placeholder tokens — exercises the
+        /// frame-boundary carry), forwarder restores under shuttle-control-
+        /// led interleavings, collector joins the emit stream. Returns
+        /// (joined output, done result).
+        async fn run_schedule(
+            _reply: String,
+            frames: Vec<String>,
+            map: SecretMap,
+            done_before_close: bool,
+        ) -> (String, Result<(), String>) {
+            let (resp, token_tx, done_tx) = StreamResponse::new();
+            let _ = token_tx; // caller-side dup dropped — matches production
+            let mut rx = resp.token_rx;
+            let done_rx = resp.done_rx;
+
+            let collector = tokio::task::spawn(async move {
+                let mut acc = String::new();
+                while let Some(tok) = rx.recv().await {
+                    acc.push_str(&tok);
+                }
+                acc
+            });
+
+            let Result::Ok(_resp) = super::guarded_stream_call(
+                move |inner_tx, inner_done| async move {
+                    for f in frames {
+                        let _ = inner_tx.send(f);
+                    }
+                    if done_before_close {
+                        // done signal while the frame channel is still open:
+                        // forwarder's done arm forwards Ok, keeps draining;
+                        // the None arm (channel close at future end) then
+                        // finalizes the trailing carry and breaks. The yield
+                        // makes "close" a LATER schedule instant than "done"
+                        // (real providers await between them; without an
+                        // await point the two coincide and the None arm
+                        // always wins — which is the false-ordering case).
+                        let _ = inner_done.send(Ok(()));
+                        tokio::task::yield_now().await;
+                    }
+                    // done_before_close=false ⇒ producer ends WITHOUT a done
+                    // signal: None arm synthesizes Err + finalize tail.
+                },
+                token_tx,
+                done_tx,
+                map,
+            ) else {
+                unreachable!("guarded_stream_call returns Ok")
+            };
+
+            let acc = collector
+                .await
+                .unwrap_or_else(|e| panic!("collector panicked: {e}"));
+            let done = done_rx
+                .await
+                .unwrap_or_else(|e| Err(format!("done channel closed: {e}")));
+            (acc, done)
+        }
+
+        /// Fixed ~8-byte char-boundary chunking of the redacted reply —
+        /// chunk width chosen so every placeholder token (⟦ + SECRET_ + n
+        /// + ⟧ ≈ 12 bytes) is cut mid-token at least once per fixture,
+        ///
+        /// exercising the frame-boundary carry deterministically.
+        fn split_frames(text: &str) -> Vec<String> {
+            let mut cuts = vec![0usize];
+            let mut last = 0usize;
+            for (i, _) in text.char_indices() {
+                if i - last >= 8 {
+                    cuts.push(i);
+                    last = i;
+                }
+            }
+            cuts.push(text.len());
+            cuts.windows(2)
+                .filter(|w| w[0] < w[1])
+                .map(|w| text[w[0]..w[1]].to_string())
+                .collect()
+        }
+
+        /// Sweep: both producer done/close orders × 100 seeded random
+        /// schedules each. Shuttle panics `deadlock` on lost progress and
+        /// hits MaxSteps on livelock — the sweep failing = a real race.
+        #[test]
+        fn dst_guarded_stream_schedule_sweep() {
+            let reply =
+                "found key ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij and AKIAIOSFODNN7EXAMPLE end"
+                    .to_string();
+            let whole = redact(&reply, &[]);
+            let frames = split_frames(&whole.text);
+            assert!(
+                frames.len() >= 5,
+                "fixture must produce multiple frames, got {}",
+                frames.len()
+            );
+
+            for done_first in [false, true] {
+                for seed in 0..100u64 {
+                    let reply = reply.clone();
+                    let frames = frames.clone();
+                    let map = whole.map.clone();
+                    let scheduler = shuttle::scheduler::RandomScheduler::new_from_seed(seed, 1);
+                    let runner = shuttle::Runner::new(scheduler, shuttle::Config::new());
+                    runner.run(move || {
+                        shuttle::future::block_on(async {
+                            let (acc, done) = run_schedule(
+                                reply.clone(),
+                                frames.clone(),
+                                map.clone(),
+                                done_first,
+                            )
+                            .await;
+                            assert_eq!(
+                                acc, reply,
+                                "schedule divergence: seed={seed} done_first={done_first}"
+                            );
+                            if done_first {
+                                assert!(done.is_ok(), "done-first lost Ok signal, got {done:?}");
+                            } else {
+                                assert!(
+                                    done.is_err(),
+                                    "close-first must synthesize Err, got {done:?}"
+                                );
+                            }
+                        });
+                    });
+                }
+            }
+        }
+    }
 
     // ── FR-042 Secrets Guard: local-skip + cloud-active decision pins ─────
 

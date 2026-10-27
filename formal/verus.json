@@ -1,0 +1,10 @@
+{
+  "$comment": "Verus toolchain pin (vest pattern: install is script-pinned, never floating). bin/verify and .github/workflows/verify.yml both read this file. Bump = edit here + re-verify formal/ + re-run bin/test.",
+  "version": "0.2026.10.18.7d82994",
+  "vstd": "=0.0.0-2026-10-18-0147",
+  "rustup_toolchain": "1.99.1",
+  "release_url": "https://github.com/verus-lang/verus/releases/download/release/0.2026.10.18.7d82994",
+  "asset_sha256": {
+    "verus-0.2026.10.18.7d82994-arm64-macos.zip": "3fc56c58277b5f0999368f7b3a2b07ba4eb9ec2965454ce7a9f2769c0464d32b"
+  }
+}

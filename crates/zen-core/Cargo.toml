@@ -40,3 +40,17 @@ test-support = []
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+# Verus (bbtree Guard-3 Wave B): ghost/proof layer lives in tests/
+# (formal_placeholder.rs mounts the REAL src file via #[path]) — test
+# targets never enter the production dependency graph, so vstd stays a
+# pure test-time cost.
+vstd = { version = "=0.0.0-2026-10-18-0147" }
+
+# Verus (bbtree Guard-3 Wave B): whole-crate opt-in — `cargo verus verify -p
+# zen-core` runs the verifier; plain cargo build/clippy/test still compile
+# the same sources (ghost items are cfg-erased under verus_keep_ghost).
+[package.metadata.verus]
+verify = true
+
+[lints]
+workspace = true

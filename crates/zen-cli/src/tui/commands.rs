@@ -519,7 +519,7 @@ Use /thinking to show/hide thinking process."#;
         }
         // contracts/04 P2: /search rides knowledge/search on the daemon.
         let query_owned = query.to_string();
-        let outcome = tokio::task::block_in_place(|| {
+        let outcome = crate::runtime_util::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 // Ensure a gateway is up (connect-or-embed / spawn),
                 // preserving the pre-existing connection policy. The surface
@@ -583,7 +583,7 @@ Use /thinking to show/hide thinking process."#;
             }
         };
         use zen_vault::note::NoteService;
-        match tokio::task::block_in_place(|| {
+        match crate::runtime_util::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(NoteService::new().create_note(
                 content,
                 vec![],
@@ -614,7 +614,7 @@ Use /thinking to show/hide thinking process."#;
         use zen_core::paths::ZenPaths;
         use zen_vault::distill::DistillationPipeline;
         if let Ok(paths) = ZenPaths::detect() {
-            let result = tokio::task::block_in_place(|| {
+            let result = crate::runtime_util::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(DistillationPipeline::new().run(&paths.inbox(), &paths.wiki()))
             });

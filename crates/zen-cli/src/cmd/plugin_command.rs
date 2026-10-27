@@ -665,7 +665,7 @@ fn execute_mcp_command(operation: &McpCommands) -> Result<(), ZenError> {
             );
 
             let server_clone = server.clone();
-            let result = tokio::task::block_in_place(|| {
+            let result = crate::runtime_util::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(
                     zen_plugin::tools::mcp_client::reconnect_mcp_server(&server_clone),
                 )

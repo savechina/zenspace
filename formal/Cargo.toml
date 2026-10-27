@@ -1,0 +1,36 @@
+[workspace]
+# Intentionally a lone workspace — parked OUTSIDE the zenspace members so
+# no normal build path ever compiles it.
+
+[package]
+name = "zen-formal"
+version = "0.0.9"
+edition = "2024"
+publish = false
+description = "Verus-verified contracts for the Secrets Guard grammar (not a workspace member — compiled only by the verification workflow)"
+
+# Deliberately NO dependencies beyond dev-gated vstd: any path-dependency
+# would drag that crate's whole compile graph through the verus wrapper
+# (cargo-verus checks every compiled crate, requiring each lib root to
+# import vstd). Proof modules here are std-only file mounts — the runtime
+# congruence between verified reference fns and the REAL implementation
+# is pinned by the plain-cargo test in crates/zen-core/tests/.
+
+# Verus (bbtree Guard-3 Wave B) — compiled ONLY by the verification
+# workflow; since this whole crate is out-of-workspace, the prod graph
+# does not see vstd at all.
+[dependencies]
+vstd = { version = "=0.0.0-2026-10-18-0147" }
+
+# Sidecar crate: vstd cfgs fire in verus-mode here; unexpected_cfgs would
+# fail any rustc that scanned this — declare them locally.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(verus_only)',
+  'cfg(verus_keep_ghost)',
+  'cfg(verus_verify_core)',
+  'cfg(verus_keep_ghost_body)',
+] }
+
+[package.metadata.verus]
+verify = true

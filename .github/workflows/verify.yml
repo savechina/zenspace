@@ -1,0 +1,64 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # bbtree Guard-3 gate (T274): Verus proofs + deterministic simulation
+  # sweeps + runtime congruence pins. Local equivalent: bin/verify.
+  # Toolchain pin lives in formal/verus.json (vest pattern: version-pinned
+  # binary release, never a floating cargo install).
+  formal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Install pinned Verus toolchain
+        run: |
+          PIN=$(python3 -c "import json;print(json.load(open('formal/verus.json'))['version'])")
+          TOOLCHAIN=$(python3 -c "import json;print(json.load(open('formal/verus.json'))['rustup_toolchain'])")
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          curl -fsSL "https://github.com/verus-lang/verus/releases/download/release/${PIN}/verus-${PIN}-x86-linux.zip" -o /tmp/verus.zip
+          mkdir -p "$HOME/.verus"
+          unzip -o /tmp/verus.zip -d "$HOME/.verus"
+          echo "$HOME/.verus" >> "$GITHUB_PATH"
+      - name: Verify version pin
+        run: |
+          PIN=$(python3 -c "import json;print(json.load(open('formal/verus.json'))['version'])")
+          verus --version 2>&1 | grep -q "$PIN"
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify
+          cache-on-failure: true
+      - name: Verus proofs (formal/ sidecar)
+        run: cargo verus verify --manifest-path formal/Cargo.toml
+      - name: Runtime congruence pin
+        run: cargo test -p zen-core --test formal_placeholder
+
+  dst:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dst
+          cache-on-failure: true
+      # Deterministic schedule sweeps (shuttle): FR-009 TUI forwarder,
+      # hosting turn-terminal race, FR-042 streaming forwarder. Feature
+      # OFF builds stay byte-identical; these runs compile the shuttle
+      # feature on per crate.
+      - name: TUI forwarder sweep (zen-cli)
+        run: cargo test -p zen-cli --features shuttle --lib dst_
+      - name: Turn-terminal race sweep (zen-gateway)
+        run: cargo test -p zen-gateway --features shuttle --lib dst_
+      - name: Streaming forwarder sweep (zen-provider)
+        run: cargo test -p zen-provider --features shuttle --lib dst_
+      - name: Frame-split differential pin
+        run: cargo test -p zen-core --lib differential_split

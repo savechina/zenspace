@@ -18,7 +18,10 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# FR-009 DST: feature OFF = shuttle-tokio re-exports real tokio
+# byte-identically; feature ON swaps in shuttle primitives for the dst_
+# schedule sweeps (bbtree Guard-3).
+tokio = { package = "shuttle-tokio", version = "1", features = ["full"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
@@ -35,3 +38,7 @@ rig-mcp = { workspace = true }
 # test-support feature makes user_root() read ZEN_HOME fresh + temp-fallback.
 zen-core = { path = "../zen-core", features = ["test-support"] }
 tempfile = { workspace = true }
+shuttle = "0.9.8"
+
+[features]
+shuttle = ["tokio/shuttle"]

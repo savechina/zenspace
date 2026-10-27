@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euo pipefail
+set -x
+
+# bbtree Guard-3 verification gate: Verus proofs + deterministic simulation
+# + runtime congruence pins, in one command. Layers:
+#   (default)    full gate: verus → dst → pins
+#   --verus-only just the Verus proof pass (local opt-in; slower toolchain)
+#
+# Toolchain pin: formal/verus.json (version + vstd + sha256). Install once:
+#   release zip from the pinned URL → ~/.verus, plus `rustup toolchain
+#   install <pinned>`; PATH must include ~/.verus for cargo-verus.
+cd "$(dirname "$0")/.."
+
+PIN_VERSION=$(python3 -c "import json;print(json.load(open('formal/verus.json'))['version'])")
+
+verus_gate() {
+    export PATH="$HOME/.verus:$PATH"
+    command -v verus >/dev/null || {
+        echo "verus not found — install per formal/verus.json (or skip: proofs are opt-in)" >&2
+        return 1
+    }
+    verus --version 2>&1 | grep -q "$PIN_VERSION" || {
+        echo "verus version mismatch: want $PIN_VERSION, got '$(verus --version 2>&1)'" >&2
+        return 1
+    }
+    cargo verus verify --manifest-path formal/Cargo.toml
+}
+
+dst_gate() {
+    # Tier 1: FR-009 TUI event forwarder (broadcast feed + stop race +
+    # drain grace + lag repair), 250 schedules.
+    cargo test -p zen-cli --features shuttle --lib dst_
+    # Tier 2a: hosting turn-terminal race (3 completers + duplicate
+    # mirror), 320 schedules.
+    cargo test -p zen-gateway --features shuttle --lib dst_
+    # FR-042 wave: streaming forwarder done/close race, 200 schedules.
+    cargo test -p zen-provider --features shuttle --lib dst_
+}
+
+pins_gate() {
+    # Verified reference impl == runtime SecretMap grammar (plain cargo).
+    cargo test -p zen-core --test formal_placeholder
+    # Exhaustive frame-split differential (~9000 timelines): incremental
+    # restore == whole-string restore for every chunking.
+    cargo test -p zen-core --lib differential_split
+}
+
+case "${1:-all}" in
+--verus-only)
+    verus_gate
+    ;;
+all)
+    verus_gate
+    dst_gate
+    pins_gate
+    echo "✅ verify gate green: verus + dst sweeps + congruence pins"
+    ;;
+*)
+    echo "usage: bin/verify [--verus-only]" >&2
+    exit 2
+    ;;
+esac

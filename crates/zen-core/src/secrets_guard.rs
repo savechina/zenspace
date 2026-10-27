@@ -1011,6 +1011,111 @@ mod tests {
         );
     }
 
+    /// bbtree-style differential simulation (Guard-3 pattern): the whole
+    /// string restore is the REFERENCE; the incremental frame-boundary chain
+    /// is the SYSTEM UNDER TEST. For every char-boundary split position of
+    /// each fixture the downstream byte stream must be identical to the
+    /// reference — exhaustively proving the frame-boundary carry machinery
+    /// never loses, duplicates, or mangles a byte.
+    #[test]
+    fn differential_split_simulation_matches_whole_string_restore() {
+        let fixtures: Vec<&str> = vec![
+            "ok token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij in line",
+            "azure key sk-proj-abcDEF123xyzUVW789ghiMNO456pqrSTU012vwxYZA345678t3bLBLbkFJmnopQRS901tuvWXY234zabCDE567890",
+            "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c",
+            "aws AKIAIOSFODNN7EXAMPLE here",
+            "connect https://deploy:s3cr3tpw@vault.internal/x",
+            "auth Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAAMjAyNC0xMC0yNFQwMDowMDowMFo=\nexample-end\n-----END OPENSSH PRIVATE KEY-----",
+            "slack XOXB-1234567890-abcdefghijklmnop",
+            "npm_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8 tail",
+            "discord mta4nzy1ndmymta5odc2ntqz.gX8M2A.ABCDEFGHIJKLMNOPQRSTUVWXYZ1",
+            // multi-secret paragraph: order + dedup both exercised
+            "a ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij then AKIAIOSFODNN7EXAMPLE then same ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij again",
+            // corpus-priority path (config-resolved value)
+            "config key ZENCORPUSVALUE2024 mid-text",
+            // no-op: byte-identical passthrough
+            "nothing secret here at all — 中文 also passes through",
+        ];
+        let corpus = vec!["ZENCORPUSVALUE2024".to_string()];
+        for src in fixtures {
+            let whole = redact(src, &corpus);
+            let reference = restore(&whole.text, &whole.map);
+
+            // Invariant B (round-trip identity): restore(redact(s)) == s
+            // exactly, no invented leftovers.
+            assert_eq!(
+                reference.text, *src,
+                "round-trip identity violated on fixture"
+            );
+            assert!(
+                reference.leftovers.is_empty(),
+                "spurious leftover in round-trip: {:?}",
+                reference.leftovers
+            );
+
+            // Invariant A (exhaustive split simulation): every 2-way split
+            // position, plus every position of the fixture with the MOST
+            // frames (3-way), reproduces the reference byte stream.
+            let mut checked_splits = 0usize;
+            for i in 0..=src.len() {
+                if !src.is_char_boundary(i) {
+                    continue;
+                }
+                let (a, b) = (&src[..i], &src[i..]);
+                let (emit_acc, carry, leftovers_ok) = run_incremental_split(&[a, b], &whole.map);
+                let finalized = restore_finalize(&emit_acc.clone(), &carry, &whole.map);
+                assert_eq!(
+                    finalized.text,
+                    reference.text,
+                    "split@{i} diverges for fixture starting {:?}",
+                    &src[..src.len().min(24)]
+                );
+                assert_eq!(finalized.leftovers, reference.leftovers);
+                let _ = leftovers_ok;
+                checked_splits += 1;
+            }
+            assert!(checked_splits >= 2);
+
+            // 3-way exhaustive on the first fixture (extra interleaving
+            // pressure: two simultaneous carry windows).
+            let first = src.len();
+            for i in 0..=first {
+                if !src.is_char_boundary(i) {
+                    continue;
+                }
+                for j in i..=first {
+                    if !src.is_char_boundary(j) {
+                        continue;
+                    }
+                    let (emit_acc, carry, _) =
+                        run_incremental_split(&[&src[..i], &src[i..j], &src[j..]], &whole.map);
+                    let finalized = restore_finalize(&emit_acc, &carry, &whole.map);
+                    assert_eq!(
+                        finalized.text, reference.text,
+                        "3-way split@{i},{j} diverges"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Simulates the streaming forwarder chain over the given frames with
+    /// zero concurrency: each frame is joined with the carry, restored,
+    /// emit accumulated, carry propagated. Returns the accumulated emit
+    /// stream, the trailing carry, and always-true (padding for readability).
+    fn run_incremental_split(frames: &[&str], map: &SecretMap) -> (String, String, bool) {
+        let mut pending = String::new();
+        let mut carry = String::new();
+        for frame in frames {
+            let buffer = format!("{carry}{frame}");
+            let (emit, new_carry) = restore_incremental(&buffer, map);
+            pending.push_str(&emit);
+            carry = new_carry;
+        }
+        (pending, carry, true)
+    }
+
     #[test]
     fn oversized_input_redacts_without_bound_failure() {
         // 1 MB of innocuous text with a handful of secrets: the sweep must

@@ -190,8 +190,22 @@ pub(crate) fn prepare_inline_app(config: &'static zen_core::config::ZenConfig) -
     // when the gateway surface was opened. We consume it once here — the TUI
     // tick loop drains request_rx; the key handler sends on response_tx.
     if let Some(bridge) = super::prewarm::take_approval_bridge() {
-        app.approval_rx = Some(bridge.request_rx);
-        app.approval_tx = Some(bridge.response_tx);
+        #[cfg(not(feature = "shuttle"))]
+        {
+            app.approval_rx = Some(bridge.request_rx);
+            app.approval_tx = Some(bridge.response_tx);
+        }
+        #[cfg(feature = "shuttle")]
+        {
+            // The prewarm bridge hands back real-tokio channels; the DST
+            // build never drives the TUI tick, so satisfy the field types
+            // with local channels.
+            let _ = (bridge.request_rx, bridge.response_tx);
+            let (_req_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, _resp_rx) = tokio::sync::mpsc::unbounded_channel();
+            app.approval_rx = Some(rx);
+            app.approval_tx = Some(tx);
+        }
         tracing::debug!("approval bridge installed from prewarm");
     }
 
@@ -1271,6 +1285,14 @@ mod tests {
         // (the `start_async_chat` gateway producer) — a hosted turn can
         // take seconds. Abort the runtime instead; the asserts below
         // only need the app state the tick produced.
+        #[cfg(feature = "shuttle")]
+        {
+            // shuttle Runtime has no background shutdown (and is not a
+            // Drop type); the Layer-2 timing test is outside the DST gate
+            // (dst_ filter) and the binding only needs to be released.
+            let _ = rt;
+        }
+        #[cfg(not(feature = "shuttle"))]
         rt.shutdown_background();
 
         assert!(

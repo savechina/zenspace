@@ -8,7 +8,7 @@ description = "Multi-model provider connections using rig-core for zenspace"
 url.workspace = true
 zen-core = { path = "../zen-core" }
 zen-auth = { path = "../zen-auth" }
-tokio = { workspace = true }
+tokio = { package = "shuttle-tokio", version = "1", features = ["full"] }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,5 +33,12 @@ home = { workspace = true }
 workspace = true
 features = ["ort-load-dynamic"]
 
+[features]
+# FR-042 DST (bbtree Guard-3): feature OFF = shuttle-tokio re-exports real
+# tokio byte-identically; feature ON swaps in shuttle-compatible primitives
+# for deterministic schedule sweep of the guarded stream forwarder.
+shuttle = ["tokio/shuttle"]
+
 [dev-dependencies]
+shuttle = "0.9.8"
 tempfile = { workspace = true }

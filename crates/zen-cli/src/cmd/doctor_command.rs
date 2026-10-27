@@ -479,7 +479,7 @@ fn check_schema_compat() -> CheckResult {
     let db_path = paths.data().join("state.db");
     let probe = schema_compat_for_path(&db_path);
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(probe)),
+        Ok(handle) => crate::runtime_util::block_in_place(|| handle.block_on(probe)),
         Err(_) => match tokio::runtime::Runtime::new() {
             Ok(rt) => rt.block_on(probe),
             Err(e) => CheckResult {

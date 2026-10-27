@@ -229,22 +229,9 @@ impl App {
 
             match outcome {
                 Ok(response) => {
-                    // Live deltas already composed the response in the
-                    // collector; only the no-event fallback re-sends the full
-                    // text as one token (byte-identical to the prior behavior).
-                    if !saw_delta {
-                        let _ = tokens_tx.send(response.clone());
-                    } else if saw_lag && response.starts_with(deltas_prefix.as_str()) {
-                        // Lag repair: dropped deltas left the composed prefix
-                        // short of the authoritative response. Deltas arrive
-                        // in order, so the received prefix aligns with the
-                        // response for single-attempt turns; append only the
-                        // missing suffix (token-compose contract intact).
-                        let suffix = &response[deltas_prefix.len()..];
-                        if !suffix.is_empty() {
-                            let _ = tokens_tx.send(suffix.to_string());
-                        }
-                    } else if saw_lag {
+                    let (tokens, misaligned) =
+                        compose_response_tokens(saw_delta, saw_lag, &deltas_prefix, &response);
+                    if misaligned {
                         // Prefix misalignment (recovery re-stream / multi-
                         // attempt turns) — completion is not derivable; the
                         // visible partial content is what the turn produced.
@@ -253,6 +240,9 @@ impl App {
                             prefix_len = deltas_prefix.len(),
                             "lagged delta stream not prefix-aligned with the authoritative response; transcript may be incomplete"
                         );
+                    }
+                    for token in tokens {
+                        let _ = tokens_tx.send(token);
                     }
                     let _ = done_tx.send((Ok(response), Some(session)));
                 }
@@ -795,6 +785,38 @@ fn event_to_stream_token(turn_id: &str, ev: &TurnNotification) -> Option<String>
     }
 }
 
+/// FR-009: post-forwarder composition decision — given the forwarder's
+/// observed stream state (`saw_delta`, `saw_lag`, `deltas_prefix`) and the
+/// authoritative response, returns the tokens still owed to the transcript
+/// plus a misalignment flag (lag happened and the surviving delta prefix
+/// does not align with the response, so completion is not derivable).
+///
+/// Contract (DST-pinned, `dst_chat_forwarder_schedule_sweep`): the final
+/// transcript equals the authoritative response when no own deltas were
+/// observed, or when lag occurred and the surviving prefix aligns; in the
+/// remaining quadrants the transcript is the surviving delta prefix and
+/// nothing is invented. Pure; shared by the production turn task and the
+/// DST harness.
+fn compose_response_tokens(
+    saw_delta: bool,
+    saw_lag: bool,
+    deltas_prefix: &str,
+    response: &str,
+) -> (Vec<String>, bool) {
+    if !saw_delta {
+        (vec![response.to_string()], false)
+    } else if saw_lag && response.starts_with(deltas_prefix) {
+        let suffix = &response[deltas_prefix.len()..];
+        if suffix.is_empty() {
+            (Vec::new(), false)
+        } else {
+            (vec![suffix.to_string()], false)
+        }
+    } else {
+        (Vec::new(), saw_lag)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +931,312 @@ mod tests {
                 &ev("t1", "agent_status", serde_json::json!({"status": "busy"}))
             )
             .is_none()
+        );
+    }
+}
+
+// ── FR-009 DST (bbtree Guard-3 pattern): deterministic schedule sweep ─
+// Feature-gated (`--features shuttle`). The gateway event feed is modeled
+// over a REAL-tokio broadcast channel (executor-agnostic; the shuttle-tokio
+// broadcast impl is a stub) so lag arises from real capacity pressure; the
+// stop oneshot, the biased select and the drain-grace timeout are shuttle
+// primitives; the 200ms grace is advanced explicitly by the producer
+// (shuttle timeouts never fire on their own). Decision logic is the REAL
+// production code: `event_to_stream_token` + `compose_response_tokens`.
+#[cfg(all(test, feature = "shuttle"))]
+mod dst_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Quadrant-coverage counters: the sweep must actually reach the lag
+    /// and repair paths, not just the no-lag schedule family.
+    static LAG_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static REPAIR_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static MISALIGNED_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    fn delta(turn_id: &str, text: &str) -> TurnNotification {
+        TurnNotification {
+            turn_id: turn_id.to_string(),
+            seq: 1,
+            kind: "delta".to_string(),
+            payload: serde_json::json!({ "text": text }),
+        }
+    }
+
+    fn kind(turn_id: &str, kind: &str) -> TurnNotification {
+        TurnNotification {
+            turn_id: turn_id.to_string(),
+            seq: 1,
+            kind: kind.to_string(),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[derive(Clone)]
+    struct Scenario {
+        name: &'static str,
+        frames: Vec<TurnNotification>,
+        capacity: usize,
+        rpc_ok: bool,
+        response: &'static str,
+    }
+
+    fn scenarios() -> Vec<Scenario> {
+        let own = "turn-dst";
+        let other = "turn-other";
+        vec![
+            // Live deltas complete the transcript; composed adds nothing.
+            Scenario {
+                name: "normal-deltas-then-terminal",
+                frames: vec![
+                    delta(other, "FOREIGN"),
+                    delta(own, "a"),
+                    delta(own, "b"),
+                    kind(own, "turn_completed"),
+                ],
+                capacity: 16,
+                rpc_ok: true,
+                response: "ab",
+            },
+            // No own deltas reached the forwarder → full-response fallback.
+            Scenario {
+                name: "fallback-no-own-events",
+                frames: vec![delta(other, "FOREIGN"), kind(own, "turn_completed")],
+                capacity: 16,
+                rpc_ok: true,
+                response: "full text",
+            },
+            // Capacity-2 pressure: the forwarder lags behind the pump and
+            // must repair from the authoritative response.
+            Scenario {
+                name: "lag-pressure-aligned",
+                frames: vec![
+                    delta(own, "a"),
+                    delta(own, "b"),
+                    delta(own, "c"),
+                    delta(own, "d"),
+                    kind(own, "turn_completed"),
+                ],
+                capacity: 2,
+                rpc_ok: true,
+                response: "abcd",
+            },
+            // Recovery re-stream: surviving prefix never aligns with the
+            // authoritative response — nothing may be invented.
+            Scenario {
+                name: "lag-misaligned-restream",
+                frames: vec![
+                    delta(own, "a"),
+                    delta(own, "b"),
+                    kind(own, "turn_completed"),
+                ],
+                capacity: 1,
+                rpc_ok: true,
+                response: "zzz",
+            },
+            // Turn errors before any terminal event: drain-grace +
+            // channel-close must both terminate the forwarder.
+            Scenario {
+                name: "rpc-error-partial",
+                frames: vec![delta(own, "a")],
+                capacity: 4,
+                rpc_ok: false,
+                response: "",
+            },
+        ]
+    }
+
+    async fn run_schedule(sc: Scenario, seed: u64) {
+        let (btx, brx) = tokio_real::sync::broadcast::channel::<TurnNotification>(sc.capacity);
+        let mut events = brx;
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let fwd_token_tx = token_tx.clone();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<(bool, String)>();
+        let (rpc_tx, rpc_rx) = tokio::sync::oneshot::channel::<bool>();
+        let own = "turn-dst".to_string();
+
+        // Forwarder — faithful re-model of the production loop
+        // (start_async_chat, chat.rs turn task): biased select, stop-gate,
+        // bounded drain grace, foreign-turn filter, terminal break. The
+        // only modeled piece is the channel plumbing; the per-event
+        // decisions call the real `event_to_stream_token`.
+        let fwd_turn = own.clone();
+        let forwarder = tokio::task::spawn(async move {
+            let token_tx = fwd_token_tx;
+            let mut saw_delta = false;
+            let mut saw_lag = false;
+            let mut deltas_concat = String::new();
+            let mut stop_fired = false;
+            loop {
+                let received = if stop_fired {
+                    match tokio::time::timeout(EVENT_DRAIN_GRACE, events.recv()).await {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        out = events.recv() => out,
+                        _ = &mut stop_rx => {
+                            stop_fired = true;
+                            continue;
+                        }
+                    }
+                };
+                match received {
+                    Ok(ev) => {
+                        if ev.turn_id != fwd_turn {
+                            continue;
+                        }
+                        if ev.kind == "delta" {
+                            saw_delta = true;
+                            if let Some(text) = ev.payload["text"].as_str() {
+                                deltas_concat.push_str(text);
+                            }
+                        }
+                        let terminal = ev.kind == "turn_completed" || ev.kind == "turn_error";
+                        if let Some(token) = event_to_stream_token(&fwd_turn, &ev)
+                            && token_tx.send(token).is_err()
+                        {
+                            break;
+                        }
+                        if terminal {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        saw_lag = true;
+                        LAG_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            (saw_delta, saw_lag, deltas_concat)
+        });
+
+        // Gateway pump: fan the frames (yield between sends so the
+        // forwarder can fall behind under some schedules), then report the
+        // RPC outcome — mirroring the server's emit-terminal-before-response.
+        let frames = sc.frames;
+        let rpc_ok = sc.rpc_ok;
+        tokio::task::spawn(async move {
+            for f in frames {
+                let _ = btx.send(f);
+                tokio::task::yield_now().await;
+            }
+            drop(btx);
+            let _ = rpc_tx.send(rpc_ok);
+        });
+
+        // Turn-task tail: await the RPC, gate the pump, advance the
+        // virtual clock (the 200ms grace may now elapse), join, compose.
+        let rpc_ok = rpc_rx.await.unwrap_or(rpc_ok);
+        let _ = stop_tx.send(());
+        tokio::time::trigger_timeouts(|_| true);
+        let (saw_delta, saw_lag, prefix) = forwarder.await.unwrap();
+        let response = sc.response.to_string();
+        if rpc_ok && saw_lag {
+            if response.starts_with(prefix.as_str()) {
+                REPAIR_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                MISALIGNED_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if rpc_ok {
+            let (tokens, _misaligned) =
+                compose_response_tokens(saw_delta, saw_lag, &prefix, &response);
+            for t in tokens {
+                let _ = token_tx.send(t);
+            }
+            let _ = done_tx.send((true, response.clone()));
+        } else {
+            let _ = done_tx.send((false, "[[CANCELLED]]".to_string()));
+        }
+
+        // ── Invariants under every schedule ──
+        let mut transcript = String::new();
+        while let Ok(t) = token_rx.try_recv() {
+            transcript.push_str(&t);
+        }
+        drop(token_tx);
+        assert!(
+            token_rx.try_recv().is_err(),
+            "token stream must be drained exactly once, seed={seed} scenario={}",
+            sc.name
+        );
+        let (done_ok, done_text) = done_rx.try_recv().expect("done must fire once");
+        assert!(
+            done_rx.try_recv().is_err(),
+            "done must fire exactly once, seed={seed} scenario={}",
+            sc.name
+        );
+        assert_eq!(
+            done_ok, rpc_ok,
+            "done outcome mirrors the RPC, scenario={}",
+            sc.name
+        );
+        if rpc_ok {
+            assert_eq!(
+                done_text, response,
+                "done carries the authoritative response"
+            );
+        }
+        // Token-compose contract (all four stream-state quadrants):
+        //   no own deltas            → the full authoritative response
+        //   deltas, no lag           → the live delta prefix (complete by
+        //                              construction; nothing appended)
+        //   lag, prefix aligned      → prefix + repair suffix == response
+        //   lag, misaligned          → the surviving prefix, nothing invented
+        let aligned = response.starts_with(prefix.as_str());
+        if rpc_ok {
+            let expected = if !saw_delta || (saw_lag && aligned) {
+                response.clone()
+            } else {
+                prefix.clone()
+            };
+            assert_eq!(
+                transcript, expected,
+                "token-compose contract violated, seed={seed} scenario={} saw_delta={saw_delta} saw_lag={saw_lag} prefix={prefix:?}",
+                sc.name
+            );
+        }
+    }
+
+    /// Sweep: 5 scenarios × 50 seeded random schedules. Shuttle panics
+    /// `deadlock` on lost progress (forwarder hang) and hits MaxSteps on
+    /// livelock — a sweep failure is a real race, and any transcript
+    /// divergence is a token-compose contract violation.
+    #[test]
+    fn dst_chat_forwarder_schedule_sweep() {
+        for sc in scenarios() {
+            for seed in 0..50u64 {
+                let scheduler = shuttle::scheduler::RandomScheduler::new_from_seed(seed, 1);
+                let runner = shuttle::Runner::new(scheduler, shuttle::Config::new());
+                let sc = Scenario {
+                    name: sc.name,
+                    frames: sc.frames.clone(),
+                    capacity: sc.capacity,
+                    rpc_ok: sc.rpc_ok,
+                    response: sc.response,
+                };
+                runner.run(move || {
+                    let sc = sc.clone();
+                    shuttle::future::block_on(run_schedule(sc, seed));
+                });
+            }
+        }
+        let lag = LAG_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        let repair = REPAIR_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        let misaligned = MISALIGNED_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(lag > 0, "sweep never reached the broadcast-lag path");
+        assert!(
+            repair > 0,
+            "sweep never reached the aligned lag-repair path"
+        );
+        assert!(
+            misaligned > 0,
+            "sweep never reached the misaligned (no-invention) path"
         );
     }
 }

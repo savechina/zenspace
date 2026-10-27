@@ -15,6 +15,18 @@ members = [
 ]
 resolver = "2"
 
+# Verus verification cfgs (FR-042 Guard-3 Wave B): the verus! macro expands
+# ghost content under cfg(verus_keep_ghost) (set only by the verifier) and
+# guards ghost-item imports with cfg(verus_only); without these check-cfg
+# declarations `cargo clippy -D warnings` fails on unexpected_cfgs.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(verus_only)',
+  'cfg(verus_keep_ghost)',
+  'cfg(verus_verify_core)',
+  'cfg(verus_keep_ghost_body)',
+] }
+
 
 [workspace.package]
 edition = "2024"

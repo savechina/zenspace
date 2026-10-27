@@ -1057,7 +1057,9 @@ async fn run_uds_foreground(
     qqbot_cfg: Option<zen_gateway::channel::qqbot::QqBotAdapterOptions>,
 ) -> Result<(), ZenError> {
     use std::io::IsTerminal;
-    use zen_gateway::{GatewayDaemonConfig, GatewayService};
+    use zen_gateway::GatewayDaemonConfig;
+    #[cfg(not(feature = "shuttle"))]
+    use zen_gateway::GatewayService;
 
     // Banner output only for humans at a terminal; spawned/redirected
     // runs (auto-start, pipes) stay machine-quiet.
@@ -1147,10 +1149,21 @@ async fn run_uds_foreground(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
     let signal_tx = shutdown_tx.clone();
-    let serve_task = tokio::spawn(async move {
-        let result = GatewayService::serve_with_shutdown(config, shutdown_tx, shutdown_rx).await;
-        let _ = done_tx.send(());
-        result
+    let serve_task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        #[cfg(not(feature = "shuttle"))]
+        {
+            let result =
+                GatewayService::serve_with_shutdown(config, shutdown_tx, shutdown_rx).await;
+            let _ = done_tx.send(());
+            result
+        }
+        #[cfg(feature = "shuttle")]
+        {
+            // zen-gateway's serve API takes real-tokio watch channels; the
+            // DST build never drives the foreground daemon.
+            let _ = (config, shutdown_tx, shutdown_rx, done_tx);
+            unreachable!("gateway serve is never driven under the shuttle DST build")
+        }
     });
     tokio::select! {
         _ = &mut done_rx => {
