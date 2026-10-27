@@ -20,7 +20,7 @@ struct OutputCache {
 }
 
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tui_textarea::{Input, Key, TextArea};
 use zen_core::types::SessionContext;
 
@@ -59,6 +59,14 @@ pub enum PendingCallKind {
 }
 
 const MAX_HISTORY: usize = 100;
+
+/// T2xx(a): window in which a second Ctrl+C after a cleared draft converts
+/// into a quit (codex-rs double-press-quit semantics).
+pub(crate) const QUIT_INTENT_WINDOW: Duration = Duration::from_secs(1);
+
+/// T2xx(b): window in which a second idle Esc discards the draft INTO
+/// history so Up recalls it (hermes-agent semantics).
+pub(crate) const ESC_ESC_WINDOW: Duration = Duration::from_millis(500);
 
 /// FR-016: maximum number of scrollback blocks held in the deferred queue
 /// (reading mode). Overflow flushes oldest entries first (ADR-001 Option A).
@@ -337,11 +345,29 @@ pub struct App {
     #[allow(dead_code)] // live-seam: memory surface wiring pending
     pub memory_count: usize,
     pub show_thinking: bool,
+    /// (c) Three-state thinking display: true ONLY in brief mode (single
+    /// truncated pending-tail line). `show_thinking` remains the canonical
+    /// "mode != off" bool — brief = (true, true), full = (true, false),
+    /// off = (false, false).
+    pub thinking_brief: bool,
     pub is_streaming: bool,
     /// T228: a cancel was already requested (Ctrl+C or Esc) during the
     /// current streaming turn. First Ctrl+C while streaming cancels; a
     /// second Ctrl+C while still streaming quits. Reset at turn start/end.
     pub cancel_requested: bool,
+    /// T2xx(a): instant of the Ctrl+C that cleared a non-empty draft. A
+    /// second press within [`QUIT_INTENT_WINDOW`] quits (codex-rs
+    /// double-press-quit); `None` = disarmed.
+    pub last_ctrl_c_quit_intent: Option<Instant>,
+    /// T2xx(b): instant of the previous idle Esc. A second Esc within
+    /// [`ESC_ESC_WINDOW`] pushes a non-empty draft INTO history (hermes:
+    /// the correction must never be lost) instead of the plain no-op
+    /// fall-through.
+    pub last_esc_discard: Option<Instant>,
+    /// T2xx(c): `?` shortcuts overlay open (inline only). Opened only on an
+    /// empty composer; while open every key is swallowed except the
+    /// dismiss keys (Esc / `?` / Enter).
+    pub shortcuts_overlay: bool,
     pub chat_history: Vec<(String, String)>,
     pub pending_calls: Vec<PendingCallKind>,
     pub message_queue: VecDeque<String>,
@@ -456,8 +482,12 @@ impl App {
             ),
             memory_count: 0,
             show_thinking: false,
+            thinking_brief: false,
             is_streaming: false,
             cancel_requested: false,
+            last_ctrl_c_quit_intent: None,
+            last_esc_discard: None,
+            shortcuts_overlay: false,
             chat_history: Vec::new(),
             pending_calls: Vec::new(),
             message_queue: VecDeque::new(),

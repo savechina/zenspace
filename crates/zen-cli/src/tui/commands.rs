@@ -144,6 +144,36 @@ pub(crate) fn split_slash_input(cmd: &str) -> (&str, Option<&str>) {
     (token, rest)
 }
 
+/// (c) Thinking-display mode decoded from the canonical field pair:
+/// `show_thinking` is the "mode != off" bool, `thinking_brief` selects the
+/// hermes `truncated` single-line pending tail.
+fn decode_thinking_mode(show: bool, brief: bool) -> &'static str {
+    match (show, brief) {
+        (false, _) => "off",
+        (true, true) => "brief",
+        (true, false) => "full",
+    }
+}
+
+/// (c) Bare `/thinking` cycle: off -> brief -> full -> off.
+fn cycle_thinking_mode(show: bool, brief: bool) -> (bool, bool) {
+    match (show, brief) {
+        (false, _) => (true, true),
+        (true, true) => (true, false),
+        (true, false) => (false, false),
+    }
+}
+
+/// (c) Explicit `/thinking <arg>` -> mode field pair; `None` = unknown arg.
+fn parse_thinking_mode(arg: &str) -> Option<(bool, bool)> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "off" => Some((false, false)),
+        "brief" => Some((true, true)),
+        "full" => Some((true, false)),
+        _ => None,
+    }
+}
+
 impl App {
     pub fn handle_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
@@ -222,16 +252,34 @@ impl App {
                 self.invalidate_output_cache();
             }
             "thinking" => {
-                self.show_thinking = !self.show_thinking;
-                self.push_output(
-                    format!(
-                        "Thinking display {}",
-                        if self.show_thinking {
-                            "enabled"
-                        } else {
-                            "hidden"
+                // (c) Three-state thinking display (hermes off/brief/full).
+                // Bare `/thinking` cycles off -> brief -> full -> off; an
+                // explicit arg sets the mode. `show_thinking` stays the
+                // canonical "mode != off" bool (every existing consumer
+                // compiles untouched); `thinking_brief` is true ONLY in
+                // brief mode. The stream_collector mirror feeds the render
+                // path (same shape as /tools -> tools_expanded, so the
+                // frozen inline.rs/chat.rs drain call sites keep their
+                // signature).
+                let mode = match rest {
+                    None => cycle_thinking_mode(self.show_thinking, self.thinking_brief),
+                    Some(arg) => match parse_thinking_mode(arg) {
+                        Some(mode) => mode,
+                        None => {
+                            self.push_output(
+                                "Usage: /thinking [off|brief|full] (bare cycles off -> brief -> full)"
+                                    .to_string(),
+                                true,
+                            );
+                            return;
                         }
-                    ),
+                    },
+                };
+                self.show_thinking = mode.0;
+                self.thinking_brief = mode.1;
+                self.stream_collector.set_thinking_brief(mode.1);
+                self.push_output(
+                    format!("Thinking display: {}", decode_thinking_mode(mode.0, mode.1)),
                     false,
                 );
             }
@@ -275,7 +323,8 @@ impl App {
   /help (/h)             Show this help
   /exit (/q)             Exit TUI
   /clear                 Clear output
-  /thinking              Toggle showing thinking process (default: OFF)
+  /thinking [off|brief|full]
+                         Thinking display mode (bare cycles; default OFF)
   /model <p> [m]         Switch provider [model], show current if omitted
   /variant (/vc)          Cycle through model variants (reasoning levels)
   /export (/e)           Export chat to Markdown
@@ -300,7 +349,7 @@ Aliases: Commands shown with (/<alias>) can be typed with the shorter form.
 Example: '/h' = '/help', '/q' = '/exit', '/s <query>' = '/search <query>'
 
 Chat mode is default — type questions to get LLM responses.
-Use /thinking to show/hide thinking process."#;
+Use /thinking [off|brief|full] to control the thinking display (bare cycles)."#;
         self.push_output(help.to_string(), false);
     }
 
@@ -820,6 +869,84 @@ mod enqueue_echo_tests {
         assert!(
             echo.contains("> queued later"),
             "enqueue echo must still render the user line: {echo:?}"
+        );
+    }
+}
+
+/// (c) Three-state /thinking command pins.
+#[cfg(test)]
+mod thinking_mode_tests {
+    use crate::tui::app::App;
+    use crate::tui::cell::OutputCell;
+
+    fn test_app() -> App {
+        let config: &'static zen_core::config::ZenConfig = Box::leak(Box::default());
+        App::new(config)
+    }
+
+    fn mode(app: &App) -> (bool, bool) {
+        (app.show_thinking, app.thinking_brief)
+    }
+
+    fn last_plain_output(app: &App) -> String {
+        for cell in app.output.iter().rev() {
+            if let OutputCell::Plain(cell) = cell {
+                return cell.text.clone();
+            }
+        }
+        panic!("no plain output cell found");
+    }
+
+    #[test]
+    fn thinking_command_cycles_off_brief_full() {
+        let mut app = test_app();
+        assert_eq!(mode(&app), (false, false), "default is off");
+
+        app.handle_slash_command("thinking"); // off -> brief
+        assert_eq!(mode(&app), (true, true), "first bare press lands on brief");
+        assert_eq!(last_plain_output(&app), "Thinking display: brief");
+
+        app.handle_slash_command("thinking"); // brief -> full
+        assert_eq!(mode(&app), (true, false));
+        assert_eq!(last_plain_output(&app), "Thinking display: full");
+
+        app.handle_slash_command("thinking"); // full -> off
+        assert_eq!(mode(&app), (false, false));
+        assert_eq!(last_plain_output(&app), "Thinking display: off");
+    }
+
+    #[test]
+    fn thinking_command_explicit_arg_sets_mode() {
+        let mut app = test_app();
+
+        app.handle_slash_command("thinking full");
+        assert_eq!(mode(&app), (true, false));
+        assert_eq!(last_plain_output(&app), "Thinking display: full");
+
+        app.handle_slash_command("thinking brief");
+        assert_eq!(mode(&app), (true, true));
+        assert_eq!(last_plain_output(&app), "Thinking display: brief");
+
+        app.handle_slash_command("thinking off");
+        assert_eq!(mode(&app), (false, false));
+        assert_eq!(last_plain_output(&app), "Thinking display: off");
+
+        // Unknown arg: usage error, mode unchanged, NO plain ack appended.
+        let plains_before = app
+            .output
+            .iter()
+            .filter(|c| matches!(c, OutputCell::Plain(_)))
+            .count();
+        app.handle_slash_command("thinking loud");
+        assert_eq!(mode(&app), (false, false), "bad arg must not flip the mode");
+        let plains_after = app
+            .output
+            .iter()
+            .filter(|c| matches!(c, OutputCell::Plain(_)))
+            .count();
+        assert_eq!(
+            plains_after, plains_before,
+            "error path appends no Plain ack"
         );
     }
 }

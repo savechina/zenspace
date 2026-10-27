@@ -1,7 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_textarea::{Input, Key};
 
-use super::app::App;
+use std::time::Instant;
+
+use super::app::{App, ESC_ESC_WINDOW, QUIT_INTENT_WINDOW};
 use super::history_search;
 use super::slash::{EnterAction, enter_decision};
 
@@ -117,13 +119,40 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         return InlineKeyAction::Continue;
     }
 
+    // T2xx(c): `?` shortcuts overlay. While open every key is swallowed
+    // except the three dismiss keys (approval-popup swallow precedent);
+    // Esc dismisses BEFORE the streaming cancel ladder, so closing help can
+    // never kill a turn — a second Esc interrupts as usual.
+    if app.shortcuts_overlay {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
+                app.shortcuts_overlay = false;
+                InlineKeyAction::Continue
+            }
+            _ => InlineKeyAction::Continue,
+        };
+    }
+    // Open gate: EMPTY composer only — `?` must keep typing normally into a
+    // draft. Never while an approval is pending (its gate sits below and
+    // must own y/n/Esc) or the slash popup is up.
+    if key.code == KeyCode::Char('?')
+        && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+        && !app.approval.is_pending()
+        && !app.slash_state.visible
+        && app.input.lines().join("\n").trim().is_empty()
+    {
+        app.shortcuts_overlay = true;
+        return InlineKeyAction::Continue;
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             // T228: Ctrl+C while a turn is streaming cancels the in-flight
             // response (same cancel RPC path as Esc) instead of discarding it
             // into a quit. A second consecutive Ctrl+C while still streaming
-            // quits. While idle, Ctrl+C keeps its long-standing quit
-            // semantics (never broken).
+            // quits. While idle, Ctrl+C goes through the T2xx(a)
+            // draft-protection ladder below — a non-empty draft is never
+            // killed by a single press.
             if app.is_streaming {
                 if app.cancel_requested {
                     return InlineKeyAction::Quit;
@@ -131,6 +160,29 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
                 app.cancel_requested = true;
                 return InlineKeyAction::CancelTurn;
             }
+            let now = Instant::now();
+            let in_window = app
+                .last_ctrl_c_quit_intent
+                .is_some_and(|t| now.duration_since(t) <= QUIT_INTENT_WINDOW);
+            if !in_window {
+                let draft = app.input.lines().join("\n");
+                if !draft.trim().is_empty() {
+                    // First press (or window expired): draft protection —
+                    // clear via the same path the submit flow uses, toast,
+                    // and arm the quit intent.
+                    app.input = App::create_input_textarea("");
+                    app.clear_paste_pills();
+                    app.last_ctrl_c_quit_intent = Some(now);
+                    app.show_toast("draft cleared — Ctrl+C again to exit");
+                    return InlineKeyAction::Continue;
+                }
+            }
+            // Empty composer quits (long-standing rule), and a press inside
+            // the quit window quits too (codex double-press: the draft was
+            // already surrendered by the first clear — a draft re-typed
+            // inside the 1s window is likewise surrendered, pinned
+            // trade-off). Disarm so a later press is a fresh first press.
+            app.last_ctrl_c_quit_intent = None;
             return InlineKeyAction::Quit;
         }
         (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
@@ -212,6 +264,28 @@ pub fn handle_key(key: KeyEvent, app: &mut App) -> InlineKeyAction {
         if app.is_streaming {
             return InlineKeyAction::CancelTurn;
         }
+        // T2xx(b): idle Esc-Esc pushes a non-empty draft INTO history
+        // (hermes: the correction must never be lost) using the SAME store
+        // normal submits record into, so Up recalls it. A single Esc keeps
+        // today's behavior entirely — re-arm the window and fall through to
+        // the textarea catch-all unchanged.
+        let now = Instant::now();
+        if let Some(last) = app.last_esc_discard
+            && now.duration_since(last) <= ESC_ESC_WINDOW
+        {
+            // Record the EXPANDED text (pill fidelity matches the submit
+            // path); push_history dedupes adjacent repeats.
+            let draft = app.expanded_input_text();
+            if !draft.trim().is_empty() {
+                app.push_history(&draft);
+                app.input = App::create_input_textarea("");
+                app.clear_paste_pills();
+                app.last_esc_discard = None;
+                app.show_toast("draft saved to history — Up recalls it");
+                return InlineKeyAction::Continue;
+            }
+        }
+        app.last_esc_discard = Some(now);
         // Esc while idle — no-op (fall through to catch-all which forwards to textarea)
     }
 
@@ -434,6 +508,7 @@ mod tests {
     use super::*;
     use crate::tui::app::App;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
 
     fn test_app() -> App {
         let config: &'static zen_core::config::ZenConfig = Box::leak(Box::default());
@@ -815,6 +890,9 @@ mod tests {
 
     #[test]
     fn t228_ctrl_c_idle_still_quits() {
+        // T2xx(a) empty-draft pin: idle + EMPTY composer quits immediately
+        // (long-standing semantics, unchanged by the draft-protection
+        // ladder — the ladder only intercepts non-empty drafts).
         let mut app = test_app();
         app.is_streaming = false;
         let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -1062,5 +1140,209 @@ mod tests {
                 )
                 .contains("[Pasted 5 lines /")
         );
+    }
+
+    // === T2xx(a): Ctrl+C draft-protection ladder (idle) ===
+
+    /// First idle Ctrl+C on a NON-empty draft clears it and stays alive
+    /// (codex-rs semantics) — a single press must never kill a draft.
+    #[test]
+    fn idle_draft_ctrl_c_first_press_clears_not_quits() {
+        let mut app = test_app();
+        app.input.insert_str("precious draft");
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            action,
+            InlineKeyAction::Continue,
+            "first press must NOT quit"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "",
+            "first press must clear the draft"
+        );
+        assert!(
+            app.last_ctrl_c_quit_intent.is_some(),
+            "quit intent must be armed"
+        );
+    }
+
+    /// Second press inside the quit window lands on the (already cleared)
+    /// composer and quits — the codex double-press contract.
+    #[test]
+    fn idle_draft_ctrl_c_second_press_within_window_quits() {
+        let mut app = test_app();
+        app.input.insert_str("draft");
+        let first = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(first, InlineKeyAction::Continue);
+        let second = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            second,
+            InlineKeyAction::Quit,
+            "second press inside window quits"
+        );
+        assert!(
+            app.last_ctrl_c_quit_intent.is_none(),
+            "intent must be disarmed on quit"
+        );
+    }
+
+    /// After the window expires a press behaves as a FRESH first press:
+    /// a re-typed draft is re-cleared and the intent re-armed (never quit).
+    /// Window expiry is simulated by backdating the stored Instant — no sleeps.
+    #[test]
+    fn idle_draft_ctrl_c_after_window_reclears() {
+        let mut app = test_app();
+        app.input.insert_str("first draft");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            InlineKeyAction::Continue
+        );
+        app.last_ctrl_c_quit_intent =
+            Instant::now().checked_sub(QUIT_INTENT_WINDOW + Duration::from_millis(1));
+        // User re-typed a new draft during the (now expired) window.
+        app.input.insert_str("second draft");
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            action,
+            InlineKeyAction::Continue,
+            "expired window must behave as a fresh first press, never quit"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "",
+            "fresh first press re-clears the draft"
+        );
+        assert!(
+            app.last_ctrl_c_quit_intent.is_some(),
+            "fresh first press re-arms the intent"
+        );
+    }
+
+    // === T2xx(b): Esc-Esc pushes the draft INTO history (inline only) ===
+
+    /// Double idle Esc saves the draft via the same store normal submits
+    /// use (so Up recalls it) and clears the composer; a single Esc never
+    /// clears anything.
+    #[test]
+    fn esc_esc_pushes_draft_to_history_and_clears() {
+        let mut app = test_app();
+        app.input.insert_str("my correction");
+        let first = press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(first, InlineKeyAction::Continue);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "my correction",
+            "single Esc must not clear the draft"
+        );
+        let second = press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(second, InlineKeyAction::Continue);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "",
+            "second Esc clears the composer"
+        );
+        assert_eq!(
+            app.command_history.last().map(String::as_str),
+            Some("my correction"),
+            "draft must land in the same history store submits use"
+        );
+        // Recallable: Up pulls the discarded draft back.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "my correction",
+            "Up must recall the discarded draft"
+        );
+    }
+
+    /// A single idle Esc keeps today's fall-through: the draft survives and
+    /// only the recall window is armed.
+    #[test]
+    fn single_esc_idle_keeps_textarea_fallthrough() {
+        let mut app = test_app();
+        app.input.insert_str("survives");
+        let action = press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "survives",
+            "single idle Esc must never clear the draft"
+        );
+        assert!(
+            app.last_esc_discard.is_some(),
+            "single Esc arms the Esc-Esc window"
+        );
+    }
+
+    // === T2xx(c): `?` shortcuts overlay (inline only) ===
+
+    /// `?` opens the overlay ONLY on an empty composer; with a draft it
+    /// types normally.
+    #[test]
+    fn question_overlay_opens_only_on_empty_composer() {
+        let mut app = test_app();
+        let action = press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert!(
+            app.shortcuts_overlay,
+            "? must open the overlay on an empty composer"
+        );
+
+        let mut app2 = test_app();
+        app2.input.insert_str("draft?");
+        let action2 = press(&mut app2, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(action2, InlineKeyAction::Continue);
+        assert!(
+            !app2.shortcuts_overlay,
+            "? must NOT open the overlay when a draft exists"
+        );
+        assert_eq!(
+            app2.input.lines().join("\n"),
+            "draft??",
+            "? must type into a non-empty draft"
+        );
+    }
+
+    /// While open, all other keys are swallowed (approval-popup precedent);
+    /// Esc / `?` / Enter each dismiss.
+    #[test]
+    fn question_overlay_dismisses_and_swallows() {
+        let mut app = test_app();
+        app.shortcuts_overlay = true;
+
+        // Letters must not type.
+        let action = press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert!(app.shortcuts_overlay, "plain key must not dismiss");
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "",
+            "swallowed key must not reach the textarea"
+        );
+
+        // Ctrl+C is swallowed too — dismiss first, then quit.
+        let action = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            action,
+            InlineKeyAction::Continue,
+            "Ctrl+C swallowed while open"
+        );
+        assert!(app.shortcuts_overlay);
+
+        // Esc dismisses.
+        let action = press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(action, InlineKeyAction::Continue);
+        assert!(!app.shortcuts_overlay, "Esc must dismiss the overlay");
+
+        // `?` toggles closed.
+        app.shortcuts_overlay = true;
+        press(&mut app, KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(!app.shortcuts_overlay, "? must toggle the overlay closed");
+
+        // Enter dismisses.
+        app.shortcuts_overlay = true;
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.shortcuts_overlay, "Enter must dismiss the overlay");
     }
 }

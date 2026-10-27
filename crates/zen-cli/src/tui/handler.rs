@@ -1,7 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tui_textarea::{Input, Key};
 
-use super::app::InputMode;
+use std::time::Instant;
+
+use super::app::{InputMode, QUIT_INTENT_WINDOW};
 use super::history_search;
 use super::selection::{Selection, TextPosition};
 use super::slash::{EnterAction, enter_decision};
@@ -215,7 +217,9 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
             }
             // T228 parity with inline_handler: while streaming, first Ctrl+C
             // cancels the in-flight turn (CancelTurn), a second consecutive
-            // press quits. Idle Ctrl+C keeps quit semantics.
+            // press quits. Idle Ctrl+C goes through the T2xx(a)
+            // draft-protection ladder, mirrored byte-for-byte from
+            // inline_handler so both surfaces behave identically.
             if app.is_streaming {
                 if app.cancel_requested {
                     return KeyAction::Quit;
@@ -223,6 +227,25 @@ pub fn handle_key(key: KeyEvent, app: &mut super::app::App) -> KeyAction {
                 app.cancel_requested = true;
                 return KeyAction::CancelTurn;
             }
+            let now = Instant::now();
+            let in_window = app
+                .last_ctrl_c_quit_intent
+                .is_some_and(|t| now.duration_since(t) <= QUIT_INTENT_WINDOW);
+            if !in_window {
+                let draft = app.input.lines().join("\n");
+                if !draft.trim().is_empty() {
+                    // First press (or window expired): clear the draft via
+                    // the submit-path clear, toast, and arm the quit intent.
+                    app.input = super::app::App::create_input_textarea("");
+                    app.clear_paste_pills();
+                    app.last_ctrl_c_quit_intent = Some(now);
+                    app.show_toast("draft cleared — Ctrl+C again to exit");
+                    return KeyAction::Continue;
+                }
+            }
+            // Empty composer (long-standing rule) or second press inside the
+            // quit window: quit and disarm.
+            app.last_ctrl_c_quit_intent = None;
             return KeyAction::Quit;
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => return KeyAction::Quit,
@@ -781,6 +804,52 @@ mod tests {
         let action = press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
         assert_eq!(action, KeyAction::Continue);
         assert_eq!(app.input.lines(), vec!["hello", ""]);
+    }
+
+    /// T2xx(a): fullscreen Ctrl+C mirrors the inline draft-protection
+    /// ladder — first idle press clears a non-empty draft (never quits),
+    /// second press inside the window quits, expired window re-clears a
+    /// re-typed draft.
+    #[test]
+    fn fullscreen_ctrl_c_draft_ladder_mirrors_inline() {
+        let mut app = test_app();
+        app.input.insert_str("draft");
+        let first = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            first,
+            KeyAction::Continue,
+            "first idle press clears, never quits"
+        );
+        assert_eq!(app.input.lines().join(""), "", "draft cleared");
+        assert!(app.last_ctrl_c_quit_intent.is_some(), "intent armed");
+
+        let second = press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            second,
+            KeyAction::Quit,
+            "second press inside the window quits"
+        );
+        assert!(
+            app.last_ctrl_c_quit_intent.is_none(),
+            "intent disarmed on quit"
+        );
+
+        // Expired window (backdated Instant, no sleeps) + re-typed draft:
+        // fresh first press re-clears instead of quitting.
+        let mut app2 = test_app();
+        app2.input.insert_str("first");
+        press(&mut app2, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app2.last_ctrl_c_quit_intent = std::time::Instant::now()
+            .checked_sub(QUIT_INTENT_WINDOW + std::time::Duration::from_millis(1));
+        app2.input.insert_str("retyped");
+        let action = press(&mut app2, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Continue, "expired window re-clears");
+        assert_eq!(app2.input.lines().join(""), "");
+
+        // Fullscreen keeps the long-standing empty-composer quit.
+        let mut app3 = test_app();
+        let action = press(&mut app3, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::Quit, "empty composer still quits");
     }
 
     /// T246 unification: a fully typed `/name` executes on the first Enter in
