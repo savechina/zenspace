@@ -35,6 +35,7 @@ use super::theme::{
     OutputTheme, ZenTheme, auto_select as theme_auto_select, from_name as theme_from_name,
     no_color as theme_no_color,
 };
+use super::transcript_source::{TranscriptSource, TranscriptSourceRegistry};
 use zen_memory::conversation::ConversationStore;
 use zen_memory::history::HistoryStore;
 
@@ -76,7 +77,10 @@ pub(crate) const DEFERRED_QUEUE_CAP: usize = 256;
 /// test-design.md §3 L3). Exercises reasoning (`<think>`), heading, paragraph
 /// (committed block), code fence (FR-012 highlight), list, link, and a trailing
 /// partial line (viewport tail).
-pub(crate) const ECHO_SCRIPT: &str = r##"<think>I should first understand the user's request.</think>
+pub(crate) const ECHO_SCRIPT: &str = r##"<think>
+I should first understand the user's request.
+I must also verify every edge case carefully.
+</think>
 # Echo Heading
 
 A paragraph with **bold** and *italic* inline text.
@@ -451,6 +455,11 @@ pub struct App {
     /// T082 (NFR-009): 1-based sequence of streaming turns in this TUI
     /// process; identifies `tui.stream.stall` audit lines (`turn_id`).
     pub(crate) stream_turn_seq: u64,
+    /// Wave 2A: source-backed transcript registry — the SOURCE of every
+    /// committed scrollback block, capped, so a terminal WIDTH change can
+    /// purge native scrollback and re-render the transcript at the new
+    /// width (see `transcript_source.rs` for the scope contract).
+    pub(crate) transcript: TranscriptSourceRegistry,
 }
 
 impl App {
@@ -538,6 +547,7 @@ impl App {
             loop_panel: crate::tui::loop_panel::LoopPanelState::default(),
             last_nudge_poll: None,
             stream_turn_seq: 0,
+            transcript: TranscriptSourceRegistry::new(),
             gateway_banner: super::banner::GatewayBannerState::default(),
             approval: super::approval::ApprovalState::default(),
             approval_tx: None,
@@ -861,6 +871,70 @@ impl App {
         }
     }
 
+    /// Wave 2A: drain the stream collector's replay source log into the
+    /// registry. Called right after every `drain_and_tail_filtered` on the
+    /// inline path so the registry mirrors the committed transcript exactly.
+    pub(crate) fn record_stream_sources(&mut self) {
+        let sources = self.stream_collector.take_source_log();
+        if !sources.is_empty() {
+            self.transcript.extend(sources);
+        }
+    }
+
+    /// Wave 2A: render the whole registry into fresh scrollback entries at
+    /// `width` (oldest first — the insert path preserves that order above
+    /// the viewport). Source kinds re-render through their production
+    /// pipelines; PreRendered re-inserts unchanged (see the fidelity note
+    /// in `transcript_source.rs`).
+    pub(crate) fn build_replay_entries(
+        &self,
+        width: u16,
+    ) -> std::collections::VecDeque<ScrollbackEntry> {
+        let mut out = std::collections::VecDeque::new();
+        if self.transcript.truncated() {
+            out.push_back(ScrollbackEntry {
+                lines: vec![Line::from(Span::styled(
+                    super::transcript_source::TRUNCATION_NOTICE.to_string(),
+                    self.theme.as_ref().text_muted(),
+                ))],
+                wrap: true,
+            });
+        }
+        for entry in self.transcript.iter() {
+            let (lines, wrap) = match entry {
+                TranscriptSource::Markdown(src) => {
+                    // Same empty-fallback `push_output` uses: an empty
+                    // render still commits one blank separator line.
+                    let lines = super::markdown::render_markdown(src);
+                    let lines = if lines.is_empty() {
+                        vec![Line::from("")]
+                    } else {
+                        lines
+                    };
+                    (lines, true)
+                }
+                TranscriptSource::UserEcho { text, queued } => {
+                    let mut lines = self.render_user_lines_for_scrollback(text);
+                    if *queued {
+                        lines = super::commands::mark_queued_echo(lines, self.theme.as_ref());
+                    }
+                    (lines, true)
+                }
+                TranscriptSource::Tool(block) => (
+                    StreamCollector::render_tool_block(
+                        block,
+                        self.stream_collector.tools_expanded(),
+                    ),
+                    true,
+                ),
+                TranscriptSource::Banner => (self.welcome_banner_lines(width), false),
+                TranscriptSource::PreRendered(lines) => (lines.clone(), true),
+            };
+            out.push_back(ScrollbackEntry { lines, wrap });
+        }
+        out
+    }
+
     /// FR-016: push a scrollback entry into the deferred queue, flushing
     /// the oldest entries when the cap is reached. Used by ALL defer sites
     /// in inline.rs so overflow handling is centralized.
@@ -884,6 +958,22 @@ impl App {
         use crossterm::terminal::size;
 
         let width = size().map(|(w, _)| w).unwrap_or(80);
+        let lines = self.welcome_banner_lines(width);
+
+        if !lines.is_empty() {
+            self.scrollback_queue
+                .push_back(ScrollbackEntry { lines, wrap: false });
+            // Wave 2A: the banner is regenerable from its constants, so the
+            // registry stores the Banner kind (not the rendered Lines) and
+            // replay rebuilds it with the WIDTH-DEPENDENT logo selection.
+            self.transcript.push(TranscriptSource::Banner);
+        }
+    }
+
+    /// Wave 2A: width-parameterized welcome banner renderer — shared by the
+    /// startup enqueue and the width-change replay so the logo variant is
+    /// chosen from the live width in both paths (single source of truth).
+    pub(crate) fn welcome_banner_lines(&self, width: u16) -> Vec<Line<'static>> {
         let logo = match width {
             w if w >= 90 => SPLASH_LOGO_FULL,
             w if w >= 70 => SPLASH_LOGO_MINIMAL,
@@ -913,10 +1003,7 @@ impl App {
             )));
         }
 
-        if !lines.is_empty() {
-            self.scrollback_queue
-                .push_back(ScrollbackEntry { lines, wrap: false });
-        }
+        lines
     }
 
     pub(crate) fn render_user_lines_for_scrollback(&self, text: &str) -> Vec<Line<'static>> {
@@ -961,8 +1048,16 @@ impl App {
             if is_error {
                 let cell = ErrorCell::new(text, theme);
                 let lines = cell.display_lines().to_vec();
+                // Wave 2A: error cells are themed renderings, not markdown —
+                // keep the rendered Lines (replay re-inserts unchanged).
+                self.transcript
+                    .push(TranscriptSource::PreRendered(lines.clone()));
                 self.enqueue_scrollback(lines);
             } else {
+                // Wave 2A: capture the SOURCE; replay re-runs the identical
+                // render_markdown pipeline at the new width.
+                self.transcript
+                    .push(TranscriptSource::Markdown(text.clone()));
                 let lines = super::markdown::render_markdown(&text);
                 if lines.is_empty() {
                     self.enqueue_scrollback(vec![Line::from("")]);

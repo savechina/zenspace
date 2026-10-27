@@ -21,6 +21,9 @@ use super::app::App;
 use super::inline_handler::InlineKeyAction;
 use super::theme::auto_select as theme_auto_select;
 use super::theme::no_color as theme_no_color;
+use super::transcript_source::{
+    ReplayState, ReplayVerdict, replay_decision, watchdog_due, watchdog_size_mismatch,
+};
 
 /// Preferred height (rows) of the bottom inline viewport (ADR-006).
 /// Budget: tail (2–4) + popup (≤6) + input (3) + toast (0–1) + footer (1) = 12.
@@ -230,6 +233,9 @@ pub(crate) fn apply_inline_theme(
 pub(crate) struct InlineLoopState {
     pub dirty: bool,
     pub last_streaming_render: Instant,
+    /// Wave 2A: transcript-replay engine state (last replayed width, the
+    /// pending flag for deferred replays, and the watchdog probe stamp).
+    pub replay: ReplayState,
 }
 
 impl InlineLoopState {
@@ -237,6 +243,7 @@ impl InlineLoopState {
         Self {
             dirty: true,
             last_streaming_render: Instant::now(),
+            replay: ReplayState::new(),
         }
     }
 }
@@ -338,6 +345,127 @@ fn degrade_io_outcome(result: io::Result<()>, operation: &str) -> bool {
 /// Best-effort viewport re-anchor; see [`degrade_io_outcome`].
 fn best_effort_reanchor<B: Backend>(terminal: &mut Terminal<B>, width: u16, height: u16) -> bool {
     degrade_io_outcome(reanchor_viewport(terminal, width, height), "reanchor")
+}
+
+/// Wave 2A: replay gate + execution seam.
+///
+/// SCOPE LOGIC (Principle XV — `transcript_source.rs` holds the full
+/// contract):
+/// - Functionality: on a terminal WIDTH change (never height-only), purge
+///   native scrollback and re-render the transcript from source at the new
+///   width through the existing markdown/insert pipeline.
+/// - Decision: PURE ([`replay_decision`]) — Now / Defer(streaming or
+///   reading) / Noop; a Defer sets the pending flag and the replay runs at
+///   the stream-completion or reading-mode-exit boundary.
+/// - Default: no width change since the last replay = no-op (cheap path).
+/// - Interaction: only ever called at the coalescer TRAILING edge or at the
+///   two boundaries — never at the leading edge (a drag burst replays once,
+///   at its settled geometry).
+///
+/// Returns whether a replay actually ran (pins + logging).
+pub(crate) fn maybe_replay_transcript<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    state: &mut InlineLoopState,
+) -> bool {
+    let Some(size) = terminal.size().ok() else {
+        return false;
+    };
+    let target_w = size.width;
+    if target_w == 0 {
+        return false;
+    }
+    let width_changed = state.replay.last_replay_width != target_w;
+    match replay_decision(
+        width_changed,
+        app.is_streaming,
+        app.reading_mode,
+        state.replay.pending,
+    ) {
+        ReplayVerdict::Noop => false,
+        ReplayVerdict::Defer => {
+            state.replay.pending = true;
+            false
+        }
+        ReplayVerdict::Now => {
+            // Empty transcript (and nothing queued): nothing to re-render —
+            // skip the destructive purge entirely and just move the replay
+            // baseline; content committed later renders at the live width
+            // anyway.
+            if app.transcript.is_empty()
+                && app.scrollback_queue.is_empty()
+                && app.deferred_scrollback.is_empty()
+            {
+                state.replay.last_replay_width = target_w;
+                state.replay.pending = false;
+                return false;
+            }
+            let ok = degrade_io_outcome(replay_transcript(terminal, app), "transcript replay");
+            if ok {
+                state.replay.last_replay_width = target_w;
+                state.replay.pending = false;
+                // The purge wiped the viewport too; reanchor reset the back
+                // buffer, so the next draw full-repaints the composer.
+                state.dirty = true;
+            }
+            ok
+        }
+    }
+}
+
+/// Wave 2A replay execution: ONE DEC 2026 synchronized-update region
+/// wrapping purge, re-render, re-insert, and re-anchor. Every I/O error
+/// propagates to the caller's [`degrade_io_outcome`] — a failed replay
+/// never kills the session (fail-soft: the registry survives and the next
+/// width change retries).
+fn replay_transcript<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+    let (width, height) = terminal
+        .size()
+        .map(|s| (s.width, s.height))
+        .unwrap_or((80, 24));
+    let _ = queue!(io::stdout(), crossterm::terminal::BeginSynchronizedUpdate);
+    let result = replay_transcript_inner(terminal, app, width, height);
+    let _ = queue!(io::stdout(), crossterm::terminal::EndSynchronizedUpdate);
+    let _ = io::Write::flush(&mut io::stdout());
+    result
+}
+
+fn replay_transcript_inner<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    // (1) Drop old-width pending entries FIRST — every queued/deferred
+    // block's source is already in the registry, so dropping them cannot
+    // lose content; keeping them would re-insert old-width ghosts after
+    // the purge.
+    app.scrollback_queue.clear();
+    app.deferred_scrollback.clear();
+    // (2) Wipe the visible screen (ED 2) through the backend and purge the
+    // native scrollback (ED 3) via crossterm. ACCEPTED COST (product-owner
+    // decision, wave 2A contract): ED 3 destroys the PRE-session shell
+    // scrollback too, exactly like codex-rs clear_for_viewport_change.
+    // Backend errors are stringified into io::Error (same mapping the
+    // insert/reanchor paths use) so the replay seam keeps one error type.
+    terminal
+        .backend_mut()
+        .clear_region(ClearType::All)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let _ = queue!(
+        io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge)
+    );
+    // (3) Re-render oldest-to-newest at the live width and re-insert via
+    // the EXISTING hard-wrap insert path (Paragraph wraps at the current
+    // terminal width — no forked renderer).
+    let mut entries = app.build_replay_entries(width);
+    super::scrollback_inserter::insert_scrollback_queue(terminal, &mut entries)?;
+    // (4) Bottom-anchor the viewport; Terminal::resize's clear_viewport
+    // resets the back buffer so the next draw repaints everything (no
+    // stale-diff blanks over the raw-wiped screen).
+    reanchor_viewport(terminal, width, height)?;
+    Ok(())
 }
 
 /// Quiet-window length for [`ResizeCoalescer`] (hermes-style leading+trailing,
@@ -446,6 +574,7 @@ pub(crate) fn inline_tick<B: Backend>(
     event: Option<Event>,
 ) -> Result<bool> {
     let prev_streaming = app.is_streaming;
+    let prev_reading_mode = app.reading_mode;
     let prev_buffer_len = app.stream_collector.buffer().len();
 
     app.poll_llm_response();
@@ -491,6 +620,8 @@ pub(crate) fn inline_tick<B: Backend>(
             .stream_collector
             .drain_and_tail_filtered(reasoning_style, app.show_thinking);
         if !committed.is_empty() {
+            // Wave 2A: the log mirrors the committed lines just drained.
+            app.record_stream_sources();
             app.enqueue_scrollback(committed);
         }
         app.viewport_tail = pending;
@@ -537,9 +668,17 @@ pub(crate) fn inline_tick<B: Backend>(
             .stream_collector
             .drain_and_tail_filtered(reasoning_style, app.show_thinking);
         if !committed.is_empty() {
+            // Wave 2A: capture committed sources before the collector clears.
+            app.record_stream_sources();
             app.enqueue_scrollback(committed);
         }
         if !pending.is_empty() {
+            // Wave 2A: the tail block only ever flushes here — capture its
+            // source exactly once before the collector resets.
+            if let Some(src) = app.stream_collector.take_pending_source() {
+                app.transcript
+                    .push(super::transcript_source::TranscriptSource::Markdown(src));
+            }
             app.enqueue_scrollback(pending);
         }
         app.stream_collector.clear();
@@ -720,6 +859,15 @@ pub(crate) fn inline_tick<B: Backend>(
         let _ = io::Write::flush(&mut io::stdout());
     }
 
+    // Wave 2A: deferred-replay boundaries. The stream-completion boundary
+    // (turn finished while a width change was pending) and the
+    // reading-mode-exit boundary (user returned to bottom) both re-run the
+    // PURE decision — it no-ops unless a width change is actually waiting,
+    // so these calls are free in the common path.
+    if response_just_completed || (prev_reading_mode && !app.reading_mode) {
+        maybe_replay_transcript(terminal, app, state);
+    }
+
     Ok(false)
 }
 
@@ -871,6 +1019,9 @@ fn run_inline_session(
     // truth from the first frame (Wave-2 watchdog hook).
     let seed = crossterm::terminal::size().unwrap_or((80, 24));
     let mut coalescer = ResizeCoalescer::new(seed);
+    // Wave 2A: the replay baseline is the LIVE startup width — a replay may
+    // only fire after a real width CHANGE from here.
+    state.replay.last_replay_width = seed.0;
     // T075 test seam (e16 PTY acceptance): deliberately panic on the first
     // key event so the PTY test can prove the panic path restores the
     // terminal. Same env-seam convention as `ZEN_TEST_ECHO_LLM` (app.rs).
@@ -880,9 +1031,38 @@ fn run_inline_session(
         // applies its final size exactly once — before this iteration's
         // insert+draw, so the first frame after a drag renders at the
         // settled geometry.
-        coalescer.apply_if_due(Instant::now(), &mut |w, h| {
+        let trailing_fired = coalescer.apply_if_due(Instant::now(), &mut |w, h| {
             apply_production_resize(&mut terminal, &mut state, w, h)
         });
+        // Wave 2A: replay at the TRAILING edge only (never mid-burst) — the
+        // pure gate makes this a no-op for height-only changes, while
+        // streaming/reading defer to their boundary hooks in inline_tick.
+        if trailing_fired {
+            maybe_replay_transcript(&mut terminal, &mut app, &mut state);
+        }
+
+        // Wave 2A size watchdog: crossterm SIGWINCH delivery is unreliable
+        // under some tmux setups — probe the live size every 500ms and
+        // synthesize a resize through the coalescer when it drifts from
+        // `applied` (also recovers a failed leading apply). The probe is an
+        // ioctl; the interval gate keeps it at <=2Hz. A probe error is
+        // skipped silently — the next tick retries.
+        let probe_now = Instant::now();
+        if watchdog_due(state.replay.last_watchdog, probe_now) {
+            state.replay.last_watchdog = Some(probe_now);
+            if let Ok(live) = crossterm::terminal::size()
+                && watchdog_size_mismatch(coalescer.applied, live)
+            {
+                tracing::info!(
+                    applied = ?coalescer.applied,
+                    live = ?live,
+                    "size watchdog: synthesizing missed resize"
+                );
+                coalescer.on_resize(live.0, live.1, probe_now, &mut |w, h| {
+                    apply_production_resize(&mut terminal, &mut state, w, h)
+                });
+            }
+        }
 
         let base_poll_ms = if app.is_streaming {
             POLL_INTERVAL_ACTIVE_MS

@@ -107,6 +107,62 @@ tui_tmux_smoke() {
   echo "tmux smoke PASSED"
 }
 
+tui_tmux_resize() {
+  # Wave 2A (T091): a REAL multiplexer resizes the pane under a live zen TUI.
+  # Proves the source-backed replay reflows committed transcript at the new
+  # width under genuine SIGWINCH delivery (complements the PTY-simulated
+  # e19), and that the session survives the destructive purge. Deterministic
+  # content: ZEN_TEST_ECHO_LLM=1 echo script + a fixed 70-char user message
+  # whose "> " echo (72 cols) hard-wraps at 60 and fits one row at 100.
+  local bin="./target/debug/zen"
+  [[ -x "$bin" ]] || cargo build -p zen >/dev/null
+  tui_session="zen-tui-resize-$$"
+  tmux new-session -d -s "$tui_session" -x 60 -y 30 \
+    -e "ZEN_HOME=$ZEN_HOME" -e "ZEN_TEST_ECHO_LLM=1" "bash --noprofile --norc"
+  trap 'tmux kill-session -t "$tui_session" 2>/dev/null || true' EXIT
+  tmux send-keys -t "$tui_session" "$bin" Enter
+  sleep 4
+  local pane
+  pane="$(tmux capture-pane -t "$tui_session" -p)"
+  grep -q "Input (Enter=send" <<<"$pane" || { echo "FAIL: input box missing"; echo "$pane"; exit 1; }
+  local body="REPLAYHEAD-$(printf 'x%.0s' {1..48})-REPLAYTAIL"
+  tmux send-keys -t "$tui_session" -l "$body"
+  sleep 0.5
+  tmux send-keys -t "$tui_session" Enter
+  sleep 3
+  pane="$(tmux capture-pane -t "$tui_session" -p)"
+  grep -q "REPLAYTAIL" <<<"$pane" || { echo "FAIL: echo not committed at 60 cols"; echo "$pane"; exit 1; }
+  if grep -E "REPLAYHEAD.*REPLAYTAIL" <<<"$pane"; then
+    echo "FAIL: precondition — echo must be hard-wrapped at 60 cols"; echo "$pane"; exit 1
+  fi
+  echo "    ok: echo hard-wrapped at 60 cols"
+  tmux resize-window -t "$tui_session" -x 100 -y 30
+  sleep 2
+  pane="$(tmux capture-pane -t "$tui_session" -p)"
+  grep -Eq "REPLAYHEAD.*REPLAYTAIL" <<<"$pane" || {
+    echo "FAIL: replay did not reflow the echo onto one row at 100 cols"; echo "$pane"; exit 1; }
+  local heads
+  heads="$(grep -c "REPLAYHEAD" <<<"$pane")"
+  [[ "$heads" == "1" ]] || { echo "FAIL: replay duplicated the echo ($heads rows)"; echo "$pane"; exit 1; }
+  echo "    ok: width grow replayed transcript at new width (exactly once)"
+  tmux send-keys -t "$tui_session" C-u
+  sleep 0.3
+  tmux send-keys -t "$tui_session" C-d
+  sleep 2
+  # Exit probe = the pane's foreground command, NOT composer-graphics
+  # absence: the last viewport render legitimately remains on the tmux
+  # screen after exit (pre-existing behavior, identical with and without
+  # replay — verified by control run 2026-10-27). pane_current_command
+  # flips zen -> bash exactly when the process is gone.
+  local cur
+  cur="$(tmux list-panes -t "$tui_session" -F '#{pane_current_command}')"
+  [[ "$cur" == "bash" ]] || { echo "FAIL: zen did not exit after replay (pane still runs $cur)"; exit 1; }
+  pane="$(tmux capture-pane -t "$tui_session" -p -S -60)"
+  grep -q "REPLAYTAIL" <<<"$pane" || { echo "FAIL: scrollback lost after exit (FR-015)"; echo "$pane"; exit 1; }
+  echo "    ok: exit after replay leaves scrollback intact"
+  echo "tmux resize PASSED"
+}
+
 tui_copy_checklist() {
   cat <<'EOS'
 ──────────────────────────────────────────────────────────────
@@ -153,6 +209,7 @@ tui() {
         echo "==> L4: skipped (ZEN_SKIP_TMUX=1)"
       elif command -v tmux >/dev/null 2>&1; then
         echo "==> L4: tmux smoke"; tui_tmux_smoke
+        echo "==> L4: tmux resize"; tui_tmux_resize
       else
         echo "==> L4: tmux not installed — skipped"
       fi
@@ -166,7 +223,7 @@ tui() {
     unit)     tui_unit ;;
     guard)    tui_guard ;;
     pty)      shift || true; tui_pty "${1:-}" ;;
-    tmux)     tui_tmux_smoke ;;
+    tmux)     tui_tmux_smoke; tui_tmux_resize ;;
     copy)     tui_copy_checklist ;;
     list)     tui_list ;;
     *)        echo "unknown tui mode: $mode (valid: quick|unit|guard|pty|tmux|copy|list)" >&2; exit 2 ;;

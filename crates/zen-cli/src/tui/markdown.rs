@@ -489,6 +489,11 @@ pub struct CommittedBlock {
 
 pub struct PendingBlock {
     pub lines: Vec<Line<'static>>,
+    /// Wave 2A additive seam: the display source this block was rendered
+    /// from, so the completion flush can capture it for width-change
+    /// replay (rendering semantics untouched — same string block_to_lines
+    /// consumed above).
+    pub raw: String,
 }
 
 pub struct StreamingMarkdown {
@@ -536,7 +541,10 @@ impl StreamingMarkdown {
         let pending = self.state.pending().map(|block| {
             let display = block.display_or_raw().to_string();
             let lines = block_to_lines(&display);
-            PendingBlock { lines }
+            PendingBlock {
+                lines,
+                raw: display,
+            }
         });
 
         StreamingUpdate { committed, pending }

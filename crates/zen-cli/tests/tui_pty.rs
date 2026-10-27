@@ -671,27 +671,59 @@ fn e13_echo_streaming_commits_blocks_without_duplication() {
     tui.wait_exit();
 }
 
-/// E14 (streaming E2E, `ZEN_TEST_ECHO_LLM=1`): `/thinking` toggles reasoning
-/// visibility. With thinking enabled before the turn, the W3 collapsed-thinking
-/// display (Codex pattern) commits the `✓ Thought for Ns` summary — full
-/// reasoning NEVER pollutes the transcript (it shows only as a live tail
-/// while the think block is still streaming).
+/// E14 (streaming E2E, `ZEN_TEST_ECHO_LLM=1`): `/thinking` three-state
+/// (T089) — brief surfaces only the graduation title (first reasoning
+/// sentence) in the transcript; full surfaces the reasoning body live.
+/// Body-only needle = the second ECHO_SCRIPT sentence; assertions are
+/// completion-synchronized (the live brief line legitimately shows collapsed
+/// reasoning mid-stream inside the viewport tail).
 #[test]
 #[ignore]
 fn e14_echo_streaming_thinking_toggle_surfaces_reasoning() {
-    let mut tui = Tui::spawn(&[("ZEN_TEST_ECHO_LLM", "1")]);
+    // 250ms/chunk: the multi-line reasoning phase spans ~750ms of live
+    // in_think draws — the full-mode body needle gets >=2 poll samples
+    // (100ms wait_for cadence) instead of a single-drain vanish.
+    let mut tui = Tui::spawn(&[
+        ("ZEN_TEST_ECHO_LLM", "1"),
+        ("ZEN_TEST_ECHO_DELAY_MS", "250"),
+    ]);
     tui.wait_for("Input (Enter=send", "composer ready");
+
+    // Phase 1 — BRIEF (bare /thinking cycles off -> brief). The two-sentence
+    // ECHO_SCRIPT reasoning pins the T089 split: the graduation TITLE is the
+    // first sentence; the second sentence ("edge case carefully") is body-only
+    // and must NEVER reach the transcript in brief mode. Assert only after
+    // turn completion — while streaming, the live brief line legitimately
+    // shows the collapsed reasoning inside the viewport tail.
     tui.send(b"/thinking\r");
     std::thread::sleep(Duration::from_millis(300)); // let the toggle ack render
     tui.send(b"hello echo\r");
-
-    tui.wait_for("Thought for", "collapsed thinking summary in scrollback");
+    tui.wait_for("Thought for", "graduation line in scrollback");
     tui.wait_for("A paragraph with", "committed paragraph in scrollback");
+    tui.wait_for("\u{2500}\u{2500}", "turn separator after completion");
     let screen = tui.screen();
     assert!(
-        !screen.contains("understand the user"),
-        "W3: full reasoning must stay collapsed out of the transcript:\n{screen}"
+        screen.contains("understand the user's request"),
+        "brief mode: graduation title (first reasoning sentence) must render:\n{screen}"
     );
+    assert!(
+        !screen.contains("edge case carefully"),
+        "brief mode: reasoning body beyond the title must stay collapsed out \
+         of the transcript after completion:\n{screen}"
+    );
+
+    // Phase 2 — FULL (second bare /thinking cycles brief -> full): the W3
+    // window now surfaces the reasoning body live while streaming.
+    tui.send(b"/thinking\r");
+    std::thread::sleep(Duration::from_millis(300));
+    tui.send(b"hello full\r");
+    tui.wait_for(
+        "edge case carefully",
+        "full mode surfaces the reasoning body",
+    );
+
+    tui.send(b"\x15");
+    std::thread::sleep(Duration::from_millis(100));
     tui.send(b"\x04");
     tui.wait_exit();
 }
@@ -826,5 +858,88 @@ fn input_latency_smoke() {
     // Ctrl+D quits only on EMPTY input in inline mode (otherwise it is
     // delete-char-forward) — clear the composer first (Ctrl+U), then exit.
     tui.send(b"\x15\x04");
+    tui.wait_exit();
+}
+
+/// E19 (Wave 2A, T090): source-backed replay reflows the committed
+/// transcript on a width GROW. A user echo hard-wrapped at 60 cols (one
+/// logical line > 60 chars) must appear on ONE grid row after growing to
+/// 100 cols — pre-Wave-2A behavior kept the 60-col hard wrap in native
+/// scrollback forever (the 显示错乱 the replay lane exists for). Also pins:
+/// exactly-once reinsertion (no duplication from the purge+replay), the
+/// turn separator survives as a PreRendered capture, and the app keeps
+/// accepting input after the destructive purge.
+///
+/// Assertion law (e10 lesson): only BOTTOM-anchored content is asserted —
+/// the echo/response/separator tail sits above the 12-row viewport and the
+/// 40-row grid leaves ample headroom; the banner may scroll off and is
+/// deliberately not asserted.
+#[test]
+#[ignore]
+fn e19_width_change_replays_transcript_at_new_width() {
+    let mut tui = Tui::spawn(&[("ZEN_TEST_ECHO_LLM", "1")]);
+    tui.wait_for("Input (Enter=send", "composer ready");
+
+    // Narrow BEFORE any content is committed so the echo hard-wraps at 60.
+    // Rows grow 30→40 in the same step (height change is orthogonal — the
+    // replay gate only fires on WIDTH change; the taller grid keeps the
+    // bottom-anchored tail on screen at both widths).
+    tui.resize(40, 60);
+    std::thread::sleep(Duration::from_millis(400));
+
+    // 70-char body → "> " echo = 72 cols: ONE logical row at 100 cols,
+    // TWO rows at 60. Head/tail tokens straddle the 60-col wrap point.
+    let body = format!("REPLAYHEAD-{}-REPLAYTAIL", "x".repeat(48));
+    assert_eq!(body.chars().count(), 70);
+    tui.send(format!("{body}\r").as_bytes());
+    tui.wait_for("REPLAYTAIL", "echo committed at 60 cols");
+    tui.wait_for("\u{2500}\u{2500}", "turn separator after completion");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // At 60 cols the logical line is hard-wrapped: no single grid row can
+    // hold both tokens (this is the state replay must UNDO on grow).
+    let narrow = tui.screen();
+    assert!(
+        narrow.contains("REPLAYHEAD") && narrow.contains("REPLAYTAIL"),
+        "both tokens must be on screen before the grow:\n{narrow}"
+    );
+    assert!(
+        !narrow
+            .lines()
+            .any(|l| l.contains("REPLAYHEAD") && l.contains("REPLAYTAIL")),
+        "precondition: echo must be hard-wrapped at 60 cols:\n{narrow}"
+    );
+
+    // Grow: coalescer trailing edge → width change → purge + re-render +
+    // reinsert at 100 cols, all inside one synchronized-update region.
+    tui.resize(40, 100);
+    std::thread::sleep(Duration::from_millis(600));
+
+    let wide = tui.screen();
+    let joined = wide
+        .lines()
+        .filter(|l| l.contains("REPLAYHEAD") && l.contains("REPLAYTAIL"))
+        .count();
+    assert_eq!(
+        joined, 1,
+        "replay must reflow the echo onto ONE 100-col row:\n{wide}"
+    );
+    assert_eq!(
+        wide.lines().filter(|l| l.contains("REPLAYHEAD")).count(),
+        1,
+        "replay must reinsert exactly once (no duplication):\n{wide}"
+    );
+    assert!(
+        wide.contains("\u{2500}\u{2500}"),
+        "turn separator must survive the purge+replay:\n{wide}"
+    );
+
+    // Alive after the destructive purge (fail-soft contract: replay never
+    // kills the session).
+    tui.send(b"still alive\r");
+    tui.wait_for("still alive", "input accepted after replay");
+    tui.send(b"\x15");
+    std::thread::sleep(Duration::from_millis(100));
+    tui.send(b"\x04");
     tui.wait_exit();
 }

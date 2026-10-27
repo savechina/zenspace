@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use super::transcript_source::TranscriptSource;
 use crate::tui::markdown::StreamingMarkdown;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -44,6 +45,16 @@ pub struct StreamCollector {
     thinking_brief: bool,
     // T082 (NFR-009): inter-token stall tracker for the current turn.
     stall: super::stall::StallTracker,
+    // Wave 2A: source log for transcript replay. Appended ONLY on the
+    // inline drain path (`drain == true`) in the exact order committed
+    // lines are assembled, so the registry mirrors the rendered transcript.
+    // The fullscreen snapshot path (drain == false) never accumulates.
+    source_log: Vec<TranscriptSource>,
+    // Wave 2A: display source of the current pending tail block (the block
+    // mdstream has not committed yet). Consumed once at the completion
+    // boundary — the final block never passes through the committed path,
+    // so without this its source would vanish from replay.
+    last_pending_raw: Option<String>,
 }
 
 /// Maximum reasoning lines kept in the pending tail viewport (header + N lines).
@@ -183,6 +194,8 @@ impl StreamCollector {
             text_fed_len: 0,
             reasoning_fed_len: 0,
             tool_blocks: Vec::new(),
+            source_log: Vec::new(),
+            last_pending_raw: None,
             rendered_tools: 0,
             tools_expanded: false,
             reasoning_started_at: None,
@@ -502,10 +515,20 @@ impl StreamCollector {
             } else if !self.thinking_summary_committed {
                 // BUG-1: THINK CLOSE: commit exactly ONE summary line, no body.
                 // The once-guard prevents duplicate ✓ lines on repeated drains.
-                committed.push(Line::from(Span::styled(header_text, reasoning_style)));
+                let header_line = Line::from(Span::styled(header_text, reasoning_style));
+                committed.push(header_line.clone());
                 // Blank separator after the thought summary.
                 committed.push(Line::from(Span::raw("")));
                 self.thinking_summary_committed = true;
+                // Wave 2A: the summary line is timing-derived (elapsed secs)
+                // and NOT re-derivable from raw source — capture the rendered
+                // Lines so replay keeps them (PreRendered kind).
+                if drain {
+                    self.source_log.push(TranscriptSource::PreRendered(vec![
+                        header_line,
+                        Line::from(Span::raw("")),
+                    ]));
+                }
             }
         }
 
@@ -517,6 +540,9 @@ impl StreamCollector {
             let start = self.rendered_tools.min(self.tool_blocks.len());
             for block in &self.tool_blocks[start..] {
                 committed.extend(Self::tool_block_lines(block, expanded));
+                // Wave 2A: capture the ToolIntermediate itself so replay
+                // re-renders with the CURRENT /tools expanded state.
+                self.source_log.push(TranscriptSource::Tool(block.clone()));
             }
             self.rendered_tools = self.tool_blocks.len();
         } else {
@@ -530,6 +556,13 @@ impl StreamCollector {
             let text_update = self.text_renderer.append(text_delta);
             for block in &text_update.committed {
                 committed.extend(block.lines.iter().cloned());
+                // Wave 2A: capture the block's display source — replay
+                // re-runs it through render_markdown (the exact pipeline
+                // that produced these lines) at the new width.
+                if drain {
+                    self.source_log
+                        .push(TranscriptSource::Markdown(block.display.clone()));
+                }
             }
             if let Some(pending_block) = &text_update.pending {
                 // W4a: mdstream 0.3.0 guarantees pending blocks only contain
@@ -544,10 +577,38 @@ impl StreamCollector {
                 // in BoundaryDetector, which means the table is complete). No
                 // speculative holdback scanner needed at this layer.
                 pending.extend(pending_block.lines.iter().cloned());
+                // Wave 2A: remember the pending block's source so the
+                // completion boundary can capture it exactly once (take_).
+                if drain && !pending_block.lines.is_empty() {
+                    self.last_pending_raw = Some(pending_block.raw.clone());
+                }
             }
         }
 
         (committed, pending)
+    }
+
+    /// Wave 2A: drain the source log accumulated by the inline drain path.
+    /// Called right after `drain_and_tail_filtered` by the inline pipeline;
+    /// entries append to the App-level registry in commit order.
+    pub(crate) fn take_source_log(&mut self) -> Vec<TranscriptSource> {
+        std::mem::take(&mut self.source_log)
+    }
+
+    /// Wave 2A: consume the pending tail block's source once (completion
+    /// boundary only — mid-stream calls would race the growing tail).
+    pub fn take_pending_source(&mut self) -> Option<String> {
+        self.last_pending_raw.take()
+    }
+
+    /// Wave 2A: render one captured tool intermediate (exposed for the
+    /// replay path so registry entries re-render with the CURRENT /tools
+    /// expanded preference instead of the capture-time one).
+    pub(crate) fn render_tool_block(
+        block: &ToolIntermediate,
+        expanded: bool,
+    ) -> Vec<Line<'static>> {
+        Self::tool_block_lines(block, expanded)
     }
 
     fn indent_line(line: Line<'static>) -> Line<'static> {
@@ -590,6 +651,9 @@ impl StreamCollector {
         self.reasoning_fed_len = 0;
         self.tool_blocks.clear();
         self.rendered_tools = 0;
+        // Wave 2A: the turn ended — any unconsumed replay sources are stale.
+        self.source_log.clear();
+        self.last_pending_raw = None;
         // (a) the turn is over — drop the live footer summary.
         self.latest_reasoning_summary = None;
         let (text, reasoning, _) = Self::split_reasoning(&raw);
@@ -605,6 +669,8 @@ impl StreamCollector {
         self.buffer.clear();
         self.text_renderer.clear();
         self.reasoning_renderer.clear();
+        self.source_log.clear();
+        self.last_pending_raw = None;
         self.reasoning_active = false;
         self.buffer_changed_since_render = false;
         self.last_reasoning_split = None;

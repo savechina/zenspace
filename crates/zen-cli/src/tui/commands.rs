@@ -7,7 +7,12 @@ use super::theme::OutputTheme;
 /// dim `⇅` prefix in inline scrollback. Applied to render-only line clones
 /// after the queue accepts the raw text, so the marker never reaches
 /// `message_queue`, the session jsonl, or the model payload.
-fn mark_queued_echo(mut lines: Vec<Line<'static>>, theme: &dyn OutputTheme) -> Vec<Line<'static>> {
+/// Wave 2A: pub(crate) so the replay path (`App::build_replay_entries`)
+/// reproduces the queued-submission marker on UserEcho entries.
+pub(crate) fn mark_queued_echo(
+    mut lines: Vec<Line<'static>>,
+    theme: &dyn OutputTheme,
+) -> Vec<Line<'static>> {
     if let Some(first) = lines.first_mut() {
         let mut spans = vec![Span::styled("⇅ ", theme.text_muted())];
         spans.append(&mut first.spans);
@@ -197,6 +202,13 @@ impl App {
                 if self.is_inline_mode() {
                     let user_lines = self.render_user_lines_for_scrollback(cmd);
                     let user_lines = mark_queued_echo(user_lines, self.theme.as_ref());
+                    // Wave 2A: capture the echo source (queued variant keeps
+                    // the marker through width-change replay).
+                    self.transcript
+                        .push(super::transcript_source::TranscriptSource::UserEcho {
+                            text: cmd.to_string(),
+                            queued: true,
+                        });
                     self.enqueue_scrollback(user_lines);
                 }
                 self.message_queue.push_back(cmd.to_string());
@@ -208,6 +220,12 @@ impl App {
             // dispatch) runs in background tasks.
             if self.is_inline_mode() {
                 let user_lines = self.render_user_lines_for_scrollback(cmd);
+                // Wave 2A: capture the echo source for width-change replay.
+                self.transcript
+                    .push(super::transcript_source::TranscriptSource::UserEcho {
+                        text: cmd.to_string(),
+                        queued: false,
+                    });
                 self.enqueue_scrollback(user_lines);
             }
             self.ensure_session(cmd);
@@ -241,10 +259,19 @@ impl App {
                     self.scrollback_queue.clear();
                     self.output.clear();
                     self.stream_collector.clear();
-                    self.enqueue_scrollback(vec![Line::from(ratatui::text::Span::styled(
+                    // Wave 2A: /clear restarts the transcript — the replay
+                    // registry must restart with it (the notice below is the
+                    // only history that remains).
+                    self.transcript.clear();
+                    let cleared = vec![Line::from(ratatui::text::Span::styled(
                         "(screen cleared)",
                         self.theme.as_ref().text_muted(),
-                    ))]);
+                    ))];
+                    self.transcript
+                        .push(super::transcript_source::TranscriptSource::PreRendered(
+                            cleared.clone(),
+                        ));
+                    self.enqueue_scrollback(cleared);
                 } else {
                     self.output.clear();
                     self.stream_collector.clear();
