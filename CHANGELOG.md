@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Source-backed transcript replay** (2026-10-27): width changes no longer
+  leave the transcript hard-wrapped at the old width. A source registry
+  captures every committed block (assistant markdown, user echoes, tool
+  cards, thinking graduation lines, banner, pre-rendered fallbacks) within
+  a budget cap that renders a trim notice when exceeded; on a width change
+  at the coalescer trailing edge the native scrollback is purged and the
+  transcript re-rendered and reinserted at the new width inside a single
+  synchronized-update region, then the viewport re-anchors. Streaming and
+  reading-mode sessions defer to their boundaries and replay once. A 500ms
+  size watchdog synthesizes resizes the terminal failed to deliver (some
+  multiplexer setups). Replay failures degrade without killing the session.
+  Accepted cost (owner decision, codex-rs parity): the purge also clears
+  pre-session shell scrollback. Verified by PTY and real-tmux
+  `resize-window` dynamic simulation tests.
+
 - **Interaction-language convergence (codex/hermes study wave)**
   (2026-10-27): markdown output converges on conventions studied from
   codex-rs and hermes-agent — heading hierarchy (H1 bold+underline,
