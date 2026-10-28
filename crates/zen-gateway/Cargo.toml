@@ -41,4 +41,4 @@ tempfile = { workspace = true }
 shuttle = "0.9.8"
 
 [features]
-shuttle = ["tokio/shuttle"]
+shuttle = ["tokio/shuttle", "zen-agents/shuttle"]

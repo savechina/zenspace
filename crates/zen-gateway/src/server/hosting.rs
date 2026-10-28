@@ -1841,6 +1841,168 @@ mod tests {
             other => panic!("expected Completed, got {other:?}"),
         }
     }
+
+    /// Differential pin (bbtree Guard-3): the gateway turn() callback
+    /// classifies each callback token INDEPENDENTLY (`split_tool_intermediates(&tok)`
+    /// at the streaming site), so the architecture is safe iff every tool
+    /// emission unit is line-atomic within a single token (Started line;
+    /// Completed header + its preview line together). Under that contract,
+    /// arbitrary chunking of the surrounding text must compose to exactly
+    /// the whole-string classification. This test enumerates every split of
+    /// the text portions and asserts the composition equality.
+    #[test]
+    fn per_token_classification_composes_to_whole_stream_when_lines_atomic() {
+        let text_head = "first answer chunk — 中文 ok\n";
+        let started_line = "🔧 web.search {\"query\":\"rust\"}\n";
+        let text_mid = "mid text line\nanother line\n";
+        let completed_unit = "✅ web.search done 2 hits 90ms provider=ddg\npreview line\n";
+        let text_tail = "final line";
+
+        // Whole-string reference classification.
+        let whole = format!("{text_head}{started_line}{text_mid}{completed_unit}{text_tail}");
+        let (ref_text, ref_events) = split_tool_intermediates(&whole);
+
+        // Emitters keep tool units token-atomic; text chunks are split at
+        // every char-boundary position of each text segment (exhaustive,
+        // char-safe per the CJK in text_head).
+        let split_token = |s: &str| -> Vec<(usize, String)> {
+            (0..=s.chars().count())
+                .map(|n| {
+                    let end = s.char_indices().nth(n).map(|(i, _)| i).unwrap_or(s.len());
+                    (n, s[..end].to_string())
+                })
+                .collect()
+        };
+        let heads = split_token(text_head);
+        let mids = split_token(text_mid);
+        let tails = split_token(text_tail);
+
+        let classify = |tokens: &[String]| -> (String, Vec<ToolIntermediate>) {
+            let mut text = String::new();
+            let mut events = Vec::new();
+            for tok in tokens {
+                let (t, mut e) = split_tool_intermediates(tok);
+                if !text.is_empty() && !t.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&t);
+                events.append(&mut e);
+            }
+            (text, events)
+        };
+
+        for (hn, head) in &heads {
+            for (mn, mid) in &mids {
+                for (tn, tail) in &tails {
+                    // Chunking model: each text segment splits into a
+                    // prefix/suffix pair at position n (both halves kept —
+                    // chunking never drops characters); tool lines stay
+                    // token-atomic per the emitter contract.
+                    let head_prefix: &str = head;
+                    let mid_prefix: &str = mid;
+                    let tail_prefix: &str = tail;
+                    let mut tokens = vec![
+                        head_prefix.to_string(),
+                        text_head[head_prefix.len()..].to_string(),
+                        started_line.to_string(),
+                        mid_prefix.to_string(),
+                        text_mid[mid_prefix.len()..].to_string(),
+                        completed_unit.to_string(),
+                        tail_prefix.to_string(),
+                        text_tail[tail_prefix.len()..].to_string(),
+                    ];
+                    tokens.retain(|t| !t.is_empty());
+                    let (text, events) = classify(&tokens);
+                    assert_eq!(
+                        events.len(),
+                        ref_events.len(),
+                        "split ({hn},{mn},{tn}): tool events must be chunk-invariant"
+                    );
+                    match (events.as_slice(), ref_events.as_slice()) {
+                        (
+                            [
+                                ToolIntermediate::Started { tool, args },
+                                ToolIntermediate::Completed { .. },
+                            ],
+                            [
+                                ToolIntermediate::Started { tool: rt, args: ra },
+                                ToolIntermediate::Completed { .. },
+                            ],
+                        ) => {
+                            assert_eq!(tool, rt, "split ({hn},{mn},{tn})");
+                            assert_eq!(args, ra, "split ({hn},{mn},{tn})");
+                        }
+                        _ => panic!("split ({hn},{mn},{tn}): unexpected event shapes"),
+                    }
+                    // Text composition: per-token classification consumes
+                    // each token's trailing newline as a line boundary, so
+                    // cross-token separators are lost in the raw delta
+                    // stream — the honest equality is whitespace-insensitive
+                    // (same characters, possibly different separators).
+                    // Lost/leaked TOOL LINES and dropped text still trip.
+                    let squeeze: fn(&str) -> String =
+                        |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect();
+                    assert_eq!(
+                        squeeze(&text),
+                        squeeze(&ref_text),
+                        "split ({hn},{mn},{tn}): visible text must be chunk-invariant"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Honest boundary pin: a 🔧 marker line SPLIT across two callback
+    /// tokens loses the Started event AND leaks the remainder as display
+    /// text. This documents the no-carry limitation of per-token
+    /// classification — emitters MUST keep tool lines line-atomic
+    /// (orchestrator dispatch sites do). If a future emitter change emits
+    /// partial tool lines, this pin trips and the fix is a carry buffer
+    /// (mirror of the FR-042 restore_incremental frame-carry), not a
+    /// silent regression.
+    #[test]
+    fn marker_line_split_across_tokens_is_lost_and_leaks_documented() {
+        let (t1, e1) = split_tool_intermediates("🔧");
+        let (t2, e2) = split_tool_intermediates(" fs.read {\"path\":\"a\"}\n");
+        assert!(e1.is_empty(), "bare marker token yields no event");
+        assert!(t1.is_empty(), "bare marker token is suppressed from text");
+        assert!(
+            e2.is_empty(),
+            "the remainder token carries no marker, so no Started event"
+        );
+        assert_eq!(
+            t2, " fs.read {\"path\":\"a\"}\n",
+            "the args leak into visible text — the documented degradation"
+        );
+    }
+
+    /// Honest boundary pin: a ✅ header and its preview line arriving in
+    /// SEPARATE tokens loses the preview capture (per-token
+    /// `collecting_preview` state resets); the preview line degrades to
+    /// display text. Same line-atomicity contract as the Started split.
+    #[test]
+    fn completed_preview_split_across_tokens_loses_preview_documented() {
+        let (t1, e1) = split_tool_intermediates("✅ web.search done 2 hits 90ms\n");
+        let (t2, e2) = split_tool_intermediates("preview line\n");
+        assert_eq!(e1.len(), 1, "header token still classifies the Completed");
+        match &e1[0] {
+            ToolIntermediate::Completed { preview, .. } => {
+                assert!(preview.is_none(), "no preview in the header token");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(e2.is_empty());
+        assert_eq!(
+            t1.replace('\n', ""),
+            String::new(),
+            "header token contributes no text"
+        );
+        assert_eq!(
+            t2.replace('\n', ""),
+            "preview line",
+            "preview line degrades to text when split from its header"
+        );
+    }
 }
 
 // ── FR-009 DST (bbtree Guard-3): turn-terminal race sweep ─

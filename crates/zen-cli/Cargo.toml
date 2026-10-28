@@ -81,4 +81,4 @@ bench = []
 # FR-009 DST (bbtree Guard-3): feature OFF = shuttle-tokio re-exports real
 # tokio byte-identically; feature ON swaps in shuttle-compatible primitives
 # for deterministic schedule exploration (`bin/verify` runs the dst_ tests).
-shuttle = ["tokio/shuttle"]
+shuttle = ["tokio/shuttle", "zen-gateway/shuttle", "zen-agents/shuttle"]

@@ -369,7 +369,7 @@ impl Drop for ReaderAbort {
 /// clone is dropped or [`GatewayClient::close`] is called.
 #[derive(Clone)]
 pub struct GatewayClient {
-    transport: Arc<UdsTransport>,
+    transport: Arc<dyn Transport>,
     shared: Arc<Shared>,
     reader_abort: Arc<ReaderAbort>,
     notifications_rx: Arc<Mutex<mpsc::Receiver<Frame>>>,
@@ -617,7 +617,7 @@ impl GatewayClient {
         client.close().await;
     }
 
-    fn from_transport(transport: Arc<UdsTransport>, socket_path: &Path) -> Self {
+    fn from_transport(transport: Arc<dyn Transport>, socket_path: &Path) -> Self {
         let (notifications_tx, notifications_rx) = mpsc::channel(256);
         let shared = Arc::new(Shared {
             next_id: 0.into(),
@@ -1347,5 +1347,298 @@ mod tests {
             .unwrap();
         assert_eq!(status["storeHealth"], "ok");
         client.close().await;
+    }
+}
+
+// ── FR-009 DST (bbtree Guard-3): multiplexer three-way race sweep ─
+// The response/timeout/fail_all race over the REAL `GatewayClient`
+// multiplexer (pending map, `route`, `request_timeout`, reader task) on an
+// `InProcessTransport` pair. Shuttle's timeouts never fire on their own, so
+// the request deadline is advanced by an explicit `trigger_timeouts` racer;
+// endpoint death is modeled by the server driver dropping its only endpoint
+// clone (the reader's `recv` then errors, exactly the UDS-close shape).
+//
+// Invariants under every schedule: the caller resolves to EXACTLY ONE
+// terminal (response XOR timeout XOR connection-closed — the oneshot
+// remove-under-lock is the linearization point); an unknown-id response is
+// ignored; a duplicate response is delivered once; after a timeout the late
+// response is discarded harmlessly and a follow-up request still routes
+// (reader alive, no poisoned state); after endpoint death every waiter gets
+// the closed error.
+#[cfg(all(test, feature = "shuttle"))]
+mod dst_tests {
+    use super::*;
+    use crate::transport::in_process::{self, InProcessTransport};
+    use serde_json::json;
+
+    /// Server-side scripted behavior per arriving request.
+    #[derive(Clone, Copy)]
+    enum ReqBehavior {
+        /// Yield N times, then answer with the echoed id.
+        RespondAfter(usize),
+        /// Never answer (the shape only the deadline can resolve).
+        Never,
+        /// Answer twice with the same id (duplicate-response shape).
+        DuplicateRespond,
+        /// Answer a bogus id first, then the real one.
+        UnknownFirst,
+        /// Yield N times after the request arrives, then drop the endpoint
+        /// (connection death mid-request).
+        DropAfter(usize),
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Expect {
+        Ok,
+        Timeout,
+        Closed,
+        OkOrTimeout,
+    }
+
+    #[derive(Clone)]
+    struct MuxPlan {
+        name: &'static str,
+        first: ReqBehavior,
+        second: ReqBehavior,
+        probe: bool,
+        trigger_at: Option<usize>,
+        expect: Expect,
+        /// Follow-up expectation: plans whose trigger racer may still be
+        /// pending when the probe's own deadline exists must accept
+        /// OkOrTimeout (the one-shot global clock advance fires ANY pending
+        /// timer); only trigger-free plans pin the probe to Ok, which is
+        /// the real reader-aliveness assertion.
+        probe_expect: Expect,
+    }
+
+    fn frame_request_id(frame: &Frame) -> Option<u64> {
+        match frame {
+            Frame::ClientRequest { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    async fn server_driver(server: InProcessTransport, plan: MuxPlan) {
+        let mut idx = 0usize;
+        while let Ok(frame) = server.recv().await {
+            let Some(id) = frame_request_id(&frame) else {
+                continue;
+            };
+            let behavior = if idx == 0 { plan.first } else { plan.second };
+            idx += 1;
+            match behavior {
+                ReqBehavior::RespondAfter(steps) => {
+                    for _ in 0..steps {
+                        tokio::task::yield_now().await;
+                    }
+                    let _ = server.send(Frame::response(id, json!("pong"))).await;
+                }
+                ReqBehavior::Never => {}
+                ReqBehavior::DuplicateRespond => {
+                    let _ = server.send(Frame::response(id, json!("pong"))).await;
+                    let _ = server.send(Frame::response(id, json!("pong"))).await;
+                }
+                ReqBehavior::UnknownFirst => {
+                    let _ = server.send(Frame::response(999_999, json!("stray"))).await;
+                    let _ = server.send(Frame::response(id, json!("pong"))).await;
+                }
+                ReqBehavior::DropAfter(steps) => {
+                    for _ in 0..steps {
+                        tokio::task::yield_now().await;
+                    }
+                    drop(server);
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn run_schedule(plan: MuxPlan, seed: u64) {
+        let (client_side, server_side) = in_process::pair();
+        let client = GatewayClient::from_transport(
+            Arc::new(client_side),
+            Path::new("/tmp/zen-dst-mux.sock"),
+        );
+        tokio::task::spawn(server_driver(server_side, plan.clone()));
+
+        if let Some(steps) = plan.trigger_at {
+            tokio::task::spawn(async move {
+                for _ in 0..steps {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::trigger_timeouts(|_| true);
+            });
+        }
+
+        let outcome = client
+            .request_timeout("health/status", json!({}), Duration::from_millis(1))
+            .await;
+        let message = |e: &RpcErrorBody| e.message.clone();
+        match plan.expect {
+            Expect::Ok => {
+                assert!(
+                    outcome.is_ok(),
+                    "seed={seed} plan={}: expected Ok, got {:?}",
+                    plan.name,
+                    outcome.as_ref().err().map(message)
+                );
+            }
+            Expect::Timeout => {
+                let err = outcome.expect_err("seed={seed} plan={plan.name}: expected timeout");
+                assert!(
+                    err.message.contains("timed out"),
+                    "seed={seed} plan={}: timeout must name the deadline, got {:?}",
+                    plan.name,
+                    err.message
+                );
+            }
+            Expect::Closed => {
+                let err = outcome.expect_err("seed={seed} plan={plan.name}: expected closed");
+                assert!(
+                    err.message.contains("connection closed"),
+                    "seed={seed} plan={}: closed must name the reason, got {:?}",
+                    plan.name,
+                    err.message
+                );
+            }
+            Expect::OkOrTimeout => match &outcome {
+                Ok(_) => {}
+                Err(e) => assert!(
+                    e.message.contains("timed out"),
+                    "seed={seed} plan={}: only response/timeout are legal, got {:?}",
+                    plan.name,
+                    e.message
+                ),
+            },
+        }
+
+        if plan.probe {
+            let follow = client
+                .request_timeout("health/status", json!({}), Duration::from_millis(1))
+                .await;
+            match (&follow, plan.probe_expect) {
+                (Ok(_), _) => {}
+                (Err(e), Expect::Ok) => panic!(
+                    "seed={seed} plan={}: follow-up must resolve Ok (reader alive, no poisoned state), got {:?}",
+                    plan.name, e.message
+                ),
+                (Err(e), Expect::OkOrTimeout) => assert!(
+                    e.message.contains("timed out"),
+                    "seed={seed} plan={}: follow-up terminal must be response/timeout, got {:?}",
+                    plan.name,
+                    e.message
+                ),
+                (Err(e), _) => panic!(
+                    "seed={seed} plan={}: follow-up saw unexpected terminal {:?}",
+                    plan.name, e.message
+                ),
+            }
+        }
+    }
+
+    /// Sweep: 8 plans × 40 seeded schedules. A failure is a real
+    /// multiplexer race bug (double terminal, lost route after timeout,
+    /// hung waiter, poisoned pending map).
+    #[test]
+    fn dst_client_multiplexer_race_sweep() {
+        let plans = vec![
+            MuxPlan {
+                name: "respond-immediate",
+                first: ReqBehavior::RespondAfter(0),
+                second: ReqBehavior::Never,
+                probe: false,
+                trigger_at: None,
+                expect: Expect::Ok,
+                probe_expect: Expect::Ok,
+            },
+            MuxPlan {
+                name: "respond-slow",
+                first: ReqBehavior::RespondAfter(3),
+                second: ReqBehavior::RespondAfter(0),
+                probe: true,
+                trigger_at: None,
+                expect: Expect::Ok,
+                probe_expect: Expect::Ok,
+            },
+            MuxPlan {
+                name: "timeout-only",
+                first: ReqBehavior::Never,
+                second: ReqBehavior::RespondAfter(0),
+                probe: true,
+                trigger_at: Some(1),
+                expect: Expect::Timeout,
+                probe_expect: Expect::OkOrTimeout,
+            },
+            MuxPlan {
+                name: "drop-closes",
+                first: ReqBehavior::DropAfter(1),
+                second: ReqBehavior::Never,
+                probe: false,
+                trigger_at: None,
+                expect: Expect::Closed,
+                probe_expect: Expect::Ok,
+            },
+            MuxPlan {
+                name: "respond-vs-timeout",
+                first: ReqBehavior::RespondAfter(2),
+                second: ReqBehavior::RespondAfter(0),
+                probe: true,
+                trigger_at: Some(0),
+                expect: Expect::OkOrTimeout,
+                probe_expect: Expect::OkOrTimeout,
+            },
+            MuxPlan {
+                name: "duplicate-response",
+                first: ReqBehavior::DuplicateRespond,
+                second: ReqBehavior::RespondAfter(0),
+                probe: true,
+                trigger_at: None,
+                expect: Expect::Ok,
+                probe_expect: Expect::Ok,
+            },
+            MuxPlan {
+                name: "unknown-then-real",
+                first: ReqBehavior::UnknownFirst,
+                second: ReqBehavior::RespondAfter(0),
+                probe: true,
+                trigger_at: None,
+                expect: Expect::Ok,
+                probe_expect: Expect::Ok,
+            },
+            MuxPlan {
+                name: "duplicate-vs-timeout",
+                first: ReqBehavior::DuplicateRespond,
+                second: ReqBehavior::RespondAfter(0),
+                probe: true,
+                trigger_at: Some(2),
+                expect: Expect::OkOrTimeout,
+                probe_expect: Expect::OkOrTimeout,
+            },
+        ];
+        for plan in &plans {
+            for seed in 0..40u64 {
+                let scheduler = shuttle::scheduler::RandomScheduler::new_from_seed(seed, 1);
+                let plan = plan.clone();
+                // Two shuttle-engine facts shape this harness:
+                // (1) the default task stack (0xf000 = 60 KiB) overflows
+                //     (SIGBUS) on this deeper future chain — bump to 256 KiB;
+                // (2) TIMEOUT_TABLE (trigger_timeouts / timeout registration)
+                //     is THREAD-LOCAL and a `|_| true` trigger persists for
+                //     the thread's lifetime, so trigger-bearing plans poison
+                //     every later schedule on the same thread — run each
+                //     schedule on a fresh OS thread for a clean time table.
+                std::thread::scope(|scope| {
+                    scope.spawn(move || {
+                        let mut config = shuttle::Config::new();
+                        config.stack_size = 256 * 1024;
+                        let runner = shuttle::Runner::new(scheduler, config);
+                        runner.run(move || {
+                            let plan = plan.clone();
+                            shuttle::future::block_on(run_schedule(plan, seed));
+                        });
+                    });
+                });
+            }
+        }
     }
 }

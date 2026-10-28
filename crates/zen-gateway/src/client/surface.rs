@@ -152,6 +152,15 @@ pub struct SurfaceClient {
     /// aborts the prior pump before installing its replacement, so
     /// reconnect cycles never leak blocked pump tasks.
     pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes [`Self::ensure_link`]'s check-then-dial window. Without
+    /// it, two concurrent callers (e.g. a turn racing
+    /// `cancel_active_turns` after a link death) both observe the dead
+    /// link and both dial; the interleaved pump-slot
+    /// take/take/install/install sequence then overwrites the first
+    /// dial's pump handle WITHOUT aborting it — a leaked live pump whose
+    /// daemon connection delivers every session event twice into the
+    /// shared broadcast fan-out.
+    dial_serial: tokio::sync::Mutex<()>,
     /// FR-024: Interactive approval sink. When `Some`, Q3 approval requests
     /// are routed to this channel instead of the policy-lambda. The TUI
     /// sends decisions back via the response channel. The pump awaits
@@ -267,6 +276,7 @@ impl SurfaceClient {
             )),
             events_tx,
             pump: std::sync::Mutex::new(None),
+            dial_serial: tokio::sync::Mutex::new(()),
         };
         surface.dial().await?;
         Ok(surface)
@@ -517,7 +527,15 @@ impl SurfaceClient {
 
     /// Returns a live client, redialing when the cached one is dead
     /// (reconnect-between-turns entry point).
+    ///
+    /// The check-then-dial window is serialized by `dial_serial`: a
+    /// concurrent caller waits for the in-flight dial and then re-checks
+    /// the freshly installed client instead of double-dialing (a leaked
+    /// second pump would duplicate every session event into the
+    /// broadcast fan-out — see the `dial_serial` field doc and the
+    /// dst pump-slot sweep).
     async fn ensure_link(&self) -> Result<GatewayClient, SurfaceError> {
+        let _dial_gate = self.dial_serial.lock().await;
         let mut guard = self.inner.lock().await;
         if let Some(client) = guard.as_ref()
             && client.is_connected()
@@ -1147,6 +1165,7 @@ mod tests {
             )),
             events_tx: tokio::sync::broadcast::channel(16).0,
             pump: std::sync::Mutex::new(None),
+            dial_serial: tokio::sync::Mutex::new(()),
         };
         assert_eq!(
             surface.link_state(),
@@ -1474,6 +1493,7 @@ mod tests {
             )),
             events_tx: tokio::sync::broadcast::channel(16).0,
             pump: std::sync::Mutex::new(None),
+            dial_serial: tokio::sync::Mutex::new(()),
         };
 
         // No sink initially.
@@ -1544,6 +1564,7 @@ mod tests {
             )),
             events_tx: tokio::sync::broadcast::channel(16).0,
             pump: std::sync::Mutex::new(None),
+            dial_serial: tokio::sync::Mutex::new(()),
         };
 
         // Initially no sink.
@@ -1705,5 +1726,236 @@ mod tests {
             seen.contains(&"turn_completed".to_string()),
             "terminal event must reach the caller subscription: {seen:?}"
         );
+    }
+}
+
+// ── FR-009 DST (bbtree Guard-3): concurrent double-dial pump-slot sweep ─
+// `ensure_link` drops the inner guard BEFORE dialing, so two concurrent
+// callers (a turn racing `cancel_active_turns` after a link death) can both
+// observe the dead link and both dial. The pump-slot then interleaves
+// take/take/install/install and the second install OVERWRITES the first
+// dial's pump handle without aborting it — a leaked live pump whose daemon
+// connection re-delivers every session event into the shared broadcast
+// fan-out. The replica models the dial as a paced stub whose per-connection
+// server stream carries the SAME values (daemon-side fan-out), so a leak
+// shows up as duplicate delivery; the production fix is the `dial_serial`
+// gate around the check-then-dial window (second caller re-checks the
+// freshly installed client instead of double-dialing).
+#[cfg(all(test, feature = "shuttle"))]
+mod dst_tests {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct ReplicaClient {
+        connected: StdArc<AtomicBool>,
+        rx: StdArc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u64)>>>,
+    }
+
+    struct PumpSlotReplica {
+        inner: tokio::sync::Mutex<Option<ReplicaClient>>,
+        pump_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        /// The production fix under test: serialize the check-then-dial
+        /// window (mirror of `SurfaceClient::dial_serial`).
+        dial_serial: tokio::sync::Mutex<()>,
+        dials_started: StdArc<AtomicUsize>,
+        /// Dial stub: instance ids below this count fail (Offline shape).
+        dial_fails: usize,
+        feed_sent: StdArc<AtomicUsize>,
+        forwarded: StdArc<AtomicUsize>,
+    }
+
+    impl PumpSlotReplica {
+        /// `SurfaceClient::ensure_link` shape: gate → check → dial → install.
+        /// The fan-out sender moves in and is cloned into the pump; the
+        /// original drops on return so the channel disconnects exactly when
+        /// the last live pump exits (the drain-termination signal).
+        async fn ensure_link(&self, events: tokio::sync::mpsc::Sender<(u64, u64)>) {
+            let _dial_gate = self.dial_serial.lock().await;
+            let mut guard = self.inner.lock().await;
+            if let Some(client) = guard.as_ref()
+                && client.connected.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            *guard = None;
+            drop(guard);
+
+            let n = self.dials_started.fetch_add(1, Ordering::SeqCst) as u64;
+            for _ in 0..2 {
+                tokio::task::yield_now().await;
+            }
+            if (n as usize) < self.dial_fails {
+                return;
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel::<(u64, u64)>(8);
+            let client = ReplicaClient {
+                connected: StdArc::new(AtomicBool::new(true)),
+                rx: StdArc::new(tokio::sync::Mutex::new(rx)),
+            };
+            self.spawn_pump(client.clone(), events);
+            // Server-side stream: the daemon delivers the same values on
+            // EVERY connection — a leaked pump duplicates them.
+            let feed_sent = StdArc::clone(&self.feed_sent);
+            tokio::task::spawn(async move {
+                for v in 0..3u64 {
+                    if tx.send((n, v)).await.is_ok() {
+                        feed_sent.fetch_add(1, Ordering::SeqCst);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+            *self.inner.lock().await = Some(client);
+        }
+
+        /// `spawn_notification_pump` shape: take → abort prior → spawn →
+        /// install. The take/install interleave IS the leak window.
+        fn spawn_pump(&self, client: ReplicaClient, events: tokio::sync::mpsc::Sender<(u64, u64)>) {
+            let mut slot = self.pump_slot.lock().expect("pump slot poisoned");
+            if let Some(prior) = slot.take() {
+                prior.abort();
+            }
+            let forwarded = StdArc::clone(&self.forwarded);
+            let handle = tokio::task::spawn(async move {
+                loop {
+                    let ev = client.rx.lock().await.recv().await;
+                    match ev {
+                        Some(v) => {
+                            let _ = events.send(v).await;
+                            forwarded.fetch_add(1, Ordering::SeqCst);
+                        }
+                        None => break,
+                    }
+                }
+            });
+            *slot = Some(handle);
+        }
+    }
+
+    #[derive(Clone)]
+    struct DialPlan {
+        name: &'static str,
+        concurrent: bool,
+        dial_fails: usize,
+        /// Exact (instance, value) multiset the subscriber must observe.
+        expected: Vec<(u64, u64)>,
+        /// Post-settle dial count.
+        expected_dials: usize,
+    }
+
+    async fn run_dial_schedule(plan: DialPlan, seed: u64) {
+        // Single-subscriber fan-out: shuttle's broadcast try_recv is a
+        // `todo!()` stub (same as the FR-009 forwarder wave used real-tokio
+        // for); with exactly one subscriber an mpsc pair is semantically
+        // identical here.
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+        let events_tx_for_drain = events_tx.clone();
+        let replica = StdArc::new(PumpSlotReplica {
+            inner: tokio::sync::Mutex::new(None),
+            pump_slot: std::sync::Mutex::new(None),
+            dial_serial: tokio::sync::Mutex::new(()),
+            dials_started: StdArc::new(AtomicUsize::new(0)),
+            dial_fails: plan.dial_fails,
+            feed_sent: StdArc::new(AtomicUsize::new(0)),
+            forwarded: StdArc::new(AtomicUsize::new(0)),
+        });
+        if plan.concurrent {
+            let r1 = StdArc::clone(&replica);
+            let r2 = StdArc::clone(&replica);
+            let ev2 = events_tx.clone();
+            let (ra, rb) = tokio::join!(r1.ensure_link(events_tx), r2.ensure_link(ev2));
+            let _ = (ra, rb);
+        } else {
+            replica.ensure_link(events_tx).await;
+        }
+
+        // Settle: feeds complete → pump channels close → pumps exit.
+        for _ in 0..200 {
+            let done = {
+                let slot = replica.pump_slot.lock().expect("pump slot poisoned");
+                slot.as_ref().is_none_or(|h| h.is_finished())
+            };
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            replica.dials_started.load(Ordering::SeqCst),
+            plan.expected_dials,
+            "seed={seed} plan={}: dial count must match the serialized contract",
+            plan.name
+        );
+        // Drain by exact count with a LIVE sender held for the whole
+        // schedule: shuttle's mpsc returns None as soon as every sender is
+        // dropped, DISCARDING buffered messages (poll_recv's acquire-Err
+        // arm), so disconnect-as-EOF would swallow the delivered events.
+        // Exactly-once leak detection rides on the dials assertion below
+        // (a leaked pump implies a second dial).
+        let mut got: Vec<(u64, u64)> = Vec::new();
+        let live_sender = events_tx_for_drain;
+        let _keep_channel_connected = live_sender;
+        for _ in 0..plan.expected.len() {
+            match events_rx.recv().await {
+                Some(ev) => got.push(ev),
+                None => panic!(
+                    "seed={seed} plan={}: fan-out closed before delivering {} events",
+                    plan.name,
+                    plan.expected.len()
+                ),
+            }
+        }
+        got.sort();
+        let mut expected = plan.expected.clone();
+        expected.sort();
+        assert_eq!(
+            got, expected,
+            "seed={seed} plan={}: fan-out must deliver each session event exactly once (a leaked pump duplicates them)",
+            plan.name
+        );
+    }
+
+    /// Sweep: 2 plans × 40 seeded schedules over fresh threads (shuttle's
+    /// TIMEOUT_TABLE is thread-local; also isolates stack state).
+    #[test]
+    fn dst_surface_double_dial_pump_slot_sweep() {
+        let plans = vec![
+            DialPlan {
+                name: "concurrent-both-ok",
+                concurrent: true,
+                dial_fails: 0,
+                expected: vec![(0, 0), (0, 1), (0, 2)],
+                expected_dials: 1,
+            },
+            DialPlan {
+                name: "concurrent-first-fails",
+                concurrent: true,
+                dial_fails: 1,
+                expected: vec![(1, 0), (1, 1), (1, 2)],
+                expected_dials: 2,
+            },
+        ];
+        for plan in &plans {
+            for seed in 0..40u64 {
+                let plan = plan.clone();
+                let plan_name = plan.name;
+                std::thread::scope(|scope| {
+                    scope.spawn(move || {
+                        // 256 KiB: shuttle's 60 KiB default overflows (SIGBUS)
+                        // on gateway-sized future chains.
+                        let mut config = shuttle::Config::new();
+                        config.stack_size = 256 * 1024;
+                        let scheduler = shuttle::scheduler::RandomScheduler::new_from_seed(seed, 1);
+                        let runner = shuttle::Runner::new(scheduler, config);
+                        runner.run(move || {
+                            let plan = plan.clone();
+                            shuttle::future::block_on(run_dial_schedule(plan, seed));
+                        });
+                    });
+                });
+                let _ = plan_name;
+            }
+        }
     }
 }

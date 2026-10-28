@@ -26,7 +26,9 @@ rig-agent = { workspace = true }
 rig-compose = { workspace = true }
 rig-resources = { workspace = true }
 rig-mcp = { workspace = true }
-tokio = { workspace = true }
+# FR-009 DST Tier 3b: feature OFF = shuttle-tokio re-exports real tokio
+# byte-identically; feature ON swaps in shuttle-compatible primitives.
+tokio = { package = "shuttle-tokio", version = "1", features = ["full"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
 schemars = { workspace = true }
@@ -36,7 +38,11 @@ jsonschema = { workspace = true }
 # prod sha2 consumer: content_sha8 (scheduler workers, CSO log-leak mask)
 sha2 = { workspace = true }
 
+[features]
+shuttle = ["tokio/shuttle"]
+
 [dev-dependencies]
+shuttle = "0.9.8"
 # T111/T118: test builds must never resolve the real ~/.zen — the
 # test-support feature makes user_root() read ZEN_HOME fresh + temp-fallback.
 zen-core = { path = "../zen-core", features = ["test-support"] }

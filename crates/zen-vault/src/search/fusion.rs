@@ -32,12 +32,24 @@ pub struct FusedResult {
 /// by several tiers accumulates score and provenance instead of appearing
 /// multiple times. Ties break on first-seen order (deterministic). The
 /// returned list is truncated to `limit` and ordered best-first.
+///
+/// # Contract: positive finite weights only
+///
+/// A tier whose `weight` is zero, negative, NaN, or infinite is skipped
+/// entirely (no score contribution, no provenance, its documents do not
+/// enter the fused set through that tier). Rationale: a negative weight
+/// would *subtract* score and silently demote documents; NaN propagates
+/// through `+=` and poisons the total-order comparison (`partial_cmp` is
+/// `None` for every NaN pair, collapsing the sort's determinism);
+/// infinite weights flatten all rankings into an undifferentiated `inf`
+/// tier. Production weights are positive constants; this guard keeps the
+/// fusion robust if weights ever become config-derived.
 pub fn reciprocal_rank_fusion(lists: &[RankedList], k: f64, limit: usize) -> Vec<FusedResult> {
     let mut order: Vec<(std::path::PathBuf, u32)> = Vec::new();
     let mut acc: HashMap<(std::path::PathBuf, u32), FusedResult> = HashMap::new();
 
     for list in lists {
-        if list.weight == 0.0 {
+        if !(list.weight > 0.0 && list.weight.is_finite()) {
             continue;
         }
         for (idx, result) in list.results.iter().enumerate() {
@@ -147,6 +159,70 @@ mod tests {
         );
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].result.file, PathBuf::from("a.md"));
+    }
+
+    #[test]
+    fn negative_weight_tier_is_skipped_not_subtracted() {
+        let fused = reciprocal_rank_fusion(
+            &[
+                list("fts5", 1.0, vec![hit("a.md", 1), hit("b.md", 1)]),
+                list("bad", -1.0, vec![hit("c.md", 1)]),
+            ],
+            RRF_K,
+            10,
+        );
+        let files: Vec<_> = fused.iter().map(|f| f.result.file.clone()).collect();
+        assert_eq!(
+            files,
+            vec![PathBuf::from("a.md"), PathBuf::from("b.md")],
+            "negative-weight tier must not inject documents or demote others"
+        );
+        assert!(fused.iter().all(|f| f.score.is_finite() && f.score > 0.0));
+    }
+
+    #[test]
+    fn nan_weight_tier_is_skipped_and_scores_stay_total_order() {
+        let baseline = reciprocal_rank_fusion(
+            &[list("fts5", 1.0, vec![hit("a.md", 1), hit("b.md", 1)])],
+            RRF_K,
+            10,
+        );
+        let with_nan = reciprocal_rank_fusion(
+            &[
+                list("fts5", 1.0, vec![hit("a.md", 1), hit("b.md", 1)]),
+                list("bad", f64::NAN, vec![hit("c.md", 1)]),
+            ],
+            RRF_K,
+            10,
+        );
+        assert_eq!(
+            with_nan.iter().map(|f| &f.result.file).collect::<Vec<_>>(),
+            baseline.iter().map(|f| &f.result.file).collect::<Vec<_>>(),
+            "NaN weight must be invisible, not order-poisoning"
+        );
+        assert!(with_nan.iter().all(|f| f.score.is_finite()));
+    }
+
+    #[test]
+    fn infinite_weight_tier_is_skipped() {
+        let baseline = reciprocal_rank_fusion(
+            &[list("fts5", 1.0, vec![hit("a.md", 1), hit("b.md", 1)])],
+            RRF_K,
+            10,
+        );
+        let with_inf = reciprocal_rank_fusion(
+            &[
+                list("fts5", 1.0, vec![hit("a.md", 1), hit("b.md", 1)]),
+                list("bad", f64::INFINITY, vec![hit("c.md", 1)]),
+            ],
+            RRF_K,
+            10,
+        );
+        assert_eq!(
+            with_inf.iter().map(|f| &f.result.file).collect::<Vec<_>>(),
+            baseline.iter().map(|f| &f.result.file).collect::<Vec<_>>(),
+            "non-finite weight must not flatten the ranking into inf-land"
+        );
     }
 
     #[test]

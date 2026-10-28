@@ -159,23 +159,38 @@ impl Tool for FsEditTool {
         // stale .tmp instead of leaving it behind.
         let mut temp_guard = TempfileDropGuard::new(&temp_path);
 
-        {
-            let mut temp_file = match std::fs::File::create(&temp_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    return Ok(json!({ "error": format!("Failed to create temp file: {}", e) }));
+        // Temp-write + fsync + atomic rename off the async worker (the
+        // fsync can block for milliseconds on real disks; mirror of the
+        // fs_write tunnel — same FR-021/040 atomic-replace contract, error
+        // strings byte-identical).
+        let write_result = tokio::task::spawn_blocking({
+            let temp_path = temp_path.clone();
+            let path = path.clone();
+            move || -> Result<(), String> {
+                let mut temp_file = match std::fs::File::create(&temp_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return Err(format!("Failed to create temp file: {}", e));
+                    }
+                };
+                if let Err(e) = temp_file.write_all(modified.as_bytes()) {
+                    return Err(format!("Failed to write temp file: {}", e));
                 }
-            };
-            if let Err(e) = temp_file.write_all(modified.as_bytes()) {
-                return Ok(json!({ "error": format!("Failed to write temp file: {}", e) }));
+                if let Err(e) = temp_file.sync_all() {
+                    return Err(format!("Failed to sync temp file: {}", e));
+                }
+                drop(temp_file);
+                if let Err(e) = std::fs::rename(&temp_path, &path) {
+                    return Err(format!("Failed to atomically replace file: {}", e));
+                }
+                Ok(())
             }
-            if let Err(e) = temp_file.sync_all() {
-                return Ok(json!({ "error": format!("Failed to sync temp file: {}", e) }));
-            }
-        }
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("edit worker panicked: {e}")));
 
-        if let Err(e) = std::fs::rename(&temp_path, &path) {
-            return Ok(json!({ "error": format!("Failed to atomically replace file: {}", e) }));
+        if let Err(msg) = write_result {
+            return Ok(json!({ "error": msg }));
         }
 
         // Edit fully succeeded: the temp file has been renamed into place and

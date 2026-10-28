@@ -101,6 +101,15 @@ struct KnowledgeStack {
 /// # Returns
 /// Whatever `f` returns, unchanged.
 pub fn run_blocking_llm<T>(f: impl FnOnce() -> T) -> T {
+    // Shuttle build: no multi-thread runtime flavor exists (single-task
+    // deterministic executor) — the closure runs inline, mirroring the
+    // zen-cli runtime_util seam.
+    #[cfg(feature = "shuttle")]
+    {
+        let _ = tokio::runtime::Handle::try_current();
+        f()
+    }
+    #[cfg(not(feature = "shuttle"))]
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)

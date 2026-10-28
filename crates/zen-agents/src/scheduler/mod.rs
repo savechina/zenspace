@@ -1568,3 +1568,269 @@ mod tests {
         }
     }
 }
+
+// ── FR-009 DST (bbtree Guard-3): F5 fire/claim/limiter sweep ─
+// The cron-fire vs manual-trigger vs overlapping-tick race over the REAL
+// `ZenScheduler` machinery: the collect-phase `in_flight.swap` claim, the
+// fire-task `InFlightGuard` clear, the FIFO limiter, and the `trigger`
+// busy path. Historical F5 was a double-fire; the invariants pinned here:
+// (1) cron and trigger never overlap the same worker (swap exclusivity),
+// (2) the in-flight flag always clears so later ticks fire again (no
+// latch), (3) overlapping ticks never double-fire a running worker,
+// (4) the limiter caps cross-worker execute concurrency. Time source is
+// the injectable `tick(now)`; worker pacing is cooperative yields.
+#[cfg(all(test, feature = "shuttle"))]
+mod dst_tests {
+    use super::*;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct DstWorker {
+        id: &'static str,
+        steps: usize,
+        active: StdArc<AtomicUsize>,
+        peak: StdArc<AtomicUsize>,
+        completed: StdArc<AtomicUsize>,
+    }
+
+    impl DstWorker {
+        fn new(
+            id: &'static str,
+            steps: usize,
+            active: StdArc<AtomicUsize>,
+            peak: StdArc<AtomicUsize>,
+            completed: StdArc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                id,
+                steps,
+                active,
+                peak,
+                completed,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ZenWorker for DstWorker {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn description(&self) -> &'static str {
+            "dst-paced worker"
+        }
+        /// Every minute at :00 — with `now` at :50 the next fire is 10s
+        /// away, inside the 30s tick window, so every tick fires.
+        fn schedule(&self) -> &'static str {
+            "0 * * * * *"
+        }
+        async fn execute(&self, _ctx: &WorkerContext) -> Result<WorkerReport> {
+            let running = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.peak.fetch_max(running, Ordering::AcqRel);
+            for _ in 0..self.steps {
+                tokio::task::yield_now().await;
+            }
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            self.completed.fetch_add(1, Ordering::AcqRel);
+            Ok(WorkerReport {
+                worker_id: self.id.to_string(),
+                success: true,
+                fact_count: 0,
+                duration_ms: 0,
+                llm_cost_usd: 0.0,
+            })
+        }
+    }
+
+    /// Bounded busy-wait for a counter target (cooperative, no timers).
+    async fn wait_for(target: &StdArc<AtomicUsize>, want: usize, what: &str) {
+        for _ in 0..2000 {
+            if target.load(Ordering::SeqCst) >= want {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "settle timeout: {} reached {} want {want}",
+            what,
+            target.load(Ordering::SeqCst)
+        );
+    }
+
+    fn in_window_now() -> chrono::DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 10, 28, 8, 59, 50).unwrap()
+    }
+
+    async fn run_schedule(plan: &'static str, seed: u64) {
+        match plan {
+            // Invariant 1+2: back-to-back ticks fire twice, never overlap.
+            "cron-then-cron-no-latch" => {
+                let active = StdArc::new(AtomicUsize::new(0));
+                let peak = StdArc::new(AtomicUsize::new(0));
+                let completed = StdArc::new(AtomicUsize::new(0));
+                let mut sched = ZenScheduler::new();
+                sched
+                    .register(DstWorker::new(
+                        "w",
+                        3,
+                        StdArc::clone(&active),
+                        StdArc::clone(&peak),
+                        StdArc::clone(&completed),
+                    ))
+                    .unwrap();
+                sched.tick(in_window_now()).await;
+                wait_for(&completed, 1, "first cron fire").await;
+                sched.tick(in_window_now()).await;
+                wait_for(&completed, 2, "second cron fire (flag cleared)").await;
+                assert_eq!(
+                    peak.load(Ordering::SeqCst),
+                    1,
+                    "seed={seed}: cron fires of the same worker must never overlap"
+                );
+            }
+            // Invariant 1 (the F5 core): cron fire racing manual trigger
+            // yields exactly one execution of the worker.
+            "cron-vs-trigger-mutual-exclusion" => {
+                let active = StdArc::new(AtomicUsize::new(0));
+                let peak = StdArc::new(AtomicUsize::new(0));
+                let completed = StdArc::new(AtomicUsize::new(0));
+                let mut builder = ZenScheduler::new();
+                builder
+                    .register(DstWorker::new(
+                        "w",
+                        3,
+                        StdArc::clone(&active),
+                        StdArc::clone(&peak),
+                        StdArc::clone(&completed),
+                    ))
+                    .unwrap();
+                let sched = StdArc::new(builder);
+                let cron_sched = StdArc::clone(&sched);
+                let cron = tokio::task::spawn(async move {
+                    cron_sched.tick(in_window_now()).await;
+                });
+                tokio::task::yield_now().await;
+                let trigger_outcome = sched.trigger("w").await;
+                cron.await.unwrap();
+                // One of: trigger ran (Ok) or lost the claim (busy Err).
+                if let Err(e) = trigger_outcome {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("busy") || msg.contains("in flight"),
+                        "seed={seed}: trigger must either run or report busy, got {msg}"
+                    );
+                }
+                wait_for(&completed, 1, "at least one execution").await;
+                for _ in 0..200 {
+                    tokio::task::yield_now().await;
+                }
+                // Legal schedules: (a) trigger lost the claim → busy → cron
+                // executed once; (b) trigger executed and COMPLETED before
+                // the tick's collect → cron fires its own (sequential)
+                // execution after. Both are 1..=2 sequential executions.
+                // The hard invariant is the swap mutex: never concurrent.
+                let total = completed.load(Ordering::SeqCst);
+                assert!(
+                    (1..=2).contains(&total),
+                    "seed={seed}: executions must be 1 (one owner) or 2 (sequential), got {total}"
+                );
+                assert_eq!(
+                    peak.load(Ordering::SeqCst),
+                    1,
+                    "seed={seed}: executions must never overlap"
+                );
+            }
+            // Invariant 4: the limiter caps cross-worker execute concurrency.
+            "limiter-caps-cross-worker-peak" => {
+                let active = StdArc::new(AtomicUsize::new(0));
+                let peak = StdArc::new(AtomicUsize::new(0));
+                let completed = StdArc::new(AtomicUsize::new(0));
+                let mut sched = ZenScheduler::new().with_limiter(2);
+                for id in ["w1", "w2", "w3"] {
+                    sched
+                        .register(DstWorker::new(
+                            id,
+                            20,
+                            StdArc::clone(&active),
+                            StdArc::clone(&peak),
+                            StdArc::clone(&completed),
+                        ))
+                        .unwrap();
+                }
+                sched.tick(in_window_now()).await;
+                wait_for(&completed, 3, "all three workers").await;
+                let p = peak.load(Ordering::SeqCst);
+                assert!(
+                    (1..=2).contains(&p),
+                    "seed={seed}: cross-worker peak must be capped at 2 permits, got {p}"
+                );
+            }
+            // Invariant 3: an overlapping tick while the fire task still
+            // runs must not double-fire; after completion the next tick
+            // fires again (no latch).
+            "overlapping-tick-no-double-fire" => {
+                let active = StdArc::new(AtomicUsize::new(0));
+                let peak = StdArc::new(AtomicUsize::new(0));
+                let completed = StdArc::new(AtomicUsize::new(0));
+                let mut sched = ZenScheduler::new();
+                sched
+                    .register(DstWorker::new(
+                        "w",
+                        10,
+                        StdArc::clone(&active),
+                        StdArc::clone(&peak),
+                        StdArc::clone(&completed),
+                    ))
+                    .unwrap();
+                sched.tick(in_window_now()).await;
+                sched.tick(in_window_now()).await; // overlaps the running fire
+                for _ in 0..500 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    completed.load(Ordering::SeqCst),
+                    1,
+                    "seed={seed}: overlapping tick must skip the in-flight worker"
+                );
+                sched.tick(in_window_now()).await;
+                wait_for(&completed, 2, "post-completion fire").await;
+                assert_eq!(
+                    peak.load(Ordering::SeqCst),
+                    1,
+                    "seed={seed}: never two concurrent executions"
+                );
+            }
+            other => panic!("unknown plan {other}"),
+        }
+    }
+
+    /// Sweep: 4 plans × 40 seeded schedules on fresh threads (shuttle's
+    /// TIMEOUT_TABLE is thread-local) with 256 KiB stacks (the 60 KiB
+    /// default SIGBUSes on agent-crate future chains).
+    #[test]
+    fn dst_scheduler_fire_claim_limiter_sweep() {
+        let plans = [
+            "cron-then-cron-no-latch",
+            "cron-vs-trigger-mutual-exclusion",
+            "limiter-caps-cross-worker-peak",
+            "overlapping-tick-no-double-fire",
+        ];
+        for plan in plans {
+            for seed in 0..40u64 {
+                std::thread::scope(|scope| {
+                    scope.spawn(move || {
+                        let mut config = shuttle::Config::new();
+                        config.stack_size = 256 * 1024;
+                        let scheduler = shuttle::scheduler::RandomScheduler::new_from_seed(seed, 1);
+                        let runner = shuttle::Runner::new(scheduler, config);
+                        runner.run(move || {
+                            shuttle::future::block_on(run_schedule(plan, seed));
+                        });
+                    });
+                });
+            }
+        }
+    }
+}
