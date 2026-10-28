@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use super::transcript_source::TranscriptSource;
 use crate::tui::markdown::StreamingMarkdown;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -33,13 +34,153 @@ pub struct StreamCollector {
     // BUG-1: Guard to ensure the thinking summary is committed exactly once.
     // Without this, each drain after think-close would re-push the ✓ line.
     thinking_summary_committed: bool,
+    // (a) Footer live-summary cache: latest reasoning line while a think
+    // block is open. Refreshed on EVERY split REGARDLESS of show_thinking —
+    // the footer status header is mode-independent (codex separates the
+    // status header from transcript gating).
+    latest_reasoning_summary: Option<String>,
+    // (c) Brief pending-tail preference mirror, set by the /thinking handler
+    // alongside App::thinking_brief (same shape as tools_expanded — keeps the
+    // frozen inline.rs/chat.rs drain call sites signature-identical).
+    thinking_brief: bool,
     // T082 (NFR-009): inter-token stall tracker for the current turn.
     stall: super::stall::StallTracker,
+    // Wave 2A: source log for transcript replay. Appended ONLY on the
+    // inline drain path (`drain == true`) in the exact order committed
+    // lines are assembled, so the registry mirrors the rendered transcript.
+    // The fullscreen snapshot path (drain == false) never accumulates.
+    source_log: Vec<TranscriptSource>,
+    // Wave 2A: display source of the current pending tail block (the block
+    // mdstream has not committed yet). Consumed once at the completion
+    // boundary — the final block never passes through the committed path,
+    // so without this its source would vanish from replay.
+    last_pending_raw: Option<String>,
 }
 
 /// Maximum reasoning lines kept in the pending tail viewport (header + N lines).
 /// Must stay ≤4 total (header + 3 body lines) to fit the 2-4 row tail viewport.
 const THINKING_BODY_MAX_LINES: usize = 3;
+
+/// (a) Footer live-summary cap (codex `latest_summary_line` truncation).
+const REASONING_SUMMARY_MAX_CHARS: usize = 120;
+
+/// (c) Brief pending-tail single-line cap (hermes THINKING_COT_MAX).
+const THINKING_BRIEF_MAX_CHARS: usize = 160;
+
+/// (b) Thought-graduation title cap (hermes: 72 chars).
+const THOUGHT_TITLE_MAX_CHARS: usize = 72;
+
+/// Collapses every whitespace run (incl. newlines/tabs) into single spaces.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Truncates to at most `max_chars` on a CHAR boundary (CJK-safe — never
+/// slices mid-char), appending an ellipsis when clipping occurred.
+pub(crate) fn truncate_char_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// (a) codex `latest_summary_line`: the LAST line of the reasoning body that
+/// qualifies — empty/whitespace lines are skipped, leading `#` header markers
+/// and `**` bold markers are stripped (plus the bold CLOSER, so bolded lines
+/// read as prose), whitespace is collapsed, and the result is capped at
+/// `max_chars` with an ellipsis. Returns `None` when nothing qualifies.
+fn reasoning_summary_line_capped(reasoning: &str, max_chars: usize) -> Option<String> {
+    let mut latest: Option<String> = None;
+    for raw in reasoning.lines() {
+        // Owns the marker-stripped line when the mid-line closer rewrite
+        // fires (borrow must outlive the loop iteration).
+        let rewritten;
+        let mut line = raw.trim().trim_start_matches('#').trim();
+        let was_bold = line.starts_with("**");
+        line = line.trim_start_matches("**").trim();
+        if was_bold {
+            if let Some(rest) = line.strip_suffix("**") {
+                line = rest;
+            } else if let Some(idx) = line.find("**") {
+                // Mid-line bold closer: drop the two-marker span.
+                rewritten = format!("{}{}", &line[..idx], &line[idx + 2..]);
+                line = rewritten.trim();
+            }
+        }
+        if line.is_empty() {
+            continue;
+        }
+        latest = Some(collapse_whitespace(line));
+    }
+    latest.map(|s| truncate_char_ellipsis(&s, max_chars))
+}
+
+/// (a) Footer-capped variant of [`reasoning_summary_line_capped`].
+fn reasoning_summary_line(reasoning: &str) -> Option<String> {
+    reasoning_summary_line_capped(reasoning, REASONING_SUMMARY_MAX_CHARS)
+}
+
+/// (b) hermes thought-graduation title: the first `**bold**` segment wins;
+/// otherwise the first TERMINATED sentence (terminators CJK/ASCII plus
+/// newline). An unterminated run deliberately yields NO title — that keeps
+/// the W3 no-reasoning-body-in-scrollback pin intact for bare one-liners.
+/// Whitespace-collapsed, trailing punctuation trimmed, capped at 72 chars on
+/// a char boundary. `None` when nothing is extractable — the graduation line
+/// then stays bare (no dangling separator).
+fn thought_title(reasoning: &str) -> Option<String> {
+    if reasoning.trim().is_empty() {
+        return None;
+    }
+    let raw = reasoning
+        .split_once("**")
+        .and_then(|(_, rest)| rest.split_once("**"))
+        .map(|(seg, _)| collapse_whitespace(seg))
+        .filter(|seg| !seg.is_empty())
+        .or_else(|| {
+            let mut sentence = String::new();
+            let mut terminated = false;
+            for ch in reasoning.trim_start().chars() {
+                if matches!(
+                    ch,
+                    '\u{3002}'
+                        | '\u{ff0e}'
+                        | '.'
+                        | '!'
+                        | '?'
+                        | '\u{ff01}'
+                        | '\u{ff1f}'
+                        | '\n'
+                        | '\r'
+                ) {
+                    terminated = true;
+                    break;
+                }
+                sentence.push(ch);
+            }
+            if !terminated {
+                return None;
+            }
+            let collapsed = collapse_whitespace(&sentence);
+            if collapsed.is_empty() {
+                None
+            } else {
+                Some(collapsed)
+            }
+        })?;
+    let trimmed = raw
+        .trim()
+        .trim_end_matches([
+            '.', '\u{3002}', '\u{ff0e}', '!', '\u{ff01}', '?', '\u{ff1f}', ',', '\u{ff0c}', ';',
+            '\u{ff1b}', ':', '\u{ff1a}', '\u{2026}',
+        ])
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_char_ellipsis(trimmed, THOUGHT_TITLE_MAX_CHARS))
+}
 
 impl StreamCollector {
     pub fn new() -> Self {
@@ -53,11 +194,15 @@ impl StreamCollector {
             text_fed_len: 0,
             reasoning_fed_len: 0,
             tool_blocks: Vec::new(),
+            source_log: Vec::new(),
+            last_pending_raw: None,
             rendered_tools: 0,
             tools_expanded: false,
             reasoning_started_at: None,
             last_rendered_think_secs: None,
             thinking_summary_committed: false,
+            latest_reasoning_summary: None,
+            thinking_brief: false,
             stall: super::stall::StallTracker::default(),
         }
     }
@@ -87,6 +232,18 @@ impl StreamCollector {
 
     pub fn tools_expanded(&self) -> bool {
         self.tools_expanded
+    }
+
+    /// (c) Brief pending-tail preference mirror (see the field comment).
+    pub fn set_thinking_brief(&mut self, brief: bool) {
+        self.thinking_brief = brief;
+    }
+
+    /// (a) codex-style live status-header payload: the LATEST reasoning line
+    /// while the model is emitting reasoning (open think block with content).
+    /// Mode-independent by contract — callers must NOT gate on /thinking.
+    pub fn live_reasoning_summary(&self) -> Option<String> {
+        self.latest_reasoning_summary.clone()
     }
 
     /// Drains rendered lines for blocks the watermark has not emitted
@@ -256,6 +413,15 @@ impl StreamCollector {
         let (text, reasoning, in_think) = self.get_or_compute_split(&self.buffer.clone());
         self.reasoning_active = in_think;
 
+        // (a) Refresh the footer live-summary cache on every split, in BOTH
+        // /thinking modes — the split always runs, only the delta feed is
+        // mode-gated above.
+        self.latest_reasoning_summary = if in_think && !reasoning.is_empty() {
+            reasoning_summary_line(&reasoning)
+        } else {
+            None
+        };
+
         // Record the instant when reasoning first appears in this turn.
         if self.reasoning_started_at.is_none() && !reasoning.is_empty() {
             self.reasoning_started_at = Some(Instant::now());
@@ -286,7 +452,15 @@ impl StreamCollector {
             let header_text = if in_think {
                 format!("\u{23f3} Thinking\u{2026} ({elapsed_secs}s)")
             } else {
-                format!("\u{2713} Thought for {elapsed_secs}s")
+                // (b) Thought graduation title (hermes `· <title>`): first
+                // bold segment else first terminated sentence. No extractable
+                // title keeps today's bare line (no dangling separator).
+                match thought_title(&reasoning) {
+                    Some(title) => {
+                        format!("\u{2713} Thought for {elapsed_secs}s \u{b7} {title}")
+                    }
+                    None => format!("\u{2713} Thought for {elapsed_secs}s"),
+                }
             };
 
             let reasoning_update = self.reasoning_renderer.append(reasoning_delta);
@@ -318,16 +492,43 @@ impl StreamCollector {
 
                 let header = Line::from(Span::styled(header_text, reasoning_style));
                 pending.push(header);
-                for rl in tail_lines {
-                    pending.push(rl.clone());
+                if self.thinking_brief {
+                    // (c) BRIEF mode (hermes `truncated`): ONE collapsed line
+                    // capped at THINKING_BRIEF_MAX_CHARS instead of the last-3
+                    // tail. The renderer above still consumes the delta, so a
+                    // mid-think switch back to full resumes without a gap.
+                    let collapsed = truncate_char_ellipsis(
+                        &collapse_whitespace(&reasoning),
+                        THINKING_BRIEF_MAX_CHARS,
+                    );
+                    if !collapsed.is_empty() {
+                        pending.push(Self::indent_line(Line::from(Span::styled(
+                            collapsed,
+                            reasoning_style,
+                        ))));
+                    }
+                } else {
+                    for rl in tail_lines {
+                        pending.push(rl.clone());
+                    }
                 }
             } else if !self.thinking_summary_committed {
                 // BUG-1: THINK CLOSE: commit exactly ONE summary line, no body.
                 // The once-guard prevents duplicate ✓ lines on repeated drains.
-                committed.push(Line::from(Span::styled(header_text, reasoning_style)));
+                let header_line = Line::from(Span::styled(header_text, reasoning_style));
+                committed.push(header_line.clone());
                 // Blank separator after the thought summary.
                 committed.push(Line::from(Span::raw("")));
                 self.thinking_summary_committed = true;
+                // Wave 2A: the summary line is timing-derived (elapsed secs)
+                // and NOT re-derivable from raw source — capture the rendered
+                // Lines so replay keeps them (PreRendered kind).
+                if drain {
+                    self.source_log.push(TranscriptSource::PreRendered(vec![
+                        header_line,
+                        Line::from(Span::raw("")),
+                    ]));
+                }
             }
         }
 
@@ -339,6 +540,9 @@ impl StreamCollector {
             let start = self.rendered_tools.min(self.tool_blocks.len());
             for block in &self.tool_blocks[start..] {
                 committed.extend(Self::tool_block_lines(block, expanded));
+                // Wave 2A: capture the ToolIntermediate itself so replay
+                // re-renders with the CURRENT /tools expanded state.
+                self.source_log.push(TranscriptSource::Tool(block.clone()));
             }
             self.rendered_tools = self.tool_blocks.len();
         } else {
@@ -352,6 +556,13 @@ impl StreamCollector {
             let text_update = self.text_renderer.append(text_delta);
             for block in &text_update.committed {
                 committed.extend(block.lines.iter().cloned());
+                // Wave 2A: capture the block's display source — replay
+                // re-runs it through render_markdown (the exact pipeline
+                // that produced these lines) at the new width.
+                if drain {
+                    self.source_log
+                        .push(TranscriptSource::Markdown(block.display.clone()));
+                }
             }
             if let Some(pending_block) = &text_update.pending {
                 // W4a: mdstream 0.3.0 guarantees pending blocks only contain
@@ -366,10 +577,38 @@ impl StreamCollector {
                 // in BoundaryDetector, which means the table is complete). No
                 // speculative holdback scanner needed at this layer.
                 pending.extend(pending_block.lines.iter().cloned());
+                // Wave 2A: remember the pending block's source so the
+                // completion boundary can capture it exactly once (take_).
+                if drain && !pending_block.lines.is_empty() {
+                    self.last_pending_raw = Some(pending_block.raw.clone());
+                }
             }
         }
 
         (committed, pending)
+    }
+
+    /// Wave 2A: drain the source log accumulated by the inline drain path.
+    /// Called right after `drain_and_tail_filtered` by the inline pipeline;
+    /// entries append to the App-level registry in commit order.
+    pub(crate) fn take_source_log(&mut self) -> Vec<TranscriptSource> {
+        std::mem::take(&mut self.source_log)
+    }
+
+    /// Wave 2A: consume the pending tail block's source once (completion
+    /// boundary only — mid-stream calls would race the growing tail).
+    pub fn take_pending_source(&mut self) -> Option<String> {
+        self.last_pending_raw.take()
+    }
+
+    /// Wave 2A: render one captured tool intermediate (exposed for the
+    /// replay path so registry entries re-render with the CURRENT /tools
+    /// expanded preference instead of the capture-time one).
+    pub(crate) fn render_tool_block(
+        block: &ToolIntermediate,
+        expanded: bool,
+    ) -> Vec<Line<'static>> {
+        Self::tool_block_lines(block, expanded)
     }
 
     fn indent_line(line: Line<'static>) -> Line<'static> {
@@ -412,6 +651,11 @@ impl StreamCollector {
         self.reasoning_fed_len = 0;
         self.tool_blocks.clear();
         self.rendered_tools = 0;
+        // Wave 2A: the turn ended — any unconsumed replay sources are stale.
+        self.source_log.clear();
+        self.last_pending_raw = None;
+        // (a) the turn is over — drop the live footer summary.
+        self.latest_reasoning_summary = None;
         let (text, reasoning, _) = Self::split_reasoning(&raw);
         let reasoning = if reasoning.is_empty() {
             None
@@ -425,6 +669,8 @@ impl StreamCollector {
         self.buffer.clear();
         self.text_renderer.clear();
         self.reasoning_renderer.clear();
+        self.source_log.clear();
+        self.last_pending_raw = None;
         self.reasoning_active = false;
         self.buffer_changed_since_render = false;
         self.last_reasoning_split = None;
@@ -437,6 +683,8 @@ impl StreamCollector {
         self.last_rendered_think_secs = None;
         // BUG-1: reset the once-guard so next turn can commit its summary.
         self.thinking_summary_committed = false;
+        // (a) fresh footer summary for the next turn.
+        self.latest_reasoning_summary = None;
         // T082: fresh stall tracking for the next turn.
         self.stall.reset();
     }
@@ -961,5 +1209,217 @@ mod tests {
             lines_text(&c2).contains("\u{2713} Thought for"),
             "after clear, new turn must commit summary"
         );
+    }
+
+    // --- (a) footer live-summary extraction (codex latest_summary_line) ---
+
+    #[test]
+    fn reasoning_summary_line_multi_line_picks_last_non_empty() {
+        let s = "first thought\n\n  \nsecond thought\n";
+        assert_eq!(
+            reasoning_summary_line(s).as_deref(),
+            Some("second thought"),
+            "must pick the LAST qualifying line"
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_line_strips_hashes_bold_and_collapses() {
+        // Leading `#`s stripped from qualifying lines; a fully-bolded line
+        // loses BOTH markers (opener + closer); whitespace runs collapse.
+        assert_eq!(
+            reasoning_summary_line("## Heading").as_deref(),
+            Some("Heading")
+        );
+        assert_eq!(
+            reasoning_summary_line("**bold point**").as_deref(),
+            Some("bold point")
+        );
+        assert_eq!(
+            reasoning_summary_line("a\tb\nc   d").as_deref(),
+            Some("c d")
+        );
+        // Mid-line bold closer is dropped too (opener was stripped).
+        assert_eq!(
+            reasoning_summary_line("**plan** for retrieval").as_deref(),
+            Some("plan for retrieval")
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_line_truncates_at_char_cap_with_ellipsis() {
+        let long = "x".repeat(REASONING_SUMMARY_MAX_CHARS + 40);
+        let out = reasoning_summary_line(&long).expect("non-empty");
+        assert_eq!(out.chars().count(), REASONING_SUMMARY_MAX_CHARS);
+        assert!(
+            out.ends_with('\u{2026}'),
+            "clipped output ends with ellipsis"
+        );
+        // CJK safety: multi-byte text truncates on a char boundary.
+        let cjk = "\u{8bb0}".repeat(REASONING_SUMMARY_MAX_CHARS + 40);
+        let out = reasoning_summary_line(&cjk).expect("non-empty");
+        assert_eq!(out.chars().count(), REASONING_SUMMARY_MAX_CHARS);
+    }
+
+    #[test]
+    fn reasoning_summary_line_none_on_blank() {
+        assert_eq!(reasoning_summary_line(""), None);
+        assert_eq!(reasoning_summary_line("  \n\t\n"), None);
+        assert_eq!(
+            reasoning_summary_line("###\n**"),
+            None,
+            "marker-only lines skip"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_summary_tracks_open_think_regardless_of_mode() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>## Plan\nlatest idea here");
+        // show_thinking=false drain must STILL refresh the footer cache.
+        let _ = c.drain_and_tail_filtered(Style::default(), false);
+        assert_eq!(
+            c.live_reasoning_summary().as_deref(),
+            Some("latest idea here"),
+            "footer summary is mode-independent"
+        );
+        // Think closed: no live summary — the footer falls back.
+        c.push_delta("</think>answer");
+        let _ = c.drain_and_tail_filtered(Style::default(), false);
+        assert_eq!(c.live_reasoning_summary(), None);
+    }
+
+    // --- (b) thought graduation title (hermes convention) ---
+
+    #[test]
+    fn thought_title_from_bold_segment() {
+        assert_eq!(
+            thought_title("先看背景。 **设计记忆检索** 然后是实现。").as_deref(),
+            Some("设计记忆检索"),
+            "first bold segment wins over the first sentence"
+        );
+        assert_eq!(
+            thought_title("**Verify pin suite** then gates.").as_deref(),
+            Some("Verify pin suite")
+        );
+    }
+
+    #[test]
+    fn thought_title_from_first_sentence_cjk_safe() {
+        assert_eq!(
+            thought_title("第一个想法是关于记忆系统。然后是检索策略。").as_deref(),
+            Some("第一个想法是关于记忆系统"),
+            "CJK sentence splits on the ideographic full stop, char-safe"
+        );
+        assert_eq!(
+            thought_title("Check the config. Then run tests!").as_deref(),
+            Some("Check the config"),
+            "ASCII sentence + trailing punctuation trimmed"
+        );
+    }
+
+    #[test]
+    fn thought_title_truncates_at_char_boundary() {
+        let body = "\u{8bb0}".repeat(100);
+        let title = thought_title(&format!("{body}\u{3002}")).expect("terminated sentence");
+        assert_eq!(title.chars().count(), THOUGHT_TITLE_MAX_CHARS);
+        assert!(title.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn thought_title_none_on_blank() {
+        assert_eq!(thought_title(""), None);
+        assert_eq!(thought_title("   \n\t "), None);
+    }
+
+    #[test]
+    fn thought_title_none_on_unterminated_prose() {
+        // No bold span, no terminator: no title — the W3 no-body pin holds
+        // for bare one-liner reasoning (graduation line stays bare).
+        assert_eq!(thought_title("reasoning content"), None);
+    }
+
+    #[test]
+    fn graduation_line_includes_title() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>**Verify pin suite** then gates.</think>Answer.");
+        let (committed, _) = c.drain_and_tail_filtered(Style::default(), true);
+        let text = lines_text(&committed);
+        assert!(text.contains("\u{2713} Thought for"), "{text:?}");
+        assert!(
+            text.contains("\u{b7} Verify pin suite"),
+            "graduation line must carry the title: {text:?}"
+        );
+    }
+
+    #[test]
+    fn graduation_line_bare_when_no_title() {
+        let mut c = StreamCollector::new();
+        c.push_delta("<think>reasoning content</think>Answer.");
+        let (committed, _) = c.drain_and_tail_filtered(Style::default(), true);
+        let text = lines_text(&committed);
+        assert!(text.contains("\u{2713} Thought for"), "{text:?}");
+        assert!(
+            !text.contains('\u{b7}'),
+            "no title means NO dangling separator: {text:?}"
+        );
+        assert!(
+            !text.contains("reasoning content"),
+            "no reasoning body leaks into scrollback: {text:?}"
+        );
+    }
+
+    // --- (c) three-state thinking display ---
+
+    #[test]
+    fn brief_mode_shows_single_truncated_line() {
+        let mut c = StreamCollector::new();
+        c.set_thinking_brief(true);
+        let reasoning = (0..40)
+            .map(|i| format!("point {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        c.push_delta(&format!("<think>{reasoning}"));
+        let (_, pending) = c.drain_and_tail_filtered(Style::default(), true);
+        assert_eq!(
+            pending.len(),
+            2,
+            "brief mode: header + exactly ONE body line: {pending:?}"
+        );
+        assert!(
+            lines_text(&[pending[0].clone()]).contains("\u{23f3} Thinking"),
+            "the ⏳ header is kept in brief mode"
+        );
+        let body = lines_text(&[pending[1].clone()]);
+        assert!(
+            body.starts_with("  point 0"),
+            "brief body collapses from the head: {body:?}"
+        );
+        assert!(!body.contains('\n'), "single line: {body:?}");
+        assert!(
+            body.trim().chars().count() <= THINKING_BRIEF_MAX_CHARS,
+            "brief body capped at {THINKING_BRIEF_MAX_CHARS} chars: {body:?}"
+        );
+        assert!(body.trim().ends_with('\u{2026}'), "truncated: {body:?}");
+    }
+
+    #[test]
+    fn full_mode_keeps_three_lines() {
+        let mut c = StreamCollector::new();
+        // Blank-line separated: each line renders as its OWN markdown line
+        // (single \n would merge into one paragraph line).
+        let reasoning = (0..20)
+            .map(|i| format!("Line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        c.push_delta(&format!("<think>{reasoning}"));
+        let (_, pending) = c.drain_and_tail_filtered(Style::default(), true);
+        assert_eq!(
+            pending.len(),
+            4,
+            "full mode unchanged: header + exactly 3 body lines"
+        );
+        assert!(lines_text(&[pending[1].clone()]).contains("Line 17"));
+        assert!(lines_text(&[pending[3].clone()]).contains("Line 19"));
     }
 }

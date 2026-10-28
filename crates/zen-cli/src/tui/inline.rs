@@ -10,8 +10,9 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::queue;
 use ratatui::Terminal;
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use ratatui::{TerminalOptions, Viewport};
@@ -20,6 +21,9 @@ use super::app::App;
 use super::inline_handler::InlineKeyAction;
 use super::theme::auto_select as theme_auto_select;
 use super::theme::no_color as theme_no_color;
+use super::transcript_source::{
+    ReplayState, ReplayVerdict, replay_decision, watchdog_due, watchdog_size_mismatch,
+};
 
 /// Preferred height (rows) of the bottom inline viewport (ADR-006).
 /// Budget: tail (2–4) + popup (≤6) + input (3) + toast (0–1) + footer (1) = 12.
@@ -77,8 +81,13 @@ impl TerminalRestoreGuard {
         if self.done.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        // (a) Hygiene: a panic landing between a Begin/End synchronized-update
+        // pair leaves the terminal in sync mode (paints withheld) until the
+        // next pair; closing the region FIRST guarantees the user's shell
+        // gets a terminal that paints. Best-effort like the rest of restore.
         execute!(
             io::stdout(),
+            crossterm::terminal::EndSynchronizedUpdate,
             DisableBracketedPaste,
             PopKeyboardEnhancementFlags,
         )?;
@@ -238,6 +247,9 @@ pub(crate) fn apply_inline_theme(
 pub(crate) struct InlineLoopState {
     pub dirty: bool,
     pub last_streaming_render: Instant,
+    /// Wave 2A: transcript-replay engine state (last replayed width, the
+    /// pending flag for deferred replays, and the watchdog probe stamp).
+    pub replay: ReplayState,
 }
 
 impl InlineLoopState {
@@ -245,6 +257,7 @@ impl InlineLoopState {
         Self {
             dirty: true,
             last_streaming_render: Instant::now(),
+            replay: ReplayState::new(),
         }
     }
 }
@@ -261,15 +274,17 @@ impl InlineLoopState {
 /// Sequence: (1) record the cursor on the last row of the current viewport so
 /// the preserved offset is `viewport_height - 1`; (2) move the backend cursor
 /// (bypassing ratatui's tracking) to the bottom row of the resized screen;
-/// (3) `Terminal::resize` then recomputes the viewport bottom-anchored.
+/// (3) `Terminal::resize` then recomputes the viewport bottom-anchored;
+/// (4) GROW-only: wipe the stale band the old viewport vacates above the new
+/// one (codex-rs `clear_for_viewport_change` precedent).
 pub(crate) fn reanchor_viewport<B: Backend>(
     terminal: &mut Terminal<B>,
     width: u16,
     height: u16,
 ) -> io::Result<()> {
-    let viewport = terminal.get_frame().area();
+    let old_area = terminal.get_frame().area();
     terminal
-        .set_cursor_position(Position::new(0, viewport.bottom().saturating_sub(1)))
+        .set_cursor_position(Position::new(0, old_area.bottom().saturating_sub(1)))
         .map_err(|e| io::Error::other(e.to_string()))?;
     terminal
         .backend_mut()
@@ -278,6 +293,46 @@ pub(crate) fn reanchor_viewport<B: Backend>(
     terminal
         .resize(Rect::new(0, 0, width, height))
         .map_err(|e| io::Error::other(e.to_string()))?;
+    // GROW leaves rows old_top..new_top holding the PREVIOUSLY drawn
+    // composer/tail: ratatui's `Terminal::resize` clears only the NEW viewport
+    // area (`clear_viewport` = Clear AfterCursor from the new origin), and
+    // draws only ever render rows >= new_top — so without this wipe the stale
+    // band keeps showing a ghost copy of the input box mid-screen (the
+    // user-reported 显示错乱 on window grow; codex-rs precedent:
+    // `clear_for_viewport_change` clears from min(old, new) top so stale
+    // cells never show). SHRINK needs no clear: the stale rows fall off the
+    // bottom of the now-shorter screen and the overlap is repainted. The
+    // wipe is backend-level raw-cell I/O — ratatui's buffer diff is
+    // viewport-scoped and never touches these rows, so there is no
+    // interference with the next dirty draw. Errors propagate to the
+    // caller's degrade contract (`degrade_io_outcome`): warn + keep state +
+    // retry on the next resize — never kill the session.
+    let new_area = terminal.get_frame().area();
+    if old_area.top() < new_area.top() {
+        for y in old_area.top()..new_area.top() {
+            terminal
+                .backend_mut()
+                .set_cursor_position(Position::new(0, y))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            terminal
+                .backend_mut()
+                .clear_region(ClearType::UntilNewLine)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        // `Terminal::resize` left the backend cursor anchored at the bottom
+        // row it observed; restore that anchor so later inline-anchor
+        // computations (`insert_before` → `compute_inline_size`, a blocking
+        // DSR on real terminals) re-derive the viewport from the bottom row
+        // instead of the last wiped row.
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(0, height.saturating_sub(1)))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        terminal
+            .backend_mut()
+            .flush()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -306,6 +361,218 @@ fn best_effort_reanchor<B: Backend>(terminal: &mut Terminal<B>, width: u16, heig
     degrade_io_outcome(reanchor_viewport(terminal, width, height), "reanchor")
 }
 
+/// Wave 2A: replay gate + execution seam.
+///
+/// SCOPE LOGIC (Principle XV — `transcript_source.rs` holds the full
+/// contract):
+/// - Functionality: on a terminal WIDTH change (never height-only), purge
+///   native scrollback and re-render the transcript from source at the new
+///   width through the existing markdown/insert pipeline.
+/// - Decision: PURE ([`replay_decision`]) — Now / Defer(streaming or
+///   reading) / Noop; a Defer sets the pending flag and the replay runs at
+///   the stream-completion or reading-mode-exit boundary.
+/// - Default: no width change since the last replay = no-op (cheap path).
+/// - Interaction: only ever called at the coalescer TRAILING edge or at the
+///   two boundaries — never at the leading edge (a drag burst replays once,
+///   at its settled geometry).
+///
+/// Returns whether a replay actually ran (pins + logging).
+pub(crate) fn maybe_replay_transcript<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    state: &mut InlineLoopState,
+) -> bool {
+    let Some(size) = terminal.size().ok() else {
+        return false;
+    };
+    let target_w = size.width;
+    if target_w == 0 {
+        return false;
+    }
+    let width_changed = state.replay.last_replay_width != target_w;
+    match replay_decision(
+        width_changed,
+        app.is_streaming,
+        app.reading_mode,
+        state.replay.pending,
+    ) {
+        ReplayVerdict::Noop => false,
+        ReplayVerdict::Defer => {
+            state.replay.pending = true;
+            false
+        }
+        ReplayVerdict::Now => {
+            // Empty transcript (and nothing queued): nothing to re-render —
+            // skip the destructive purge entirely and just move the replay
+            // baseline; content committed later renders at the live width
+            // anyway.
+            if app.transcript.is_empty()
+                && app.scrollback_queue.is_empty()
+                && app.deferred_scrollback.is_empty()
+            {
+                state.replay.last_replay_width = target_w;
+                state.replay.pending = false;
+                return false;
+            }
+            let ok = degrade_io_outcome(replay_transcript(terminal, app), "transcript replay");
+            if ok {
+                state.replay.last_replay_width = target_w;
+                state.replay.pending = false;
+                // The purge wiped the viewport too; reanchor reset the back
+                // buffer, so the next draw full-repaints the composer.
+                state.dirty = true;
+            }
+            ok
+        }
+    }
+}
+
+/// Wave 2A replay execution: ONE DEC 2026 synchronized-update region
+/// wrapping purge, re-render, re-insert, and re-anchor. Every I/O error
+/// propagates to the caller's [`degrade_io_outcome`] — a failed replay
+/// never kills the session (fail-soft: the registry survives and the next
+/// width change retries).
+fn replay_transcript<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
+    let (width, height) = terminal
+        .size()
+        .map(|s| (s.width, s.height))
+        .unwrap_or((80, 24));
+    let _ = queue!(io::stdout(), crossterm::terminal::BeginSynchronizedUpdate);
+    let result = replay_transcript_inner(terminal, app, width, height);
+    let _ = queue!(io::stdout(), crossterm::terminal::EndSynchronizedUpdate);
+    let _ = io::Write::flush(&mut io::stdout());
+    result
+}
+
+fn replay_transcript_inner<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    // (1) Drop old-width pending entries FIRST — every queued/deferred
+    // block's source is already in the registry, so dropping them cannot
+    // lose content; keeping them would re-insert old-width ghosts after
+    // the purge.
+    app.scrollback_queue.clear();
+    app.deferred_scrollback.clear();
+    // (2) Wipe the visible screen (ED 2) through the backend and purge the
+    // native scrollback (ED 3) via crossterm. ACCEPTED COST (product-owner
+    // decision, wave 2A contract): ED 3 destroys the PRE-session shell
+    // scrollback too, exactly like codex-rs clear_for_viewport_change.
+    // Backend errors are stringified into io::Error (same mapping the
+    // insert/reanchor paths use) so the replay seam keeps one error type.
+    terminal
+        .backend_mut()
+        .clear_region(ClearType::All)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let _ = queue!(
+        io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge)
+    );
+    // (3) Re-render oldest-to-newest at the live width and re-insert via
+    // the EXISTING hard-wrap insert path (Paragraph wraps at the current
+    // terminal width — no forked renderer).
+    let mut entries = app.build_replay_entries(width);
+    super::scrollback_inserter::insert_scrollback_queue(terminal, &mut entries)?;
+    // (4) Bottom-anchor the viewport; Terminal::resize's clear_viewport
+    // resets the back buffer so the next draw repaints everything (no
+    // stale-diff blanks over the raw-wiped screen).
+    reanchor_viewport(terminal, width, height)?;
+    Ok(())
+}
+
+/// Quiet-window length for [`ResizeCoalescer`] (hermes-style leading+trailing,
+/// FIXED window): the first `Resize` of a burst applies immediately; every
+/// event inside the window only updates the pending size; the window closes
+/// 80ms after it OPENED (later events never extend it).
+const RESIZE_QUIET_MS: u64 = 80;
+
+/// (b) Resize-burst coalescer.
+///
+/// Root cause this fixes: every `Resize` event used to drive a full
+/// reanchor/rebuild (2x cursor moves + `Terminal::resize`, which emits a
+/// blocking `ESC[6n` DSR query). A drag-resize burst interleaves those DSR
+/// replies and corrupts the inline anchor into duplicated/floated viewports
+/// (see the tui_pty.rs reader comment). Coalescing bounds the work to <=2
+/// applies per 80ms window regardless of the event rate.
+///
+/// Every method takes `now: Instant` so the unit pins are deterministic (no
+/// sleeps); the production loop passes `Instant::now()`.
+struct ResizeCoalescer {
+    /// Size waiting for the trailing-edge apply. `Some` while a burst window
+    /// is open; the leading edge ALSO records here so the trailing apply can
+    /// re-apply the final geometry when it changed mid-window.
+    pending: Option<(u16, u16)>,
+    /// Fixed deadline = leading-edge time + RESIZE_QUIET_MS. Never extended
+    /// by suppressed events — a continuous drag produces successive windows,
+    /// each with its own leading apply (~2 applies per 80ms instead of ~1
+    /// per event).
+    deadline: Option<Instant>,
+    /// Last size successfully applied to the terminal. Wave-2 (scrollback
+    /// replay) watchdog hook — recorded now so the replay wave can trust it
+    /// from day one; no production reader yet, hence the allow.
+    #[allow(dead_code)]
+    applied: (u16, u16),
+}
+
+impl ResizeCoalescer {
+    fn new(applied: (u16, u16)) -> Self {
+        Self {
+            pending: None,
+            deadline: None,
+            applied,
+        }
+    }
+
+    /// Feed one `Resize(w, h)`. Leading edge (no window open) applies
+    /// immediately through `apply` (production: [`apply_resize`] with the
+    /// rebuild closure; pins: a collecting closure) and opens the quiet
+    /// window; mid-burst events overwrite `pending` only — ZERO terminal
+    /// writes. A failed leading apply still opens the window so the trailing
+    /// edge retries the final size (T250 next-resize-retries contract).
+    fn on_resize(&mut self, w: u16, h: u16, now: Instant, apply: &mut dyn FnMut(u16, u16) -> bool) {
+        if self.pending.is_none() {
+            if apply(w, h) {
+                self.applied = (w, h);
+            }
+            self.pending = Some((w, h));
+            self.deadline = Some(now + Duration::from_millis(RESIZE_QUIET_MS));
+        } else {
+            self.pending = Some((w, h));
+        }
+    }
+
+    /// Trailing edge: once the fixed window elapsed, apply the final pending
+    /// size exactly once and close the window. Returns whether it fired.
+    fn apply_if_due(&mut self, now: Instant, apply: &mut dyn FnMut(u16, u16) -> bool) -> bool {
+        match (self.pending, self.deadline) {
+            (Some((w, h)), Some(deadline)) if now >= deadline => {
+                if apply(w, h) {
+                    self.applied = (w, h);
+                }
+                self.pending = None;
+                self.deadline = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Poll-timeout cap: while a window is open, wake no later than the
+    /// deadline so the trailing apply fires on time. A past-due deadline
+    /// caps to 0ms = non-blocking poll, and the next iteration's
+    /// [`Self::apply_if_due`] closes the window.
+    fn capped_poll_ms(&self, base_ms: u64, now: Instant) -> u64 {
+        match self.deadline {
+            Some(deadline) => {
+                base_ms.min(deadline.saturating_duration_since(now).as_millis() as u64)
+            }
+            None => base_ms,
+        }
+    }
+}
+
 /// One iteration of the inline event loop: advance streaming state, flush
 /// committed blocks into native scrollback, process one terminal event (if
 /// any), and redraw the bottom viewport. Returns `true` when the session
@@ -321,6 +588,7 @@ pub(crate) fn inline_tick<B: Backend>(
     event: Option<Event>,
 ) -> Result<bool> {
     let prev_streaming = app.is_streaming;
+    let prev_reading_mode = app.reading_mode;
     let prev_buffer_len = app.stream_collector.buffer().len();
 
     app.poll_llm_response();
@@ -366,6 +634,8 @@ pub(crate) fn inline_tick<B: Backend>(
             .stream_collector
             .drain_and_tail_filtered(reasoning_style, app.show_thinking);
         if !committed.is_empty() {
+            // Wave 2A: the log mirrors the committed lines just drained.
+            app.record_stream_sources();
             app.enqueue_scrollback(committed);
         }
         app.viewport_tail = pending;
@@ -412,9 +682,17 @@ pub(crate) fn inline_tick<B: Backend>(
             .stream_collector
             .drain_and_tail_filtered(reasoning_style, app.show_thinking);
         if !committed.is_empty() {
+            // Wave 2A: capture committed sources before the collector clears.
+            app.record_stream_sources();
             app.enqueue_scrollback(committed);
         }
         if !pending.is_empty() {
+            // Wave 2A: the tail block only ever flushes here — capture its
+            // source exactly once before the collector resets.
+            if let Some(src) = app.stream_collector.take_pending_source() {
+                app.transcript
+                    .push(super::transcript_source::TranscriptSource::Markdown(src));
+            }
             app.enqueue_scrollback(pending);
         }
         app.stream_collector.clear();
@@ -478,9 +756,18 @@ pub(crate) fn inline_tick<B: Backend>(
                 }
             }
             Event::Resize(width, height) => {
-                // T250: best-effort — a failed reanchor keeps the old viewport
-                // and the next resize retries instead of killing the session.
-                best_effort_reanchor(terminal, width, height);
+                // (c) unified path: same branch selection the production loop
+                // uses through the coalescer. Direct-driven tests (s5/t250)
+                // exercise this arm; production traffic never forwards Resize
+                // here anymore. Wholesale rebuild is only expressible over
+                // the concrete stdout backend (the closure swaps `*terminal`),
+                // so generic backends fall back to the in-place reanchor —
+                // exactly the pre-unification arm behavior, keeping s5/t250
+                // byte-identical in intent. T250 degrade contract untouched:
+                // a failed apply keeps the old viewport; the next one retries.
+                apply_resize(terminal, width, height, |t, h| {
+                    best_effort_reanchor(t, width, h)
+                });
                 state.dirty = true;
             }
             // H1 fix (analyze-report.md): bracketed paste is ENABLED at
@@ -493,6 +780,19 @@ pub(crate) fn inline_tick<B: Backend>(
             }
             _ => {}
         }
+    }
+
+    // (a) DEC 2026 synchronized update: bracket this tick's scrollback
+    // insert + draw in ONE synchronized region so terminals that honor it
+    // (tmux >=3.7b, iTerm2) never paint a half-flushed frame mid-burst —
+    // the exact duplicate-viewport flash class. Apple Terminal ignores 2026
+    // (harmless no-op). Same stdout handle the CrosstermBackend flushes
+    // through during draw, so byte order Begin→inserts→draw→End is
+    // preserved. No insert and no draw => no region (empty sync frames are
+    // pure byte noise).
+    let frame_pending = !app.scrollback_queue.is_empty() || state.dirty;
+    if frame_pending {
+        let _ = queue!(io::stdout(), crossterm::terminal::BeginSynchronizedUpdate);
     }
 
     if !app.scrollback_queue.is_empty() {
@@ -565,6 +865,23 @@ pub(crate) fn inline_tick<B: Backend>(
         state.dirty = false;
     }
 
+    if frame_pending {
+        // Failure here is hygiene-only: a failed End leaves sync mode on
+        // until the next Begin/End pair (or the restore guard) closes it.
+        // The draw's `?` above can also skip this End — same recovery.
+        let _ = queue!(io::stdout(), crossterm::terminal::EndSynchronizedUpdate);
+        let _ = io::Write::flush(&mut io::stdout());
+    }
+
+    // Wave 2A: deferred-replay boundaries. The stream-completion boundary
+    // (turn finished while a width change was pending) and the
+    // reading-mode-exit boundary (user returned to bottom) both re-run the
+    // PURE decision — it no-ops unless a width change is actually waiting,
+    // so these calls are free in the common path.
+    if response_just_completed || (prev_reading_mode && !app.reading_mode) {
+        maybe_replay_transcript(terminal, app, state);
+    }
+
     Ok(false)
 }
 
@@ -582,6 +899,13 @@ fn open_inline_terminal(
 }
 
 /// Best-effort viewport rebuild after a terminal height change.
+///
+/// Ghost-safety verdict: a rebuild cannot leave a stale viewport band —
+/// `Terminal::with_options(Inline)` re-derives the viewport from the
+/// bottom-anchored cursor and its `compute_inline_size` `append_lines` call
+/// scrolls the ENTIRE old screen content off into native scrollback before
+/// the fresh viewport occupies the bottom rows (nothing stale survives
+/// on-grid); the next draw repaints the viewport wholesale. No clear needed.
 ///
 /// T250: on failure the caller keeps the existing terminal and the next
 /// `Resize` event retries — never propagate the error out of the REPL.
@@ -609,6 +933,51 @@ fn best_effort_rebuild_inline_terminal(
             false
         }
     }
+}
+
+/// (c) THE single resize application path.
+///
+/// Replaces the two racing sites that could both fire for one event — the
+/// poll loop's pre-tick rebuild probe and inline_tick's `Resize` arm — each
+/// driving its own reanchor/rebuild (and thus its own blocking DSR query).
+///
+/// Branch selection: when the live viewport height no longer matches what
+/// the new terminal rows warrant (e.g. 24→6 rows must shrink the 12-row
+/// composer), the terminal must be rebuilt wholesale (`rebuild`; only
+/// expressible where a reconstruction closure exists — the production stdout
+/// backend swaps `*terminal`); same-height geometry changes reanchor in
+/// place. Both branches keep the T250 degrade contract: `false` = keep the
+/// previous viewport, the next resize retries; errors never propagate.
+fn apply_resize<B: Backend, R>(
+    terminal: &mut Terminal<B>,
+    width: u16,
+    height: u16,
+    rebuild: R,
+) -> bool
+where
+    R: FnOnce(&mut Terminal<B>, u16) -> bool,
+{
+    if terminal.get_frame().area().height != inline_viewport_height(height) {
+        rebuild(terminal, height)
+    } else {
+        best_effort_reanchor(terminal, width, height)
+    }
+}
+
+/// Production resize apply shared by both coalescer edges: branch through
+/// [`apply_resize`] with the real rebuild closure, and mark the frame dirty
+/// on success so the tick redraws at the new geometry.
+fn apply_production_resize(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: &mut InlineLoopState,
+    w: u16,
+    h: u16,
+) -> bool {
+    let ok = apply_resize(terminal, w, h, best_effort_rebuild_inline_terminal);
+    if ok {
+        state.dirty = true;
+    }
+    ok
 }
 
 fn run_inline_session(
@@ -660,16 +1029,63 @@ fn run_inline_session(
     }
 
     let mut state = InlineLoopState::new();
+    // (b) seed the coalescer with the live geometry so `applied` is ground
+    // truth from the first frame (Wave-2 watchdog hook).
+    let seed = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut coalescer = ResizeCoalescer::new(seed);
+    // Wave 2A: the replay baseline is the LIVE startup width — a replay may
+    // only fire after a real width CHANGE from here.
+    state.replay.last_replay_width = seed.0;
     // T075 test seam (e16 PTY acceptance): deliberately panic on the first
     // key event so the PTY test can prove the panic path restores the
     // terminal. Same env-seam convention as `ZEN_TEST_ECHO_LLM` (app.rs).
     let panic_on_first_key = std::env::var("ZEN_TEST_PANIC_ON_FIRST_KEY").as_deref() == Ok("1");
     loop {
-        let poll_ms = if app.is_streaming {
+        // (b) trailing edge FIRST: a burst whose 80ms quiet window elapsed
+        // applies its final size exactly once — before this iteration's
+        // insert+draw, so the first frame after a drag renders at the
+        // settled geometry.
+        let trailing_fired = coalescer.apply_if_due(Instant::now(), &mut |w, h| {
+            apply_production_resize(&mut terminal, &mut state, w, h)
+        });
+        // Wave 2A: replay at the TRAILING edge only (never mid-burst) — the
+        // pure gate makes this a no-op for height-only changes, while
+        // streaming/reading defer to their boundary hooks in inline_tick.
+        if trailing_fired {
+            maybe_replay_transcript(&mut terminal, &mut app, &mut state);
+        }
+
+        // Wave 2A size watchdog: crossterm SIGWINCH delivery is unreliable
+        // under some tmux setups — probe the live size every 500ms and
+        // synthesize a resize through the coalescer when it drifts from
+        // `applied` (also recovers a failed leading apply). The probe is an
+        // ioctl; the interval gate keeps it at <=2Hz. A probe error is
+        // skipped silently — the next tick retries.
+        let probe_now = Instant::now();
+        if watchdog_due(state.replay.last_watchdog, probe_now) {
+            state.replay.last_watchdog = Some(probe_now);
+            if let Ok(live) = crossterm::terminal::size()
+                && watchdog_size_mismatch(coalescer.applied, live)
+            {
+                tracing::info!(
+                    applied = ?coalescer.applied,
+                    live = ?live,
+                    "size watchdog: synthesizing missed resize"
+                );
+                coalescer.on_resize(live.0, live.1, probe_now, &mut |w, h| {
+                    apply_production_resize(&mut terminal, &mut state, w, h)
+                });
+            }
+        }
+
+        let base_poll_ms = if app.is_streaming {
             POLL_INTERVAL_ACTIVE_MS
         } else {
             POLL_INTERVAL_IDLE_MS
         };
+        // (b) while a window is open, cap the poll at the deadline so the
+        // trailing apply is never late.
+        let poll_ms = coalescer.capped_poll_ms(base_poll_ms, Instant::now());
         let mut event = if crossterm::event::poll(Duration::from_millis(poll_ms))? {
             Some(crossterm::event::read()?)
         } else {
@@ -683,14 +1099,17 @@ fn run_inline_session(
         {
             panic!("T075 seam: deliberate panic on first key (ZEN_TEST_PANIC_ON_FIRST_KEY)");
         }
-        if let Some(Event::Resize(_, height)) = event.as_ref() {
-            let height = *height;
-            if terminal.get_frame().area().height != inline_viewport_height(height)
-                && best_effort_rebuild_inline_terminal(&mut terminal, height)
-            {
-                state.dirty = true;
-                event = None;
-            }
+        // (b) leading edge: the FIRST Resize of a burst applies immediately;
+        // every event inside the quiet window only overwrites the pending
+        // size (zero terminal writes). Resize events never reach inline_tick
+        // anymore — the coalescer owns resize application, so the old
+        // event=None rebuild-swallow hack is gone (inline_tick's Resize arm
+        // remains only for direct-driven tests).
+        if let Some(Event::Resize(w, h)) = event {
+            coalescer.on_resize(w, h, Instant::now(), &mut |w, h| {
+                apply_production_resize(&mut terminal, &mut state, w, h)
+            });
+            event = None;
         }
         if inline_tick(&mut app, &mut terminal, &mut state, event)? {
             break;
@@ -993,6 +1412,65 @@ mod tests {
         let area = terminal.get_frame().area();
         assert_eq!(area.bottom(), 6, "viewport must clamp to shrunken screen");
         assert_eq!(area.height, 6);
+    }
+
+    /// Ghost-viewport pin (grow-resize fix): growing the screen moves the
+    /// bottom-anchored viewport DOWN; ratatui `Terminal::resize` clears only
+    /// the NEW viewport area, so reanchor must wipe the stale band
+    /// old_top..new_top itself (codex `clear_for_viewport_change`
+    /// precedent) — otherwise the previously drawn composer stays visible as
+    /// a ghost copy mid-screen (user-reported 显示错乱 on window grow).
+    #[test]
+    fn reanchor_on_grow_clears_stale_viewport_rows() {
+        let mut terminal = anchored_terminal(60, 30);
+        // 30-row screen, 12-row viewport bottom-anchored: rows 18..30.
+        assert_eq!(
+            terminal.get_frame().area().top(),
+            18,
+            "setup: old viewport must be bottom-anchored at rows 18..30"
+        );
+        // Distinctive composer-like content across the WHOLE old viewport —
+        // every stale row must hold drawn content before the grow.
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new("GHOST-ROW ".repeat(80))
+                        .wrap(ratatui::widgets::Wrap { trim: false }),
+                    f.area(),
+                );
+            })
+            .expect("draw old viewport");
+        {
+            let buf = terminal.backend().buffer();
+            for y in 18..28 {
+                assert!(
+                    !row_text(buf, y).is_empty(),
+                    "setup: stale row {y} must hold drawn content"
+                );
+            }
+        }
+
+        // Grow the backend 30 → 40 and reanchor through the real path.
+        terminal.backend_mut().resize(60, 40);
+        reanchor_viewport(&mut terminal, 60, 40).expect("reanchor");
+
+        // Viewport is bottom-anchored at the new geometry.
+        let area = terminal.get_frame().area();
+        assert_eq!(
+            area.bottom(),
+            40,
+            "viewport must re-anchor to the new bottom"
+        );
+        assert_eq!(area.height, INLINE_VIEWPORT_ROWS);
+        // The stale band old_top..new_top must be wiped — no ghost rows.
+        let buf = terminal.backend().buffer();
+        for y in 18..area.top() {
+            assert_eq!(
+                row_text(buf, y),
+                "",
+                "stale viewport row {y} must be cleared after grow (ghost)"
+            );
+        }
     }
 
     // T250 pin: a resize I/O failure degrades to "skip this tick" — the
@@ -1706,6 +2184,204 @@ mod tests {
         assert!(
             !app.approval.is_pending(),
             "timed-out approval must be closed"
+        );
+    }
+
+    // =========================================================================
+    // (b) ResizeCoalescer state-machine pins — pure transitions, injected
+    // clock (no sleeps), terminal writes observed through a collecting
+    // closure standing in for the real apply_resize.
+    // =========================================================================
+
+    #[test]
+    fn coalescer_leading_applies_immediately() {
+        let mut c = ResizeCoalescer::new((60, 12));
+        let mut applies: Vec<(u16, u16)> = Vec::new();
+        let t0 = Instant::now();
+        {
+            let mut apply = |w, h| {
+                applies.push((w, h));
+                true
+            };
+            c.on_resize(60, 20, t0, &mut apply);
+        }
+        // Leading edge: exactly one IMMEDIATE apply, no waiting for the
+        // quiet window — a single resize must still feel instant.
+        assert_eq!(applies, vec![(60, 20)]);
+        assert_eq!(c.pending, Some((60, 20)));
+        // Fixed window anchored at the leading-edge time.
+        assert_eq!(
+            c.deadline,
+            Some(t0 + Duration::from_millis(RESIZE_QUIET_MS))
+        );
+        assert_eq!(c.applied, (60, 20), "successful apply is recorded");
+    }
+
+    #[test]
+    fn coalescer_intermediate_events_suppressed() {
+        let mut c = ResizeCoalescer::new((60, 12));
+        let mut applies: Vec<(u16, u16)> = Vec::new();
+        let t0 = Instant::now();
+        {
+            let mut apply = |w, h| {
+                applies.push((w, h));
+                true
+            };
+            // Burst of 5 events, 10ms apart — all inside one quiet window.
+            for i in 0..5u64 {
+                c.on_resize(
+                    60,
+                    20 + i as u16,
+                    t0 + Duration::from_millis(10 * i),
+                    &mut apply,
+                );
+            }
+        }
+        // Exactly ONE terminal write: the leading apply, at the FIRST size.
+        // The pre-coalescer path would have reanchored five times (five
+        // blocking DSR queries — the corruption source).
+        assert_eq!(applies, vec![(60, 20)]);
+        // Suppressed events overwrite the pending size only: the LAST
+        // event's geometry is what the trailing edge will apply.
+        assert_eq!(c.pending, Some((60, 24)));
+        // The window is FIXED: the deadline stays anchored at the leading
+        // edge and is NOT extended by the suppressed events.
+        assert_eq!(
+            c.deadline,
+            Some(t0 + Duration::from_millis(RESIZE_QUIET_MS))
+        );
+    }
+
+    #[test]
+    fn coalescer_trailing_applies_final_size() {
+        let mut c = ResizeCoalescer::new((60, 12));
+        let mut applies: Vec<(u16, u16)> = Vec::new();
+        let t0 = Instant::now();
+        {
+            let mut apply = |w, h| {
+                applies.push((w, h));
+                true
+            };
+            c.on_resize(60, 20, t0, &mut apply);
+            c.on_resize(60, 28, t0 + Duration::from_millis(30), &mut apply);
+            // Before the deadline: nothing fires.
+            assert!(!c.apply_if_due(t0 + Duration::from_millis(79), &mut apply));
+            // At the fixed deadline (NOT 30ms+80ms — later events never
+            // extend the window): the final pending size applies once.
+            assert!(c.apply_if_due(t0 + Duration::from_millis(80), &mut apply));
+        }
+        assert_eq!(
+            applies,
+            vec![(60, 20), (60, 28)],
+            "leading + trailing = exactly 2 applies for the whole burst"
+        );
+        assert_eq!(c.pending, None, "window closed after the trailing apply");
+        assert_eq!(c.deadline, None);
+        assert_eq!(
+            c.applied,
+            (60, 28),
+            "applied tracks the last successful size"
+        );
+        // After the window closed, late checks fire nothing.
+        let mut late: Vec<(u16, u16)> = Vec::new();
+        {
+            let mut apply = |w, h| {
+                late.push((w, h));
+                true
+            };
+            assert!(!c.apply_if_due(t0 + Duration::from_millis(5000), &mut apply));
+        }
+        assert!(late.is_empty());
+    }
+
+    #[test]
+    fn coalescer_continuous_drag_bounds_applies() {
+        // Apply-count math: 30 events every 10ms over 300ms. Each fixed 80ms
+        // window contributes at most 2 applies (leading + trailing); windows
+        // open at t=0/80/160/240 -> 4 windows -> at most 8 applies for 30
+        // events (the per-event path would reanchor 30 times, each emitting
+        // a blocking DSR query). The loop below mirrors run_inline_session
+        // exactly: trailing-check at the top of the iteration, then the
+        // event — that ordering is what lets a due window close before the
+        // same-tick event opens a fresh one.
+        let mut c = ResizeCoalescer::new((60, 12));
+        let mut applies: Vec<(u16, u16)> = Vec::new();
+        let t0 = Instant::now();
+        {
+            let mut apply = |w, h| {
+                applies.push((w, h));
+                true
+            };
+            for i in 0..30u64 {
+                let now = t0 + Duration::from_millis(10 * i);
+                c.apply_if_due(now, &mut apply);
+                c.on_resize(60, 20 + i as u16, now, &mut apply);
+            }
+            // Settle: advance past the final window so the last size lands.
+            c.apply_if_due(
+                t0 + Duration::from_millis(300 + RESIZE_QUIET_MS),
+                &mut apply,
+            );
+        }
+        assert!(
+            applies.len() <= 8,
+            "30-event drag must coalesce to <= 8 applies (4 windows x 2), got {applies:?}"
+        );
+        assert!(
+            applies.len() >= 4,
+            "each of the 4 windows must at least contribute its leading apply, got {applies:?}"
+        );
+        assert_eq!(c.pending, None, "settled burst leaves nothing pending");
+        assert_eq!(c.deadline, None);
+    }
+
+    #[test]
+    fn coalescer_poll_cap_remaining_deadline() {
+        let mut c = ResizeCoalescer::new((60, 12));
+        let t0 = Instant::now();
+        // No window open: the base cadence passes through untouched.
+        assert_eq!(
+            c.capped_poll_ms(POLL_INTERVAL_IDLE_MS, t0),
+            POLL_INTERVAL_IDLE_MS
+        );
+        assert_eq!(
+            c.capped_poll_ms(POLL_INTERVAL_ACTIVE_MS, t0),
+            POLL_INTERVAL_ACTIVE_MS
+        );
+        {
+            let mut applies: Vec<(u16, u16)> = Vec::new();
+            let mut apply = |w, h| {
+                applies.push((w, h));
+                true
+            };
+            c.on_resize(60, 20, t0, &mut apply);
+        }
+        // Window open at t0 (deadline t0+80): the poll caps at the remaining
+        // time so the trailing apply fires on schedule.
+        assert_eq!(
+            c.capped_poll_ms(POLL_INTERVAL_IDLE_MS, t0 + Duration::from_millis(40)),
+            40,
+            "idle 50ms must cap at the 40ms remaining before the deadline"
+        );
+        assert_eq!(
+            c.capped_poll_ms(POLL_INTERVAL_ACTIVE_MS, t0 + Duration::from_millis(40)),
+            POLL_INTERVAL_ACTIVE_MS,
+            "active 16ms is already below the 40ms remaining"
+        );
+        assert_eq!(
+            c.capped_poll_ms(POLL_INTERVAL_IDLE_MS, t0 + Duration::from_millis(79)),
+            1
+        );
+        // Due / past due: 0ms = non-blocking poll, so the next iteration's
+        // trailing check fires immediately instead of sleeping past the
+        // deadline.
+        assert_eq!(
+            c.capped_poll_ms(POLL_INTERVAL_IDLE_MS, t0 + Duration::from_millis(80)),
+            0
+        );
+        assert_eq!(
+            c.capped_poll_ms(POLL_INTERVAL_IDLE_MS, t0 + Duration::from_millis(200)),
+            0
         );
     }
 }

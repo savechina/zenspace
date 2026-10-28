@@ -2,6 +2,7 @@ use super::app::App;
 use super::model_picker::render_model_picker_inline;
 use super::session_picker::render_session_picker_inline;
 use super::slash::{popup_row_count, render_slash_popup_inline};
+use super::stream::truncate_char_ellipsis;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,6 +15,11 @@ const FOOTER_HEIGHT: u16 = 1;
 const POPUP_HEIGHT: u16 = 8;
 const MIN_TAIL_HEIGHT: u16 = 2;
 const MAX_TAIL_HEIGHT: u16 = 4;
+
+/// (a) Below this many leftover columns a live reasoning summary is noise —
+/// dropped entirely. The summary is the FIRST segment sacrificed under width
+/// pressure (before the queue/working indicators and the contextual hint).
+const LIVE_SUMMARY_MIN_WIDTH: usize = 16;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let (muted, info_accent, bg_color, streaming_cursor) = {
@@ -30,7 +36,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let any_picker = app.approval.is_pending()
         || app.slash_state.visible
         || app.session_picker.visible
-        || app.model_picker.visible;
+        || app.model_picker.visible
+        || app.shortcuts_overlay;
 
     // Codex/Claude-style bottom popup: the picker grows upward from the input
     // row. Input + footer ALWAYS keep their full height — the popup is capped
@@ -132,6 +139,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             );
         } else if app.model_picker.visible {
             render_model_picker_inline(frame, &app.model_picker, popup_area, theme_ref);
+        } else if app.shortcuts_overlay {
+            render_shortcuts_overlay_inline(frame, popup_area, theme_ref);
         }
     } else {
         chunk_idx += 1;
@@ -250,6 +259,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // (a) Live reasoning summary (codex `latest_summary_line`): while the
+        // model is emitting reasoning the status area shows the LATEST
+        // reasoning line — REGARDLESS of the /thinking toggle (codex
+        // separates the status header from transcript gating). The `esc to
+        // interrupt` affordance above is never duplicated. The summary
+        // truncates to the leftover width and is the FIRST segment dropped
+        // under pressure, so its slot is only decided after every other
+        // segment has claimed its width (inserted at `summary_slot` below).
+        let summary_slot = spans.len();
         // Queued-message count while streaming: the footer also carries the
         // queue depth because inline mode has no queue side panel (full-screen
         // renders one in ui.rs).
@@ -308,11 +326,108 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         spans.push(Span::styled(" | ", muted));
         spans.push(Span::styled(app.workspace.clone(), accent_fg));
+        // T2xx(d): state-dependent key hint ("keys that do something right
+        // now" — hermes hint_pairs). LOWEST-priority segment: dropped FIRST
+        // when the row runs out of width; the indicators above keep their
+        // existing precedence. Streaming renders no hint here — its own
+        // `esc to interrupt` segment already carries the affordance.
+        if let Some(hint) = contextual_key_hint(app) {
+            let label = format!(" | {hint}");
+            let base_width: usize = spans.iter().map(|span| span.content.width()).sum();
+            if base_width + label.width() <= footer_area.width as usize {
+                spans.push(Span::styled(label, muted));
+            }
+        }
+        // (a) Decide the live-summary slot last: only the width that ALL
+        // other segments left over is available to it, so it truncates first
+        // and drops before any indicator loses its slot.
+        if let Some(summary) = app.stream_collector.live_reasoning_summary() {
+            let used: usize = spans.iter().map(|span| span.content.width()).sum();
+            let available = (footer_area.width as usize).saturating_sub(used + " | ".width());
+            if available >= LIVE_SUMMARY_MIN_WIDTH {
+                let clipped = truncate_char_ellipsis(&summary, available);
+                spans.insert(
+                    summary_slot,
+                    Span::styled(
+                        clipped,
+                        Style::default()
+                            .fg(info_accent)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                );
+                spans.insert(summary_slot, Span::styled(" | ", muted));
+            }
+        }
         spans
     };
     let footer_line = Line::from(footer_spans);
     let footer = Paragraph::new(footer_line).style(Style::default().bg(bg_color));
     frame.render_widget(footer, footer_area);
+}
+
+/// T2xx(d): contextual key hints — the footer only advertises keys that DO
+/// something right now (hermes hint_pairs convention). `None` means an
+/// existing dedicated footer segment already carries the affordance
+/// (streaming renders its own `esc to interrupt`).
+fn contextual_key_hint(app: &App) -> Option<&'static str> {
+    if app.shortcuts_overlay {
+        Some("esc close")
+    } else if app.approval.is_pending() {
+        Some("y/n approve")
+    } else if app.slash_state.visible {
+        Some("\u{2191}\u{2193} nav \u{b7} tab complete")
+    } else if app.reading_mode {
+        Some("pgdn/end resume")
+    } else if app.is_streaming {
+        None
+    } else if !app.input.lines().join("\n").trim().is_empty() {
+        Some("enter send \u{b7} ctrl+j newline")
+    } else {
+        Some("? shortcuts")
+    }
+}
+
+/// T2xx(c): static shortcuts overlay (codex-rs `toggle_shortcuts`): a
+/// read-only keybinding card rendered in the shared bottom popup slot.
+/// Content is the inline-scoped extract of the `/help` keybinding section —
+/// commands.rs owns the full /help output and is outside this wave's file
+/// set, so the card cross-references rather than imports it.
+fn render_shortcuts_overlay_inline(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    theme: &dyn crate::tui::theme::OutputTheme,
+) {
+    let header_style = Style::default()
+        .fg(Color::Black)
+        .bg(theme.info_accent())
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(theme.info_accent())
+        .add_modifier(Modifier::BOLD);
+    let hint_style = theme.text_muted();
+
+    // Exactly 8 rows (POPUP_HEIGHT): header + 7 key rows, never grows the slot.
+    let rows: [(&str, &str); 7] = [
+        ("enter / ctrl+j", "send · newline"),
+        ("esc", "interrupt stream · esc esc saves draft"),
+        ("ctrl+c", "clear draft · again exits"),
+        ("up / down", "history recall"),
+        ("ctrl+r", "search history"),
+        ("/ + tab", "slash commands · complete"),
+        ("pgup / pgdn", "reading mode · resume"),
+    ];
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() + 1);
+    lines.push(Line::from(Span::styled(
+        " Shortcuts — Esc / ? / Enter closes ".to_string(),
+        header_style,
+    )));
+    for (key, hint) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {key:<14}"), key_style),
+            Span::styled(hint.to_string(), hint_style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// FR-023: Render the gateway status banner.
@@ -1232,6 +1347,152 @@ mod tests {
         assert!(
             !footer.contains("queued"),
             "idle footer must not show the queued count: {footer:?}"
+        );
+    }
+
+    // === T2xx(d): contextual footer hints ===
+
+    /// Idle + empty composer advertises the shortcuts affordance.
+    #[test]
+    fn footer_hint_idle_shows_shortcuts() {
+        let mut app = test_app();
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("? shortcuts"),
+            "idle empty composer must hint `? shortcuts`: {footer:?}"
+        );
+    }
+
+    /// Streaming keeps its own `esc to interrupt` affordance and renders no
+    /// idle hint — never two hint segments.
+    #[test]
+    fn footer_hint_streaming_shows_esc_interrupt() {
+        let mut app = test_app();
+        app.is_streaming = true;
+        let buf = draw_ui(120, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("esc to interrupt"),
+            "streaming footer must keep the interrupt affordance: {footer:?}"
+        );
+        assert!(
+            !footer.contains("? shortcuts"),
+            "streaming footer must not show the idle hint: {footer:?}"
+        );
+    }
+
+    /// Idle + non-empty draft advertises send; under narrow width the hint
+    /// is dropped FIRST (lowest priority) while the core footer survives.
+    #[test]
+    fn footer_hint_draft_idle_shows_enter_send_and_drops_first_when_narrow() {
+        let mut app = test_app();
+        app.input.insert_str("hello");
+        let buf = draw_ui(200, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("enter send") && footer.contains("ctrl+j newline"),
+            "draft idle footer must hint send + newline: {footer:?}"
+        );
+
+        // Width pressure: hint dropped before any core segment.
+        let narrow = draw_ui(40, 8, &mut app);
+        let footer = row_text(&narrow, 7);
+        assert!(
+            !footer.contains("enter send"),
+            "hint must be the first segment dropped under width pressure: {footer:?}"
+        );
+        assert!(
+            footer.contains("Zen"),
+            "core footer must survive narrow width: {footer:?}"
+        );
+    }
+
+    // === T2xx(c): shortcuts overlay rendering ===
+
+    /// The overlay renders in the shared popup slot (header visible above
+    /// the input box) and the footer hint switches to `esc close`.
+    #[test]
+    fn shortcuts_overlay_renders_in_popup_slot_with_esc_close_hint() {
+        let mut app = test_app();
+        app.shortcuts_overlay = true;
+        let buf = draw_ui(100, 12, &mut app);
+        let header = row_text(&buf, 0);
+        assert!(
+            header.contains("Shortcuts"),
+            "overlay header must render in the popup slot: {header:?}"
+        );
+        let footer = row_text(&buf, 11);
+        assert!(
+            footer.contains("esc close"),
+            "overlay footer must hint esc close: {footer:?}"
+        );
+        assert!(
+            !footer.contains("? shortcuts"),
+            "overlay must replace the idle shortcuts hint: {footer:?}"
+        );
+        assert!(
+            row_text(&buf, 8).contains("Input"),
+            "input box must stay unclipped"
+        );
+    }
+
+    // === (a) live reasoning summary footer ===
+
+    fn app_with_live_reasoning() -> App {
+        let mut app = test_app();
+        app.is_streaming = true;
+        // show_thinking=false proves the summary is mode-independent (codex
+        // separates the status header from transcript gating).
+        app.show_thinking = false;
+        app.stream_collector
+            .push_delta("<think>## Plan\n**Verify pin suite** then gates");
+        let style = ratatui::style::Style::default();
+        let _ = app
+            .stream_collector
+            .drain_and_tail_filtered(style, app.show_thinking);
+        app
+    }
+
+    /// While reasoning streams, the footer shows the latest reasoning line
+    /// REGARDLESS of the /thinking toggle; the interrupt affordance stays
+    /// exactly once.
+    #[test]
+    fn footer_shows_reasoning_summary_while_thinking() {
+        let mut app = app_with_live_reasoning();
+        let buf = draw_ui(160, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            footer.contains("Verify pin suite"),
+            "footer must show the live reasoning summary: {footer:?}"
+        );
+        assert!(
+            footer.contains("esc to interrupt"),
+            "interrupt affordance must survive: {footer:?}"
+        );
+        assert_eq!(
+            footer.matches("esc to interrupt").count(),
+            1,
+            "esc must never duplicate: {footer:?}"
+        );
+    }
+
+    /// Width pressure: the summary is the FIRST segment dropped — the
+    /// interrupt affordance and the core footer survive.
+    #[test]
+    fn footer_reasoning_summary_drops_first_under_width_pressure() {
+        let mut app = app_with_live_reasoning();
+        // 60 cols: the core footer (brand/model/esc/tok) still fits, but the
+        // leftover for the summary is far below LIVE_SUMMARY_MIN_WIDTH.
+        let buf = draw_ui(60, 8, &mut app);
+        let footer = row_text(&buf, 7);
+        assert!(
+            !footer.contains("Verify pin suite"),
+            "summary must drop first under width pressure: {footer:?}"
+        );
+        assert!(
+            footer.contains("esc to interrupt"),
+            "interrupt affordance must survive narrow width: {footer:?}"
         );
     }
 }

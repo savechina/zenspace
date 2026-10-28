@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resize-garbling remediation** (2026-10-27): the TUI no longer scrambles
+  when the terminal window is auto-resized. DEC 2026 synchronized-update
+  regions wrap per-tick scrollback insertion and drawing so intermediate
+  states never reach the screen; an 80ms resize coalescer applies
+  leading+trailing within a burst instead of re-anchoring on every event;
+  a unified resize path rebuilds the viewport once; and on height growth
+  stale viewport rows are cleared (codex-rs `clear_for_viewport_change`
+  semantics), eliminating the ghost composer previously left mid-screen.
+  Verified with PTY burst-resize and grow-ghost dynamic simulation tests.
+
+### Added
+
+- **Source-backed transcript replay** (2026-10-27): width changes no longer
+  leave the transcript hard-wrapped at the old width. A source registry
+  captures every committed block (assistant markdown, user echoes, tool
+  cards, thinking graduation lines, banner, pre-rendered fallbacks) within
+  a budget cap that renders a trim notice when exceeded; on a width change
+  at the coalescer trailing edge the native scrollback is purged and the
+  transcript re-rendered and reinserted at the new width inside a single
+  synchronized-update region, then the viewport re-anchors. Streaming and
+  reading-mode sessions defer to their boundaries and replay once. A 500ms
+  size watchdog synthesizes resizes the terminal failed to deliver (some
+  multiplexer setups). Replay failures degrade without killing the session.
+  Accepted cost (owner decision, codex-rs parity): the purge also clears
+  pre-session shell scrollback. Verified by PTY and real-tmux
+  `resize-window` dynamic simulation tests.
+
+- **Interaction-language convergence (codex/hermes study wave)**
+  (2026-10-27): markdown output converges on conventions studied from
+  codex-rs and hermes-agent — heading hierarchy (H1 bold+underline,
+  H2 bold, H3 bold-italic, H4-6 italic), `•` bullet glyph, accent-colored
+  underlined links without the redundant destination suffix, dim em-dash
+  horizontal rules, and a uniform one-blank-line block rhythm — while zen
+  keeps its framed code fences by owner decision. Two rendering bugs fixed
+  en route: line-level styles were silently dropped before reaching the
+  scrollback, and blank-line-separated lists merged into preceding code
+  fences whose parser then dropped everything after the closing fence.
+  Keybindings adopt hermes conventions: Ctrl+C protects the idle composer
+  draft (first press clears it, second within 1s quits), Esc-Esc sends the
+  draft to history, `?` opens a shortcuts overlay, and the footer shows
+  contextual key hints per state. Thinking display upgrades to a
+  three-state `/thinking` (off -> brief -> full) with a 160-char one-line
+  brief, the existing three-line full window, and a
+  `Thought for Ns - title` graduation line, plus a live reasoning summary
+  in the footer.
+
 ## [0.0.9] - 2026-09-27
 
 ### Added

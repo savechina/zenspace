@@ -10,7 +10,10 @@ use ratatui_themes::{ThemeName, ThemePalette};
 /// - Layer 3 (Active): Dynamic elements/cursors - energy flow (RGB 0,162,97)
 /// - Layer 4 (Muted): Secondary text/logs - ambient info (RGB 30,80,85)
 pub trait OutputTheme {
-    /// Layer 2: Heading hierarchy (level 1-6, higher = more prominent)
+    /// Layer 2: Heading hierarchy (level 1-6, higher = more prominent).
+    /// The markdown renderer uses the codex-convention hierarchy from
+    /// [`markdown_heading_style`] (H1 bold+underlined, H2 bold, H3
+    /// bold+italic, H4-H6 italic).
     fn heading(&self, level: u8) -> Style;
 
     /// Layer 2: Bold emphasis for key content
@@ -305,6 +308,51 @@ pub fn no_color() -> Box<dyn OutputTheme> {
 }
 
 // ---------------------------------------------------------------------------
+// Markdown renderer conventions (codex/hermes convergence, 002-agentic-tui)
+//
+// The TUI markdown pipeline (`tui/markdown.rs`) renders assistant output
+// through tui-markdown with zen's own StyleSheet. These functions are the
+// single source of the converged element styles so tests can pin them and
+// NO_COLOR degradation stays in one place:
+//   - headings: codex per-level hierarchy, modifier-only (no fg), which is
+//     NO_COLOR-safe by construction — NoColorTheme already uses BOLD/ITALIC;
+//   - links: accent + underline (hermes convention) using zen's canonical
+//     moss-green link color, degraded to underline-only under NO_COLOR
+//     (mirrors NoColorTheme::link).
+// ---------------------------------------------------------------------------
+fn no_color_env() -> bool {
+    std::env::var("NO_COLOR").is_ok()
+}
+
+/// Codex-convention heading hierarchy: H1 bold+underlined, H2 bold,
+/// H3 bold+italic, H4-H6 italic. Modifier-only — identical output under
+/// NO_COLOR (no color to degrade).
+pub(crate) fn markdown_heading_style(level: u8) -> Style {
+    match level {
+        1 => Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        2 => Style::default().add_modifier(Modifier::BOLD),
+        3 => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        _ => Style::default().add_modifier(Modifier::ITALIC),
+    }
+}
+
+/// Link style for the markdown pipeline: accent + underline (hermes
+/// convention) using zen's canonical link color.
+pub(crate) fn markdown_link_style() -> Style {
+    markdown_link_style_with(no_color_env())
+}
+
+/// `no_color` seam so tests can pin both degradation branches without
+/// mutating process env (tests run concurrently).
+pub(crate) fn markdown_link_style_with(no_color: bool) -> Style {
+    if no_color {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    } else {
+        ZenTheme.link()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Zen — Wabi-sabi natural palette (DEFAULT)
 // Inspired by Japanese temple aesthetics: moss, sand, wood, stone.
 // Warm, organic, calm. Designed for zen/flow state immersion.
@@ -317,20 +365,14 @@ pub struct ZenTheme;
 
 impl OutputTheme for ZenTheme {
     fn heading(&self, level: u8) -> Style {
-        match level {
-            1 => Style::default()
-                .fg(Color::Rgb(178, 130, 100)) // terracotta copper
-                .add_modifier(Modifier::BOLD),
-            2 => Style::default()
-                .fg(Color::Rgb(110, 170, 120)) // sage green
-                .add_modifier(Modifier::BOLD),
-            3 => Style::default()
-                .fg(Color::Rgb(196, 178, 136)) // sand/amber
-                .add_modifier(Modifier::BOLD),
-            _ => Style::default()
-                .fg(Color::Rgb(210, 205, 196)) // warm white
-                .add_modifier(Modifier::BOLD),
-        }
+        // Codex-convention per-level modifiers (see `markdown_heading_style`)
+        // composed with the zen wabi-sabi palette.
+        markdown_heading_style(level).fg(match level {
+            1 => Color::Rgb(178, 130, 100), // terracotta copper
+            2 => Color::Rgb(110, 170, 120), // sage green
+            3 => Color::Rgb(196, 178, 136), // sand/amber
+            _ => Color::Rgb(210, 205, 196), // warm white
+        })
     }
 
     fn bold(&self) -> Style {
@@ -962,12 +1004,10 @@ pub struct NoColorTheme;
 
 impl OutputTheme for NoColorTheme {
     fn heading(&self, level: u8) -> Style {
-        let modifier = if level <= 2 {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        };
-        Style::default().add_modifier(modifier)
+        // Full codex-convention hierarchy. Modifier-only styles are already
+        // the NoColorTheme idiom (BOLD/ITALIC/UNDERLINED all in use in this
+        // impl), so no further degradation is needed.
+        markdown_heading_style(level)
     }
 
     fn bold(&self) -> Style {

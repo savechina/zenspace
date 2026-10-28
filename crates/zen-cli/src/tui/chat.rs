@@ -49,9 +49,16 @@ impl App {
         // orchestrator/LLM; production is unaffected (env var absent).
         if std::env::var("ZEN_TEST_ECHO_LLM").is_ok() {
             let script = ECHO_SCRIPT.to_string();
+            // Test-only pacing knob: e14 needs the reasoning phase to span
+            // multiple draws (live W3/brief tail sampling); default 30ms
+            // keeps every other echo test's timing unchanged.
+            let chunk_ms = std::env::var("ZEN_TEST_ECHO_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30);
             tokio::task::spawn(async move {
                 for chunk in script.split_inclusive('\n') {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(chunk_ms)).await;
                     let _ = tokens_tx.send(chunk.to_string());
                 }
                 let _ = done_tx.send((
@@ -496,6 +503,14 @@ impl App {
                             let tool_lines = self.stream_collector.take_tool_lines();
                             if !tool_lines.is_empty() {
                                 if self.is_inline_mode() {
+                                    // Wave 2A: blocks flushed here never pass
+                                    // the drain watermark, so capture their
+                                    // rendered Lines (replay re-inserts as-is).
+                                    self.transcript.push(
+                                        super::transcript_source::TranscriptSource::PreRendered(
+                                            tool_lines.clone(),
+                                        ),
+                                    );
                                     self.enqueue_scrollback(tool_lines);
                                 } else {
                                     for line in tool_lines {
@@ -525,6 +540,16 @@ impl App {
                                     .drain_and_tail_filtered(reasoning_style, self.show_thinking);
                                 let mut remaining = committed;
                                 remaining.extend(pending);
+                                // Wave 2A: capture the final turn's sources —
+                                // committed block kinds from the collector's
+                                // log, then the tail block that only ever
+                                // flushes as `pending` (never committed).
+                                self.record_stream_sources();
+                                if let Some(src) = self.stream_collector.take_pending_source() {
+                                    self.transcript.push(
+                                        super::transcript_source::TranscriptSource::Markdown(src),
+                                    );
+                                }
                                 if !remaining.is_empty() {
                                     self.enqueue_scrollback(remaining);
                                 }
@@ -533,6 +558,13 @@ impl App {
                                         format!("── {} ──", l),
                                         self.theme.as_ref().separator(),
                                     ));
+                                    // Wave 2A: separator is a one-off styled
+                                    // line — PreRendered keeps it identical.
+                                    self.transcript.push(
+                                        super::transcript_source::TranscriptSource::PreRendered(
+                                            vec![separator_line.clone()],
+                                        ),
+                                    );
                                     self.enqueue_scrollback(vec![separator_line]);
                                 }
                             }
@@ -584,6 +616,16 @@ impl App {
                                         );
                                     let mut r = committed;
                                     r.extend(pending);
+                                    // Wave 2A: capture what the cancelled turn
+                                    // already committed + its tail block.
+                                    self.record_stream_sources();
+                                    if let Some(src) = self.stream_collector.take_pending_source() {
+                                        self.transcript.push(
+                                            super::transcript_source::TranscriptSource::Markdown(
+                                                src,
+                                            ),
+                                        );
+                                    }
                                     r
                                 };
                                 if !remaining.is_empty() {
@@ -596,6 +638,11 @@ impl App {
                                     "\u{26a0} cancelled",
                                     self.theme.as_ref().text_muted(),
                                 ));
+                                self.transcript.push(
+                                    super::transcript_source::TranscriptSource::PreRendered(vec![
+                                        cancel_line.clone(),
+                                    ]),
+                                );
                                 self.enqueue_scrollback(vec![cancel_line]);
                                 self.status_hint = None;
                                 self.current_response_tokens = 0;
@@ -690,16 +737,28 @@ impl App {
                 super::resume::ResumeMessage::TurnText { text, .. } => {
                     let lines = super::resume::render_replay_turn(&text);
                     if !lines.is_empty() {
+                        // Wave 2A: replayed turns are one-off renderings —
+                        // PreRendered keeps them through width changes.
+                        self.transcript.push(
+                            super::transcript_source::TranscriptSource::PreRendered(lines.clone()),
+                        );
                         self.enqueue_scrollback(lines);
                     }
                 }
                 super::resume::ResumeMessage::GapNotice { skipped_count } => {
                     let lines = super::resume::render_gap_notice(skipped_count);
+                    self.transcript
+                        .push(super::transcript_source::TranscriptSource::PreRendered(
+                            lines.clone(),
+                        ));
                     self.enqueue_scrollback(lines);
                 }
                 super::resume::ResumeMessage::CompletedResponse { text } => {
                     let lines = super::resume::render_completed_response(&text);
                     if !lines.is_empty() {
+                        self.transcript.push(
+                            super::transcript_source::TranscriptSource::PreRendered(lines.clone()),
+                        );
                         self.enqueue_scrollback(lines);
                     }
                 }

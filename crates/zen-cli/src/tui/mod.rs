@@ -26,6 +26,7 @@ pub mod slash;
 mod stall;
 pub mod stream;
 pub mod theme;
+mod transcript_source;
 mod ui;
 
 /// Drain window granted to in-flight work after SIGINT/SIGTERM before the TUI
