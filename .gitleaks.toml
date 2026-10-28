@@ -29,4 +29,13 @@ regexes = [
   '''sk-(REDACTED|EXAMPLE|PLACEHOLDER|xxx|X{5,}|test|dummy|your[_-]*)''',
   # Provider config doc samples that ship empty.
   '''[A-Za-z0-9_]*_API_KEY\s*=\s*("")''',
+  # In-file #[cfg(test)] fixtures in crates/zen-provider/src/router.rs (DST
+  # guarded-stream sweep, 6f3db60): the line intentionally carries ghp_/AKIA
+  # -shaped fakes because Secrets Guard must mask exactly those shapes —
+  # rewording would defeat the pin. Exact literals only (alphabet-sequential
+  # / AWS-docs canonical example), never shape wildcards, so a real ghp_/AKIA
+  # key anywhere else still fails CI. Note: gitleaks 8.24.x flags the ghp_
+  # literal while 8.30+ no longer matches it — version-immune by exact match.
+  '''ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij''',
+  '''AKIAIOSFODNN7EXAMPLE''',
 ]
