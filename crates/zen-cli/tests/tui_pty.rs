@@ -35,7 +35,7 @@ struct Tui {
     raw: Arc<Mutex<Vec<u8>>>,
     _reader: std::thread::JoinHandle<()>,
     // Keep the isolated HOME alive for the child's lifetime.
-    _home: tempfile::TempDir,
+    _home: Option<tempfile::TempDir>,
 }
 
 impl Tui {
@@ -97,7 +97,24 @@ impl Tui {
         if let Some(toml) = config_toml {
             std::fs::write(home.path().join(".zen/config.toml"), toml).expect("temp config");
         }
-        cmd.env("HOME", home.path());
+        // Post-mortem seam: ZEN_TEST_KEEP_HOME=1 leaks the temp home and
+        // prints its path so a failing case's zen.log can be inspected —
+        // without it the TempDir drop deletes the evidence at teardown.
+        let keep_home = std::env::var("ZEN_TEST_KEEP_HOME").as_deref() == Ok("1");
+        let home_path = home.path().to_path_buf();
+        if keep_home {
+            eprintln!("ZEN_TEST_KEEP_HOME: {}", home_path.display());
+        }
+        // The forget lives in the keep-branch only, so exactly one arm moves
+        // `home` (a forget in both arms' scope would leave the other a
+        // use-after-move).
+        let home_cell = if keep_home {
+            std::mem::forget(home);
+            None
+        } else {
+            Some(home)
+        };
+        cmd.env("HOME", &home_path);
         cmd.cwd(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
         for (k, v) in extra_env {
             cmd.env(k, v);
@@ -172,7 +189,7 @@ impl Tui {
             parser,
             raw,
             _reader,
-            _home: home,
+            _home: home_cell,
         }
     }
 
@@ -893,7 +910,6 @@ fn e19_width_change_replays_transcript_at_new_width() {
     assert_eq!(body.chars().count(), 70);
     tui.send(format!("{body}\r").as_bytes());
     tui.wait_for("REPLAYTAIL", "echo committed at 60 cols");
-    tui.wait_for("\u{2500}\u{2500}", "turn separator after completion");
     std::thread::sleep(Duration::from_millis(200));
 
     // At 60 cols the logical line is hard-wrapped: no single grid row can
@@ -912,18 +928,30 @@ fn e19_width_change_replays_transcript_at_new_width() {
 
     // Grow: coalescer trailing edge → width change → purge + re-render +
     // reinsert at 100 cols, all inside one synchronized-update region.
+    //
+    // Completion orders (both legal, both must converge): if the scripted
+    // echo reply already finished, the replay runs at the trailing edge;
+    // if it is still streaming (slow CI runner — the Linux repro), the pure
+    // gate DEFERS (streaming defers by design) and the stream-completion
+    // boundary runs it. Poll for the replay OUTCOME instead of sampling
+    // once after a fixed sleep — a single shot loses to either slow order.
     tui.resize(40, 100);
-    std::thread::sleep(Duration::from_millis(600));
-
-    let wide = tui.screen();
-    let joined = wide
-        .lines()
-        .filter(|l| l.contains("REPLAYHEAD") && l.contains("REPLAYTAIL"))
-        .count();
-    assert_eq!(
-        joined, 1,
-        "replay must reflow the echo onto ONE 100-col row:\n{wide}"
-    );
+    let replay_deadline = Instant::now() + TIMEOUT;
+    let wide = loop {
+        let wide = tui.screen();
+        let joined = wide
+            .lines()
+            .filter(|l| l.contains("REPLAYHEAD") && l.contains("REPLAYTAIL"))
+            .count();
+        if joined == 1 {
+            break wide;
+        }
+        assert!(
+            Instant::now() < replay_deadline,
+            "replay never reflowed the echo onto ONE 100-col row:\n{wide}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
         wide.lines().filter(|l| l.contains("REPLAYHEAD")).count(),
         1,
