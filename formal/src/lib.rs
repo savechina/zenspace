@@ -19,7 +19,11 @@ use vstd::prelude::*;
 
 pub mod trusted;
 
-/// Placehholder grammar proofs — the canonical proof file BOTH mounted
+/// Placeholder grammar proofs — the canonical proof file BOTH mounted
 /// here and by `crates/zen-core/tests/formal_placeholder.rs` (runtime pin):
 /// one physical source, two consumers.
 pub mod secrets_verify;
+
+/// Kahn layering proofs (T278) — mounted here and by the zen-agents
+/// congruence test: one physical source, two consumers.
+pub mod plan_layers_verify;
