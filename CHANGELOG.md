@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bounded web.search** (2026-10-30): a dead or hanging search backend no
+  longer stalls a hosted turn for ~33s (production evidence). Each backend
+  (Brave → Tavily → DuckDuckGo) is bounded by `[web_search] timeout_ms`
+  (default 8s, clamp 1..30s, env `ZEN_WEB_SEARCH_TIMEOUT_MS`), applied both
+  per HTTP request and around the backend's entire retry chain — the
+  worst-case all-backends cascade is ~24s. When every backend fails, one
+  aggregated actionable error lists each backend's one-line reason (timeout /
+  HTTP status / network / missing key) plus fix hints (Brave/Tavily API keys,
+  `HTTPS_PROXY` for DuckDuckGo), replacing the bare last-backend error.
+
+- **Agent pipeline result honesty** (2026-10-30): hosted turns no longer
+  swallow results or answers. Read-only turns (search, browse, plan
+  inspection) skip the quality gate entirely — previously every tool-using
+  turn faced Momus, which structurally vetoed read-only search answers
+  (production evidence: 3/3 hosted turns vetoed on queries that mutated
+  nothing); the gate now triggers on mutating tool calls only, with
+  `Confidential` sessions always gated and unknown tools failing safe as
+  mutating. Exhausted tool loops (token budget, model-call cap, unparseable
+  tool JSON) deliver the model's last words plus a visible `⚠` notice
+  instead of an empty answer; rig-agent max-turns exhaustion recovers
+  instead of killing the turn. Parse rejections land a bounded
+  `loop.parse.rejected` audit line, and delegated sub-agents returning empty
+  or tool-JSON-only responses produce a structured error instead of an
+  ok-shaped empty result. An upheld quality veto is now visible: the
+  non-streaming path prefixes the answer with the veto reason, the streaming
+  path emits a `vetoed` marker (the existing `delivery not ready` wording is
+  unchanged). Prose following a ```json fenced block in a response is no
+  longer dropped by the display stripper (pre-existing truncation bug).
+
 - **Resize-garbling remediation** (2026-10-27): the TUI no longer scrambles
   when the terminal window is auto-resized. DEC 2026 synchronized-update
   regions wrap per-tick scrollback insertion and drawing so intermediate
@@ -20,6 +49,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Verified with PTY burst-resize and grow-ghost dynamic simulation tests.
 
 ### Added
+
+- **Intent classification speed** (2026-10-30): keyword-matching queries no
+  longer wait on LLM intent classification. An L0 fast path (default on,
+  `[agentic.intent] l0_fast_path`) serves keyword-table hits immediately —
+  the recorded falsifiable baseline (intent p95 < 500ms) was violated ~40×
+  in production by the LLM-first ordering (20s classification against the
+  35B default model on 2/3 hosted turns). The L2 LLM classification runs as
+  a detached record-only shadow that logs the L0-vs-L2 disagreement pair to
+  `logs/audit.jsonl` (`decision_kind: l0_fast_path`), keeping the calibration
+  decision falsifiable. The classification timeout is now configurable
+  (`classify_timeout_ms`, default 8s, clamp 1..60s, env
+  `ZEN_INTENT_CLASSIFY_TIMEOUT_MS`; previously a hard 20s const), and
+  `[agentic.intent] model` routes the call to a smaller local model
+  (e.g. `llama3.2:2GB`) via a new per-call model-override seam honored by
+  the ollama provider.
+
+- **Daemon-side conversation persistence (single writer)** (2026-10-30):
+  the gateway daemon now persists completed hosted turns to the session
+  jsonl — every surface (TUI, `zen chat`, qqbot, HTTP) contributes to
+  session hydration and memory replay; previously only the TUI client
+  wrote, starving `zen serve`-hosted surfaces. Cancelled and execution-error
+  turns append nothing (client-semantics parity); a persist failure never
+  fails the turn. The TUI keeps a meta-only carve-out (title provenance for
+  the resume picker). Version-skew note: an old daemon paired with a new
+  TUI persists nothing for the interim window — `zen serve restart` after
+  upgrade closes it.
 
 - **Source-backed transcript replay** (2026-10-27): width changes no longer
   leave the transcript hard-wrapped at the old width. A source registry

@@ -92,7 +92,7 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
 | zen-auth | Keychain + SecretRef resolution | `crates/zen-auth/` |
 | zen-plugin | Agent tools, WASM sandbox (wasmtime), MCP client, plugin registry | `crates/zen-plugin/` |
-| zen-gateway | Sole-owner UDS daemon: JSON-RPC 2.0 method registry, hosted agent sessions (US4), guards/approvals, HTTP `/api/v1` + MCP stdio, QQBot channel (`channel/qqbot/`: WS gateway + HTTP bridge) | `crates/zen-gateway/` |
+| zen-gateway | Sole-owner UDS daemon: JSON-RPC 2.0 method registry, hosted agent sessions (US4), single-writer conversation persistence (D7 — daemon persists completed hosted turns to session jsonl for ALL surfaces), guards/approvals, HTTP `/api/v1` + MCP stdio, QQBot channel (`channel/qqbot/`: WS gateway + HTTP bridge) | `crates/zen-gateway/` |
 
 ### Dependency Graph
 
@@ -129,7 +129,7 @@ zen-provider → zen-core
 zen wiki distill → zen-vault (DistillationPipeline) → notion extraction → wiki compile → archive
 zen wiki loop run → ZenLoopWorker → budget gate → distill (normalize/txn/checkpoint) → ORAV self-correction → graph verify → hypothesis incubation → wisdom hooks → report/gaps/git
 zen wiki rebuild-memory → RPC to zen-gateway daemon → MemvidIndexer full reindex → replay from jsonl
-zen session start → zen-agents (AgentOrchestrator: INTENT_SIGNALS route → tool loop → quality gate) → executor
+zen session start → zen-agents (AgentOrchestrator: L0 keyword fast path → INTENT_SIGNALS route → tool loop → quality gate (mutating-only, D1)) → executor
 zen wiki reindex → zen-vault (Reindexer, checksums, embeddings)
 zen wiki lint    → zen-vault (Linter, orphan pages, broken wikilinks)
 zen serve start  → zen-gateway daemon + ZenScheduler (cron workers: journal, dream, wisdom, subconscious)
@@ -534,7 +534,7 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 | `fs.grep` | Public | zen-plugin/tools/fs_grep.rs | Regex content search |
 | `fs.glob` | Public | zen-plugin/tools/fs_glob.rs | Pattern matching |
 | `web.fetch` | Private | zen-plugin/tools/web_fetch.rs | NetworkPolicy-validated (FR-036), Jina fallback |
-| `web.search` | Private | zen-plugin/tools/web_search.rs | DDG/Brave/Tavily tiers, NetworkPolicy-validated |
+| `web.search` | Private | zen-plugin/tools/web_search.rs | DDG/Brave/Tavily tiers, NetworkPolicy-validated; per-backend deadline `[web_search] timeout_ms` (default 8s, worst-case cascade 24s), aggregated actionable all-backends-failed error (D8) |
 | `shell.exec` | **Confidential** | zen-plugin/tools/shell_exec.rs | Structured binary+args (no shell string), env scrubbed, timeout SIGTERM→SIGKILL process-group, excluded from external MCP (FR-028) |
 | `system.*` (5 tools) | Public/Private | zen-plugin/platform/ | health/notifications/calendar/daemon/fs_watcher — fs_watcher capped at 8 (FR-045), seatbelt arg-registry mediated (FR-035) |
 | `plugin.wasm_sandbox` | Private | zen-plugin/wasm_sandbox.rs | Permission gate on every invoke (FR-029), StoreLimits memory cap (FR-030), single impl (FR-031) |
@@ -809,6 +809,17 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 - Binary/library split: `zen` binary (13 lines) → `zen-cli` library (exporting `shell()`)
 
 ## Recent Changes
+
+- **Agent 管线 QA 波：结果诚实 + intent 提速 + 单写者持久化 + web.search 有界（2026-10-30，`bin/test` **3571/0/28** = 基线 3480 +91；本波全部文件 clippy/fmt 干净——`bin/lint` 全门被并行 T278 Verus 分支文件欠账阻挡，4 clippy + 1 fmt 全在 `plan_task.rs`/`formal/`）** — /qa 全循环：生产日志取证（3 hosted turns：Momus veto×3 / intent LLM 20s 超时×2 / web.search 33s DDG 失败 / 空 deliverable）→ rig-agent 0.42 上游合同审计 → Oracle D1-D8 评审 → 4 并行 lane。设计记录 `docs/designs/agent-pipeline-qa-2026-10-30.md`：
+  - **D1 门作用域**（orchestrator）：quality gate 只由 MUTATING tool calls 触发——`is_mutating_tool` 只读白名单（fs.read/list/grep/glob、tier2/3/4_search、web.fetch/search、compute_embeddings、system.health），`<parse>/<budget>/<dispatch>/<max_turns>` 合成记录永不触发，**未知工具名 fail-safe 视为 mutating**（新工具永不静默跳门）；Confidential 会话恒触发。read-only search turn 不再被 Momus 结构性 veto（生产 3/3 证据）。
+  - **D3/D4/D5 rig-agent 合同守卫**：`ensured_tool_results` 守每个 `tool_results` 站点（空 answers + pending calls ⇒ 每 pending call 一条合成 error，按 rig call id 恰答一次——rig-agent 0.42 `tool_results(vec![])` = PromptCancelled 协议）；`recover_max_turns_error`（MaxTurnsError 恢复为 last-assistant-words + ⚠ 通知 + `<max_turns>` 审计平价记录，不再整轮暴毙）；`sub_response_honesty_error`（委托子代理空/纯 tool-JSON 响应 ⇒ 结构化 error，不再 ok-shaped 空结果）；共享 `exhaustion_notice` wording（annotate-never-replace：内容存活、通知前缀、空内容变通知本体）。
+  - **D6/FIX-7 可见性**：`loop.parse.rejected` 审计线（每拒绝轮一行，≤4 errors × ≤200 chars，count 携全量）；upheld veto 用户可见——execute 路径 `verdict_notice` 前缀标注交付响应，stream 路径抽纯函数 `stream_gate_marker`（not-ready 原文案字节保留为既有钉，`vetoed` 分支 additive 补此前静默态）。
+  - **D2 intent 提速**（intent.rs/decision/config）：`[agentic.intent] classify_timeout_ms`（默认 8s，原 20s 硬 const；clamp 1000..=60000，E11 warn-not-silent，env `ZEN_INTENT_CLASSIFY_TIMEOUT_MS`）；`l0_fast_path`（默认 **on**：keyword 命中零 LLM 等待即刻服务，L2 LLM 分类降级为 detached record-only shadow——`loop.decision` 记 `decision_kind:"l0_fast_path"` + `l0_signal/l2_category/l0_l2_agree` 失配对，τ 校准决策保持可falsify；V13-A.3 基线 intent p95<500ms 被 LLM-first 排序在生产违反 ~40×；kill-switch off = pre-D2 排序字节等同）；`model` override（D2b **wire 实装**：`ModelOptions.model` 字段 → `OllamaProvider::effective_model`（3 completion 站点 + 2 log 站点）→ `DefaultRouter::call_stream_with_model`/`stream_options` 缝（trait `call_stream` 委托 None = 字节等同）→ intent `complete_prompt` 传递——ollama per-call 模型名原生支持，其它 provider 保持配置默认且**三层文档诚实标注**；`TaskRequirements.preferred_model` 与 `build_fallback_chain` 的 model 元组此前均为 wire 死代码——全 provider 插管记为 follow-up）。
+  - **D7 单写者会话持久化**（zen-gateway hosting.rs + zen-cli tui）：daemon persist 完成的 hosted turn 至 `{sessions}/YYYY/MM/DD/<id>.jsonl`（meta-first，spawn_blocking，事件 shape 与被移除的 TUI writer 逐字节兼容）——所有 surface（TUI/`zen chat`/qqbot/HTTP）现在都喂 `hydrate_session` 与 `SessionReplayer`（此前仅 TUI client 写，非 TUI surface 永久饥饿）；cancelled/execution-error turn 不 append（client 语义平价）；persist 失败 warn 永不 fail turn；TUI 保留 meta-only carve-out（title provenance 供 resume picker——`session/start` 协议无 title 面）；daemon meta mint 为 exists-check-gated 无重复。版本偏斜合同：旧 daemon + 新 TUI =  interim 窗口无人 persist，`zen serve restart` 关闭。
+  - **D8 web.search 有界**（web_search.rs + config）：`[web_search] timeout_ms`（默认 8s，clamp 1000..=30000，env `ZEN_WEB_SEARCH_TIMEOUT_MS`）双层预算——per-request `RequestBuilder::timeout()` + **per-backend 总 deadline**（`tokio::time::timeout` 包住整条 `retry_with_backoff` 链含 backoff sleep）⇒ 最坏级联 brave+tavily+ddg = 3×8s = 24s（Oracle 核准界；此前单死 backend 即 3×10s+backoff ≈ 33s 生产实测）；全后端失败聚合 actionable error（逐 backend 一行 reason + `BRAVE_API_KEY`/`TAVILY_API_KEY`/`HTTPS_PROXY` 修复提示，纯函数可钉）；provider 级联顺序与 NetworkPolicy 不动。
+  - **坑与学费**：`strip_fenced_tool_blocks` offset-0 自匹配（close-fence 搜索从 open marker 起点开跑 ⇒ 首个 ```json 围栏后**全部 prose 被丢弃**——pre-existing 潜伏 bug，被 D5 pin 暴露）；POSIX 创建权限由**最深目录**决定（read-only-home 测试前提错误——须 chmod date dir 本身）；rig-agent 0.42 协议细节三连（初始 `next_step()` 必先消费 CallModel 才能 `model_response`；ModelTurn granted 集不含工具名 ⇒ invalid-tool-call resolution pending 阻塞 next_step；`AgentRun::new` 默认 max_turns=1）；plain `cargo test` 线程并行下 env-mutation 测试互染（ZEN_HOME/ZEN_INTENT_*）⇒ 15 假失败——门禁是 nextest（process-per-test，T118 纪律）。
+  - **代理基建**：Lane B 首派 0s 空返回（registry 亦丢失 A/D 任务记录但代码已落盘——「Task not found ≠ 未干活」，验证以树状态为准）；Lane C 首派同 0s 空亡重派成功。并行 T278 Verus 波（他会话）共享 checkout——文件集零重叠，lane 提交外科式 staging（排除 `plan_task.rs`/`plan_task/`/`formal/`/`zen-agents/Cargo.toml`/`Cargo.lock`）。
+  - **运维**：生产 daemon 二进制 stale（built Oct 17，落后 HEAD 12+ 天）——修复上屏需 `cargo install --path crates/zen --force --locked` + `zen serve restart`；mock-provider 审计线为 T270 测试泄漏（无 ZEN_HOME 隔离跑向真 ~/.zen），非生产路由。
 
 - **bbtree Guard-3 验证基建：Verus 形式化 + DST 确定性模拟（2026-10-27，`bin/lint` 0；`bin/test` **3474/0/25** = 基线 3472 +2；`bin/verify` 全门绿；tasks.md Phase 42 T274）** — owner 指令 "先实现 dst 路线"；bbtree（blog.xiangpeng.systems/posts/bbtree）三 Guard 模式落地（proof + 交叉评审 + simulation）。新基建与语义学费：
   - **`formal/` Verus 侧车**（T274a）：非 workspace 成员（lone `[workspace]` 头）、零依赖仅 vstd pin `=0.0.0-2026-10-18-0147`、工具链 pin `formal/verus.json`（verus 0.2026.10.18.7d82994 二进制 + rustup 1.99.1，vest 模式；`~/.verus` 安装，`cargo verus verify --manifest-path formal/Cargo.toml`）。**已验证 14/0**：`make_placeholder` ≡ `render_spec`（⟦SECRET_n⟧ 文法）、`tenth` 溢出界、`place_digit` 表、+3 helper lemma；TCB 3 项 external_body（lemma_rank 数论 / rd_len_bounded / rd_len_exec，`formal/src/trusted.rs`）。**防 stale-copy**：`crates/zen-core/tests/formal_placeholder.rs` `#[path]` 物理挂载同文件 + 纯 cargo congruence 钉（vs SecretMap format!）。**语义学费（实锤）**：递归 spec fn fuel=1 ⇒ `reveal_with_fuel` 物化数值；**loop body 只见 invariants + guard，fn requires 不可见**（minprobe 实证）⇒ 需要事实升格 invariant；spec match 拒 nat bare int pattern；str-literal `@[i]` 公理化贵 ⇒ digit_char 用 if-chain。
