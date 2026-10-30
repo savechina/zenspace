@@ -748,34 +748,49 @@ impl DelegateTaskTool {
             .record_usage(reservation, actual, actual)
             .await;
 
-        // W2.2 (D12) artifact pattern: surface the declared output pointer
-        // and a bounded summary alongside the answer (additive — a request
-        // without an artifact keeps the pre-W2 shape byte-identical).
-        let artifact_summary = req
-            .artifact
-            .as_deref()
-            .map(|_| bounded_summary(&clean_response));
-        let mut output = serde_json::json!({
-            "agent": agent_name,
-            "response": clean_response,
-            "rounds": rounds,
-            "duration_ms": started.elapsed().as_millis() as u64,
-        });
-        if let Some(artifact) = req.artifact.as_deref() {
-            output["artifact_path"] = serde_json::json!(artifact);
-            if let Some(summary) = artifact_summary {
-                output["summary"] = serde_json::json!(summary);
+        // FIX-5: an empty or tool-JSON-only sub-agent response must not
+        // masquerade as an ok-shaped result. The error is built BEFORE the
+        // QE-cascade shadow below so the shadow records `has_error: true`,
+        // and before the completion log (which now carries the error flag).
+        let honesty_error = sub_response_honesty_error(
+            agent_name,
+            req.artifact.as_deref(),
+            &clean_response,
+            rounds,
+        );
+        let output = if let Some(error) = honesty_error {
+            serde_json::json!({ "error": error })
+        } else {
+            // W2.2 (D12) artifact pattern: surface the declared output pointer
+            // and a bounded summary alongside the answer (additive — a request
+            // without an artifact keeps the pre-W2 shape byte-identical).
+            let artifact_summary = req
+                .artifact
+                .as_deref()
+                .map(|_| bounded_summary(&clean_response));
+            let mut output = serde_json::json!({
+                "agent": agent_name,
+                "response": clean_response,
+                "rounds": rounds,
+                "duration_ms": started.elapsed().as_millis() as u64,
+            });
+            if let Some(artifact) = req.artifact.as_deref() {
+                output["artifact_path"] = serde_json::json!(artifact);
+                if let Some(summary) = artifact_summary {
+                    output["summary"] = serde_json::json!(summary);
+                }
             }
-        }
-        if let Some(description) = req.description.as_ref() {
-            output["description"] = serde_json::json!(description);
-        }
-        if let Some(reasoning) = reasoning {
-            output["reasoning"] = serde_json::json!(reasoning);
-        }
-        if let Some(verification) = verification {
-            output["verification"] = serde_json::json!(verification);
-        }
+            if let Some(description) = req.description.as_ref() {
+                output["description"] = serde_json::json!(description);
+            }
+            if let Some(reasoning) = reasoning {
+                output["reasoning"] = serde_json::json!(reasoning);
+            }
+            if let Some(verification) = verification {
+                output["verification"] = serde_json::json!(verification);
+            }
+            output
+        };
         // T233 (006 D13/W3.1): post-`run_single` quality estimate — a
         // record-only shadow observation (`loop.decision`, `rung:"shadow"`).
         // It never gates or mutates the returned result.
@@ -798,10 +813,47 @@ impl DelegateTaskTool {
             knowledge_inherited = !sub.knowledge.is_empty(),
             inherited_chars,
             inherited_budget_chars = sub.budget_chars,
+            has_error = output.get("error").is_some(),
             "delegate.task sub-turn completed"
         );
         output
     }
+}
+
+/// FIX-5: honesty check on a sub-agent's final answer. A delegate that
+/// produced no prose (or ended on unexecuted tool-call JSON alone) must
+/// return a structured `error` instead of an ok-shaped result with an empty
+/// response string — consumers (plan.execute status, weight aggregation)
+/// read `response`'s presence, and `""` is not a deliverable.
+///
+/// Contract (Oracle D4): applies regardless of parse-error history. A
+/// declared `artifact` short-circuits to `None` — the artifact file is the
+/// deliverable, prose is optional there.
+pub(crate) fn sub_response_honesty_error(
+    agent: &str,
+    artifact: Option<&str>,
+    clean_response: &str,
+    rounds: usize,
+) -> Option<String> {
+    if artifact.is_some() {
+        return None;
+    }
+    if clean_response.trim().is_empty() {
+        return Some(format!(
+            "sub-agent \"{agent}\" produced no response ({rounds} round(s))"
+        ));
+    }
+    let stripped = crate::orchestrator::strip_fenced_tool_blocks(clean_response);
+    if stripped.trim().is_empty()
+        && !crate::orchestrator::AgentOrchestrator::parse_tool_invocations_verbose(clean_response)
+            .0
+            .is_empty()
+    {
+        return Some(format!(
+            "sub-agent \"{agent}\" ended with unexecuted tool call(s) and no prose answer"
+        ));
+    }
+    None
 }
 
 /// One delegation subtask — the fan-out unit (001 A.6 collect mode).

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures::{StreamExt, TryStreamExt};
 use rig_agent::agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, PendingToolCall};
+use rig_agent::completion::PromptError;
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::{
     ToolDispatchHook, ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
@@ -647,13 +648,16 @@ fn answer_pending_at_round_cap(
 
 /// Removes ```json fenced blocks from display text — used at the round cap
 /// so the delivered response never reads as a raw tool-call envelope.
-fn strip_fenced_tool_blocks(text: &str) -> String {
+pub(crate) fn strip_fenced_tool_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("```json") {
         out.push_str(&rest[..start]);
-        let after_open = &rest[start..];
-        match after_open.find("```").filter(|&end| end > 0) {
+        // Search for the CLOSE fence strictly after the open marker — a find
+        // over the marker itself matches at offset 0 and would truncate
+        // everything past the first fence.
+        let after_open = &rest[start + "```json".len()..];
+        match after_open.find("```") {
             Some(close) => {
                 rest = &after_open[close + 3..];
             }
@@ -662,6 +666,247 @@ fn strip_fenced_tool_blocks(text: &str) -> String {
     }
     out.push_str(rest);
     out.trim().to_string()
+}
+
+/// FIX-1 (006 D4 tightening): classify a tool invocation by whether it can
+/// change world state. Only MUTATING calls justify running the quality gate
+/// over a turn — a read-only search/plan turn must never be structurally
+/// vetoed by Momus (production evidence: 3/3 hosted read-only search turns
+/// Momus-vetoed on queries that mutated nothing).
+///
+/// Classification contract:
+/// - READ-ONLY → `false`: `fs.read`, `fs.list`, `fs.grep`, `fs.glob`,
+///   `tier2_search`, `tier3_search`, `tier4_search`, `compute_embeddings`,
+///   `web.fetch`, `web.search`, `system.health`.
+/// - SYNTHETIC → `false`: any name starting with `<` (`<budget>`,
+///   `<parse>`, `<dispatch>`, `<max_turns>`) — audit bookkeeping records,
+///   not tool invocations.
+/// - MUTATING → `true`: `fs.write`, `fs.edit`, `fs.delete`, `fs.move`,
+///   `fs.copy`, `shell.exec`, `delegate.task`, `plan.execute`,
+///   `system.notifications`, `system.calendar`, `system.daemon`,
+///   `system.fs_watcher`, every `plugin:*` tool, and EVERY UNKNOWN NAME
+///   (fail-safe default: an unrecognized tool is treated as mutating so a
+///   new tool can never silently skip the gate).
+#[must_use]
+pub(crate) fn is_mutating_tool(name: &str) -> bool {
+    if name.starts_with('<') {
+        return false;
+    }
+    !matches!(
+        name,
+        "fs.read"
+            | "fs.list"
+            | "fs.grep"
+            | "fs.glob"
+            | "tier2_search"
+            | "tier3_search"
+            | "tier4_search"
+            | "compute_embeddings"
+            | "web.fetch"
+            | "web.search"
+            | "system.health"
+    )
+}
+
+/// FIX-3: the shared exhaustion-notice wording — one place so the budget
+/// break (FIX-4) and the MaxTurnsError recovery (FIX-2b) phrase the user
+/// visible notice identically. The `⚠` prefix mirrors the existing
+/// round-cap wording (`answer_pending_at_round_cap`).
+fn exhaustion_notice(kind: &str, detail: &str) -> String {
+    format!("⚠ {kind} — {detail}")
+}
+
+/// FIX-3: apply the shared exhaustion notice to the turn's final response
+/// with the same annotate-never-replace semantics as
+/// [`answer_pending_at_round_cap`]: fenced tool-call JSON is stripped from
+/// the display text, real content survives, and a contentless response
+/// becomes the notice alone (the user must never see literally nothing).
+/// Returns the notice string so callers can also surface it as a stream
+/// intermediate.
+fn apply_exhaustion_notice(kind: &str, detail: &str, final_response: &mut String) -> String {
+    let notice = exhaustion_notice(kind, detail);
+    let stripped = strip_fenced_tool_blocks(final_response);
+    if stripped.is_empty() {
+        *final_response = notice.clone();
+    } else {
+        *final_response = format!("{notice}\n\n{stripped}");
+    }
+    notice
+}
+
+/// FIX-7: an upheld quality-gate veto must be user-visible — a response the
+/// gate still rejects after the single redraft round is delivered (the
+/// re-review verdict is final by design) but never silently. Mirrors the
+/// exhaustion-notice wording family (`⚠ …`); the note quotes the first
+/// substantive review line, char-boundary-bounded.
+fn verdict_notice(review_notes: &str) -> String {
+    let first_line = review_notes
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("review findings withheld");
+    let bounded: String = first_line.chars().take(160).collect();
+    format!("⚠ quality gate veto upheld after redraft — {bounded}")
+}
+
+/// FIX-7: annotate-never-replace application of [`verdict_notice`] (same
+/// semantics as [`apply_exhaustion_notice`], minus the fence strip — the
+/// reviewed response is already display-clean at this point).
+fn apply_verdict_notice(review_notes: &str, final_response: &mut String) -> String {
+    let notice = verdict_notice(review_notes);
+    if final_response.trim().is_empty() {
+        *final_response = notice.clone();
+    } else {
+        *final_response = format!("{notice}\n\n{final_response}");
+    }
+    notice
+}
+
+/// FIX-7: the stream path's user-visible verdict marker. The streamed text
+/// cannot be recalled, so the callback marker is the only trace of the
+/// verdict. Branch order is the contract: the not-ready wording is the
+/// pre-FIX-7 pinned shape and wins over the veto marker; the veto marker is
+/// additive for the previously-silent upheld-veto case (the stream path runs
+/// one review, no redraft round). `None` ⇒ no marker (approved, or the gate
+/// never ran).
+fn stream_gate_marker(review: &crate::review::PipelineResult, gated: bool) -> Option<String> {
+    if !review.delivery_ready {
+        let note = review
+            .failed_attempts
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "review flagged this answer".to_string());
+        return Some(format!("⚠️ quality gate: delivery not ready — {note}\n"));
+    }
+    if gated && !review.plan_approved {
+        let note: String = review
+            .review_notes
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("review findings withheld")
+            .chars()
+            .take(160)
+            .collect();
+        return Some(format!("⚠️ quality gate: vetoed — {note}\n"));
+    }
+    None
+}
+
+/// FIX-6: parse rejections are auditable events, not just warn-log lines —
+/// one `loop.parse.rejected` entry in `<logs>/audit.jsonl` per rejecting
+/// round (bounded: ≤4 errors × ≤200 chars each, count carries the total).
+/// Best-effort like every audit emitter: a failing append warns, never
+/// fails the turn.
+fn append_parse_reject_audit(turn: usize, errors: &[String]) {
+    let Ok(paths) = zen_core::paths::ZenPaths::detect() else {
+        return;
+    };
+    let bounded: Vec<String> = errors
+        .iter()
+        .take(4)
+        .map(|e| e.chars().take(200).collect())
+        .collect();
+    let entry = serde_json::json!({
+        "kind": "loop.parse.rejected",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "turn": turn,
+        "count": errors.len(),
+        "errors": bounded,
+    });
+    if let Err(e) = zen_core::jsonl::append_jsonl_line(&paths.logs().join("audit.jsonl"), &entry) {
+        warn!(error = %e, "loop.parse.rejected audit append failed");
+    }
+}
+
+/// FIX-2a (rig-agent 0.42 contract): `tool_results(vec![])` is a protocol
+/// cancellation (`PromptCancelled: tool execution produced no tool results`)
+/// and every pending call must be answered exactly once by rig call id.
+/// This guard drives every `tool_results` call site: empty answers with
+/// pending calls get one synthetic error result per pending call, and a
+/// truly empty pending list skips the call entirely instead of cancelling
+/// the run.
+fn ensured_tool_results(
+    run: &mut AgentRun,
+    mut answers: Vec<UserContent>,
+    pending: &[PendingToolCall],
+) -> Result<()> {
+    if answers.is_empty() {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let error = serde_json::json!({ "error": "tool dispatch produced no result" }).to_string();
+        answers = pending
+            .iter()
+            .map(|p| {
+                tool_result_content(
+                    p.tool_call.id.to_string(),
+                    p.tool_call.function.name.clone(),
+                    error.clone(),
+                )
+            })
+            .collect();
+    }
+    run.tool_results(answers)?;
+    Ok(())
+}
+
+/// FIX-2b (rig-agent 0.42 contract): `next_step` returns
+/// `PromptError::MaxTurnsError` (carrying the canonical `chat_history`) when
+/// the model-call budget is exhausted — propagating it kills the turn with
+/// no answer at all. Recover instead: keep whatever the model already said
+/// as the final response, push a synthetic `<max_turns>` audit record (audit
+/// parity with `<budget>`), and report `true` so the caller breaks the loop.
+/// Returns `false` for any other error, which the caller must still
+/// propagate unchanged.
+fn recover_max_turns_error(
+    error: &PromptError,
+    final_response: &mut String,
+    tool_calls: &mut Vec<ToolCall>,
+) -> bool {
+    let PromptError::MaxTurnsError {
+        max_turns,
+        chat_history,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    tool_calls.push(ToolCall {
+        tool_name: "<max_turns>".to_string(),
+        arguments: String::new(),
+        result: "max_turns_exhausted".to_string(),
+    });
+    apply_exhaustion_notice(
+        "max turns exhausted",
+        &format!("model-call budget ({max_turns}) reached before a final answer"),
+        final_response,
+    );
+    let extracted = last_assistant_text(chat_history);
+    if !extracted.is_empty() && !final_response.contains(&extracted) {
+        final_response.push_str("\n\n");
+        final_response.push_str(&extracted);
+    }
+    true
+}
+
+/// FIX-2b: the last non-empty assistant text block from a rig chat history —
+/// the model's final words before exhaustion, when any exist.
+fn last_assistant_text(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .filter_map(|m| match m {
+            Message::Assistant { content, .. } => Some(content),
+            _ => None,
+        })
+        .flat_map(|content| content.iter())
+        .filter_map(|c| match c {
+            AssistantContent::Text(text) => Some(text.text.trim().to_string()),
+            _ => None,
+        })
+        .find(|t| !t.is_empty())
+        .unwrap_or_default()
 }
 
 /// FR-034: derive a citation fingerprint from a note's body — the first
@@ -1332,6 +1577,12 @@ impl AgentOrchestrator {
     /// (`plan_approved == false`) run EXACTLY one redraft round and
     /// re-review — the re-review verdict is final.
     ///
+    /// Eng-review D3 decision ("gate limited to tool-mutating/Confidential
+    /// turns"), actually implemented as of FIX-1: the boolean is computed
+    /// from MUTATING tool calls only (`is_mutating_tool`) — read-only
+    /// search/plan turns skip the gate entirely; `Confidential` sessions
+    /// always gate regardless.
+    ///
     /// # Parameters
     /// - `pipeline`: quality gate (Metis→Momus→Hermes→Zeus + semantic stage)
     /// - `review_task`: the turn/plan review task (entropy + sensitivity metadata)
@@ -1347,8 +1598,8 @@ impl AgentOrchestrator {
     /// Propagates the redraft round's executor failure — a vetoed turn
     /// that cannot be redrafted fails the whole execution (identical to
     /// the pre-extraction inline behavior).
-    fn turn_gated(has_tool_calls: bool, sensitivity: Sensitivity) -> bool {
-        has_tool_calls || sensitivity == Sensitivity::Confidential
+    fn turn_gated(has_mutating_tool_calls: bool, sensitivity: Sensitivity) -> bool {
+        has_mutating_tool_calls || sensitivity == Sensitivity::Confidential
     }
 
     async fn review_with_feedback_round(
@@ -1785,7 +2036,16 @@ impl AgentOrchestrator {
         let mut round_reservations: Vec<rig_compose::budget::TokenReservation> = Vec::new();
 
         loop {
-            match run.next_step()? {
+            let step = match run.next_step() {
+                Ok(step) => step,
+                Err(e) => {
+                    if recover_max_turns_error(&e, &mut final_response, &mut tool_calls) {
+                        break;
+                    }
+                    return Err(e.into());
+                }
+            };
+            match step {
                 AgentRunStep::CallModel {
                     prompt: _,
                     history: _,
@@ -1814,6 +2074,17 @@ impl AgentOrchestrator {
                                     "budget_exhausted: token budget exhausted before this round"
                                         .to_string(),
                             });
+                            // FIX-4: the user must never receive an empty
+                            // final response from a budget break — annotate
+                            // whatever survives (possibly nothing).
+                            apply_exhaustion_notice(
+                                "token budget exhausted",
+                                &format!(
+                                    "{} tool result(s) collected, no final synthesis",
+                                    accumulated_results.len()
+                                ),
+                                &mut final_response,
+                            );
                             break;
                         }
                         Err(e) => {
@@ -1841,6 +2112,9 @@ impl AgentOrchestrator {
                             arguments: String::new(),
                             result: err.clone(),
                         });
+                    }
+                    if !parse_errors.is_empty() {
+                        append_parse_reject_audit(turn, &parse_errors);
                     }
                     if invocations.is_empty() && !parse_errors.is_empty() {
                         // No valid sibling to preserve: retain the corrective
@@ -1938,9 +2212,7 @@ impl AgentOrchestrator {
                             &mut tool_calls,
                             &mut accumulated_results,
                         );
-                        if !answers.is_empty() {
-                            run.tool_results(answers)?;
-                        }
+                        ensured_tool_results(&mut run, answers, &calls)?;
                         break;
                     }
                     let BatchPlan {
@@ -1950,7 +2222,7 @@ impl AgentOrchestrator {
                     } = plan_tool_batch(&calls);
 
                     if dispatch.is_empty() {
-                        run.tool_results(answers)?;
+                        ensured_tool_results(&mut run, answers, &calls)?;
                         continue;
                     }
 
@@ -1994,7 +2266,7 @@ impl AgentOrchestrator {
                                     )
                                 })
                                 .collect();
-                            run.tool_results(results)?;
+                            ensured_tool_results(&mut run, results, &calls)?;
                             continue;
                         }
                     };
@@ -2067,7 +2339,7 @@ impl AgentOrchestrator {
                             serde_json::to_string(&result.output).unwrap_or_default(),
                         ));
                     }
-                    run.tool_results(answers)?;
+                    ensured_tool_results(&mut run, answers, &calls)?;
                 }
                 AgentRunStep::Done(response) => {
                     final_response = response.output;
@@ -2144,7 +2416,10 @@ impl AgentOrchestrator {
             .record_usage(reservation, actual_tokens, actual_tokens)
             .await;
 
-        let gated = Self::turn_gated(!tool_calls.is_empty(), session.sensitivity_policy);
+        // FIX-1: gate on MUTATING tool calls only — a read-only search turn
+        // must reach the user without the quality gate structurally vetoing it.
+        let has_mutating_tool_calls = tool_calls.iter().any(|tc| is_mutating_tool(&tc.tool_name));
+        let gated = Self::turn_gated(has_mutating_tool_calls, session.sensitivity_policy);
         let (review, feedback_rounds, _redrafted) = if gated {
             let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
             Self::review_with_feedback_round(
@@ -2163,7 +2438,8 @@ impl AgentOrchestrator {
             (
                 crate::review::PipelineResult {
                     plan_approved: true,
-                    review_notes: "quality gate skipped: no tool invocations this turn".to_string(),
+                    review_notes: "quality gate skipped: no mutating tool calls this turn"
+                        .to_string(),
                     delivery_ready: true,
                     athena_shield: None,
                     failed_attempts: Vec::new(),
@@ -2172,6 +2448,13 @@ impl AgentOrchestrator {
                 None,
             )
         };
+
+        // FIX-7: the re-review verdict is final — an upheld veto is delivered
+        // but annotated, never silent (production evidence: 3/3 hosted turns
+        // Momus-vetoed with no user-visible trace of the verdict).
+        if gated && !review.plan_approved {
+            apply_verdict_notice(&review.review_notes, &mut final_response);
+        }
 
         if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
             Self::append_turn_review_audit(
@@ -2590,7 +2873,16 @@ impl AgentOrchestrator {
         let mut round_reservations: Vec<rig_compose::budget::TokenReservation> = Vec::new();
 
         loop {
-            match run.next_step()? {
+            let step = match run.next_step() {
+                Ok(step) => step,
+                Err(e) => {
+                    if recover_max_turns_error(&e, &mut final_response, &mut tool_calls) {
+                        break;
+                    }
+                    return Err(e.into());
+                }
+            };
+            match step {
                 AgentRunStep::CallModel {
                     prompt: _,
                     history: _,
@@ -2616,6 +2908,17 @@ impl AgentOrchestrator {
                                     "budget_exhausted: token budget exhausted before this round"
                                         .to_string(),
                             });
+                            // FIX-4: same never-empty contract as `execute`,
+                            // surfaced through the stream as well.
+                            let notice = apply_exhaustion_notice(
+                                "token budget exhausted",
+                                &format!(
+                                    "{} tool result(s) collected, no final synthesis",
+                                    accumulated_results.len()
+                                ),
+                                &mut final_response,
+                            );
+                            callback(&format!("{notice}\n"));
                             break;
                         }
                         Err(e) => {
@@ -2649,6 +2952,9 @@ impl AgentOrchestrator {
                             arguments: String::new(),
                             result: err.clone(),
                         });
+                    }
+                    if !parse_errors.is_empty() {
+                        append_parse_reject_audit(turn, &parse_errors);
                     }
                     if invocations.is_empty() && !parse_errors.is_empty() {
                         let feedback = format!(
@@ -2738,9 +3044,7 @@ impl AgentOrchestrator {
                             &mut tool_calls,
                             &mut accumulated_results,
                         );
-                        if !answers.is_empty() {
-                            run.tool_results(answers)?;
-                        }
+                        ensured_tool_results(&mut run, answers, &calls)?;
                         callback(&format!("{notice}\n"));
                         break;
                     }
@@ -2751,7 +3055,7 @@ impl AgentOrchestrator {
                     } = plan_tool_batch(&calls);
 
                     if dispatch.is_empty() {
-                        run.tool_results(answers)?;
+                        ensured_tool_results(&mut run, answers, &calls)?;
                         continue;
                     }
 
@@ -2797,7 +3101,7 @@ impl AgentOrchestrator {
                                     )
                                 })
                                 .collect();
-                            run.tool_results(results)?;
+                            ensured_tool_results(&mut run, results, &calls)?;
                             continue;
                         }
                     };
@@ -2880,7 +3184,7 @@ impl AgentOrchestrator {
                             serde_json::to_string(&result.output).unwrap_or_default(),
                         ));
                     }
-                    run.tool_results(answers)?;
+                    ensured_tool_results(&mut run, answers, &calls)?;
                 }
                 AgentRunStep::Done(response) => {
                     final_response = response.output;
@@ -2908,7 +3212,9 @@ impl AgentOrchestrator {
 
         zen_agent.persist_turn(&session.session_id.to_string(), user_query, &final_response);
 
-        let gated = Self::turn_gated(!tool_calls.is_empty(), session.sensitivity_policy);
+        // FIX-1: gate on MUTATING tool calls only (mirrors `execute`).
+        let has_mutating_tool_calls = tool_calls.iter().any(|tc| is_mutating_tool(&tc.tool_name));
+        let gated = Self::turn_gated(has_mutating_tool_calls, session.sensitivity_policy);
         let review = if gated {
             let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
             self.quality_pipeline
@@ -2919,19 +3225,16 @@ impl AgentOrchestrator {
         } else {
             crate::review::PipelineResult {
                 plan_approved: true,
-                review_notes: "quality gate skipped: no tool invocations this turn".to_string(),
+                review_notes: "quality gate skipped: no mutating tool calls this turn".to_string(),
                 delivery_ready: true,
                 athena_shield: None,
                 failed_attempts: Vec::new(),
             }
         };
-        if !review.delivery_ready {
-            let note = review
-                .failed_attempts
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "review flagged this answer".to_string());
-            callback(&format!("⚠️ quality gate: delivery not ready — {note}\n"));
+        // FIX-7: the stream already delivered the text — the marker is the
+        // only visible trace of the verdict (see `stream_gate_marker`).
+        if let Some(marker) = stream_gate_marker(&review, gated) {
+            callback(&marker);
         }
         if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
             Self::append_turn_review_audit(
@@ -3636,6 +3939,441 @@ mod tests {
             true,
             Sensitivity::Confidential
         ));
+    }
+
+    #[test]
+    fn is_mutating_tool_classification_table() {
+        // FIX-1: READ-ONLY → false.
+        for name in [
+            "fs.read",
+            "fs.list",
+            "fs.grep",
+            "fs.glob",
+            "tier2_search",
+            "tier3_search",
+            "tier4_search",
+            "compute_embeddings",
+            "web.fetch",
+            "web.search",
+            "system.health",
+        ] {
+            assert!(
+                !is_mutating_tool(name),
+                "{name} is read-only and must NOT gate a turn"
+            );
+        }
+        // FIX-1: SYNTHETIC audit bookkeeping records → false.
+        for name in ["<budget>", "<parse>", "<dispatch>", "<max_turns>"] {
+            assert!(
+                !is_mutating_tool(name),
+                "{name} is a synthetic record, not a tool"
+            );
+        }
+        // FIX-1: MUTATING → true.
+        for name in [
+            "fs.write",
+            "fs.edit",
+            "fs.delete",
+            "fs.move",
+            "fs.copy",
+            "shell.exec",
+            "delegate.task",
+            "plan.execute",
+            "system.notifications",
+            "system.calendar",
+            "system.daemon",
+            "system.fs_watcher",
+            "plugin:my-plugin/tool",
+        ] {
+            assert!(is_mutating_tool(name), "{name} must gate a turn");
+        }
+        // FIX-1: fail-safe default — every UNKNOWN name gates.
+        assert!(is_mutating_tool("brand_new_tool"));
+        assert!(is_mutating_tool(""));
+        assert!(is_mutating_tool("FS.READ"), "matching is exact, not fuzzy");
+    }
+
+    #[test]
+    fn turn_gated_scopes_to_mutating_calls_only() {
+        let read_only_turn: Vec<ToolCall> = ["fs.read", "tier3_search", "web.fetch"]
+            .iter()
+            .map(|n| ToolCall {
+                tool_name: (*n).to_string(),
+                arguments: String::new(),
+                result: "ok".to_string(),
+            })
+            .collect();
+        let has_mutating = read_only_turn
+            .iter()
+            .any(|tc| is_mutating_tool(&tc.tool_name));
+        assert!(
+            !AgentOrchestrator::turn_gated(has_mutating, Sensitivity::Public),
+            "a read-only search turn must NOT be gated (production bug: Momus vetoed 3/3 hosted search turns)"
+        );
+
+        let mutating_turn: Vec<ToolCall> = ["fs.read", "fs.write"]
+            .iter()
+            .map(|n| ToolCall {
+                tool_name: (*n).to_string(),
+                arguments: String::new(),
+                result: "ok".to_string(),
+            })
+            .collect();
+        let has_mutating = mutating_turn
+            .iter()
+            .any(|tc| is_mutating_tool(&tc.tool_name));
+        assert!(
+            AgentOrchestrator::turn_gated(has_mutating, Sensitivity::Public),
+            "a mutating turn must be gated"
+        );
+
+        // Synthetic-only records never gate a Public turn…
+        let synthetic_turn: Vec<ToolCall> = ["<budget>", "<parse>"]
+            .iter()
+            .map(|n| ToolCall {
+                tool_name: (*n).to_string(),
+                arguments: String::new(),
+                result: "n/a".to_string(),
+            })
+            .collect();
+        let has_mutating = synthetic_turn
+            .iter()
+            .any(|tc| is_mutating_tool(&tc.tool_name));
+        assert!(!AgentOrchestrator::turn_gated(
+            has_mutating,
+            Sensitivity::Public
+        ));
+        // …but Confidential always gates regardless of tool activity.
+        assert!(AgentOrchestrator::turn_gated(
+            false,
+            Sensitivity::Confidential
+        ));
+    }
+
+    #[test]
+    fn exhaustion_notice_wording_and_annotate_never_replace() {
+        // FIX-3: single wording source.
+        assert_eq!(
+            exhaustion_notice("token budget exhausted", "0 tool result(s)"),
+            "⚠ token budget exhausted — 0 tool result(s)"
+        );
+
+        // Content survives; notice prefixes it.
+        let mut response = "real answer text".to_string();
+        let notice = apply_exhaustion_notice("k", "d", &mut response);
+        assert_eq!(response, "⚠ k — d\n\nreal answer text");
+        assert_eq!(notice, "⚠ k — d");
+
+        // Fenced tool JSON is stripped from the display, prose survives.
+        let mut response = "```json\n{\"tool\": \"fs.read\"}\n```\nprose tail".to_string();
+        apply_exhaustion_notice("k", "d", &mut response);
+        assert_eq!(response, "⚠ k — d\n\nprose tail");
+
+        // Empty response → notice alone (the user must never see nothing).
+        let mut response = String::new();
+        apply_exhaustion_notice("k", "d", &mut response);
+        assert_eq!(response, "⚠ k — d");
+
+        // Pure tool-JSON response → notice alone.
+        let mut response = "```json\n{\"tool\": \"fs.read\", \"args\": {}}\n```".to_string();
+        apply_exhaustion_notice("k", "d", &mut response);
+        assert_eq!(response, "⚠ k — d");
+    }
+
+    #[test]
+    fn stream_gate_marker_branch_order_is_the_contract() {
+        // FIX-7: not-ready wins over veto (pre-FIX-7 pinned wording);
+        // veto marker fires only for the gated upheld-veto case; approved
+        // or ungated turns stay silent.
+        let approved = crate::review::PipelineResult {
+            plan_approved: true,
+            review_notes: "ok".to_string(),
+            delivery_ready: true,
+            athena_shield: None,
+            failed_attempts: Vec::new(),
+        };
+        assert_eq!(stream_gate_marker(&approved, true), None);
+        assert_eq!(stream_gate_marker(&approved, false), None);
+
+        let not_ready = crate::review::PipelineResult {
+            plan_approved: false,
+            review_notes: "vetoed too".to_string(),
+            delivery_ready: false,
+            athena_shield: None,
+            failed_attempts: vec!["hallucinated key id".to_string()],
+        };
+        assert_eq!(
+            stream_gate_marker(&not_ready, true).expect("marker"),
+            "⚠️ quality gate: delivery not ready — hallucinated key id\n"
+        );
+
+        let vetoed = crate::review::PipelineResult {
+            plan_approved: false,
+            review_notes: "\n  untestable acceptance criteria\nsecond".to_string(),
+            delivery_ready: true,
+            athena_shield: None,
+            failed_attempts: Vec::new(),
+        };
+        assert_eq!(
+            stream_gate_marker(&vetoed, true).expect("marker"),
+            "⚠️ quality gate: vetoed — untestable acceptance criteria\n"
+        );
+        assert_eq!(
+            stream_gate_marker(&vetoed, false),
+            None,
+            "ungated turns never ran the gate — no veto marker"
+        );
+    }
+
+    #[test]
+    fn verdict_notice_annotates_never_replaces_and_bounds() {
+        // FIX-7: first substantive review line, char-bounded to 160.
+        let notice = verdict_notice("\n\n  veto: acceptance criteria untestable\nsecond line");
+        assert_eq!(
+            notice,
+            "⚠ quality gate veto upheld after redraft — veto: acceptance criteria untestable"
+        );
+        let long = "x".repeat(400);
+        assert_eq!(
+            verdict_notice(&long).chars().count(),
+            "⚠ quality gate veto upheld after redraft — "
+                .chars()
+                .count()
+                + 160
+        );
+        assert_eq!(
+            verdict_notice("   \n  "),
+            "⚠ quality gate veto upheld after redraft — review findings withheld"
+        );
+
+        // Annotate-never-replace: content survives, notice prefixes it.
+        let mut response = "real answer".to_string();
+        let n = apply_verdict_notice("veto reason", &mut response);
+        assert_eq!(response, format!("{n}\n\nreal answer"));
+
+        // Empty response → notice alone (never deliver literally nothing).
+        let mut empty = String::new();
+        apply_verdict_notice("veto reason", &mut empty);
+        assert_eq!(
+            empty,
+            "⚠ quality gate veto upheld after redraft — veto reason"
+        );
+    }
+
+    #[test]
+    fn parse_reject_audit_writes_bounded_entry() {
+        // FIX-6: one bounded `loop.parse.rejected` line per rejecting round.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: test-only env mutation; nextest runs one process per test
+        // and the test-support build resolves ZEN_HOME per call (T118).
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let errors: Vec<String> = (0..6)
+            .map(|i| format!("err{i}-{}", "y".repeat(300)))
+            .collect();
+        append_parse_reject_audit(3, &errors);
+        unsafe { std::env::remove_var("ZEN_HOME") };
+
+        let audit = std::fs::read_to_string(dir.path().join("logs").join("audit.jsonl"))
+            .expect("audit.jsonl written");
+        let entry: serde_json::Value =
+            serde_json::from_str(audit.lines().next().expect("one line")).expect("json line");
+        assert_eq!(entry["kind"], "loop.parse.rejected");
+        assert_eq!(entry["turn"], 3);
+        assert_eq!(entry["count"], 6, "count carries the unbounded total");
+        let list = entry["errors"].as_array().expect("bounded list");
+        assert_eq!(list.len(), 4, "≤4 errors recorded");
+        assert_eq!(
+            list[0].as_str().expect("str").chars().count(),
+            200,
+            "each error bounded to 200 chars"
+        );
+    }
+
+    #[test]
+    fn recover_max_turns_error_keeps_last_assistant_words_and_audits() {
+        // FIX-2b: MaxTurnsError must degrade to a notice + last assistant
+        // text, never kill the turn with no answer.
+        let history = vec![
+            Message::user("find it"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text(
+                    "partial findings: none yet".to_string(),
+                )],
+            },
+        ];
+        let error = PromptError::MaxTurnsError {
+            max_turns: 10,
+            chat_history: Box::new(history),
+            prompt: Box::new(Message::user("next")),
+        };
+        let mut final_response = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        assert!(recover_max_turns_error(
+            &error,
+            &mut final_response,
+            &mut tool_calls
+        ));
+        assert_eq!(
+            final_response,
+            "⚠ max turns exhausted — model-call budget (10) reached before a final answer\n\npartial findings: none yet"
+        );
+        assert_eq!(tool_calls.len(), 1, "synthetic audit record pushed");
+        assert_eq!(tool_calls[0].tool_name, "<max_turns>");
+        assert_eq!(tool_calls[0].result, "max_turns_exhausted");
+
+        // No assistant text anywhere → notice-only, still never empty.
+        let error = PromptError::MaxTurnsError {
+            max_turns: 3,
+            chat_history: Box::new(vec![Message::user("q")]),
+            prompt: Box::new(Message::user("q")),
+        };
+        let mut final_response = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        assert!(recover_max_turns_error(
+            &error,
+            &mut final_response,
+            &mut tool_calls
+        ));
+        assert_eq!(
+            final_response,
+            "⚠ max turns exhausted — model-call budget (3) reached before a final answer"
+        );
+        assert_eq!(tool_calls.len(), 1);
+
+        // Extracted text already mirrored in final_response is not duplicated.
+        let history = vec![Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text("already here".to_string())],
+        }];
+        let error = PromptError::MaxTurnsError {
+            max_turns: 5,
+            chat_history: Box::new(history),
+            prompt: Box::new(Message::user("q")),
+        };
+        let mut final_response = "already here".to_string();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        assert!(recover_max_turns_error(
+            &error,
+            &mut final_response,
+            &mut tool_calls
+        ));
+        assert_eq!(
+            final_response,
+            "⚠ max turns exhausted — model-call budget (5) reached before a final answer\n\nalready here",
+            "the extracted text must appear exactly once"
+        );
+
+        // Any other error is NOT recovered — the caller must propagate it.
+        let cancelled = PromptError::PromptCancelled {
+            chat_history: Vec::new(),
+            reason: "reason".to_string(),
+        };
+        let mut final_response = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        assert!(!recover_max_turns_error(
+            &cancelled,
+            &mut final_response,
+            &mut tool_calls
+        ));
+    }
+
+    #[test]
+    fn last_assistant_text_returns_last_non_empty_block() {
+        assert_eq!(last_assistant_text(&[]), "");
+        let history = vec![
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text("earlier".to_string())],
+            },
+            Message::user("tool output"),
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text("  ".to_string())],
+            },
+            Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::text("final words".to_string())],
+            },
+        ];
+        assert_eq!(last_assistant_text(&history), "final words");
+        let whitespace_only: Vec<Message> = vec![Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::text("   ".to_string())],
+        }];
+        assert_eq!(last_assistant_text(&whitespace_only), "");
+    }
+
+    #[test]
+    fn ensured_tool_results_fills_synthetic_errors_per_pending_call() {
+        // FIX-2a: rig-agent cancels the run on `tool_results(vec![])`; the
+        // guard must answer every pending call exactly once.
+        let mut run = AgentRun::new(Message::user("q")).max_turns(4);
+        match run.next_step().expect("initial step") {
+            AgentRunStep::CallModel { .. } => {}
+            _ => panic!("expected the initial CallModel step"),
+        }
+        let model_turn = ModelTurn::new(
+            None,
+            vec![
+                AssistantContent::text("calling".to_string()),
+                AssistantContent::tool_call("call_1", "fs.read", serde_json::json!({})),
+            ],
+            Usage::new(),
+            BTreeSet::from(["fs.read".to_string()]),
+            BTreeSet::from(["fs.read".to_string()]),
+        );
+        run.model_response(model_turn)
+            .expect("tool-call turn accepted");
+        let calls = match run.next_step().expect("step") {
+            AgentRunStep::CallTools { calls } => calls,
+            _ => panic!("expected CallTools step"),
+        };
+        assert_eq!(calls.len(), 1);
+
+        // Empty answers + pending calls → one synthetic error per pending
+        // call, and the run stays drivable (next_step yields CallModel).
+        ensured_tool_results(&mut run, Vec::new(), &calls).expect("synthetic fill");
+        match run.next_step().expect("run stays drivable after fill") {
+            AgentRunStep::CallModel { .. } => {}
+            _ => panic!("expected CallModel after synthetic answers"),
+        }
+
+        // Nothing pending + nothing answered → skip entirely (no cancel).
+        let mut idle = AgentRun::new(Message::user("q"));
+        ensured_tool_results(&mut idle, Vec::new(), &[]).expect("no pending: no-op");
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_stream_break_emits_visible_notice() {
+        // FIX-4: a mid-loop budget break must surface a visible notice, both
+        // as the final response and through the stream callback — never an
+        // empty reply. Budget 1000 admits the pre-loop reservation (512) but
+        // starves the first in-loop probe (512 more) → break before any
+        // model call.
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let orchestrator = AgentOrchestrator::with_token_budget(router, 1000);
+        let mut session = SessionContext::new("Sisyphus".to_string(), String::new());
+        let mut streamed = String::new();
+        let response = orchestrator
+            .execute_stream(&mut session, "hi", |chunk| streamed.push_str(chunk))
+            .await
+            .expect("a budget break must not fail the turn");
+        assert!(
+            response.contains("⚠ token budget exhausted —"),
+            "final response must carry the exhaustion notice: {response:?}"
+        );
+        assert!(
+            !response.trim().is_empty(),
+            "the user must never receive an empty response"
+        );
+        assert!(
+            streamed.contains("⚠ token budget exhausted —"),
+            "stream must carry the notice: {streamed:?}"
+        );
     }
 
     #[tokio::test]
