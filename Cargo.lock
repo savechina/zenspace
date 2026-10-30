@@ -10975,6 +10975,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "uuid",
+ "vstd",
  "wat",
  "zen-core",
  "zen-memory",

@@ -950,6 +950,108 @@ mod tests {
         }
     }
 
+    // T278: the verified Kahn core mounted from formal/ (one physical
+    // source, two consumers — verus verifies it there; here we pin the REAL
+    // `topological_layers` to the same behavior on the fixtures below).
+    #[path = "formal_plan_layers.rs"]
+    mod formal_plan_layers;
+
+    fn resolved_deps(plan: &PlanSpec) -> (Vec<Vec<usize>>, usize) {
+        let n = plan.tasks.len();
+        let index_of = |id: &str| plan.tasks.iter().position(|t| t.id == id);
+        let deps: Vec<Vec<usize>> = plan
+            .tasks
+            .iter()
+            .map(|t| {
+                t.depends_on
+                    .iter()
+                    .map(|dep| index_of(dep).expect("resolved by parse"))
+                    .collect()
+            })
+            .collect();
+        (deps, n)
+    }
+
+    fn assert_congruent(plan: &PlanSpec) {
+        let (deps, n) = resolved_deps(plan);
+        let real = PlanExecuteTool::topological_layers(plan);
+        let verified = formal_plan_layers::topo_layers_exec(&deps, n);
+        match (real, verified) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "layer divergence on n={n}"),
+            (Err(msg), Err(err)) => match err {
+                formal_plan_layers::LayerError::Cycle => {
+                    assert!(msg.contains("cycle"), "{msg}")
+                }
+                formal_plan_layers::LayerError::TooDeep => {
+                    assert!(msg.contains("cap"), "{msg}")
+                }
+            },
+            (Ok(a), Err(err)) => {
+                panic!("real Ok / verified Err({err:?}) on n={n}: {a:?}")
+            }
+            (Err(msg), Ok(b)) => {
+                panic!("real Err({msg}) / verified Ok on n={n}: {b:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn formal_consts_match_plan_caps() {
+        assert_eq!(formal_plan_layers::PIN_MAX_PLAN_TASKS, MAX_PLAN_TASKS);
+        assert_eq!(formal_plan_layers::PIN_MAX_PLAN_LAYERS, MAX_PLAN_LAYERS);
+    }
+
+    #[test]
+    fn formal_congruent_empty_plan() {
+        assert_congruent(&plan(vec![]));
+    }
+
+    #[test]
+    fn formal_congruent_linear_chain() {
+        assert_congruent(&plan(vec![
+            spec("a", "Explore", &[]),
+            spec("b", "Explore", &["a"]),
+            spec("c", "Explore", &["b"]),
+        ]));
+    }
+
+    #[test]
+    fn formal_congruent_diamond() {
+        assert_congruent(&plan(vec![
+            spec("a", "Explore", &[]),
+            spec("b", "Librarian", &["a"]),
+            spec("c", "Hephaestus", &["a"]),
+            spec("d", "Explore", &["b", "c"]),
+        ]));
+    }
+
+    #[test]
+    fn formal_congruent_duplicate_deps() {
+        assert_congruent(&plan(vec![
+            spec("a", "Explore", &[]),
+            spec("b", "Explore", &["a", "a"]),
+            spec("c", "Explore", &["b", "a"]),
+        ]));
+    }
+
+    #[test]
+    fn formal_congruent_cycle() {
+        assert_congruent(&plan(vec![
+            spec("a", "Explore", &["b"]),
+            spec("b", "Explore", &["a"]),
+        ]));
+    }
+
+    #[test]
+    fn formal_congruent_over_deep() {
+        assert_congruent(&plan(vec![
+            spec("a", "Explore", &[]),
+            spec("b", "Explore", &["a"]),
+            spec("c", "Explore", &["b"]),
+            spec("d", "Explore", &["c"]),
+        ]));
+    }
+
     #[test]
     fn topological_layers_linear_chain() {
         let p = plan(vec![

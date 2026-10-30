@@ -43,6 +43,9 @@ shuttle = ["tokio/shuttle"]
 
 [dev-dependencies]
 shuttle = "0.9.8"
+# T278: formal/ plan_layers_verify.rs mounts into plan_task's test mod —
+# plain-cargo congruence pin needs the verus! macro (ghost code cfg-erases).
+vstd = { version = "=0.0.0-2026-10-18-0147" }
 # T111/T118: test builds must never resolve the real ~/.zen — the
 # test-support feature makes user_root() read ZEN_HOME fresh + temp-fallback.
 zen-core = { path = "../zen-core", features = ["test-support"] }
