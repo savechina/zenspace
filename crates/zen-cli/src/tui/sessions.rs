@@ -10,6 +10,17 @@ use zen_memory::session::SessionManager;
 use super::app::App;
 
 impl App {
+    /// Creates the local session (meta jsonl) on first message.
+    ///
+    /// D7 dual-writer carve-out (meta ONLY): the gateway daemon is the
+    /// single writer for `chat/turn` events (hosting.rs
+    /// `persist_completed_turn`), but this meta write is kept because the
+    /// protocol's `session/start` carries no title/agent-creation surface
+    /// — the TUI-minted meta (title provenance, `Session::list` /
+    /// /resume-picker discovery, journal summaries) would be lost.
+    /// No duplication in practice: the daemon's meta mint is
+    /// exists-check-gated and skips any session that already carries a
+    /// jsonl; TUI turns never reach a session the daemon didn't adopt.
     pub(crate) fn ensure_session(&mut self, first_message: &str) {
         if self.session_id.is_some() {
             return;

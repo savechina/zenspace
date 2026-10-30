@@ -589,14 +589,10 @@ impl App {
                             };
                             self.auto_scroll = true;
                             self.chat_history.push((_query.clone(), response.clone()));
-                            if let Some(store) = &self.conversation_store {
-                                if let Err(e) = store.append("user", &_query) {
-                                    tracing::warn!(error = %e, "failed to persist user turn to conversation store");
-                                }
-                                if let Err(e) = store.append("assistant", &response) {
-                                    tracing::warn!(error = %e, "failed to persist assistant turn to conversation store");
-                                }
-                            }
+                            // The client does NOT persist turns: the gateway
+                            // daemon is the single conversation writer (D7) —
+                            // see hosting.rs `persist_completed_turn` for the
+                            // version-skew contract.
                         }
                         (Err(e), _) => {
                             completed_indices.push(idx);

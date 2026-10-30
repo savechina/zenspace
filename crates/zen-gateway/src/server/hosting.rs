@@ -30,7 +30,11 @@
 //! Turn lifecycle is audited to `audit.jsonl`: `gateway.turn.started`
 //! fires once per registration and exactly-once `gateway.turn.completed`
 //! (`outcome` completed|cancelled) fires at the FIRST terminal
-//! transition (T054 observability).
+//! transition (T054 observability). COMPLETED turns are additionally
+//! persisted to the session jsonl by the daemon itself (D7
+//! single-writer: `session/meta` first event at `session/start`, user +
+//! assistant `chat/turn` after each completed turn — see
+//! [`persist_completed_turn`] for the version-skew contract).
 //!
 //! ERRORS: -32602 malformed params; -32003 unknown sessionId;
 //! -32004 replayed completed turn; -32603 execution failure /
@@ -763,6 +767,150 @@ fn hydrate_session(session_id: &str) -> SessionContext {
     ctx
 }
 
+// ─────────────── conversation persistence (D7 single-writer) ───────────────
+
+/// Version-skew contract (D7, DOCUMENTED DOWNGRADE): session-conversation
+/// jsonl persistence moved from the TUI client
+/// (`zen-cli/src/tui/chat.rs`) into the daemon in the SAME release, so
+/// every hosted surface (TUI, `zen chat`, qqbot, HTTP) persists
+/// identically and hydration + memory replay starve no more.
+///
+/// OLD daemon + NEW TUI ⇒ nobody persists those turns (the interim window
+/// starves hydration/memory-replay for the affected sessions). The
+/// `[gateway] upgrade_policy=warn` machinery surfaces the stale daemon
+/// (`zen serve status` STALE marker, `zen doctor` daemon-version probe,
+/// TUI banner hint); there is deliberately NO runtime gating here.
+///
+/// NEW daemon + OLD TUI ⇒ both writers append the same turn (duplicate
+/// `chat/turn` lines). Tolerated by construction: the blake3 turn-key
+/// replay idempotency (`zen-memory::SessionReplayer`) dedups, and
+/// `hydrate_session` reads a plain turn list where a duplicated pair
+/// merely halves the effective [`HYDRATION_MAX_TURNS`] window.
+///
+/// Resolves the canonical session jsonl path — byte-exact mirror of
+/// [`zen_memory::conversation::ConversationStore::open`]'s resolution
+/// (date-sharded `{sessions}/YYYY/MM/DD/<id>.jsonl` from the UUIDv7
+/// timestamp; flat `<sessions>/<id>/<id>.jsonl` fallback when the id
+/// carries no embeddable date). Kept in lockstep by the
+/// `conversation_file_path_mirrors_conversation_store_open` unit pin.
+fn conversation_file_path(session_id: &str) -> Option<std::path::PathBuf> {
+    let paths = zen_core::paths::ZenPaths::detect().ok()?;
+    let date_dir = match zen_core::types::session_created_at_from_id(session_id) {
+        Some(created_at) => paths.session_dir_for_date(created_at),
+        None => paths.sessions().join(session_id),
+    };
+    Some(date_dir.join(format!("{session_id}.jsonl")))
+}
+
+/// Sync body: ensures the `session/meta` first event exists for
+/// `session_id`. Idempotent by construction — an EXISTING file is never
+/// rewritten, so the creating surface (TUI `Session::save`, fork) keeps
+/// meta ownership (title provenance); the daemon mints meta only for
+/// sessions born daemon-side (no `sessionId` param, qqbot, HTTP). Shape
+/// and path identical to the TUI writer's `Session::save` output.
+fn ensure_session_meta_blocking(session_id: &str, agent_label: &str) -> anyhow::Result<()> {
+    let path = conversation_file_path(session_id)
+        .ok_or_else(|| anyhow::anyhow!("zen paths unresolved (no global root)"))?;
+    if path.exists() {
+        return Ok(());
+    }
+    let mut session = zen_core::types::Session::new(agent_label, ".");
+    session.id = session_id.to_string();
+    if let Some(created_at) = zen_core::types::session_created_at_from_id(session_id) {
+        session.created_at = created_at;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    zen_core::types::SessionEvent::write_meta(&path, &session)
+}
+
+/// Sync body: appends one completed turn's `chat/turn` events (user then
+/// assistant) through the SAME [`ConversationStore`] plumbing the removed
+/// TUI writer used — event shapes identical (adjacently-tagged
+/// `{"type":"chat/turn","payload":{...}}`, lowercase roles), so
+/// `SessionReplayer` and `hydrate_session` readers stay byte-compatible.
+fn persist_turn_blocking(session_id: &str, prompt: &str, response: &str) -> anyhow::Result<()> {
+    let path = conversation_file_path(session_id)
+        .ok_or_else(|| anyhow::anyhow!("zen paths unresolved (no global root)"))?;
+    let store = zen_memory::conversation::ConversationStore::with_file(path, session_id)?;
+    store.append("user", prompt)?;
+    store.append("assistant", response)?;
+    Ok(())
+}
+
+/// Best-effort persistence of a COMPLETED hosted turn (D7): ensures the
+/// `session/meta` first event, then appends the user + assistant
+/// `chat/turn` events.
+///
+/// Scope logic:
+/// - Functionality: single-writer session jsonl persistence — the daemon
+///   writes what the TUI client used to write, for ALL hosted surfaces.
+/// - User impact: hydration (`session/start` adoption) and long-term
+///   memory replay (`SessionReplayer` → memvid) now see qqbot / HTTP /
+///   `zen chat` conversations; a disk failure never fails the turn.
+/// - Default: on for every COMPLETED hosted turn; best-effort (failure ⇒
+///   tracing::warn, turn result unaffected — hydration is fail-open by
+///   design and persistence must be its symmetric write side).
+/// - Interaction: turns within a session are serialized by the
+///   per-session permit, so append order matches turn order (no new
+///   locks); a `start()` racing the first turn's meta mint is safe —
+///   `write_meta` is tmp+fsync+rename atomic and rewrites line 1 when
+///   the file appeared mid-window. Cancelled / execution-error /
+///   watchdog turns are NOT persisted, mirroring the removed TUI client
+///   semantics.
+async fn persist_completed_turn(session_id: &str, agent_label: &str, prompt: &str, response: &str) {
+    let body = {
+        let session_id = session_id.to_string();
+        let agent_label = agent_label.to_string();
+        let prompt = prompt.to_string();
+        let response = response.to_string();
+        move || {
+            ensure_session_meta_blocking(&session_id, &agent_label)
+                .and_then(|()| persist_turn_blocking(&session_id, &prompt, &response))
+        }
+    };
+    match tokio::task::spawn_blocking(body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "conversation persistence failed; completed turn result unaffected"
+        ),
+        Err(e) => tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "conversation persistence join failed; completed turn result unaffected"
+        ),
+    }
+}
+
+/// Best-effort `session/meta` mint at `session/start` (D7): daemon-born
+/// sessions get their meta first-event immediately, so `Session::list`
+/// (TUI /resume picker) discovers them even before the first completed
+/// turn. Sessions that already carry a jsonl (TUI/fork-created, resumed)
+/// are left untouched — see [`ensure_session_meta_blocking`].
+async fn ensure_session_meta(session_id: &str, agent_label: &str) {
+    let body = {
+        let session_id = session_id.to_string();
+        let agent_label = agent_label.to_string();
+        move || ensure_session_meta_blocking(&session_id, &agent_label)
+    };
+    match tokio::task::spawn_blocking(body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "session/meta write failed; session adoption unaffected"
+        ),
+        Err(e) => tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "session/meta join failed; session adoption unaffected"
+        ),
+    }
+}
+
 /// session/start — `{sessionId?, agent?}` → `{sessionId, agent}`.
 /// Mints UUIDv7 ids and registers the hosted [`SessionContext`].
 pub async fn start(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcError> {
@@ -785,6 +933,10 @@ pub async fn start(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcEr
     } else {
         session.agent_name.clone()
     };
+    // Release before best-effort meta I/O — the map lock never spans
+    // file I/O (memory RPC offload precedent).
+    drop(sessions);
+    ensure_session_meta(&session_id, &agent_label).await;
     Ok(json!({ "sessionId": session_id, "agent": agent_label }))
 }
 
@@ -1068,6 +1220,7 @@ pub async fn turn_with(
 
     let watchdog = crate::server::guards::watchdog_timeout();
     let turn_scope = record.turn_id.clone();
+    let prompt_for_persist = prompt.clone();
     let execution = async move {
         let outcome = zen_agents::APPROVAL_TURN
             .scope(
@@ -1111,6 +1264,12 @@ pub async fn turn_with(
             emit_agent_status(&record, "idle");
             release_done(&record);
             audit_turn_completed(&deps, &record, "completed");
+            // D7 single-writer: COMPLETED turns only — the cancelled /
+            // execution-error / watchdog arms mirror the removed TUI
+            // client semantics, which never persisted those.
+            if let Some(text) = record.final_response() {
+                persist_completed_turn(&session_id, &agent_label, &prompt_for_persist, &text).await;
+            }
             Ok(
                 json!({ "turnId": turn_id, "response": record.final_response().unwrap_or_default() }),
             )
@@ -1362,6 +1521,38 @@ mod tests {
             {"path": "p", "content": "c", "sensitivity": "secret"}
         ]});
         assert_eq!(parse_knowledge(&bad).unwrap_err().code, -32602);
+    }
+
+    /// D7 path-parity pin: the daemon writer resolves the SAME
+    /// date-sharded `{sessions}/YYYY/MM/DD/<id>.jsonl` layout
+    /// `ConversationStore::open` (the `hydrate_session` reader) uses.
+    /// Cross-store discoverability is proven behaviorally in
+    /// `tests/session_persistence.rs` (write via turn → read via `open`).
+    #[test]
+    fn conversation_file_path_matches_date_sharded_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", tmp.path()) };
+
+        let uuidv7 = uuid::Uuid::now_v7().to_string();
+        let daemon_path = conversation_file_path(&uuidv7).unwrap();
+        let created = zen_core::types::session_created_at_from_id(&uuidv7).unwrap();
+        let paths = zen_core::paths::ZenPaths::detect().unwrap();
+        assert_eq!(
+            daemon_path,
+            paths
+                .session_dir_for_date(created)
+                .join(format!("{uuidv7}.jsonl")),
+            "date-sharded {{sessions}}/YYYY/MM/DD/<id>.jsonl naming"
+        );
+
+        // Non-UUIDv7 id: the documented flat fallback shape.
+        assert_eq!(
+            conversation_file_path("legacy-session-id").unwrap(),
+            paths
+                .sessions()
+                .join("legacy-session-id")
+                .join("legacy-session-id.jsonl")
+        );
     }
 
     #[tokio::test]
