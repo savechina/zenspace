@@ -54,6 +54,21 @@ jina_fallback_threshold_chars = 500
 user_agent = "zen-agent/1.0"
 
 # =============================================================================
+# Web search tool (zen web.search) — provider selection and deadlines
+# =============================================================================
+#
+# Provider cascade: Brave → Tavily → DuckDuckGo. A backend runs only when an
+# API key is configured for it (Brave: BRAVE_SEARCH_API_KEY, Tavily:
+# TAVILY_API_KEY); DuckDuckGo is always tried last and needs no key. When
+# every attempted backend fails, the tool reports each one with its reason.
+#
+[web_search]
+# default_provider = "duckduckgo"
+# timeout_ms = 8000
+# api_key_brave = ""
+# api_key_tavily = ""
+
+# =============================================================================
 # Embedding provider selection (standalone from chat providers)
 # =============================================================================
 #
@@ -544,6 +559,60 @@ max_rounds = 8
 #
 [agentic.delegate]
 # context_inheritance = false
+
+# =============================================================================
+# Intent classification ladder (D2 intent-speed fix; T168/T169)
+# =============================================================================
+#
+# classify_timeout_ms (env ZEN_INTENT_CLASSIFY_TIMEOUT_MS, clamp 1000..=60000,
+#   out-of-range warns and falls back to the default):
+#   Functionality: wall-clock cap for ONE LLM intent-classification turn —
+#     at the cap the call is abandoned and the keyword path takes over.
+#   User impact: a hung/cold-starting local model can no longer stall every
+#     hosted turn's first token for the full cap.
+#   Default: 8000 (down from the old hard-coded 20s — production timed out
+#     2/3 turns at 20s against the 35B default model, ~40x over the
+#     intent-p95<500ms baseline).
+#   Values: 1000..=60000 ms.
+#   Interaction: also bounds the L0-fast-path shadow's LLM attempt; the L1
+#     binary classifiers share the same plumbing and thus the same cap.
+#
+# model (env ZEN_INTENT_MODEL):
+#   Functionality: preferred model for the intent-classification call,
+#     e.g. a small local model instead of the default 35B.
+#   User impact: intent latency drops on the ollama path (the override is
+#     honored per call); absent = the routed provider's own default model.
+#   Default: absent.
+#   Values: any model name the target provider serves (e.g. "llama3.2:2GB",
+#     "qwen2.5-coder:1.5b").
+#   Interaction: rides DefaultRouter::call_stream_with_model →
+#     ModelOptions.model; honored by the ollama provider, other providers
+#     keep their configured default until they read the override.
+#
+# l0_fast_path (env ZEN_INTENT_L0_FAST_PATH):
+#   Functionality: a keyword-table hit serves the turn IMMEDIATELY and the
+#     LLM classification runs as a detached record-only shadow that logs the
+#     l0-vs-l2 disagreement pair to the decision audit; a keyword miss takes
+#     the inline LLM path unchanged.
+#   User impact: keyword-hitting turns skip the LLM intent wait entirely;
+#     intent_llm_outcome records "l0_fast_path" and the shadow's verdict
+#     lands in logs/audit.jsonl (decision_kind "l0_fast_path").
+#   Default: true (intentional — the LLM-first ordering violated the
+#     recorded falsifiable baseline ~40x in production).
+#   Values: true | false (invalid values warn and keep the default).
+#   Interaction: false restores the pre-D2 LLM-first behaviour
+#     byte-identically; the no-provider fail-fast gate and the calibrated
+#     L1 gate (l1_threshold) are unaffected and still run first.
+#
+# shadow_embedding / l1_threshold: see the T168/T169 calibration docs —
+#   unchanged by D2 (l1_threshold absent ⇒ the L1 rung never gates).
+#
+[agentic.intent]
+# classify_timeout_ms = 8000
+# model = "llama3.2:2GB"
+# l0_fast_path = true
+# shadow_embedding = false
+# l1_threshold = 0.7   # absent ⇒ L1 gate closed (V13-A.3: no invented τ)
 
 # =============================================================================
 # Skill auto-routing — Pi-style trigger hits (005-agentic-loop, T076)

@@ -1037,6 +1037,25 @@ impl OrchestratorConfig {
     }
 }
 
+/// Default wall-clock cap (ms) for the LLM intent classification turn.
+///
+/// D2 (intent-speed fix): production evidence showed the prior hard-coded 20s
+/// cap burning up to 20s per hosted turn against the default 35B local model
+/// (2/3 turns timed out at ~20s), violating the recorded V13-A.3 baseline
+/// (intent p95 < 500ms) by ~40×. 8s keeps headroom for cold local-model
+/// prefill while bounding the worst-case stall.
+pub const INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT: u64 = 8_000;
+
+/// Minimum accepted `[agentic.intent] classify_timeout_ms` (below this the
+/// timeout cannot cover even a warm small-model prefill; out-of-range values
+/// warn and fall back to the default — E11 never-silent).
+pub const INTENT_CLASSIFY_TIMEOUT_MS_MIN: u64 = 1_000;
+
+/// Maximum accepted `[agentic.intent] classify_timeout_ms` (the old hard
+/// 20s cap was already production-hostile; a larger cap must be a deliberate
+/// per-deployment choice, not an accident of a stray config value).
+pub const INTENT_CLASSIFY_TIMEOUT_MS_MAX: u64 = 60_000;
+
 /// Intent classification configuration — TOML `[agentic.intent]` (T168/T169).
 ///
 /// Scope logic (Constitution XV):
@@ -1046,21 +1065,33 @@ impl OrchestratorConfig {
 ///   `l1_threshold` is the calibrated operating point that lets the L1 rung
 ///   *gate* the decision (T169) — the ladder tries L1 first and only falls
 ///   through to the LLM when L1's confidence is below it.
+///   `classify_timeout_ms` bounds the LLM classification turn (D2a).
+///   `model` names a smaller model the intent call should prefer (D2b).
+///   `l0_fast_path` serves keyword hits immediately and demotes the LLM
+///   classification to a record-only shadow (D2c, Oracle-approved).
 /// - User impact: shadow mode starts accumulating calibration data (L1 vs
 ///   production disagreements are the highest-information samples for T173);
 ///   setting `l1_threshold` activates the fast path that avoids the LLM
-///   classification call on confidently-L1 turns.
+///   classification call on confidently-L1 turns. `classify_timeout_ms`
+///   caps how long a hung/stuffed model may stall every turn's first token.
 /// - Default: `shadow_embedding = false` (per-turn cost unchanged until
 ///   opt-in) and `l1_threshold = absent`. **An absent threshold means the
 ///   L1 rung never gates** — the ladder behaves exactly as it did before
 ///   T169. This is deliberate (V13-A.3): no τ is ever invented here; it is
 ///   supplied by calibration (T173's harness writes
 ///   `<ZEN_HOME>/logs/decision-audit/thresholds.json`) or explicitly by the
-///   user via this key.
-/// - Interaction: `ZEN_INTENT_SHADOW_EMBEDDING` / `ZEN_INTENT_L1_THRESHOLD`
-///   env vars override any config layer (5th layer). The config value wins
-///   over the calibration artefact when both are present, so a user can pin
-///   or override a calibrated operating point.
+///   user via this key. `classify_timeout_ms = absent` ⇒ 8000 (a deliberate
+///   change from the old 20s hard constant — production timed out 2/3 turns
+///   at 20s against the 35B default model). `model = absent` ⇒ the routed
+///   provider's own default model. `l0_fast_path = absent` ⇒ **on** —
+///   intentional (D2c): the 40× p95 violation is production evidence, so the
+///   fast path ships default-on with `l0-vs-l2` disagreement telemetry
+///   keeping the LLM-first decision falsifiable.
+/// - Interaction: `ZEN_INTENT_SHADOW_EMBEDDING` / `ZEN_INTENT_L1_THRESHOLD` /
+///   `ZEN_INTENT_CLASSIFY_TIMEOUT_MS` / `ZEN_INTENT_MODEL` /
+///   `ZEN_INTENT_L0_FAST_PATH` env vars override any config layer (5th
+///   layer). The config value wins over the calibration artefact when both
+///   are present, so a user can pin or override a calibrated operating point.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct IntentConfig {
@@ -1071,6 +1102,24 @@ pub struct IntentConfig {
     /// never gates and the pre-T169 behaviour is preserved exactly. Valid
     /// range 0.0..=1.0; out-of-range values warn and are ignored.
     pub l1_threshold: Option<f32>,
+    /// Wall-clock cap (ms) for one LLM intent-classification turn (D2a).
+    /// Absent ⇒ [`INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT`] (8000). Clamped
+    /// `1000..=60000` at read; out-of-range values warn and fall back to the
+    /// default (E11: never silent).
+    pub classify_timeout_ms: Option<u64>,
+    /// Model override for the intent-classification call (D2b) — e.g. a
+    /// small local model (`llama3.2:2GB`, `qwen2.5-coder:1.5b`) instead of
+    /// the default 35B. Absent ⇒ the routed provider's own default model.
+    /// Wiring: rides `DefaultRouter::call_stream_with_model` →
+    /// `ModelOptions::model` — honored by the ollama provider (per-call
+    /// model names are native to its API); providers that do not read the
+    /// override yet keep their configured default.
+    pub model: Option<String>,
+    /// L0 keyword fast path (D2c). `true` (default) ⇒ a keyword-table hit
+    /// serves the turn immediately and the L2 LLM classification runs as a
+    /// detached, record-only shadow that logs the l0-vs-l2 disagreement pair.
+    /// `false` ⇒ the pre-D2 inline-LLM-first behaviour, byte-identical.
+    pub l0_fast_path: Option<bool>,
 }
 
 impl IntentConfig {
@@ -1095,6 +1144,53 @@ impl IntentConfig {
             }
             None => None,
         }
+    }
+
+    /// Effective LLM-classification wall-clock cap (D2a).
+    ///
+    /// Scope logic:
+    /// - Functionality: bounds how long one LLM intent-classification turn
+    ///   (and, once plumbed, the L0-shadow classification) may run before it
+    ///   is abandoned and the keyword degrade path takes over
+    /// - User impact: a hung or cold-starting local model can no longer
+    ///   stall every hosted turn's first token for the full cap
+    /// - Default: 8000ms (`INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT`) — down from
+    ///   the old 20s hard constant, which production timed out on 2/3 turns
+    /// - Interaction: clamped to `1000..=60000`; an out-of-range configured
+    ///   value warns (E11) and falls back to the default rather than being
+    ///   silently accepted or silently dropped
+    pub fn classify_timeout(&self) -> std::time::Duration {
+        match self.classify_timeout_ms {
+            Some(ms)
+                if (INTENT_CLASSIFY_TIMEOUT_MS_MIN..=INTENT_CLASSIFY_TIMEOUT_MS_MAX)
+                    .contains(&ms) =>
+            {
+                std::time::Duration::from_millis(ms)
+            }
+            Some(ms) => {
+                tracing::warn!(
+                    value = ms,
+                    "[agentic.intent] classify_timeout_ms outside {INTENT_CLASSIFY_TIMEOUT_MS_MIN}..={INTENT_CLASSIFY_TIMEOUT_MS_MAX}; \
+                     using default {INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT}ms"
+                );
+                std::time::Duration::from_millis(INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT)
+            }
+            None => std::time::Duration::from_millis(INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT),
+        }
+    }
+
+    /// The configured intent model override, or `None` when absent/blank.
+    pub fn model_override(&self) -> Option<&str> {
+        self.model.as_deref().filter(|m| !m.trim().is_empty())
+    }
+
+    /// Effective L0 keyword fast-path flag (D2c). Default **true** —
+    /// intentional: the recorded falsifiable baseline (V13-A.3 intent
+    /// p95 < 500ms) was violated ~40× by the LLM-first ordering, so the
+    /// Oracle-approved fast path ships on; the kill-switch exists to restore
+    /// the old ordering without a rebuild.
+    pub fn l0_fast_path_or_default(&self) -> bool {
+        self.l0_fast_path.unwrap_or(true)
     }
 }
 
@@ -1963,6 +2059,12 @@ pub struct ModelOptions {
     pub max_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
     pub top_p: Option<f64>,
+    /// Per-call model-name override (D2b). `Some` makes the provider build
+    /// its completion model under this name instead of its configured
+    /// default — honored by the ollama provider (per-call model names are
+    /// native to its API); providers that do not read it yet keep their
+    /// configured default.
+    pub model: Option<String>,
 }
 
 /// Named variant override for a model — same model, different params.
@@ -2135,6 +2237,23 @@ impl Default for WebFetchConfig {
     }
 }
 
+/// Default `[web_search] timeout_ms` (D8): bounds each HTTP request AND each
+/// backend's whole retry chain. Down from the old hard 10s client constant,
+/// which burned 3×10s+backoff ≈ 33s on a dead backend (production: a hosted
+/// turn's DDG search failed after 33010ms with no proxy in the daemon env).
+pub const WEB_SEARCH_TIMEOUT_MS_DEFAULT: u64 = 8_000;
+
+/// Minimum accepted `[web_search] timeout_ms` (below this even a warm request
+/// to a search backend cannot complete reliably; out-of-range values warn and
+/// fall back to the default — E11 never-silent).
+pub const WEB_SEARCH_TIMEOUT_MS_MIN: u64 = 1_000;
+
+/// Maximum accepted `[web_search] timeout_ms` (keeps the worst-case
+/// all-backends cascade — brave + tavily + ddg — within ~90s; a larger cap
+/// must be a deliberate per-deployment choice, not an accident of a stray
+/// config value).
+pub const WEB_SEARCH_TIMEOUT_MS_MAX: u64 = 30_000;
+
 /// Web search tool configuration — provider selection and API keys.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct WebSearchConfig {
@@ -2147,6 +2266,57 @@ pub struct WebSearchConfig {
     /// Tavily API key (falls back to `TAVILY_API_KEY` env).
     #[serde(default)]
     pub api_key_tavily: Option<String>,
+    /// Per-request + per-backend wall-clock budget (ms) for `web.search` (D8).
+    ///
+    /// Scope logic (Constitution XV):
+    /// - Functionality: applied twice — as the per-HTTP-request timeout
+    ///   (`RequestBuilder::timeout`, overriding the client default) and as
+    ///   the total deadline for each backend's entire retry chain (a single
+    ///   `tokio::time::timeout` around `retry_with_backoff`). A dead backend
+    ///   can no longer burn 3×timeout+backoff; the worst-case all-backends
+    ///   cascade is bounded at ~3×`timeout_ms` (brave+tavily+ddg).
+    /// - User impact: hosted turns fail fast with an actionable per-backend
+    ///   aggregated error (timeout / http status / network error / missing
+    ///   api key) instead of a ~33s stall followed by a bare backend message.
+    /// - Default: absent ⇒ 8000ms (`WEB_SEARCH_TIMEOUT_MS_DEFAULT`).
+    /// - Values: clamped `1000..=30000` at read; out-of-range values warn and
+    ///   fall back to the default (E11: never silent).
+    /// - Interaction: `ZEN_WEB_SEARCH_TIMEOUT_MS` env var overrides any
+    ///   config layer (5th layer); a non-numeric env value warns and is
+    ///   ignored. Provider selection order and NetworkPolicy validation are
+    ///   unchanged.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+impl WebSearchConfig {
+    /// Effective per-request + per-backend wall-clock budget (D8).
+    ///
+    /// Scope logic:
+    /// - Functionality: the single budget applied to each `web.search` HTTP
+    ///   request and to each backend's whole retry chain
+    /// - User impact: bounds the worst-case all-backends cascade at
+    ///   ~3× this value instead of the old ~3×(10s+backoff) per backend
+    /// - Default: 8000ms when the key is absent
+    /// - Interaction: values outside `1000..=30000` warn (E11) and fall back
+    ///   to the default rather than being silently accepted or silently
+    ///   dropped
+    pub fn request_timeout(&self) -> std::time::Duration {
+        match self.timeout_ms {
+            Some(ms) if (WEB_SEARCH_TIMEOUT_MS_MIN..=WEB_SEARCH_TIMEOUT_MS_MAX).contains(&ms) => {
+                std::time::Duration::from_millis(ms)
+            }
+            Some(ms) => {
+                tracing::warn!(
+                    value = ms,
+                    "[web_search] timeout_ms outside {WEB_SEARCH_TIMEOUT_MS_MIN}..={WEB_SEARCH_TIMEOUT_MS_MAX}; \
+                     using default {WEB_SEARCH_TIMEOUT_MS_DEFAULT}ms"
+                );
+                std::time::Duration::from_millis(WEB_SEARCH_TIMEOUT_MS_DEFAULT)
+            }
+            None => std::time::Duration::from_millis(WEB_SEARCH_TIMEOUT_MS_DEFAULT),
+        }
+    }
 }
 
 /// Persistent trust store for MCP server trust decisions.
@@ -2526,6 +2696,12 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
         intent: IntentConfig {
             shadow_embedding: ov.intent.shadow_embedding.or(base.intent.shadow_embedding),
             l1_threshold: ov.intent.l1_threshold.or(base.intent.l1_threshold),
+            classify_timeout_ms: ov
+                .intent
+                .classify_timeout_ms
+                .or(base.intent.classify_timeout_ms),
+            model: ov.intent.model.or(base.intent.model),
+            l0_fast_path: ov.intent.l0_fast_path.or(base.intent.l0_fast_path),
         },
         classifiers: ClassifierConfig {
             correction_threshold: ov
@@ -2884,6 +3060,7 @@ fn merge_web_search(base: WebSearchConfig, override_cfg: WebSearchConfig) -> Web
             .api_key_tavily
             .clone()
             .or_else(|| base.api_key_tavily.clone()),
+        timeout_ms: override_cfg.timeout_ms.or(base.timeout_ms),
     }
 }
 
@@ -2929,6 +3106,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_security_env(&mut config.security);
     apply_plugin_env(&mut config.plugin);
     apply_channels_env(&mut config.channels);
+    apply_web_search_env(&mut config.web_search);
     apply_history_env(&mut config.history);
     apply_embeddings_env(&mut config.embeddings);
     apply_loop_env(&mut config.agentic.loop_cfg);
@@ -2948,6 +3126,18 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_tui_env(&mut config.tui);
     apply_gateway_env(&mut config.gateway);
     config
+}
+
+fn apply_web_search_env(cfg: &mut WebSearchConfig) {
+    if let Some(v) = env_str("ZEN_WEB_SEARCH_TIMEOUT_MS") {
+        match v.trim().parse::<u64>() {
+            Ok(parsed) => cfg.timeout_ms = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_WEB_SEARCH_TIMEOUT_MS is not a number; ignoring (default 8000ms stays)"
+            ),
+        }
+    }
 }
 
 fn apply_gateway_env(cfg: &mut GatewayConfig) {
@@ -3152,6 +3342,28 @@ fn apply_intent_env(cfg: &mut IntentConfig) {
             Err(_) => tracing::warn!(
                 value = %v,
                 "ZEN_INTENT_L1_THRESHOLD is not a number; ignoring (L1 gate stays closed)"
+            ),
+        }
+    }
+    if let Some(v) = env_str("ZEN_INTENT_CLASSIFY_TIMEOUT_MS") {
+        match v.trim().parse::<u64>() {
+            Ok(parsed) => cfg.classify_timeout_ms = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_INTENT_CLASSIFY_TIMEOUT_MS is not a number; ignoring (default 8000ms stays)"
+            ),
+        }
+    }
+    if let Some(v) = env_str("ZEN_INTENT_MODEL") {
+        cfg.model = Some(v);
+    }
+    if let Some(v) = env_str("ZEN_INTENT_L0_FAST_PATH") {
+        match v.trim().to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => cfg.l0_fast_path = Some(true),
+            "false" | "0" | "no" | "off" => cfg.l0_fast_path = Some(false),
+            _ => tracing::warn!(
+                value = %v,
+                "ZEN_INTENT_L0_FAST_PATH is not a boolean; ignoring (default on stays)"
             ),
         }
     }
@@ -3949,6 +4161,156 @@ provider = "anthropic"
         assert!(!cfg.agentic.intent.shadow_embedding_or_default());
 
         unsafe { std::env::remove_var("ZEN_INTENT_SHADOW_EMBEDDING") };
+    }
+
+    #[test]
+    fn intent_classify_timeout_defaults_clamps_and_env_overrides() {
+        // Absent key ⇒ 8s default (D2a; down from the old hard 20s const).
+        assert_eq!(
+            IntentConfig::default().classify_timeout(),
+            std::time::Duration::from_millis(INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT)
+        );
+        assert_eq!(INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT, 8_000);
+
+        // In-range value passes through.
+        let config: ZenConfig =
+            toml::from_str("[agentic.intent]\nclassify_timeout_ms = 12000\n").unwrap();
+        assert_eq!(
+            config.agentic.intent.classify_timeout(),
+            std::time::Duration::from_millis(12_000)
+        );
+
+        // Out-of-range warns and falls back to the default (E11 never-silent).
+        for (raw, label) in [("500", "below"), ("61000", "above")] {
+            let config: ZenConfig =
+                toml::from_str(&format!("[agentic.intent]\nclassify_timeout_ms = {raw}\n"))
+                    .unwrap_or_else(|e| panic!("{label} bound must still parse: {e}"));
+            assert_eq!(
+                config.agentic.intent.classify_timeout(),
+                std::time::Duration::from_millis(INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT),
+                "{label}-range value must fall back to the default, not clamp"
+            );
+        }
+
+        // 5th layer: ZEN_INTENT_CLASSIFY_TIMEOUT_MS env override.
+        // SAFETY: test-only env mutation; read by no sibling test in this
+        // binary and removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_INTENT_CLASSIFY_TIMEOUT_MS", "3000") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.intent.classify_timeout(),
+            std::time::Duration::from_millis(3_000)
+        );
+
+        // Invalid env value warns + ignores (default stays).
+        unsafe { std::env::set_var("ZEN_INTENT_CLASSIFY_TIMEOUT_MS", "soon") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.intent.classify_timeout_ms.is_none());
+
+        unsafe { std::env::remove_var("ZEN_INTENT_CLASSIFY_TIMEOUT_MS") };
+    }
+
+    #[test]
+    fn intent_model_override_parses_merges_and_env_overrides() {
+        assert_eq!(IntentConfig::default().model_override(), None);
+
+        let config: ZenConfig =
+            toml::from_str("[agentic.intent]\nmodel = \"llama3.2:2GB\"\n").unwrap();
+        assert_eq!(config.agentic.intent.model_override(), Some("llama3.2:2GB"));
+
+        // Blank string is treated as absent.
+        let config: ZenConfig = toml::from_str("[agentic.intent]\nmodel = \"  \"\n").unwrap();
+        assert_eq!(config.agentic.intent.model_override(), None);
+
+        // SAFETY: test-only env mutation; removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_INTENT_MODEL", "qwen2.5-coder:1.5b") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.agentic.intent.model_override(),
+            Some("qwen2.5-coder:1.5b")
+        );
+        unsafe { std::env::remove_var("ZEN_INTENT_MODEL") };
+    }
+
+    #[test]
+    fn intent_l0_fast_path_defaults_on_with_env_kill_switch() {
+        // Absent key ⇒ ON (D2c intentional default).
+        assert!(IntentConfig::default().l0_fast_path_or_default());
+
+        let config: ZenConfig = toml::from_str("[agentic.intent]\nl0_fast_path = false\n").unwrap();
+        assert!(!config.agentic.intent.l0_fast_path_or_default());
+
+        // SAFETY: test-only env mutation; removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_INTENT_L0_FAST_PATH", "false") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(!cfg.agentic.intent.l0_fast_path_or_default());
+
+        // Invalid env value warns + ignores (default on stays).
+        unsafe { std::env::set_var("ZEN_INTENT_L0_FAST_PATH", "maybe") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.intent.l0_fast_path.is_none());
+
+        unsafe { std::env::remove_var("ZEN_INTENT_L0_FAST_PATH") };
+    }
+
+    #[test]
+    fn web_search_timeout_defaults_clamps_merges_and_env_overrides() {
+        // Absent key ⇒ 8s default (D8: per-request + per-backend budget,
+        // down from the old hard 10s client constant that burned ~33s on a
+        // dead backend).
+        assert_eq!(
+            WebSearchConfig::default().request_timeout(),
+            std::time::Duration::from_millis(WEB_SEARCH_TIMEOUT_MS_DEFAULT)
+        );
+        assert_eq!(WEB_SEARCH_TIMEOUT_MS_DEFAULT, 8_000);
+
+        // In-range value passes through.
+        let config: ZenConfig = toml::from_str("[web_search]\ntimeout_ms = 5000\n").unwrap();
+        assert_eq!(
+            config.web_search.request_timeout(),
+            std::time::Duration::from_millis(5_000)
+        );
+
+        // Out-of-range warns and falls back to the default (E11 never-silent;
+        // falls back, NOT clamps — a stray 500 must not silently become 1000).
+        for (raw, label) in [("500", "below"), ("31000", "above")] {
+            let config: ZenConfig = toml::from_str(&format!("[web_search]\ntimeout_ms = {raw}\n"))
+                .unwrap_or_else(|e| panic!("{label} bound must still parse: {e}"));
+            assert_eq!(
+                config.web_search.request_timeout(),
+                std::time::Duration::from_millis(WEB_SEARCH_TIMEOUT_MS_DEFAULT),
+                "{label}-range value must fall back to the default, not clamp"
+            );
+        }
+
+        // Merge: override layer wins; absent override inherits the base layer.
+        let base: ZenConfig = toml::from_str("[web_search]\ntimeout_ms = 4000\n").unwrap();
+        let merged = merge_web_search(base.web_search.clone(), WebSearchConfig::default());
+        assert_eq!(merged.timeout_ms, Some(4_000));
+        let merged = merge_web_search(
+            WebSearchConfig::default(),
+            toml::from_str::<ZenConfig>("[web_search]\ntimeout_ms = 6000\n")
+                .unwrap()
+                .web_search,
+        );
+        assert_eq!(merged.timeout_ms, Some(6_000));
+
+        // 5th layer: ZEN_WEB_SEARCH_TIMEOUT_MS env override.
+        // SAFETY: test-only env mutation; read by no sibling test in this
+        // binary and removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_WEB_SEARCH_TIMEOUT_MS", "2500") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(
+            cfg.web_search.request_timeout(),
+            std::time::Duration::from_millis(2_500)
+        );
+
+        // Invalid env value warns + ignores (default stays).
+        unsafe { std::env::set_var("ZEN_WEB_SEARCH_TIMEOUT_MS", "soon") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.web_search.timeout_ms.is_none());
+
+        unsafe { std::env::remove_var("ZEN_WEB_SEARCH_TIMEOUT_MS") };
     }
 
     #[test]
