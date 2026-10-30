@@ -202,12 +202,35 @@ fn parse_retry_after(value: Option<&str>) -> u64 {
     value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(60)
 }
 
+/// One-line reason for a backend whose whole retry chain hit the deadline
+/// (`tokio::time::timeout` elapsed) — D8 per-backend total deadline.
+fn timeout_reason(budget: Duration) -> String {
+    format!("timeout after {}s", budget.as_secs())
+}
+
+/// Aggregated, actionable failure message for the D8 fix: names every
+/// backend attempted with its one-line reason, then the fix hints. Pure
+/// function (no I/O) so it stays pin-testable without network.
+fn all_backends_failed_error(attempts: &[(impl AsRef<str>, impl AsRef<str>)]) -> String {
+    let mut msg = String::from("web.search: all search backends failed");
+    for (backend, reason) in attempts {
+        msg.push_str(&format!("\n  - {}: {}", backend.as_ref(), reason.as_ref()));
+    }
+    msg.push_str(
+        "\nFix: set BRAVE_API_KEY or TAVILY_API_KEY \
+         (config [web_search].api_key_brave/api_key_tavily), \
+         or provide HTTPS_PROXY for duckduckgo",
+    );
+    msg
+}
+
 async fn search_brave(
     client: &reqwest::Client,
     policy: &NetworkPolicy,
     query: &str,
     max: usize,
     api_key: &str,
+    timeout: Duration,
 ) -> Result<SearchOutcome, ProviderError> {
     let url = format!(
         "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
@@ -219,6 +242,7 @@ async fn search_brave(
         .map_err(|e| ProviderError::Fatal(e.to_string()))?;
     let resp = client
         .get(&url)
+        .timeout(timeout)
         .header("X-Subscription-Token", api_key)
         .send()
         .await
@@ -264,6 +288,7 @@ async fn search_tavily(
     query: &str,
     max: usize,
     api_key: &str,
+    timeout: Duration,
 ) -> Result<SearchOutcome, ProviderError> {
     let body = json!({
         "query": query,
@@ -277,6 +302,7 @@ async fn search_tavily(
         .map_err(|e| ProviderError::Fatal(e.to_string()))?;
     let resp = client
         .post(endpoint)
+        .timeout(timeout)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key))
         .json(&body)
@@ -319,6 +345,7 @@ async fn search_ddg(
     policy: &NetworkPolicy,
     query: &str,
     max: usize,
+    timeout: Duration,
 ) -> Result<SearchOutcome, ProviderError> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
     policy
@@ -326,6 +353,7 @@ async fn search_ddg(
         .map_err(|e| ProviderError::Fatal(e.to_string()))?;
     let resp = client
         .get(&url)
+        .timeout(timeout)
         .send()
         .await
         .map_err(|e| ProviderError::Retryable(e.to_string()))?;
@@ -409,6 +437,9 @@ impl Tool for WebSearchTool {
 
         let config = zen_core::config::load_config().ok();
         let configured = config.as_ref().map(|c| &c.web_search);
+        let fallback_search_cfg = zen_core::config::WebSearchConfig::default();
+        let search_cfg = configured.unwrap_or(&fallback_search_cfg);
+        let budget = search_cfg.request_timeout();
         let override_provider = configured
             .and_then(|c| c.default_provider.as_deref())
             .unwrap_or("");
@@ -428,59 +459,85 @@ impl Tool for WebSearchTool {
                 let key = brave_key.as_deref().ok_or_else(|| {
                     KernelError::ToolFailed("API key not configured for provider 'brave'".into())
                 })?;
-                let o = retry_with_backoff(3, ProviderError::retryable, || {
-                    search_brave(&self.client, &self.network_policy, query, max, key)
-                })
-                .await
-                .map_err(|e| KernelError::ToolFailed(e.into_message()))?;
+                let fut = retry_with_backoff(3, ProviderError::retryable, || {
+                    search_brave(&self.client, &self.network_policy, query, max, key, budget)
+                });
+                // D8: the backend's ENTIRE retry chain is bounded by one
+                // deadline — a dead backend burns `budget`, not 3×timeout+backoff.
+                let o = match tokio::time::timeout(budget, fut).await {
+                    Ok(Ok(o)) => Ok(o),
+                    Ok(Err(e)) => Err(all_backends_failed_error(&[("brave", e.into_message())])),
+                    Err(_) => Err(all_backends_failed_error(&[(
+                        "brave",
+                        timeout_reason(budget),
+                    )])),
+                }
+                .map_err(KernelError::ToolFailed)?;
                 (o, "brave")
             }
             "tavily" => {
                 let key = tavily_key.as_deref().ok_or_else(|| {
                     KernelError::ToolFailed("API key not configured for provider 'tavily'".into())
                 })?;
-                let o = retry_with_backoff(3, ProviderError::retryable, || {
-                    search_tavily(&self.client, &self.network_policy, query, max, key)
-                })
-                .await
-                .map_err(|e| KernelError::ToolFailed(e.into_message()))?;
+                let fut = retry_with_backoff(3, ProviderError::retryable, || {
+                    search_tavily(&self.client, &self.network_policy, query, max, key, budget)
+                });
+                let o = match tokio::time::timeout(budget, fut).await {
+                    Ok(Ok(o)) => Ok(o),
+                    Ok(Err(e)) => Err(all_backends_failed_error(&[("tavily", e.into_message())])),
+                    Err(_) => Err(all_backends_failed_error(&[(
+                        "tavily",
+                        timeout_reason(budget),
+                    )])),
+                }
+                .map_err(KernelError::ToolFailed)?;
                 (o, "tavily")
             }
             _ => {
-                let brave_try = brave_key.as_deref().map(|key| {
-                    retry_with_backoff(3, ProviderError::retryable, || {
-                        search_brave(&self.client, &self.network_policy, query, max, key)
-                    })
-                });
-                let tavily_try = tavily_key.as_deref().map(|key| {
-                    retry_with_backoff(3, ProviderError::retryable, || {
-                        search_tavily(&self.client, &self.network_policy, query, max, key)
-                    })
-                });
-
                 let mut selected: Option<(&str, SearchOutcome)> = None;
-                if let Some(try_brave) = brave_try
-                    && let Ok(o) = try_brave.await
-                {
-                    selected = Some(("brave", o));
+                let mut attempts: Vec<(&str, String)> = Vec::new();
+
+                if let Some(key) = brave_key.as_deref() {
+                    let fut = retry_with_backoff(3, ProviderError::retryable, || {
+                        search_brave(&self.client, &self.network_policy, query, max, key, budget)
+                    });
+                    match tokio::time::timeout(budget, fut).await {
+                        Ok(Ok(o)) => selected = Some(("brave", o)),
+                        Ok(Err(e)) => attempts.push(("brave", e.into_message())),
+                        Err(_) => attempts.push(("brave", timeout_reason(budget))),
+                    }
                 }
                 if selected.is_none()
-                    && let Some(try_tavily) = tavily_try
-                    && let Ok(o) = try_tavily.await
+                    && let Some(key) = tavily_key.as_deref()
                 {
-                    selected = Some(("tavily", o));
+                    let fut = retry_with_backoff(3, ProviderError::retryable, || {
+                        search_tavily(&self.client, &self.network_policy, query, max, key, budget)
+                    });
+                    match tokio::time::timeout(budget, fut).await {
+                        Ok(Ok(o)) => selected = Some(("tavily", o)),
+                        Ok(Err(e)) => attempts.push(("tavily", e.into_message())),
+                        Err(_) => attempts.push(("tavily", timeout_reason(budget))),
+                    }
                 }
                 if selected.is_none() {
-                    let o = retry_with_backoff(3, ProviderError::retryable, || {
-                        search_ddg(&self.client, &self.network_policy, query, max)
-                    })
-                    .await
-                    .map_err(|e| KernelError::ToolFailed(e.into_message()))?;
-                    selected = Some(("duckduckgo", o));
+                    let fut = retry_with_backoff(3, ProviderError::retryable, || {
+                        search_ddg(&self.client, &self.network_policy, query, max, budget)
+                    });
+                    match tokio::time::timeout(budget, fut).await {
+                        Ok(Ok(o)) => selected = Some(("duckduckgo", o)),
+                        Ok(Err(e)) => attempts.push(("duckduckgo", e.into_message())),
+                        Err(_) => attempts.push(("duckduckgo", timeout_reason(budget))),
+                    }
                 }
 
-                let (p, o) = selected.expect("fallback always selects a provider");
-                (o, p)
+                match selected {
+                    Some((p, o)) => (o, p),
+                    None => {
+                        return Err(KernelError::ToolFailed(all_backends_failed_error(
+                            &attempts,
+                        )));
+                    }
+                }
             }
         };
 
@@ -573,5 +630,43 @@ mod tests {
         ] {
             assert!(policy.validate_url(url).is_ok(), "{url}");
         }
+    }
+
+    #[test]
+    fn all_backends_failed_error_lists_every_backend_and_both_hints() {
+        let msg = all_backends_failed_error(&[
+            ("brave", "search provider rate limit reached (429)"),
+            ("tavily", "search provider returned 401 Unauthorized"),
+            ("duckduckgo", "timeout after 8s"),
+        ]);
+        for backend in ["brave", "tavily", "duckduckgo"] {
+            assert!(msg.contains(backend), "must name {backend}, got: {msg}");
+        }
+        for hint in ["BRAVE_API_KEY", "TAVILY_API_KEY", "HTTPS_PROXY"] {
+            assert!(msg.contains(hint), "must contain hint {hint}, got: {msg}");
+        }
+        assert!(
+            msg.contains("[web_search].api_key_brave"),
+            "must name the config keys, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn all_backends_failed_error_single_backend_still_actionable() {
+        // Explicit-override path (e.g. [web_search] default_provider="brave")
+        // aggregates one attempt but keeps the fix hints.
+        let msg = all_backends_failed_error(&[("brave", "search provider returned 403")]);
+        assert!(msg.contains("brave") && msg.contains("403"), "got: {msg}");
+        assert!(msg.contains("HTTPS_PROXY"), "got: {msg}");
+    }
+
+    #[test]
+    fn timeout_reason_maps_elapsed_deadline_to_one_line_reason() {
+        assert_eq!(timeout_reason(Duration::from_secs(8)), "timeout after 8s");
+        assert_eq!(timeout_reason(Duration::from_secs(1)), "timeout after 1s");
+        assert_eq!(
+            timeout_reason(Duration::from_millis(30_000)),
+            "timeout after 30s"
+        );
     }
 }
