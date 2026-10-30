@@ -24,13 +24,23 @@ jobs:
           TOOLCHAIN=$(python3 -c "import json;print(json.load(open('formal/verus.json'))['rustup_toolchain'])")
           rustup toolchain install "$TOOLCHAIN" --profile minimal
           curl -fsSL "https://github.com/verus-lang/verus/releases/download/release/${PIN}/verus-${PIN}-x86-linux.zip" -o /tmp/verus.zip
-          mkdir -p "$HOME/.verus"
-          unzip -o /tmp/verus.zip -d "$HOME/.verus"
+          # Release zips nest ALL entries under a single verus-x86-linux/
+          # top-level dir (verus build.yml zips the staging dir itself).
+          # Flatten so ~/.verus has binaries at top level — the layout
+          # bin/verify and the PATH export below both assume.
+          unzip -q /tmp/verus.zip -d /tmp/verus-extract
+          INNER=$(echo /tmp/verus-extract/verus-*)
+          [ -d "$INNER" ] || { echo "unexpected verus zip layout: no verus-* dir at zip root" >&2; exit 1; }
+          rm -rf "$HOME/.verus"
+          mv "$INNER" "$HOME/.verus"
           echo "$HOME/.verus" >> "$GITHUB_PATH"
       - name: Verify version pin
         run: |
           PIN=$(python3 -c "import json;print(json.load(open('formal/verus.json'))['version'])")
-          verus --version 2>&1 | grep -q "$PIN"
+          verus --version 2>&1 | grep -q "$PIN" || {
+            echo "verus version pin check failed: want $PIN, got '$(verus --version 2>&1 || echo <command-not-found-or-error>)'" >&2
+            exit 1
+          }
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
