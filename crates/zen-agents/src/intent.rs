@@ -13,14 +13,23 @@
 //!   `logs/decision-audit/thresholds.json`). No τ ⇒ every L1 gate is closed
 //!   (V13-A.3: no invented threshold) and the ladder is byte-identical to the
 //!   pre-T169 path.
-//! - **L2** — the LLM: [`classify`] below, the existing LLM-first
-//!   classification with the keyword fast path as its degraded branch.
+//! - **L2** — the LLM: [`classify`] below, the existing LLM classification
+//!   with the keyword fast path as its degraded branch.
 //!
-//! Within L2, pipeline order is **LLM first, keyword is the degraded fast
-//! path**: a cheap LLM classification turn runs at the top of every
-//! orchestrator turn; only when the LLM is unavailable (routing error, stream
-//! error, timeout, unparsable reply) does the keyword table take over. A
-//! low-confidence LLM verdict (<0.7) and a keyword-miss both fall back to
+//! Within L2, the production ordering depends on the D2 kill-switch
+//! `[agentic.intent] l0_fast_path` (default **on**, Oracle-approved — the
+//! recorded V13-A.3 falsifiable baseline (intent p95 < 500ms) was violated
+//! ~40× by the LLM-first ordering against the default 35B local model):
+//!
+//! - **Fast path on (default)**: a [`keyword_route`] hit serves the turn
+//!   *immediately*; the LLM classification then runs as a detached,
+//!   record-only shadow (T233 `rung:"shadow"` house pattern) that logs the
+//!   L0-vs-L2 disagreement pair to the decision audit. A keyword miss takes
+//!   the inline LLM path exactly as before.
+//! - **Fast path off** (`l0_fast_path = false`): the pre-D2 pipeline —
+//!   LLM first, keyword as the degraded branch — byte-identical.
+//!
+//! A low-confidence LLM verdict (<0.7) and a keyword-miss both fall back to
 //! `Conversation`, mirroring 001's "unknown → Conversation fallback".
 //!
 //! The drift record for this module's doc (it previously described the
@@ -34,8 +43,9 @@
 //! Ambiguous requests now reach a model-driven classification instead of a
 //! substring match; every degrade is observable in logs + audit.
 //! # Default behavior
-//! L1 closed (no τ) ⇒ `classify`: LLM-first, 20s wall-clock cap, `>=0.7`
-//! confidence gate.
+//! L1 closed (no τ) ⇒ `classify`: L0 keyword fast path (default on) with the
+//! LLM as record-only shadow on hits, inline-LLM otherwise, 8s wall-clock cap
+//! (`[agentic.intent] classify_timeout_ms`), `>=0.7` confidence gate.
 //! # Interaction
 //! `keyword_route` is reused verbatim by `AgentOrchestrator::classify_intent`
 //! for the synchronous `route()` facade; the async [`classify`] is the
@@ -65,8 +75,6 @@
 //! **Decision rule** (V8 §6, after PD-01 lands): the outcome distribution
 //! snapshot decides keep-LLM-first vs ambiguity-only-trigger vs retire —
 //! see V8.md §6 "snapshot" section for the evaluation criteria.
-
-use std::time::Duration;
 
 use tracing::warn;
 use zen_core::types::Sensitivity;
@@ -151,9 +159,14 @@ pub(crate) const INTENT_SIGNALS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// Wall-clock cap for the LLM classification turn. A hung provider must not
-/// stall every turn's first token; degrade to the keyword path instead.
-const CLASSIFY_TIMEOUT: Duration = Duration::from_secs(20);
+// D2a: the wall-clock cap for the LLM classification turn is configurable
+// (`[agentic.intent] classify_timeout_ms`, default 8000ms, clamp
+// 1000..=60000, env `ZEN_INTENT_CLASSIFY_TIMEOUT_MS`). The clamp and the
+// E11 warn-on-out-of-range live in
+// `zen_core::config::IntentConfig::classify_timeout` — the single
+// implementation; this module only consults it. Config-load failure
+// degrades to the default (a classification call must never die because a
+// config file is unreadable).
 
 /// 001 A.3: LLM verdicts below this confidence fall back to Conversation
 /// (gate is inclusive — exactly 0.7 is accepted).
@@ -250,16 +263,17 @@ pub enum IntentSource {
     Fallback,
 }
 
-/// Outcome of the LLM classification attempt (T112). Recorded on the
-/// `loop.turn.review` audit line as `intent_llm_outcome` to make the
-/// LLM-first path's worthiness measurable.
+/// The T112 outcomes the `loop.turn.review` audit line records as
+/// `intent_llm_outcome` to make the LLM-first path's worthiness measurable.
+/// Additive-only: consumers match by name, never exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmOutcome {
     /// LLM replied with confidence >= 0.7 — routed as IntentSource::Llm.
     Ok,
     /// LLM replied but confidence < 0.7 — fell back to Conversation.
     LowConfidence,
-    /// LLM classify exceeded the 20s wall-clock cap.
+    /// LLM classify exceeded the configured wall-clock cap
+    /// (`[agentic.intent] classify_timeout_ms`, default 8s).
     Timeout,
     /// Provider/model or API key could not be resolved (config-level).
     Unavailable,
@@ -273,6 +287,11 @@ pub enum LlmOutcome {
     /// outcome the ladder's fast path is meant to produce; its share of
     /// `loop.turn.review` lines is the V13-A.3 "<10% LLM-intent rate" baseline.
     L1Resolved,
+    /// D2c L0 fast path: a keyword-table hit served the turn immediately and
+    /// the LLM classification was demoted to the detached record-only shadow
+    /// (`decision::run_l0_fast_path_shadow`). The turn paid zero LLM latency;
+    /// the shadow's verdict surfaces in the `loop.decision` audit, not here.
+    L0FastPath,
 }
 
 impl LlmOutcome {
@@ -285,6 +304,7 @@ impl LlmOutcome {
             Self::Error => "error",
             Self::Skipped => "skipped",
             Self::L1Resolved => "l1_resolved",
+            Self::L0FastPath => "l0_fast_path",
         }
     }
 }
@@ -422,9 +442,27 @@ pub(crate) fn signal_vocabulary() -> String {
         .join(", ")
 }
 
-/// Classify one user turn: LLM first, keyword fast path on LLM failure,
-/// Conversation fallback on low confidence or keyword miss. Returns the
-/// classified intent plus [`LlmTelemetry`] for the audit line.
+/// Classify one user turn (D2c): a keyword-table hit serves the turn
+/// immediately (L0 fast path, default on via
+/// `[agentic.intent] l0_fast_path`) while the LLM classification runs as a
+/// detached record-only shadow; a keyword miss takes the inline LLM path
+/// (LLM first, keyword fast path on LLM failure, Conversation fallback on
+/// low confidence or keyword miss). Returns the classified intent plus
+/// [`LlmTelemetry`] for the audit line.
+///
+/// Scope logic:
+/// - Functionality: `l0_fast_path = true` removes the LLM classification
+///   from the turn's critical path whenever the keyword table matches;
+///   `false` restores the pre-D2 LLM-first ordering byte-identically
+/// - User impact: keyword-hitting turns start agent routing with zero LLM
+///   wait; the shadow's L0-vs-L2 disagreement pair keeps the decision
+///   falsifiable in the decision audit
+/// - Default: fast path ON (production evidence: 2/3 turns timed out at the
+///   old 20s cap, ~40× over the V13-A.3 p95 baseline)
+/// - Interaction: the fail-fast availability gate (no provider configured)
+///   still runs first and is unchanged; the L1 calibrated gate
+///   (T169) sits above this fn in `decision::classify_intent` and is
+///   unaffected — a keyword hit below that layer's τ never reaches here
 pub async fn classify(
     router: &DefaultRouter,
     query: &str,
@@ -437,6 +475,29 @@ pub async fn classify(
         let intent = keyword_route(query).unwrap_or_else(|| Intent::fallback("default", 0.5));
         return (intent, LlmTelemetry::skipped());
     }
+    let config = zen_core::config::load_config().ok();
+    // D2c: keyword hit ⇒ serve immediately, LLM demoted to the detached
+    // record-only shadow. The spawn itself is fail-safe: without a tokio
+    // runtime (test contexts) the shadow is skipped, never blocks the turn.
+    if config
+        .as_ref()
+        .is_none_or(|config| config.agentic.intent.l0_fast_path_or_default())
+        && let Some(intent) = keyword_route(query)
+    {
+        spawn_l0_shadow(
+            router.clone(),
+            query.to_string(),
+            sensitivity,
+            intent.clone(),
+        );
+        return (
+            intent,
+            LlmTelemetry {
+                outcome: LlmOutcome::L0FastPath,
+                elapsed_ms: 0,
+            },
+        );
+    }
     let start = std::time::Instant::now();
     let verdict = llm_classify(router, query, sensitivity).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -448,6 +509,30 @@ pub async fn classify(
             elapsed_ms,
         },
     )
+}
+
+/// Spawn the detached L0-fast-path shadow (D2c) — never blocks, never
+/// panics the turn.
+///
+/// Scope logic:
+/// - Functionality: runs the same LLM classification the pre-D2 path ran,
+///   off the critical path, and records the L0-vs-L2 disagreement pair
+/// - User impact: none on the turn itself — the record lands in the
+///   decision audit when (if) the LLM answers
+/// - Default: enabled with the fast path (`[agentic.intent] l0_fast_path`)
+/// - Interaction: `Handle::try_current` guards the no-runtime case (inline
+///   unit tests): no runtime ⇒ no spawn and no record. A panic inside the
+///   spawned task is contained by tokio task isolation (the JoinHandle is
+///   dropped, so the turn can never observe it); every failure inside the
+///   shadow is a `Result` (timeout included) that the shadow logs.
+fn spawn_l0_shadow(router: DefaultRouter, query: String, sensitivity: Sensitivity, l0: Intent) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("no tokio runtime; L0 fast-path shadow skipped");
+        return;
+    };
+    handle.spawn(async move {
+        crate::decision::run_l0_fast_path_shadow(&router, sensitivity, &query, &l0).await;
+    });
 }
 
 /// Pure degrade ladder (001 A.3), extracted so every rung is unit-testable
@@ -486,7 +571,7 @@ fn resolve_intent(
 }
 
 /// Map an LLM classify error string to the appropriate [`LlmOutcome`].
-fn classify_error_outcome(err: &str) -> LlmOutcome {
+pub(crate) fn classify_error_outcome(err: &str) -> LlmOutcome {
     if err.contains("timed out") {
         LlmOutcome::Timeout
     } else if err.contains("route:") || err.contains("no provider") {
@@ -501,22 +586,51 @@ fn passes_confidence_gate(confidence: f32) -> bool {
     confidence >= CONFIDENCE_GATE
 }
 
+/// The TaskRequirements one intent-plumbing call carries (D2b).
+///
+/// Pure so the config→requirements mapping is pin-testable without a
+/// provider. `preferred_model` carries `[agentic.intent] model`; the wire
+/// effect rides `DefaultRouter::call_stream_with_model` in
+/// [`complete_prompt`] (honored by the ollama provider — see
+/// `ModelOptions::model`).
+pub(crate) fn requirements_for_intent(
+    config: Option<&zen_core::config::IntentConfig>,
+    sensitivity: Sensitivity,
+    max_tokens: u32,
+) -> TaskRequirements {
+    TaskRequirements {
+        max_tokens: Some(max_tokens),
+        sensitivity,
+        preferred_model: config
+            .and_then(|config| config.model_override())
+            .map(str::to_string),
+        budget_limit: None,
+    }
+}
+
 /// One prompt → one model reply over the streaming path (async safe — no
 /// nested runtime). Callers own prompt construction and output parsing, so
 /// every typed contract in the crate (intent classification, the T171 binary
 /// classifiers) shares one plumbing implementation instead of forking it.
+///
+/// D2a/D2b: the wall-clock cap and the preferred model are read from the
+/// cached global config inside this fn (signature kept stable for the T171
+/// binary-classifier callers; `load_config` is process-cached, the same
+/// internal-read precedent as the orchestrator's `install_delegate_tool`).
 pub(crate) async fn complete_prompt(
     router: &DefaultRouter,
     prompt: &str,
     sensitivity: Sensitivity,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let requirements = TaskRequirements {
-        max_tokens: Some(max_tokens),
-        sensitivity,
-        preferred_model: None,
-        budget_limit: None,
-    };
+    let intent_config = zen_core::config::load_config()
+        .ok()
+        .map(|config| &config.agentic.intent);
+    let requirements = requirements_for_intent(intent_config, sensitivity, max_tokens);
+    let timeout = intent_config.map_or_else(
+        || std::time::Duration::from_millis(zen_core::config::INTENT_CLASSIFY_TIMEOUT_MS_DEFAULT),
+        |config| config.classify_timeout(),
+    );
     // `route()` is a sync trait method whose sensitivity enforcement may run
     // a blocking provider health check (nested `Runtime::new` inside
     // OllamaProvider) — panic-safe only off the async runtime.
@@ -526,9 +640,15 @@ pub(crate) async fn complete_prompt(
         .map_err(|e| format!("classify route join: {e}"))?
         .map_err(|e| format!("route: {e}"))?;
     let prompt = prompt.to_string();
-    tokio::time::timeout(CLASSIFY_TIMEOUT, async {
+    // D2b wire path: the configured intent model rides the per-call
+    // override seam (honored by the ollama provider; others keep their
+    // configured default — see `ModelOptions::model`).
+    let model_override = intent_config
+        .and_then(|config| config.model_override())
+        .map(str::to_string);
+    tokio::time::timeout(timeout, async {
         let mut stream = router
-            .call_stream(provider, &prompt)
+            .call_stream_with_model(provider, &prompt, model_override)
             .map_err(|e| format!("stream: {e}"))?;
         let mut reply = String::new();
         while let Some(token) = stream.token_rx.recv().await {
@@ -571,21 +691,27 @@ pub(crate) async fn classify_typed(
     router: &DefaultRouter,
     query: &str,
     sensitivity: Sensitivity,
-) -> Result<Option<(IntentCategory, f32, Option<String>)>, String> {
+) -> ClassifyVerdict {
     let reply = complete_prompt(router, &classification_prompt(query), sensitivity, 128).await?;
     parse_classification(&reply)
         .map(Some)
         .ok_or_else(|| format!("unparsable classification reply: {reply}"))
 }
 
+/// One typed classification round's verdict: `Ok(Some((category, confidence,
+/// signal)))` on a gated pass, `Ok(None)` below the confidence gate, `Err`
+/// on timeout/unavailable/unparsable. Shared alias so the decision-ladder
+/// consumers (L0 shadow recorder) don't re-spell the nested type.
+pub(crate) type ClassifyVerdict = Result<Option<(IntentCategory, f32, Option<String>)>, String>;
+
 /// L2's call: [`classify_typed`] plus the 001 A.3 verbal-confidence gate
 /// (exactly [`CONFIDENCE_GATE`] passes). `Ok(None)` means "parsed but below
 /// the gate"; `Err` degrades to the keyword fast path.
-async fn llm_classify(
+pub(crate) async fn llm_classify(
     router: &DefaultRouter,
     query: &str,
     sensitivity: Sensitivity,
-) -> Result<Option<(IntentCategory, f32, Option<String>)>, String> {
+) -> ClassifyVerdict {
     match classify_typed(router, query, sensitivity).await? {
         Some((_, confidence, _)) if !passes_confidence_gate(confidence) => Ok(None),
         other => Ok(other),
@@ -941,5 +1067,97 @@ mod tests {
         assert_eq!(LlmOutcome::Error.as_str(), "error");
         assert_eq!(LlmOutcome::Skipped.as_str(), "skipped");
         assert_eq!(LlmOutcome::L1Resolved.as_str(), "l1_resolved");
+        assert_eq!(LlmOutcome::L0FastPath.as_str(), "l0_fast_path");
+    }
+
+    /// Serializes the env-mutating tests below: the kill-switch key is read
+    /// by `classify` (via the per-call test-mode config load), so sibling
+    /// async tests in this binary must not observe a mid-test mutation.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn l0_fast_path_serves_keyword_hit_without_awaiting_the_llm() {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        assert!(router.has_configured_provider());
+
+        // Fast path ON (default): a keyword hit returns IMMEDIATELY with the
+        // keyword intent. L0FastPath is only reachable from the fast path —
+        // the inline LLM path can never produce it — so this outcome is the
+        // proof the LLM call left the critical path (the mock would otherwise
+        // reply unparsable and record LlmOutcome::Error, as the disabled pin
+        // below shows).
+        let (intent, telemetry) = classify(
+            &router,
+            "please refactor this function",
+            Sensitivity::Public,
+        )
+        .await;
+        assert_eq!(intent.source, IntentSource::Keyword);
+        assert_eq!(intent.agent, "Hephaestus");
+        assert_eq!(intent.category, IntentCategory::Action);
+        assert_eq!(telemetry.outcome, LlmOutcome::L0FastPath);
+        assert_eq!(telemetry.elapsed_ms, 0);
+
+        // Keyword miss ⇒ inline LLM path unchanged (mock reply unparsable ⇒
+        // keyword degrade ladder ⇒ Fallback here).
+        let (miss, telemetry) =
+            classify(&router, "tell me a joke about rust", Sensitivity::Public).await;
+        assert_ne!(telemetry.outcome, LlmOutcome::L0FastPath);
+        assert_eq!(miss.source, IntentSource::Fallback);
+    }
+
+    // The ENV_LOCK guard is deliberately held across the classify().await:
+    // serializing the whole env-mutation window (set → classify → remove)
+    // is the point of the lock (T270 TEST_LOCK precedent, async form).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn fast_path_disabled_restores_inline_llm_first_ordering() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+
+        // SAFETY: test-only env mutation, serialized on ENV_LOCK and removed
+        // before the guard drops.
+        unsafe { std::env::set_var("ZEN_INTENT_L0_FAST_PATH", "false") };
+        let (intent, telemetry) = classify(
+            &router,
+            "please refactor this function",
+            Sensitivity::Public,
+        )
+        .await;
+        unsafe { std::env::remove_var("ZEN_INTENT_L0_FAST_PATH") };
+
+        // The inline path ran the mock LLM first: its unparsable reply
+        // degrades to the keyword intent, and the outcome is the LLM attempt
+        // result (Error) — NOT the fast-path marker.
+        assert_ne!(telemetry.outcome, LlmOutcome::L0FastPath);
+        assert_eq!(telemetry.outcome, LlmOutcome::Error);
+        assert_eq!(intent.source, IntentSource::Keyword);
+        assert_eq!(intent.agent, "Hephaestus");
+    }
+
+    #[test]
+    fn requirements_for_intent_carries_the_configured_model() {
+        use zen_core::config::IntentConfig;
+        let mut config = IntentConfig::default();
+        assert_eq!(
+            requirements_for_intent(Some(&config), Sensitivity::Public, 128).preferred_model,
+            None,
+            "absent [agentic.intent] model ⇒ preferred_model stays None"
+        );
+
+        config.model = Some("llama3.2:2GB".to_string());
+        let requirements = requirements_for_intent(Some(&config), Sensitivity::Public, 128);
+        assert_eq!(
+            requirements.preferred_model.as_deref(),
+            Some("llama3.2:2GB")
+        );
+        assert_eq!(requirements.max_tokens, Some(128));
+        assert_eq!(requirements.sensitivity, Sensitivity::Public);
     }
 }

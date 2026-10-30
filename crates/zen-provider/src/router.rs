@@ -1508,6 +1508,119 @@ impl DefaultRouter {
 
         chain
     }
+
+    /// D2b seam: effective stream options for a provider with an optional
+    /// per-call model override layered over the config-resolved options.
+    /// Pure config resolution — pin-testable without a wire.
+    pub(crate) fn stream_options(
+        &self,
+        provider_name: &str,
+        model_override: Option<String>,
+    ) -> zen_core::config::ModelOptions {
+        let mut options = self
+            .resolve_effective_options(provider_name)
+            .unwrap_or_default();
+        if let Some(model) = model_override {
+            options.model = Some(model);
+        }
+        options
+    }
+
+    /// `call_stream` with a per-call model override (D2b — `[agentic.intent]
+    /// model` rides this seam). `None` is byte-identical to the trait method;
+    /// the override lands in [`ModelOptions::model`], which the ollama
+    /// provider honors (other providers keep their configured default).
+    pub fn call_stream_with_model(
+        &self,
+        provider: Provider,
+        prompt: &str,
+        model_override: Option<String>,
+    ) -> Result<crate::stream::StreamResponse, LlmError> {
+        let (guarded, secret_map) = self.secrets_guard_redact(&provider, prompt);
+        let prompt: &str = guarded.as_str();
+        let (stream_resp, token_tx, done_tx) = crate::stream::StreamResponse::new();
+
+        let provider_name = match &provider {
+            Provider::Unknown(name) => name.clone(),
+            _ => provider.to_string(),
+        };
+
+        if provider_name == "mock" {
+            let prompt = prompt.to_string();
+            info!(
+                prompt_len = prompt.len(),
+                "DefaultRouter: MockProvider stream"
+            );
+            if let Some(map) = secret_map {
+                let mock = self.mock.clone();
+                let prompt = prompt.to_string();
+                return guarded_stream_call(
+                    move |inner_tx, inner_done| async move {
+                        let result = mock.complete_streaming("call", &prompt, inner_tx).await;
+                        if let Err(e) = inner_done.send(result.map_err(|e| e.to_string())) {
+                            warn!("mock provider done channel closed: {:?}", e);
+                        }
+                    },
+                    token_tx,
+                    done_tx,
+                    map,
+                );
+            }
+            let mock = self.mock.clone();
+            tokio::spawn(async move {
+                let result = mock.complete_streaming("call", &prompt, token_tx).await;
+                if let Err(e) = done_tx.send(result.map_err(|e| e.to_string())) {
+                    warn!("mock provider done channel closed: {:?}", e);
+                }
+            });
+            return Ok(stream_resp);
+        }
+
+        if let Some(instance) = self.provider_instance(&provider_name) {
+            let prompt = prompt.to_string();
+            let options = self.stream_options(&provider_name, model_override);
+            info!(
+                provider = provider_name,
+                model = options.model.as_deref().unwrap_or(instance.model_name()),
+                prompt_len = prompt.len(),
+                "DefaultRouter: provider stream"
+            );
+            let instance = instance.clone();
+            if let Some(map) = secret_map {
+                let instance = instance.clone();
+                let prompt = prompt.to_string();
+                return guarded_stream_call(
+                    move |inner_tx, inner_done| async move {
+                        let result = instance
+                            .complete_streaming(&prompt, inner_tx, &options)
+                            .await;
+                        if let Err(e) = inner_done.send(result.map_err(|e| e.to_string())) {
+                            warn!("provider done channel closed: {:?}", e);
+                        }
+                    },
+                    token_tx,
+                    done_tx,
+                    map,
+                );
+            }
+            tokio::spawn(async move {
+                let result = instance
+                    .complete_streaming(&prompt, token_tx, &options)
+                    .await;
+                if let Err(e) = done_tx.send(result.map_err(|e| e.to_string())) {
+                    warn!("provider done channel closed: {:?}", e);
+                }
+            });
+        } else {
+            if let Err(e) =
+                done_tx.send(Err(format!("Provider '{}' not configured", provider_name)))
+            {
+                warn!("provider error done channel closed: {:?}", e);
+            }
+        }
+
+        Ok(stream_resp)
+    }
 }
 
 impl LlmRouter for DefaultRouter {
@@ -1625,92 +1738,7 @@ impl LlmRouter for DefaultRouter {
         provider: Provider,
         prompt: &str,
     ) -> Result<crate::stream::StreamResponse, LlmError> {
-        let (guarded, secret_map) = self.secrets_guard_redact(&provider, prompt);
-        let prompt: &str = guarded.as_str();
-        let (stream_resp, token_tx, done_tx) = crate::stream::StreamResponse::new();
-
-        let provider_name = match &provider {
-            Provider::Unknown(name) => name.clone(),
-            _ => provider.to_string(),
-        };
-
-        if provider_name == "mock" {
-            let prompt = prompt.to_string();
-            info!(
-                prompt_len = prompt.len(),
-                "DefaultRouter: MockProvider stream"
-            );
-            if let Some(map) = secret_map {
-                let mock = self.mock.clone();
-                let prompt = prompt.to_string();
-                return guarded_stream_call(
-                    move |inner_tx, inner_done| async move {
-                        let result = mock.complete_streaming("call", &prompt, inner_tx).await;
-                        if let Err(e) = inner_done.send(result.map_err(|e| e.to_string())) {
-                            warn!("mock provider done channel closed: {:?}", e);
-                        }
-                    },
-                    token_tx,
-                    done_tx,
-                    map,
-                );
-            }
-            let mock = self.mock.clone();
-            tokio::spawn(async move {
-                let result = mock.complete_streaming("call", &prompt, token_tx).await;
-                if let Err(e) = done_tx.send(result.map_err(|e| e.to_string())) {
-                    warn!("mock provider done channel closed: {:?}", e);
-                }
-            });
-            return Ok(stream_resp);
-        }
-
-        if let Some(instance) = self.provider_instance(&provider_name) {
-            let prompt = prompt.to_string();
-            let options = self
-                .resolve_effective_options(&provider_name)
-                .unwrap_or_default();
-            info!(
-                provider = provider_name,
-                model = instance.model_name(),
-                prompt_len = prompt.len(),
-                "DefaultRouter: provider stream"
-            );
-            let instance = instance.clone();
-            if let Some(map) = secret_map {
-                let instance = instance.clone();
-                let prompt = prompt.to_string();
-                return guarded_stream_call(
-                    move |inner_tx, inner_done| async move {
-                        let result = instance
-                            .complete_streaming(&prompt, inner_tx, &options)
-                            .await;
-                        if let Err(e) = inner_done.send(result.map_err(|e| e.to_string())) {
-                            warn!("provider done channel closed: {:?}", e);
-                        }
-                    },
-                    token_tx,
-                    done_tx,
-                    map,
-                );
-            }
-            tokio::spawn(async move {
-                let result = instance
-                    .complete_streaming(&prompt, token_tx, &options)
-                    .await;
-                if let Err(e) = done_tx.send(result.map_err(|e| e.to_string())) {
-                    warn!("provider done channel closed: {:?}", e);
-                }
-            });
-        } else {
-            if let Err(e) =
-                done_tx.send(Err(format!("Provider '{}' not configured", provider_name)))
-            {
-                warn!("provider error done channel closed: {:?}", e);
-            }
-        }
-
-        Ok(stream_resp)
+        self.call_stream_with_model(provider, prompt, None)
     }
 
     fn list_providers(&self) -> Vec<(String, String)> {
@@ -1795,6 +1823,17 @@ pub fn is_local_llm_available(router: &dyn LlmRouter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_options_layers_model_override_over_defaults() {
+        // D2b seam: the per-call override lands in ModelOptions::model;
+        // None keeps the config-resolved options untouched.
+        let router = DefaultRouter::new(LlmConfig::default());
+        let overridden = router.stream_options("ollama", Some("llama3.2:2GB".to_string()));
+        assert_eq!(overridden.model.as_deref(), Some("llama3.2:2GB"));
+        let plain = router.stream_options("ollama", None);
+        assert_eq!(plain.model, None);
+    }
 
     // ── FR-042 DST (bbtree Guard-3 pattern): deterministic schedule sweep ─
     // Feature-gated (`--features shuttle`): shuttle swaps tokio primitives

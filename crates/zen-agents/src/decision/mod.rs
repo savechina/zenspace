@@ -1033,6 +1033,82 @@ pub async fn run_intent_shadow(
     append_decision_audit(paths, &entry);
 }
 
+/// D2c L0-fast-path shadow observer: re-runs the L2 LLM classification for a
+/// turn that was already served by the keyword fast path, and records the
+/// L0-vs-L2 pair as ONE `loop.decision` line (`decision_kind`
+/// `"l0_fast_path"`, `rung:"shadow"` — the W3 house pattern). Record-only:
+/// the production verdict is an input, never rewritten.
+///
+/// Scope logic:
+/// - Functionality: measures how often (and how) the LLM disagrees with the
+///   keyword table, keeping the Oracle-approved fast-path default falsifiable
+///   against the V13-A.3 baseline
+/// - User impact: none on the served turn — the caller (intent fast path)
+///   has already returned; this runs detached and only appends audit
+/// - Default: active whenever the fast path is (`[agentic.intent]
+///   l0_fast_path`, default on); bounded by the same configured
+///   `classify_timeout_ms`, so a stuffed model dies quietly at the cap
+/// - Interaction: the audit paths resolve via `ZenPaths::detect()`
+///   (`classify_binary` precedent) — undetectable home ⇒ no record, never an
+///   error; `session_id` is not visible at the intent layer, so the record
+///   carries `"unknown"` rather than a fabricated id
+///
+/// The record carries BOTH labels (the disagreement pair is the point):
+/// `l0_signal`/`l0_category`/`l0_confidence` and `l2_outcome`/`l2_category`/
+/// `l2_signal` plus `elapsed_ms` and `l0_l2_agree` (`null` when L2 produced
+/// no category verdict — timeout/unavailable/error/low-confidence abstain).
+pub(crate) async fn run_l0_fast_path_shadow(
+    router: &DefaultRouter,
+    sensitivity: Sensitivity,
+    query: &str,
+    l0: &Intent,
+) {
+    let start = std::time::Instant::now();
+    let verdict = crate::intent::llm_classify(router, query, sensitivity).await;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let entry = l0_shadow_entry(l0, &verdict, elapsed_ms);
+    if let Ok(paths) = ZenPaths::detect() {
+        append_decision_audit(&paths, &entry);
+    }
+}
+
+/// Pure record builder for [`run_l0_fast_path_shadow`] — unit-testable
+/// without a provider. `verdict` is the L2 outcome; every failure shape
+/// (timeout/unavailable/error/low-confidence abstain) yields a `null`
+/// `l2_category`, which is itself the disagreement evidence (L0 served, L2
+/// could not confirm).
+fn l0_shadow_entry(
+    l0: &Intent,
+    verdict: &crate::intent::ClassifyVerdict,
+    elapsed_ms: u64,
+) -> serde_json::Value {
+    let (l2_outcome, l2_category, l2_signal) = match verdict {
+        Ok(Some((category, _, signal))) => (
+            LlmOutcome::Ok.as_str(),
+            Some(category.as_str()),
+            signal.as_deref(),
+        ),
+        Ok(None) => (LlmOutcome::LowConfidence.as_str(), None, None),
+        Err(error) => {
+            let outcome = crate::intent::classify_error_outcome(error);
+            (outcome.as_str(), None, None)
+        }
+    };
+    let mut entry = shadow_entry("l0_fast_path", "unknown");
+    entry["l0_signal"] = serde_json::json!(l0.signal);
+    entry["l0_category"] = serde_json::json!(l0.category.as_str());
+    entry["l0_confidence"] = serde_json::json!(audit_score(l0.confidence));
+    entry["l2_outcome"] = serde_json::json!(l2_outcome);
+    entry["l2_category"] = serde_json::json!(l2_category);
+    entry["l2_signal"] = serde_json::json!(l2_signal);
+    entry["elapsed_ms"] = serde_json::json!(elapsed_ms);
+    entry["l0_l2_agree"] = match l2_category {
+        Some(category) => serde_json::json!(category == l0.category.as_str()),
+        None => serde_json::Value::Null,
+    };
+    entry
+}
+
 // ---------------------------------------------------------------------------
 // W3 — calibration-queue shadow observers (D13; shadow-only, V13-A.3)
 // ---------------------------------------------------------------------------
@@ -1460,6 +1536,103 @@ mod tests {
         assert_eq!(production_rung(IntentSource::Llm), "L2");
         assert_eq!(production_rung(IntentSource::Keyword), "L0");
         assert_eq!(production_rung(IntentSource::Fallback), "L0");
+    }
+
+    #[test]
+    fn l0_shadow_record_carries_both_l0_and_l2_labels() {
+        let l0 = production_intent(IntentCategory::Action, IntentSource::Keyword);
+
+        // L2 agrees with a concrete signal.
+        let agreeing = l0_shadow_entry(
+            &l0,
+            &Ok(Some((
+                IntentCategory::Action,
+                0.9,
+                Some("coder".to_string()),
+            ))),
+            1234,
+        );
+        assert_eq!(agreeing["kind"], "loop.decision");
+        assert_eq!(agreeing["decision_kind"], "l0_fast_path");
+        assert_eq!(agreeing["rung"], SHADOW_RUNG, "W3 house rung marker");
+        assert_eq!(agreeing["l0_signal"], "default");
+        assert_eq!(agreeing["l0_category"], "Action");
+        assert!(agreeing["l0_confidence"].as_f64().is_some());
+        assert_eq!(agreeing["l2_outcome"], "ok");
+        assert_eq!(agreeing["l2_category"], "Action");
+        assert_eq!(agreeing["l2_signal"], "coder");
+        assert_eq!(agreeing["elapsed_ms"], 1234);
+        assert_eq!(agreeing["l0_l2_agree"], true);
+
+        // L2 disagrees on category ⇒ the disagreement pair is explicit.
+        let disagreeing = l0_shadow_entry(
+            &l0,
+            &Ok(Some((IntentCategory::Conversation, 0.95, None))),
+            5,
+        );
+        assert_eq!(disagreeing["l2_outcome"], "ok");
+        assert_eq!(disagreeing["l2_category"], "Conversation");
+        assert_eq!(disagreeing["l2_signal"], serde_json::Value::Null);
+        assert_eq!(disagreeing["l0_l2_agree"], false);
+
+        // L2 failure shapes (timeout/unavailable/error/low-confidence) keep
+        // the L2 side null — evidence that L0 served while L2 could not
+        // confirm — and never fabricate agreement.
+        for verdict in [
+            Err("classification timed out".to_string()),
+            Err("route: no provider".to_string()),
+            Ok(None),
+        ] {
+            let entry = l0_shadow_entry(&l0, &verdict, 0);
+            assert_eq!(entry["l2_category"], serde_json::Value::Null);
+            assert_eq!(entry["l0_l2_agree"], serde_json::Value::Null);
+            assert_eq!(entry["l0_category"], "Action");
+            assert!(
+                entry["l2_outcome"].as_str().is_some(),
+                "the L2 failure shape is still labelled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn l0_fast_path_shadow_appends_to_decision_audit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: test-only env mutation; nextest runs one process per test
+        // and the test-support build resolves ZEN_HOME per call (T118).
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let l0 = production_intent(IntentCategory::Action, IntentSource::Keyword);
+        run_l0_fast_path_shadow(
+            &router,
+            Sensitivity::Public,
+            "please refactor this function",
+            &l0,
+        )
+        .await;
+
+        let audit =
+            std::fs::read_to_string(dir.path().join("logs").join("audit.jsonl")).expect("audit");
+        let entry: serde_json::Value = serde_json::from_str(
+            audit
+                .lines()
+                .find(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .map(|v| v["decision_kind"] == "l0_fast_path")
+                        .unwrap_or(false)
+                })
+                .expect("l0_fast_path record present"),
+        )
+        .expect("valid json");
+        assert_eq!(entry["l0_category"], "Action");
+        assert_eq!(entry["l0_signal"], "default");
+        assert!(entry["elapsed_ms"].as_u64().is_some());
+        // The mock's unparsable reply is an L2 error observation.
+        assert_eq!(entry["l2_outcome"], "error");
+        assert_eq!(entry["l2_category"], serde_json::Value::Null);
     }
 
     #[test]

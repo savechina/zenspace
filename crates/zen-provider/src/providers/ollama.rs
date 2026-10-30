@@ -54,6 +54,13 @@ impl OllamaProvider {
         })
     }
 
+    /// D2b: per-call model override — `options.model` wins over the
+    /// provider's configured default (ollama model names are per-request,
+    /// so the override needs no client rebuild).
+    fn effective_model<'a>(&'a self, options: &'a zen_core::config::ModelOptions) -> &'a str {
+        options.model.as_deref().unwrap_or(&self.model)
+    }
+
     pub async fn complete_async(
         &self,
         prompt: &str,
@@ -61,7 +68,7 @@ impl OllamaProvider {
     ) -> Result<String, LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion_model(&self.model);
+        let model = client.completion_model(self.effective_model(options));
         let mut agent_builder = AgentBuilder::new(model);
         if let Some(t) = options.temperature {
             agent_builder = agent_builder.temperature(t);
@@ -76,7 +83,7 @@ impl OllamaProvider {
         })?;
 
         info!(
-            model = self.model,
+            model = self.effective_model(options),
             response_len = response.len(),
             "OllamaProvider complete"
         );
@@ -124,7 +131,7 @@ impl OllamaProvider {
     ) -> Result<UsedCompletion, LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion_model(&self.model);
+        let model = client.completion_model(self.effective_model(options));
         let mut request = model.completion_request(prompt);
         if let Some(t) = options.temperature {
             request = request.temperature(t);
@@ -172,7 +179,7 @@ impl OllamaProvider {
     ) -> Result<(), LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion_model(&self.model);
+        let model = client.completion_model(self.effective_model(options));
 
         let mut request = model.completion_request(prompt.to_string());
         if let Some(t) = options.temperature {
@@ -209,7 +216,7 @@ impl OllamaProvider {
         }
 
         info!(
-            model = self.model,
+            model = self.effective_model(options),
             response_len = full_response.len(),
             "OllamaProvider stream complete"
         );
@@ -265,4 +272,23 @@ pub(crate) fn is_loopback_url(base_url: &str) -> bool {
     let host = host.trim_matches(|c| c == '[' || c == ']');
     // `0.0.0.0` (unspecified) also never leaves the machine.
     host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_model_prefers_options_override() {
+        // D2b: the per-call override wins; absent override keeps the
+        // provider's configured default (byte-identical legacy path).
+        let provider = OllamaProvider::new(
+            "http://127.0.0.1:11434".to_string(),
+            "qwen3.6:35b-mlx".to_string(),
+        );
+        let mut options = zen_core::config::ModelOptions::default();
+        assert_eq!(provider.effective_model(&options), "qwen3.6:35b-mlx");
+        options.model = Some("llama3.2:2GB".to_string());
+        assert_eq!(provider.effective_model(&options), "llama3.2:2GB");
+    }
 }
