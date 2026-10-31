@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Background tool execution** (2026-10-31): `shell.exec` gains a
+  `background: bool` param (default `false` — foreground path byte-identical).
+  Background spawns run all existing validation gates (seatbelt, env
+  scrubbing, process groups), return a task handle immediately
+  (`{"task_id","status":"running","output_dir",…}`), and stream stdout/stderr
+  to `~/.zen/logs/tasks/<task_id>/` (8 MiB per-stream stop-capture with a
+  `truncated` flag — the child is never SIGPIPE-killed by its own logs).
+  Two new tools collect and control them: `shell.collect {task_id, wait_ms?}`
+  (default 10 s yield-wait, ≤8 k char tails, full stdout inline when ≤4 k,
+  meta.json fallback across daemon restarts) and `shell.kill {task_id}`
+  (SIGTERM → 3 s → SIGKILL process group). Completed tasks push a
+  per-session notice into the next model round (consume-once cursor — another
+  session's tasks are never injected); the stream path echoes notices live.
+  Lifecycle: wall-clock deadline `[agentic.background] max_wall_secs`
+  (default 1800, clamp 60..86400, env `ZEN_BACKGROUND_MAX_WALL_SECS`) and
+  concurrency `max_concurrent` (default 4, clamp 1..16,
+  `ZEN_BACKGROUND_MAX_CONCURRENT`) enforced on the gateway's existing 30 s GC
+  tick; SIGTERM drain kills live tasks with audit lines; daemon boot marks
+  crash-orphaned task metas (mark-only — no pid-reuse kill risk). Task
+  outputs expire after 7 days via the retention table.
+
 ### Fixed
 
 - **Bounded web.search** (2026-10-30): a dead or hanging search backend no
