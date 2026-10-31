@@ -12,7 +12,7 @@
 #![allow(clippy::print_stdout)]
 
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -24,6 +24,20 @@ const TIMEOUT: Duration = Duration::from_secs(12);
 
 type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
 
+/// Process-wide PTY serializer. Every test in this file drives a REAL child
+/// process through a PTY and asserts wall-clock timing (12s wait timeouts,
+/// one-shot screen captures after 300–400ms settle sleeps); under
+/// `cargo test`'s default runner (one thread per test, ~12-way on an 8–12
+/// core box) the cross-test CPU oversubscription corrupts partial-painted
+/// frames and starves child startup — observed as mass failures when the
+/// suite is invoked with plain `cargo test -- --ignored` instead of the
+/// documented `bin/test tui pty` entry (which passes `--test-threads=1`).
+/// Each test holds exactly one `Tui` for its whole lifetime, so packaging
+/// the guard INSIDE `Tui` (acquired in `spawn_cmd`, released on drop)
+/// serializes the suite at zero per-test cost; with `--test-threads=1` the
+/// lock is uncontended and behavior is unchanged.
+static PTY_SERIAL: Mutex<()> = Mutex::new(());
+
 struct Tui {
     child: Box<dyn portable_pty::Child + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -34,6 +48,8 @@ struct Tui {
     /// update pairs).
     raw: Arc<Mutex<Vec<u8>>>,
     _reader: std::thread::JoinHandle<()>,
+    /// Held for the Tui's whole lifetime — the suite-wide serializer seat.
+    _serial: MutexGuard<'static, ()>,
     // Keep the isolated HOME alive for the child's lifetime.
     _home: Option<tempfile::TempDir>,
 }
@@ -79,6 +95,9 @@ impl Tui {
         extra_env: &[(&str, &str)],
         config_toml: Option<&str>,
     ) -> Self {
+        // Serialize before ANY PTY work (poison-tolerant: a panicking sibling
+        // test must not cascade — matches the guards::lock_ok discipline).
+        let serial = PTY_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -189,6 +208,7 @@ impl Tui {
             parser,
             raw,
             _reader,
+            _serial: serial,
             _home: home_cell,
         }
     }
@@ -430,8 +450,14 @@ fn e10_burst_resize_preserves_content_and_single_viewport() {
     // The echo commits to scrollback at submit; the echo-LLM seam completes
     // the turn so the transcript is static before the burst starts.
     tui.wait_for(MARKER, "user echo committed to scrollback");
+    // Needle MUST be the label form `── ` (two U+2500 + space): the turn
+    // separator renders `── <elapsed>s ──` while the composer border
+    // (`┌────…┐`) renders bare `──` runs without interior spaces — a bare
+    // `──` needle matches the border instantly and the burst starts while
+    // the echo turn is still streaming (observed flake: `● working` on the
+    // footer at assert time, transcript tail cut mid-stream).
     tui.wait_for(
-        "\u{2500}\u{2500}",
+        "\u{2500}\u{2500} ",
         "turn separator (turn completed pre-burst)",
     );
 
@@ -663,7 +689,7 @@ fn e13_echo_streaming_commits_blocks_without_duplication() {
     tui.wait_for("A paragraph with", "committed paragraph in scrollback");
     tui.wait_for("fn main", "committed code fence in scrollback");
     // Completion flushes the tail and emits the turn separator.
-    tui.wait_for("\u{2500}\u{2500}", "turn separator after completion");
+    tui.wait_for("\u{2500}\u{2500} ", "turn separator after completion");
 
     let screen = tui.screen();
     assert_eq!(
@@ -717,7 +743,7 @@ fn e14_echo_streaming_thinking_toggle_surfaces_reasoning() {
     tui.send(b"hello echo\r");
     tui.wait_for("Thought for", "graduation line in scrollback");
     tui.wait_for("A paragraph with", "committed paragraph in scrollback");
-    tui.wait_for("\u{2500}\u{2500}", "turn separator after completion");
+    tui.wait_for("\u{2500}\u{2500} ", "turn separator after completion");
     let screen = tui.screen();
     assert!(
         screen.contains("understand the user's request"),
@@ -958,7 +984,7 @@ fn e19_width_change_replays_transcript_at_new_width() {
         "replay must reinsert exactly once (no duplication):\n{wide}"
     );
     assert!(
-        wide.contains("\u{2500}\u{2500}"),
+        wide.contains("\u{2500}\u{2500} "),
         "turn separator must survive the purge+replay:\n{wide}"
     );
 
