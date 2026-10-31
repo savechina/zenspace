@@ -1218,7 +1218,9 @@ pub async fn turn_with(
         token_notify.notify_one();
     };
 
-    let watchdog = crate::server::guards::watchdog_timeout();
+    let watchdog = crate::server::guards::watchdog_deadline(
+        crate::server::guards::local_llm_reachable_cached(),
+    );
     let turn_scope = record.turn_id.clone();
     let prompt_for_persist = prompt.clone();
     let execution = async move {

@@ -55,21 +55,38 @@ pub struct TurnNotification {
 }
 
 /// Client-side ceiling for one hosted turn (LLM + tool rounds). Must
-/// exceed the server watchdog (`ZEN_TURN_WATCHDOG_SECS`, default 900s)
-/// so the server's own guards resolve the turn before the client
-/// abandons it.
+/// exceed the server watchdog (`ZEN_TURN_WATCHDOG_SECS` default, config
+/// `[gateway].turn_watchdog_secs`) so the server's own guards resolve the
+/// turn before the client abandons it.
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(960);
 
-/// Effective turn ceiling: [`TURN_TIMEOUT`] unless
-/// `ZEN_TURN_TIMEOUT_SECS` overrides it (parsed once per process).
+/// Margin the ceiling adds above the widest server watchdog
+/// (`960 default = 900 watchdog + 60`).
+const CEILING_MARGIN: Duration = Duration::from_secs(60);
+
+/// Effective turn ceiling: [`TURN_TIMEOUT`] unless `ZEN_TURN_TIMEOUT_SECS`
+/// overrides it (parsed once per process); otherwise config-derived
+/// `max(base, local probe) + CEILING_MARGIN` so the invariant
+/// "ceiling > server watchdog" holds with the same configs the daemon
+/// reads (local probe scales both sides together).
 fn turn_timeout() -> Duration {
     static OVERRIDE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *OVERRIDE.get_or_init(|| {
-        std::env::var("ZEN_TURN_TIMEOUT_SECS")
+        if let Some(v) = std::env::var("ZEN_TURN_TIMEOUT_SECS")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(TURN_TIMEOUT)
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Duration::from_secs(v);
+        }
+        let base = Duration::from_secs(crate::server::guards::base_watchdog_secs());
+        let effective = if crate::server::guards::local_llm_reachable_cached() {
+            base.max(Duration::from_secs(
+                crate::server::guards::local_watchdog_secs(),
+            ))
+        } else {
+            base
+        };
+        effective + CEILING_MARGIN
     })
 }
 

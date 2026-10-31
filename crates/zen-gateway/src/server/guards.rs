@@ -3,8 +3,9 @@
 //!
 //! PURPOSE: Contains runaway agent loops at the daemon boundary. Four
 //! guards with data-model E7 defaults: [`TurnWatchdog`] (per-turn
-//! deadline, 900s default — enforced in `hosting::turn` via
-//! [`watchdog_timeout`]), [`CircuitBreaker`] (consecutive failed turns
+//! deadline, 900s default, scaled wider when a local LLM is reachable —
+//! enforced in `hosting::turn` via [`watchdog_deadline`]),
+//! [`CircuitBreaker`] (consecutive failed turns
 //! per session → cool-down, 5→60s), [`DoomLoop`] (turn-rate cap per
 //! session window, 20/10min), and the StaleClientGC heartbeat helper.
 //!
@@ -94,6 +95,117 @@ pub fn watchdog_timeout() -> Duration {
             .map(Duration::from_secs)
             .unwrap_or(WATCHDOG_TIMEOUT)
     })
+}
+
+/// Base watchdog seconds: config `[gateway].turn_watchdog_secs` (5-layer),
+/// falling back to the default when config cannot be loaded. Legacy
+/// `ZEN_TURN_WATCHDOG_SECS` precedence is applied by the callers, not here.
+pub(crate) fn base_watchdog_secs() -> u64 {
+    zen_core::config::load_config()
+        .map(|c| c.gateway.turn_watchdog_secs_or_default())
+        .unwrap_or(zen_core::config::GATEWAY_TURN_WATCHDOG_DEFAULT_SECS)
+}
+
+/// Local-LLM watchdog seconds from
+/// `[gateway].local_turn_watchdog_secs` (same load fallback).
+pub(crate) fn local_watchdog_secs() -> u64 {
+    zen_core::config::load_config()
+        .map(|c| c.gateway.local_turn_watchdog_secs_or_default())
+        .unwrap_or(zen_core::config::GATEWAY_LOCAL_TURN_WATCHDOG_DEFAULT_SECS)
+}
+
+/// Effective per-turn watchdog deadline.
+///
+/// Precedence: the legacy `ZEN_TURN_WATCHDOG_SECS` env (explicit full
+/// override, parsed once per process) beats everything; otherwise the base
+/// budget (`[gateway].turn_watchdog_secs`, default 900s) is widened to
+/// `max(base, local)` when `local_reachable` — a slow local model must
+/// finish multi-round tool loops instead of dying at the base deadline.
+/// The local budget never shortens below the base.
+pub fn watchdog_deadline(local_reachable: bool) -> Duration {
+    if let Some(t) = repo_watchdog_env_override() {
+        return t;
+    }
+    let base = Duration::from_secs(base_watchdog_secs());
+    if local_reachable {
+        base.max(Duration::from_secs(local_watchdog_secs()))
+    } else {
+        base
+    }
+}
+
+/// Process-static parse of the legacy explicit watchdog
+/// (`ZEN_TURN_WATCHDOG_SECS`); `None` when unset/unparsable.
+fn repo_watchdog_env_override() -> Option<Duration> {
+    static PARSED: StdMutex<Option<Option<Duration>>> = StdMutex::new(None);
+    *lock_ok(&PARSED, "watchdog env override").get_or_insert_with(|| {
+        std::env::var("ZEN_TURN_WATCHDOG_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+    })
+}
+
+/// TTL for the cached local-LLM reachability probe (GraphCoreCache
+/// precedent): an ollama started mid-session is picked up within ≤5min.
+const LOCAL_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Shared answer holder: the override seam and the cached reader MUST be
+/// the same static or the seam writes into a slot nobody reads.
+static LOCAL_PROBE_OVERRIDE: StdMutex<Option<bool>> = StdMutex::new(None);
+
+/// Cached local-LLM reachability for turn-budget scaling (and the client
+/// turn ceiling): a `zen_provider` router probe over
+/// `DefaultRouter::from_agentic` running the ollama `health_check`
+/// (dedicated-threaded, no-proxy for loopback); process-lifetime cache
+/// with [`LOCAL_PROBE_TTL`]; probe failure is fail-safe (unreachable ⇒
+/// base deadline).
+///
+/// `#[doc(hidden)]` seam: `set_local_llm_probe_override` pins locality
+/// deterministically in tests without a network. The seam and this reader
+/// share one static — two module statics of the same name would be separate
+/// cells and the pin would write into a slot nobody reads (caught by the
+/// pin at review time).
+#[must_use]
+pub fn local_llm_reachable_cached() -> bool {
+    if let Some(v) = *lock_ok(&LOCAL_PROBE_OVERRIDE, "local probe override") {
+        return v;
+    }
+    static CACHE: StdMutex<Option<(std::time::Instant, bool)>> = StdMutex::new(None);
+    let mut cache = lock_ok(&CACHE, "local probe cache");
+    if let Some((at, reachable)) = *cache
+        && at.elapsed() < LOCAL_PROBE_TTL
+    {
+        return reachable;
+    }
+    let reachable = probe_local_llm_reachable();
+    *cache = Some((std::time::Instant::now(), reachable));
+    reachable
+}
+
+/// One fresh ollama reachability probe. Config load failure degrades to
+/// defaults (no ollama ⇒ unreachable ⇒ byte-identical base).
+#[must_use]
+pub fn probe_local_llm_reachable() -> bool {
+    match zen_core::config::load_config() {
+        Ok(cfg) => probe_router(cfg),
+        Err(e) => {
+            tracing::warn!(error = %e, "config load failed; probing local LLM with defaults");
+            probe_router(&zen_core::config::ZenConfig::default())
+        }
+    }
+}
+
+fn probe_router(cfg: &zen_core::config::ZenConfig) -> bool {
+    let router = zen_provider::DefaultRouter::from_agentic(cfg);
+    zen_provider::is_local_llm_available(&router)
+}
+
+/// Test seam: pin the cached reachability answer (docs in
+/// [`local_llm_reachable_cached`]). `None` restores live probing.
+#[doc(hidden)]
+pub fn set_local_llm_probe_override(v: Option<bool>) {
+    *lock_ok(&LOCAL_PROBE_OVERRIDE, "local probe override") = v;
 }
 
 /// Watchdog expiry surfaced as a catalog rejection to the turn caller.

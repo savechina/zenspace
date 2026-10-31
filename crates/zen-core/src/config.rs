@@ -1732,6 +1732,23 @@ impl CacheConfig {
 const COMPILE_GHOSTLINK_STRIP: &str = "strip";
 const COMPILE_GHOSTLINK_WARN: &str = "warn";
 
+/// Per-turn watchdog default seconds (base) — data-model E7 `TurnWatchdog`.
+///
+/// Must exceed the client's first-token budget (zen-agents
+/// `ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS`, default 600s) so cold local
+/// models finish their load+prefill before the watchdog fires, and the
+/// invariant `ceiling > watchdog` must hold versus `TURN_TIMEOUT`.
+pub const GATEWAY_TURN_WATCHDOG_DEFAULT_SECS: u64 = 900;
+/// Local-LLM watchdog default seconds: applied (max'd with the base) when
+/// a local LLM is reachable. 3× the base covers a 35B-class local model
+/// taking ~2-4min per round over a multi-round tool loop.
+pub const GATEWAY_LOCAL_TURN_WATCHDOG_DEFAULT_SECS: u64 = 2700;
+
+/// Inclusive clamp range for `[gateway] turn_watchdog_secs`.
+pub const GATEWAY_TURN_WATCHDOG_CLAMP: (u64, u64) = (60, 14_400);
+/// Inclusive clamp range for `[gateway] local_turn_watchdog_secs`.
+pub const GATEWAY_LOCAL_TURN_WATCHDOG_CLAMP: (u64, u64) = (60, 86_400);
+
 /// Valid `[gateway] upgrade_policy` value: surface the stale daemon but
 /// never act on it (default).
 pub const GATEWAY_UPGRADE_WARN: &str = "warn";
@@ -1758,11 +1775,34 @@ pub const GATEWAY_UPGRADE_AUTO_RESTART: &str = "auto-restart";
 ///   TUI-spawned daemons run the current binary by construction and never
 ///   trigger the policy. `zen doctor`'s daemon-version probe diagnoses but
 ///   never acts, regardless of policy.
+///
+/// Turn-budget keys (2026-10-31, slow-local-model fix):
+/// - Functionality: `turn_watchdog_secs` is the base per-turn watchdog
+///   deadline (zen-guards `-32020 watchdog`); `local_turn_watchdog_secs` is
+///   the deadline applied (max'd with the base) when a local LLM — default
+///   ollama probe — is reachable, so slow local models complete multi-round
+///   tool loops instead of dying at the base deadline.
+/// - User impact: 35B-class local sessions no longer get turn-cancelled
+///   mid-tool-chain; cloud-only machines keep 900s (byte-identical when the
+///   local probe answers unreachable).
+/// - Default: 900 / 2700; clamps 60..=14400 / 60..=86400; out-of-range
+///   values warn and degrade to the default (E11).
+/// - Interaction: env `ZEN_GATEWAY_TURN_WATCHDOG_SECS` /
+///   `ZEN_GATEWAY_LOCAL_TURN_WATCHDOG_SECS` (5th layer) override config
+///   files; the legacy per-process envs `ZEN_TURN_WATCHDOG_SECS`
+///   (watchdog) and `ZEN_TURN_TIMEOUT_SECS` (client ceiling) beat both —
+///   when overriding manually keep the invariant: ceiling > watchdog.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct GatewayConfig {
     /// Stale-daemon action — TOML `upgrade_policy` (absent → "warn").
     pub upgrade_policy: Option<String>,
+    /// Base per-turn watchdog deadline — TOML `turn_watchdog_secs`
+    /// (absent → [`GATEWAY_TURN_WATCHDOG_DEFAULT_SECS`]).
+    pub turn_watchdog_secs: Option<u64>,
+    /// Local-LLM watchdog deadline — TOML `local_turn_watchdog_secs`
+    /// (absent → [`GATEWAY_LOCAL_TURN_WATCHDOG_DEFAULT_SECS`]).
+    pub local_turn_watchdog_secs: Option<u64>,
 }
 
 impl GatewayConfig {
@@ -1783,6 +1823,64 @@ impl GatewayConfig {
                 );
                 GATEWAY_UPGRADE_WARN
             }
+        }
+    }
+
+    /// Effective base watchdog seconds: clamp(60..=14_400), default 900;
+    /// out-of-range values warn and degrade to the default (E11 — a typo
+    /// must never silently shift the deadline, cron-timezone discipline).
+    pub fn turn_watchdog_secs_or_default(&self) -> u64 {
+        match self.turn_watchdog_secs {
+            Some(secs)
+                if (GATEWAY_TURN_WATCHDOG_CLAMP.0..=GATEWAY_TURN_WATCHDOG_CLAMP.1)
+                    .contains(&secs) =>
+            {
+                secs
+            }
+            Some(secs) => {
+                // Warn-once per process (k3 discipline): callers run per turn.
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        value = secs,
+                        "[gateway] turn_watchdog_secs outside {min}..={max}; \
+                         using default {default}s",
+                        min = GATEWAY_TURN_WATCHDOG_CLAMP.0,
+                        max = GATEWAY_TURN_WATCHDOG_CLAMP.1,
+                        default = GATEWAY_TURN_WATCHDOG_DEFAULT_SECS
+                    );
+                });
+                GATEWAY_TURN_WATCHDOG_DEFAULT_SECS
+            }
+            None => GATEWAY_TURN_WATCHDOG_DEFAULT_SECS,
+        }
+    }
+
+    /// Effective local-LLM watchdog seconds: clamp(60..=86_400), default
+    /// 2700; out-of-range values warn and degrade to the default (E11).
+    pub fn local_turn_watchdog_secs_or_default(&self) -> u64 {
+        match self.local_turn_watchdog_secs {
+            Some(secs)
+                if (GATEWAY_LOCAL_TURN_WATCHDOG_CLAMP.0..=GATEWAY_LOCAL_TURN_WATCHDOG_CLAMP.1)
+                    .contains(&secs) =>
+            {
+                secs
+            }
+            Some(secs) => {
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        value = secs,
+                        "[gateway] local_turn_watchdog_secs outside {min}..={max}; \
+                         using default {default}s",
+                        min = GATEWAY_LOCAL_TURN_WATCHDOG_CLAMP.0,
+                        max = GATEWAY_LOCAL_TURN_WATCHDOG_CLAMP.1,
+                        default = GATEWAY_LOCAL_TURN_WATCHDOG_DEFAULT_SECS
+                    );
+                });
+                GATEWAY_LOCAL_TURN_WATCHDOG_DEFAULT_SECS
+            }
+            None => GATEWAY_LOCAL_TURN_WATCHDOG_DEFAULT_SECS,
         }
     }
 
@@ -2815,6 +2913,14 @@ fn merge_configs(base: ZenConfig, override_cfg: ZenConfig) -> Result<ZenConfig, 
                 .gateway
                 .upgrade_policy
                 .or(base.gateway.upgrade_policy),
+            turn_watchdog_secs: override_cfg
+                .gateway
+                .turn_watchdog_secs
+                .or(base.gateway.turn_watchdog_secs),
+            local_turn_watchdog_secs: override_cfg
+                .gateway
+                .local_turn_watchdog_secs
+                .or(base.gateway.local_turn_watchdog_secs),
         },
     })
 }
@@ -3305,6 +3411,29 @@ fn apply_web_search_env(cfg: &mut WebSearchConfig) {
 fn apply_gateway_env(cfg: &mut GatewayConfig) {
     if let Some(v) = env_str("ZEN_GATEWAY_UPGRADE_POLICY") {
         cfg.upgrade_policy = Some(v);
+    }
+    for (env_key, field, label) in [
+        (
+            "ZEN_GATEWAY_TURN_WATCHDOG_SECS",
+            &mut cfg.turn_watchdog_secs,
+            "turn_watchdog_secs",
+        ),
+        (
+            "ZEN_GATEWAY_LOCAL_TURN_WATCHDOG_SECS",
+            &mut cfg.local_turn_watchdog_secs,
+            "local_turn_watchdog_secs",
+        ),
+    ] {
+        if let Some(v) = env_str(env_key) {
+            match v.trim().parse::<u64>() {
+                Ok(parsed) => *field = Some(parsed),
+                Err(_) => tracing::warn!(
+                    value = %v,
+                    key = label,
+                    "{env_key} is not a number; ignoring (config/default stays)"
+                ),
+            }
+        }
     }
 }
 
@@ -5371,6 +5500,31 @@ mod gateway_config_tests {
             GATEWAY_UPGRADE_WARN
         );
         unsafe { std::env::remove_var("ZEN_GATEWAY_UPGRADE_POLICY") };
+    }
+
+    #[test]
+    fn gateway_turn_watchdog_defaults_and_clamps() {
+        let cfg: ZenConfig = toml::from_str("[gateway]").expect("parse");
+        assert_eq!(cfg.gateway.turn_watchdog_secs_or_default(), 900);
+        assert_eq!(cfg.gateway.local_turn_watchdog_secs_or_default(), 2700);
+        let cfg: ZenConfig =
+            toml::from_str("[gateway]\nturn_watchdog_secs = 59\nlocal_turn_watchdog_secs = 86401")
+                .expect("parse");
+        assert_eq!(cfg.gateway.turn_watchdog_secs_or_default(), 900);
+        assert_eq!(cfg.gateway.local_turn_watchdog_secs_or_default(), 2700);
+    }
+
+    #[test]
+    fn gateway_turn_watchdog_env_layer_applies_and_reasons() {
+        // SAFETY: test-only env mutation; these keys are read by no sibling
+        // test in this binary and are removed at the end.
+        unsafe { std::env::set_var("ZEN_GATEWAY_TURN_WATCHDOG_SECS", "1200") };
+        unsafe { std::env::set_var("ZEN_GATEWAY_LOCAL_TURN_WATCHDOG_SECS", "abc") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.gateway.turn_watchdog_secs_or_default(), 1200);
+        assert_eq!(cfg.gateway.local_turn_watchdog_secs_or_default(), 2700);
+        unsafe { std::env::remove_var("ZEN_GATEWAY_TURN_WATCHDOG_SECS") };
+        unsafe { std::env::remove_var("ZEN_GATEWAY_LOCAL_TURN_WATCHDOG_SECS") };
     }
 }
 

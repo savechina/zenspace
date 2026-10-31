@@ -682,3 +682,19 @@ enabled = true
 #
 [gateway]
 # upgrade_policy = "warn"
+#
+# Per-turn watchdog budget (2026-10-31 slow-local-model fix).
+#   turn_watchdog_secs       — base per-turn deadline (server guard -32020
+#                              watchdog; default 900, clamp 60..=14400).
+#   local_turn_watchdog_secs — deadline used (max'd with the base) when a
+#                              local LLM (ollama probe) is reachable, so slow
+#                              local models finish multi-round tool loops
+#                              (default 2700, clamp 60..=86400). Cloud-only
+#                              machines keep the base deadline unchanged.
+# The client turn ceiling derives itself from the same keys (+60s margin)
+# so `ceiling > watchdog` holds. Legacy per-process envs
+# ZEN_TURN_WATCHDOG_SECS (server) / ZEN_TURN_TIMEOUT_SECS (client) beat
+# both — override them in pairs to keep the invariant intact.
+#
+# turn_watchdog_secs = 900
+# local_turn_watchdog_secs = 2700

@@ -154,4 +154,18 @@ max_concurrent = 8
                 && c.agentic.background.max_concurrent == Some(8)
         },
     );
+
+    // Gateway turn budgets ([gateway] — slow-local-model fix 2026-10-31).
+    assert_key_lands(
+        r#"
+[gateway]
+turn_watchdog_secs = 1234
+local_turn_watchdog_secs = 5678
+"#,
+        "gateway.(turn_watchdog_secs|local_turn_watchdog_secs)",
+        |c| {
+            c.gateway.turn_watchdog_secs == Some(1234)
+                && c.gateway.local_turn_watchdog_secs == Some(5678)
+        },
+    );
 }
