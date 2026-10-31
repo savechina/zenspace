@@ -11118,6 +11118,7 @@ dependencies = [
  "zen-agents",
  "zen-core",
  "zen-memory",
+ "zen-plugin",
  "zen-provider",
  "zen-repo",
  "zen-vault",

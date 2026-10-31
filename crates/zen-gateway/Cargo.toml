@@ -12,6 +12,10 @@ zen-agents = { path = "../zen-agents" }
 zen-provider = { path = "../zen-provider" }
 zen-memory = { path = "../zen-memory" }
 zen-repo = { path = "../zen-repo" }
+# Lane G (background-tool-execution design): direct dep for the daemon
+# lifecycle hooks (boot orphan sweep, SIGTERM drain kill_all, GC-tick
+# expire_due) — the process-global TaskRegistry lives here.
+zen-plugin = { path = "../zen-plugin" }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }

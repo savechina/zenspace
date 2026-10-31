@@ -299,7 +299,127 @@ fn spawn_boot_time_sweep() {
                 tracing::warn!(error = %e, "boot_time_sweep task failed");
             }
         }
+        // Background-task crash-orphan sweep (background-tool-execution
+        // design D1, mark-only): same fire-and-forget blocking-pool
+        // discipline as the FR-040 sweep above; the sweep body is
+        // panic-free (per-file failures warn internally), so a failure
+        // here can only be the task join itself.
+        match tokio::task::spawn_blocking(sweep_background_orphans_blocking).await {
+            Ok(marked) if marked > 0 => {
+                tracing::info!(
+                    marked,
+                    "boot_time_sweep: background-task orphan sweep complete"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "background-task boot sweep task failed");
+            }
+        }
     });
+}
+
+/// Blocking body of the background-task crash-orphan sweep (design D1,
+/// mark-only): metas left in status `running` by a dead daemon are
+/// rewritten `orphaned` — nothing is signalled (pid-reuse risk).
+/// [`zen_plugin::task_registry::sweep_orphans_on_boot`] is infallible and
+/// panic-free (missing/corrupt files skip with warns), so this wrapper
+/// returns the marked count for the boot log line and cannot fail.
+#[must_use]
+pub fn sweep_background_orphans_blocking() -> usize {
+    zen_plugin::task_registry::sweep_orphans_on_boot()
+}
+
+// ─────────────────── background-task lifecycle (Lane G, D1/D7) ───────────────────
+
+/// Best-effort wall-clock timestamp for audit lines (hosting.rs
+/// `chrono_now` shape: unix ms as a string).
+fn background_audit_ts() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// Emit one background-task lifecycle audit line (`gateway.background.*`)
+/// to the shared audit sink. Fire-and-forget: a write failure warns and
+/// never aborts the drain/expire path. `task_id` is recorded first-8
+/// (`taskId`) plus full (`taskIdFull`) — grep-friendly without leaking a
+/// 32-char id into every human tail.
+fn audit_background_event(
+    audit_path: Option<&std::path::Path>,
+    kind: &'static str,
+    task_id: &str,
+    reason: &str,
+) {
+    let Some(path) = audit_path else {
+        return;
+    };
+    let record = serde_json::json!({
+        "ts": background_audit_ts(),
+        "kind": kind,
+        "taskId": zen_plugin::task_registry::truncate_char_safe(task_id, 8),
+        "taskIdFull": task_id,
+        "reason": reason,
+    });
+    if let Err(e) = zen_core::jsonl::append_jsonl_line(path, &record) {
+        tracing::warn!(path = %path.display(), error = %e, "background audit line write failed");
+    }
+}
+
+/// Audit/log reporting for drain-killed background tasks — split from
+/// [`drain_background_tasks`] so pins can assert the emission shape
+/// without a live child process. One `gateway.background.killed` audit
+/// line per id; an empty list writes nothing (zero-event = zero-lines).
+pub fn report_killed_background_tasks(audit_path: Option<&std::path::Path>, killed: &[String]) {
+    for task_id in killed {
+        audit_background_event(
+            audit_path,
+            "gateway.background.killed",
+            task_id,
+            "daemon-shutdown",
+        );
+    }
+}
+
+/// SIGTERM drain hook (design D1): kill every live background task and
+/// audit each kill. Zero live tasks ⇒ `kill_all` returns empty ⇒ zero
+/// audit/log output (one in-memory registry scan). Returns the killed ids.
+pub fn drain_background_tasks(audit_path: Option<&std::path::Path>) -> Vec<String> {
+    let killed = zen_plugin::task_registry::registry().kill_all("daemon-shutdown");
+    report_killed_background_tasks(audit_path, &killed);
+    if !killed.is_empty() {
+        tracing::info!(
+            count = killed.len(),
+            "background tasks killed by daemon drain"
+        );
+    }
+    killed
+}
+
+/// Audit/log reporting for deadline-expired background tasks — split from
+/// [`expire_background_due`] so pins can assert the emission shape without
+/// a live child process. One `gateway.background.expired` audit line per
+/// id; an empty list writes nothing.
+pub fn report_expired_background_tasks(audit_path: Option<&std::path::Path>, expired: &[String]) {
+    for task_id in expired {
+        tracing::warn!(target: "zen_background", task_id = %task_id, "background task expired (GC tick deadline)");
+        audit_background_event(
+            audit_path,
+            "gateway.background.expired",
+            task_id,
+            "max_wall_secs deadline",
+        );
+    }
+}
+
+/// GC-tick hook (design D7): expire wall-clock-deadline background tasks
+/// on the existing 30s stale-client GC cadence (no new sweeper). Zero
+/// expired ⇒ zero audit/log output. Returns the expired ids.
+pub fn expire_background_due(audit_path: Option<&std::path::Path>, now_ms: i64) -> Vec<String> {
+    let expired = zen_plugin::task_registry::registry().expire_due(now_ms);
+    report_expired_background_tasks(audit_path, &expired);
+    expired
 }
 
 // ─────────────────── UDS gateway service (US1, T012) ───────────────────
@@ -1338,6 +1458,13 @@ impl GatewayService {
                     gc_service.hosting.turns.reap_terminal(64);
                     gc_service.run_replay_tick().await;
                     gc_service.run_compression_step().await;
+                    // Background-task deadline enforcement rides the same
+                    // 30s GC tick (design D7 — no new sweeper); zero
+                    // expired tasks costs one in-memory scan.
+                    expire_background_due(
+                        gc_service.hosting.audit_path.as_deref(),
+                        zen_plugin::task_registry::now_ms(),
+                    );
                 }
             })
         };
@@ -1515,6 +1642,10 @@ impl GatewayService {
             service.hosting.turns.cancel_all_active().await;
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+        // Background tasks (design D1): the turn drain is done (or forced)
+        // — kill any live background children so nothing outlives the
+        // daemon. Zero live tasks = one registry scan, zero audit lines.
+        drain_background_tasks(service.hosting.audit_path.as_deref());
         uds::cleanup_socket(&config.socket_path);
         tracing::info!(drained, cancelled, "gateway drained; store closing cleanly");
         Ok(())
