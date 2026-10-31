@@ -701,11 +701,16 @@ impl Tool for ShellExecTool {
             })
             .unwrap_or_default();
 
-        let cwd = args
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.workspace_root.clone());
+        // Hosted daemon (launchd, cwd=/) has NO workspace root, so wiring
+        // falls back to an EMPTY PathBuf there — `current_dir("")` makes
+        // every spawn fail with ENOENT (foreground AND background alike).
+        // Resolve the default cwd to the global root in that case; explicit
+        // `cwd` args and a real workspace root are unchanged.
+        let cwd = match args.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from) {
+            Some(cwd) => cwd,
+            None if self.workspace_root.as_os_str().is_empty() => zen_core::paths::user_root(),
+            None => self.workspace_root.clone(),
+        };
 
         let timeout_ms = args
             .get("timeout_ms")

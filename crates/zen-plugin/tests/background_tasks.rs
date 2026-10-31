@@ -113,6 +113,35 @@ async fn background_spawn_returns_task_id_and_paths_without_waiting() {
     reap_wait(&task_id, Duration::from_secs(3)).await;
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn empty_workspace_root_defaults_cwd_to_global_root_not_enoent() {
+    use zen_core::sandbox::{OsSandboxProfile, SandboxMode, SandboxValidator};
+    let home = set_zen_home();
+    let validator = SandboxValidator::new(SandboxMode::DangerFullAccess, vec![]);
+    let profile = OsSandboxProfile::from_mode(SandboxMode::DangerFullAccess, vec![], false);
+    // The hosted-daemon shape (launchd, workspace root None): wiring hands
+    // the tool an EMPTY workspace root. Previously `current_dir("")` made
+    // every spawn ENOENT — the fix resolves the default cwd to user_root().
+    let tool = ShellExecTool::new(PathBuf::from(""), validator, profile);
+    let res = tool
+        .invoke(json!({
+            "binary": "/bin/sleep",
+            "args": ["5"],
+            "background": true
+        }))
+        .await
+        .unwrap();
+    assert!(
+        res["error"].as_str().is_none(),
+        "empty workspace root must not break spawn: {res}"
+    );
+    let task_id = res["task_id"].as_str().unwrap().to_string();
+    registry().kill(&task_id).unwrap();
+    reap_wait(&task_id, Duration::from_secs(3)).await;
+    let _ = home;
+}
+
 // ── Item 7: meta.json lands on disk at spawn, BEFORE completion ──────────
 
 #[tokio::test]
