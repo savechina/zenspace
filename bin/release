@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 VERSION_FILE="$PROJECT_ROOT/VERSION"
 CARGO_TOML="$PROJECT_ROOT/Cargo.toml"
+CARGO_LOCK="$PROJECT_ROOT/Cargo.lock"
 
 # Colors for output
 RED='\033[0;31m'
@@ -112,6 +113,15 @@ if [[ "$CARGO_VERSION" != "$NEW_VERSION" ]]; then
     exit 1
 fi
 
+# Sync Cargo.lock with the bumped workspace version: a stale lock makes
+# `cargo install --locked` (release workflow) fail. Fail-soft on offline cache miss.
+if [[ -f "$CARGO_LOCK" ]]; then
+    log_info "Syncing Cargo.lock..."
+    if ! cargo update --workspace --offline -q; then
+        log_warn "Cargo.lock 同步失败（离线缓存缺失）——构建后请手动提交 Cargo.lock"
+    fi
+fi
+
 # Show diff
 echo ""
 log_info "Changes to be committed:"
@@ -119,7 +129,7 @@ git diff
 
 if [[ "$DRY_RUN" == true ]]; then
     log_warn "Dry run complete. Resetting changes..."
-    git checkout -- "$VERSION_FILE" "$CARGO_TOML"
+    git checkout -- "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
     exit 0
 fi
 
@@ -129,14 +139,16 @@ read -p "Release v$NEW_VERSION? (y/N): " -n 1 -r
 echo
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     log_warn "Aborted. Resetting changes..."
-    git checkout -- "$VERSION_FILE" "$CARGO_TOML"
+    git checkout -- "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
     exit 1
 fi
 
 # Commit and tag
+# Title must be a Conventional Commit: the bin/ship commit-msg hook blocks
+# anything outside feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert.
 log_info "Creating release commit..."
-git add "$VERSION_FILE" "$CARGO_TOML"
-git commit -m "release: v$NEW_VERSION"
+git add "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
+git commit -m "chore(release): v$NEW_VERSION"
 
 log_info "Creating git tag..."
 git tag "v$NEW_VERSION"
