@@ -34,7 +34,7 @@ repository = "https://github.com/savechina/zenspace"
 homepage = "https://github.com/savechina/zenspace"
 license = "MIT"
 description = "Zenspace AI Agents productivity suite，个人生产力套件"
-version = "0.0.9"
+version = "0.1.0"
 
 [workspace.dependencies]
 # Micro-benchmark harness (benches/*.rs, harness = false) — divan over
