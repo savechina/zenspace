@@ -446,6 +446,10 @@ impl ZenWiring {
                     .unwrap_or(false),
             ),
         )));
+        tools.register(Arc::new(
+            zen_plugin::tools::shell_collect::ShellCollectTool::new(),
+        ));
+        tools.register(Arc::new(zen_plugin::tools::shell_kill::ShellKillTool::new()));
 
         let memvid_store = Self::try_open_memvid_store();
 
@@ -469,6 +473,8 @@ impl ZenWiring {
         tool_sensitivity.insert("fs.list".to_string(), Sensitivity::Public);
         tool_sensitivity.insert("fs.grep".to_string(), Sensitivity::Public);
         tool_sensitivity.insert("shell.exec".to_string(), Sensitivity::Confidential);
+        tool_sensitivity.insert("shell.collect".to_string(), Sensitivity::Confidential);
+        tool_sensitivity.insert("shell.kill".to_string(), Sensitivity::Confidential);
         tool_sensitivity.insert("fs.glob".to_string(), Sensitivity::Public);
         tool_sensitivity.insert("web.fetch".to_string(), Sensitivity::Private);
         tool_sensitivity.insert("web.search".to_string(), Sensitivity::Private);
@@ -644,6 +650,12 @@ impl ZenWiring {
 
         registry.register_tool_args("system.daemon", &[], &["daemon_action", "action"]);
         registry.register_tool_args("shell.exec", &["cwd"], &["binary"]);
+        // shell.collect/shell.kill carry only a task_id — no path or command
+        // args. Explicit EMPTY registration prevents the ["command"]/["path"]
+        // fallback from ever scanning their args (FR-035: no tool bypasses
+        // the registry by accident).
+        registry.register_tool_args("shell.collect", &[], &[]);
+        registry.register_tool_args("shell.kill", &[], &[]);
         registry.register_tool_args("plugin.wasm_sandbox", &["wasm_path"], &[]);
 
         // fs.* tools already match the default `path` fallback; register
@@ -900,7 +912,11 @@ mod tests {
     #[test]
     fn zen_wiring_registers_all_tools() {
         let wiring = ZenWiring::new();
-        assert_eq!(wiring.tools.len(), 22);
+        assert_eq!(
+            wiring.tools.len(),
+            24,
+            "24 builtin tools incl. shell.collect/shell.kill"
+        );
 
         assert!(wiring.tools.get("tier2_search").is_ok());
         assert!(wiring.tools.get("tier4_search").is_ok());
@@ -1129,7 +1145,7 @@ mod tests {
             Some(&registry),
         );
         // Failure is isolated: wiring still constructs with all builtin tools.
-        assert_eq!(wiring.tools.len(), 22);
+        assert_eq!(wiring.tools.len(), 24);
     }
 
     fn write_wasm_plugin(dir: &std::path::Path, id: &str) {
@@ -1176,7 +1192,7 @@ mod tests {
         // Exported func registered under {plugin_id}.{func}; _start excluded.
         assert!(wiring.tools.get("demo_plugin.ping").is_ok());
         assert!(wiring.tools.get("demo_plugin._start").is_err());
-        assert_eq!(wiring.tools.len(), 23);
+        assert_eq!(wiring.tools.len(), 25);
 
         // Plugin tools default to Private sensitivity and stay MCP-exposed
         // (non-Confidential) per build_mcp_registry filtering.
@@ -1283,7 +1299,7 @@ mod tests {
 
         // Integrity-failed plugin is isolated: no tools, echo unaffected.
         assert!(wiring.tools.get("bogus.hello").is_err());
-        assert_eq!(wiring.tools.len(), 23, "22 builtin tools + echo.hello");
+        assert_eq!(wiring.tools.len(), 25, "24 builtin tools + echo.hello");
     }
 
     // ── FR-035: arg-registry end-to-end via ZenWiring hook pipeline ─────────
@@ -1692,7 +1708,7 @@ mod tests {
             wiring.tools.get("good.ping").is_ok(),
             "sibling plugin's tools must still register"
         );
-        assert_eq!(wiring.tools.len(), 23, "22 builtin tools + good.ping only");
+        assert_eq!(wiring.tools.len(), 25, "24 builtin tools + good.ping only");
     }
 
     // ── FR-046c(4): grant overlay does not change MCP exposure ───────────

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use crate::task_registry;
 use async_trait::async_trait;
 use rig_compose::normalizer::{ToolDispatchAction, ToolInvocation};
 use rig_compose::registry::KernelError;
@@ -32,8 +33,7 @@ pub struct ShellExecTool {
 // binaries the seatbelt allowed. See spec.md FR-028 Clarification 2026-08-15.
 
 const NAME: &str = "shell.exec";
-const DESCRIPTION: &str =
-    "Execute a binary with an argv array, optional stdin, env overrides, and a timeout";
+const DESCRIPTION: &str = "Execute a binary with an argv array, optional stdin, env overrides, and a timeout; background:true returns a task_id immediately and the child keeps running (retrieve with shell.collect, stop with shell.kill)";
 
 static ARGS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
@@ -44,7 +44,8 @@ static ARGS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "cwd": { "type": "string", "description": "Working directory (default: workspace root)" },
             "timeout_ms": { "type": "integer", "description": "Timeout in ms (default 30000, clamped 1000..=600000)" },
             "stdin": { "type": "string", "description": "Content written to child stdin, then closed" },
-            "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars injected into the child (the only env injection path; parent secrets are scrubbed)" }
+            "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Env vars injected into the child (the only env injection path; parent secrets are scrubbed)" },
+            "background": { "type": "boolean", "description": "Run detached: return a task_id immediately, drain output to logs/tasks/<task_id>/, enforce [agentic.background] wall-clock deadline (default false)" }
         },
         "required": ["binary"]
     })
@@ -59,7 +60,13 @@ static RESULT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "stderr": { "type": "string" },
             "timed_out": { "type": "boolean" },
             "duration_ms": { "type": "integer" },
-            "sandbox_denied": { "type": "boolean" }
+            "sandbox_denied": { "type": "boolean" },
+            "task_id": { "type": "string" },
+            "status": { "type": "string" },
+            "output_dir": { "type": "string" },
+            "stdout_path": { "type": "string" },
+            "stderr_path": { "type": "string" },
+            "note": { "type": "string" }
         }
     })
 });
@@ -558,6 +565,61 @@ impl ShellExecTool {
         SeatbeltPolicy::new(mode, self.sandbox_profile.readable_roots.clone())
             .with_arg_registry(registry)
     }
+
+    /// Register a validated command as a background task (design Section 5).
+    ///
+    /// All validation gates (binary resolution, cwd, embedded-command scan,
+    /// protected-path scan, env scrub, OS sandbox wrap, process group 0) have
+    /// already run in `invoke` — this method only differs from the foreground
+    /// path in ownership: the registry takes the Command and holds the Child.
+    async fn spawn_background_task(
+        &self,
+        argv: Vec<String>,
+        cmd: tokio::process::Command,
+        binary: &str,
+    ) -> Result<Value, KernelError> {
+        let limits = match zen_core::config::load_config() {
+            Ok(config) => task_registry::BackgroundLimits {
+                max_wall_secs: config.agentic.background.max_wall_secs_or_default(),
+                max_concurrent: config.agentic.background.max_concurrent_or_default(),
+                output_cap_bytes: task_registry::OUTPUT_CAP_BYTES,
+            },
+            Err(_) => {
+                let defaults = zen_core::config::BackgroundConfig::default();
+                task_registry::BackgroundLimits {
+                    max_wall_secs: defaults.max_wall_secs_or_default(),
+                    max_concurrent: defaults.max_concurrent_or_default(),
+                    output_cap_bytes: task_registry::OUTPUT_CAP_BYTES,
+                }
+            }
+        };
+        let session_id = task_registry::current_session_scope();
+        let command_digest = task_registry::make_command_digest(binary, &argv);
+        match task_registry::registry().spawn_background(cmd, &session_id, &command_digest, &limits)
+        {
+            Ok(snapshot) => {
+                let output_dir = snapshot.output_dir.clone();
+                let stdout_path = task_registry::meta_stdout_path(Path::new(&output_dir))
+                    .to_string_lossy()
+                    .into_owned();
+                let stderr_path = task_registry::meta_stderr_path(Path::new(&output_dir))
+                    .to_string_lossy()
+                    .into_owned();
+                Ok(json!({
+                    "task_id": snapshot.task_id,
+                    "status": snapshot.status.as_str(),
+                    "output_dir": output_dir,
+                    "stdout_path": stdout_path,
+                    "stderr_path": stderr_path,
+                    "note": "running in background; poll with shell.collect(task_id), stop with shell.kill(task_id)"
+                }))
+            }
+            Err(e) => {
+                tracing::warn!(tool = NAME, binary, error = %e, "background task rejected");
+                Ok(json!({ "error": e.to_string() }))
+            }
+        }
+    }
 }
 
 fn segment_denied(segment: &CompoundSegment, reason: impl AsRef<str>) -> KernelError {
@@ -643,6 +705,16 @@ impl Tool for ShellExecTool {
             .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
         let stdin_data = args.get("stdin").and_then(|v| v.as_str()).map(String::from);
+
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if background && stdin_data.is_some() {
+            return Err(KernelError::InvalidArgument(
+                "shell.exec background:true cannot be combined with 'stdin' — the spawning scope returns immediately, so no writer would stay attached to the child's stdin pipe".into(),
+            ));
+        }
 
         let resolved = resolve_binary(binary)?;
 
@@ -733,8 +805,16 @@ impl Tool for ShellExecTool {
 
         // T165: kill the child if the turn is cancelled and this future is
         // dropped — with its own process group an orphan is unreachable by the
-        // parent's signals.
-        cmd.kill_on_drop(true);
+        // parent's signals. Background tasks invert this (D8): the registry
+        // holds the Child past this scope, so dropping the handle must NOT
+        // kill the child.
+        cmd.kill_on_drop(!background);
+
+        if background {
+            return self.spawn_background_task(argv, cmd, binary).await;
+        }
+
+        // Foreground path below is byte-identical to pre-background behavior.
 
         tracing::debug!(tool = NAME, binary, ?argv, ?cwd, timeout_ms, "spawning");
 

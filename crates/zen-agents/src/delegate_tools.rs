@@ -78,6 +78,8 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
 /// | `tier4_search` | 6 — same six as `tier3_search` (graph reach) |
 /// | `compute_embeddings` | 6 — Sisyphus, Junior, Prometheus, Librarian, Hephaestus, Atlas |
 /// | `shell.exec` | 1 — Sisyphus only |
+/// | `shell.collect` | 1 — Sisyphus only (background-task retrieval) |
+/// | `shell.kill` | 1 — Sisyphus only (background-task stop) |
 ///
 /// **There is no `tier1_search` agent tool.** Tier 1 is zen's internal ripgrep
 /// tier (`zen-vault/src/search/mod.rs`), reached through `SearchService` and
@@ -109,6 +111,8 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
             "web.fetch",
             "web.search",
             "shell.exec",
+            "shell.collect",
+            "shell.kill",
             "system.health",
             "system.notifications",
             "system.calendar",
@@ -708,6 +712,8 @@ mod tests {
                 "web.fetch",
                 "web.search",
                 "shell.exec",
+                "shell.collect",
+                "shell.kill",
                 "system.health",
                 "system.notifications",
                 "system.calendar",
