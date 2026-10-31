@@ -57,13 +57,18 @@ fn read_audit_lines(path: &std::path::Path) -> Vec<Value> {
 
 // ── (a) drain: zero live tasks ⇒ empty + zero audit lines ──
 
-#[test]
-fn drain_with_zero_live_tasks_returns_empty_and_writes_no_audit_lines() {
-    let _guard = test_lock();
-    let tmp = isolate_home();
+#[tokio::test]
+async fn drain_with_zero_live_tasks_returns_empty_and_writes_no_audit_lines() {
+    // Guard scoped to the env-mutating setup: the drain await must not run
+    // with a std MutexGuard alive (clippy::await_holding_lock). The drain
+    // itself is env-independent (in-memory registry + explicit audit path).
+    let tmp = {
+        let _guard = test_lock();
+        isolate_home()
+    };
     let audit = tmp.path().join("audit.jsonl");
 
-    let killed = drain_background_tasks(Some(&audit));
+    let killed = drain_background_tasks(Some(&audit)).await;
 
     assert!(killed.is_empty(), "empty registry ⇒ no killed ids");
     assert!(
@@ -115,7 +120,12 @@ async fn drain_kills_live_background_task_and_audits_the_kill() {
         );
 
         let task_id = snapshot.task_id.clone();
-        let killed = drain_background_tasks(Some(&audit));
+        // Drop the guard before the drain await (clippy::await_holding_lock):
+        // the drain is env-independent (in-memory registry + absolute
+        // output_dir + explicit audit path). Re-acquired below for the
+        // env-sensitive meta read.
+        drop(_guard);
+        let killed = drain_background_tasks(Some(&audit)).await;
 
         assert_eq!(killed, vec![task_id.clone()], "drain returns the killed id");
         assert_eq!(
@@ -133,7 +143,9 @@ async fn drain_kills_live_background_task_and_audits_the_kill() {
         assert_eq!(line["reason"], "daemon-shutdown");
         assert!(line["ts"].is_string(), "ts present (hosting.rs shape)");
 
-        // Disk truth: the drain rewrote meta.json to Killed.
+        // Disk truth: the drain rewrote meta.json to Killed. Re-acquire the
+        // lock: read_meta resolves user_root() from ZEN_HOME.
+        let _guard = test_lock();
         let meta = zen_plugin::task_registry::read_meta(&task_id).expect("meta exists");
         assert_eq!(meta.status, zen_plugin::task_registry::TaskStatus::Killed);
         snapshot.pid
@@ -177,13 +189,17 @@ fn boot_sweep_wrapper_is_fail_soft_on_missing_and_corrupt_tasks_dir() {
 
 // ── (c) expire: zero expired ⇒ empty + zero audit lines ──
 
-#[test]
-fn expire_with_zero_live_tasks_returns_empty_and_writes_no_audit_lines() {
-    let _guard = test_lock();
-    let tmp = isolate_home();
+#[tokio::test]
+async fn expire_with_zero_live_tasks_returns_empty_and_writes_no_audit_lines() {
+    // Guard scoped to the env-mutating setup (clippy::await_holding_lock);
+    // the expire itself is env-independent.
+    let tmp = {
+        let _guard = test_lock();
+        isolate_home()
+    };
     let audit = tmp.path().join("audit.jsonl");
 
-    let expired = expire_background_due(Some(&audit), i64::MAX);
+    let expired = expire_background_due(Some(&audit), i64::MAX).await;
 
     assert!(expired.is_empty(), "empty registry ⇒ nothing expires");
     assert!(!audit.exists(), "zero-event = zero-lines");

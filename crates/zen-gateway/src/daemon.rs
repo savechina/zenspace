@@ -383,10 +383,24 @@ pub fn report_killed_background_tasks(audit_path: Option<&std::path::Path>, kill
 }
 
 /// SIGTERM drain hook (design D1): kill every live background task and
-/// audit each kill. Zero live tasks ⇒ `kill_all` returns empty ⇒ zero
-/// audit/log output (one in-memory registry scan). Returns the killed ids.
-pub fn drain_background_tasks(audit_path: Option<&std::path::Path>) -> Vec<String> {
-    let killed = zen_plugin::task_registry::registry().kill_all("daemon-shutdown");
+/// audit each kill. Zero live tasks ⇒ `kill_all_blocking` returns empty ⇒
+/// zero audit/log output (one in-memory registry scan). Returns the killed
+/// ids.
+///
+/// Async wrapper (review fixes d+e): the blocking body — SIGTERM, 2s grace,
+/// group-liveness probe, SIGKILL survivors, meta rewrites — runs on the
+/// blocking pool so the escalation CANNOT die with the exiting daemon (a
+/// detached escalation thread would never fire its SIGKILL) and the sync
+/// I/O stays off the async workers.
+pub async fn drain_background_tasks(audit_path: Option<&std::path::Path>) -> Vec<String> {
+    let killed = tokio::task::spawn_blocking(|| {
+        zen_plugin::task_registry::registry().kill_all_blocking("daemon-shutdown")
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "background drain task failed (join)");
+        Vec::new()
+    });
     report_killed_background_tasks(audit_path, &killed);
     if !killed.is_empty() {
         tracing::info!(
@@ -416,8 +430,22 @@ pub fn report_expired_background_tasks(audit_path: Option<&std::path::Path>, exp
 /// GC-tick hook (design D7): expire wall-clock-deadline background tasks
 /// on the existing 30s stale-client GC cadence (no new sweeper). Zero
 /// expired ⇒ zero audit/log output. Returns the expired ids.
-pub fn expire_background_due(audit_path: Option<&std::path::Path>, now_ms: i64) -> Vec<String> {
-    let expired = zen_plugin::task_registry::registry().expire_due(now_ms);
+///
+/// Async wrapper (review fix e): the registry scan + SIGKILL + meta
+/// rewrites are sync — off the async worker (house spawn_blocking
+/// discipline).
+pub async fn expire_background_due(
+    audit_path: Option<&std::path::Path>,
+    now_ms: i64,
+) -> Vec<String> {
+    let expired = tokio::task::spawn_blocking(move || {
+        zen_plugin::task_registry::registry().expire_due(now_ms)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "background expire task failed (join)");
+        Vec::new()
+    });
     report_expired_background_tasks(audit_path, &expired);
     expired
 }
@@ -1464,7 +1492,8 @@ impl GatewayService {
                     expire_background_due(
                         gc_service.hosting.audit_path.as_deref(),
                         zen_plugin::task_registry::now_ms(),
-                    );
+                    )
+                    .await;
                 }
             })
         };
@@ -1620,6 +1649,10 @@ impl GatewayService {
         // SIGTERM/SIGINT during the window toggles the external watch
         // again (`serve_command` escalator), which exits the wait early
         // and cancels immediately — cancellation audits are still written.
+        // Background-task drain gate (review fix i): set BEFORE the turn
+        // drain/cancellation begins — a stuck block_in_place turn can no
+        // longer spawn a background task that would outlive the daemon.
+        zen_plugin::task_registry::set_draining();
         let drained = service.client_count().await;
         let mut external_drain = external_rx.clone();
         let exit = wait_drain_or_force(
@@ -1645,7 +1678,7 @@ impl GatewayService {
         // Background tasks (design D1): the turn drain is done (or forced)
         // — kill any live background children so nothing outlives the
         // daemon. Zero live tasks = one registry scan, zero audit lines.
-        drain_background_tasks(service.hosting.audit_path.as_deref());
+        drain_background_tasks(service.hosting.audit_path.as_deref()).await;
         uds::cleanup_socket(&config.socket_path);
         tracing::info!(drained, cancelled, "gateway drained; store closing cleanly");
         Ok(())
