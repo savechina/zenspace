@@ -139,4 +139,19 @@ enabled = true
     assert_key_lands("", "security.secrets_guard.enabled(absent)", |c| {
         c.security.secrets_guard.enabled.is_none() && c.secrets_guard_enabled()
     });
+
+    // Background tool execution caps ([agentic.background] — design record
+    // background-tool-execution-2026-10-30.md, documented in config.toml).
+    assert_key_lands(
+        r#"
+[agentic.background]
+max_wall_secs = 3600
+max_concurrent = 8
+"#,
+        "agentic.background.(max_wall_secs|max_concurrent)",
+        |c| {
+            c.agentic.background.max_wall_secs == Some(3600)
+                && c.agentic.background.max_concurrent == Some(8)
+        },
+    );
 }

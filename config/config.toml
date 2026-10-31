@@ -615,6 +615,43 @@ max_rounds = 8
 # l1_threshold = 0.7   # absent ⇒ L1 gate closed (V13-A.3: no invented τ)
 
 # =============================================================================
+# Background tool execution (design record
+# docs/designs/background-tool-execution-2026-10-30.md, D7)
+# =============================================================================
+#
+# max_wall_secs (env ZEN_BACKGROUND_MAX_WALL_SECS, clamp 60..=86400,
+#   out-of-range warns and falls back to the default):
+#   Functionality: per-task wall-clock deadline for background tasks
+#     (`shell.exec` with `background:true`) — enforced on the existing 30s
+#     GC tick; an expired task is SIGKILLed by process group and marked
+#     Timeout.
+#   User impact: long-running work (builds, test suites, scrapes) can
+#     outlive a model round; a forgotten task cannot pin a concurrency
+#     slot forever.
+#   Default: 1800 (30 minutes).
+#   Values: 60..=86400 seconds.
+#   Interaction: the per-stream output cap (8MiB), collect tail (8k chars),
+#     inline threshold (4k chars) and collect default wait (10s) are code
+#     constants, not config keys.
+#
+# max_concurrent (env ZEN_BACKGROUND_MAX_CONCURRENT, clamp 1..=16,
+#   out-of-range warns and falls back to the default):
+#   Functionality: registry-wide live-task ceiling — checked FIRST on every
+#     background spawn; an over-limit spawn is rejected with a structured
+#     error naming the limit.
+#   User impact: bounds worst-case live disk at
+#     max_concurrent × 2 streams × 8MiB (64MiB at the defaults), further
+#     bounded by the 7-day retention row on logs/tasks/.
+#   Default: 4 (matches the delegate fan-out default).
+#   Values: 1..=16.
+#   Interaction: foreground `shell.exec` (background:false) is unaffected —
+#     it keeps its own 1..=600s timeout clamp and SIGKILL semantics.
+#
+[agentic.background]
+# max_wall_secs = 1800
+# max_concurrent = 4
+
+# =============================================================================
 # Skill auto-routing — Pi-style trigger hits (005-agentic-loop, T076)
 # =============================================================================
 #

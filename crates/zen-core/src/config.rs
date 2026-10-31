@@ -501,6 +501,9 @@ pub struct AgenticConfig {
     pub orchestrator: OrchestratorConfig,
     /// Intent classification tuning — TOML `[agentic.intent]` (T168).
     pub intent: IntentConfig,
+    /// Background tool execution caps — TOML `[agentic.background]`
+    /// (design record `background-tool-execution-2026-10-30.md`, D7).
+    pub background: BackgroundConfig,
     /// Binary-classifier thresholds — TOML `[agentic.classifiers]` (T171).
     pub classifiers: ClassifierConfig,
     /// Decision-audit content policy — TOML `[agentic.audit]` (T173/T175).
@@ -1187,10 +1190,147 @@ impl IntentConfig {
     /// Effective L0 keyword fast-path flag (D2c). Default **true** —
     /// intentional: the recorded falsifiable baseline (V13-A.3 intent
     /// p95 < 500ms) was violated ~40× by the LLM-first ordering, so the
-    /// Oracle-approved fast path ships on; the kill-switch exists to restore
+    /// fast path ships on; the kill-switch exists to restore
     /// the old ordering without a rebuild.
     pub fn l0_fast_path_or_default(&self) -> bool {
         self.l0_fast_path.unwrap_or(true)
+    }
+}
+
+/// Default `[agentic.background] max_wall_secs` (D7): the wall-clock deadline
+/// for one background task, enforced on the existing 30s GC tick. 30 minutes
+/// covers the target workload (builds, test suites, scrapes) without letting
+/// a forgotten task pin a concurrency slot for days.
+pub const BACKGROUND_MAX_WALL_SECS_DEFAULT: u64 = 1_800;
+
+/// Minimum accepted `[agentic.background] max_wall_secs` (below this even a
+/// quick build cannot finish; out-of-range values warn and fall back to the
+/// default — E11 never-silent).
+pub const BACKGROUND_MAX_WALL_SECS_MIN: u64 = 60;
+
+/// Maximum accepted `[agentic.background] max_wall_secs` (a full day; a
+/// longer deadline must be a deliberate per-deployment choice, not an
+/// accident of a stray config value).
+pub const BACKGROUND_MAX_WALL_SECS_MAX: u64 = 86_400;
+
+/// Default `[agentic.background] max_concurrent` (D7): matches the delegate
+/// fan-out default (4). Worst live disk at the 8MiB/stream output cap is
+/// 4 tasks × 2 streams × 8MiB = 64MiB, bounded further by the 7d retention
+/// row on `logs/tasks/`.
+pub const BACKGROUND_MAX_CONCURRENT_DEFAULT: usize = 4;
+
+/// Minimum accepted `[agentic.background] max_concurrent` (one slot — zero
+/// would disable the feature entirely, which is the kill-switch's job, not a
+/// clamp value's).
+pub const BACKGROUND_MAX_CONCURRENT_MIN: usize = 1;
+
+/// Maximum accepted `[agentic.background] max_concurrent` (16 — beyond this
+/// the 64MiB worst-case disk math stops holding; a higher cap must be a
+/// deliberate per-deployment choice).
+pub const BACKGROUND_MAX_CONCURRENT_MAX: usize = 16;
+
+/// Background tool execution — TOML `[agentic.background]` (design record
+/// `docs/designs/background-tool-execution-2026-10-30.md`, D7).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: caps the in-daemon background task registry —
+///   `max_wall_secs` is the per-task wall-clock deadline (expired tasks are
+///   SIGKILLed by process group and marked `Timeout` on the GC tick),
+///   `max_concurrent` is the registry-wide live-task ceiling (an over-limit
+///   `shell.exec background:true` spawn is rejected with a structured error
+///   naming the limit).
+/// - User impact: long-running work (builds, test suites) can outlive a
+///   model round without a hung tool stalling the turn; the caps keep a
+///   runaway model from pinning unbounded CPU/disk (worst live disk
+///   4×2×8MiB = 64MiB at the defaults).
+/// - Default: `max_wall_secs = 1800` (clamp 60..=86400), `max_concurrent =
+///   4` (clamp 1..=16). Out-of-range values warn and fall back to the
+///   default (E11: never silent).
+/// - Interaction: `ZEN_BACKGROUND_MAX_WALL_SECS` /
+///   `ZEN_BACKGROUND_MAX_CONCURRENT` env vars override any config layer
+///   (5th layer); a non-numeric env value warns and is ignored. The
+///   per-stream output cap (8MiB), collect tail (8k chars), inline
+///   threshold (4k chars) and collect default wait (10s) are code
+///   constants, not config keys.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct BackgroundConfig {
+    /// Per-task wall-clock deadline in seconds. Absent ⇒
+    /// [`BACKGROUND_MAX_WALL_SECS_DEFAULT`] (1800). Clamped
+    /// `60..=86400` at read; out-of-range values warn and fall back to the
+    /// default (E11: never silent).
+    pub max_wall_secs: Option<u64>,
+    /// Registry-wide live-task ceiling. Absent ⇒
+    /// [`BACKGROUND_MAX_CONCURRENT_DEFAULT`] (4). Clamped `1..=16` at
+    /// read; out-of-range values warn and fall back to the default
+    /// (E11: never silent).
+    pub max_concurrent: Option<usize>,
+}
+
+impl BackgroundConfig {
+    /// Effective per-task wall-clock deadline (D7).
+    ///
+    /// Scope logic:
+    /// - Functionality: the deadline the GC tick enforces — an expired task
+    ///   is SIGKILLed by process group and marked `Timeout`
+    /// - User impact: a forgotten background task cannot pin a concurrency
+    ///   slot forever
+    /// - Default: 1800s when the key is absent
+    /// - Interaction: values outside `60..=86400` warn (E11) and fall back
+    ///   to the default rather than being silently accepted or silently
+    ///   dropped
+    pub fn max_wall_secs_or_default(&self) -> u64 {
+        match self.max_wall_secs {
+            Some(secs)
+                if (BACKGROUND_MAX_WALL_SECS_MIN..=BACKGROUND_MAX_WALL_SECS_MAX)
+                    .contains(&secs) =>
+            {
+                secs
+            }
+            Some(secs) => {
+                tracing::warn!(
+                    value = secs,
+                    "[agentic.background] max_wall_secs outside \
+                     {BACKGROUND_MAX_WALL_SECS_MIN}..={BACKGROUND_MAX_WALL_SECS_MAX}; \
+                     using default {BACKGROUND_MAX_WALL_SECS_DEFAULT}s"
+                );
+                BACKGROUND_MAX_WALL_SECS_DEFAULT
+            }
+            None => BACKGROUND_MAX_WALL_SECS_DEFAULT,
+        }
+    }
+
+    /// Effective registry-wide live-task ceiling (D7).
+    ///
+    /// Scope logic:
+    /// - Functionality: the concurrency gate checked FIRST on every
+    ///   background spawn; over-limit spawns are rejected with a structured
+    ///   error naming the limit
+    /// - User impact: bounds worst-case live disk at
+    ///   max_concurrent × 2 × 8MiB (64MiB at the defaults)
+    /// - Default: 4 when the key is absent (matches the delegate fan-out
+    ///   default)
+    /// - Interaction: values outside `1..=16` warn (E11) and fall back to
+    ///   the default rather than being silently accepted or silently
+    ///   dropped
+    pub fn max_concurrent_or_default(&self) -> usize {
+        match self.max_concurrent {
+            Some(n)
+                if (BACKGROUND_MAX_CONCURRENT_MIN..=BACKGROUND_MAX_CONCURRENT_MAX).contains(&n) =>
+            {
+                n
+            }
+            Some(n) => {
+                tracing::warn!(
+                    value = n,
+                    "[agentic.background] max_concurrent outside \
+                     {BACKGROUND_MAX_CONCURRENT_MIN}..={BACKGROUND_MAX_CONCURRENT_MAX}; \
+                     using default {BACKGROUND_MAX_CONCURRENT_DEFAULT}"
+                );
+                BACKGROUND_MAX_CONCURRENT_DEFAULT
+            }
+            None => BACKGROUND_MAX_CONCURRENT_DEFAULT,
+        }
     }
 }
 
@@ -2703,6 +2843,16 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
             model: ov.intent.model.or(base.intent.model),
             l0_fast_path: ov.intent.l0_fast_path.or(base.intent.l0_fast_path),
         },
+        background: BackgroundConfig {
+            max_wall_secs: ov
+                .background
+                .max_wall_secs
+                .or(base.background.max_wall_secs),
+            max_concurrent: ov
+                .background
+                .max_concurrent
+                .or(base.background.max_concurrent),
+        },
         classifiers: ClassifierConfig {
             correction_threshold: ov
                 .classifiers
@@ -3115,6 +3265,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_delegate_env(&mut config.agentic.delegate);
     apply_orchestrator_env(&mut config.agentic.orchestrator);
     apply_intent_env(&mut config.agentic.intent);
+    apply_background_env(&mut config.agentic.background);
     apply_classifier_env(&mut config.agentic.classifiers);
     apply_audit_env(&mut config.agentic.audit);
     apply_retention_env(&mut config.agentic.retention);
@@ -3364,6 +3515,27 @@ fn apply_intent_env(cfg: &mut IntentConfig) {
             _ => tracing::warn!(
                 value = %v,
                 "ZEN_INTENT_L0_FAST_PATH is not a boolean; ignoring (default on stays)"
+            ),
+        }
+    }
+}
+
+fn apply_background_env(cfg: &mut BackgroundConfig) {
+    if let Some(v) = env_str("ZEN_BACKGROUND_MAX_WALL_SECS") {
+        match v.trim().parse::<u64>() {
+            Ok(parsed) => cfg.max_wall_secs = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_BACKGROUND_MAX_WALL_SECS is not a number; ignoring (default 1800s stays)"
+            ),
+        }
+    }
+    if let Some(v) = env_str("ZEN_BACKGROUND_MAX_CONCURRENT") {
+        match v.trim().parse::<usize>() {
+            Ok(parsed) => cfg.max_concurrent = Some(parsed),
+            Err(_) => tracing::warn!(
+                value = %v,
+                "ZEN_BACKGROUND_MAX_CONCURRENT is not a number; ignoring (default 4 stays)"
             ),
         }
     }
@@ -4251,6 +4423,80 @@ provider = "anthropic"
         assert!(cfg.agentic.intent.l0_fast_path.is_none());
 
         unsafe { std::env::remove_var("ZEN_INTENT_L0_FAST_PATH") };
+    }
+
+    #[test]
+    fn background_defaults_clamps_merges_and_env_overrides() {
+        // Absent keys ⇒ D7 defaults (1800s / 4, matching the delegate
+        // fan-out default).
+        assert_eq!(
+            BackgroundConfig::default().max_wall_secs_or_default(),
+            BACKGROUND_MAX_WALL_SECS_DEFAULT
+        );
+        assert_eq!(BACKGROUND_MAX_WALL_SECS_DEFAULT, 1_800);
+        assert_eq!(
+            BackgroundConfig::default().max_concurrent_or_default(),
+            BACKGROUND_MAX_CONCURRENT_DEFAULT
+        );
+        assert_eq!(BACKGROUND_MAX_CONCURRENT_DEFAULT, 4);
+
+        // In-range values pass through.
+        let config: ZenConfig =
+            toml::from_str("[agentic.background]\nmax_wall_secs = 3600\nmax_concurrent = 8\n")
+                .unwrap();
+        assert_eq!(config.agentic.background.max_wall_secs_or_default(), 3600);
+        assert_eq!(config.agentic.background.max_concurrent_or_default(), 8);
+
+        // Out-of-range values warn + fall back to the default (E11).
+        for raw in ["30", "100000"] {
+            let config: ZenConfig =
+                toml::from_str(&format!("[agentic.background]\nmax_wall_secs = {raw}\n")).unwrap();
+            assert_eq!(
+                config.agentic.background.max_wall_secs_or_default(),
+                BACKGROUND_MAX_WALL_SECS_DEFAULT,
+                "max_wall_secs = {raw} must fall back to the default"
+            );
+        }
+        for raw in ["0", "99"] {
+            let config: ZenConfig =
+                toml::from_str(&format!("[agentic.background]\nmax_concurrent = {raw}\n")).unwrap();
+            assert_eq!(
+                config.agentic.background.max_concurrent_or_default(),
+                BACKGROUND_MAX_CONCURRENT_DEFAULT,
+                "max_concurrent = {raw} must fall back to the default"
+            );
+        }
+
+        // Layered merge: override layer wins when set.
+        let base: ZenConfig =
+            toml::from_str("[agentic.background]\nmax_wall_secs = 120\n").unwrap();
+        let merged = merge_agentic(base.agentic.clone(), ZenConfig::default().agentic);
+        assert_eq!(merged.background.max_wall_secs_or_default(), 120);
+        let merged = merge_agentic(
+            ZenConfig::default().agentic,
+            toml::from_str::<ZenConfig>("[agentic.background]\nmax_wall_secs = 240\n")
+                .unwrap()
+                .agentic,
+        );
+        assert_eq!(merged.background.max_wall_secs_or_default(), 240);
+
+        // 5th layer: env overrides.
+        // SAFETY: test-only env mutation; removed at the end of the test.
+        unsafe { std::env::set_var("ZEN_BACKGROUND_MAX_WALL_SECS", "7200") };
+        unsafe { std::env::set_var("ZEN_BACKGROUND_MAX_CONCURRENT", "2") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert_eq!(cfg.agentic.background.max_wall_secs_or_default(), 7200);
+        assert_eq!(cfg.agentic.background.max_concurrent_or_default(), 2);
+
+        // Non-numeric env value warns + is ignored (default stays).
+        unsafe { std::env::set_var("ZEN_BACKGROUND_MAX_WALL_SECS", "soon") };
+        unsafe { std::env::set_var("ZEN_BACKGROUND_MAX_CONCURRENT", "many") };
+        let cfg = apply_env_overrides(ZenConfig::default());
+        assert!(cfg.agentic.background.max_wall_secs.is_none());
+        assert!(cfg.agentic.background.max_concurrent.is_none());
+
+        unsafe { std::env::remove_var("ZEN_BACKGROUND_MAX_WALL_SECS") };
+        unsafe { std::env::remove_var("ZEN_BACKGROUND_MAX_CONCURRENT") };
     }
 
     #[test]

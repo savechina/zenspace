@@ -359,6 +359,21 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 keep: 2,
             },
         },
+        // Background tool execution (design record
+        // background-tool-execution-2026-10-30.md, D7): each task writes
+        // stdout/stderr/meta.json under logs/tasks/<task_id>/ — up to
+        // 2×8MiB per task at the output cap. 7d matches the opencode
+        // precedent; collect falls back to meta.json only within a daemon
+        // lifetime, so week-old task dirs are dead weight.
+        Policy {
+            home: "logs/tasks",
+            root: logs.join("tasks"),
+            action: Action::DeleteOlder {
+                pattern: None,
+                days: 7,
+                recursive: true,
+            },
+        },
         Policy {
             home: "vault/archive/quarantine",
             root: paths.archive().join("quarantine"),

@@ -552,3 +552,31 @@ fn skills_history_and_wisdom_event_dirs_age_out() {
     assert!(!reflections.join("ancient.md").exists());
     assert!(reflections.join("recent.md").exists());
 }
+
+// Background tool execution (design record
+// background-tool-execution-2026-10-30.md, Section 7 item 12): task output
+// dirs age out at 7d, recursively on mtime.
+#[test]
+fn background_task_dirs_age_out_at_seven_days() {
+    let (_dir, paths) = setup();
+    let tasks = paths.logs().join("tasks");
+    write_aged(
+        &tasks.join("task-old/stdout"),
+        "stale output",
+        Duration::days(8),
+    );
+    write_aged(&tasks.join("task-old/meta.json"), "{}", Duration::days(8));
+    write_aged(
+        &tasks.join("task-fresh/stdout"),
+        "live output",
+        Duration::days(6),
+    );
+
+    let report = apply_policies(&paths, &cfg(), now());
+    assert_eq!(report.homes["logs/tasks"].removed_files, 2);
+    // The engine deletes FILES (empty parent dirs are left behind — same
+    // shape as the journal recursive delete).
+    assert!(!tasks.join("task-old/stdout").exists());
+    assert!(!tasks.join("task-old/meta.json").exists());
+    assert!(tasks.join("task-fresh/stdout").exists());
+}
