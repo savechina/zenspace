@@ -3,13 +3,19 @@ set -euo pipefail
 set -x
 
 # bbtree Guard-3 verification gate: Verus proofs + deterministic simulation
-# + runtime congruence pins, in one command. Layers:
-#   (default)    full gate: verus → dst → pins
-#   --verus-only just the Verus proof pass (local opt-in; slower toolchain)
+# + runtime congruence pins. One command for local and CI (verify.yml calls
+# these targets instead of duplicating cargo commands):
+#   (default) / all  full gate: verus → dst → pins
+#   formal           Verus proofs + congruence pins (no shuttle sweeps)
+#   verus            just the Verus proof pass (needs the pinned toolchain)
+#   dst              just the deterministic shuttle sweeps
+#   pins             just the plain-cargo congruence pins
+#   --verus-only     alias of `verus` (kept for compatibility)
 #
-# Toolchain pin: formal/verus.json (version + vstd + sha256). Install once:
-#   release zip from the pinned URL → ~/.verus, plus `rustup toolchain
-#   install <pinned>`; PATH must include ~/.verus for cargo-verus.
+# Toolchain pin: formal/verus.json (version + vstd + asset sha256) — installed
+# by the "Install pinned Verus toolchain" step in .github/workflows/verify.yml;
+# locally: unzip the pinned release into ~/.verus + `rustup toolchain install
+# <rustup_toolchain>`.
 cd "$(dirname "$0")/.."
 
 PIN_VERSION=$(python3 -c "import json;print(json.load(open('formal/verus.json'))['version'])")
@@ -17,11 +23,15 @@ PIN_VERSION=$(python3 -c "import json;print(json.load(open('formal/verus.json'))
 verus_gate() {
     export PATH="$HOME/.verus:$PATH"
     command -v verus >/dev/null || {
-        echo "verus not found — install per formal/verus.json (or skip: proofs are opt-in)" >&2
+        echo "verus not found — install the pinned release from formal/verus.json into ~/.verus" >&2
         return 1
     }
-    verus --version 2>&1 | grep -q "$PIN_VERSION" || {
-        echo "verus version mismatch: want $PIN_VERSION, got '$(verus --version 2>&1)'" >&2
+    # Capture once, then compare — never run the fallback inside the message
+    # (unquoted '<...>' there is shell redirection, not text).
+    local got
+    got=$(verus --version 2>&1 || true)
+    printf '%s\n' "$got" | grep -q "$PIN_VERSION" || {
+        echo "verus version mismatch: want $PIN_VERSION, got: ${got:-no output} — reinstall the pinned release from formal/verus.json" >&2
         return 1
     }
     cargo verus verify --manifest-path formal/Cargo.toml
@@ -47,8 +57,21 @@ pins_gate() {
 }
 
 case "${1:-all}" in
---verus-only)
+verus | --verus-only)
     verus_gate
+    ;;
+formal)
+    verus_gate
+    pins_gate
+    echo "✅ formal gate green: verus proofs + congruence pins"
+    ;;
+dst)
+    dst_gate
+    echo "✅ dst gate green: deterministic schedule sweeps"
+    ;;
+pins)
+    pins_gate
+    echo "✅ pins gate green: congruence pins"
     ;;
 all)
     verus_gate
@@ -57,7 +80,7 @@ all)
     echo "✅ verify gate green: verus + dst sweeps + congruence pins"
     ;;
 *)
-    echo "usage: bin/verify [--verus-only]" >&2
+    echo "usage: bin/verify [all|formal|verus|dst|pins|--verus-only]" >&2
     exit 2
     ;;
 esac
