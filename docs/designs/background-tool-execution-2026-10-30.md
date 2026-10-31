@@ -198,7 +198,8 @@ items (`ses_e702f0306ffeP9lY6vZJ78YZeP`). Both lanes flagged the same theme clus
 async-worker blocking, exactly-once notice loss, boot-sweep pid-reuse. Landed fixes:
 
 - **P1 (security)** = task_id uuid/charset validation + collect/kill meta.json fallback confined under `logs/tasks/<id>/` — crafted meta `stdout_path`/rewrite escape closed (arbitrary read/write).
-- (a) `%`→*fix label*: SIGTERM drain loops now bound each child's kill escalation window (kill_all_blocking, no unbounded join).
+- **P1 (hosted cwd, live-repro 2026-10-31)**: in the launchd daemon shape (no workspace root), wiring's `unwrap_or_default()` handed shell.exec an EMPTY workspace root and `current_dir("")` made EVERY spawn — foreground and background alike — fail with ENOENT (live evidence: `background task rejected … No such file or directory`; /bin/sleep locally reproduces fine under the same seatbelt profile). Fix: empty workspace root ⇒ default cwd resolves to the global root; explicit `cwd` args unchanged. Pin: `empty_workspace_root_defaults_cwd_to_global_root_not_enoent` (real spawn through the hosted shape).
+- (a) SIGTERM drain loops now bound each child's kill escalation window (kill_all_blocking, no unbounded join).
 - (b) `kill()` pid-reuse guard: `reaped` flag checked at signal time — never signal a reaped pid.
 - (c) GC-tick expiry (3s/10s waits under lock) → mutex-gap structure: reads take a snapshot under the lock, waits/cas happen without it, status-revalidated under the lock before mutation.
 - (d) boot-sweep re-checks the live registry at mark time (TOCTOU between scan and act).
