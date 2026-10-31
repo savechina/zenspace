@@ -5,7 +5,7 @@ use std::path::Path;
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct CheckResult {
     pub name: String,
     pub ok: bool,
@@ -62,6 +62,7 @@ fn run_all_checks() -> Vec<CheckResult> {
         check_vault(),
         check_outbox(),
         check_schema_compat(),
+        check_background_tasks(),
     ]
 }
 
@@ -491,6 +492,102 @@ fn check_schema_compat() -> CheckResult {
     }
 }
 
+/// Probe 11 (background wave 2026-10-31): orphaned background-tool metas.
+///
+/// Reads `<logs>/tasks/*/meta.json` (the on-disk mirror written at spawn and
+/// at every terminal transition). A daemon crash between spawn and
+/// completion leaves metas stuck in `status:"running"` forever — that is the
+/// state this probe surfaces.
+///
+/// Daemon-alive distinction: a live daemon owns genuinely running tasks
+/// that look byte-identical to orphans on disk, so a live daemon ⇒
+/// informational PASS (count only). Daemon down with running metas ⇒ FAIL
+/// with the actionable remedy (`zen serve start` settles them via the boot
+/// sweep: verifiably-live groups get killed, dead groups get marked).
+///
+/// # Returns
+/// PASS when no metas are on disk, none are running, or the daemon is live;
+/// FAIL when the daemon is down and ≥1 meta still says `running`.
+fn check_background_tasks() -> CheckResult {
+    let dir = match ZenPaths::detect() {
+        Ok(p) => p.logs().join("tasks"),
+        Err(e) => {
+            return CheckResult {
+                name: "background-tasks".into(),
+                ok: false,
+                detail: format!("paths unavailable: {e}"),
+            };
+        }
+    };
+    let socket = zen_gateway::transport::uds::default_socket_path();
+    let daemon_running =
+        socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok();
+    background_tasks_probe(&dir, daemon_running)
+}
+
+/// Pure half of the background-tasks probe (testable without env/sockets).
+/// Status is parsed from raw meta JSON — no zen-plugin dependency: the
+/// doctor observes the same on-disk contract (`"running"` until a
+/// terminal transition is written), never the in-memory registry.
+fn background_tasks_probe(task_dir: &Path, daemon_running: bool) -> CheckResult {
+    const NAME: &str = "background-tasks";
+    let Ok(entries) = std::fs::read_dir(task_dir) else {
+        return CheckResult {
+            name: NAME.into(),
+            ok: true,
+            detail: "no background task records".into(),
+        };
+    };
+    let mut recorded = 0u64;
+    let mut running: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        recorded += 1;
+        let meta = entry.path().join("meta.json");
+        let Ok(text) = std::fs::read_to_string(&meta) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            // Deliberately visible: corrupt metas are the exact shape the
+            // on-disk contract warns about; a record that cannot prove it
+            // terminated still counts, but cannot be called running.
+            continue;
+        };
+        if value.get("status").and_then(|s| s.as_str()) == Some("running") {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            running.push(id.chars().take(8).collect());
+        }
+    }
+    if running.is_empty() {
+        return CheckResult {
+            name: NAME.into(),
+            ok: true,
+            detail: format!("{recorded} recorded task(s), none running"),
+        };
+    }
+    if daemon_running {
+        return CheckResult {
+            name: NAME.into(),
+            ok: true,
+            detail: format!(
+                "{} running task(s) while the daemon is live (live tasks look identical on disk)",
+                running.len()
+            ),
+        };
+    }
+    CheckResult {
+        name: NAME.into(),
+        ok: false,
+        detail: format!(
+            "daemon down: {} task(s) stuck in running ({}…) — outputs under logs/tasks/, `zen serve start` settles them",
+            running.len(),
+            running.join(", ")
+        ),
+    }
+}
+
 /// Read-only schema-version probe for one state.db path.
 ///
 /// Opens `sqlite://<path>?mode=ro` — deliberately NOT
@@ -824,12 +921,67 @@ mod tests {
     }
 
     #[test]
-    fn doctor_runs_ten_probes_including_schema_compat() {
+    fn doctor_runs_eleven_probes_including_background_tasks() {
         let checks = run_all_checks();
-        assert_eq!(checks.len(), 10, "doctor must run 10 liveness probes");
+        assert_eq!(checks.len(), 11, "doctor must run 11 liveness probes");
         assert!(
             checks.iter().any(|c| c.name == "schema-compat"),
             "probe #10 `schema-compat` must be present"
+        );
+        assert!(
+            checks.iter().any(|c| c.name == "background-tasks"),
+            "probe #11 `background-tasks` must be present"
+        );
+    }
+
+    #[test]
+    fn background_tasks_probe_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = background_tasks_probe(&dir.path().join("absent"), false);
+        assert!(
+            r.ok && r.detail.contains("no background task records"),
+            "absent dir is a trivial PASS, got {r:?}"
+        );
+
+        let r = background_tasks_probe(dir.path(), false);
+        assert!(r.ok, "empty dir PASS, got {r:?}");
+        assert_eq!(r.detail, "0 recorded task(s), none running");
+    }
+
+    #[test]
+    fn background_tasks_probe_surfaces_stale_running_metas() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_meta = |id: &str, status: &str| {
+            let d = dir.path().join(id);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("meta.json"),
+                format!(r#"{{"status": "{status}", "task_id": "{id}"}}"#),
+            )
+            .unwrap();
+        };
+        write_meta("aaaaaaaa", "running");
+        write_meta("bbbbbbbb", "running");
+        write_meta("cccccccc", "completed");
+        write_meta("dddddddd", "not-json");
+
+        // Daemon down: running metas are orphans — FAIL with id8s only.
+        let r = background_tasks_probe(dir.path(), false);
+        assert!(
+            !r.ok
+                && r.detail.contains("2 task(s) stuck")
+                && r.detail.contains("aaaaaaaa")
+                && r.detail.contains("bbbbbbbb")
+                && !r.detail.contains("cccccccc")
+                && !r.detail.contains("dddddddd"),
+            "stale metas must FAIL naming id8s (order unstable), got {r:?}"
+        );
+
+        // Daemon live: live tasks look identical on disk — informational PASS.
+        let r = background_tasks_probe(dir.path(), true);
+        assert!(
+            r.ok && r.detail.contains("2 running task(s)"),
+            "daemon-live running metas PASS, got {r:?}"
         );
     }
 

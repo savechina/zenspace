@@ -47,7 +47,7 @@ Local-first by default. macOS Keychain for secrets. Sensitive data never touches
 ```bash
 brew install savechina/tap/zenspace   # or: cargo install zen (needs bubblewrap on Linux)
 zen                                   # first run — opens the TUI, initializes ~/.zen
-zen doctor                            # 10 health probes
+zen doctor                            # 11 health probes
 zen wiki list                         # see the wiki that built itself
 zen serve start                       # background learning loop (wiki distill, memory, whitewatchers run here — recommended for daily use)
 ```

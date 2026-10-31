@@ -516,7 +516,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen skill` | Skill management (list, run, progress, show, precipitate, confirm) | `skill_command.rs` |
 | `zen discover` | Self-learning gate surface (PD-06): run (one zen-loop cycle now — stages 5b/5c/5d), stage/queue, confirm/reject (Hybrid C promotion gate; BeliefEvidence applies `Belief::update` on confirm), report (discover metrics, reads `loop-last-report.json`; additive `memory_strength` section reads `logs/memory-strength-report.json` — missing/corrupt renders `{"recorded": false}`, replay-section fail-open precedent), arena (distill regression gate vs baselines/external CLIs — every lost case is staged as an improvement hypothesis under `wiki/wisdom/hypotheses/`) | `discover_command.rs` |
 | `zen sandbox` | OS-level sandbox surface: `run` (exec a binary under the active sandbox mode), `status`, `policy`, `test` (verify isolation works) | `sandbox_command.rs` |
-| `zen doctor` | System health: 10 liveness probes (config, state.db, memories, daemon, daemon-version, loop, provider, vault, outbox — staged briefs + unconfigured qqbot ⇒ FAIL with actionable message; daemon-version: running explicit daemon whose pid-record version mismatches/is unknown ⇒ FAIL with "run `zen serve restart`", daemon-down or implicit daemon ⇒ pass; schema-compat (W4.3): read-only applied-vs-embedded migration comparison — skew (db ahead of binary) ⇒ informational PASS "tolerated (additive-only); upgrade zen when convenient", missing DB/table ⇒ fresh-install PASS, corrupt ⇒ FAIL; never migrates, never takes the flock); `--json` machine output; exit 0 all-green / 1 any-fail | `doctor_command.rs` |
+| `zen doctor` | System health: 11 liveness probes (config, state.db, memories, daemon, daemon-version, loop, provider, vault, outbox — staged briefs + unconfigured qqbot ⇒ FAIL with actionable message; daemon-version: running explicit daemon whose pid-record version mismatches/is unknown ⇒ FAIL with "run `zen serve restart`", daemon-down or implicit daemon ⇒ pass; schema-compat (W4.3): read-only applied-vs-embedded migration comparison — skew (db ahead of binary) ⇒ informational PASS "tolerated (additive-only); upgrade zen when convenient", missing DB/table ⇒ fresh-install PASS, corrupt ⇒ FAIL; never migrates, never takes the flock; background-tasks (2026-10-31): scans `logs/tasks/*/meta.json` — daemon down + metas stuck `running` ⇒ FAIL with id8s + "run `zen serve start`" (boot sweep settles), daemon live ⇒ informational PASS, none/clean ⇒ trivial PASS); `--json` machine output; exit 0 all-green / 1 any-fail | `doctor_command.rs` |
 
 ## AGENT TOOL INVENTORY (v0.0.6)
 
@@ -602,11 +602,11 @@ Implementation: `render_plist()` is a pure function (unit-testable); `gui_domain
 
 ### zen doctor System Health
 
-`zen doctor` runs 10 liveness probes with JSON/human dual output (Principle IX):
+`zen doctor` runs 11 liveness probes with JSON/human dual output (Principle IX):
 
 ```
 zen doctor [--json]
-  Functionality: runs 10 isolated health checks:
+  Functionality: runs 11 isolated health checks:
     1. config: load_config() succeeds (4-layer global)
     2. state.db: exists + readable (file header check)
     3. memories: memvid store under {global}/memories/ exists (count/size)
@@ -621,6 +621,10 @@ zen doctor [--json]
    10. schema-compat (W4.3): read-only (mode=ro) applied-vs-embedded migration comparison; skew
        (db ahead of binary) ⇒ informational PASS; missing DB/table ⇒ fresh-install PASS; corrupt ⇒
        FAIL; never migrates, never takes the flock
+   11. background-tasks (background wave 2026-10-31): scans `logs/tasks/*/meta.json`; daemon down
+       + metas stuck `running` ⇒ FAIL with id8s + "run `zen serve start`" (boot sweep settles:
+       verifiably-live groups killed, dead groups marked); daemon live ⇒ informational PASS;
+       none/clean/corrupt-only ⇒ trivial PASS
   User impact: exit 0 all-green / exit 1 any-fail; --json for machine parsing
   Default: human-readable one-line-per-check output
   Interaction: exit code follows Principle IX conventional exit codes

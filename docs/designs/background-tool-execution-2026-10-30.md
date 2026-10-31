@@ -214,9 +214,11 @@ async-worker blocking, exactly-once notice loss, boot-sweep pid-reuse. Landed fi
 - (o) concurrency TOCTOU: atomic slot reservation + rollback on spawn failure (cap cannot be overrun).
 - (p) drain_pipe meta accounting: `captured` advances only on successful writes (meta never claims disk bytes it does not hold); `truncated` = bytes actually discarded (exactly-cap output NOT flagged).
 
-Backlog (explicitly arbitrable, deferred): meta `.audit` durability framing beyond
-write_atomic; doctor surfacing of stale `running` metas; `shell.exec` structured-args
-timeout propagation typing. All three have defined revisit triggers recorded here.
+Backlog (2026-10-31 close recorded in review-2026-10-31-background-tool-execution.md):
+doctor surfacing of stale `running` metas — IMPLEMENTED as `background-tasks` probe
+#11; `shell.exec` structured-args timeout propagation typing — NO-WORK-NEEDED (k2
+landed the banner + shared timeout parse site); meta `.audit` durability framing —
+STAYS DEFERRED (meta is a durability aid, not a gate; no revisit trigger fired).
 
 Security delta lane's five self-check questions (lane dropped after 3 infra failures;
 hand-verified): `logs/tasks/` fs.read exposure == pre-existing audit.jsonl exposure class
