@@ -522,6 +522,72 @@ fn join_tool_results_history(history: &[String]) -> String {
     history.join("\n---\n")
 }
 
+/// Background-tool-execution design (D4): the push line for one completed
+/// background task, exactly the design-Section-5 format. Pure so the format
+/// is pinnable from a synthetic snapshot without touching the registry; the
+/// short-id guard keeps a malformed id from panicking on byte slicing.
+#[must_use]
+fn background_notice_line(task_id: &str, command_digest: &str, status: &str) -> String {
+    let id8: String = task_id.chars().take(8).collect();
+    format!(
+        "⚙ background task {id8} `{command_digest}` {status} — collect: shell.collect {{\"task_id\":\"{task_id}\"}}"
+    )
+}
+
+/// Background-tool-execution design (D4): format this session's consume-once
+/// completion snapshots as push lines for `accumulated_results`. Each
+/// terminal transition delivered by [`TaskRegistry::take_status_changes`]
+/// becomes exactly one line — the registry cursor guarantees exactly-once.
+#[must_use]
+fn background_notices_from(changes: &[zen_plugin::task_registry::TaskSnapshot]) -> Vec<String> {
+    changes
+        .iter()
+        .map(|snap| {
+            background_notice_line(&snap.task_id, &snap.command_digest, snap.status.as_str())
+        })
+        .collect()
+}
+
+/// Background-tool-execution design (D4): drain the session's completed
+/// background tasks from the process-global registry as push lines.
+/// Consume-once per session — a completion is delivered to its owner exactly
+/// once, ever; an empty registry returns an empty vec (byte-identical
+/// callers).
+#[must_use]
+fn drain_background_notices(session_id: &str) -> Vec<String> {
+    background_notices_from(&zen_plugin::task_registry::registry().take_status_changes(session_id))
+}
+
+/// Background-tool-execution design (D6): turn-end audit of this session's
+/// still-live background tasks — the soft contract that keeps uncollected
+/// work visible (no hard barrier: long builds MUST outlive a turn). Zero-event
+/// = zero-lines house discipline: an empty `live_for_session` writes nothing,
+/// so turns without background tasks stay byte-identical. Best-effort like
+/// every audit emitter: a failing append warns, never fails the turn.
+fn append_background_live_audit(session_id: &str) {
+    let live = zen_plugin::task_registry::registry().live_for_session(session_id);
+    if live.is_empty() {
+        return;
+    }
+    let Ok(paths) = zen_core::paths::ZenPaths::detect() else {
+        return;
+    };
+    let ids: Vec<String> = live
+        .iter()
+        .map(|t| t.task_id.chars().take(8).collect())
+        .collect();
+    let entry = serde_json::json!({
+        "kind": "loop.background.live",
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "session_id": session_id,
+        "count": live.len(),
+        "task_ids": ids,
+    });
+    if let Err(e) = zen_core::jsonl::append_jsonl_line(&paths.logs().join("audit.jsonl"), &entry) {
+        warn!(error = %e, "loop.background.live audit append failed");
+    }
+}
+
 /// W4.5b (G1-03): split normalized invocations into the granted subset that
 /// enters `model_response` and the not-granted names answered with a targeted
 /// structured rejection. rig's `InvalidToolCallAction::Skip` suppresses the
@@ -677,12 +743,14 @@ pub(crate) fn strip_fenced_tool_blocks(text: &str) -> String {
 /// Classification contract:
 /// - READ-ONLY → `false`: `fs.read`, `fs.list`, `fs.grep`, `fs.glob`,
 ///   `tier2_search`, `tier3_search`, `tier4_search`, `compute_embeddings`,
-///   `web.fetch`, `web.search`, `system.health`.
+///   `web.fetch`, `web.search`, `system.health`, `shell.collect`
+///   (collect reads already-captured background-task output — it mutates
+///   nothing; `shell.kill` stays MUTATING via the fail-safe default).
 /// - SYNTHETIC → `false`: any name starting with `<` (`<budget>`,
 ///   `<parse>`, `<dispatch>`, `<max_turns>`) — audit bookkeeping records,
 ///   not tool invocations.
 /// - MUTATING → `true`: `fs.write`, `fs.edit`, `fs.delete`, `fs.move`,
-///   `fs.copy`, `shell.exec`, `delegate.task`, `plan.execute`,
+///   `fs.copy`, `shell.exec`, `shell.kill`, `delegate.task`, `plan.execute`,
 ///   `system.notifications`, `system.calendar`, `system.daemon`,
 ///   `system.fs_watcher`, every `plugin:*` tool, and EVERY UNKNOWN NAME
 ///   (fail-safe default: an unrecognized tool is treated as mutating so a
@@ -705,6 +773,7 @@ pub(crate) fn is_mutating_tool(name: &str) -> bool {
             | "web.fetch"
             | "web.search"
             | "system.health"
+            | "shell.collect"
     )
 }
 
@@ -2092,6 +2161,14 @@ impl AgentOrchestrator {
                         }
                     }
 
+                    // Background-tool-execution (D4): round-boundary
+                    // per-session push — completed background tasks enter the
+                    // next prompt exactly once (consume-once registry cursor).
+                    // Empty registry ⇒ no push, byte-identical.
+                    for notice in drain_background_notices(&session.session_id.to_string()) {
+                        push_tool_results_history(&mut accumulated_results, notice);
+                    }
+
                     let history_text = join_tool_results_history(&accumulated_results);
                     let (response_text, native_calls) = run_blocking_llm(|| {
                         self.executor.execute_model_call(
@@ -2240,13 +2317,16 @@ impl AgentOrchestrator {
                         dispatch.iter().map(|(_, inv)| inv.clone()).collect();
 
                     let hooks = self.wiring.dispatch_hooks();
-                    let (mut results, latencies) = match dispatch_timed(
-                        zen_agent.generic.tools(),
-                        &invocations,
-                        &hooks,
-                    )
-                    .await
-                    {
+                    // Background-tool-execution (Lane O): attribute any
+                    // background spawn made during dispatch to this session —
+                    // shell_exec reads SESSION_SCOPE (default "local") so the
+                    // round-boundary scan and the turn-end audit stay
+                    // per-session.
+                    let dispatch_scoped = zen_plugin::task_registry::SESSION_SCOPE.scope(
+                        session.session_id.to_string(),
+                        dispatch_timed(zen_agent.generic.tools(), &invocations, &hooks),
+                    );
+                    let (mut results, latencies) = match dispatch_scoped.await {
                         Ok(pair) => pair,
                         Err(e) => {
                             let feedback = dispatch_error_feedback(&e);
@@ -2347,6 +2427,10 @@ impl AgentOrchestrator {
                 }
             }
         }
+
+        // Background-tool-execution (D6): turn-end soft-contract audit of
+        // this session's live background tasks. Zero live tasks ⇒ no line.
+        append_background_live_audit(&session.session_id.to_string());
 
         // FR-034: increment downstream_citations when retrieved content appears in
         // response. Detection uses a body fingerprint (T161) so boilerplate echoes
@@ -2926,6 +3010,17 @@ impl AgentOrchestrator {
                         }
                     }
 
+                    // Background-tool-execution (D4 + D8 stream visibility):
+                    // round-boundary per-session push, plus a live echo of
+                    // each notice through the token callback (same channel as
+                    // the 🔧 intermediates) so TUI users see completions
+                    // without waiting for the next model round. `execute()`
+                    // pushes without echoing.
+                    for notice in drain_background_notices(&session.session_id.to_string()) {
+                        callback(&format!("{notice}\n"));
+                        push_tool_results_history(&mut accumulated_results, notice);
+                    }
+
                     let history_text = join_tool_results_history(&accumulated_results);
                     let history_opt = if history_text.is_empty() {
                         None
@@ -3074,13 +3169,14 @@ impl AgentOrchestrator {
                         dispatch.iter().map(|(_, inv)| inv.clone()).collect();
 
                     let hooks = self.wiring.dispatch_hooks();
-                    let (mut results, latencies) = match dispatch_timed(
-                        zen_agent.generic.tools(),
-                        &invocations,
-                        &hooks,
-                    )
-                    .await
-                    {
+                    // Background-tool-execution (Lane O): same per-session
+                    // attribution as `execute()`'s dispatch — shell_exec
+                    // reads SESSION_SCOPE (default "local").
+                    let dispatch_scoped = zen_plugin::task_registry::SESSION_SCOPE.scope(
+                        session.session_id.to_string(),
+                        dispatch_timed(zen_agent.generic.tools(), &invocations, &hooks),
+                    );
+                    let (mut results, latencies) = match dispatch_scoped.await {
                         Ok(pair) => pair,
                         Err(e) => {
                             let feedback = dispatch_error_feedback(&e);
@@ -3192,6 +3288,10 @@ impl AgentOrchestrator {
                 }
             }
         }
+
+        // Background-tool-execution (D6): turn-end soft-contract audit of
+        // this session's live background tasks. Zero live tasks ⇒ no line.
+        append_background_live_audit(&session.session_id.to_string());
 
         session.add_turn(MessageRole::User, user_query);
         for (role, content) in &interaction_turns {
@@ -5343,5 +5443,159 @@ mod tests {
             dispatch_error_feedback(&KernelError::ToolFailed("boom".into()))
                 .starts_with("tool failed")
         );
+    }
+
+    // ── Background-tool-execution pins (design Section 7 items 8, 13) ───────
+    //
+    // Determinism choice, documented per the lane contract: the registry is a
+    // process-global OnceLock, but take_status_changes/live_for_session
+    // filter strictly by session id, so every registry-touching pin below
+    // spawns under a UNIQUE uuid session id — sibling tests (even in the same
+    // `cargo test` process under thread parallelism) can neither collide with
+    // nor observe these entries. NO env mutation: zen-core's `test-support`
+    // dev-dep makes user_root() fall back to a per-process temp home, so the
+    // spawns below never touch the developer's real ~/.zen.
+
+    use zen_plugin::task_registry::{BackgroundLimits, TaskSnapshot, TaskStatus};
+
+    /// A spawn-ready `Command` for a fast, real background child (`/bin/echo`
+    /// is instant, unix-only like the zen-plugin registry pins).
+    #[cfg(unix)]
+    fn echo_command() -> zen_plugin::task_registry::BackgroundCommand {
+        let mut cmd = zen_plugin::task_registry::BackgroundCommand::new("/bin/echo");
+        cmd.arg("hi")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn background_test_limits() -> BackgroundLimits {
+        BackgroundLimits {
+            max_wall_secs: 60,
+            max_concurrent: 4,
+            output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
+        }
+    }
+
+    /// Poll the registry until `task_id` reaches a terminal state (echo
+    /// completes in milliseconds; 5s ceiling keeps a wedged CI from hanging).
+    #[cfg(unix)]
+    async fn wait_terminal(task_id: &str) {
+        for _ in 0..500 {
+            if let Some(snap) = zen_plugin::task_registry::registry().snapshot(task_id)
+                && snap.status.is_terminal()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("background echo did not reach a terminal state within the poll window");
+    }
+
+    // (a) notice formatting: the design-Section-5 push-line shape, from a
+    // synthetic snapshot — pure, no registry.
+    #[test]
+    fn background_notice_line_matches_design_push_format() {
+        let snap = TaskSnapshot {
+            task_id: "abcdef1234567890abcdef1234567890".to_string(),
+            session_id: "sess".to_string(),
+            pid: 42,
+            command_digest: "/bin/echo hi".to_string(),
+            output_dir: "/tmp/tasks/abcdef12".to_string(),
+            status: TaskStatus::Completed(0),
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            bytes_stdout: 3,
+            bytes_stderr: 0,
+            truncated: false,
+        };
+        let lines = background_notices_from(&[snap]);
+        assert_eq!(
+            lines,
+            vec![
+                "⚙ background task abcdef12 `/bin/echo hi` completed — collect: shell.collect {\"task_id\":\"abcdef1234567890abcdef1234567890\"}"
+            ]
+        );
+        // Short ids must not panic on the first-8 slice.
+        assert_eq!(
+            background_notice_line("ab", "d", "killed"),
+            "⚙ background task ab `d` killed — collect: shell.collect {\"task_id\":\"ab\"}"
+        );
+    }
+
+    // (b) exactly-once: one completion yields exactly one push line ever —
+    // the second drain of the same session is empty (real registry).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_notices_drain_exactly_once_per_completion() {
+        let session = format!("bg-once-{}", uuid::Uuid::new_v4());
+        let spawned = zen_plugin::task_registry::registry()
+            .spawn_background(
+                echo_command(),
+                &session,
+                "/bin/echo hi",
+                &background_test_limits(),
+            )
+            .expect("echo spawns");
+        wait_terminal(&spawned.task_id).await;
+
+        let first = drain_background_notices(&session);
+        assert_eq!(first.len(), 1, "one completion = one line: {first:?}");
+        assert!(first[0].starts_with("⚙ background task "), "{:?}", first[0]);
+        assert!(first[0].contains("completed"), "{:?}", first[0]);
+        assert!(
+            first[0].contains(spawned.task_id.as_str()),
+            "push line carries the full task id: {:?}",
+            first[0]
+        );
+
+        let second = drain_background_notices(&session);
+        assert!(second.is_empty(), "consume-once: second drain is empty");
+    }
+
+    // (c) cross-session security pin: a task owned by session A is NEVER
+    // delivered to session B's drain — cross-session injection would be a
+    // Confidential leak (D4). An orchestrator-side pin of the session-
+    // filtered helper is required even though the registry half is
+    // registry-owned (this is the design's Section 7 item 8 security pin).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_notices_never_cross_sessions() {
+        let owner = format!("bg-owner-{}", uuid::Uuid::new_v4());
+        let other = format!("bg-other-{}", uuid::Uuid::new_v4());
+        assert!(
+            drain_background_notices(&other).is_empty(),
+            "a session with no tasks drains empty"
+        );
+
+        let spawned = zen_plugin::task_registry::registry()
+            .spawn_background(
+                echo_command(),
+                &owner,
+                "/bin/echo hi",
+                &background_test_limits(),
+            )
+            .expect("echo spawns");
+        // The completion must not leak to `other` while running OR once
+        // terminal and collected by the owner.
+        assert!(drain_background_notices(&other).is_empty());
+        wait_terminal(&spawned.task_id).await;
+        assert!(drain_background_notices(&other).is_empty());
+
+        let owner_lines = drain_background_notices(&owner);
+        assert_eq!(owner_lines.len(), 1, "owner still gets its completion");
+        assert!(drain_background_notices(&other).is_empty());
+    }
+
+    // (d) gate scope: shell.collect joins the read-only allowlist (returns
+    // captured output, mutates nothing); shell.kill stays mutating via the
+    // fail-safe default; foreground shell.exec unchanged.
+    #[test]
+    fn background_gate_scope_collect_readonly_kill_mutating() {
+        assert!(!is_mutating_tool("shell.collect"));
+        assert!(is_mutating_tool("shell.kill"));
+        assert!(is_mutating_tool("shell.exec"), "foreground exec unchanged");
     }
 }
