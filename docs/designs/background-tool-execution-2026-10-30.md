@@ -37,8 +37,11 @@ build entirely at the tool layer.
 
 - **D1 In-daemon TaskRegistry** (not setsid): daemon is launchd-respawned and restarts are
   deliberate (`zen serve restart` drains). SIGTERM drain kills live background tasks with
-  audit lines. Crash-orphan hole closed by a boot-time sweep that is **mark-only**
-  (`status=orphaned` + warn; no pid-reuse kill risk in v1).
+  audit lines. Crash-orphan hole closed by a boot-time sweep that is **two-tier (amended
+  2026-10-31)**: dead group (`kill(-pgid, 0)` ⇒ ESRCH) ⇒ mark-only; live group verified ours (leader's
+  observed process age matches the spawn record within ±10s, via macOS `/bin/ps -o
+  etime=` / Linux procfs starttime) ⇒ SIGKILL + mark; live but unverifiable ⇒ mark-only
+  (pid-reuse fail-safe invariant, kept).
 - **D2 `background: bool` param on `shell.exec`** (default false = byte-identical), not a
   separate tool — one concept one tool; validation gates, sensitivity (Confidential), and
   ToolArgRegistry row all inherited unchanged.
@@ -50,6 +53,10 @@ build entirely at the tool layer.
   is a Confidential leak, security pin required). Cross-turn notification comes free:
   the per-session cursor picks up between-turn completions at the next turn's first
   round boundary. Stream path additionally echoes the notice via the token callback.
+  **Delivery is at-least-once (amended 2026-10-31)**: the drain does NOT consume; the
+  orchestrator confirms via `mark_notified` only after the model round that carried the
+  notices returned Ok — a failed round re-offers the notice next round/turn (advisory
+  data tolerates duplicates, never loss).
 - **D5 `shell.collect {task_id, wait_ms?}`**: default wait 10s (codex-yield precedent,
   clamp 0..=30000); returns status/exit_code/stdout_tail/stderr_tail (each ≤8k chars,
   char-boundary-safe)/output_path/bytes/truncated; full stdout inline when ≤4k chars
@@ -58,11 +65,18 @@ build entirely at the tool layer.
   listing live session tasks. A hard "refuse to end turn" barrier contradicts the feature
   (25-min builds must outlive turns). Barriers belong to plan.execute layer semantics
   (phase 2, deferred). Revisit trigger: models systematically never collecting.
+  **Gate visibility (amended 2026-10-31)**: the quality-gate input gains a facts-only
+  context line when the session has still-live tasks (id8/digest8/age) — the gate
+  reviewer sees only `final_response` and could otherwise pass a partial deliverable
+  as complete. Zero live tasks ⇒ gate prompt byte-identical.
 - **D7 Caps**: 8MiB/stream = **stop-capturing threshold, NOT kill** (drain keeps reading
-  and discarding so the child never SIGPIPEs; `truncated:true`, `bytes_*` keep counting).
-  Deadline `[agentic.background] max_wall_secs` default 1800 (clamp 60..=86400) enforced
-  on the **existing 30s GC tick** (no new sweeper). `max_concurrent` default 4 (clamp
-  1..=16, consistent with delegate). Worst live disk 4×2×8MiB = 64MiB + 7d retention.
+  and discarding so the child never SIGPIPEs; `truncated:true` = bytes actually DISCARDED
+  past the cap, an exactly-cap output is not truncated; `bytes_*` keep counting; on a
+  failed capture write the meta stops advancing `captured` — never claims bytes the
+  disk does not hold [2026-10-31 review fix]). Deadline `[agentic.background]
+  max_wall_secs` default 1800 (clamp 60..=86400) enforced on the **existing 30s GC
+  tick** (no new sweeper). `max_concurrent` default 4 (clamp 1..=16, consistent with
+  delegate). Worst live disk 4×2×8MiB = 64MiB + 7d retention.
 - **D8 Contract-clean with amendments**: registry MUST hold `tokio::process::Child` +
   pipe handles (strong hold, mcp_toolsets pattern — dropped Child = closed pipes =
   SIGPIPE death); dispatch_tasks revival REJECTED (schema mismatch, dormant); registry is
@@ -97,7 +111,7 @@ impl TaskRegistry {
     pub fn expire_due(&self, now_ms: i64) -> Vec<String>;                 // GC-tick hook; Timeout status
     pub fn kill_all(&self, reason: &str) -> Vec<String>;                  // SIGTERM drain
 }
-pub fn sweep_orphans_on_boot() -> usize;  // scan logs/tasks/*/meta.json status=running -> mark orphaned + warn (mark-only, D1)
+pub fn sweep_orphans_on_boot() -> usize;  // scan logs/tasks/*/meta.json status=running -> two-tier (D1 amended: dead group mark-only / verified-ours live group SIGKILL+mark / unverifiable mark-only)
 // session scoping for the tool layer (APPROVAL_TURN task-local precedent):
 tokio::task_local! pub static SESSION_SCOPE: String;   // orchestrator wraps dispatch; shell_exec reads, default "local"
 pub struct BackgroundLimits { pub max_wall_secs: u64, pub max_concurrent: usize, pub output_cap_bytes: u64 }
@@ -160,7 +174,7 @@ Push line format (orchestrator, both loops, shared helper):
 9. Collect: wait semantics; 8k char-boundary-safe tails; ≤4k inline full; meta-fallback
    for unknown-to-registry task.
 10. Kill: group SIGKILL, meta `Killed`, audit line.
-11. SIGTERM drain kills live tasks with audit; boot sweep marks orphaned metas (mark-only).
+11. SIGTERM drain kills live tasks with audit; boot sweep two-tier (dead ⇒ mark-only; verified-ours live ⇒ SIGKILL+mark; unverifiable ⇒ mark-only); Notices at-least-once (take/mark split).
 12. Retention row applies to `logs/tasks/`.
 13. Quality gate: shell.collect read-only (no gate), shell.kill mutating (gate fires).
 14. Config: clamps + invalid-value warn-not-silent + env overrides.
@@ -176,3 +190,38 @@ Push line format (orchestrator, both loops, shared helper):
 - Hard turn-end barrier (D6) — on evidence models systematically never collect.
 - Cross-session collect policy — v1 allows collect-by-unguessable-uuid across sessions
   (trust-equivalent to fs.read on `.zen`); tighten if that ever leaks.
+
+## 9. Review remediation record (2026-10-31)
+
+Review lanes: two-party blind review (contracts & ops) + Oracle arbitration of deferred
+items (`ses_e702f0306ffeP9lY6vZJ78YZeP`). Both lanes flagged the same theme clusters:
+async-worker blocking, exactly-once notice loss, boot-sweep pid-reuse. Landed fixes:
+
+- **P1 (security)** = task_id uuid/charset validation + collect/kill meta.json fallback confined under `logs/tasks/<id>/` — crafted meta `stdout_path`/rewrite escape closed (arbitrary read/write).
+- (a) `%`→*fix label*: SIGTERM drain loops now bound each child's kill escalation window (kill_all_blocking, no unbounded join).
+- (b) `kill()` pid-reuse guard: `reaped` flag checked at signal time — never signal a reaped pid.
+- (c) GC-tick expiry (3s/10s waits under lock) → mutex-gap structure: reads take a snapshot under the lock, waits/cas happen without it, status-revalidated under the lock before mutation.
+- (d) boot-sweep re-checks the live registry at mark time (TOCTOU between scan and act).
+- (f) sweep cost bound: metas older than the 7d retention window are skipped.
+- (g) registry `Mutex` poisoning tolerance via shared `lock_ok` (warn + into_inner) — hot-path fix-now (Oracle ITEM4-g).
+- (h) sweep skips metas whose task has a live registry entry (boot-object race).
+- (i/j) tool-loop failure accounting + `live_count` canonical lock path.
+- (k) shell.kill escalation thread named + detached cleanly; group spawned with `process_group(0)` (parent-less group kill parity).
+- (l) **D4 at-least-once** (Oracle ITEM1-iii): take/mark split — `take_status_changes` re-offers un-marked terminal transitions; `mark_notified` retires them only after the carrying model round returned Ok.
+- (m) **two-tier sweep** (Oracle ITEM2): dead group ⇒ mark-only; live group verified ours (leader process age vs spawn record, ±10s, macOS `/bin/ps -o etime=` / Linux procfs) ⇒ SIGKILL + mark; unverifiable ⇒ mark-only.
+- (n) **D6 gate visibility** (Oracle ITEM3): facts-only background context line appended to the quality-gate Task input when the session has live tasks.
+- (o) concurrency TOCTOU: atomic slot reservation + rollback on spawn failure (cap cannot be overrun).
+- (p) drain_pipe meta accounting: `captured` advances only on successful writes (meta never claims disk bytes it does not hold); `truncated` = bytes actually discarded (exactly-cap output NOT flagged).
+
+Backlog (explicitly arbitrable, deferred): meta `.audit` durability framing beyond
+write_atomic; doctor surfacing of stale `running` metas; `shell.exec` structured-args
+timeout propagation typing. All three have defined revisit triggers recorded here.
+
+Security delta lane's five self-check questions (lane dropped after 3 infra failures;
+hand-verified): `logs/tasks/` fs.read exposure == pre-existing audit.jsonl exposure class
+(same `GLOBAL_ROOT_SUBTREES` anchor); push lines are synthesized static text (no tool
+output transit); collect results pass `screen_tool_output` at both dispatch sites;
+ConfidentialityHook is consulted per-invocation and spawn gates run inside the
+Confidential `shell.exec` dispatch; `shell.collect`/`shell.kill` are Confidential ⇒
+excluded from the external MCP registry by the FR-028 exclusion (pinned by
+`build_mcp_registry_excludes_confidential_tools`).
