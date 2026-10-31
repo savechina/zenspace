@@ -106,10 +106,19 @@ struct CollectState<'a> {
     stderr_path: &'a Path,
 }
 
+/// Read both capture files off the async worker (review fix e): the reads
+/// are bounded (≤8MiB each) but still blocking I/O — house spawn_blocking
+/// discipline.
+async fn read_captures_blocking(state: &CollectState<'_>) -> (String, String) {
+    let stdout_path = state.stdout_path.to_path_buf();
+    let stderr_path = state.stderr_path.to_path_buf();
+    tokio::task::spawn_blocking(move || (read_capture(&stdout_path), read_capture(&stderr_path)))
+        .await
+        .unwrap_or_default()
+}
+
 /// Render the collect result from a status plus the capture paths.
-fn render(task_id: &str, state: &CollectState<'_>) -> Value {
-    let stdout = read_capture(state.stdout_path);
-    let stderr = read_capture(state.stderr_path);
+fn render(task_id: &str, state: &CollectState<'_>, stdout: String, stderr: String) -> Value {
     let mut out = json!({
         "task_id": task_id,
         "status": state.status.as_str(),
@@ -165,6 +174,17 @@ impl Tool for ShellCollectTool {
                 KernelError::InvalidArgument("Missing or invalid 'task_id' field".into())
             })?;
 
+        // P1 task_id validation (review fix a): the id reaches meta_path()
+        // and the meta fallback below — only a uuid v4 shape is accepted,
+        // closing the path-traversal hole.
+        if !task_registry::is_valid_task_id(task_id) {
+            return Err(KernelError::InvalidArgument(format!(
+                "invalid task_id \"{task_id}\": expected a uuid v4 id (32 hex \
+                 chars, or 8-4-4-4-12 hyphenated) as returned by shell.exec \
+                 background:true"
+            )));
+        }
+
         let wait_ms = args
             .get("wait_ms")
             .and_then(|v| v.as_u64())
@@ -185,12 +205,24 @@ impl Tool for ShellCollectTool {
                         stdout_path: &task_registry::meta_stdout_path(Path::new(&output_dir)),
                         stderr_path: &task_registry::meta_stderr_path(Path::new(&output_dir)),
                     };
-                    return Ok(render(task_id, &state));
+                    let (stdout, stderr) = read_captures_blocking(&state).await;
+                    return Ok(render(task_id, &state, stdout, stderr));
                 }
             } else if let Some(meta) = task_registry::read_meta(task_id) {
                 // Registry miss (daemon restart): the on-disk meta is the
                 // fallback source of truth.
                 if meta.status.is_terminal() {
+                    // Defense-in-depth (review fix a): the meta's recorded
+                    // capture paths are external data — refuse to read any
+                    // path that escapes this task's output dir.
+                    if !task_registry::meta_capture_paths_are_safe(task_id, &meta) {
+                        return Ok(json!({
+                            "error": format!(
+                                "corrupt meta for task {task_id}: recorded capture \
+                                 paths escape the task output dir; refusing to read"
+                            )
+                        }));
+                    }
                     let stdout_path = std::path::PathBuf::from(&meta.stdout_path);
                     let stderr_path = std::path::PathBuf::from(&meta.stderr_path);
                     let state = CollectState {
@@ -202,7 +234,8 @@ impl Tool for ShellCollectTool {
                         stdout_path: &stdout_path,
                         stderr_path: &stderr_path,
                     };
-                    return Ok(render(task_id, &state));
+                    let (stdout, stderr) = read_captures_blocking(&state).await;
+                    return Ok(render(task_id, &state, stdout, stderr));
                 }
             } else {
                 return Ok(json!({
@@ -227,7 +260,8 @@ impl Tool for ShellCollectTool {
                 stdout_path: &task_registry::meta_stdout_path(Path::new(&output_dir)),
                 stderr_path: &task_registry::meta_stderr_path(Path::new(&output_dir)),
             };
-            let mut out = render(task_id, &state);
+            let (stdout, stderr) = read_captures_blocking(&state).await;
+            let mut out = render(task_id, &state, stdout, stderr);
             out["note"] = json!(format!(
                 "still {status} after waiting {wait_ms}ms; call shell.collect again later",
                 status = snapshot.status.as_str()
@@ -235,6 +269,14 @@ impl Tool for ShellCollectTool {
             return Ok(out);
         }
         if let Some(meta) = task_registry::read_meta(task_id) {
+            if !task_registry::meta_capture_paths_are_safe(task_id, &meta) {
+                return Ok(json!({
+                    "error": format!(
+                        "corrupt meta for task {task_id}: recorded capture paths \
+                         escape the task output dir; refusing to read"
+                    )
+                }));
+            }
             let stdout_path = std::path::PathBuf::from(&meta.stdout_path);
             let stderr_path = std::path::PathBuf::from(&meta.stderr_path);
             let state = CollectState {
@@ -246,7 +288,8 @@ impl Tool for ShellCollectTool {
                 stdout_path: &stdout_path,
                 stderr_path: &stderr_path,
             };
-            let mut out = render(task_id, &state);
+            let (stdout, stderr) = read_captures_blocking(&state).await;
+            let mut out = render(task_id, &state, stdout, stderr);
             out["note"] = json!(format!(
                 "still {status} after waiting {wait_ms}ms (registry entry gone — daemon restart?); call shell.collect again later",
                 status = meta.status.as_str()

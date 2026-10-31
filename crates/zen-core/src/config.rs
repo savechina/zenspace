@@ -1288,12 +1288,18 @@ impl BackgroundConfig {
                 secs
             }
             Some(secs) => {
-                tracing::warn!(
-                    value = secs,
-                    "[agentic.background] max_wall_secs outside \
-                     {BACKGROUND_MAX_WALL_SECS_MIN}..={BACKGROUND_MAX_WALL_SECS_MAX}; \
-                     using default {BACKGROUND_MAX_WALL_SECS_DEFAULT}s"
-                );
+                // Warn-once per process (review fix k3): these getters run on
+                // every background spawn — a misconfigured key must warn
+                // loudly (E11) but not flood the log per spawn.
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        value = secs,
+                        "[agentic.background] max_wall_secs outside \
+                         {BACKGROUND_MAX_WALL_SECS_MIN}..={BACKGROUND_MAX_WALL_SECS_MAX}; \
+                         using default {BACKGROUND_MAX_WALL_SECS_DEFAULT}s"
+                    );
+                });
                 BACKGROUND_MAX_WALL_SECS_DEFAULT
             }
             None => BACKGROUND_MAX_WALL_SECS_DEFAULT,
@@ -1321,12 +1327,17 @@ impl BackgroundConfig {
                 n
             }
             Some(n) => {
-                tracing::warn!(
-                    value = n,
-                    "[agentic.background] max_concurrent outside \
-                     {BACKGROUND_MAX_CONCURRENT_MIN}..={BACKGROUND_MAX_CONCURRENT_MAX}; \
-                     using default {BACKGROUND_MAX_CONCURRENT_DEFAULT}"
-                );
+                // Warn-once per process (review fix k3) — see
+                // max_wall_secs_or_default for the rationale.
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        value = n,
+                        "[agentic.background] max_concurrent outside \
+                         {BACKGROUND_MAX_CONCURRENT_MIN}..={BACKGROUND_MAX_CONCURRENT_MAX}; \
+                         using default {BACKGROUND_MAX_CONCURRENT_DEFAULT}"
+                    );
+                });
                 BACKGROUND_MAX_CONCURRENT_DEFAULT
             }
             None => BACKGROUND_MAX_CONCURRENT_DEFAULT,

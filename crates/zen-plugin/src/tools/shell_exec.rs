@@ -577,6 +577,7 @@ impl ShellExecTool {
         argv: Vec<String>,
         cmd: tokio::process::Command,
         binary: &str,
+        timeout_supplied: bool,
     ) -> Result<Value, KernelError> {
         let limits = match zen_core::config::load_config() {
             Ok(config) => task_registry::BackgroundLimits {
@@ -605,13 +606,21 @@ impl ShellExecTool {
                 let stderr_path = task_registry::meta_stderr_path(Path::new(&output_dir))
                     .to_string_lossy()
                     .into_owned();
+                let mut note =
+                    "running in background; poll with shell.collect(task_id), stop with shell.kill(task_id)".to_string();
+                if timeout_supplied {
+                    note.push_str(
+                        "; timeout_ms ignored for background tasks — the \
+                         [agentic.background] max_wall_secs deadline governs",
+                    );
+                }
                 Ok(json!({
                     "task_id": snapshot.task_id,
                     "status": snapshot.status.as_str(),
                     "output_dir": output_dir,
                     "stdout_path": stdout_path,
                     "stderr_path": stderr_path,
-                    "note": "running in background; poll with shell.collect(task_id), stop with shell.kill(task_id)"
+                    "note": note
                 }))
             }
             Err(e) => {
@@ -706,10 +715,17 @@ impl Tool for ShellExecTool {
 
         let stdin_data = args.get("stdin").and_then(|v| v.as_str()).map(String::from);
 
-        let background = args
-            .get("background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Review fix k1: a wrong-typed `background` (e.g. the string
+        // "true") is a structured arg error, never a silent false.
+        let background = match args.get("background") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(other) => {
+                return Err(KernelError::InvalidArgument(format!(
+                    "'background' must be a boolean (true/false); got {other}"
+                )));
+            }
+        };
         if background && stdin_data.is_some() {
             return Err(KernelError::InvalidArgument(
                 "shell.exec background:true cannot be combined with 'stdin' — the spawning scope returns immediately, so no writer would stay attached to the child's stdin pipe".into(),
@@ -811,7 +827,12 @@ impl Tool for ShellExecTool {
         cmd.kill_on_drop(!background);
 
         if background {
-            return self.spawn_background_task(argv, cmd, binary).await;
+            // Review fix k2: surface that a supplied timeout_ms is ignored
+            // for background tasks (the wall-clock deadline governs).
+            let timeout_supplied = args.get("timeout_ms").and_then(|v| v.as_u64()).is_some();
+            return self
+                .spawn_background_task(argv, cmd, binary, timeout_supplied)
+                .await;
         }
 
         // Foreground path below is byte-identical to pre-background behavior.

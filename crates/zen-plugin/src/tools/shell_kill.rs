@@ -14,7 +14,7 @@
 //!   which is marked `killed` WITHOUT signalling — killing by a recorded
 //!   pid after a restart risks pid reuse (D1 mark-only guard).
 //! - Interaction: pairs with `shell.collect` (retrieve output) and
-//!   `TaskRegistry::kill_all` (daemon SIGTERM drain).
+//!   `TaskRegistry::kill_all_blocking` (daemon SIGTERM drain).
 
 use std::sync::LazyLock;
 
@@ -77,21 +77,51 @@ impl Tool for ShellKillTool {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
                 KernelError::InvalidArgument("Missing or invalid 'task_id' field".into())
-            })?;
+            })?
+            .to_string();
 
-        match task_registry::registry().kill(task_id) {
+        // P1 task_id validation (review fix a): the id reaches meta_path()
+        // (mark_meta_status rewrite) — only a uuid v4 shape is accepted,
+        // closing the path-traversal hole.
+        if !task_registry::is_valid_task_id(&task_id) {
+            return Err(KernelError::InvalidArgument(format!(
+                "invalid task_id \"{task_id}\": expected a uuid v4 id (32 hex \
+                 chars, or 8-4-4-4-12 hyphenated) as returned by shell.exec \
+                 background:true"
+            )));
+        }
+
+        // Registry kill + meta rewrite are sync I/O — off the async worker
+        // (review fix e, house spawn_blocking discipline).
+        let killed = tokio::task::spawn_blocking({
+            let task_id = task_id.clone();
+            move || task_registry::registry().kill(&task_id)
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("shell.kill registry task failed: {e}")));
+
+        match killed {
             Ok(snapshot) => Ok(json!({
                 "task_id": snapshot.task_id,
                 "status": snapshot.status.as_str(),
                 "pid": snapshot.pid,
-                "note": "SIGTERM sent to the process group; SIGKILL escalates after 3s if the child has not exited"
+                "note": "SIGTERM sent to the process group; SIGKILL escalates after 3s if the group is still alive"
             })),
             Err(_) => {
                 // Registry miss: fall back to the on-disk meta. A
                 // running-but-lost task is marked killed WITHOUT signalling —
                 // the process may be gone (daemon crash) and killing by the
                 // recorded pid risks pid reuse (D1 mark-only guard).
-                match task_registry::mark_meta_status(task_id, TaskStatus::Killed) {
+                let marked = tokio::task::spawn_blocking({
+                    let task_id = task_id.clone();
+                    move || task_registry::mark_meta_status(&task_id, TaskStatus::Killed)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "shell.kill meta fallback task failed");
+                    None
+                });
+                match marked {
                     Some(meta) => Ok(json!({
                         "task_id": meta.task_id,
                         "status": meta.status.as_str(),
