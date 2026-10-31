@@ -534,28 +534,91 @@ fn background_notice_line(task_id: &str, command_digest: &str, status: &str) -> 
     )
 }
 
-/// Background-tool-execution design (D4): format this session's consume-once
-/// completion snapshots as push lines for `accumulated_results`. Each
-/// terminal transition delivered by [`TaskRegistry::take_status_changes`]
-/// becomes exactly one line — the registry cursor guarantees exactly-once.
+/// D4, at-least-once (2026-10-31 review): format un-consumed terminal
+/// snapshots as (task_id, push-line) pairs for `accumulated_results`.
 #[must_use]
-fn background_notices_from(changes: &[zen_plugin::task_registry::TaskSnapshot]) -> Vec<String> {
+fn background_notice_pairs_from(
+    changes: &[zen_plugin::task_registry::TaskSnapshot],
+) -> Vec<(String, String)> {
     changes
         .iter()
         .map(|snap| {
-            background_notice_line(&snap.task_id, &snap.command_digest, snap.status.as_str())
+            (
+                snap.task_id.clone(),
+                background_notice_line(&snap.task_id, &snap.command_digest, snap.status.as_str()),
+            )
         })
         .collect()
 }
 
-/// Background-tool-execution design (D4): drain the session's completed
-/// background tasks from the process-global registry as push lines.
-/// Consume-once per session — a completion is delivered to its owner exactly
-/// once, ever; an empty registry returns an empty vec (byte-identical
-/// callers).
+/// D4 at-least-once: drain this session's un-notified terminal snapshots as
+/// (task_id, line) pairs. Consume-once happens ONLY via
+/// [`mark_background_notices_consumed`] — the caller must defer that mark
+/// until the model round that carried the notice returned Ok, so a failed
+/// round re-offers the notice next round/turn.
 #[must_use]
-fn drain_background_notices(session_id: &str) -> Vec<String> {
-    background_notices_from(&zen_plugin::task_registry::registry().take_status_changes(session_id))
+fn drain_background_notice_pairs(session_id: &str) -> Vec<(String, String)> {
+    background_notice_pairs_from(
+        &zen_plugin::task_registry::registry().take_status_changes(session_id),
+    )
+}
+
+/// D4 at-least-once confirmation: mark these task ids consumed after the
+/// model round that saw their notices succeeded. Zero ids = no registry
+/// touch (byte-identical busy-free path).
+fn mark_background_notices_consumed(session_id: &str, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    zen_plugin::task_registry::registry().mark_notified(session_id, ids);
+}
+
+/// D6 gate-visibility amendment (2026-10-31 review, Oracle ITEM3-ii): the
+/// quality-gate reviewer sees only `final_response`; still-running background
+/// tasks whose output was never collected are otherwise invisible, so a
+/// partial deliverable can pass as complete. Returns a facts-only context
+/// line (id8/digest8/age) — it asserts nothing about outcome quality.
+/// Pure on `now_ms` so the format is pinnable from synthetic snapshots.
+#[must_use]
+fn background_gate_context_line(
+    live: &[zen_plugin::task_registry::TaskSnapshot],
+    now_ms: i64,
+) -> Option<String> {
+    if live.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = live
+        .iter()
+        .map(|t| {
+            let id8: String = t.task_id.chars().take(8).collect();
+            let age_secs = (now_ms - t.started_at_ms).max(0) / 1000;
+            format!("{id8} `{}` running for {age_secs}s", t.command_digest)
+        })
+        .collect();
+    Some(format!(
+        "[Background context] {} background task(s) still running in this session: {}. Their output has not been collected via shell.collect; judge deliverable completeness accordingly.",
+        live.len(),
+        items.join("; ")
+    ))
+}
+
+/// D6 gate-visibility: clone the review Task with the background context
+/// line (when any) appended to `user_input`. Zero live tasks ⇒ input text
+/// unchanged (byte-identical gate prompt).
+#[must_use]
+fn gate_input_with_background(
+    review_task: &zen_core::types::Task,
+    session_id: &str,
+) -> zen_core::types::Task {
+    let live = zen_plugin::task_registry::registry().live_for_session(session_id);
+    match background_gate_context_line(&live, chrono::Utc::now().timestamp_millis()) {
+        Some(ctx) => {
+            let mut task = review_task.clone();
+            task.user_input = format!("{}\n\n{ctx}", task.user_input);
+            task
+        }
+        None => review_task.clone(),
+    }
 }
 
 /// Background-tool-execution design (D6): turn-end audit of this session's
@@ -2163,11 +2226,19 @@ impl AgentOrchestrator {
 
                     // Background-tool-execution (D4): round-boundary
                     // per-session push — completed background tasks enter the
-                    // next prompt exactly once (consume-once registry cursor).
-                    // Empty registry ⇒ no push, byte-identical.
-                    for notice in drain_background_notices(&session.session_id.to_string()) {
-                        push_tool_results_history(&mut accumulated_results, notice);
-                    }
+                    // next prompt. Delivery is at-least-once: consumed only
+                    // after the model round below returns Ok (empty registry
+                    // ⇒ no push, byte-identical).
+                    let background_notice_ids: Vec<String> = {
+                        let mut ids = Vec::new();
+                        for (id, line) in
+                            drain_background_notice_pairs(&session.session_id.to_string())
+                        {
+                            push_tool_results_history(&mut accumulated_results, line);
+                            ids.push(id);
+                        }
+                        ids
+                    };
 
                     let history_text = join_tool_results_history(&accumulated_results);
                     let (response_text, native_calls) = run_blocking_llm(|| {
@@ -2178,6 +2249,10 @@ impl AgentOrchestrator {
                             &history_text,
                         )
                     })?;
+                    mark_background_notices_consumed(
+                        &session.session_id.to_string(),
+                        &background_notice_ids,
+                    );
 
                     let (invocations, parse_errors, _degraded) =
                         Self::resolve_invocations(&response_text, &native_calls);
@@ -2508,7 +2583,7 @@ impl AgentOrchestrator {
             let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
             Self::review_with_feedback_round(
                 &self.quality_pipeline,
-                &review_task,
+                &gate_input_with_background(&review_task, &session.session_id.to_string()),
                 &final_response,
                 |feedback| {
                     run_blocking_llm(|| {
@@ -3015,11 +3090,20 @@ impl AgentOrchestrator {
                     // each notice through the token callback (same channel as
                     // the 🔧 intermediates) so TUI users see completions
                     // without waiting for the next model round. `execute()`
-                    // pushes without echoing.
-                    for notice in drain_background_notices(&session.session_id.to_string()) {
-                        callback(&format!("{notice}\n"));
-                        push_tool_results_history(&mut accumulated_results, notice);
-                    }
+                    // pushes without echoing. Delivery at-least-once (2026-10-31
+                    // review): consumed only after the stream round below
+                    // returns Ok.
+                    let background_notice_ids: Vec<String> = {
+                        let mut ids = Vec::new();
+                        for (id, line) in
+                            drain_background_notice_pairs(&session.session_id.to_string())
+                        {
+                            callback(&format!("{line}\n"));
+                            push_tool_results_history(&mut accumulated_results, line);
+                            ids.push(id);
+                        }
+                        ids
+                    };
 
                     let history_text = join_tool_results_history(&accumulated_results);
                     let history_opt = if history_text.is_empty() {
@@ -3030,6 +3114,10 @@ impl AgentOrchestrator {
                     let (response_text, native_calls) = zen_agent
                         .execute_stream_round(user_query, session, history_opt, &mut callback)
                         .await?;
+                    mark_background_notices_consumed(
+                        &session.session_id.to_string(),
+                        &background_notice_ids,
+                    );
 
                     let (invocations, parse_errors, degraded) =
                         Self::resolve_invocations(&response_text, &native_calls);
@@ -3317,6 +3405,8 @@ impl AgentOrchestrator {
         let gated = Self::turn_gated(has_mutating_tool_calls, session.sensitivity_policy);
         let review = if gated {
             let review_task = Self::turn_review_task(user_query, session.sensitivity_policy);
+            let review_task =
+                gate_input_with_background(&review_task, &session.session_id.to_string());
             self.quality_pipeline
                 .execute(&review_task, &final_response, |plan| {
                     Box::pin(async move { plan })
@@ -5511,12 +5601,13 @@ mod tests {
             bytes_stderr: 0,
             truncated: false,
         };
-        let lines = background_notices_from(&[snap]);
+        let pairs = background_notice_pairs_from(&[snap]);
         assert_eq!(
-            lines,
-            vec![
-                "⚙ background task abcdef12 `/bin/echo hi` completed — collect: shell.collect {\"task_id\":\"abcdef1234567890abcdef1234567890\"}"
-            ]
+            pairs,
+            vec![(
+                "abcdef1234567890abcdef1234567890".to_string(),
+                "⚙ background task abcdef12 `/bin/echo hi` completed — collect: shell.collect {\"task_id\":\"abcdef1234567890abcdef1234567890\"}".to_string()
+            )]
         );
         // Short ids must not panic on the first-8 slice.
         assert_eq!(
@@ -5525,11 +5616,42 @@ mod tests {
         );
     }
 
-    // (b) exactly-once: one completion yields exactly one push line ever —
-    // the second drain of the same session is empty (real registry).
+    // (a2) D6 gate-visibility (2026-10-31 review): the facts-only context line —
+    // zero live tasks ⇒ None (gate prompt byte-identical); live tasks ⇒
+    // id8/digest8/age facts in the text. Pure — synthetic snapshots.
+    #[test]
+    fn background_gate_context_facts_only_and_absent_when_none_live() {
+        let live = TaskSnapshot {
+            task_id: "abc12345def67890abc12345def67890".to_string(),
+            session_id: "sess".to_string(),
+            pid: 42,
+            command_digest: "/usr/bin/cargo build".to_string(),
+            output_dir: "/tmp/tasks/abc12345".to_string(),
+            status: TaskStatus::Running,
+            started_at_ms: 100_000,
+            ended_at_ms: None,
+            bytes_stdout: 0,
+            bytes_stderr: 0,
+            truncated: false,
+        };
+        assert!(background_gate_context_line(&[], 150_000).is_none());
+        let ctx = background_gate_context_line(&[live], 150_000).expect("live ⇒ Some");
+        assert!(ctx.contains("[Background context]"));
+        assert!(ctx.contains("1 background task(s)"), "{ctx}");
+        assert!(
+            ctx.contains("abc12345 `/usr/bin/cargo build` running for 50s"),
+            "{ctx}"
+        );
+        assert!(ctx.contains("shell.collect"), "{ctx}");
+    }
+
+    // (b) at-least-once (2026-10-31 review): an un-marked completion re-persists
+    // on every drain — a failed model round re-offers the notice; only
+    // mark_notified (after the round returned Ok) retires it. Duplicates are
+    // safe, loss is not.
     #[tokio::test]
     #[cfg(unix)]
-    async fn background_notices_drain_exactly_once_per_completion() {
+    async fn background_notices_at_least_once_until_marked() {
         let session = format!("bg-once-{}", uuid::Uuid::new_v4());
         let spawned = zen_plugin::task_registry::registry()
             .spawn_background(
@@ -5541,18 +5663,42 @@ mod tests {
             .expect("echo spawns");
         wait_terminal(&spawned.task_id).await;
 
-        let first = drain_background_notices(&session);
-        assert_eq!(first.len(), 1, "one completion = one line: {first:?}");
-        assert!(first[0].starts_with("⚙ background task "), "{:?}", first[0]);
-        assert!(first[0].contains("completed"), "{:?}", first[0]);
+        let first = drain_background_notice_pairs(&session);
+        assert_eq!(first.len(), 1, "one completion = one notice: {first:?}");
         assert!(
-            first[0].contains(spawned.task_id.as_str()),
-            "push line carries the full task id: {:?}",
+            first[0].1.starts_with("⚙ background task "),
+            "{:?}",
             first[0]
         );
+        assert!(first[0].1.contains("completed"), "{:?}", first[0]);
+        assert!(
+            first[0].1.contains(spawned.task_id.as_str()),
+            "push line carries the full task id: {:?}",
+            first[0].1
+        );
 
-        let second = drain_background_notices(&session);
-        assert!(second.is_empty(), "consume-once: second drain is empty");
+        // Simulated failed model round: drained but never marked ⇒ re-offered.
+        let retried = drain_background_notice_pairs(&session);
+        assert_eq!(retried.len(), 1, "un-marked completion is re-offered");
+        assert_eq!(
+            retried[0].0, first[0].0,
+            "re-offered notice carries the same id"
+        );
+
+        // Simulated succeeded round: the round carried the notice and
+        // returned Ok ⇒ mark ⇒ notice retired.
+        mark_background_notices_consumed(
+            &session,
+            &first.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        );
+        assert!(
+            drain_background_notice_pairs(&session).is_empty(),
+            "marked completion never re-offers"
+        );
+
+        // Cross-session guard unperturbed by the mark (it is session-guarded).
+        let other = format!("bg-once-other-{}", uuid::Uuid::new_v4());
+        assert!(drain_background_notice_pairs(&other).is_empty());
     }
 
     // (c) cross-session security pin: a task owned by session A is NEVER
@@ -5566,7 +5712,7 @@ mod tests {
         let owner = format!("bg-owner-{}", uuid::Uuid::new_v4());
         let other = format!("bg-other-{}", uuid::Uuid::new_v4());
         assert!(
-            drain_background_notices(&other).is_empty(),
+            drain_background_notice_pairs(&other).is_empty(),
             "a session with no tasks drains empty"
         );
 
@@ -5580,13 +5726,21 @@ mod tests {
             .expect("echo spawns");
         // The completion must not leak to `other` while running OR once
         // terminal and collected by the owner.
-        assert!(drain_background_notices(&other).is_empty());
+        assert!(drain_background_notice_pairs(&other).is_empty());
         wait_terminal(&spawned.task_id).await;
-        assert!(drain_background_notices(&other).is_empty());
+        assert!(drain_background_notice_pairs(&other).is_empty());
 
-        let owner_lines = drain_background_notices(&owner);
-        assert_eq!(owner_lines.len(), 1, "owner still gets its completion");
-        assert!(drain_background_notices(&other).is_empty());
+        let owner_pairs = drain_background_notice_pairs(&owner);
+        assert_eq!(owner_pairs.len(), 1, "owner still gets its completion");
+        mark_background_notices_consumed(
+            &owner,
+            &owner_pairs
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert!(drain_background_notice_pairs(&owner).is_empty());
+        assert!(drain_background_notice_pairs(&other).is_empty());
     }
 
     // (d) gate scope: shell.collect joins the read-only allowlist (returns
