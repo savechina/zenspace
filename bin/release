@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # Release helper script for zenspace Rust CLI
-# Usage: bin/release [major|minor|patch] [version]
+# Usage: bin/release <major|minor|patch|VERSION> [dry-run] [-y|--yes]
+#        bin/release --finish            # 续跑：为当前 VERSION 补打 tag 并推送
 #
 # Examples:
 #   bin/release patch          # Auto-increment patch version (0.1.0 -> 0.1.1)
@@ -9,9 +10,14 @@
 #   bin/release major          # Auto-increment major version (0.1.1 -> 1.0.0)
 #   bin/release 0.2.0          # Use specific version
 #   bin/release 0.2.0 dry-run  # Dry run (no commit, no tag, no push)
+#   bin/release --finish       # 发布提交已存在但 tag/推送缺失时收尾（不 bump 不提交）
+#
+# 发布提交会经过 bin/ship 安装的 git hooks：pre-commit 跑 bin/lint，
+# commit-msg 校验 Conventional Commits。任何一步失败都会打印恢复命令，
+# 不再 set -e 静默中断（tag/推送缺失的常见原因）。
 #
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -37,24 +43,115 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check if we're in dry-run mode
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d'; }
+
+# Fail loudly on any unexpected error: the old `set -e` alone left the repo
+# bumped-but-untagged with no explanation of what to run next.
+STEP="初始化"
+on_error() {
+    local code=$?
+    trap - ERR
+    log_error "release 中断于「${STEP}」步骤（exit $code）"
+    echo "  恢复：git status 查看当前改动"
+    echo "    · 版本号已改但发布提交没成功 → git checkout -- VERSION Cargo.toml Cargo.lock（回滚后重跑）"
+    echo "    · 发布提交已存在、只差 tag/推送 → bin/release --finish"
+    exit "$code"
+}
+trap on_error ERR
+
+CURRENT_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+NEW_VERSION=""
+
+# --- argument parsing (flags may appear anywhere) ---
 DRY_RUN=false
-if [[ "$2" == "dry-run" ]]; then
-    DRY_RUN=true
+ASSUME_YES=false
+FINISH=false
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        dry-run|--dry-run) DRY_RUN=true ;;
+        -y|--yes) ASSUME_YES=true ;;
+        --finish|--tag-only) FINISH=true ;;
+        -h|--help) usage; exit 0 ;;
+        -*) log_error "未知参数: $arg（见 bin/release --help）"; exit 1 ;;
+        *) POSITIONAL+=("$arg") ;;
+    esac
+done
+
+if [[ "$DRY_RUN" == true ]]; then
     log_warn "Dry run mode enabled - no changes will be committed or pushed"
 fi
 
-# Get current version
-CURRENT_VERSION=$(cat "$VERSION_FILE")
 log_info "Current version: v$CURRENT_VERSION"
 
-# Determine new version
-if [[ $# -eq 0 ]]; then
-    log_error "Usage: bin/release [major|minor|patch] [version] [dry-run]"
+# --- tag / push helpers: idempotent + actionable failures ---
+ensure_tag() {
+    local tag="$1" commit="$2" existing
+    if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+        existing="$(git rev-list -n1 "$tag")"
+        if [[ "$existing" == "$commit" ]]; then
+            log_warn "tag $tag 已存在且指向 $(git rev-parse --short "$commit")，跳过创建"
+            return 0
+        fi
+        log_error "tag $tag 已存在于 $(git rev-parse --short "$existing")，与目标 $(git rev-parse --short "$commit") 不同"
+        echo "  处理：确认后 git tag -d $tag 重跑；若远端已存在需一并删除远端 tag"
+        return 1
+    fi
+    git tag "$tag" "$commit"
+    log_info "已创建 tag $tag -> $(git rev-parse --short "$commit")"
+}
+
+push_release() {
+    local tag="$1"
+    if ! git push origin HEAD; then
+        log_error "推送分支失败（网络/权限）"
+        echo "  发布提交与 tag $tag 已在本地创建；修复后执行："
+        echo "    git push origin HEAD && git push origin $tag"
+        return 1
+    fi
+    if ! git push origin "$tag"; then
+        log_error "推送 tag $tag 失败（网络/权限）"
+        echo "  本地 tag 已创建；修复后执行：git push origin $tag"
+        return 1
+    fi
+}
+
+# --- --finish: complete an interrupted release (tag + push only) ---
+if [[ "$FINISH" == true ]]; then
+    STEP="定位发布提交"
+    TAG="v$CURRENT_VERSION"
+    RELEASE_COMMIT="$(git log -1 --format=%H -F --grep="chore(release): $TAG" || true)"
+    if [[ -z "$RELEASE_COMMIT" ]]; then
+        log_error "找不到 $TAG 的发布提交（git log --grep='chore(release): $TAG' 为空）"
+        echo "  若版本号已 bump 但未提交：git commit -m \"chore(release): $TAG\" 后重跑 bin/release --finish"
+        exit 1
+    fi
+    if ! git merge-base --is-ancestor "$RELEASE_COMMIT" HEAD; then
+        log_error "发布提交 $(git rev-parse --short "$RELEASE_COMMIT") 不在当前分支历史中"
+        exit 1
+    fi
+    log_info "Release commit: $(git rev-parse --short "$RELEASE_COMMIT") $(git log -1 --format=%s "$RELEASE_COMMIT")"
+
+    STEP="创建 tag"
+    ensure_tag "$TAG" "$RELEASE_COMMIT"
+    STEP="推送"
+    push_release "$TAG"
+
+    echo ""
+    log_info "✓ v$CURRENT_VERSION 发布收尾完成（tag 已推送）"
+    exit 0
+fi
+
+# --- bump mode ---
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+    log_error "Usage: bin/release <major|minor|patch|VERSION> [dry-run] [-y|--yes]"
+    log_error "       bin/release --finish"
     exit 1
 fi
 
-case "$1" in
+STEP="计算版本号"
+BUMP="${POSITIONAL[0]}"
+case "$BUMP" in
     major)
         IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
         NEW_VERSION="$((MAJOR + 1)).0.0"
@@ -69,34 +166,62 @@ case "$1" in
         ;;
     *)
         # Assume explicit version provided
-        NEW_VERSION="$1"
+        NEW_VERSION="$BUMP"
         ;;
 esac
 
+if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    log_error "版本号格式非法：'$NEW_VERSION'（期望 X.Y.Z）"
+    exit 1
+fi
+
 log_info "New version: v$NEW_VERSION"
+
+# 版本文件有未提交改动 = 上次发布中断（否则会把 bump 叠在旧 bump 上，静默跳版本）
+STEP="预检工作区"
+DIRTY_VERSION_FILES="$(git status --porcelain -- "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK")"
+if [[ -n "$DIRTY_VERSION_FILES" ]]; then
+    log_error "版本文件存在未提交改动（可能是上次中断的发布）"
+    echo "$DIRTY_VERSION_FILES"
+    echo "  处理：git checkout -- VERSION Cargo.toml Cargo.lock 回滚后重跑，或先提交这些改动"
+    exit 1
+fi
 
 # Verify we're on main branch
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 if [[ "$CURRENT_BRANCH" != "main" && "$CURRENT_BRANCH" != "master" ]]; then
     log_warn "You're on branch '$CURRENT_BRANCH', not main/master"
-    read -p "Continue anyway? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
+    if [[ "$ASSUME_YES" != true ]]; then
+        if [[ ! -t 0 ]]; then
+            log_error "非交互式运行：加 --yes 确认（或切回 main）"
+            exit 1
+        fi
+        read -p "Continue anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
     fi
 fi
 
 # Check for uncommitted changes
 if [[ -n $(git status --porcelain) ]]; then
     log_warn "You have uncommitted changes"
-    read -p "Continue anyway? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
+    if [[ "$ASSUME_YES" != true ]]; then
+        if [[ ! -t 0 ]]; then
+            log_error "非交互式运行且有未提交改动：先提交/暂存，或加 --yes 继续"
+            exit 1
+        fi
+        read -p "Continue anyway? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
     fi
 fi
 
 # Update VERSION file
+STEP="写入版本号"
 log_info "Updating VERSION file..."
 echo "$NEW_VERSION" > "$VERSION_FILE"
 
@@ -106,6 +231,7 @@ sed -i.bak "s/^version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" "$CARGO_TOML"
 rm -f "$CARGO_TOML.bak"
 
 # Verify changes
+STEP="校验版本号"
 log_info "Verifying changes..."
 CARGO_VERSION=$(grep '^version = ' "$CARGO_TOML" | head -1 | cut -d'"' -f2)
 if [[ "$CARGO_VERSION" != "$NEW_VERSION" ]]; then
@@ -115,6 +241,7 @@ fi
 
 # Sync Cargo.lock with the bumped workspace version: a stale lock makes
 # `cargo install --locked` (release workflow) fail. Fail-soft on offline cache miss.
+STEP="同步 Cargo.lock"
 if [[ -f "$CARGO_LOCK" ]]; then
     log_info "Syncing Cargo.lock..."
     if ! cargo update --workspace --offline -q; then
@@ -125,7 +252,7 @@ fi
 # Show diff
 echo ""
 log_info "Changes to be committed:"
-git diff
+git --no-pager diff
 
 if [[ "$DRY_RUN" == true ]]; then
     log_warn "Dry run complete. Resetting changes..."
@@ -135,28 +262,42 @@ fi
 
 # Confirm release
 echo ""
-read -p "Release v$NEW_VERSION? (y/N): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    log_warn "Aborted. Resetting changes..."
-    git checkout -- "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
-    exit 1
+if [[ "$ASSUME_YES" != true ]]; then
+    if [[ ! -t 0 ]]; then
+        log_error "非交互式运行：加 --yes 确认发布（脚本已回滚版本号）"
+        git checkout -- "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
+        exit 1
+    fi
+    read -p "Release v$NEW_VERSION? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_warn "Aborted. Resetting changes..."
+        git checkout -- "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
+        exit 1
+    fi
 fi
 
 # Commit and tag
 # Title must be a Conventional Commit: the bin/ship commit-msg hook blocks
 # anything outside feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert.
+STEP="提交发布变更（pre-commit 会跑 bin/lint）"
 log_info "Creating release commit..."
 git add "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
-git commit -m "chore(release): v$NEW_VERSION"
+if ! git commit -m "chore(release): v$NEW_VERSION"; then
+    log_error "发布提交被拒绝——tag 与推送未执行（bump 仍留在工作区）"
+    echo "  修复上面的门禁错误（bin/lint / Conventional Commits）后执行：bin/release --finish"
+    echo "  或回滚版本号：git checkout -- VERSION Cargo.toml Cargo.lock"
+    exit 1
+fi
 
+STEP="创建 tag"
 log_info "Creating git tag..."
-git tag "v$NEW_VERSION"
+ensure_tag "v$NEW_VERSION" "$(git rev-parse HEAD)"
 
 # Push
+STEP="推送"
 log_info "Pushing to remote..."
-git push origin HEAD
-git push origin "v$NEW_VERSION"
+push_release "v$NEW_VERSION"
 
 echo ""
 log_info "✓ Release v$NEW_VERSION created successfully!"
@@ -164,6 +305,8 @@ log_info "GitHub Actions will automatically:"
 echo "  1. Build binaries for all platforms"
 echo "  2. Run tests on all platforms"
 echo "  3. Create GitHub Release with packaged binaries"
-echo "  4. Publish to crates.io"
+echo "  4. Publish release artifacts/installers"
 echo ""
-log_info "Monitor progress: https://github.com/$(git remote get-url origin | sed 's/git@github.com:\(.*\)\.git/\1/' | sed 's/https:\/\/github.com\///')/actions"
+REMOTE_URL="$(git remote get-url origin 2>/dev/null || echo "origin")"
+REMOTE_SLUG="$(printf '%s' "$REMOTE_URL" | sed 's/git@github.com:\(.*\)\.git/\1/' | sed 's/https:\/\/github.com\///')"
+log_info "Monitor progress: https://github.com/${REMOTE_SLUG}/actions"
