@@ -120,10 +120,12 @@ push_release() {
 if [[ "$FINISH" == true ]]; then
     STEP="定位发布提交"
     TAG="v$CURRENT_VERSION"
-    RELEASE_COMMIT="$(git log -1 --format=%H -F --grep="chore(release): $TAG" || true)"
+    TAG_RE="${TAG//./\\.}"
+    # 发布标题形式都认：`release: vX` / `release vX` / `release(scope): vX`（GitHub Release / 历史约定）与 `chore(release): vX`
+    RELEASE_COMMIT="$(git log -1 --format=%H -E --grep="^((chore\\(release\\): )|release(\\([^)]*\\))?:? )$TAG_RE\$" || true)"
     if [[ -z "$RELEASE_COMMIT" ]]; then
-        log_error "找不到 $TAG 的发布提交（git log --grep='chore(release): $TAG' 为空）"
-        echo "  若版本号已 bump 但未提交：git commit -m \"chore(release): $TAG\" 后重跑 bin/release --finish"
+        log_error "找不到 $TAG 的发布提交（git log --grep='release...: $TAG' 为空）"
+        echo "  若版本号已 bump 但未提交：git commit -m \"release: $TAG\" 后重跑 bin/release --finish"
         exit 1
     fi
     if ! git merge-base --is-ancestor "$RELEASE_COMMIT" HEAD; then
@@ -278,14 +280,14 @@ if [[ "$ASSUME_YES" != true ]]; then
 fi
 
 # Commit and tag
-# Title must be a Conventional Commit: the bin/ship commit-msg hook blocks
-# anything outside feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert.
+# 标题用 `release: vX.Y.Z`：与历史发布提交/ GitHub Release 约定一致，
+# bin/ship 的 commit-msg 门对该形式放行（`chore(release): vX.Y.Z` 同样合法）。
 STEP="提交发布变更（pre-commit 会跑 bin/lint）"
 log_info "Creating release commit..."
 git add "$VERSION_FILE" "$CARGO_TOML" "$CARGO_LOCK"
-if ! git commit -m "chore(release): v$NEW_VERSION"; then
+if ! git commit -m "release: v$NEW_VERSION"; then
     log_error "发布提交被拒绝——tag 与推送未执行（bump 仍留在工作区）"
-    echo "  修复上面的门禁错误（bin/lint / Conventional Commits）后执行：bin/release --finish"
+    echo "  修复上面的门禁错误（bin/lint / 标题格式）后执行：bin/release --finish"
     echo "  或回滚版本号：git checkout -- VERSION Cargo.toml Cargo.lock"
     exit 1
 fi
