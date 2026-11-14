@@ -8,5 +8,6 @@
 
 ## Open items
 
+- [ ] perf: 后台任务单一预留记账（single armed reservation）— D20 option B，2026-11-14 SDD orchestration review 否决留档。**What**: 一次 admission 预留直接移入 spawned future，runtime 消费同一预留、collect 退还未消费余额，取代现行「admission hold + runtime 二次预留」双预留。**Why**: 消除任务运行期间的双份预算占用与 hold-vs-billing 二元性（oracle outside-voice OV-6）。**Current state**: T17 已落 right-sized 修复（compose-before-reserve + inherited term + drain-sweep），SC-021 additive 子句恢复；D20 §8 refund-on-collect 合同保持原样。**Trigger**: 实测 budget-refusal 事故或 background-heavy 使用模式出现时启动；启动前需重设计 refund 语义（refund-of-remainder）并同步 G1 refund pins。**Depends on**: T17 先落地。**Context**: docs/specs/006-agentic-orchestration/review-2026-11-14-sdd-orchestration.md §2 OV-6 + D20/D22。
 - [x] perf: tier-1 rg stdout 无上限 — 已修（2026-10-20 同日落地）：读取线程 1 MiB 帽到量即 kill rg，stderr 并行排空防死锁，输出 lossy 解码（帽可能切在多字节中间）；in-process 兜底的整文件读同帽。钉 `test_tier1_output_cap_bounds_burst_without_losing_results`。
 - [x] perf: PPR `load_graph_core` 每次融合查询全量加载 — 已修（2026-10-20 同日落地）：`GraphCoreCache` 挂 `SqliteClient`（per-database，杜绝跨库串图），TTL 60s（写侧失效需枚举 ~12 个写方法、漏一个即永久陈旧；TTL 有界陈旧对 0.9 权重排名信号可接受）。钉 `graph_core_cache_does_not_leak_across_databases`。
