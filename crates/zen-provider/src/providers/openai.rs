@@ -1,8 +1,6 @@
 use rig_agent::AgentBuilder;
-use rig_agent::completion::Prompt;
-use rig_core::client::CompletionClient;
-use rig_core::completion::CompletionModel;
-use rig_core::providers::openai;
+use rig_core::completion::CompletionRequest;
+use rig_core::providers::openai::{OpenAI, OpenAIConfig};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -32,23 +30,25 @@ impl OpenAIProvider {
         }
     }
 
+    /// rig 0.46: `.chat(name)` is the `/chat/completions` wire — the one
+    /// endpoint every dialect serves, direct successor of 0.42's
+    /// `completions_api().completion_model()`.
+    fn rig_client(&self) -> Result<OpenAI, LlmError> {
+        let mut config = OpenAIConfig::new(&self.api_key);
+        if self.base_url != zen_core::constants::OPENAI_API_URL {
+            config = config.with_base_url(&self.base_url);
+        }
+        Ok(config.client())
+    }
+
     pub async fn complete_async(
         &self,
         prompt: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<String, LlmError> {
-        let mut builder = openai::Client::builder().api_key(&self.api_key);
+        let client = self.rig_client()?;
 
-        if self.base_url != zen_core::constants::OPENAI_API_URL {
-            builder = builder.base_url(&self.base_url);
-        }
-
-        let client = builder.build().map_err(|e| LlmError::Call {
-            reason: format!("Failed to create OpenAI client: {}", e),
-        })?;
-
-        let client = client.completions_api();
-        let model = client.completion_model(&self.model);
+        let model = client.chat(&self.model);
         let mut agent_builder = AgentBuilder::new(model);
         if let Some(t) = options.temperature {
             agent_builder = agent_builder.temperature(t);
@@ -62,12 +62,13 @@ impl OpenAIProvider {
             reason: format!("OpenAI completion failed: {}", e),
         })?;
 
+        let text = response.output();
         info!(
             model = self.model,
-            response_len = response.len(),
+            response_len = text.len(),
             "OpenAIProvider complete"
         );
-        Ok(response)
+        Ok(text)
     }
 
     pub fn complete(
@@ -104,26 +105,17 @@ impl OpenAIProvider {
         prompt: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<UsedCompletion, LlmError> {
-        let mut builder = openai::Client::builder().api_key(&self.api_key);
+        let client = self.rig_client()?;
 
-        if self.base_url != zen_core::constants::OPENAI_API_URL {
-            builder = builder.base_url(&self.base_url);
-        }
-
-        let client = builder.build().map_err(|e| LlmError::Call {
-            reason: format!("Failed to create OpenAI client: {}", e),
-        })?;
-
-        let client = client.completions_api();
-        let model = client.completion_model(&self.model);
-        let mut request = model.completion_request(prompt);
+        let model = client.chat(&self.model);
+        let mut request = CompletionRequest::new(prompt);
         if let Some(t) = options.temperature {
             request = request.temperature(t);
         }
         if let Some(m) = options.max_tokens {
             request = request.max_tokens(m);
         }
-        let response = request.send().await.map_err(|e| LlmError::Call {
+        let response = model.call(request).await.map_err(|e| LlmError::Call {
             reason: format!("OpenAI completion failed: {}", e),
         })?;
 

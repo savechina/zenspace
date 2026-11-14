@@ -246,3 +246,52 @@ fn killed_report_emits_one_line_per_id_and_none_when_empty() {
     assert_eq!(lines[0]["taskIdFull"], "task-uuid-full");
     assert_eq!(lines[0]["reason"], "daemon-shutdown");
 }
+
+/// W5.4: a delegate-future task (no child, delegate digest via meta) gets
+/// BOTH the generic background line and the additive
+/// `gateway.delegate.killed` line; a shell task keeps exactly one line.
+#[test]
+fn delegate_killed_report_emits_additive_delegate_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let audit = tmp.path().join("audit.jsonl");
+    // Registry-miss path: the meta.json fallback must classify this id as
+    // a delegate task (pid 0 + agent present).
+    let id = "c1ea0000-0000-4000-8000-000000000001";
+    let dir = tmp.path().join("logs").join("tasks").join(id);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // SAFETY: single-threaded test process (nextest discipline).
+    unsafe {
+        std::env::set_var("ZEN_HOME", tmp.path());
+    }
+    let meta = serde_json::json!({
+        "task_id": id,
+        "session_id": "s",
+        "pid": 0,
+        "command_digest": "delegate:Explore",
+        "output_dir": dir.to_string_lossy(),
+        "status": "running",
+        "started_at_ms": 1,
+        "ended_at_ms": null,
+        "bytes_stdout": 0,
+        "bytes_stderr": 0,
+        "truncated": false,
+        "stdout_path": "stdout",
+        "stderr_path": "stderr",
+        "agent": "Explore"
+    });
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec(&meta).expect("ser"),
+    )
+    .expect("write meta");
+    report_killed_background_tasks(Some(&audit), &[id.to_string()]);
+    let lines = read_audit_lines(&audit);
+    assert_eq!(
+        lines.len(),
+        2,
+        "delegate id emits background + delegate lines"
+    );
+    assert_eq!(lines[0]["kind"], "gateway.background.killed");
+    assert_eq!(lines[1]["kind"], "gateway.delegate.killed");
+    assert_eq!(lines[1]["taskIdFull"], id);
+}

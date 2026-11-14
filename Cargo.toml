@@ -158,11 +158,20 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # LLM agent orchestration framework
-rig-core = "0.42"
-rig-agent = "0.42"
+# `reqwest` feature is explicit: rig-core 0.46's default no longer includes a
+# transport (0.43+ cut rig-reqwest out of core) — this preserves the implicit
+# reqwest transport zen's providers build on (research.md R-DEC-T1).
+rig-core = { version = "0.46", features = ["reqwest"] }
+rig-agent = "0.46"
 
 # Composable agent kernel: stateless skills, transport-agnostic tools, registry-driven agents
 rig-compose = "0.5"
+
+# Reqwest transport adapter for rig-core's `connect(http)` seam — zen names it
+# directly only to wrap a custom no-proxy/timeout reqwest::Client (ollama
+# loopback discipline, R-DEC-T1 refinement 2026-11-07: rig-core does not
+# re-export rig_reqwest, so injecting a custom client requires naming it).
+rig-reqwest = "0.46"
 
 # Resource adapters and projection helpers for rig-compose (Evidence → ContextItem bridge)
 rig-resources = "0.2"
@@ -170,7 +179,7 @@ rig-resources = "0.2"
 # MCP bridge for rig-compose tools
 rig-mcp = "0.2"
 
-rig-sqlite = "0.42"
+rig-sqlite = "0.46"
 
 # Utility crates — shared across workspace
 fastrand = "2"

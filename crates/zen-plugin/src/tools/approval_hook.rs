@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +21,43 @@ use crate::tools::confidentiality_hook::{is_cloud_tool, is_mutating_tool};
 // behavior for single-context surfaces (TUI/CLI).
 tokio::task_local! {
     pub static APPROVAL_TURN: Option<String>;
+
+    /// Background-dispatch marker (W5.2, spec 006 D20 §10 — fail-closed
+    /// approvals): set around an agent-future sub-turn running inside
+    /// [`crate::task_registry::TaskRegistry::spawn_async`]. Task-locals do
+    /// NOT cross `tokio::spawn`, so a background sub-turn has no originating
+    /// surface AND no reachable turn affinity — any Ask-mode approval inside
+    /// it resolves deny + audit + structured `approval-required` (never the
+    /// legacy first-free-claim fallback below, which could render on an
+    /// unrelated session's connection — T103 class hazard).
+    pub static BACKGROUND_TASK: bool;
+
+    /// W9.5-F3 watchdog-renewal seam (APPROVAL_TURN precedent): the gateway
+    /// hosting layer scopes a renewal callback around the hosted turn's
+    /// execution; the plan executor fires it after each task settles so the
+    /// turn watchdog extends per completed task (never per wave — one wave
+    /// can hold a 600s first-token wait). Unset → no-op: non-hosted
+    /// surfaces (TUI/CLI direct orchestrator) keep byte-identical behavior.
+    /// Task-locals do not cross `tokio::spawn`; the plan wave loop runs in
+    /// the hosted turn's task tree (`dispatch_timed` buffered stream +
+    /// `join_all` — no spawn between hosting.rs and this read).
+    pub static WATCHDOG_RENEWAL: RefCell<Option<WatchdogRenewal>>;
+}
+
+/// W9.5-F3 watchdog-renewal callback: hosted turns install a closure that
+/// extends the shared watchdog deadline (extend-only, ceiling-capped —
+/// enforcement lives in zen-gateway `server::guards::WatchdogDeadline`).
+pub type WatchdogRenewal = Arc<dyn Fn() + Send + Sync>;
+
+/// Fires the watchdog-renewal heartbeat from inside the hosted turn's
+/// task tree (plan executor, after one task settles). Unset task-local
+/// = silent no-op.
+pub fn fire_watchdog_renewal() {
+    let _ = WATCHDOG_RENEWAL.try_with(|cell| {
+        if let Some(renew) = cell.borrow().clone() {
+            renew();
+        }
+    });
 }
 
 /// Wall-clock budget for an interactive approval callback. A prompt that does
@@ -95,6 +134,21 @@ impl ToolDispatchHook for AskApprovalHook {
         // Gate only mutating/cloud tools (D26). Read-only local tools run direct.
         if !requires_approval(invocation) {
             return Ok(ToolDispatchAction::Continue);
+        }
+
+        // Background fail-closed (W5.2, D20 §10): a sub-turn running inside
+        // the task registry has no originating surface and no turn affinity.
+        // Deny BEFORE any callback/legacy-fallback path can claim a free
+        // route; the audit line lands via the audit hook that observes the
+        // denial action.
+        let background = BACKGROUND_TASK.try_get().unwrap_or(false);
+        if background {
+            return Ok(ToolDispatchAction::Terminate {
+                reason: format!(
+                    "approval denied (background: no surface) — approval-required: {}",
+                    invocation.name
+                ),
+            });
         }
 
         // No callback wired → behave as "direct": allow the invocation without

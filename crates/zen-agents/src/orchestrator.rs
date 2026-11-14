@@ -6,15 +6,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::{StreamExt, TryStreamExt};
-use rig_agent::agent::run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, PendingToolCall};
 use rig_agent::completion::PromptError;
+use rig_agent::run::policy::InvalidToolCallAction;
+use rig_agent::run::{
+    AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, PendingToolCall, TurnPolicy,
+};
 use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::{
     ToolDispatchHook, ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
 use rig_compose::registry::{KernelError, ToolRegistry};
-use rig_core::completion::{AssistantContent, Usage, message::ToolCall as NativeToolCall};
-use rig_core::message::{Message, ToolResultContent, UserContent};
+use rig_core::completion::{
+    AssistantContent, Usage,
+    message::ToolCall as NativeToolCall,
+    message::{AssistantMessage, ToolName},
+};
+use rig_core::message::Message;
+use rig_core::tool::{ToolOutput, ToolResult};
 use tracing::{debug, info, instrument, warn};
 
 use zen_core::config::{KnowledgeInjectMode, LlmPreference};
@@ -144,10 +152,20 @@ pub struct AgentOrchestrator {
     /// 006: parent sensitivity shared with DelegateTaskTool so delegated
     /// sub-turns route under the same sensitivity policy.
     delegate_sensitivity: crate::delegate_task::SharedSensitivity,
+    /// W6.2 (D24 §5): parent sensitivity mirrored into `plan.todos` so the
+    /// minted plan row records it in `spec_json` (future surfaces are safe
+    /// by construction; gates nothing today).
+    plan_todos_sensitivity: crate::delegate_task::SharedSensitivity,
     /// T215 (design F2-D8): parent M1 knowledge block shared with
     /// DelegateTaskTool so `compose_sub_session` can inherit it into
     /// sub-agent sessions under `[agentic.delegate] context_inheritance`.
     delegate_knowledge: crate::delegate_task::SharedKnowledge,
+    delegate_history: crate::delegate_task::SharedHistory,
+    /// The admitting delegate tool's background book (W5.4): populated at
+    /// `install_delegate_tool` so round-boundary notice drains can attach
+    /// the falsifiable `model_source` to the unified notice payload.
+    /// Empty when delegate is disabled (no delegate tasks can exist).
+    delegate_background_book: std::sync::OnceLock<crate::delegate_task::BackgroundBook>,
     /// T214: lazy KB search stack (`[agentic.orchestrator] knowledge_inject`).
     knowledge_stack: OnceLock<Option<Arc<KnowledgeStack>>>,
 }
@@ -415,11 +433,6 @@ fn dispatch_error_feedback(error: &KernelError) -> String {
     }
 }
 
-/// W4.5c (G1-04): build a tool-result `UserContent` answering one call by id.
-fn tool_result_content(call_id: String, name: String, text: String) -> UserContent {
-    UserContent::tool_result(call_id, name, vec![ToolResultContent::text(text)])
-}
-
 /// Upper bound on concurrently in-flight tool dispatches within one round.
 /// Ordered (`buffered`) execution preserves the result↔invocation
 /// positional contract that `BatchPlan` and the answer-zip in both driver
@@ -534,19 +547,64 @@ fn background_notice_line(task_id: &str, command_digest: &str, status: &str) -> 
     )
 }
 
+/// W5.4 (D25 A5 notice parity): delegate tasks get the `delegate.collect`
+/// hint plus the unified payload `{task_index, agent, status,
+/// response|error, model_source}`. The shell line keeps its existing
+/// byte-identical shape. Payload-less (registry+meta miss) → hint only.
+fn delegate_notice_line(
+    task_id: &str,
+    command_digest: &str,
+    status: &str,
+    book: Option<&crate::delegate_task::BackgroundBook>,
+) -> String {
+    let id8: String = task_id.chars().take(8).collect();
+    let hint = format!(
+        "⚙ background task {id8} `{command_digest}` {status} — collect: delegate.collect {{\"task_id\":\"{task_id}\"}}"
+    );
+    let registry = zen_plugin::task_registry::registry();
+    let payload = match registry.delegate_notice_payload(task_id) {
+        Some(mut p) => {
+            if let Some(obj) = p.as_object_mut() {
+                obj.insert(
+                    "model_source".to_string(),
+                    book.and_then(|b| b.peek_model_source(task_id))
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            p
+        }
+        None => serde_json::json!({
+            "task_index": null,
+            "agent": null,
+            "status": status,
+            "model_source": null
+        }),
+    };
+    format!("{hint} {payload}")
+}
+
 /// D4, at-least-once (2026-10-31 review): format un-consumed terminal
 /// snapshots as (task_id, push-line) pairs for `accumulated_results`.
 #[must_use]
 fn background_notice_pairs_from(
     changes: &[zen_plugin::task_registry::TaskSnapshot],
+    book: Option<&crate::delegate_task::BackgroundBook>,
 ) -> Vec<(String, String)> {
     changes
         .iter()
         .map(|snap| {
-            (
-                snap.task_id.clone(),
-                background_notice_line(&snap.task_id, &snap.command_digest, snap.status.as_str()),
-            )
+            let line = if snap.command_digest.starts_with("delegate:") {
+                delegate_notice_line(
+                    &snap.task_id,
+                    &snap.command_digest,
+                    snap.status.as_str(),
+                    book,
+                )
+            } else {
+                background_notice_line(&snap.task_id, &snap.command_digest, snap.status.as_str())
+            };
+            (snap.task_id.clone(), line)
         })
         .collect()
 }
@@ -557,10 +615,51 @@ fn background_notice_pairs_from(
 /// until the model round that carried the notice returned Ok, so a failed
 /// round re-offers the notice next round/turn.
 #[must_use]
-fn drain_background_notice_pairs(session_id: &str) -> Vec<(String, String)> {
+fn drain_background_notice_pairs(
+    session_id: &str,
+    book: Option<&crate::delegate_task::BackgroundBook>,
+) -> Vec<(String, String)> {
     background_notice_pairs_from(
         &zen_plugin::task_registry::registry().take_status_changes(session_id),
+        book,
     )
+}
+
+/// W5.4: one additive `loop.delegate.background` audit line per drained
+/// DELEGATE notice (shell ids emit nothing — the existing
+/// `loop.background.live` line already covers them). Zero ids = zero
+/// writes. Returns the number of lines emitted (test seam).
+fn audit_delegate_background_notices(session_id: &str, drained_ids: &[String]) -> usize {
+    let registry = zen_plugin::task_registry::registry();
+    let delegate_ids: Vec<&String> = drained_ids
+        .iter()
+        .filter(|id| registry.is_delegate_task(id))
+        .collect();
+    if delegate_ids.is_empty() {
+        return 0;
+    }
+    let Ok(paths) = zen_core::paths::ZenPaths::detect() else {
+        return 0;
+    };
+    let mut emitted = 0usize;
+    for id in delegate_ids {
+        let payload = registry.delegate_notice_payload(id);
+        let entry = serde_json::json!({
+            "kind": "loop.delegate.background",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "session_id": session_id,
+            "task_id": id,
+            "payload": payload,
+        });
+        if let Err(e) =
+            zen_core::jsonl::append_jsonl_line(&paths.logs().join("audit.jsonl"), &entry)
+        {
+            warn!(error = %e, "loop.delegate.background audit append failed");
+        } else {
+            emitted += 1;
+        }
+    }
+    emitted
 }
 
 /// D4 at-least-once confirmation: mark these task ids consumed after the
@@ -678,40 +777,48 @@ struct BatchPlan {
     /// Calls to dispatch, each paired with its rig call id (result order
     /// matches this slice exactly, so results map by id — never by index).
     dispatch: Vec<(String, ToolInvocation)>,
-    /// Answers for preresolved / normalizer-rejected calls, keyed by id.
-    answers: Vec<UserContent>,
+    /// Answers for normalizer-rejected calls, keyed by rig call id.
+    answers: Vec<(String, String)>,
     /// Observability records for normalizer-rejected calls.
     rejected: Vec<ToolCall>,
 }
 
 /// W4.5c (G1-04) + W4.6b (G1-05): turn rig's pending calls into an id-keyed
-/// execution plan. Preresolved calls are answered verbatim; calls rejected by
-/// the normalizer are answered inline with `invalid arguments: …` so their
-/// ids are never left unanswered (which would protocol-violate the turn).
+/// execution plan. Executable calls go to dispatch; malformed calls (args
+/// not a JSON object — rig 0.46 splits these out of the executable set) are
+/// answered inline with `invalid arguments: …` so their ids are never left
+/// unanswered (which would protocol-violate the turn). rig 0.42's
+/// `preresolved_result` field no longer exists upstream — pre-resolution
+/// happens in hooks before a call ever reaches a `CallTools` step.
 fn plan_tool_batch(calls: &[PendingToolCall]) -> BatchPlan {
     let mut dispatch = Vec::new();
     let mut answers = Vec::with_capacity(calls.len());
     let mut rejected = Vec::new();
     for pending in calls {
-        if let Some(pre) = &pending.preresolved_result {
-            answers.push(pre.clone());
+        let PendingToolCall::Execute(exec) = pending else {
+            let PendingToolCall::Malformed(malformed) = pending else {
+                unreachable!("PendingToolCall is a closed two-variant enum today")
+            };
+            let reason = "invalid arguments: call arguments are not a JSON object".to_string();
+            rejected.push(ToolCall {
+                tool_name: malformed.name().to_string(),
+                arguments: malformed.raw_arguments().to_string(),
+                result: reason.clone(),
+            });
+            answers.push((malformed.id().wire().into_owned(), reason));
             continue;
-        }
-        let tc = &pending.tool_call;
-        match ToolInvocation::new(tc.function.name.clone(), tc.function.arguments.clone()) {
-            Ok(invocation) => dispatch.push((tc.id.to_string(), invocation)),
+        };
+        let tc = exec.tool_call();
+        match ToolInvocation::new(tc.function.name.to_string(), exec.arguments()) {
+            Ok(invocation) => dispatch.push((exec.id().wire().into_owned(), invocation)),
             Err(error) => {
                 let reason = format!("invalid arguments: {error}");
                 rejected.push(ToolCall {
-                    tool_name: tc.function.name.clone(),
-                    arguments: tc.function.arguments.to_string(),
+                    tool_name: tc.function.name.to_string(),
+                    arguments: exec.arguments().to_string(),
                     result: reason.clone(),
                 });
-                answers.push(tool_result_content(
-                    tc.id.to_string(),
-                    tc.function.name.clone(),
-                    reason,
-                ));
+                answers.push((exec.id().wire().into_owned(), reason));
             }
         }
     }
@@ -730,7 +837,7 @@ fn answer_pending_at_round_cap(
     final_response: &mut String,
     tool_calls: &mut Vec<ToolCall>,
     accumulated_results: &mut Vec<String>,
-) -> (Vec<UserContent>, String) {
+) -> (Vec<(String, String)>, String) {
     let error = serde_json::json!({
         "error": format!(
             "tool round cap reached ({max_tool_rounds}) — tool intent not executed"
@@ -740,20 +847,27 @@ fn answer_pending_at_round_cap(
     let mut answers = Vec::with_capacity(calls.len());
     let mut round_entry = String::new();
     for pending in calls {
-        let call = &pending.tool_call;
-        answers.push(tool_result_content(
-            call.id.to_string(),
-            call.function.name.clone(),
-            error.clone(),
-        ));
+        let (id, name, args) = match pending {
+            PendingToolCall::Execute(exec) => (
+                exec.id().wire().into_owned(),
+                exec.name().to_string(),
+                exec.arguments().to_string(),
+            ),
+            PendingToolCall::Malformed(malformed) => (
+                malformed.id().wire().into_owned(),
+                malformed.name().to_string(),
+                malformed.raw_arguments().to_string(),
+            ),
+            _ => unreachable!("PendingToolCall is a closed two-variant enum today"),
+        };
+        answers.push((id, error.clone()));
         tool_calls.push(ToolCall {
-            tool_name: call.function.name.clone(),
-            arguments: call.function.arguments.to_string(),
+            tool_name: name.clone(),
+            arguments: args.clone(),
             result: error.clone(),
         });
         round_entry.push_str(&format!(
-            "tool: {}\nargs: {}\nresult: {error}\n---\n",
-            call.function.name, call.function.arguments
+            "tool: {name}\nargs: {args}\nresult: {error}\n---\n"
         ));
     }
     if !round_entry.is_empty() {
@@ -837,11 +951,17 @@ pub(crate) fn is_mutating_tool(name: &str) -> bool {
             | "web.search"
             | "system.health"
             | "shell.collect"
+            | "delegate.collect"
+            // G-21 / W6.2: plan.todos mutates only plan rows, not the
+            // world — a mutating classification would fire
+            // Metis→Momus→Hermes on every checklist tick (the 2026-10-30
+            // structural veto, re-created).
+            | "plan.todos"
     )
 }
 
 /// FIX-3: the shared exhaustion-notice wording — one place so the budget
-/// break (FIX-4) and the MaxTurnsError recovery (FIX-2b) phrase the user
+/// break (FIX-4) and the MaxTurns recovery (FIX-2b) phrase the user
 /// visible notice identically. The `⚠` prefix mirrors the existing
 /// round-cap wording (`answer_pending_at_round_cap`).
 fn exhaustion_notice(kind: &str, detail: &str) -> String {
@@ -952,39 +1072,64 @@ fn append_parse_reject_audit(turn: usize, errors: &[String]) {
 }
 
 /// FIX-2a (rig-agent 0.42 contract): `tool_results(vec![])` is a protocol
-/// cancellation (`PromptCancelled: tool execution produced no tool results`)
+/// cancellation (`Cancelled: tool execution produced no tool results`)
 /// and every pending call must be answered exactly once by rig call id.
-/// This guard drives every `tool_results` call site: empty answers with
-/// pending calls get one synthetic error result per pending call, and a
-/// truly empty pending list skips the call entirely instead of cancelling
-/// the run.
+/// This guard drives every answer site: results are keyed by rig call id
+/// (`(call_id, result_json)` pairs); empty results with pending calls get
+/// one synthetic error per pending call, and a truly empty pending list
+/// skips the call entirely instead of cancelling the run. rig 0.46: answers
+/// are `ToolAnswer`s minted from the pending `ExecCall`s themselves (the
+/// call identity is carried internally — the id map only routes the text).
+/// The rig call id of a pending call, across both 0.46 arms.
+fn pending_call_id(pending: &PendingToolCall) -> String {
+    match pending {
+        PendingToolCall::Execute(e) => e.id().wire().into_owned(),
+        PendingToolCall::Malformed(m) => m.id().wire().into_owned(),
+        _ => unreachable!("PendingToolCall is a closed two-variant enum today"),
+    }
+}
+
 fn ensured_tool_results(
     run: &mut AgentRun,
-    mut answers: Vec<UserContent>,
+    mut results: Vec<(String, String)>,
     pending: &[PendingToolCall],
 ) -> Result<()> {
-    if answers.is_empty() {
+    if results.is_empty() {
         if pending.is_empty() {
             return Ok(());
         }
         let error = serde_json::json!({ "error": "tool dispatch produced no result" }).to_string();
-        answers = pending
+        results = pending
             .iter()
-            .map(|p| {
-                tool_result_content(
-                    p.tool_call.id.to_string(),
-                    p.tool_call.function.name.clone(),
-                    error.clone(),
-                )
-            })
+            .map(|p| (pending_call_id(p), error.clone()))
             .collect();
     }
-    run.tool_results(answers)?;
+    let by_id: std::collections::HashMap<&str, &str> = results
+        .iter()
+        .map(|(id, text)| (id.as_str(), text.as_str()))
+        .collect();
+    let answers = pending.iter().map(|p| {
+        let text = by_id
+            .get(pending_call_id(p).as_str())
+            .copied()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                serde_json::json!({ "error": "pending call left unanswered" }).to_string()
+            });
+        match p {
+            PendingToolCall::Execute(exec) => exec
+                .clone()
+                .answer(ToolResult::success(ToolOutput::text(text))),
+            PendingToolCall::Malformed(malformed) => malformed.clone().answer(None),
+            _ => unreachable!("PendingToolCall is a closed two-variant enum today"),
+        }
+    });
+    run.answer_all(answers)?;
     Ok(())
 }
 
-/// FIX-2b (rig-agent 0.42 contract): `next_step` returns
-/// `PromptError::MaxTurnsError` (carrying the canonical `chat_history`) when
+/// FIX-2b (rig-agent contract): `next_step` returns
+/// `PromptError::MaxTurns` (carrying the canonical `chat_history`) when
 /// the model-call budget is exhausted — propagating it kills the turn with
 /// no answer at all. Recover instead: keep whatever the model already said
 /// as the final response, push a synthetic `<max_turns>` audit record (audit
@@ -996,7 +1141,7 @@ fn recover_max_turns_error(
     final_response: &mut String,
     tool_calls: &mut Vec<ToolCall>,
 ) -> bool {
-    let PromptError::MaxTurnsError {
+    let PromptError::MaxTurns {
         max_turns,
         chat_history,
         ..
@@ -1029,7 +1174,7 @@ fn last_assistant_text(history: &[Message]) -> String {
         .iter()
         .rev()
         .filter_map(|m| match m {
-            Message::Assistant { content, .. } => Some(content),
+            Message::Assistant(assistant) => Some(&assistant.content),
             _ => None,
         })
         .flat_map(|content| content.iter())
@@ -1333,7 +1478,10 @@ impl AgentOrchestrator {
             max_tool_rounds,
             skill_router: SkillHitRouter::new(),
             delegate_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            plan_todos_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
             delegate_knowledge: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delegate_history: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delegate_background_book: std::sync::OnceLock::new(),
             knowledge_stack: OnceLock::new(),
         }
     }
@@ -1359,7 +1507,10 @@ impl AgentOrchestrator {
             max_tool_rounds,
             skill_router: SkillHitRouter::new(),
             delegate_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            plan_todos_sensitivity: Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
             delegate_knowledge: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delegate_history: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delegate_background_book: std::sync::OnceLock::new(),
             knowledge_stack: OnceLock::new(),
         }
     }
@@ -1436,25 +1587,59 @@ impl AgentOrchestrator {
             self.memvid_store.clone(),
             Arc::clone(&self.delegate_sensitivity),
             Arc::clone(&self.delegate_knowledge),
+            Arc::clone(&self.delegate_history),
             Arc::clone(&self.token_budget),
             std::time::Duration::from_secs(timeout),
             max_depth,
             max_concurrent,
         ));
+        // W5.2: wire the self-Arc BEFORE registration so background
+        // admissions can move an owned clone into the spawned future.
+        tool.set_self_arc(Arc::clone(&tool));
+        // W5.4: notice drains read model_source through the same book.
+        let _ = self.delegate_background_book.set(tool.background_book());
         self.wiring
             .tools
             .register(Arc::clone(&tool) as Arc<dyn rig_compose::tool::Tool>);
+        // W5.3: collect/kill share the SAME background book — releasing a
+        // hold here refunds the admission reservation. Both are stripped
+        // from sub-agents by the `delegate.` prefix rule (build_sub_agent).
+        let book = tool.background_book();
+        self.wiring.tools.register(Arc::new(
+            crate::delegate_background_tools::DelegateCollectTool::new(book.share()),
+        ));
+        self.wiring.tools.register(Arc::new(
+            crate::delegate_background_tools::DelegateKillTool::new(book.share()),
+        ));
         // T375: plan.execute rides the same kill-switch and lifecycle —
         // it executes DAG nodes through delegate.task's run_single.
+        // T4/A6.2 (SDD review F4): the plan gate carries the SAME semantic
+        // reviewer as the turn gates — Confidential plan deliverables must
+        // not skip the review stage (parity with Self::review_pipeline at
+        // the execute/execute_stream construction sites).
         let plan = crate::plan_task::PlanExecuteTool::new(
-            tool,
-            QualityPipeline::new(),
+            Arc::clone(&tool),
+            Self::review_pipeline(self.executor.router()),
             max_concurrent,
-            zen_core::paths::ZenPaths::detect()
-                .ok()
-                .map(|p| p.data().join("state.db")),
+            crate::plan_todos::resolve_state_db(),
         );
         self.wiring.tools.register(Arc::new(plan));
+        // W6.2 (D21 §2): the durable todo ledger rides the same lifecycle —
+        // Sisyphus-only, Private, read-only for the quality gate.
+        self.wiring
+            .tools
+            .register(Arc::new(crate::plan_todos::PlanTodosTool::new(
+                crate::plan_todos::resolve_state_db(),
+                Arc::clone(&self.plan_todos_sensitivity),
+            )));
+        // W9.3: cancel/append control rides the same lifecycle — Sisyphus
+        // grader-facing, mutating for the quality gate (never whitelisted).
+        self.wiring
+            .tools
+            .register(Arc::new(crate::plan_control::PlanControlTool::new(
+                tool,
+                crate::plan_todos::resolve_state_db(),
+            )));
     }
 
     /// Lazily ensure `delegate.task` is registered before agent building.
@@ -1481,6 +1666,11 @@ impl AgentOrchestrator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *cell = sensitivity;
+        let mut plan_cell = self
+            .plan_todos_sensitivity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *plan_cell = sensitivity;
     }
 
     /// T215 (design F2-D8): mirror the turn's retrieved M1 knowledge block
@@ -1488,12 +1678,74 @@ impl AgentOrchestrator {
     /// inherit it — same last-writer-wins mirror semantics as
     /// [`AgentOrchestrator::propagate_sensitivity`], refreshed on every turn
     /// entry so a later turn never inherits an earlier turn's block.
-    fn propagate_knowledge(&self, knowledge: &[RetrievedNote]) {
+    fn propagate_knowledge(&self, knowledge: &[RetrievedNote]) -> Vec<RetrievedNote> {
+        let snapshot = knowledge.to_vec();
         let mut cell = self
             .delegate_knowledge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *cell = knowledge.to_vec();
+        *cell = snapshot.clone();
+        snapshot
+    }
+
+    /// D25 SC-021 `history` fork source: mirror the parent conversation
+    /// into the delegate tool's shared cell (same last-writer-wins
+    /// semantics as [`AgentOrchestrator::propagate_knowledge`], refreshed
+    /// every turn entry). Assistant entries keep prose only — tool
+    /// invocations/reasoning are stripped here and composition strips
+    /// again defensively; tool-result noise never enters the mirror.
+    fn propagate_history(
+        &self,
+        session: &SessionContext,
+    ) -> Vec<crate::delegate_task::ParentHistoryMessage> {
+        use crate::delegate_task::ParentHistoryMessage;
+        let mut built = Vec::new();
+        let mut cell = self
+            .delegate_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cell.clear();
+        for message in &session.conversation {
+            let role = match message.role {
+                zen_core::types::MessageRole::User => "user",
+                zen_core::types::MessageRole::Assistant => "assistant",
+                // System/tool bookkeeping never forks into a sub-agent
+                // (SC-021: user + assistant prose only).
+                _ => continue,
+            };
+            let content = match message.role {
+                zen_core::types::MessageRole::Assistant => {
+                    crate::orchestrator::strip_fenced_tool_blocks(&message.content)
+                }
+                _ => message.content.clone(),
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            built.push(ParentHistoryMessage {
+                role: role.to_string(),
+                content,
+            });
+        }
+        *cell = built.clone();
+        built
+    }
+
+    /// D30 (F1+OV-1): the single turn-entry context setup. Mirrors the turn's
+    /// policy/knowledge/history into the non-turn fallback cells (wiring +
+    /// delegate + plan.todos) AND builds the scoped [`TurnContext`] — the one
+    /// sanctioned turn-path source. Called once per turn AFTER knowledge
+    /// injection; the caller scopes the result around the turn body.
+    fn begin_turn_context(&self, session: &SessionContext) -> zen_core::turn_context::TurnContext {
+        self.wiring.set_sensitivity(session.sensitivity_policy);
+        self.propagate_sensitivity(session.sensitivity_policy);
+        let knowledge = self.propagate_knowledge(&session.knowledge);
+        let history = self.propagate_history(session);
+        zen_core::turn_context::TurnContext {
+            sensitivity: session.sensitivity_policy,
+            knowledge,
+            history,
+        }
     }
 
     /// Lazily open the KB search stack once per orchestrator (T214, design
@@ -1788,6 +2040,11 @@ impl AgentOrchestrator {
             "delivery_ready": review.delivery_ready,
             "feedback_rounds": feedback_rounds,
             "failed_attempts": review.failed_attempts,
+            // D21 W6.1: additive planning-hint fields. Existing consumers
+            // match by name and ignore unknown keys; the pre-existing field
+            // set is unchanged.
+            "multi_step": intent.multi_step,
+            "hint_source": intent::hint_source(intent),
         });
         // Present only when the user opted in ([agentic.audit]
         // decision_excerpt_chars); absent otherwise, so nothing about the
@@ -1808,6 +2065,208 @@ impl AgentOrchestrator {
                 let _ = writeln!(f, "{entry}");
             }
         }
+    }
+
+    /// D21 W6.1: did a dispatched batch this turn contain `plan.execute`?
+    /// Pure observation over the dispatch results — a plan batch that was
+    /// rejected pre-dispatch (ungranted) or failed to dispatch never
+    /// materializes as a result, so it correctly reads as "no plan ran".
+    fn plan_batch_ran_in(results: &[ToolInvocationResult]) -> bool {
+        results
+            .iter()
+            .any(|r| r.invocation.name.as_str() == crate::plan_task::PLAN_TOOL_NAME)
+    }
+
+    /// D21 W6.1: one `loop.plan.started` line per plan turn — the adoption
+    /// measurement for the multi-step hint. Emitted once at turn end from a
+    /// turn-scoped flag (exactly-once by construction); a turn without a
+    /// dispatched `plan.execute` batch emits nothing.
+    fn append_plan_started_audit(
+        paths: &ZenPaths,
+        session_id: &str,
+        agent: &str,
+        intent: &intent::Intent,
+    ) {
+        let entry = Self::plan_started_entry(session_id, agent, intent);
+        let log_path = paths.logs().join("audit.jsonl");
+        if let Some(parent) = log_path.parent()
+            && fs::create_dir_all(parent).is_ok()
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(f, "{entry}");
+            }
+        }
+    }
+
+    /// D21 W6.1: the `loop.plan.started` entry shape. `hint_source` is the
+    /// `l0|l1|prompt|none` provenance of the turn's multi-step verdict (see
+    /// [`intent::hint_source`]); `multi_step` is the advisory hint itself.
+    fn plan_started_entry(
+        session_id: &str,
+        agent: &str,
+        intent: &intent::Intent,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "loop.plan.started",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "session_id": session_id,
+            "agent": agent,
+            "hint_source": intent::hint_source(intent),
+            "multi_step": intent.multi_step,
+        })
+    }
+
+    /// W6.5 (D21 §5): one `loop.plan.synthesis` line per plan turn that
+    /// reached the final-answer decision (zero lines when no batch ran).
+    fn append_plan_synthesis_audit(
+        paths: &ZenPaths,
+        session_id: &str,
+        agent: &str,
+        mut entry: serde_json::Value,
+    ) {
+        entry["kind"] = serde_json::json!("loop.plan.synthesis");
+        entry["ts"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+        entry["session_id"] = serde_json::json!(session_id);
+        entry["agent"] = serde_json::json!(agent);
+        let log_path = paths.logs().join("audit.jsonl");
+        if let Some(parent) = log_path.parent()
+            && fs::create_dir_all(parent).is_ok()
+        {
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(f, "{entry}");
+            }
+        }
+    }
+
+    /// W6.5 (D21 §5): the bounded synthesis pass. Returns `(prose, label)` —
+    /// prose is `Some` only on a successful synthesis (the caller replaces
+    /// the in-loop answer with it); label is the block's honesty line
+    /// (`ok` | `skipped:<reason>` | `failed`). Every decided turn emits one
+    /// audit line; failure/timeout/skip fall back to the in-loop prose and
+    /// NEVER fail the turn.
+    async fn run_plan_synthesis(
+        &self,
+        call: crate::plan_synthesis::SynthesisCall<'_>,
+    ) -> (Option<String>, String) {
+        let crate::plan_synthesis::SynthesisCall {
+            sensitivity,
+            session_id,
+            agent_name,
+            user_query,
+            final_prose,
+            snapshot,
+            vetoed,
+        } = call;
+        let started = std::time::Instant::now();
+        let decision = crate::plan_synthesis::decide_synthesis(true, vetoed, final_prose);
+        let mut skipped_reason: Option<&'static str> = None;
+        let mut provider_label = "none".to_string();
+        let mut chars_in = 0usize;
+        let mut chars_out = 0usize;
+        let mut ok = false;
+        let mut prose: Option<String> = None;
+        match &decision {
+            crate::plan_synthesis::SynthesisDecision::Skip { reason } => {
+                skipped_reason = Some(reason);
+            }
+            crate::plan_synthesis::SynthesisDecision::Run => {
+                let prompt =
+                    crate::plan_synthesis::build_synthesis_prompt(user_query, &snapshot.rows);
+                chars_in = prompt.chars().count();
+                let estimated = (prompt.len() / 4 + 256) as u64;
+                let budget = self.token_budget.try_reserve_tokens(estimated).await;
+                if let Ok(Some(_reservation)) = budget {
+                    let preferences = self
+                        .registry
+                        .find_by_name(agent_name)
+                        .map(|profile| profile.llm_preferences.clone())
+                        .unwrap_or_else(|_| vec![LlmPreference::Any]);
+                    // T16 (OV-4): ONE off-runtime resolve. The route may run
+                    // a blocking provider health check (intent.rs precedent)
+                    // — the previous inline resolve on the async worker was
+                    // the D1-class daemon stall its own comment forbade, and
+                    // it duplicated this spawn_blocking call. provider_label,
+                    // is_local, secs, and the skip decision all derive from
+                    // this single result. SC-012: unreachable ⇒ skip, never
+                    // cloud.
+                    let route_router = self.executor.router().clone();
+                    let prefs = preferences.clone();
+                    let routed = tokio::task::spawn_blocking(move || {
+                        resolve_completion_provider(&route_router, &prefs, sensitivity)
+                    })
+                    .await;
+                    match routed {
+                        Ok(Ok(provider)) => {
+                            provider_label = crate::plan_synthesis::provider_name(&provider);
+                            let is_local = crate::plan_synthesis::is_local_provider(&provider);
+                            let secs = crate::plan_synthesis::synthesis_timeout_secs(is_local);
+                            let outcome =
+                                tokio::time::timeout(std::time::Duration::from_secs(secs), async {
+                                    let mut stream = self
+                                        .executor
+                                        .router()
+                                        .call_stream_with_model(provider, &prompt, None)
+                                        .map_err(|e| e.to_string())?;
+                                    let mut reply = String::new();
+                                    while let Some(token) = stream.token_rx.recv().await {
+                                        reply.push_str(&token);
+                                    }
+                                    if let Ok(Err(e)) = stream.done_rx.await {
+                                        return Err(e);
+                                    }
+                                    Ok(reply)
+                                })
+                                .await;
+                            match outcome {
+                                Ok(Ok(text)) if !text.trim().is_empty() => {
+                                    ok = true;
+                                    chars_out = text.chars().count();
+                                    prose = Some(text);
+                                }
+                                Ok(Ok(_)) => skipped_reason = Some("empty"),
+                                _ => skipped_reason = Some("timeout_or_error"),
+                            }
+                        }
+                        _ => skipped_reason = Some("no_provider"),
+                    }
+                } else {
+                    skipped_reason = Some("budget");
+                }
+            }
+        }
+        if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
+            let mut entry = serde_json::json!({
+                "ok": ok,
+                "chars_in": chars_in,
+                "chars_out": chars_out,
+                "duration_ms": started.elapsed().as_millis() as u64,
+                "provider": provider_label,
+            });
+            if let Some(reason) = skipped_reason {
+                entry["skipped_reason"] = serde_json::json!(reason);
+            }
+            Self::append_plan_synthesis_audit(&paths, session_id, agent_name, entry);
+        }
+        let label = match (&decision, skipped_reason) {
+            (crate::plan_synthesis::SynthesisDecision::Skip { reason }, _) => {
+                format!("skipped:{reason}")
+            }
+            (crate::plan_synthesis::SynthesisDecision::Run, Some(reason)) => {
+                format!("skipped:{reason}")
+            }
+            (crate::plan_synthesis::SynthesisDecision::Run, None) => "ok".to_string(),
+        };
+        (prose, label)
     }
 
     /// T233 (006 D13/W3): record-only shadow observations at turn completion.
@@ -1942,6 +2401,7 @@ impl AgentOrchestrator {
         {
             tools.push(crate::delegate_task::DELEGATE_TOOL_NAME.to_string());
             tools.push(crate::plan_task::PLAN_TOOL_NAME.to_string());
+            tools.push(crate::plan_control::PLAN_CONTROL_TOOL_NAME.to_string());
         }
         // T378 `delegation-only`: the 001 A.8 ultra surface — Sisyphus
         // keeps exactly the delegation tools; all direct tools move to
@@ -1950,6 +2410,7 @@ impl AgentOrchestrator {
             tools.retain(|t| {
                 t == crate::delegate_task::DELEGATE_TOOL_NAME
                     || t == crate::plan_task::PLAN_TOOL_NAME
+                    || t == crate::plan_control::PLAN_CONTROL_TOOL_NAME
             });
         }
         debug!(
@@ -2129,15 +2590,18 @@ impl AgentOrchestrator {
         let reservation = reservation.unwrap();
 
         self.wiring.connect_mcp_servers().await;
-        self.wiring.set_sensitivity(session.sensitivity_policy);
-        self.propagate_sensitivity(session.sensitivity_policy);
-        self.propagate_knowledge(&session.knowledge);
-
+        // D30 (F1+OV-1): one turn-entry setup mirrors the fallback cells and
+        // builds the scoped TurnContext — the single sanctioned turn-path
+        // source (delegate composition, confidentiality hook, plan gate,
+        // plan.todos tag). Single-session behavior is byte-identical.
+        let turn_ctx = self.begin_turn_context(session);
+        return zen_core::turn_context::TURN_CONTEXT
+            .scope(turn_ctx, async move {
         let tool_manifest = zen_agent.tool_manifest();
         let tool_names: BTreeSet<String> = zen_agent
             .tool_definitions()
             .into_iter()
-            .map(|td| td.name)
+            .map(|td| String::from(td.name))
             .collect();
 
         let output_schema = agent_output_schema_value(&agent_name).cloned();
@@ -2154,7 +2618,7 @@ impl AgentOrchestrator {
                         MessageRole::Assistant => Message::assistant(&t.content),
                         MessageRole::System | MessageRole::Tool => Message::system(&t.content),
                     })
-                    .collect(),
+                    .collect::<Vec<Message>>(),
             );
 
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -2166,6 +2630,11 @@ impl AgentOrchestrator {
         let mut accumulated_results: Vec<String> = Vec::new();
         let mut pending_rejection_entries: Vec<String> = Vec::new();
         let mut round_reservations: Vec<rig_compose::budget::TokenReservation> = Vec::new();
+        // D21 W6.1: turn-scoped plan-batch flag — set when a dispatched batch
+        // contained plan.execute; drives the single loop.plan.started audit
+        // line at turn end (exactly-once by construction).
+        let mut plan_batch_ran = false;
+        let mut plan_snapshot: Option<crate::plan_synthesis::PlanOutcomeSnapshot> = None;
 
         loop {
             let step = match run.next_step() {
@@ -2229,11 +2698,19 @@ impl AgentOrchestrator {
                     // next prompt. Delivery is at-least-once: consumed only
                     // after the model round below returns Ok (empty registry
                     // ⇒ no push, byte-identical).
+                    // W11.16/T17 (OV-6): release expired/terminal admission
+                    // holds at the round-boundary notice drain so an expired
+                    // background task refunds its budget promptly instead of
+                    // pinning it until the next admission.
+                    if let Some(book) = self.delegate_background_book.get() {
+                        book.sweep_terminal();
+                    }
                     let background_notice_ids: Vec<String> = {
                         let mut ids = Vec::new();
-                        for (id, line) in
-                            drain_background_notice_pairs(&session.session_id.to_string())
-                        {
+                        for (id, line) in drain_background_notice_pairs(
+                            &session.session_id.to_string(),
+                            self.delegate_background_book.get(),
+                        ) {
                             push_tool_results_history(&mut accumulated_results, line);
                             ids.push(id);
                         }
@@ -2250,6 +2727,10 @@ impl AgentOrchestrator {
                         )
                     })?;
                     mark_background_notices_consumed(
+                        &session.session_id.to_string(),
+                        &background_notice_ids,
+                    );
+                    audit_delegate_background_notices(
                         &session.session_id.to_string(),
                         &background_notice_ids,
                     );
@@ -2311,19 +2792,22 @@ impl AgentOrchestrator {
                         for (idx, inv) in granted.iter().enumerate() {
                             items.push(AssistantContent::tool_call(
                                 format!("call_{idx}"),
-                                inv.name.clone(),
+                                ToolName::try_from(inv.name.clone())
+                                    .expect("granted invocation names are validated non-empty"),
                                 inv.args.clone(),
                             ));
                         }
                         items
                     };
 
+                    let policy = TurnPolicy::new(tool_names.iter().cloned().collect(), None, None)
+                        .map_err(|e| anyhow::anyhow!("turn policy rejected: {e}"))?;
                     let model_turn = ModelTurn::new(
-                        None,
+                        AssistantMessage::new(assistant_content.clone()),
                         assistant_content,
                         Usage::new(),
-                        tool_names.clone(),
-                        tool_names.clone(),
+                        policy,
+                        serde_json::Value::Null,
                     );
 
                     match run.model_response(model_turn)? {
@@ -2334,11 +2818,9 @@ impl AgentOrchestrator {
                             // call count) so the next `next_step()` cannot
                             // protocol-violate.
                             for _ in 0..=granted.len() {
-                                match run.resolve_invalid_tool_call(
-                                    rig_agent::agent::hook::InvalidToolCallAction::skip(
-                                        "invalid tool call",
-                                    ),
-                                )? {
+                                match run.resolve_invalid_tool_call(InvalidToolCallAction::skip(
+                                    "invalid tool call",
+                                ))? {
                                     ModelTurnOutcome::NeedsResolution(_) => continue,
                                     _ => break,
                                 }
@@ -2411,14 +2893,18 @@ impl AgentOrchestrator {
                                 arguments: String::new(),
                                 result: feedback.clone(),
                             });
-                            let results: Vec<rig_core::message::UserContent> = calls
+                            let results: Vec<(String, String)> = calls
                                 .iter()
-                                .map(|c| {
-                                    tool_result_content(
-                                        c.tool_call.id.to_string(),
-                                        c.tool_call.function.name.clone(),
-                                        feedback.clone(),
-                                    )
+                                .map(|c| match c {
+                                    PendingToolCall::Execute(e) => {
+                                        (e.id().wire().into_owned(), feedback.clone())
+                                    }
+                                    PendingToolCall::Malformed(m) => {
+                                        (m.id().wire().into_owned(), feedback.clone())
+                                    }
+                                    _ => unreachable!(
+                                        "PendingToolCall is a closed two-variant enum today"
+                                    ),
                                 })
                                 .collect();
                             ensured_tool_results(&mut run, results, &calls)?;
@@ -2475,6 +2961,17 @@ impl AgentOrchestrator {
                             }
                         }
                     }
+                    // D21 W6.1: observe whether this dispatched batch ran the
+                    // plan tool (drives loop.plan.started at turn end).
+                    if Self::plan_batch_ran_in(&results) {
+                        plan_batch_ran = true;
+                        // W6.5: the full per-task outcome snapshot — the
+                        // synthesis reads the plan result, not the capped
+                        // history (SC-012).
+                        if let Some(snapshot) = crate::plan_synthesis::extract_snapshot(&results) {
+                            plan_snapshot = Some(snapshot);
+                        }
+                    }
 
                     // W4.6c: accumulate this round's rejections + results so
                     // the next CallModel prompt carries prior rounds.
@@ -2488,16 +2985,15 @@ impl AgentOrchestrator {
 
                     // W4.5c: map each result back to its call id (never by index).
                     for ((call_id, _), result) in dispatch.iter().zip(results.iter()) {
-                        answers.push(tool_result_content(
+                        answers.push((
                             call_id.clone(),
-                            result.invocation.name.to_string(),
                             serde_json::to_string(&result.output).unwrap_or_default(),
                         ));
                     }
                     ensured_tool_results(&mut run, answers, &calls)?;
                 }
                 AgentRunStep::Done(response) => {
-                    final_response = response.output;
+                    final_response = response.output();
                     break;
                 }
             }
@@ -2615,6 +3111,33 @@ impl AgentOrchestrator {
             apply_verdict_notice(&review.review_notes, &mut final_response);
         }
 
+        // W6.5 (D21 §5): synthesis + `Plan result` block — after the gate,
+        // never re-judged. Zero impact when no batch ran (no block, no
+        // tokens, no audit line).
+        if let Some(snapshot) = &plan_snapshot {
+            let vetoed = gated && !review.plan_approved;
+            let (prose, label) = self
+                .run_plan_synthesis(crate::plan_synthesis::SynthesisCall {
+                    sensitivity: session.sensitivity_policy,
+                    session_id: &session.session_id.to_string(),
+                    agent_name: &agent_name,
+                    user_query,
+                    final_prose: &final_response,
+                    snapshot,
+                    vetoed,
+                })
+                .await;
+            if !vetoed && let Some(synth) = prose {
+                final_response = synth;
+            }
+            final_response.push('\n');
+            final_response.push_str(&crate::plan_synthesis::render_plan_result_block_in(
+                session.plan_result_format,
+                snapshot,
+                &label,
+            ));
+        }
+
         if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
             Self::append_turn_review_audit(
                 &paths,
@@ -2625,6 +3148,16 @@ impl AgentOrchestrator {
                 feedback_rounds,
                 user_query,
             );
+            // D21 W6.1: exactly one loop.plan.started line per plan turn —
+            // the turn-scoped flag guarantees once-per-turn idempotency.
+            if plan_batch_ran {
+                Self::append_plan_started_audit(
+                    &paths,
+                    &session.session_id.to_string(),
+                    &agent_name,
+                    &intent,
+                );
+            }
             Self::emit_shadow_observations(
                 &paths,
                 &session.session_id.to_string(),
@@ -2640,7 +3173,8 @@ impl AgentOrchestrator {
             agent_name: agent_name.clone(),
             response: final_response.clone(),
             metadata: ExecutionMetadata {
-                tokens_used: run.usage().input_tokens as u32 + run.usage().output_tokens as u32,
+                tokens_used: run.usage().input_tokens.unwrap_or(0) as u32
+                    + run.usage().output_tokens.unwrap_or(0) as u32,
                 cost_estimate: 0.0,
                 model_used: last_model_used,
                 duration_ms,
@@ -2677,6 +3211,8 @@ impl AgentOrchestrator {
         }
 
         Ok(final_execution)
+            })
+            .await;
     }
 
     /// Verbose parser: returns invocations plus one diagnostic per fenced
@@ -2781,7 +3317,10 @@ impl AgentOrchestrator {
         let mut invocations = Vec::new();
         let mut errors = Vec::new();
         for call in native_calls {
-            match ToolInvocation::new(call.function.name.clone(), call.function.arguments.clone()) {
+            match ToolInvocation::new(
+                call.function.name.as_str().to_string(),
+                serde_json::Value::Object(call.function.arguments.clone()),
+            ) {
                 Ok(invocation) => invocations.push(invocation),
                 Err(e) => {
                     warn!(
@@ -2964,10 +3503,12 @@ impl AgentOrchestrator {
             .await?;
 
         self.wiring.connect_mcp_servers().await;
-        self.wiring.set_sensitivity(session.sensitivity_policy);
-        self.propagate_sensitivity(session.sensitivity_policy);
-        self.propagate_knowledge(&session.knowledge);
-
+        // D30 (F1+OV-1): same turn-entry setup as execute() — the stream
+        // path's tool loop, delegate composition, and hook gates all read
+        // the scoped context, not the racy shared cells.
+        let turn_ctx = self.begin_turn_context(session);
+        return zen_core::turn_context::TURN_CONTEXT
+            .scope(turn_ctx, async move {
         // FR-034: reward sidecar bookkeeping for this turn (access, plus
         // corrections when the user is correcting prior output). The sidecar
         // increments are blocking flock+fsync cycles — run them off the async
@@ -2983,7 +3524,7 @@ impl AgentOrchestrator {
         let tool_names: BTreeSet<String> = zen_agent
             .tool_definitions()
             .into_iter()
-            .map(|td| td.name)
+            .map(|td| String::from(td.name))
             .collect();
 
         // W1.4a (G5-02): mirror `execute()`'s turn-level pre-loop reservation
@@ -3020,7 +3561,7 @@ impl AgentOrchestrator {
                         MessageRole::Assistant => Message::assistant(&t.content),
                         MessageRole::System | MessageRole::Tool => Message::system(&t.content),
                     })
-                    .collect(),
+                    .collect::<Vec<Message>>(),
             );
 
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -3030,6 +3571,10 @@ impl AgentOrchestrator {
         let mut accumulated_results: Vec<String> = Vec::new();
         let mut pending_rejection_entries: Vec<String> = Vec::new();
         let mut round_reservations: Vec<rig_compose::budget::TokenReservation> = Vec::new();
+        // D21 W6.1: turn-scoped plan-batch flag (stream path) — same
+        // exactly-once loop.plan.started contract as `execute`.
+        let mut plan_batch_ran = false;
+        let mut plan_snapshot: Option<crate::plan_synthesis::PlanOutcomeSnapshot> = None;
 
         loop {
             let step = match run.next_step() {
@@ -3093,11 +3638,19 @@ impl AgentOrchestrator {
                     // pushes without echoing. Delivery at-least-once (2026-10-31
                     // review): consumed only after the stream round below
                     // returns Ok.
+                    // W11.16/T17 (OV-6): release expired/terminal admission
+                    // holds at the round-boundary notice drain so an expired
+                    // background task refunds its budget promptly instead of
+                    // pinning it until the next admission.
+                    if let Some(book) = self.delegate_background_book.get() {
+                        book.sweep_terminal();
+                    }
                     let background_notice_ids: Vec<String> = {
                         let mut ids = Vec::new();
-                        for (id, line) in
-                            drain_background_notice_pairs(&session.session_id.to_string())
-                        {
+                        for (id, line) in drain_background_notice_pairs(
+                            &session.session_id.to_string(),
+                            self.delegate_background_book.get(),
+                        ) {
                             callback(&format!("{line}\n"));
                             push_tool_results_history(&mut accumulated_results, line);
                             ids.push(id);
@@ -3115,6 +3668,10 @@ impl AgentOrchestrator {
                         .execute_stream_round(user_query, session, history_opt, &mut callback)
                         .await?;
                     mark_background_notices_consumed(
+                        &session.session_id.to_string(),
+                        &background_notice_ids,
+                    );
+                    audit_delegate_background_notices(
                         &session.session_id.to_string(),
                         &background_notice_ids,
                     );
@@ -3183,30 +3740,31 @@ impl AgentOrchestrator {
                         for (idx, inv) in granted.iter().enumerate() {
                             items.push(AssistantContent::tool_call(
                                 format!("call_{idx}"),
-                                inv.name.clone(),
+                                ToolName::try_from(inv.name.clone())
+                                    .expect("granted invocation names are validated non-empty"),
                                 inv.args.clone(),
                             ));
                         }
                         items
                     };
 
+                    let policy = TurnPolicy::new(tool_names.iter().cloned().collect(), None, None)
+                        .map_err(|e| anyhow::anyhow!("turn policy rejected: {e}"))?;
                     let model_turn = ModelTurn::new(
-                        None,
+                        AssistantMessage::new(assistant_content.clone()),
                         assistant_content,
                         Usage::new(),
-                        tool_names.clone(),
-                        tool_names.clone(),
+                        policy,
+                        serde_json::Value::Null,
                     );
 
                     match run.model_response(model_turn)? {
                         ModelTurnOutcome::Continue { .. } => {}
                         ModelTurnOutcome::NeedsResolution(_) => {
                             for _ in 0..=granted.len() {
-                                match run.resolve_invalid_tool_call(
-                                    rig_agent::agent::hook::InvalidToolCallAction::skip(
-                                        "invalid tool call",
-                                    ),
-                                )? {
+                                match run.resolve_invalid_tool_call(InvalidToolCallAction::skip(
+                                    "invalid tool call",
+                                ))? {
                                     ModelTurnOutcome::NeedsResolution(_) => continue,
                                     _ => break,
                                 }
@@ -3275,14 +3833,18 @@ impl AgentOrchestrator {
                                 result: feedback.clone(),
                             });
                             callback(&format!("❌ tool dispatch blocked: {e}\n"));
-                            let results: Vec<rig_core::message::UserContent> = calls
+                            let results: Vec<(String, String)> = calls
                                 .iter()
-                                .map(|c| {
-                                    tool_result_content(
-                                        c.tool_call.id.to_string(),
-                                        c.tool_call.function.name.clone(),
-                                        feedback.clone(),
-                                    )
+                                .map(|c| match c {
+                                    PendingToolCall::Execute(e) => {
+                                        (e.id().wire().into_owned(), feedback.clone())
+                                    }
+                                    PendingToolCall::Malformed(m) => {
+                                        (m.id().wire().into_owned(), feedback.clone())
+                                    }
+                                    _ => unreachable!(
+                                        "PendingToolCall is a closed two-variant enum today"
+                                    ),
                                 })
                                 .collect();
                             ensured_tool_results(&mut run, results, &calls)?;
@@ -3343,8 +3905,14 @@ impl AgentOrchestrator {
 
                     // W4.6d (G1-08): persist the calls that actually ran, not
                     // an empty slice.
-                    let turn_native_calls: Vec<NativeToolCall> =
-                        calls.iter().map(|c| c.tool_call.clone()).collect();
+                    let turn_native_calls: Vec<NativeToolCall> = calls
+                        .iter()
+                        .filter_map(|c| match c {
+                            PendingToolCall::Execute(e) => Some(e.tool_call().clone()),
+                            PendingToolCall::Malformed(_) => None,
+                            _ => unreachable!("PendingToolCall is a closed two-variant enum today"),
+                        })
+                        .collect();
                     let assistant_text =
                         append_native_tool_calls_fenced(final_response.clone(), &turn_native_calls);
                     interaction_turns.push(("assistant", assistant_text));
@@ -3362,16 +3930,26 @@ impl AgentOrchestrator {
 
                     // W4.5c: map each result back to its call id (never by index).
                     for ((call_id, _), result) in dispatch.iter().zip(results.iter()) {
-                        answers.push(tool_result_content(
+                        answers.push((
                             call_id.clone(),
-                            result.invocation.name.to_string(),
                             serde_json::to_string(&result.output).unwrap_or_default(),
                         ));
+                    }
+                    // D21 W6.1: observe whether this dispatched batch ran the
+                    // plan tool (drives loop.plan.started at turn end).
+                    if Self::plan_batch_ran_in(&results) {
+                        plan_batch_ran = true;
+                        // W6.5: the full per-task outcome snapshot — the
+                        // synthesis reads the plan result, not the capped
+                        // history (SC-012).
+                        if let Some(snapshot) = crate::plan_synthesis::extract_snapshot(&results) {
+                            plan_snapshot = Some(snapshot);
+                        }
                     }
                     ensured_tool_results(&mut run, answers, &calls)?;
                 }
                 AgentRunStep::Done(response) => {
-                    final_response = response.output;
+                    final_response = response.output();
                     break;
                 }
             }
@@ -3426,6 +4004,36 @@ impl AgentOrchestrator {
         if let Some(marker) = stream_gate_marker(&review, gated) {
             callback(&marker);
         }
+        // W6.5 (D21 §5): the streamed tokens cannot be retracted — the
+        // synthesis arrives as a labeled section after the gate marker,
+        // then the block (duplication accepted by design).
+        if let Some(snapshot) = &plan_snapshot {
+            let vetoed = gated && !review.plan_approved;
+            let (prose, label) = self
+                .run_plan_synthesis(crate::plan_synthesis::SynthesisCall {
+                    sensitivity: session.sensitivity_policy,
+                    session_id: &session.session_id.to_string(),
+                    agent_name: &agent_name,
+                    user_query,
+                    final_prose: &final_response,
+                    snapshot,
+                    vetoed,
+                })
+                .await;
+            if !vetoed && let Some(synth) = prose {
+                let section = format!("\n\n### Synthesis\n\n{synth}\n");
+                callback(&section);
+                final_response.push_str(&section);
+            }
+            let block = crate::plan_synthesis::render_plan_result_block_in(
+                session.plan_result_format,
+                snapshot,
+                &label,
+            );
+            let block_text = format!("\n{block}");
+            callback(&block_text);
+            final_response.push_str(&block_text);
+        }
         if let Ok(paths) = zen_core::paths::ZenPaths::detect() {
             Self::append_turn_review_audit(
                 &paths,
@@ -3436,6 +4044,16 @@ impl AgentOrchestrator {
                 0,
                 user_query,
             );
+            // D21 W6.1: exactly one loop.plan.started line per plan turn —
+            // the turn-scoped flag guarantees once-per-turn idempotency.
+            if plan_batch_ran {
+                Self::append_plan_started_audit(
+                    &paths,
+                    &session.session_id.to_string(),
+                    &agent_name,
+                    &intent,
+                );
+            }
             Self::emit_shadow_observations(
                 &paths,
                 &session.session_id.to_string(),
@@ -3455,6 +4073,8 @@ impl AgentOrchestrator {
         }
 
         Ok(final_response)
+            })
+            .await;
     }
 
     /// Route (keyword classification) — backward compatible public facade.
@@ -3822,10 +4442,15 @@ mod tests {
         assert!(!line.contains("hits"), "got: {line}");
     }
 
+    fn tool_name(name: &str) -> rig_core::message::ToolName {
+        rig_core::message::ToolName::try_from(name.to_string())
+            .expect("test tool names are non-empty")
+    }
+
     fn native_call(name: &str, args: serde_json::Value) -> NativeToolCall {
         NativeToolCall::new(
-            rig_core::message::ToolCallId::new_or_mint("native-id"),
-            rig_core::completion::message::ToolFunction::new(name.to_string(), args),
+            rig_core::message::CallId::from_wire("native-id"),
+            rig_core::completion::message::ToolFunction::new(tool_name(name), args),
         )
     }
 
@@ -3883,18 +4508,10 @@ mod tests {
         assert!(errors.is_empty(), "valid native call produces no errors");
     }
 
-    #[test]
-    fn resolve_invocations_invalid_native_name_logged_as_error() {
-        let native = vec![native_call("", serde_json::json!({}))];
-        let (invocations, errors, _degraded) =
-            AgentOrchestrator::resolve_invocations("plain answer", &native);
-        assert!(
-            invocations.is_empty(),
-            "invalid native call must not dispatch"
-        );
-        assert_eq!(errors.len(), 1, "one error for the invalid name");
-    }
-
+    // resolve_invocations_invalid_native_name_logged_as_error RETIRED with
+    // the 0.46 migration: rig's ToolName is TryFrom and rejects empty names
+    // at the type level, so a native call with an empty name can no longer
+    // be constructed — the case this pin guarded is unrepresentable.
     #[test]
     fn resolve_invocations_fenced_errors_preserved_when_no_native() {
         let response = "```json\n{\"tool\": \"x\"}\n```";
@@ -4152,6 +4769,21 @@ mod tests {
                 "{name} is read-only and must NOT gate a turn"
             );
         }
+        // W5.3: delegate.collect is read-only bookkeeping.
+        assert!(
+            !is_mutating_tool("delegate.collect"),
+            "delegate.collect is read-only and must NOT gate a turn"
+        );
+        // G-21 / W6.2: plan.todos mutates only plan rows — a checklist tick
+        // must never fire Metis→Momus→Hermes.
+        assert!(
+            !is_mutating_tool("plan.todos"),
+            "plan.todos is ledger bookkeeping and must NOT gate a turn"
+        );
+        assert!(
+            is_mutating_tool("plan.execute"),
+            "plan.execute remains mutating (G-21 separation from plan.todos)"
+        );
         // FIX-1: SYNTHETIC audit bookkeeping records → false.
         for name in ["<budget>", "<parse>", "<dispatch>", "<max_turns>"] {
             assert!(
@@ -4169,6 +4801,7 @@ mod tests {
             "shell.exec",
             "delegate.task",
             "plan.execute",
+            "delegate.kill",
             "system.notifications",
             "system.calendar",
             "system.daemon",
@@ -4381,21 +5014,18 @@ mod tests {
 
     #[test]
     fn recover_max_turns_error_keeps_last_assistant_words_and_audits() {
-        // FIX-2b: MaxTurnsError must degrade to a notice + last assistant
+        // FIX-2b: MaxTurns must degrade to a notice + last assistant
         // text, never kill the turn with no answer.
         let history = vec![
             Message::user("find it"),
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::text(
-                    "partial findings: none yet".to_string(),
-                )],
-            },
+            Message::Assistant(AssistantMessage::new(vec![AssistantContent::text(
+                "partial findings: none yet".to_string(),
+            )])),
         ];
-        let error = PromptError::MaxTurnsError {
+        let error = PromptError::MaxTurns {
             max_turns: 10,
-            chat_history: Box::new(history),
-            prompt: Box::new(Message::user("next")),
+            chat_history: history,
+            prompt: Message::user("next"),
         };
         let mut final_response = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -4413,10 +5043,10 @@ mod tests {
         assert_eq!(tool_calls[0].result, "max_turns_exhausted");
 
         // No assistant text anywhere → notice-only, still never empty.
-        let error = PromptError::MaxTurnsError {
+        let error = PromptError::MaxTurns {
             max_turns: 3,
-            chat_history: Box::new(vec![Message::user("q")]),
-            prompt: Box::new(Message::user("q")),
+            chat_history: vec![Message::user("q")],
+            prompt: Message::user("q"),
         };
         let mut final_response = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -4432,14 +5062,13 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
 
         // Extracted text already mirrored in final_response is not duplicated.
-        let history = vec![Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::text("already here".to_string())],
-        }];
-        let error = PromptError::MaxTurnsError {
+        let history = vec![Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::text("already here".to_string()),
+        ]))];
+        let error = PromptError::MaxTurns {
             max_turns: 5,
-            chat_history: Box::new(history),
-            prompt: Box::new(Message::user("q")),
+            chat_history: history,
+            prompt: Message::user("q"),
         };
         let mut final_response = "already here".to_string();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -4455,7 +5084,7 @@ mod tests {
         );
 
         // Any other error is NOT recovered — the caller must propagate it.
-        let cancelled = PromptError::PromptCancelled {
+        let cancelled = PromptError::Cancelled {
             chat_history: Vec::new(),
             reason: "reason".to_string(),
         };
@@ -4472,25 +5101,21 @@ mod tests {
     fn last_assistant_text_returns_last_non_empty_block() {
         assert_eq!(last_assistant_text(&[]), "");
         let history = vec![
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::text("earlier".to_string())],
-            },
+            Message::Assistant(AssistantMessage::new(vec![AssistantContent::text(
+                "earlier".to_string(),
+            )])),
             Message::user("tool output"),
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::text("  ".to_string())],
-            },
-            Message::Assistant {
-                id: None,
-                content: vec![AssistantContent::text("final words".to_string())],
-            },
+            Message::Assistant(AssistantMessage::new(vec![AssistantContent::text(
+                "  ".to_string(),
+            )])),
+            Message::Assistant(AssistantMessage::new(vec![AssistantContent::text(
+                "final words".to_string(),
+            )])),
         ];
         assert_eq!(last_assistant_text(&history), "final words");
-        let whitespace_only: Vec<Message> = vec![Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::text("   ".to_string())],
-        }];
+        let whitespace_only: Vec<Message> = vec![Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::text("   ".to_string()),
+        ]))];
         assert_eq!(last_assistant_text(&whitespace_only), "");
     }
 
@@ -4503,15 +5128,20 @@ mod tests {
             AgentRunStep::CallModel { .. } => {}
             _ => panic!("expected the initial CallModel step"),
         }
+        let policy = TurnPolicy::new(BTreeSet::from(["fs.read".to_string()]), None, None)
+            .expect("policy accepts the advertised tool");
         let model_turn = ModelTurn::new(
-            None,
+            AssistantMessage::new(vec![
+                AssistantContent::text("calling".to_string()),
+                AssistantContent::tool_call("call_1", tool_name("fs.read"), serde_json::json!({})),
+            ]),
             vec![
                 AssistantContent::text("calling".to_string()),
-                AssistantContent::tool_call("call_1", "fs.read", serde_json::json!({})),
+                AssistantContent::tool_call("call_1", tool_name("fs.read"), serde_json::json!({})),
             ],
             Usage::new(),
-            BTreeSet::from(["fs.read".to_string()]),
-            BTreeSet::from(["fs.read".to_string()]),
+            policy,
+            serde_json::Value::Null,
         );
         run.model_response(model_turn)
             .expect("tool-call turn accepted");
@@ -4919,6 +5549,7 @@ mod tests {
             acl: intent::Acl::ReadOnly,
             confidence: 0.9,
             source: intent::IntentSource::Llm,
+            multi_step: false,
         };
         let telemetry = intent::LlmTelemetry {
             outcome: intent::LlmOutcome::Ok,
@@ -4948,6 +5579,247 @@ mod tests {
             entry.get("input_excerpt").is_none(),
             "the excerpt is OFF by default: no input_excerpt field when [agentic.audit] decision_excerpt_chars is unset"
         );
+    }
+
+    // ── D21 W6.1: multi_step planning hint audit pins ──────────────────
+
+    fn audit_entries_of_kind(paths: &ZenPaths, kind: &str) -> Vec<serde_json::Value> {
+        let Ok(content) = fs::read_to_string(paths.logs().join("audit.jsonl")) else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry["kind"] == kind)
+            .collect()
+    }
+
+    fn w61_intent(
+        category: intent::IntentCategory,
+        source: intent::IntentSource,
+        multi_step: bool,
+    ) -> intent::Intent {
+        let acl = match category {
+            intent::IntentCategory::Query => intent::Acl::ReadOnly,
+            intent::IntentCategory::Action => intent::Acl::Write,
+            intent::IntentCategory::System => intent::Acl::Admin,
+            intent::IntentCategory::Conversation => intent::Acl::None,
+        };
+        intent::Intent {
+            category,
+            agent: "Sisyphus".to_string(),
+            signal: "w6.1-test".to_string(),
+            acl,
+            confidence: 0.9,
+            source,
+            multi_step,
+        }
+    }
+
+    fn w61_review() -> crate::review::PipelineResult {
+        crate::review::PipelineResult {
+            plan_approved: true,
+            review_notes: String::new(),
+            delivery_ready: true,
+            athena_shield: None,
+            failed_attempts: Vec::new(),
+        }
+    }
+
+    fn w61_telemetry(outcome: intent::LlmOutcome, elapsed_ms: u64) -> intent::LlmTelemetry {
+        intent::LlmTelemetry {
+            outcome,
+            elapsed_ms,
+        }
+    }
+
+    /// Acceptance pin 2: `loop.turn.review` carries the hint as ADDITIVE
+    /// fields — `multi_step` + `hint_source` ride alongside the untouched
+    /// pre-existing field set; existing consumers match by name and ignore
+    /// unknown keys.
+    #[test]
+    fn turn_review_carries_additive_multi_step_and_hint_source_fields() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let intent = w61_intent(
+            intent::IntentCategory::Action,
+            intent::IntentSource::L1,
+            true,
+        );
+        AgentOrchestrator::append_turn_review_audit(
+            &paths,
+            "s-hint",
+            "Sisyphus",
+            (&intent, &w61_telemetry(intent::LlmOutcome::Skipped, 0)),
+            &w61_review(),
+            0,
+            "implement a three-tier cache with tests",
+        );
+        let entries = audit_entries_of_kind(&paths, "loop.turn.review");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["multi_step"], true);
+        assert_eq!(entry["hint_source"], "l1");
+        // Pre-existing field set unchanged (additive-only contract).
+        for key in [
+            "session_id",
+            "agent",
+            "intent_signal",
+            "intent_category",
+            "intent_source",
+            "intent_confidence",
+            "intent_acl",
+            "intent_llm_outcome",
+            "intent_llm_ms",
+            "plan_approved",
+            "delivery_ready",
+            "feedback_rounds",
+            "failed_attempts",
+        ] {
+            assert!(
+                entry.get(key).is_some(),
+                "pre-existing key '{key}' must remain on the line"
+            );
+        }
+    }
+
+    /// Acceptance pin 1 (byte-identity): a single-step Action turn with no
+    /// ledger emits ONLY the `loop.turn.review` line — no `loop.plan.started`
+    /// line (the model-volition gate) — and the review line carries the
+    /// additive `multi_step:false` without disturbing any pre-existing field
+    /// value.
+    #[test]
+    fn multi_step_single_step_action_turn_byte_identical_no_plan_started() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let intent = w61_intent(
+            intent::IntentCategory::Action,
+            intent::IntentSource::Keyword,
+            false,
+        );
+        AgentOrchestrator::append_turn_review_audit(
+            &paths,
+            "s-single",
+            "Hephaestus",
+            (&intent, &w61_telemetry(intent::LlmOutcome::Ok, 5)),
+            &w61_review(),
+            0,
+            "fix the typo",
+        );
+        let audit = fs::read_to_string(paths.logs().join("audit.jsonl")).expect("audit file");
+        assert_eq!(
+            audit.lines().count(),
+            1,
+            "a no-plan turn writes exactly one audit line"
+        );
+        let entry: serde_json::Value = serde_json::from_str(audit.trim()).expect("json");
+        assert_eq!(entry["kind"], "loop.turn.review");
+        assert_eq!(entry["multi_step"], false);
+        assert_eq!(entry["intent_category"], "Action");
+        // Zero plan.started lines when no batch ran.
+        assert!(audit_entries_of_kind(&paths, "loop.plan.started").is_empty());
+    }
+
+    /// Acceptance pin 3: Conversation turns never see the hint —
+    /// multi_step=false, hint_source "none" (Fallback), and no plan.started
+    /// line.
+    #[test]
+    fn multi_step_conversation_turn_no_hint_no_plan_started() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let intent = w61_intent(
+            intent::IntentCategory::Conversation,
+            intent::IntentSource::Fallback,
+            false,
+        );
+        AgentOrchestrator::append_turn_review_audit(
+            &paths,
+            "s-chat",
+            "Sisyphus",
+            (&intent, &w61_telemetry(intent::LlmOutcome::Skipped, 0)),
+            &w61_review(),
+            0,
+            "tell me a joke",
+        );
+        let entries = audit_entries_of_kind(&paths, "loop.turn.review");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["multi_step"], false);
+        assert_eq!(entries[0]["hint_source"], "none");
+        assert!(audit_entries_of_kind(&paths, "loop.plan.started").is_empty());
+    }
+
+    /// D21 W6.1: the observation point reads ONLY dispatched results —
+    /// a `plan.execute` invocation in the batch (even mixed with other
+    /// tools) flips the turn flag; any other tool set never does. This is
+    /// what makes the exactly-once emission turn-scoped by construction.
+    #[test]
+    fn multi_step_plan_batch_ran_in_observes_only_plan_execute() {
+        let plan_result = ToolInvocationResult {
+            invocation: ToolInvocation::new(
+                crate::plan_task::PLAN_TOOL_NAME,
+                serde_json::json!({"tasks": []}),
+            )
+            .expect("invocation"),
+            output: serde_json::json!({"ok": true}),
+        };
+        let other_result = ToolInvocationResult {
+            invocation: ToolInvocation::new("fs.read", serde_json::json!({"path": "/tmp/x"}))
+                .expect("invocation"),
+            output: serde_json::json!({"content": "x"}),
+        };
+        assert!(AgentOrchestrator::plan_batch_ran_in(std::slice::from_ref(
+            &plan_result
+        )));
+        assert!(AgentOrchestrator::plan_batch_ran_in(&[
+            other_result.clone(),
+            plan_result.clone()
+        ]));
+        assert!(!AgentOrchestrator::plan_batch_ran_in(&[other_result]));
+        assert!(!AgentOrchestrator::plan_batch_ran_in(&[]));
+    }
+
+    /// Acceptance pin 4: every plan turn records EXACTLY ONE
+    /// `loop.plan.started` line — one turn-scoped emission writes one line;
+    /// zero emissions (flag never set ⇒ call sites skip) write zero lines.
+    /// Shape mirrors sibling `loop.*` lines: flat snake_case keys.
+    #[test]
+    fn plan_started_emitted_exactly_once_per_plan_turn() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        // Zero emissions ⇒ zero lines (file may not even exist).
+        assert!(audit_entries_of_kind(&paths, "loop.plan.started").is_empty());
+        // One emission ⇒ exactly one line.
+        let intent = w61_intent(
+            intent::IntentCategory::Action,
+            intent::IntentSource::L1,
+            true,
+        );
+        AgentOrchestrator::append_plan_started_audit(&paths, "s-plan", "Sisyphus", &intent);
+        let entries = audit_entries_of_kind(&paths, "loop.plan.started");
+        assert_eq!(entries.len(), 1, "exactly one line per plan turn");
+        let entry = &entries[0];
+        assert_eq!(entry["session_id"], "s-plan");
+        assert_eq!(entry["agent"], "Sisyphus");
+        assert_eq!(entry["hint_source"], "l1");
+        assert_eq!(entry["multi_step"], true);
+        assert!(entry.get("ts").is_some(), "sibling lines carry ts");
+    }
+
+    /// Acceptance pin 5: keyword fast-path plan turns record
+    /// `hint_source: "l0"` — the L0 signal itself drove the hint.
+    #[test]
+    fn plan_started_l0_keyword_plan_turn_hint_source_is_l0() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let paths = ZenPaths::for_testing(dir.path().to_path_buf());
+        let l0_intent =
+            crate::intent::keyword_route("please implement this function").expect("coder hit");
+        assert_eq!(l0_intent.source, intent::IntentSource::Keyword);
+        assert!(l0_intent.multi_step);
+        AgentOrchestrator::append_plan_started_audit(&paths, "s-l0", "Sisyphus", &l0_intent);
+        let entries = audit_entries_of_kind(&paths, "loop.plan.started");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["hint_source"], "l0");
+        assert_eq!(entries[0]["multi_step"], true);
     }
 
     // ── Phase 31 T214: knowledge injection ─────────────────────────────
@@ -5411,14 +6283,39 @@ mod tests {
 
     // ── W4.5/W4.6: batch isolation, id-mapping, history ──────────────────
 
-    fn pending_call(id: &str, name: &str, args: serde_json::Value) -> PendingToolCall {
-        PendingToolCall {
-            tool_call: NativeToolCall::new(
-                rig_core::message::ToolCallId::new_or_mint(id),
-                rig_core::completion::message::ToolFunction::new(name.to_string(), args),
-            ),
-            preresolved_result: None,
-            internal_call_id: None,
+    /// Drive a real `AgentRun` through a synthetic tool-call turn so the
+    /// pending calls carry rig-minted identity (0.46 `PendingToolCall` is
+    /// `#[non_exhaustive]` with crate-private fields — constructing one
+    /// directly is impossible, and the type-level fix is the honest fixture:
+    /// these ARE the calls a live run produces).
+    fn pending_calls_from_turn(calls: &[(&str, &str, serde_json::Value)]) -> Vec<PendingToolCall> {
+        let mut run = AgentRun::new(Message::user("test")).max_turns(4);
+        let mut content = vec![AssistantContent::text("using tools".to_string())];
+        let mut advertised: BTreeSet<String> = BTreeSet::new();
+        for (id, name, args) in calls {
+            content.push(AssistantContent::tool_call(
+                id.to_string(),
+                tool_name(name),
+                args.clone(),
+            ));
+            advertised.insert(name.to_string());
+        }
+        let policy = TurnPolicy::new(advertised, None, None).expect("test policy");
+        let turn = ModelTurn::new(
+            AssistantMessage::new(content.clone()),
+            content,
+            Usage::new(),
+            policy,
+            serde_json::Value::Null,
+        );
+        match run.next_step().expect("initial step") {
+            AgentRunStep::CallModel { .. } => {}
+            other => panic!("expected initial CallModel step, got {other:?}"),
+        }
+        run.model_response(turn).expect("tool-call turn accepted");
+        match run.next_step().expect("next_step after tool-call turn") {
+            AgentRunStep::CallTools { calls } => calls,
+            other => panic!("expected CallTools step, got {other:?}"),
         }
     }
 
@@ -5484,10 +6381,13 @@ mod tests {
 
     #[test]
     fn plan_tool_batch_answers_normalizer_rejection_inline() {
-        let calls = vec![
-            pending_call("call_ok", "fs.read", serde_json::json!({})),
-            pending_call("call_bad", "", serde_json::json!({})),
-        ];
+        // The empty-name call is UNCONSTRUCTIBLE in 0.46 (ToolName is
+        // TryFrom, rejects empty at the type level) — the invalid-name case
+        // is now exercised by the malformed-args arm instead.
+        let calls = pending_calls_from_turn(&[
+            ("call_ok", "fs.read", serde_json::json!({})),
+            ("call_bad", "web.search", serde_json::json!("not-an-object")),
+        ]);
         let plan = plan_tool_batch(&calls);
         assert_eq!(plan.dispatch.len(), 1, "only the valid call dispatches");
         assert_eq!(plan.rejected.len(), 1, "the empty name is rejected inline");
@@ -5601,7 +6501,7 @@ mod tests {
             bytes_stderr: 0,
             truncated: false,
         };
-        let pairs = background_notice_pairs_from(&[snap]);
+        let pairs = background_notice_pairs_from(&[snap], None);
         assert_eq!(
             pairs,
             vec![(
@@ -5663,7 +6563,7 @@ mod tests {
             .expect("echo spawns");
         wait_terminal(&spawned.task_id).await;
 
-        let first = drain_background_notice_pairs(&session);
+        let first = drain_background_notice_pairs(&session, None);
         assert_eq!(first.len(), 1, "one completion = one notice: {first:?}");
         assert!(
             first[0].1.starts_with("⚙ background task "),
@@ -5678,7 +6578,7 @@ mod tests {
         );
 
         // Simulated failed model round: drained but never marked ⇒ re-offered.
-        let retried = drain_background_notice_pairs(&session);
+        let retried = drain_background_notice_pairs(&session, None);
         assert_eq!(retried.len(), 1, "un-marked completion is re-offered");
         assert_eq!(
             retried[0].0, first[0].0,
@@ -5692,13 +6592,13 @@ mod tests {
             &first.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
         );
         assert!(
-            drain_background_notice_pairs(&session).is_empty(),
+            drain_background_notice_pairs(&session, None).is_empty(),
             "marked completion never re-offers"
         );
 
         // Cross-session guard unperturbed by the mark (it is session-guarded).
         let other = format!("bg-once-other-{}", uuid::Uuid::new_v4());
-        assert!(drain_background_notice_pairs(&other).is_empty());
+        assert!(drain_background_notice_pairs(&other, None).is_empty());
     }
 
     // (c) cross-session security pin: a task owned by session A is NEVER
@@ -5712,7 +6612,7 @@ mod tests {
         let owner = format!("bg-owner-{}", uuid::Uuid::new_v4());
         let other = format!("bg-other-{}", uuid::Uuid::new_v4());
         assert!(
-            drain_background_notice_pairs(&other).is_empty(),
+            drain_background_notice_pairs(&other, None).is_empty(),
             "a session with no tasks drains empty"
         );
 
@@ -5726,11 +6626,11 @@ mod tests {
             .expect("echo spawns");
         // The completion must not leak to `other` while running OR once
         // terminal and collected by the owner.
-        assert!(drain_background_notice_pairs(&other).is_empty());
+        assert!(drain_background_notice_pairs(&other, None).is_empty());
         wait_terminal(&spawned.task_id).await;
-        assert!(drain_background_notice_pairs(&other).is_empty());
+        assert!(drain_background_notice_pairs(&other, None).is_empty());
 
-        let owner_pairs = drain_background_notice_pairs(&owner);
+        let owner_pairs = drain_background_notice_pairs(&owner, None);
         assert_eq!(owner_pairs.len(), 1, "owner still gets its completion");
         mark_background_notices_consumed(
             &owner,
@@ -5739,8 +6639,8 @@ mod tests {
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>(),
         );
-        assert!(drain_background_notice_pairs(&owner).is_empty());
-        assert!(drain_background_notice_pairs(&other).is_empty());
+        assert!(drain_background_notice_pairs(&owner, None).is_empty());
+        assert!(drain_background_notice_pairs(&other, None).is_empty());
     }
 
     // (d) gate scope: shell.collect joins the read-only allowlist (returns
@@ -5751,5 +6651,264 @@ mod tests {
         assert!(!is_mutating_tool("shell.collect"));
         assert!(is_mutating_tool("shell.kill"));
         assert!(is_mutating_tool("shell.exec"), "foreground exec unchanged");
+    }
+
+    // W9.5-F1 gate classification: plan.todos stays read-only for the
+    // quality gate (plan-row-only mutations, G-21); plan.control is
+    // mutating — cancel/append must always pass the gate.
+    #[test]
+    fn plan_gate_scope_todos_readonly_control_mutating() {
+        assert!(!is_mutating_tool("plan.todos"));
+        assert!(is_mutating_tool("plan.control"));
+    }
+
+    /// W5.4 (D25 A5 notice parity): a terminal delegate task's notice line
+    /// carries the `delegate.collect` hint plus the unified payload with
+    /// the falsifiable `model_source` from the admission book; the shell
+    /// line stays byte-identical (book irrelevant).
+    #[tokio::test]
+    async fn delegate_notice_line_carries_unified_payload_with_model_source() {
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+        let registry = zen_plugin::task_registry::registry();
+        let limits = zen_plugin::task_registry::BackgroundLimits {
+            max_wall_secs: 60,
+            max_concurrent: 4,
+            output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
+        };
+        registry
+            .spawn_async(
+                "b4d40000-0000-4000-8000-000000000001",
+                "sess-notice",
+                "Explore",
+                Some(2),
+                &limits,
+                async { Ok(serde_json::json!({"verdict": "ok"})) },
+            )
+            .expect("spawn");
+        // Synthetic admission hold with a resolved model source.
+        let book = crate::delegate_task::BackgroundBook::default();
+        book.insert(
+            "b4d40000-0000-4000-8000-000000000001".to_string(),
+            crate::delegate_task::BackgroundHolding {
+                _reservation: {
+                    let budget = rig_compose::budget::AtomicTokenBudget::new(1_000_000);
+                    budget
+                        .try_reserve_tokens(100)
+                        .await
+                        .expect("reserve")
+                        .expect("capacity")
+                },
+                model_source: Some(crate::delegate_task::ModelSource::Hint),
+            },
+        );
+        // Wait for terminal, then drain through the shared formatter.
+        let _ = registry
+            .collect_delegate("b4d40000-0000-4000-8000-000000000001", 5000)
+            .await
+            .expect("collect");
+        let changes = zen_plugin::task_registry::registry().take_status_changes("sess-notice");
+        assert_eq!(changes.len(), 1, "one terminal delegate task");
+        let pairs = background_notice_pairs_from(&changes, Some(&book));
+        let (_, line) = &pairs[0];
+        assert!(
+            line.contains("collect: delegate.collect"),
+            "delegate hint present: {line}"
+        );
+        assert!(
+            line.contains("\"model_source\":\"hint\""),
+            "model_source parity: {line}"
+        );
+        assert!(
+            line.contains("\"verdict\":\"ok\""),
+            "response parity: {line}"
+        );
+        assert!(
+            line.contains("\"task_index\":2"),
+            "task_index parity: {line}"
+        );
+        // Shell line byte-identity when the book is irrelevant.
+        let shell_pairs = background_notice_pairs_from(
+            &[zen_plugin::task_registry::TaskSnapshot {
+                task_id: "abcd1234-0000-4000-8000-000000000009".to_string(),
+                session_id: "sess".to_string(),
+                pid: 7,
+                command_digest: "/bin/echo hi".to_string(),
+                output_dir: "/tmp/x".to_string(),
+                status: zen_plugin::task_registry::TaskStatus::Completed(0),
+                started_at_ms: 1,
+                ended_at_ms: Some(2),
+                bytes_stdout: 0,
+                bytes_stderr: 0,
+                truncated: false,
+            }],
+            Some(&book),
+        );
+        assert_eq!(
+            shell_pairs[0].1,
+            "⚙ background task abcd1234 `/bin/echo hi` completed — collect: shell.collect {\"task_id\":\"abcd1234-0000-4000-8000-000000000009\"}"
+        );
+    }
+
+    /// W5.4: the `loop.delegate.background` audit is additive — zero lines
+    /// when nothing drained or when the drained ids are shell-only.
+    #[test]
+    fn delegate_background_audit_zero_lines_when_no_delegate_ids() {
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+        assert_eq!(audit_delegate_background_notices("s", &[]), 0, "empty");
+        assert_eq!(
+            audit_delegate_background_notices("s", &["unknown-id".to_string()]),
+            0,
+            "unknown ids are not delegate tasks"
+        );
+    }
+
+    /// W11.4/T4 (A6.2, F4): the plan gate carries the SAME semantic reviewer
+    /// as the turn gates — `review_pipeline` wires it, a bare
+    /// `QualityPipeline::new()` does not. Confidential plan deliverables must
+    /// not skip the semantic-review stage.
+    #[test]
+    fn review_pipeline_wires_the_semantic_reviewer_for_plan_gate_parity() {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let plan_gate = AgentOrchestrator::review_pipeline(&router);
+        assert!(
+            plan_gate.has_semantic_reviewer(),
+            "the plan gate must carry the semantic reviewer (A6.2 parity)"
+        );
+        assert!(
+            !crate::review::QualityPipeline::new().has_semantic_reviewer(),
+            "a bare pipeline skips the stage — the drift this pin guards"
+        );
+    }
+
+    /// W11.9/T9 (G2) helper: a minimal one-row batch snapshot for the
+    /// synthesis runtime-skip pins.
+    fn synthesis_skip_snapshot() -> crate::plan_synthesis::PlanOutcomeSnapshot {
+        crate::plan_synthesis::PlanOutcomeSnapshot {
+            plan_id: "p-skip".to_string(),
+            rows: vec![crate::plan_synthesis::PlanOutcomeRow {
+                id: "a".to_string(),
+                agent: "Explore".to_string(),
+                status: "completed".to_string(),
+                response: "task output".to_string(),
+            }],
+            plan_approved: true,
+            delivery_ready: true,
+            archived: None,
+            triage: Vec::new(),
+        }
+    }
+
+    /// W11.9/T9 (G2): an exhausted token budget skips synthesis with
+    /// `skipped:budget` — the turn survives on the in-loop prose.
+    #[tokio::test]
+    async fn synthesis_runtime_skips_on_exhausted_budget() {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let orchestrator = AgentOrchestrator::with_token_budget(router, 0);
+        let snapshot = synthesis_skip_snapshot();
+        let (prose, label) = orchestrator
+            .run_plan_synthesis(crate::plan_synthesis::SynthesisCall {
+                sensitivity: Sensitivity::Public,
+                session_id: "s-skip",
+                agent_name: "Sisyphus",
+                user_query: "q",
+                final_prose: "short",
+                snapshot: &snapshot,
+                vetoed: false,
+            })
+            .await;
+        assert!(prose.is_none(), "a skip never replaces the in-loop prose");
+        assert_eq!(label, "skipped:budget");
+    }
+
+    /// W11.9/T9 (G2): a Confidential turn with no reachable provider skips
+    /// with `skipped:no_provider` — NEVER falls open to cloud (SC-012).
+    #[tokio::test]
+    async fn synthesis_runtime_skips_no_provider_never_cloud() {
+        // A cloud default with no configured providers: routing fails, and a
+        // Confidential turn must error rather than fall open to the cloud.
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("openai".to_string()),
+            ..Default::default()
+        });
+        let orchestrator = AgentOrchestrator::with_token_budget(router, 10_000_000);
+        let snapshot = synthesis_skip_snapshot();
+        let (prose, label) = orchestrator
+            .run_plan_synthesis(crate::plan_synthesis::SynthesisCall {
+                sensitivity: Sensitivity::Confidential,
+                session_id: "s-skip",
+                agent_name: "Sisyphus",
+                user_query: "q",
+                final_prose: "short",
+                snapshot: &snapshot,
+                vetoed: false,
+            })
+            .await;
+        assert!(prose.is_none());
+        assert_eq!(
+            label, "skipped:no_provider",
+            "a Confidential turn must never fall open to cloud synthesis"
+        );
+    }
+
+    /// W11.9/T9 (G2): a provider that returns an empty reply skips synthesis
+    /// with `skipped:empty` — the in-loop prose survives.
+    #[tokio::test]
+    async fn synthesis_runtime_skips_empty_reply() {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        })
+        .with_mock_stream_mode(zen_provider::MockStreamMode::Empty);
+        let orchestrator = AgentOrchestrator::with_token_budget(router, 10_000_000);
+        let snapshot = synthesis_skip_snapshot();
+        let (prose, label) = orchestrator
+            .run_plan_synthesis(crate::plan_synthesis::SynthesisCall {
+                sensitivity: Sensitivity::Public,
+                session_id: "s-skip",
+                agent_name: "Sisyphus",
+                user_query: "q",
+                final_prose: "short",
+                snapshot: &snapshot,
+                vetoed: false,
+            })
+            .await;
+        assert!(prose.is_none());
+        assert_eq!(label, "skipped:empty");
+    }
+
+    /// W11.9/T9 (G2): a provider whose stream fails skips synthesis with
+    /// `skipped:timeout_or_error` — the turn never fails on synthesis.
+    #[tokio::test]
+    async fn synthesis_runtime_skips_timeout_or_error() {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        })
+        .with_mock_stream_mode(zen_provider::MockStreamMode::Error);
+        let orchestrator = AgentOrchestrator::with_token_budget(router, 10_000_000);
+        let snapshot = synthesis_skip_snapshot();
+        let (prose, label) = orchestrator
+            .run_plan_synthesis(crate::plan_synthesis::SynthesisCall {
+                sensitivity: Sensitivity::Public,
+                session_id: "s-skip",
+                agent_name: "Sisyphus",
+                user_query: "q",
+                final_prose: "short",
+                snapshot: &snapshot,
+                vetoed: false,
+            })
+            .await;
+        assert!(prose.is_none());
+        assert_eq!(label, "skipped:timeout_or_error");
     }
 }

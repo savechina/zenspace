@@ -27,8 +27,9 @@ use rig_compose::registry::KernelError;
 use rig_compose::tool::{Tool, ToolSchema};
 use tracing::info;
 use zen_core::types::Sensitivity;
+use zen_plugin::tools::approval_hook::fire_watchdog_renewal;
 
-use crate::delegate_task::{DELEGATE_ROOT_PARENT, DelegateRequest, DelegateTaskTool};
+use crate::delegate_task::{DELEGATE_ROOT_PARENT, DelegateRequest, DelegateTaskTool, ForkMode};
 use crate::review::QualityPipeline;
 
 pub const PLAN_TOOL_NAME: &str = "plan.execute";
@@ -37,10 +38,89 @@ pub const PLAN_TOOL_NAME: &str = "plan.execute";
 /// into multiple plans (001 A.6: consumer-side decision).
 pub const MAX_PLAN_TASKS: usize = 12;
 
+/// W9.4 failure triage: (lowercase needle, proposal template) pairs for
+/// RECOGNIZED failure classes only. `{plan_id}` is substituted with the
+/// plan's id at render time. A failed task whose error matches no needle
+/// contributes NO proposal — the raw error stays visible in the task row
+/// instead of a guessed repair. Proposals are text-only; nothing here
+/// re-runs anything automatically (human picks, resume reuses ok
+/// checkpoints).
+const TRIAGE_TABLE: &[(&str, &str)] = &[
+    (
+        "timed out",
+        "1. task timed out — re-run only the failed subgraph: plan.execute {\"resume_plan_id\": \"{plan_id}\"} (ok checkpoints replay, the timed-out node re-runs); consider a smaller fan-out",
+    ),
+    (
+        "timeout",
+        "1. task timed out — re-run only the failed subgraph: plan.execute {\"resume_plan_id\": \"{plan_id}\"} (ok checkpoints replay, the timed-out node re-runs); consider a smaller fan-out",
+    ),
+    (
+        "no local provider",
+        "2. no local provider reachable — resolve the local LLM (zen provider status), then resume: plan.execute {\"resume_plan_id\": \"{plan_id}\"}",
+    ),
+    (
+        "provider unavailable",
+        "2. provider unavailable — check provider credentials/health (zen provider status), then resume: plan.execute {\"resume_plan_id\": \"{plan_id}\"}",
+    ),
+    (
+        "budget",
+        "3. budget exhausted — resume with fewer concurrent tasks so the reserve fits: plan.execute {\"resume_plan_id\": \"{plan_id}\"}",
+    ),
+    (
+        "approval",
+        "4. approval required — grant the flagged action, then resume: plan.execute {\"resume_plan_id\": \"{plan_id}\"}",
+    ),
+];
+
+/// W9.4: build the triage proposals for a failed plan. Deduplicates by
+/// proposal text, caps at 3, and only matches RECOGNIZED classes —
+/// unknown error text yields zero proposals (the pin contract).
+fn triage_proposals(plan_id: &str, failed_errors: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for error in failed_errors {
+        let lower = error.to_lowercase();
+        for (needle, template) in TRIAGE_TABLE {
+            if lower.contains(needle) {
+                let proposal = template.replace("{plan_id}", plan_id);
+                if !out.contains(&proposal) {
+                    out.push(proposal);
+                }
+                break;
+            }
+        }
+        if out.len() >= 3 {
+            break;
+        }
+    }
+    out
+}
+
 /// Hard cap on DAG depth in layers. Three layers cover draft → parallel
 /// analysis → synthesis; anything deeper smells like a plan that should
 /// itself be delegated (and hits the delegate depth matrix anyway).
 pub const MAX_PLAN_LAYERS: usize = 3;
+
+/// W8.1 progress sink — the streaming host (gateway `hosting.rs`) scopes
+/// it task-locally around the turn execution, the SAME pattern as
+/// `WATCHDOG_RENEWAL`. The wave loop fires one line per wave transition;
+/// the sink forwards it to the live delta transport. No scope (non-stream
+/// turns, plain tests) = silent no-op — the line still lands in the
+/// result JSON `progress` blob, so both transports carry the same rows.
+pub type PlanProgressSink = Arc<dyn Fn(String) + Send + Sync>;
+
+tokio::task_local! {
+    pub static PLAN_PROGRESS: std::cell::RefCell<Option<PlanProgressSink>>;
+}
+
+/// Fire one progress line through the scoped sink. Never panics outside
+/// a scope (task-local `try_with` miss = no-op).
+pub(crate) fn fire_plan_progress(line: String) {
+    let _ = PLAN_PROGRESS.try_with(|cell| {
+        if let Some(sink) = cell.borrow().as_ref() {
+            sink(line);
+        }
+    });
+}
 
 /// W2.1 (D11): failure-transition edge for one plan node (GraphPlan,
 /// ESWA). `Skip` is the pre-W2 behavior and the default, so a plan without
@@ -80,6 +160,15 @@ pub struct PlanTaskSpec {
     pub on_failure: FailureAction,
     /// W2.2 (D12): optional sandbox-validated artifact output path.
     pub artifact: Option<String>,
+    /// W11.5/T5 (SC-021): per-task context fork mode. `None` (absent) keeps
+    /// the session-wide `[agentic.delegate] context_inheritance` default
+    /// byte-identically; the per-task argument wins when present.
+    pub fork_mode: Option<ForkMode>,
+    /// W11.5/T5 (SC-022): per-task model hint (catalog-validated, ≤5 distinct
+    /// per plan). Resolution: sensitivity > LlmPreference > hint > default;
+    /// the runtime override rides D2b — this wave delivers validation + the
+    /// falsifiable `model_source` label.
+    pub model_hint: Option<String>,
 }
 
 /// The full plan as parsed from tool args.
@@ -106,6 +195,17 @@ pub struct PlanExecuteTool {
     test_failures: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     #[cfg(test)]
     test_calls: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// G-13 (SC-001/SC-002) wave instrumentation: ordered `(agent, event)`
+    /// log, in-flight counter + peak, and per-agent test delays. Compiled
+    /// only for unit tests; zero production footprint.
+    #[cfg(test)]
+    test_wave_log: std::sync::Mutex<Vec<(String, &'static str)>>,
+    #[cfg(test)]
+    test_in_flight: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    test_peak_in_flight: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    test_wave_delays: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl PlanExecuteTool {
@@ -125,6 +225,14 @@ impl PlanExecuteTool {
             test_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             test_calls: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            test_wave_log: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_peak_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_wave_delays: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -171,6 +279,50 @@ impl PlanExecuteTool {
             .unwrap_or(0)
     }
 
+    /// G-13 wave instrumentation (test-only): append to the ordered
+    /// `(agent, event)` log — `enter` / `exit` / `skipped`.
+    #[cfg(test)]
+    fn test_log_wave_event(&self, agent: &str, event: &'static str) {
+        self.test_wave_log
+            .lock()
+            .unwrap()
+            .push((agent.to_string(), event));
+    }
+
+    /// G-13 (test-only): the per-agent hold injected via
+    /// `inject_test_wave_delay`, or `None`.
+    #[cfg(test)]
+    fn test_wave_delay(&self, agent: &str) -> Option<std::time::Duration> {
+        let millis = *self.test_wave_delays.lock().unwrap().get(agent)?;
+        Some(std::time::Duration::from_millis(millis))
+    }
+
+    /// G-13 test seam: hold each run of `agent` for `millis` after its
+    /// enter event, so width-2 batch siblings observably overlap (SC-001).
+    /// `tokio::time::sleep` always pends on first poll, so the overlap is
+    /// structural, not a timing race.
+    #[cfg(test)]
+    pub(crate) fn inject_test_wave_delay(&self, agent: &str, millis: u64) {
+        self.test_wave_delays
+            .lock()
+            .unwrap()
+            .insert(agent.to_string(), millis);
+    }
+
+    /// G-13 (test-only): snapshot of the ordered wave event log.
+    #[cfg(test)]
+    pub(crate) fn test_wave_events(&self) -> Vec<(String, &'static str)> {
+        self.test_wave_log.lock().unwrap().clone()
+    }
+
+    /// G-13 (test-only): peak in-flight task concurrency observed across
+    /// the whole plan run (SC-001 evidence; never derived from time).
+    #[cfg(test)]
+    pub(crate) fn test_peak_in_flight(&self) -> usize {
+        self.test_peak_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Lazily open state.db once per tool lifetime; `None` disables
     /// persistence (tests, missing paths) without touching the happy path.
     async fn db(&self) -> Option<&Arc<zen_repo::SqliteClient>> {
@@ -181,6 +333,104 @@ impl PlanExecuteTool {
         let client = zen_repo::SqliteClient::open_lazy(path).await.ok()?;
         let _ = self.db.set(Some(Arc::new(client)));
         self.db.get().and_then(|c| c.as_ref())
+    }
+
+    /// W9.1 dispatch forecast — one advisory line from recorded sub-turn
+    /// history, emitted before the first batch. `None` (⇒ no line) when the
+    /// plan store is unavailable or NO task's (agent, model) pair has
+    /// recorded durations: history-less pairs are omitted, never guessed.
+    /// Never errors, never blocks the walk.
+    async fn forecast_line(&self, plan: &PlanSpec) -> Option<String> {
+        let db = self.db().await?;
+        let repo = zen_repo::WorkflowRepo::new(db);
+        let history = repo.duration_history().await.ok()?;
+        // Per (agent, model) pair: sorted durations + min/max cost.
+        let mut pairs: std::collections::HashMap<(String, String), Vec<i64>> =
+            std::collections::HashMap::new();
+        let mut pair_costs: std::collections::HashMap<(String, String), Vec<f64>> =
+            std::collections::HashMap::new();
+        for row in history {
+            let key = (row.agent, row.model.unwrap_or_default());
+            pairs.entry(key.clone()).or_default().push(row.duration_ms);
+            if let Some(cost) = row.cost_usd {
+                pair_costs.entry(key).or_default().push(cost);
+            }
+        }
+        let mut lo_ms = 0i64;
+        let mut hi_ms = 0i64;
+        let mut matched = 0usize;
+        let mut has_cost_history = false;
+        let mut cost_lo = 0.0f64;
+        let mut cost_hi = 0.0f64;
+        for t in &plan.tasks {
+            let key = (t.agent.clone(), String::new());
+            let Some(durations) = pairs.get(&key) else {
+                continue;
+            };
+            let mut sorted = durations.clone();
+            sorted.sort_unstable();
+            lo_ms += sorted[0];
+            hi_ms += sorted[sorted.len() - 1];
+            matched += 1;
+            if let Some(costs) = pair_costs.get(&key) {
+                let mut sorted = costs.clone();
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                cost_lo += sorted[0];
+                cost_hi += sorted[sorted.len() - 1];
+                has_cost_history = true;
+            }
+        }
+        if matched == 0 {
+            return None;
+        }
+        let mins_lo = (lo_ms as f64 / 60_000.0).ceil() as i64;
+        let mins_hi = (hi_ms as f64 / 60_000.0).ceil() as i64;
+        let cost_segment = if has_cost_history {
+            format!(" · ~${:.2}-${:.2}", cost_lo.max(0.0), cost_hi.max(0.0))
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "plan {} tasks · ~{mins_lo}-{mins_hi} min{cost_segment} (estimate)",
+            plan.tasks.len()
+        ))
+    }
+
+    /// W9.3 cancel finalization (W6.2b vocabulary): in-flight tasks are
+    /// checkpointed `failed`, every never-started task `skipped`. Tasks
+    /// already settled before the signal keep their recorded outcomes —
+    /// only the cancelled batch loses its results, so no partial
+    /// `completed` can appear after the cancel point.
+    async fn mark_cancelled(
+        &self,
+        plan_id: &str,
+        plan: &PlanSpec,
+        outcomes: &mut [Option<TaskOutcome>],
+        in_flight: &[usize],
+    ) {
+        for &i in in_flight {
+            if outcomes[i].is_some() {
+                continue;
+            }
+            let outcome = TaskOutcome {
+                status: "failed",
+                value: serde_json::json!({ "error": "plan cancelled mid-batch" }),
+            };
+            self.checkpoint(plan_id, &plan.tasks[i], &outcome).await;
+            outcomes[i] = Some(outcome);
+        }
+        for (i, slot) in outcomes.iter_mut().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            let outcome = TaskOutcome {
+                status: "skipped",
+                value: serde_json::json!({ "error": "plan cancelled" }),
+            };
+            self.checkpoint(plan_id, &plan.tasks[i], &outcome).await;
+            *slot = Some(outcome);
+            fire_watchdog_renewal();
+        }
     }
 
     /// Parse `{name?, tasks: [{id, agent, prompt, depends_on?}]}`.
@@ -223,6 +473,24 @@ impl PlanExecuteTool {
                     depends_on.push(dep.to_string());
                 }
             }
+            let fork_mode = match item.get("fork_mode") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => Some(
+                    ForkMode::parse(
+                        v.as_str()
+                            .ok_or_else(|| format!("task `{id}` has a non-string `fork_mode`"))?,
+                    )
+                    .map_err(|e| format!("task `{id}`: {e}"))?,
+                ),
+            };
+            let model_hint = match item.get("model") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(m)) if !m.trim().is_empty() => Some(m.clone()),
+                Some(serde_json::Value::String(_)) => {
+                    return Err(format!("task `{id}` has an empty `model` hint"));
+                }
+                Some(_) => return Err(format!("task `{id}` has a non-string `model` hint")),
+            };
             tasks.push(PlanTaskSpec {
                 id: id.to_string(),
                 agent: agent.to_string(),
@@ -230,8 +498,14 @@ impl PlanExecuteTool {
                 depends_on,
                 on_failure: parse_failure_action(item, id)?,
                 artifact: parse_artifact(item, id)?,
+                fork_mode,
+                model_hint,
             });
         }
+        // W11.5/T5 (SC-022): ONE shared hint-set rule with delegate.task —
+        // catalog-validated, ≤5 distinct across the plan batch.
+        let hints: Vec<String> = tasks.iter().filter_map(|t| t.model_hint.clone()).collect();
+        DelegateTaskTool::validate_model_hint_values(&hints)?;
         // Unique ids + dependencies that actually exist.
         let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         for (i, t) in tasks.iter().enumerate() {
@@ -308,6 +582,9 @@ impl PlanExecuteTool {
                 response: outcome.value.get("response").and_then(|v| v.as_str()),
                 error: outcome.value.get("error").and_then(|v| v.as_str()),
                 now: chrono::Utc::now().timestamp(),
+                model: outcome.value.get("model").and_then(|v| v.as_str()),
+                duration_ms: outcome.value.get("duration_ms").and_then(|v| v.as_u64()),
+                cost_usd: outcome.value.get("cost_usd").and_then(|v| v.as_f64()),
             })
             .await;
     }
@@ -388,6 +665,41 @@ fn upstream_snippet(value: &serde_json::Value) -> String {
 }
 
 /// Append upstream OK outputs to a dependent task's prompt (eng-review D2:
+/// Fresh-run persistence (T376 + W6.2b claim-at-create): a uuid row,
+/// spec_json snapshot, owner claim from the first moment — a first run
+/// is never ownerless while live.
+/// Mint a fresh plan row for a `plan.execute` invocation (no resume id).
+///
+/// T6 (F6+OV-3): routes through the ATOMIC mint — claim-at-create in one
+/// transaction (SC-017), no transient ownerless `running` window. The
+/// previous create+claim pair discarded both results (`let _ =`), so a
+/// failed create produced a phantom plan run: orphaned task rows, an
+/// unpersisted "success", an impossible resume — all silent. Failures now
+/// propagate as a structured, model-readable rejection (the surrounding
+/// `plan claim failed` error shape), never a phantom run.
+async fn mint_fresh_plan(
+    db: &Arc<zen_repo::SqliteClient>,
+    args: &serde_json::Value,
+    name: Option<&str>,
+    session: &str,
+) -> Result<String, serde_json::Value> {
+    let plan_id = uuid::Uuid::new_v4().to_string();
+    let repo = zen_repo::WorkflowRepo::new(db);
+    let spec_json = serde_json::to_string(args).unwrap_or_default();
+    repo.mint_plan_with_tasks(
+        &plan_id,
+        name,
+        &spec_json,
+        session,
+        &[],
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    .map_err(|e| serde_json::json!({ "error": format!("plan mint failed: {e}") }))?;
+    crate::plan_todos::register_turn_plan(session, &plan_id, Vec::new());
+    Ok(plan_id)
+}
+
 /// `depends_on` previously ordered execution only — downstream tasks ran
 /// their static prompts blind, so fan-in synthesis had no inputs).
 fn compose_task_prompt(base: &str, upstream: &[(String, String)]) -> String {
@@ -440,6 +752,54 @@ fn record_plan_rewind(
     .ok()
 }
 
+/// SC-010 (D21 §4): a successful batch (≥2 tasks, ≥1 completed, none
+/// failed) writes one `wisdom/plans/<slug>.md` success page — the twin of
+/// the rewind path, which stays failure-only. Best-effort; a write failure
+/// never affects the plan result.
+fn record_plan_archive(
+    plan: &PlanSpec,
+    outcomes: &[Option<TaskOutcome>],
+    plan_id: &str,
+    plan_approved: bool,
+    delivery_ready: bool,
+    duration_ms: u128,
+) -> Option<std::path::PathBuf> {
+    let paths = zen_core::paths::ZenPaths::detect().ok()?;
+    let plans_dir = paths.wiki().join("wisdom/plans");
+    let tasks: Vec<zen_vault::distill::reflection::PlanArchiveTask<'_>> = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let outcome = outcomes[i].as_ref();
+            let response = outcome
+                .map(|o| {
+                    o.value
+                        .get("response")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| o.value.get("error").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                })
+                .unwrap_or("");
+            zen_vault::distill::reflection::PlanArchiveTask {
+                id: &t.id,
+                agent: &t.agent,
+                status: outcome.map_or("skipped", |o| o.status),
+                response,
+            }
+        })
+        .collect();
+    let archive = zen_vault::distill::reflection::PlanArchive {
+        plan_name: plan.name.as_deref(),
+        plan_id,
+        tasks: &tasks,
+        plan_approved,
+        delivery_ready,
+        duration_ms,
+    };
+    zen_vault::distill::reflection::record_plan_archive(&plans_dir, &archive).ok()
+}
+
 #[async_trait::async_trait]
 impl Tool for PlanExecuteTool {
     fn schema(&self) -> ToolSchema {
@@ -463,6 +823,10 @@ impl Tool for PlanExecuteTool {
                     "name": {
                         "type": "string",
                         "description": "Short plan label for audit logs"
+                    },
+                    "resume_plan_id": {
+                        "type": "string",
+                        "description": "D25 A6.1: resume a previously persisted plan by id — completed-checkpoints replay, pending tasks re-run; claim-fenced (one live resume per plan)"
                     },
                     "tasks": {
                         "type": "array",
@@ -488,6 +852,15 @@ impl Tool for PlanExecuteTool {
                                 "artifact": {
                                     "type": "string",
                                     "description": "Optional sandbox-validated path this task's sub-agent should write its deliverable to (requires the agent's fs.write grant)"
+                                },
+                                "fork_mode": {
+                                    "type": "string",
+                                    "enum": ["none", "knowledge", "history"],
+                                    "description": "Per-task context fork (SC-021): none (default) empty context; knowledge inherits the parent knowledge block; history adds the stripped parent conversation. Absent keeps the session-wide default"
+                                },
+                                "model": {
+                                    "type": "string",
+                                    "description": "Per-task model hint (SC-022): catalog-validated, ≤5 distinct per plan; resolution sensitivity > LlmPreference > hint > default (runtime override deferred)"
                                 }
                             },
                             "required": ["id", "agent", "prompt"]
@@ -507,7 +880,7 @@ impl Tool for PlanExecuteTool {
                             "properties": {
                                 "id": { "type": "string" },
                                 "agent": { "type": "string" },
-                                "status": { "type": "string", "enum": ["ok", "failed", "skipped"] },
+                                "status": { "type": "string", "enum": ["completed", "failed", "skipped"] },
                                 "response": { "type": "string" },
                                 "error": { "type": "string" },
                                 "artifact_path": { "type": "string" },
@@ -538,6 +911,11 @@ impl Tool for PlanExecuteTool {
             Ok(l) => l,
             Err(e) => return Ok(serde_json::json!({ "error": e })),
         };
+        let session = zen_plugin::task_registry::current_session_scope();
+        // W6.3: lives to the end of invoke so every exit path (run
+        // completion, ledger-item refusal, structured error) unmarks the
+        // session's batch exactly once.
+        let mut _batch_guard: Option<crate::plan_todos::BatchGuard> = None;
 
         // Persistence (T376): fresh runs get a uuid row; `resume_plan_id`
         // replays a running plan's ok-checkpoints and re-runs the rest.
@@ -566,7 +944,12 @@ impl Tool for PlanExecuteTool {
                         // the race and refuses with a readable error.
                         let owner = uuid::Uuid::new_v4().to_string();
                         match repo
-                            .claim_plan(&rid, &owner, chrono::Utc::now().timestamp())
+                            .claim_plan(
+                                &rid,
+                                &owner,
+                                chrono::Utc::now().timestamp(),
+                                zen_core::config::resolve_stale_claim_secs(),
+                            )
                             .await
                         {
                             Ok(true) => {}
@@ -583,9 +966,10 @@ impl Tool for PlanExecuteTool {
                             }
                         }
                         resumed = true;
+                        crate::plan_todos::register_turn_plan(&session, &rid, Vec::new());
                         let resumed_now = chrono::Utc::now().timestamp();
                         for t in repo.load_task_rows(&rid).await.unwrap_or_default() {
-                            if t.status != "ok" {
+                            if t.status != "completed" {
                                 continue;
                             }
                             let Some(i) = plan.tasks.iter().position(|p| p.id == t.task_id) else {
@@ -602,7 +986,7 @@ impl Tool for PlanExecuteTool {
                             replayed_ages
                                 .push((t.task_id.clone(), (resumed_now - t.updated_at).max(0)));
                             outcomes[i] = Some(TaskOutcome {
-                                status: "ok",
+                                status: "completed",
                                 value: serde_json::json!({
                                     "response": t.response.unwrap_or_default()
                                 }),
@@ -626,18 +1010,101 @@ impl Tool for PlanExecuteTool {
                 }
             }
             (Some(db), None) => {
-                let plan_id = uuid::Uuid::new_v4().to_string();
-                let repo = zen_repo::WorkflowRepo::new(db);
-                let spec_json = serde_json::to_string(&args).unwrap_or_default();
-                let _ = repo
-                    .create_plan(
-                        &plan_id,
-                        plan.name.as_deref(),
-                        &spec_json,
-                        chrono::Utc::now().timestamp(),
-                    )
-                    .await;
-                plan_id
+                // W6.3 (D21 §3 amended): batches are rounds on the ONE plan
+                // row `plan.todos` minted — no per-batch plan row. A live
+                // session ledger record wins over a fresh mint: attach,
+                // claim-fence, and write per-item status back through the
+                // same WorkflowRepo rows (checkpoint_task below). The claim
+                // doubles as the second-batch guard — a concurrent dispatch
+                // on a non-terminal batch loses the fence and refuses; a
+                // settled record releases the session for a fresh mint.
+                let ledger = crate::plan_todos::peek_turn_plan(&session).map(|r| r.plan_id);
+                let working = match ledger {
+                    Some(lid) => {
+                        let repo = zen_repo::WorkflowRepo::new(db);
+                        let now = chrono::Utc::now().timestamp();
+                        let claimed = repo
+                            .claim_plan(
+                                &lid,
+                                &session,
+                                now,
+                                zen_core::config::resolve_stale_claim_secs(),
+                            )
+                            .await;
+                        match claimed {
+                            Ok(true) => Some(lid),
+                            Ok(false) => match repo.load_plan(&lid).await {
+                                Ok(Some(row)) if row.status != "running" => {
+                                    crate::plan_todos::clear_turn_plan(&session, &lid);
+                                    None
+                                }
+                                Ok(Some(_)) => {
+                                    return Ok(serde_json::json!({
+                                        "error": format!(
+                                            "plan {lid} is in flight — a second batch is refused while one is non-terminal"
+                                        )
+                                    }));
+                                }
+                                Ok(None) => {
+                                    crate::plan_todos::clear_turn_plan(&session, &lid);
+                                    None
+                                }
+                                Err(e) => {
+                                    return Ok(serde_json::json!({
+                                        "error": format!("plan store read failed: {e}")
+                                    }));
+                                }
+                            },
+                            Err(e) => {
+                                return Ok(serde_json::json!({
+                                    "error": format!("plan claim failed: {e}")
+                                }));
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                match working {
+                    // Ledger attach: the batch runs on the minted row.
+                    // Item-id contract — a batch drafts tasks from the
+                    // pending ledger items; an id outside the ledger would
+                    // checkpoint an orphan row.
+                    Some(lid) => {
+                        // W6.3: the DB claim fence admits same-owner
+                        // re-claims (crash recovery), so the second-batch
+                        // refusal lives in the registry marker.
+                        if !crate::plan_todos::try_begin_batch(&session, &lid) {
+                            return Ok(serde_json::json!({
+                                "error": format!(
+                                    "plan {lid} already has a batch in flight — a second batch is refused while one is non-terminal"
+                                )
+                            }));
+                        }
+                        _batch_guard = Some(crate::plan_todos::BatchGuard::arm(&session));
+                        let repo = zen_repo::WorkflowRepo::new(db);
+                        let rows = repo.load_task_rows(&lid).await.unwrap_or_default();
+                        if let Some(missing) = plan
+                            .tasks
+                            .iter()
+                            .find(|t| !rows.iter().any(|r| r.task_id == t.id))
+                        {
+                            return Ok(serde_json::json!({
+                                "error": format!(
+                                    "task `{}` is not a ledger item of plan {lid} — draft batch tasks from the plan.todos ledger",
+                                    missing.id
+                                )
+                            }));
+                        }
+                        crate::plan_todos::register_turn_plan(&session, &lid, Vec::new());
+                        lid
+                    }
+                    None => {
+                        match mint_fresh_plan(db, &args, plan.name.as_deref(), &session).await {
+                            Ok(id) => id,
+                            Err(error) => return Ok(error),
+                        }
+                    }
+                }
             }
             (None, Some(_)) => {
                 return Ok(serde_json::json!({
@@ -649,8 +1116,41 @@ impl Tool for PlanExecuteTool {
         let mut retried = vec![false; plan.tasks.len()];
         let mut retry_count = 0usize;
         let mut halted = false;
-        for layer in &layers {
+        let mut cancelled_mid = false;
+        let mut progress_lines: Vec<String> = Vec::new();
+        // W9.1: one advisory forecast line before the first batch —
+        // omitted entirely when no task's pair has recorded history.
+        if let Some(line) = self.forecast_line(&plan).await {
+            fire_plan_progress(line.clone());
+            progress_lines.push(line);
+        }
+        // W9.3: live registration + cancel subscription. A pre-signal
+        // (plan.control cancel racing ahead of the executor) joins the
+        // same channel and is observed at the first batch boundary.
+        let (_live_guard, mut cancel_rx) = if plan_id.is_empty() {
+            (None, None)
+        } else {
+            let (guard, rx) = crate::plan_control::register_live_plan(&plan_id);
+            (Some(guard), Some(rx))
+        };
+        'layers: for layer in &layers {
+            // W9.3: between-batch cancellation check — a signal that
+            // arrived while no batch was in flight still stops the walk.
+            if let Some(rx) = cancel_rx.as_mut() {
+                let cancel_now = *rx.borrow_and_update();
+                if cancel_now {
+                    self.mark_cancelled(&plan_id, &plan, &mut outcomes, &[])
+                        .await;
+                    cancelled_mid = true;
+                    crate::plan_todos::clear_turn_plan(&session, &plan_id);
+                    break 'layers;
+                }
+            }
             let mut halt_hit = false;
+            // W8.1: the last task settled in THIS layer (newly scheduled —
+            // checkpoint replays do not count) anchors the transition line.
+            let mut last_settled: Option<usize> = None;
+            let mut layer_failed: Vec<usize> = Vec::new();
             let mut runnable = Vec::new();
             for &i in layer {
                 if outcomes[i].is_some() {
@@ -665,7 +1165,7 @@ impl Tool for PlanExecuteTool {
                         .position(|t| &t.id == dep)
                         .expect("deps validated in parse_plan");
                     match outcomes[j].as_ref() {
-                        Some(o) if o.status == "ok" => {
+                        Some(o) if o.status == "completed" => {
                             upstream.push((dep.clone(), upstream_snippet(&o.value)));
                         }
                         _ => blocked = true,
@@ -678,8 +1178,11 @@ impl Tool for PlanExecuteTool {
                             "error": "upstream task did not complete OK"
                         }),
                     };
+                    #[cfg(test)]
+                    self.test_log_wave_event(&plan.tasks[i].agent, "skipped");
                     self.checkpoint(&plan_id, &plan.tasks[i], &outcome).await;
                     outcomes[i] = Some(outcome);
+                    last_settled = Some(i);
                     continue;
                 }
                 let req = DelegateRequest {
@@ -688,6 +1191,11 @@ impl Tool for PlanExecuteTool {
                     description: Some(format!("plan task `{}`", plan.tasks[i].id)),
                     independent: true,
                     artifact: plan.tasks[i].artifact.clone(),
+                    // W11.5/T5 (SC-021/022): the plan task's own fork/model
+                    // surface flows through the same forked compose + hint
+                    // resolution as delegate.task (absent ⇒ session default).
+                    fork_mode: plan.tasks[i].fork_mode,
+                    model_hint: plan.tasks[i].model_hint.clone(),
                 };
                 if let Some(error) = self.delegate.validate_task(DELEGATE_ROOT_PARENT, 0, &req) {
                     if plan.tasks[i].on_failure == FailureAction::Halt {
@@ -699,16 +1207,34 @@ impl Tool for PlanExecuteTool {
                     };
                     self.checkpoint(&plan_id, &plan.tasks[i], &outcome).await;
                     outcomes[i] = Some(outcome);
+                    last_settled = Some(i);
+                    layer_failed.push(i);
                     continue;
                 }
                 runnable.push((i, req));
             }
             for batch in runnable.chunks(self.max_concurrent.max(1) as usize) {
+                if !plan_id.is_empty() {
+                    crate::plan_todos::update_turn_plan_unsettled(
+                        &session,
+                        &plan_id,
+                        batch
+                            .iter()
+                            .map(|(i, _)| plan.tasks[*i].id.clone())
+                            .collect(),
+                    );
+                }
                 let futures: Vec<_> = batch
                     .iter()
                     .map(|(_, req)| {
                         let req = req.clone();
                         async move {
+                            #[cfg(test)]
+                            let _wave = tests::PlanWaveGuard::enter(self, req.agent.as_str());
+                            #[cfg(test)]
+                            if let Some(delay) = self.test_wave_delay(&req.agent) {
+                                tokio::time::sleep(delay).await;
+                            }
                             #[cfg(test)]
                             {
                                 self.test_note_call(&req.agent);
@@ -728,13 +1254,48 @@ impl Tool for PlanExecuteTool {
                             let status = if value.get("error").is_some() {
                                 "failed"
                             } else {
-                                "ok"
+                                "completed"
                             };
                             TaskOutcome { status, value }
                         }
                     })
                     .collect();
-                let results = futures::future::join_all(futures).await;
+                crate::plan_control::set_in_batch(&plan_id, true);
+                let batch_indices: Vec<usize> = batch.iter().map(|(i, _)| *i).collect();
+                // W9.3: race the batch against the cancel watch. The
+                // race itself contains NO await in its arms — the watch
+                // Ref wraps a non-Send read guard, so every await (the
+                // cancel finalization) happens strictly after the race
+                // expression ends and the guard is released.
+                enum BatchRace {
+                    Done(Vec<TaskOutcome>),
+                    Cancelled,
+                }
+                let raced = if let Some(rx) = cancel_rx.as_mut() {
+                    tokio::select! {
+                        done = futures::future::join_all(futures) => {
+                            BatchRace::Done(done)
+                        }
+                        _ = rx.wait_for(|v| *v) => BatchRace::Cancelled,
+                    }
+                } else {
+                    BatchRace::Done(futures::future::join_all(futures).await)
+                };
+                crate::plan_control::set_in_batch(&plan_id, false);
+                let results = match raced {
+                    BatchRace::Done(results) => results,
+                    // W9.3: cancel mid-batch — the in-flight sub-turns
+                    // were dropped (never checkpointed as completed),
+                    // then finalized per W6.2b: in-flight `failed`,
+                    // pending `skipped`.
+                    BatchRace::Cancelled => {
+                        self.mark_cancelled(&plan_id, &plan, &mut outcomes, &batch_indices)
+                            .await;
+                        cancelled_mid = true;
+                        crate::plan_todos::clear_turn_plan(&session, &plan_id);
+                        break 'layers;
+                    }
+                };
 
                 // W2.1 (D11): failure-transition edges. Default `skip` leaves
                 // this block inert (byte-identical). `retry` re-queues ONLY the
@@ -757,12 +1318,28 @@ impl Tool for PlanExecuteTool {
 
                 for (&(i, _), outcome) in batch.iter().zip(&results) {
                     self.checkpoint(&plan_id, &plan.tasks[i], outcome).await;
+                    // W9.5-F3: one watchdog heartbeat per settled task.
+                    fire_watchdog_renewal();
+                }
+                if !plan_id.is_empty() {
+                    crate::plan_todos::update_turn_plan_unsettled(&session, &plan_id, Vec::new());
                 }
                 for (&(i, _), outcome) in batch.iter().zip(results) {
                     outcomes[i] = Some(outcome);
+                    last_settled = Some(i);
+                    if outcomes[i].as_ref().is_some_and(|o| o.status == "failed") {
+                        layer_failed.push(i);
+                    }
                 }
 
                 for (i, req) in retry_batch {
+                    if !plan_id.is_empty() {
+                        crate::plan_todos::update_turn_plan_unsettled(
+                            &session,
+                            &plan_id,
+                            vec![plan.tasks[i].id.clone()],
+                        );
+                    }
                     #[cfg(test)]
                     self.test_note_call(&req.agent);
                     let value = self
@@ -772,12 +1349,42 @@ impl Tool for PlanExecuteTool {
                     let status = if value.get("error").is_some() {
                         "failed"
                     } else {
-                        "ok"
+                        "completed"
                     };
                     let outcome = TaskOutcome { status, value };
                     self.checkpoint(&plan_id, &plan.tasks[i], &outcome).await;
                     outcomes[i] = Some(outcome);
                     retry_count += 1;
+                    last_settled = Some(i);
+                    if outcomes[i].as_ref().is_some_and(|o| o.status == "failed") {
+                        layer_failed.push(i);
+                    }
+                    fire_watchdog_renewal();
+                    if !plan_id.is_empty() {
+                        crate::plan_todos::update_turn_plan_unsettled(
+                            &session,
+                            &plan_id,
+                            Vec::new(),
+                        );
+                    }
+                }
+            }
+            // W8.1: one progress line per wave transition, fired at the
+            // settled count of the layer's last task; per-failed-task ✗
+            // lines ride the same sink. `⚠` is reserved for veto markers —
+            // never used here.
+            if let Some(li) = last_settled {
+                let done = outcomes.iter().filter(|o| o.is_some()).count();
+                let total = plan.tasks.len();
+                let task = &plan.tasks[li];
+                let line = format!("⚙ plan {done}/{total} · {} {}", task.id, task.agent);
+                fire_plan_progress(line.clone());
+                progress_lines.push(line);
+                for &fi in &layer_failed {
+                    let ftask = &plan.tasks[fi];
+                    let fline = format!("✗ plan {done}/{total} · {} failed", ftask.id);
+                    fire_plan_progress(fline.clone());
+                    progress_lines.push(fline);
                 }
             }
             if halt_hit {
@@ -796,7 +1403,7 @@ impl Tool for PlanExecuteTool {
                 value: serde_json::json!({ "error": "never scheduled" }),
             });
             match outcome.status {
-                "ok" => ok += 1,
+                "completed" => ok += 1,
                 "failed" => failed += 1,
                 _ => skipped += 1,
             }
@@ -856,16 +1463,35 @@ impl Tool for PlanExecuteTool {
             && let Some(db) = self.db().await
         {
             let repo = zen_repo::WorkflowRepo::new(db);
-            let _ = repo
-                .complete_plan(
-                    &plan_id,
-                    final_status,
-                    Some(&summary),
-                    Some(gate.plan_approved),
-                    Some(gate.delivery_ready),
-                    chrono::Utc::now().timestamp(),
-                )
-                .await;
+            // W6.3 (D21 §3 amended): batches are rounds on the ONE ledger
+            // row — the plan completes only when the LEDGER is fully
+            // terminal, never when one batch's drafted subset settles. A
+            // ledger with still-pending items keeps the row `running` (and
+            // the session record alive) for the next batch; fresh and
+            // resumed runs see all rows terminal here and behave exactly
+            // as before.
+            let ledger_pending = match crate::plan_todos::peek_turn_plan(&session) {
+                Some(record) if record.plan_id == plan_id => repo
+                    .load_task_rows(&plan_id)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|row| row.status == "pending" || row.status == "progressing"),
+                _ => false,
+            };
+            if !ledger_pending && !cancelled_mid {
+                let _ = repo
+                    .complete_plan(
+                        &plan_id,
+                        final_status,
+                        Some(&summary),
+                        Some(gate.plan_approved),
+                        Some(gate.delivery_ready),
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .await;
+                crate::plan_todos::clear_turn_plan(&session, &plan_id);
+            }
         }
         let mut audit_entry = serde_json::json!({
             "kind": "loop.plan.completed",
@@ -900,13 +1526,36 @@ impl Tool for PlanExecuteTool {
         if halted {
             audit_entry["halted"] = serde_json::json!(true);
         }
+        if cancelled_mid {
+            audit_entry["cancelled"] = serde_json::json!(true);
+        }
         // W2.2 (D12): the plan-failure rollback boundary persists a rewind
         // memory so the next attempt does not repeat the failed path. Best-
         // effort; a write failure never affects the plan result.
         if failed > 0
+            && !cancelled_mid
             && let Some(path) = record_plan_rewind(&plan, &outcomes)
         {
             audit_entry["rewind"] = serde_json::json!(path.display().to_string());
+        }
+        // SC-010: the success twin — mutually exclusive with the rewind
+        // (any failed task ⇒ rewind only) and gated on a real batch
+        // (≥2 tasks, ≥1 completed; a single-task turn writes neither).
+        let mut archived_path: Option<String> = None;
+        if failed == 0
+            && plan.tasks.len() >= 2
+            && ok >= 1
+            && let Some(path) = record_plan_archive(
+                &plan,
+                &outcomes,
+                &plan_id,
+                gate.plan_approved,
+                gate.delivery_ready,
+                started.elapsed().as_millis(),
+            )
+        {
+            archived_path = Some(path.display().to_string());
+            audit_entry["archived"] = serde_json::json!(archived_path);
         }
         self.append_plan_audit(audit_entry);
         info!(
@@ -921,8 +1570,27 @@ impl Tool for PlanExecuteTool {
             "hermes": hermes,
             "resumed": resumed,
         });
+        if !progress_lines.is_empty() {
+            out["progress"] = serde_json::json!(progress_lines);
+        }
+        // W9.4: triage proposals for recognized failure classes only —
+        // absent entirely when no class matched (raw errors stay visible
+        // in the task rows). Never executes anything; the human picks.
+        let failed_errors: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| o.as_ref())
+            .filter(|o| o.status == "failed")
+            .filter_map(|o| o.value.get("error").and_then(|v| v.as_str()))
+            .collect();
+        let triage = triage_proposals(&plan_id, &failed_errors);
+        if !triage.is_empty() {
+            out["triage"] = serde_json::json!(triage);
+        }
         if !plan_id.is_empty() {
             out["plan_id"] = serde_json::json!(plan_id);
+        }
+        if let Some(archived) = &archived_path {
+            out["archived"] = serde_json::json!(archived);
         }
         Ok(out)
     }
@@ -930,6 +1598,24 @@ impl Tool for PlanExecuteTool {
 
 #[cfg(test)]
 mod tests {
+    // D25 A6.1: resume_plan_id is read at invoke but must also be declared
+    // in the args schema — an undeclared arg is invisible to model-driven
+    // tool selection and drifts from the runtime contract.
+    #[test]
+    fn plan_execute_schema_declares_resume_plan_id() {
+        let tool = plan_tool();
+        let schema = tool.schema();
+        let prop = schema.args_schema["properties"]["resume_plan_id"]
+            .as_object()
+            .expect("resume_plan_id declared in args schema");
+        assert_eq!(prop["type"], "string", "{prop:?}");
+        assert_eq!(
+            schema.args_schema["required"],
+            serde_json::json!(["tasks"]),
+            "resume_plan_id stays optional: {prop:?}"
+        );
+    }
+
     use super::*;
 
     fn spec(id: &str, agent: &str, deps: &[&str]) -> PlanTaskSpec {
@@ -940,6 +1626,8 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             on_failure: FailureAction::Skip,
             artifact: None,
+            fork_mode: None,
+            model_hint: None,
         }
     }
 
@@ -947,6 +1635,43 @@ mod tests {
         PlanSpec {
             name: Some("test".into()),
             tasks,
+        }
+    }
+
+    /// G-13 (SC-001/SC-002) wave-overlap guard: records `enter` and bumps
+    /// the in-flight counter at construction, records `exit` and decrements
+    /// on drop — i.e. on every settle path (ok / failed / early return),
+    /// because the guard lives in the task-body scope. `pub(super)`: the
+    /// cfg(test) call site in `execute` (parent module) names this type.
+    pub(super) struct PlanWaveGuard<'a> {
+        tool: &'a PlanExecuteTool,
+        agent: String,
+    }
+
+    impl<'a> PlanWaveGuard<'a> {
+        pub(super) fn enter(tool: &'a PlanExecuteTool, agent: &str) -> Self {
+            tool.test_log_wave_event(agent, "enter");
+            let now = tool
+                .test_in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let _ = tool
+                .test_peak_in_flight
+                .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            Self {
+                tool,
+                agent: agent.to_string(),
+            }
+        }
+    }
+
+    impl std::ops::Drop for PlanWaveGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self
+                .tool
+                .test_in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.tool.test_log_wave_event(&self.agent, "exit");
         }
     }
 
@@ -1161,6 +1886,7 @@ mod tests {
             None,
             std::sync::Arc::new(Mutex::new(Sensitivity::Public)),
             std::sync::Arc::new(Mutex::new(Vec::new())),
+            std::sync::Arc::new(Mutex::new(Vec::new())),
             std::sync::Arc::new(rig_compose::budget::AtomicTokenBudget::new(100_000)),
             Duration::from_secs(30),
             1,
@@ -1192,10 +1918,436 @@ mod tests {
         assert!(out["error"].is_null(), "{out}");
         let rows = out["tasks"].as_array().expect("task rows");
         assert_eq!(rows.len(), 4);
-        assert!(rows.iter().all(|r| r["status"] == "ok"), "{out}");
+        assert!(rows.iter().all(|r| r["status"] == "completed"), "{out}");
         assert!(out["hermes"]["plan_approved"].is_boolean(), "{out}");
         assert!(out["hermes"]["delivery_ready"].is_boolean(), "{out}");
-        assert!(out["summary"].as_str().unwrap().contains("[ok] d"), "{out}");
+        assert!(
+            out["summary"].as_str().unwrap().contains("[completed] d"),
+            "{out}"
+        );
+    }
+
+    // W8.1: scoped sink receives exactly one ⚙ line per wave transition,
+    // DURING the tool run (wave-1 line observable while invoke is still
+    // executing), and no line ever opens with the reserved `⚠` marker.
+    #[tokio::test]
+    async fn plan_progress_one_line_per_wave_mid_turn_never_warning() {
+        use std::sync::Mutex;
+        let tool = plan_tool();
+        tool.inject_test_wave_delay("Hephaestus", 250);
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_collector = Arc::clone(&collected);
+        let sink: PlanProgressSink = Arc::new(move |line: String| {
+            sink_collector.lock().unwrap().push(line);
+        });
+        let invoke_tool = Arc::new(tool);
+        let run_tool = Arc::clone(&invoke_tool);
+        let handle = tokio::spawn(super::PLAN_PROGRESS.scope(
+            std::cell::RefCell::new(Some(sink)),
+            async move {
+                run_tool
+                    .invoke(serde_json::json!({
+                        "tasks": [
+                            { "id": "a", "agent": "Explore", "prompt": "p1" },
+                            { "id": "b", "agent": "Explore", "prompt": "p2" },
+                            { "id": "c", "agent": "Explore", "prompt": "p3" },
+                            { "id": "d", "agent": "Explore", "prompt": "p4", "depends_on": ["a", "b"] },
+                            { "id": "e", "agent": "Hephaestus", "prompt": "p5", "depends_on": ["c"] }
+                        ]
+                    }))
+                    .await
+            },
+        ));
+        // Wave-1 (a,b,c → 3/5) must land while the turn is still running.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let wave1_seen = loop {
+            if handle.is_finished() {
+                panic!("invoke finished before wave-1 progress line was observed");
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("wave-1 progress line never arrived");
+            }
+            if collected
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("⚙ plan 3/5 · c Explore"))
+            {
+                break true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert!(wave1_seen);
+        let out = handle.await.unwrap().unwrap();
+        let gears: Vec<String> = collected
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("⚙ "))
+            .cloned()
+            .collect();
+        assert_eq!(
+            gears.len(),
+            2,
+            "exactly one line per wave transition: {gears:?}"
+        );
+        assert_eq!(
+            collected.lock().unwrap().last().map(String::as_str),
+            Some("⚙ plan 5/5 · e Hephaestus"),
+            "wave-2 transition is the final line: {:?}",
+            collected.lock().unwrap()
+        );
+        assert!(
+            collected
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|l| !l.starts_with('⚠')),
+            "⚠ is reserved for veto markers: {:?}",
+            collected.lock().unwrap()
+        );
+        assert!(out["error"].is_null(), "{out}");
+    }
+
+    // W8.1: a failed task emits a `✗ ... failed` line mid-turn (before the
+    // turn ends) and never a `⚠` line.
+    #[tokio::test]
+    async fn plan_progress_failure_line_mid_turn() {
+        use std::sync::Mutex;
+        let tool = plan_tool();
+        tool.inject_test_failure("Atlas", 1);
+        tool.inject_test_wave_delay("Explore", 150);
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_collector = Arc::clone(&collected);
+        let sink: PlanProgressSink = Arc::new(move |line: String| {
+            sink_collector.lock().unwrap().push(line);
+        });
+        let out = super::PLAN_PROGRESS
+            .scope(std::cell::RefCell::new(Some(sink)), async {
+                tool.invoke(serde_json::json!({
+                    "tasks": [
+                        { "id": "a", "agent": "Atlas", "prompt": "boom" },
+                        { "id": "b", "agent": "Explore", "prompt": "slow" },
+                        { "id": "c", "agent": "Explore", "prompt": "next", "depends_on": ["b"] }
+                    ]
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows[0]["status"], "failed", "{out}");
+        assert!(
+            collected
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("✗ plan ") && l.contains("· a failed")),
+            "failure line present: {:?}",
+            collected.lock().unwrap()
+        );
+        assert!(
+            collected
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|l| !l.starts_with('⚠')),
+            "⚠ never used: {:?}",
+            collected.lock().unwrap()
+        );
+    }
+
+    // W8.1: the non-stream blob — the result JSON `progress` array equals
+    // the sink rows exactly (one transport, same rows).
+    #[tokio::test]
+    async fn plan_progress_blob_in_result_equals_sink_rows() {
+        use std::sync::Mutex;
+        let tool = plan_tool();
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_collector = Arc::clone(&collected);
+        let sink: PlanProgressSink = Arc::new(move |line: String| {
+            sink_collector.lock().unwrap().push(line);
+        });
+        let out = super::PLAN_PROGRESS
+            .scope(std::cell::RefCell::new(Some(sink)), async {
+                tool.invoke(serde_json::json!({
+                    "tasks": [
+                        { "id": "a", "agent": "Explore", "prompt": "p1" },
+                        { "id": "b", "agent": "Explore", "prompt": "p2", "depends_on": ["a"] }
+                    ]
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+        let blob = out["progress"].as_array().expect("progress blob");
+        let sink_rows = collected.lock().unwrap().clone();
+        assert_eq!(
+            blob.iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            sink_rows,
+            "result blob == sink rows: {blob:?} vs {sink_rows:?}"
+        );
+    }
+
+    // W8.1 byte-identity: no scoped sink = fire_plan_progress is a silent
+    // no-op (non-stream turns and payload-dropping clients see nothing new
+    // except the result blob).
+    #[tokio::test]
+    async fn fire_plan_progress_is_noop_without_scope() {
+        fire_plan_progress("⚙ plan 1/1 · a Explore".to_string());
+    }
+
+    // SC-010 acceptance: a successful ≥2-task plan writes exactly one
+    // wisdom/plans page and reports the path in the audit line.
+    #[tokio::test]
+    async fn archive_page_written_with_path_in_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let tool = plan_tool_with(Some(state_db));
+        let out = tool
+            .invoke(serde_json::json!({
+                "name": "archive-me",
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "sweep" },
+                    { "id": "b", "agent": "Explore", "prompt": "verify", "depends_on": ["a"] }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        let archived = out["archived"].as_str().expect("archived path in result");
+        assert!(std::path::Path::new(archived).is_file(), "{archived}");
+        let plans_dir = dir.path().join("vault/wiki/wisdom/plans");
+        let pages: Vec<_> = std::fs::read_dir(&plans_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(pages.len(), 1, "exactly one page: {archived}");
+        let body = std::fs::read_to_string(archived).unwrap();
+        assert!(body.contains("type: plan"), "{body}");
+        assert!(body.contains("plan_id: "), "{body}");
+        let delivery_ready = out["hermes"]["delivery_ready"].as_bool().unwrap();
+        assert!(
+            body.contains(&format!("delivery_ready: {delivery_ready}")),
+            "frontmatter echoes the gate verdict: {body}"
+        );
+
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl"))
+            .expect("audit file under ZEN_HOME");
+        let completed = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.plan.completed")
+            .expect("completion audit line");
+        assert_eq!(
+            completed["archived"].as_str(),
+            Some(archived),
+            "{completed}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // SC-010 exclusivity: a failed task keeps the rewind path — the result
+    // carries no archived path and the audit line names the rewind only.
+    #[tokio::test]
+    async fn failed_plan_writes_rewind_not_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let tool = plan_tool_with(Some(dir.path().join("state.db")));
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "NoSuchAgent", "prompt": "boom" },
+                    { "id": "b", "agent": "Explore", "prompt": "after" }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out["archived"].is_null(), "no archive on failure: {out}");
+        let plans_dir = dir.path().join("vault/wiki/wisdom/plans");
+        assert!(
+            !plans_dir.exists() || std::fs::read_dir(&plans_dir).unwrap().next().is_none(),
+            "no page written: {plans_dir:?}"
+        );
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl"))
+            .expect("audit file under ZEN_HOME");
+        let completed = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.plan.completed")
+            .expect("completion audit line");
+        assert!(
+            completed["rewind"].as_str().is_some(),
+            "failure rewinds: {completed}"
+        );
+        assert!(completed["archived"].is_null(), "{completed}");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // SC-010 exclusivity: a single-task turn writes neither archive nor
+    // rewind even when it succeeds.
+    #[tokio::test]
+    async fn single_task_plan_writes_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let tool = plan_tool_with(Some(dir.path().join("state.db")));
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [{ "id": "a", "agent": "Explore", "prompt": "solo" }]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        assert!(out["archived"].is_null(), "{out}");
+        let plans_dir = dir.path().join("vault/wiki/wisdom/plans");
+        assert!(
+            !plans_dir.exists() || std::fs::read_dir(&plans_dir).unwrap().next().is_none(),
+            "no page: {plans_dir:?}"
+        );
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl"))
+            .expect("audit file under ZEN_HOME");
+        let completed = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.plan.completed")
+            .expect("completion audit line");
+        assert!(
+            completed["rewind"].is_null() && completed["archived"].is_null(),
+            "{completed}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // W6.3 acceptance (D21 §3 amended): two batches run sequentially on
+    // the ONE plan.todos-minted row — batch 1 settles with a ledger
+    // mutation and the row still `running`; batch 2 attaches to the same
+    // row and completes the plan. No per-batch row is minted.
+    #[tokio::test]
+    async fn ledger_two_batches_share_one_plan_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(std::sync::Mutex::new(zen_core::types::Sensitivity::Private)),
+        );
+        let minted = todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "a", "title": "first", "status": "pending"},
+                {"id": "b", "title": "second", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        let plan_id = minted["plan_id"].as_str().unwrap().to_string();
+
+        let plan = plan_tool_with(Some(state_db.clone()));
+        let out1 = plan
+            .invoke(serde_json::json!({
+                "name": "two-batch",
+                "tasks": [{"id": "a", "agent": "Explore", "prompt": "p1"}]
+            }))
+            .await
+            .unwrap();
+        assert!(out1["error"].is_null(), "batch 1: {out1}");
+
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let rows = repo.load_task_rows(&plan_id).await.unwrap();
+        let a = rows.iter().find(|r| r.task_id == "a").unwrap();
+        assert_eq!(
+            a.status,
+            "completed",
+            "ledger mutation after batch 1: statuses {:?}",
+            rows.iter()
+                .map(|r| (&r.task_id, r.status.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let b = rows.iter().find(|r| r.task_id == "b").unwrap();
+        assert_eq!(
+            b.status,
+            "pending",
+            "batch 2's item untouched: statuses {:?}",
+            rows.iter()
+                .map(|r| (&r.task_id, r.status.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let plan_row = repo.load_plan(&plan_id).await.unwrap().unwrap();
+        assert_eq!(
+            plan_row.status, "running",
+            "batch 1 must NOT complete the ledger plan"
+        );
+
+        let out2 = plan
+            .invoke(serde_json::json!({
+                "name": "two-batch",
+                "tasks": [{"id": "b", "agent": "Explore", "prompt": "p2"}]
+            }))
+            .await
+            .unwrap();
+        assert!(out2["error"].is_null(), "batch 2: {out2}");
+
+        let plan_row = repo.load_plan(&plan_id).await.unwrap().unwrap();
+        assert_eq!(plan_row.status, "completed", "batch 2 completes the plan");
+        let rows = repo.load_task_rows(&plan_id).await.unwrap();
+        assert!(
+            rows.iter().all(|r| r.status == "completed"),
+            "statuses {:?}",
+            rows.iter()
+                .map(|r| (&r.task_id, r.status.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // W6.3: a second batch is refused while one is non-terminal. The DB
+    // claim fence admits same-owner re-claims (crash recovery), so the
+    // refusal lives in the registry's in-flight marker; the two-batch
+    // acceptance pin above proves the real begin/end bracket releases it.
+    #[tokio::test]
+    async fn ledger_second_batch_refused_while_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(std::sync::Mutex::new(zen_core::types::Sensitivity::Private)),
+        );
+        let minted = todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "a", "title": "first", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        let plan_id = minted["plan_id"].as_str().unwrap().to_string();
+
+        assert!(
+            crate::plan_todos::try_begin_batch("local", &plan_id),
+            "first batch admits"
+        );
+        let plan = plan_tool_with(Some(state_db.clone()));
+        let out = plan
+            .invoke(serde_json::json!({
+                "name": "collide",
+                "tasks": [{"id": "a", "agent": "Explore", "prompt": "p"}]
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap()
+                .contains("already has a batch in flight"),
+            "{out}"
+        );
+        crate::plan_todos::end_batch("local");
+        let out = plan
+            .invoke(serde_json::json!({
+                "name": "collide",
+                "tasks": [{"id": "a", "agent": "Explore", "prompt": "p"}]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "marker released: {out}");
     }
 
     #[tokio::test]
@@ -1240,10 +2392,13 @@ mod tests {
             plan_id: &repo_plan_id,
             task_id: "a",
             agent: "Explore",
-            status: "ok",
+            status: "completed",
             response: Some("REPLAYED"),
             error: None,
             now: 1_001,
+            model: None,
+            duration_ms: None,
+            cost_usd: None,
         })
         .await
         .unwrap();
@@ -1265,7 +2420,10 @@ mod tests {
             Some("REPLAYED"),
             "checkpoint replayed, not re-run"
         );
-        assert_eq!(rows[1]["status"], "ok", "pending task ran fresh: {resumed}");
+        assert_eq!(
+            rows[1]["status"], "completed",
+            "pending task ran fresh: {resumed}"
+        );
 
         let row = repo.load_plan(&repo_plan_id).await.unwrap().unwrap();
         assert_eq!(row.status, "completed", "resumed plan closed out");
@@ -1364,10 +2522,13 @@ mod tests {
             plan_id: &plan_id,
             task_id: "a",
             agent: "Explore",
-            status: "ok",
+            status: "completed",
             response: Some("STALE"),
             error: None,
             now: 1_001,
+            model: None,
+            duration_ms: None,
+            cost_usd: None,
         })
         .await
         .unwrap();
@@ -1380,7 +2541,10 @@ mod tests {
             .await
             .unwrap();
         let rows = out["tasks"].as_array().unwrap();
-        assert_eq!(rows[0]["status"], "ok", "agent-changed task reruns: {out}");
+        assert_eq!(
+            rows[0]["status"], "completed",
+            "agent-changed task reruns: {out}"
+        );
         assert_ne!(
             rows[0]["response"].as_str(),
             Some("STALE"),
@@ -1466,8 +2630,11 @@ mod tests {
             response: resp,
             error,
             now,
+            model: None,
+            duration_ms: None,
+            cost_usd: None,
         };
-        repo.checkpoint_task(cp("a", "ok", Some("REPLAYED"), None, 1_001))
+        repo.checkpoint_task(cp("a", "completed", Some("REPLAYED"), None, 1_001))
             .await
             .unwrap();
         repo.checkpoint_task(cp("b", "failed", None, Some("boom"), 1_002))
@@ -1491,21 +2658,21 @@ mod tests {
             .unwrap();
         assert_eq!(out["resumed"], serde_json::json!(true), "{out}");
         let rows = out["tasks"].as_array().unwrap();
-        assert_eq!(rows[0]["status"], "ok", "{out}");
+        assert_eq!(rows[0]["status"], "completed", "{out}");
         assert_eq!(
             rows[0]["response"].as_str(),
             Some("REPLAYED"),
             "ok checkpoint still replays: {out}"
         );
-        assert_eq!(rows[1]["status"], "ok", "failed task reruns: {out}");
+        assert_eq!(rows[1]["status"], "completed", "failed task reruns: {out}");
         assert_ne!(
             rows[1]["response"].as_str(),
             Some("boom"),
             "failed checkpoint must not replay: {out}"
         );
-        assert_eq!(rows[2]["status"], "ok", "skipped task reruns: {out}");
+        assert_eq!(rows[2]["status"], "completed", "skipped task reruns: {out}");
         assert_eq!(
-            rows[3]["status"], "ok",
+            rows[3]["status"], "completed",
             "dependent of a rerun-ok task now runs: {out}"
         );
     }
@@ -1537,7 +2704,88 @@ mod tests {
         assert_eq!(rows.len(), 6, "every chunked task still runs: {out}");
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row["id"], serde_json::json!(format!("t{i}")), "{out}");
-            assert_eq!(row["status"], "ok", "slot {i} across chunks: {out}");
+            assert_eq!(row["status"], "completed", "slot {i} across chunks: {out}");
+        }
+    }
+
+    /// G-13 (SC-001/SC-002): sibling of
+    /// `plan_chunks_wide_batches_by_max_concurrent` asserting the full wave
+    /// contract. 5-task DAG {t1,t2} → {t3,t4} → {t5} at width 2, with t2
+    /// failing (injected) so its dependent t4 is skipped. SC-001: peak
+    /// in-flight counted from enter/exit events (never elapsed time) is
+    /// ≥2 and ≤ max_concurrent. SC-002: every layer-(k+1) task enters only
+    /// after ALL layer-k tasks settled — including the failed t2 and the
+    /// skipped t4.
+    #[tokio::test]
+    async fn plan_waves_barriers_and_peak_in_flight_sc001_sc002() {
+        let tool = plan_tool_concurrency(2, None);
+        for (agent, millis) in [("Explore", 50), ("Librarian", 50), ("Junior", 50)] {
+            tool.inject_test_wave_delay(agent, millis);
+        }
+        tool.inject_test_failure("Atlas", 1);
+
+        let args = serde_json::json!({
+            "tasks": [
+                { "id": "t1", "agent": "Explore", "prompt": "x" },
+                { "id": "t2", "agent": "Atlas", "prompt": "x" },
+                { "id": "t3", "agent": "Librarian", "prompt": "x", "depends_on": ["t1"] },
+                { "id": "t4", "agent": "Hephaestus", "prompt": "x", "depends_on": ["t2"] },
+                { "id": "t5", "agent": "Junior", "prompt": "x", "depends_on": ["t3"] }
+            ]
+        });
+        let out = tool.invoke(args.clone()).await.unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        let rows = out["tasks"].as_array().unwrap();
+        let status_of = |id: &str| {
+            rows.iter()
+                .find(|r| r["id"] == serde_json::json!(id))
+                .expect("task row")["status"]
+                .clone()
+        };
+        assert_eq!(status_of("t1"), "completed", "{out}");
+        assert_eq!(status_of("t2"), "failed", "{out}");
+        assert_eq!(status_of("t3"), "completed", "{out}");
+        assert_eq!(status_of("t4"), "skipped", "{out}");
+        assert_eq!(status_of("t5"), "completed", "{out}");
+
+        // SC-001: peak in-flight from enter/exit events, never time.
+        let peak = tool.test_peak_in_flight();
+        assert!(
+            peak >= 2,
+            "SC-001: a width-2 layer must observably overlap (peak={peak})"
+        );
+        assert!(
+            peak <= 2,
+            "SC-001: in-flight must never exceed max_concurrent=2 (peak={peak})"
+        );
+
+        // SC-002: waves are barriers between layers, skipped tasks included.
+        let spec = PlanExecuteTool::parse_plan(&args).unwrap();
+        let layers = PlanExecuteTool::topological_layers(&spec).unwrap();
+        let events = tool.test_wave_events();
+        let pos_of = |agent: &str, event: &str| -> Option<usize> {
+            events.iter().position(|(a, e)| a == agent && *e == event)
+        };
+        let settle_of = |agent: &str| {
+            pos_of(agent, "exit")
+                .or_else(|| pos_of(agent, "skipped"))
+                .unwrap_or_else(|| panic!("missing settle event for {agent}: {events:?}"))
+        };
+        for pair in layers.windows(2) {
+            let last_settle_prev = pair[0]
+                .iter()
+                .map(|&i| settle_of(spec.tasks[i].agent.as_str()))
+                .max()
+                .expect("non-empty layer");
+            let first_enter_next = pair[1]
+                .iter()
+                .filter_map(|&i| pos_of(spec.tasks[i].agent.as_str(), "enter"))
+                .min()
+                .expect("fixture keeps a runnable task in every layer but the last");
+            assert!(
+                last_settle_prev < first_enter_next,
+                "SC-002: layer barrier violated ({events:?})"
+            );
         }
     }
 
@@ -1560,10 +2808,14 @@ mod tests {
             plan_id: &plan_id,
             task_id: "a",
             agent: "Explore",
-            status: "ok",
+            status: "completed",
             response: Some("REPLAYED"),
             error: None,
             now: now - 120,
+
+            model: None,
+            duration_ms: None,
+            cost_usd: None,
         })
         .await
         .unwrap();
@@ -1619,7 +2871,14 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         repo.create_plan(&plan_id, None, "{}", now).await.unwrap();
         assert!(
-            repo.claim_plan(&plan_id, "other-run", now).await.unwrap(),
+            repo.claim_plan(
+                &plan_id,
+                "other-run",
+                now,
+                zen_repo::DEFAULT_STALE_CLAIM_SECS
+            )
+            .await
+            .unwrap(),
             "seeding the foreign claim must succeed"
         );
 
@@ -1785,9 +3044,9 @@ mod tests {
             .await
             .unwrap();
         let rows = out["tasks"].as_array().unwrap();
-        assert_eq!(rows[0]["status"], "ok", "retry succeeds: {out}");
+        assert_eq!(rows[0]["status"], "completed", "retry succeeds: {out}");
         assert_eq!(
-            rows[1]["status"], "ok",
+            rows[1]["status"], "completed",
             "downstream runs after retry: {out}"
         );
         assert_eq!(tool.test_call_count("Atlas"), 2, "exactly one retry");
@@ -1811,7 +3070,7 @@ mod tests {
             .await
             .unwrap();
         let rows = out["tasks"].as_array().unwrap();
-        assert!(rows.iter().all(|r| r["status"] == "ok"), "{out}");
+        assert!(rows.iter().all(|r| r["status"] == "completed"), "{out}");
         assert_eq!(
             tool.test_call_count("Atlas"),
             2,
@@ -1843,7 +3102,7 @@ mod tests {
         let rows = out["tasks"].as_array().unwrap();
         assert_eq!(rows[0]["status"], "failed", "{out}");
         assert_eq!(
-            rows[1]["status"], "ok",
+            rows[1]["status"], "completed",
             "same-layer independent task ran: {out}"
         );
         assert_eq!(rows[2]["status"], "skipped", "next layer never ran: {out}");
@@ -1874,7 +3133,7 @@ mod tests {
             .unwrap();
         let rows = out["tasks"].as_array().unwrap();
         assert_eq!(rows[0]["status"], "failed", "{out}");
-        assert_eq!(rows[1]["status"], "ok", "{out}");
+        assert_eq!(rows[1]["status"], "completed", "{out}");
         assert_eq!(rows[2]["status"], "skipped", "{out}");
     }
 
@@ -1930,5 +3189,367 @@ mod tests {
             rows[0]["error"].as_str().unwrap().contains("fs.write"),
             "no-grant agent cannot declare an artifact: {out}"
         );
+    }
+
+    // W9.1: a plan whose tasks have no recorded (agent, model) duration
+    // history emits NO forecast line at all — the omission is the contract.
+    #[tokio::test]
+    async fn no_history_pair_emits_no_forecast_line() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let tool = plan_tool_with(Some(dir.path().join("state.db")));
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "x" },
+                    { "id": "b", "agent": "Explore", "prompt": "y" }
+                ]
+            }))
+            .await
+            .unwrap();
+        let progress = out["progress"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !progress
+                .iter()
+                .any(|l| l.as_str().is_some_and(|s| s.contains("(estimate)"))),
+            "no forecast line without history: {progress:?}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // W9.1: recorded durations produce the exact advisory line — lower =
+    // Σ per-task min, upper = Σ per-task max, minutes ceil'd.
+    #[tokio::test]
+    async fn forecast_line_uses_recorded_duration_history() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("hist", None, "{}", 1_000).await.unwrap();
+        for (tid, ms) in [("h1", 120_000i64), ("h2", 240_000i64)] {
+            repo.checkpoint_task(zen_repo::TaskCheckpoint {
+                plan_id: "hist",
+                task_id: tid,
+                agent: "Explore",
+                status: "completed",
+                response: Some("done"),
+                error: None,
+                now: 1_100,
+                model: None,
+                duration_ms: Some(ms as u64),
+                cost_usd: None,
+            })
+            .await
+            .unwrap();
+        }
+        let tool = plan_tool_with(Some(state_db));
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "x" },
+                    { "id": "b", "agent": "Explore", "prompt": "y" }
+                ]
+            }))
+            .await
+            .unwrap();
+        let progress = out["progress"].as_array().expect("progress blob");
+        assert_eq!(
+            progress[0],
+            serde_json::json!("plan 2 tasks · ~4-8 min (estimate)"),
+            "forecast line first: {progress:?}"
+        );
+        assert!(
+            !progress[0].as_str().unwrap().contains('$'),
+            "no cost segment without cost history: {progress:?}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // W9.1: the `$lo-$hi` segment appears only when the contributing pairs
+    // carry recorded cost — summed min..max, two decimals.
+    #[tokio::test]
+    async fn forecast_line_includes_cost_segment_from_cost_history() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("hist", None, "{}", 1_000).await.unwrap();
+        for (tid, cost) in [("h1", 0.01f64), ("h2", 0.03f64)] {
+            repo.checkpoint_task(zen_repo::TaskCheckpoint {
+                plan_id: "hist",
+                task_id: tid,
+                agent: "Explore",
+                status: "completed",
+                response: Some("done"),
+                error: None,
+                now: 1_100,
+                model: None,
+                duration_ms: Some(60_000),
+                cost_usd: Some(cost),
+            })
+            .await
+            .unwrap();
+        }
+        let tool = plan_tool_with(Some(state_db));
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "x" },
+                    { "id": "b", "agent": "Explore", "prompt": "y" }
+                ]
+            }))
+            .await
+            .unwrap();
+        let progress = out["progress"].as_array().expect("progress blob");
+        assert_eq!(
+            progress[0],
+            serde_json::json!("plan 2 tasks · ~2-2 min · ~$0.02-$0.06 (estimate)"),
+            "cost segment from history: {progress:?}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // W9.4: recognized failure classes produce numbered proposals that
+    // cite resume_plan_id (checkpoint reuse is the existing resume path).
+    #[test]
+    fn triage_proposals_recognized_classes_cite_resume_plan_id() {
+        let proposals = triage_proposals(
+            "p1",
+            &[
+                "task timed out after 600s",
+                "no local provider is reachable",
+            ],
+        );
+        assert_eq!(proposals.len(), 2, "{proposals:?}");
+        for p in &proposals {
+            assert!(p.contains("resume_plan_id"), "{p}");
+        }
+        assert!(proposals[0].contains("timed out"), "{proposals:?}");
+        assert!(proposals[1].contains("local provider"), "{proposals:?}");
+    }
+
+    // W9.4: error text matching no table needle yields ZERO proposals —
+    // the raw error stays in the task row instead of a guessed repair.
+    #[test]
+    fn triage_proposals_unknown_class_yields_zero_proposals() {
+        let proposals = triage_proposals("p1", &["failed to build delegate agent \"X\""]);
+        assert!(proposals.is_empty(), "{proposals:?}");
+        let proposals = triage_proposals("p1", &[]);
+        assert!(proposals.is_empty(), "{proposals:?}");
+    }
+
+    // W9.4: proposals deduplicate by class text and cap at 3.
+    #[test]
+    fn triage_proposals_dedup_and_cap_at_three() {
+        let proposals = triage_proposals(
+            "p1",
+            &[
+                "task timed out",
+                "timeout waiting for first token",
+                "budget exhausted",
+                "approval required",
+            ],
+        );
+        assert!(proposals.len() <= 3, "{proposals:?}");
+        assert_eq!(proposals.len(), 3, "dedup keeps distinct classes");
+        let all = proposals.join("\n");
+        assert_eq!(all.matches("timed out").count(), 1, "{all}");
+    }
+
+    // W9.3: a cancel signal that lands before the first batch stops the
+    // walk with ZERO completed tasks — every task exits skipped, the audit
+    // line carries `cancelled: true`, and no `completed` can appear.
+    #[tokio::test]
+    async fn pre_signal_cancels_before_first_batch_yields_no_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("pre", None, "{}", 1_000).await.unwrap();
+        // The guard must stay held across the invoke: the registry entry
+        // lives until its last guard drops, and the executor JOINS the
+        // existing channel only while the entry exists.
+        let (_guard, rx) = crate::plan_control::register_live_plan("pre");
+        assert!(crate::plan_control::signal_cancel("pre"));
+        assert!(*rx.borrow(), "signal observed");
+        let tool = plan_tool_with(Some(state_db));
+        let out = tool
+            .invoke(serde_json::json!({
+                "resume_plan_id": "pre",
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "x" },
+                    { "id": "b", "agent": "Explore", "prompt": "y" }
+                ]
+            }))
+            .await
+            .unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{out}");
+        for row in rows {
+            assert_eq!(row["status"], "skipped", "{row}");
+            assert!(row["response"].is_null(), "no partial completed: {row}");
+        }
+        let audit = std::fs::read_to_string(dir.path().join("logs/audit.jsonl"))
+            .expect("audit file under ZEN_HOME");
+        let completed = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["kind"] == "loop.plan.completed")
+            .expect("completion audit line");
+        assert_eq!(
+            completed["cancelled"],
+            serde_json::json!(true),
+            "{completed}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // W9.3: cancel DURING a live batch drops the in-flight sub-turns —
+    // they exit `failed` (never completed) and the plan never records a
+    // partial success.
+    #[tokio::test]
+    async fn cancel_mid_batch_drops_inflight_to_failed() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("pre2", None, "{}", 1_000).await.unwrap();
+        let tool = plan_tool_with(Some(state_db));
+        tool.inject_test_wave_delay("Explore", 5_000);
+        let handle = tokio::spawn({
+            async move {
+                tool.invoke(serde_json::json!({
+                    "resume_plan_id": "pre2",
+                    "tasks": [
+                        { "id": "a", "agent": "Explore", "prompt": "x" },
+                        { "id": "b", "agent": "Explore", "prompt": "y" }
+                    ]
+                }))
+                .await
+            }
+        });
+        // Wait until the executor is INSIDE the batch (in_batch=false
+        // means a batch is in flight), then cancel.
+        let mut in_batch = false;
+        for _ in 0..1000 {
+            if crate::plan_control::is_live_between_batches("pre2") == Some(false) {
+                in_batch = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(in_batch, "executor never entered the batch");
+        assert!(crate::plan_control::signal_cancel("pre2"));
+        let out = handle.await.unwrap().unwrap();
+        let rows = out["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{out}");
+        for row in rows {
+            assert_eq!(row["status"], "failed", "{row}");
+            assert!(
+                row["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("cancelled mid-batch")),
+                "{row}"
+            );
+        }
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    /// W11.5/T5 (SC-021): plan tasks accept a per-task fork_mode.
+    #[test]
+    fn parse_plan_accepts_per_task_fork_mode() {
+        let args = serde_json::json!({
+            "tasks": [{"id": "a", "agent": "Explore", "prompt": "p", "fork_mode": "knowledge"}]
+        });
+        let plan = PlanExecuteTool::parse_plan(&args).unwrap();
+        assert_eq!(plan.tasks[0].fork_mode, Some(ForkMode::Knowledge));
+        assert!(plan.tasks[0].model_hint.is_none());
+    }
+
+    /// W11.5/T5 (SC-021/022): absent fork/model keeps the session-wide
+    /// default byte-identically (both fields None).
+    #[test]
+    fn parse_plan_absent_fork_model_keeps_session_default() {
+        let args = serde_json::json!({
+            "tasks": [{"id": "a", "agent": "Explore", "prompt": "p"}]
+        });
+        let plan = PlanExecuteTool::parse_plan(&args).unwrap();
+        assert!(plan.tasks[0].fork_mode.is_none());
+        assert!(plan.tasks[0].model_hint.is_none());
+    }
+
+    /// W11.5/T5: an invalid plan-task fork_mode is a structured rejection.
+    #[test]
+    fn parse_plan_rejects_invalid_fork_mode() {
+        let args = serde_json::json!({
+            "tasks": [{"id": "a", "agent": "Explore", "prompt": "p", "fork_mode": "bogus"}]
+        });
+        let err = PlanExecuteTool::parse_plan(&args).unwrap_err();
+        assert!(err.contains("fork_mode"), "{err}");
+    }
+
+    /// W11.5/T5 (SC-022): the 6th distinct model hint is rejected — ONE
+    /// shared rule with delegate.task (≤5 distinct per batch).
+    #[test]
+    fn parse_plan_rejects_sixth_distinct_model_hint() {
+        let tasks: Vec<serde_json::Value> = (0..6)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("t{i}"), "agent": "Explore", "prompt": "p",
+                    "model": format!("hint-{i}")
+                })
+            })
+            .collect();
+        let args = serde_json::json!({ "tasks": tasks });
+        let err = PlanExecuteTool::parse_plan(&args).unwrap_err();
+        assert!(err.contains("distinct model hints"), "{err}");
+    }
+
+    /// W11.6/T6 (F6+OV-3): a forced mint failure is a STRUCTURED rejection
+    /// and leaves zero orphan rows — never a phantom plan run.
+    #[tokio::test]
+    async fn mint_fresh_plan_failure_is_structured_with_no_orphan_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("mint_fail.db");
+        let client = Arc::new(zen_repo::SqliteClient::open(&db).await.unwrap());
+        // Force the plan INSERT to abort (simulates disk-full/locked DB).
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_plan BEFORE INSERT ON workflow_plans \
+                     BEGIN SELECT RAISE(ABORT, 'forced mint failure'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let args = serde_json::json!({ "tasks": [] });
+        let err = mint_fresh_plan(&client, &args, None, "s1")
+            .await
+            .expect_err("a forced create failure must reject");
+        assert!(
+            err["error"].as_str().unwrap().contains("plan mint failed"),
+            "structured rejection: {err}"
+        );
+        // The atomic mint rolled back: no phantom plan, no orphan tasks.
+        let (plans, tasks): (i64, i64) = client
+            .writer()
+            .call(|conn| {
+                let p: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM workflow_plans", [], |r| r.get(0))?;
+                let t: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM workflow_tasks", [], |r| r.get(0))?;
+                Ok((p, t))
+            })
+            .await
+            .unwrap();
+        assert_eq!(plans, 0, "no phantom plan row");
+        assert_eq!(tasks, 0, "no orphan task rows");
     }
 }

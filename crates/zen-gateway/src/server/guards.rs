@@ -22,7 +22,7 @@
 //! failures never propagate.
 
 use std::collections::HashMap;
-use std::sync::{Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -131,6 +131,75 @@ pub fn watchdog_deadline(local_reachable: bool) -> Duration {
         base.max(Duration::from_secs(local_watchdog_secs()))
     } else {
         base
+    }
+}
+
+/// W9.5-F3: plan-turn watchdog ceiling multiplier. A plan turn's total
+/// watchdog lifetime never exceeds `PLAN_WATCHDOG_CEILING_MULTIPLIER ×`
+/// the resolved watchdog deadline, measured from turn start — the ≤3-layer
+/// plan cap plus one wave of headroom. Named code constant (约定大于配置:
+/// no config key, no env var, no protocol surface).
+pub const PLAN_WATCHDOG_CEILING_MULTIPLIER: u32 = 4;
+
+/// W9.5-F3 named ceiling: `PLAN_WATCHDOG_CEILING = 4 × watchdog`, where
+/// `watchdog` is the resolved per-turn deadline ([`watchdog_deadline`],
+/// 900s default / scaled local). The client turn-ceiling derivation
+/// (`client::surface`) consumes the same multiplier so the documented
+/// invariant `client ceiling > watchdog` holds under renewal too.
+#[must_use]
+pub fn plan_watchdog_ceiling(watchdog: Duration) -> Duration {
+    watchdog * PLAN_WATCHDOG_CEILING_MULTIPLIER
+}
+
+/// W9.5-F3 shared watchdog deadline handle. The hosting guard loop
+/// re-reads [`WatchdogDeadline::current`] on every wake (replacing the
+/// single `tokio::time::timeout` snapshot); plan-task completions renew
+/// the deadline via [`WatchdogDeadline::renew`] — extend-only, clamped
+/// to the absolute ceiling `turn_start + plan_watchdog_ceiling(watchdog)`.
+///
+/// Non-plan turns never renew: the deadline stays at the initial
+/// snapshot and the guard loop fires exactly at it (byte-identical to
+/// the previous one-shot timeout). A renewal can only EXTEND, never
+/// shorten. Cancellation is orthogonal — the hosting select resolves it
+/// immediately regardless of any live renewal (SIGTERM drain wins).
+pub struct WatchdogDeadline {
+    /// Current absolute deadline; renewals only push it later.
+    deadline: StdMutex<tokio::time::Instant>,
+    /// Absolute ceiling from turn start; renewals never cross it.
+    ceiling: tokio::time::Instant,
+}
+
+impl WatchdogDeadline {
+    /// Anchors the initial deadline and the absolute ceiling at turn
+    /// start. `watchdog` is the resolved per-turn deadline
+    /// ([`watchdog_deadline`]).
+    #[must_use]
+    pub fn start(watchdog: Duration) -> Arc<Self> {
+        let now = tokio::time::Instant::now();
+        Arc::new(Self {
+            deadline: StdMutex::new(now + watchdog),
+            ceiling: now + plan_watchdog_ceiling(watchdog),
+        })
+    }
+
+    /// Current absolute deadline — re-read by the guard loop each tick.
+    #[must_use]
+    pub fn current(&self) -> tokio::time::Instant {
+        *lock_ok(&self.deadline, "watchdog deadline")
+    }
+
+    /// Heartbeat renewal: a fresh watchdog from now, extend-only,
+    /// clamped to the absolute ceiling. Returns `true` when the deadline
+    /// moved (a renewal attempt past the ceiling is a no-op).
+    pub fn renew(&self, watchdog: Duration) -> bool {
+        let candidate = (tokio::time::Instant::now() + watchdog).min(self.ceiling);
+        let mut deadline = lock_ok(&self.deadline, "watchdog deadline");
+        if candidate > *deadline {
+            *deadline = candidate;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -332,6 +401,20 @@ pub fn audit_rejection(sink: Option<&std::path::PathBuf>, guard: &str, reason: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W7.1 invariant at defaults: turn watchdog (900s) > first-token
+    // budget (600s) — the ceiling derivation (PLAN_WATCHDOG_CEILING = 4×)
+    // only holds while this ordering is true.
+    #[test]
+    fn turn_watchdog_exceeds_the_first_token_budget_at_defaults() {
+        assert!(
+            watchdog_deadline(false).as_secs()
+                > zen_agents::completion_model::first_token_budget_secs(),
+            "watchdog {} must exceed first-token budget {}",
+            watchdog_deadline(false).as_secs(),
+            zen_agents::completion_model::first_token_budget_secs(),
+        );
+    }
 
     #[test]
     fn breaker_opens_after_threshold_and_recovers_by_time() {

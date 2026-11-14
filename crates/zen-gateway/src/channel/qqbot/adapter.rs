@@ -50,7 +50,9 @@ const SEEN_CAP: usize = 1024;
 /// Total wall-clock budget for ONE inbound message across every
 /// gateway attempt (D8): group passive window is 5 min — the reply
 /// must still fit after retries; C2C windows are far wider and the
-/// server-side turn ceiling is 960s. Expiry abandons the message with
+/// server-side turn ceiling is renewal-aware since W9.5-F3 (derived
+/// `4 × watchdog + margin`, 3660s at defaults — this budget stays a
+/// platform-window product choice). Expiry abandons the message with
 /// an error text; no further retries (in-flight duplicate turnIds
 /// mirror the original result instead of re-executing).
 const GROUP_DEADLINE: Duration = Duration::from_secs(280);

@@ -1,8 +1,6 @@
 use rig_agent::AgentBuilder;
-use rig_agent::completion::Prompt;
-use rig_core::client::CompletionClient;
-use rig_core::completion::CompletionModel;
-use rig_core::providers::anthropic;
+use rig_core::completion::CompletionRequest;
+use rig_core::providers::anthropic::{Anthropic, AnthropicConfig};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -46,20 +44,24 @@ impl AnthropicProvider {
         }
     }
 
+    /// rig 0.46: `.completion(name)` is the Anthropic `/v1/messages` wire —
+    /// the direct successor of 0.42's `completion_model()`.
+    fn rig_client(&self) -> Result<Anthropic, LlmError> {
+        let mut config = AnthropicConfig::new(&self.api_key);
+        if self.base_url != zen_core::constants::ANTHROPIC_BASE_URL {
+            config = config.with_base_url(&self.base_url);
+        }
+        Ok(config.client())
+    }
+
     pub async fn complete_async(
         &self,
         prompt: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<String, LlmError> {
-        let mut builder = anthropic::Client::builder().api_key(&self.api_key);
-        if self.base_url != zen_core::constants::ANTHROPIC_BASE_URL {
-            builder = builder.base_url(&self.base_url);
-        }
-        let client = builder.build().map_err(|e| LlmError::Call {
-            reason: format!("Failed to create Anthropic client: {}", e),
-        })?;
+        let client = self.rig_client()?;
 
-        let model = client.completion_model(&self.model);
+        let model = client.completion(&self.model);
         let mut agent_builder = AgentBuilder::new(model);
         let max_tokens = options.max_tokens.unwrap_or(4096);
         agent_builder = agent_builder.max_tokens(max_tokens);
@@ -72,12 +74,13 @@ impl AnthropicProvider {
             reason: format!("Anthropic completion failed: {}", e),
         })?;
 
+        let text = response.output();
         info!(
             model = self.model,
-            response_len = response.len(),
+            response_len = text.len(),
             "AnthropicProvider complete"
         );
-        Ok(response)
+        Ok(text)
     }
 
     pub fn complete(
@@ -115,21 +118,15 @@ impl AnthropicProvider {
         prompt: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<UsedCompletion, LlmError> {
-        let mut builder = anthropic::Client::builder().api_key(&self.api_key);
-        if self.base_url != zen_core::constants::ANTHROPIC_BASE_URL {
-            builder = builder.base_url(&self.base_url);
-        }
-        let client = builder.build().map_err(|e| LlmError::Call {
-            reason: format!("Failed to create Anthropic client: {}", e),
-        })?;
+        let client = self.rig_client()?;
 
-        let model = client.completion_model(&self.model);
-        let mut request = model.completion_request(prompt);
+        let model = client.completion(&self.model);
+        let mut request = CompletionRequest::new(prompt);
         request = request.max_tokens(options.max_tokens.unwrap_or(4096));
         if let Some(t) = options.temperature {
             request = request.temperature(t);
         }
-        let response = request.send().await.map_err(|e| LlmError::Call {
+        let response = model.call(request).await.map_err(|e| LlmError::Call {
             reason: format!("Anthropic completion failed: {}", e),
         })?;
 

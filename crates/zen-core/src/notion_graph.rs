@@ -71,6 +71,11 @@ impl std::str::FromStr for SelfModelLayer {
     }
 }
 
+// The async_trait macro stamps `#[must_use]` on every desugared boxed-future
+// signature; `Future` is already `#[must_use]`, so clippy ≥1.99 flags the
+// duplication (`double_must_use`). Silenced at the trait boundary — the macro
+// expansion is not ours to edit, and the must_use intent is correct.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NotionGraphProvider: Send + Sync {
     async fn upsert_entity(&self, notion: &SimpleNotion) -> anyhow::Result<()>;

@@ -952,3 +952,380 @@ async fn background_wrong_type_is_structured_arg_error() {
         );
     }
 }
+
+// ===========================================================================
+// W5.1 — Registry generalization: spawn_async + Expired + unified meta
+// (spec 006 D20 §2/§8; additive TaskStatus contract)
+// ===========================================================================
+
+/// uuid-shaped id the validator accepts (shape+hex only; version bits are
+/// not checked by `is_valid_task_id`).
+const W51_ID_A: &str = "a1b2c3d4-1111-2222-3333-444455556666";
+const W51_ID_B: &str = "b2c3d4e5-7777-8888-9999-aaaabbbbcccc";
+
+fn async_limits(max_wall_secs: u64) -> BackgroundLimits {
+    BackgroundLimits {
+        max_wall_secs,
+        max_concurrent: 4,
+        output_cap_bytes: task_registry::OUTPUT_CAP_BYTES,
+    }
+}
+
+#[tokio::test]
+async fn spawn_async_records_agent_and_running_meta_before_first_await() {
+    let _home = set_zen_home();
+    let future = async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(json!({"late": true}))
+    };
+    let _join = registry()
+        .spawn_async(
+            W51_ID_A,
+            "sess-w51",
+            "Explore",
+            Some(2),
+            &async_limits(60),
+            future,
+        )
+        .expect("spawn_async admits");
+    let snap = registry().snapshot(W51_ID_A).expect("registered");
+    assert_eq!(snap.status, TaskStatus::Running);
+    let meta = task_registry::read_meta(W51_ID_A).expect("initial meta on disk BEFORE first await");
+    assert_eq!(meta.status, TaskStatus::Running);
+    assert_eq!(meta.agent.as_deref(), Some("Explore"));
+    assert_eq!(meta.task_index, Some(2));
+    assert!(
+        meta.result.is_none(),
+        "result absent while running (skip_serializing_if)"
+    );
+    registry().kill(W51_ID_A).expect("cleanup kill");
+}
+
+#[tokio::test]
+async fn async_completion_marks_completed_zero_and_persists_result_in_meta() {
+    let _home = set_zen_home();
+    let join = registry()
+        .spawn_async(
+            W51_ID_A,
+            "sess-w51",
+            "Explore",
+            None,
+            &async_limits(60),
+            async { Ok(json!({"answer": 42})) },
+        )
+        .expect("spawn_async admits");
+    let value = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("completes promptly")
+        .expect("join ok");
+    assert_eq!(value, json!({"answer": 42}), "handle yields the payload");
+    let snap = registry().snapshot(W51_ID_A).expect("registered");
+    assert_eq!(
+        snap.status,
+        TaskStatus::Completed(0),
+        "async success = Completed(0)"
+    );
+    assert!(snap.ended_at_ms.is_some());
+    let meta = task_registry::read_meta(W51_ID_A).expect("terminal meta");
+    assert_eq!(meta.status, TaskStatus::Completed(0));
+    assert_eq!(
+        meta.result,
+        Some(json!({"answer": 42})),
+        "result payload lives in meta"
+    );
+}
+
+#[tokio::test]
+async fn async_error_marks_failed_without_result() {
+    let _home = set_zen_home();
+    let join = registry()
+        .spawn_async(
+            W51_ID_A,
+            "sess-w51",
+            "Explore",
+            None,
+            &async_limits(60),
+            async { anyhow::bail!("sub-turn exploded") },
+        )
+        .expect("spawn_async admits");
+    let value = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("completes promptly")
+        .expect("join ok (failure yields Null, not a panic)");
+    assert_eq!(value, serde_json::Value::Null);
+    let meta = task_registry::read_meta(W51_ID_A).expect("terminal meta");
+    assert!(matches!(meta.status, TaskStatus::Failed(ref m) if m.contains("sub-turn exploded")));
+    assert!(meta.result.is_none());
+}
+
+#[tokio::test]
+async fn expiry_marks_expired_without_aborting_the_live_handle() {
+    let _home = set_zen_home();
+    let join = registry()
+        .spawn_async(
+            W51_ID_A,
+            "sess-w51",
+            "Explore",
+            None,
+            &async_limits(1), // 1s wall budget
+            async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(json!({"late": true}))
+            },
+        )
+        .expect("spawn_async admits");
+    // GC-tick expiry with a clock past the deadline.
+    let expired = registry().expire_due(task_registry::now_ms() + 2_000);
+    assert_eq!(expired, vec![W51_ID_A.to_string()]);
+    let snap = registry().snapshot(W51_ID_A).expect("registered");
+    assert_eq!(
+        snap.status,
+        TaskStatus::Expired,
+        "wall-out = Expired on the async path"
+    );
+    // The handle was NOT aborted (W5.1 acceptance): an aborted task's join
+    // resolves to a cancellation Err — an Ok resolve proves the future ran
+    // to natural completion. Its late result is dropped (the parent
+    // re-delegates per D20 §8).
+    let value = tokio::time::timeout(Duration::from_secs(10), join)
+        .await
+        .expect("unaborted future completes naturally")
+        .expect("join resolves Ok — handle was not aborted");
+    assert_eq!(
+        value,
+        serde_json::Value::Null,
+        "late result dropped from the handle"
+    );
+    let meta = task_registry::read_meta(W51_ID_A).expect("meta");
+    assert_eq!(
+        meta.status,
+        TaskStatus::Expired,
+        "late completion never overwrites Expired"
+    );
+    assert!(meta.result.is_none(), "late result dropped from meta too");
+}
+
+#[tokio::test]
+async fn kill_aborts_the_async_future_and_marks_killed() {
+    let _home = set_zen_home();
+    let join = registry()
+        .spawn_async(
+            W51_ID_A,
+            "sess-w51",
+            "Explore",
+            None,
+            &async_limits(60),
+            async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(json!({}))
+            },
+        )
+        .expect("spawn_async admits");
+    let snap = registry().kill(W51_ID_A).expect("kill");
+    assert_eq!(snap.status, TaskStatus::Killed);
+    // The handle WAS aborted: the join resolves to a cancellation error.
+    let res = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("aborted join resolves promptly");
+    assert!(
+        res.is_err_and(|e| e.is_cancelled()),
+        "kill aborts the future handle"
+    );
+    let meta = task_registry::read_meta(W51_ID_A).expect("meta");
+    assert_eq!(meta.status, TaskStatus::Killed);
+    assert_eq!(
+        meta.agent.as_deref(),
+        Some("Explore"),
+        "kill rewrite preserves the agent field"
+    );
+}
+
+#[tokio::test]
+async fn spawn_async_rejects_invalid_and_duplicate_ids() {
+    let _home = set_zen_home();
+    // Path-shape guard (review fix a parity): the id reaches meta_path.
+    let bad = registry().spawn_async(
+        "../../etc/passwd",
+        "s",
+        "Explore",
+        None,
+        &async_limits(60),
+        async { Ok(json!({})) },
+    );
+    assert!(bad.is_err(), "invalid id rejected");
+    let first = registry()
+        .spawn_async(W51_ID_A, "s", "Explore", None, &async_limits(60), async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(json!({}))
+        })
+        .expect("first admission ok");
+    let dup = registry().spawn_async(W51_ID_A, "s", "Explore", None, &async_limits(60), async {
+        Ok(json!({}))
+    });
+    assert!(dup.is_err(), "duplicate id rejected");
+    registry().kill(W51_ID_A).expect("cleanup kill");
+    drop(first);
+}
+
+#[tokio::test]
+async fn process_path_meta_serialization_omits_async_fields() {
+    let _home = set_zen_home();
+    // Byte-identity acceptance: the process path's meta.json must NOT gain
+    // agent/task_index/result keys (skip_serializing_if keeps the old
+    // bytes). Run a real echo to completion and inspect the raw JSON.
+    let tool = exec_tool();
+    let res = tool
+        .invoke(json!({
+            "binary": "/bin/echo",
+            "args": ["w51"],
+            "background": true
+        }))
+        .await
+        .expect("background exec ok");
+    let task_id = res["task_id"].as_str().expect("task_id").to_string();
+    reap_wait(&task_id, Duration::from_secs(10)).await;
+    let raw = std::fs::read_to_string(task_registry::meta_path(&task_id)).expect("meta");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+    for key in ["agent", "task_index", "result"] {
+        assert!(
+            v.get(key).is_none(),
+            "process meta must omit `{key}` for byte-identity"
+        );
+    }
+    assert_eq!(
+        v["status"],
+        json!({"completed": 0}),
+        "externally-tagged status, byte-identical shape"
+    );
+}
+
+/// Write a `running` meta with the `agent` field set (async-path shape) —
+/// the boot sweep's discriminator input.
+fn write_running_async_meta(home: &std::path::Path, task_id: &str, agent: &str) {
+    let dir = home.join("logs").join("tasks").join(task_id);
+    std::fs::create_dir_all(&dir).expect("task dir");
+    let meta = json!({
+        "task_id": task_id,
+        "session_id": "s",
+        "pid": 999_999,
+        "command_digest": format!("delegate:{agent}"),
+        "output_dir": dir.to_string_lossy(),
+        "status": "running",
+        "started_at_ms": task_registry::now_ms(),
+        "ended_at_ms": serde_json::Value::Null,
+        "bytes_stdout": 0,
+        "bytes_stderr": 0,
+        "truncated": false,
+        "stdout_path": dir.join("stdout").to_string_lossy(),
+        "stderr_path": dir.join("stderr").to_string_lossy(),
+        "agent": agent,
+    });
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta).unwrap(),
+    )
+    .expect("meta write");
+}
+
+#[test]
+fn boot_sweep_marks_async_running_meta_expired_not_orphaned() {
+    let home = set_zen_home();
+    write_running_async_meta(&home, W51_ID_B, "Explore");
+    let marked = sweep_orphans_on_boot();
+    assert_eq!(marked, 1, "the async running meta is swept");
+    let meta = task_registry::read_meta(W51_ID_B).expect("meta");
+    assert_eq!(
+        meta.status,
+        TaskStatus::Expired,
+        "restart expiry maps async metas to Expired (D20 §8), never Orphaned"
+    );
+    assert!(meta.ended_at_ms.is_some());
+}
+
+#[tokio::test]
+async fn shell_collect_surfaces_the_async_result_payload() {
+    let _home = set_zen_home();
+    let join = registry()
+        .spawn_async(
+            W51_ID_A,
+            "sess-w51",
+            "Explore",
+            None,
+            &async_limits(60),
+            async { Ok(json!({"summary": "done", "tokens": 7})) },
+        )
+        .expect("spawn_async admits");
+    let _ = join.await;
+    let res = ShellCollectTool::new()
+        .invoke(json!({ "task_id": W51_ID_A, "wait_ms": 1000 }))
+        .await
+        .expect("collect ok");
+    assert_eq!(res["status"], json!("completed"));
+    assert_eq!(
+        res["result"],
+        json!({"summary": "done", "tokens": 7}),
+        "shell.collect surfaces the agent-future result payload (W5.1)"
+    );
+}
+
+// ── W11.11/T12 (G5): the AGENT-FUTURE expiry path ────────────────────────
+// The process path above marks Timeout + SIGKILL; the agent-future path
+// (spawn_async) must mark Expired WITHOUT aborting the live handle, and a
+// late result is dropped (the parent re-delegates). Real past-wall expiry.
+
+#[tokio::test]
+async fn expire_due_marks_agent_future_expired_without_aborting() {
+    set_zen_home();
+    let task_id = uuid::Uuid::new_v4().simple().to_string();
+    let limits = BackgroundLimits {
+        max_wall_secs: 1,
+        max_concurrent: 4,
+        output_cap_bytes: task_registry::OUTPUT_CAP_BYTES,
+    };
+    // A future that finishes AFTER the wall deadline. A completion flag
+    // proves the handle was NOT aborted (the future ran to completion); the
+    // registry handle yields the STORED result, which is dropped (Null) for
+    // an Expired task.
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&completed);
+    let handle = registry()
+        .spawn_async(&task_id, "local", "Explore", None, &limits, async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "response": "late result" }))
+        })
+        .unwrap();
+
+    // Inject a now past the 1s wall (deterministic, no real-time wait).
+    let now = task_registry::now_ms();
+    let expired = registry().expire_due(now + 2_000);
+    assert!(
+        expired.iter().any(|id| id == &task_id),
+        "overdue agent future must expire: {expired:?}"
+    );
+    let snap = registry().snapshot(&task_id).unwrap();
+    assert_eq!(
+        snap.status,
+        TaskStatus::Expired,
+        "the agent-future path marks Expired (not Timeout)"
+    );
+
+    // The handle is NOT aborted: the future still runs to completion.
+    let late = handle.await.unwrap();
+    assert!(
+        completed.load(std::sync::atomic::Ordering::SeqCst),
+        "the future must run to completion — expiry does not abort the handle"
+    );
+    // The late result is dropped: the stored result is Null, not the prose.
+    assert!(
+        late.is_null(),
+        "an Expired task's late result must be dropped: {late}"
+    );
+    // The snapshot stays Expired (no late-result overwrite).
+    let after = registry().snapshot(&task_id).unwrap();
+    assert_eq!(
+        after.status,
+        TaskStatus::Expired,
+        "a late result must not overwrite the Expired terminal state"
+    );
+}

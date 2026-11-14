@@ -1,7 +1,10 @@
 //! Proactive heartbeat: 9am morning brief via qqbot push (FR-038 / D04).
 //!
-//! The brief is 3 lines (decisions / people+preferences / watch-outs incl.
-//! ignored topics), capped at [`BRIEF_MAX_CHARS`]. Delivery is an outbox handoff:
+//! The brief is 3 wisdom lines (decisions / people+preferences / watch-outs
+//! incl. ignored topics) plus an optional 4th W9.2 plan line
+//! (`plans: N done overnight · M needs your call · K running`, emitted iff
+//! the 24h `workflow_plans` window is non-empty), capped at
+//! [`BRIEF_MAX_CHARS`]. Delivery is an outbox handoff:
 //! the worker writes `logs/outbox/morning-brief-<date>.json` (recipient-agnostic
 //! `{date, lines, chat_hint, sensitivity}`), which the gateway qqbot carrier
 //! drains with an active send (`msg_id=None`). zen-agents must not depend on
@@ -25,6 +28,9 @@ use tracing::{info, warn};
 
 use zen_core::paths::ZenPaths;
 use zen_core::types::Sensitivity;
+use zen_repo::{WorkflowPlanRow, WorkflowRepo};
+use zen_vault::SharedSqliteClient;
+use zen_vault::distill::reflection::plan_archive_slug;
 
 use super::super::{WorkerContext, WorkerReport, ZenWorker};
 
@@ -33,6 +39,9 @@ pub const MORNING_BRIEF_SCHEDULE: &str = "0 0 9 * * *";
 
 /// Hard cap on the rendered brief body.
 pub const BRIEF_MAX_CHARS: usize = 300;
+
+/// W9.2 plan-line window: `workflow_plans` rows touched in the last 24h.
+const PLAN_WINDOW_SECS: i64 = 24 * 3600;
 
 /// Outbox file the qqbot carrier drains (push, not CLI pull).
 pub fn outbox_path(paths: &ZenPaths, date: &str) -> std::path::PathBuf {
@@ -153,11 +162,12 @@ pub fn consumer_may_deliver(sensitivity: Sensitivity, consumer_allowlisted: bool
     consumer_allowlisted || sensitivity == Sensitivity::Public
 }
 
-/// Render lines into the capped 3-line body.
+/// Render lines into the capped body (3 wisdom lines + the optional W9.2
+/// plan line).
 pub fn render_brief(lines: &[BriefLine]) -> String {
     let mut body = lines
         .iter()
-        .take(3)
+        .take(4)
         .map(BriefLine::render)
         .collect::<Vec<_>>()
         .join("\n");
@@ -172,6 +182,90 @@ fn or_placeholder(s: String, fallback: &str) -> String {
         fallback.to_string()
     } else {
         s
+    }
+}
+
+/// W9.2 overnight plan tallies. Pure (no DB): `done` is gated on the archived
+/// page existing on disk (the F5 named reader — a completed row without its
+/// `wisdom/plans/<slug>.md` page is NOT counted done), `needs_call` covers
+/// failures plus stale-owner `running` rows, `running` the fresh ones.
+/// `cancelled` rows count nowhere.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlanCounts {
+    done: usize,
+    needs_call: usize,
+    running: usize,
+}
+
+fn count_plans(rows: &[WorkflowPlanRow], plans_dir: &Path, now: i64) -> PlanCounts {
+    let mut counts = PlanCounts::default();
+    // W11.3/T3: one live staleness definition (resolved once per call, not
+    // per row) — the brief's "needs a call" classification matches the
+    // sweep and the resume fence under a widened watchdog.
+    let stale_secs = zen_core::config::resolve_stale_claim_secs();
+    for row in rows {
+        match row.status.as_str() {
+            "completed" => {
+                let slug = plan_archive_slug(row.name.as_deref(), None, &row.plan_id);
+                if plans_dir.join(format!("{slug}.md")).exists() {
+                    counts.done += 1;
+                }
+            }
+            "failed" => counts.needs_call += 1,
+            // A `running` row whose claim went stale (no progress for the
+            // live staleness window — W11.3/T3 unified definition) is no
+            // longer progressing: it needs a human call.
+            "running" if row.updated_at < now - stale_secs => {
+                counts.needs_call += 1;
+            }
+            "running" => counts.running += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+/// W9.2 plan line — `Some` iff the 24h window holds at least one row (zero
+/// rows ⇒ `None` ⇒ no line). Body format is spec-frozen:
+/// `{N} done overnight · {M} needs your call · {K} running` (all three
+/// segments always present).
+fn plan_line(rows: &[WorkflowPlanRow], plans_dir: &Path, now: i64) -> Option<BriefLine> {
+    if rows.is_empty() {
+        return None;
+    }
+    let c = count_plans(rows, plans_dir, now);
+    Some(BriefLine {
+        label: "plans",
+        body: format!(
+            "{} done overnight · {} needs your call · {} running",
+            c.done, c.needs_call, c.running
+        ),
+    })
+}
+
+/// W9.2 window fetch: `workflow_plans` rows touched at/after `cutoff`,
+/// newest first. Fail-open by contract — a missing `state.db` (cold or test
+/// home; the brief worker must never CREATE the daemon's database as a
+/// side effect) or any open/query error yields `None` with a `warn!`; the
+/// brief still succeeds, just without the plan line.
+async fn recent_plan_rows(db_path: &Path, cutoff: i64) -> Option<Vec<WorkflowPlanRow>> {
+    if !db_path.exists() {
+        return None;
+    }
+    let shared = SharedSqliteClient::new(db_path.to_path_buf());
+    let client = match shared.get().await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(error = %e, "morning-brief plan stats: state.db unavailable; plan line omitted");
+            return None;
+        }
+    };
+    match WorkflowRepo::new(&client).recent_plans(cutoff).await {
+        Ok(rows) => Some(rows),
+        Err(e) => {
+            warn!(error = %e, "morning-brief plan stats: query failed; plan line omitted");
+            None
+        }
     }
 }
 
@@ -281,7 +375,17 @@ impl MorningBriefWorker {
         let start = std::time::Instant::now();
         let date = ctx.now.format("%Y-%m-%d").to_string();
 
-        let lines = compose_brief(paths);
+        let mut lines = compose_brief(paths);
+        // W9.2 plan line — appended last (after the wisdom lines). Fail-open:
+        // a missing/unreadable state.db contributes no line and never fails
+        // the worker.
+        let now_ts = ctx.now.timestamp();
+        if let Some(rows) =
+            recent_plan_rows(&paths.data().join("state.db"), now_ts - PLAN_WINDOW_SECS).await
+            && let Some(line) = plan_line(&rows, &paths.wiki().join("wisdom").join("plans"), now_ts)
+        {
+            lines.push(line);
+        }
         let outbox = outbox_path(paths, &date);
         if let Some(parent) = outbox.parent()
             && let Err(e) = fs::create_dir_all(parent)
@@ -419,5 +523,223 @@ mod tests {
         assert!(!consumer_may_deliver(Sensitivity::Private, false));
         assert!(consumer_may_deliver(Sensitivity::Private, true));
         assert!(consumer_may_deliver(Sensitivity::Public, false));
+    }
+
+    // W9.2 plan line pins.
+
+    fn plan_row(
+        plan_id: &str,
+        name: Option<&str>,
+        status: &str,
+        updated_at: i64,
+    ) -> WorkflowPlanRow {
+        WorkflowPlanRow {
+            plan_id: plan_id.to_string(),
+            name: name.map(|s| s.to_string()),
+            status: status.to_string(),
+            spec_json: "{}".to_string(),
+            summary: None,
+            plan_approved: None,
+            delivery_ready: None,
+            owner: None,
+            created_at: updated_at - 60,
+            updated_at,
+        }
+    }
+
+    fn write_archive_page(plans_dir: &Path, plan_name: Option<&str>, plan_id: &str) {
+        let tasks = [zen_vault::distill::reflection::PlanArchiveTask {
+            id: "a",
+            agent: "Explore",
+            status: "completed",
+            response: "ok",
+        }];
+        let archive = zen_vault::distill::reflection::PlanArchive {
+            plan_name,
+            plan_id,
+            tasks: &tasks,
+            plan_approved: true,
+            delivery_ready: true,
+            duration_ms: 1,
+        };
+        zen_vault::distill::reflection::record_plan_archive(plans_dir, &archive).unwrap();
+    }
+
+    #[test]
+    fn zero_plans_emits_no_line() {
+        let (_dir, paths) = setup();
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        assert_eq!(plan_line(&[], &plans_dir, 10_000), None);
+    }
+
+    #[test]
+    fn completed_plan_with_page_counts_done() {
+        let (_dir, paths) = setup();
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        write_archive_page(&plans_dir, Some("Overnight Sweep"), "p-done");
+        let rows = [plan_row(
+            "p-done",
+            Some("Overnight Sweep"),
+            "completed",
+            9_000,
+        )];
+        let counts = count_plans(&rows, &plans_dir, 10_000);
+        assert_eq!(
+            counts,
+            PlanCounts {
+                done: 1,
+                needs_call: 0,
+                running: 0
+            }
+        );
+    }
+
+    #[test]
+    fn completed_plan_without_page_not_done() {
+        let (_dir, paths) = setup();
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        let rows = [plan_row(
+            "p-ghost",
+            Some("Never Archived"),
+            "completed",
+            9_000,
+        )];
+        assert_eq!(
+            count_plans(&rows, &plans_dir, 10_000),
+            PlanCounts::default(),
+            "F5 named reader: a completed row without its archived page counts nowhere"
+        );
+    }
+
+    #[test]
+    fn stale_owner_running_counts_as_needs_call() {
+        let (_dir, paths) = setup();
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        let now = 10_000;
+        let rows = [
+            // Claim stale: no progress for the live staleness window
+            // (W11.3/T3 — the same resolver count_plans uses).
+            plan_row(
+                "p-stale",
+                None,
+                "running",
+                now - zen_core::config::resolve_stale_claim_secs() - 1,
+            ),
+            // Fresh claim: still progressing.
+            plan_row("p-live", None, "running", now - 60),
+        ];
+        let counts = count_plans(&rows, &plans_dir, now);
+        assert_eq!(counts.needs_call, 1, "stale-owner running needs a call");
+        assert_eq!(counts.running, 1, "fresh running stays running");
+        assert_eq!(counts.done, 0);
+    }
+
+    #[test]
+    fn failed_counts_needs_call_and_cancelled_counts_nowhere() {
+        let (_dir, paths) = setup();
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        let rows = [
+            plan_row("p-fail", None, "failed", 9_000),
+            plan_row("p-cancel", None, "cancelled", 9_000),
+        ];
+        assert_eq!(
+            count_plans(&rows, &plans_dir, 10_000),
+            PlanCounts {
+                done: 0,
+                needs_call: 1,
+                running: 0
+            }
+        );
+    }
+
+    #[test]
+    fn plan_line_exact_format() {
+        let (_dir, paths) = setup();
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        write_archive_page(&plans_dir, Some("Good One"), "p-ok");
+        let now = 10_000;
+        let rows = [
+            plan_row("p-ok", Some("Good One"), "completed", 9_000),
+            plan_row("p-bad", None, "failed", 9_000),
+            plan_row("p-live", None, "running", now - 60),
+        ];
+        let line = plan_line(&rows, &plans_dir, now).unwrap();
+        assert_eq!(line.label, "plans");
+        assert_eq!(
+            line.body,
+            "1 done overnight · 1 needs your call · 1 running"
+        );
+        assert_eq!(
+            line.render(),
+            "plans: 1 done overnight · 1 needs your call · 1 running"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_state_db_emits_no_plan_line_and_brief_still_succeeds() {
+        let (_dir, paths) = setup();
+        assert!(!paths.data().join("state.db").exists());
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 9, 4, 9, 0, 0).unwrap();
+        let worker = MorningBriefWorker::new();
+        let report = worker
+            .execute_with_paths(&paths, &WorkerContext::new(now))
+            .await
+            .unwrap();
+        assert!(report.success);
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(outbox_path(&paths, "2026-09-04")).unwrap())
+                .unwrap();
+        let lines = payload["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 3, "no plan line without state.db");
+        assert!(!payload.to_string().contains("plans: "));
+    }
+
+    #[tokio::test]
+    async fn execute_stages_plan_line_from_state_db() {
+        let (_dir, paths) = setup();
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 9, 4, 9, 0, 0).unwrap();
+        let now_ts = now.timestamp();
+
+        let db_path = paths.data().join("state.db");
+        let client = zen_repo::SqliteClient::open(&db_path).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("p1", Some("Overnight Sweep"), "{}", now_ts - 200)
+            .await
+            .unwrap();
+        repo.complete_plan(
+            "p1",
+            "completed",
+            Some("done"),
+            Some(true),
+            Some(true),
+            now_ts - 100,
+        )
+        .await
+        .unwrap();
+        drop(client);
+
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        write_archive_page(&plans_dir, Some("Overnight Sweep"), "p1");
+
+        let worker = MorningBriefWorker::new();
+        let report = worker
+            .execute_with_paths(&paths, &WorkerContext::new(now))
+            .await
+            .unwrap();
+        assert!(report.success);
+        assert_eq!(report.fact_count, 4);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(outbox_path(&paths, "2026-09-04")).unwrap())
+                .unwrap();
+        let lines = payload["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 4, "wisdom trio + plan line");
+        assert_eq!(
+            lines[3].as_str().unwrap(),
+            "plans: 1 done overnight · 0 needs your call · 0 running"
+        );
+        // Real workflow history is personal: the plan line is not a
+        // placeholder sentinel, so the brief flips to Private.
+        assert_eq!(payload["sensitivity"], "Private");
     }
 }

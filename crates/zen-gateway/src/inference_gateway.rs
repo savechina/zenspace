@@ -112,14 +112,14 @@ impl ContinuousBatcher {
     pub fn add_request(&mut self, req: BatchedRequest) -> Option<Vec<BatchedRequest>> {
         self.pending.push(req);
         if self.pending.len() >= self.batch_size {
-            Some(self.pending.drain(..).collect())
+            Some(std::mem::take(&mut self.pending))
         } else {
             None
         }
     }
 
     pub fn flush(&mut self) -> Vec<BatchedRequest> {
-        self.pending.drain(..).collect()
+        std::mem::take(&mut self.pending)
     }
 
     pub fn pending_count(&self) -> usize {

@@ -3,6 +3,7 @@ pub mod aggregate_weights;
 pub mod completion_model;
 pub mod context;
 pub mod decision;
+pub mod delegate_background_tools;
 pub mod delegate_task;
 pub mod delegate_tools;
 pub mod execution;
@@ -11,7 +12,10 @@ pub mod intent;
 pub mod observability;
 pub mod orchestrator;
 pub mod output_schema;
+pub mod plan_control;
+pub mod plan_synthesis;
 pub mod plan_task;
+pub mod plan_todos;
 pub mod prompt;
 pub mod telemetry;
 

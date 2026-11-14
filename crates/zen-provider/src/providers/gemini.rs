@@ -1,8 +1,6 @@
 use rig_agent::AgentBuilder;
-use rig_agent::completion::Prompt;
-use rig_core::client::CompletionClient;
-use rig_core::completion::CompletionModel;
-use rig_core::providers::gemini;
+use rig_core::completion::CompletionRequest;
+use rig_core::providers::gemini::{Gemini, GeminiConfig};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -19,16 +17,20 @@ impl GeminiProvider {
         Self { api_key, model }
     }
 
+    /// rig 0.46: `.completion(name)` is the Gemini `generateContent` wire —
+    /// the direct successor of 0.42's `completion_model()`.
+    fn rig_client(&self) -> Gemini {
+        GeminiConfig::new(&self.api_key).client()
+    }
+
     pub async fn complete_async(
         &self,
         prompt: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<String, LlmError> {
-        let client = gemini::Client::new(&self.api_key).map_err(|e| LlmError::Call {
-            reason: format!("Failed to create Gemini client: {}", e),
-        })?;
+        let client = self.rig_client();
 
-        let model = client.completion_model(&self.model);
+        let model = client.completion(&self.model);
         let mut agent_builder = AgentBuilder::new(model);
         if let Some(t) = options.temperature {
             agent_builder = agent_builder.temperature(t);
@@ -42,12 +44,13 @@ impl GeminiProvider {
             reason: format!("Gemini completion failed: {}", e),
         })?;
 
+        let text = response.output();
         info!(
             model = self.model,
-            response_len = response.len(),
+            response_len = text.len(),
             "GeminiProvider complete"
         );
-        Ok(response)
+        Ok(text)
     }
 
     pub fn complete(
@@ -79,19 +82,17 @@ impl GeminiProvider {
         prompt: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<UsedCompletion, LlmError> {
-        let client = gemini::Client::new(&self.api_key).map_err(|e| LlmError::Call {
-            reason: format!("Failed to create Gemini client: {}", e),
-        })?;
+        let client = self.rig_client();
 
-        let model = client.completion_model(&self.model);
-        let mut request = model.completion_request(prompt);
+        let model = client.completion(&self.model);
+        let mut request = CompletionRequest::new(prompt);
         if let Some(t) = options.temperature {
             request = request.temperature(t);
         }
         if let Some(m) = options.max_tokens {
             request = request.max_tokens(m);
         }
-        let response = request.send().await.map_err(|e| LlmError::Call {
+        let response = model.call(request).await.map_err(|e| LlmError::Call {
             reason: format!("Gemini completion failed: {}", e),
         })?;
 

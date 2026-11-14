@@ -154,6 +154,9 @@ impl HttpDispatchSession {
     pub(crate) async fn open(service: &Arc<crate::GatewayService>) -> anyhow::Result<Self> {
         let (tx, mut rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_CAPACITY);
         let conn = Arc::new(ClientConnection::new(tx));
+        // W8.2: the HTTP carrier serves plain-text surfaces (qqbot bridge,
+        // external API clients) — plan-result blocks render as lines.
+        conn.set_plain_text_surface();
         service.register_connection(Arc::clone(&conn)).await;
         let conn_id = conn.id.clone();
 

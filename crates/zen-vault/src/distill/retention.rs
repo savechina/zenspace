@@ -349,6 +349,18 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 recursive: false,
             },
         },
+        // record_plan_archive (SC-010) writes one success page per plan —
+        // the same 90d window as the rewind twin; the workflow_plans row
+        // remains the machine ledger.
+        Policy {
+            home: "vault/wiki/wisdom/plans",
+            root: paths.wiki().join("wisdom/plans"),
+            action: Action::DeleteOlder {
+                pattern: Some("*.md"),
+                days: 90,
+                recursive: false,
+            },
+        },
         // zen-core PromptAuditLogger appends one line per screened prompt
         // (safety sanitization audit) — append-only, unbounded.
         Policy {

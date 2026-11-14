@@ -25,6 +25,10 @@ async fn plan_lifecycle_and_task_checkpoints_round_trip() {
         response: Some("done"),
         error: None,
         now: 1001,
+
+        model: None,
+        duration_ms: None,
+        cost_usd: None,
     })
     .await
     .unwrap();
@@ -36,6 +40,10 @@ async fn plan_lifecycle_and_task_checkpoints_round_trip() {
         response: None,
         error: None,
         now: 1002,
+
+        model: None,
+        duration_ms: None,
+        cost_usd: None,
     })
     .await
     .unwrap();
@@ -84,6 +92,10 @@ async fn checkpoint_upsert_is_idempotent_per_task() {
         response: None,
         error: None,
         now: 1001,
+
+        model: None,
+        duration_ms: None,
+        cost_usd: None,
     })
     .await
     .unwrap();
@@ -95,6 +107,10 @@ async fn checkpoint_upsert_is_idempotent_per_task() {
         response: Some("redone"),
         error: None,
         now: 1002,
+
+        model: None,
+        duration_ms: None,
+        cost_usd: None,
     })
     .await
     .unwrap();

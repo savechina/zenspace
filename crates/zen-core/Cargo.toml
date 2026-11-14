@@ -27,6 +27,9 @@ libc = { workspace = true }
 url = { workspace = true }
 rusqlite = { workspace = true }
 fs2 = { workspace = true }
+# D30 TurnContext task-local (task_local! needs no tokio features; the
+# workspace graph already compiles tokio-full, so this is layering-only).
+tokio = { workspace = true }
 
 [features]
 # Test-only (T111/T118): makes `user_root()` read ZEN_HOME fresh on every
@@ -38,7 +41,6 @@ fs2 = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-tokio = { workspace = true }
 tempfile = { workspace = true }
 # Verus (bbtree Guard-3 Wave B): ghost/proof layer lives in tests/
 # (formal_placeholder.rs mounts the REAL src file via #[path]) — test

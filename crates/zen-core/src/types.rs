@@ -606,6 +606,37 @@ pub fn session_created_at_from_id(session_id: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(secs as i64, nanos)
 }
 
+/// Validate a client-supplied session id (spec D31, SDD review F2).
+///
+/// Session ids flow into filesystem paths (`sessions().join(id)`) and SQL
+/// marker matches, so they are untrusted input: the charset is
+/// `[A-Za-z0-9_-]` and the length cap is 128. UUIDv7, `"local"`, and
+/// qqbot-derived ids all satisfy this shape byte-identically.
+///
+/// # Errors
+///
+/// Returns a human-readable rejection reason when the id is empty, longer
+/// than 128 chars, or carries any character outside the charset (including
+/// path separators, `..` traversal components, and LIKE wildcards).
+pub fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty() {
+        return Err("sessionId must not be empty".to_string());
+    }
+    if session_id.len() > 128 {
+        return Err("sessionId exceeds 128 characters".to_string());
+    }
+    if !session_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(
+            "sessionId may only contain letters, digits, '_' and '-' (no path separators or wildcards)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ComplexityLevel & Task (FR-AGENT-004)
 // ---------------------------------------------------------------------------
@@ -711,6 +742,23 @@ pub struct SessionContext {
     pub conversation: Vec<Message>,
     /// Token budget for this session
     pub max_tokens: usize,
+    /// W8.2 rendering for deterministic plan-result blocks — chosen by
+    /// the gateway per surface (UDS connections render tables, the HTTP
+    /// carrier emits plain-text lines for qqbot/external clients).
+    #[serde(default)]
+    pub plan_result_format: PlanResultFormat,
+}
+
+/// W8.2: one builder, two renderings of the `Plan result` block — a
+/// markdown table for surfaces that render markdown (TUI/zen chat) and
+/// aligned plain-text lines for text-only surfaces (qqbot/HTTP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PlanResultFormat {
+    /// Markdown table (TUI renderer supports tables).
+    #[default]
+    MarkdownTable,
+    /// Aligned `- [ok] id · agent · summary` lines; never raw table pipes.
+    PlainText,
 }
 
 /// A note retrieved from the knowledge base during session context assembly.
@@ -832,6 +880,7 @@ impl SessionContext {
             sensitivity_policy: Sensitivity::Public,
             conversation: Vec::new(),
             max_tokens: 4096,
+            plan_result_format: PlanResultFormat::default(),
         }
     }
 
@@ -1142,5 +1191,29 @@ mod tests {
             all.iter().any(|s| s.id == session.id),
             "repaired session should be in list"
         );
+    }
+
+    /// W11.2/T2 (D31): legitimate session-id shapes pass byte-identically.
+    #[test]
+    fn validate_session_id_accepts_legitimate_shapes() {
+        assert!(validate_session_id("local").is_ok());
+        assert!(validate_session_id(&Uuid::now_v7().to_string()).is_ok());
+        assert!(validate_session_id("qqbot_12345-abc").is_ok());
+        assert!(validate_session_id(&"a".repeat(128)).is_ok());
+    }
+
+    /// W11.2/T2 (D31/F2): traversal, wildcard, separator, and oversize ids
+    /// are rejected — they flow into filesystem paths and SQL markers.
+    #[test]
+    fn validate_session_id_rejects_traversal_wildcard_oversize() {
+        assert!(validate_session_id("").is_err(), "empty");
+        assert!(validate_session_id("../escape").is_err(), "traversal");
+        assert!(validate_session_id("a/b").is_err(), "path separator");
+        assert!(validate_session_id("a\\b").is_err(), "backslash");
+        assert!(validate_session_id("s%1").is_err(), "LIKE wildcard");
+        assert!(validate_session_id("s_1").is_ok(), "underscore is allowed");
+        assert!(validate_session_id("a b").is_err(), "space");
+        assert!(validate_session_id("a.b").is_err(), "dot");
+        assert!(validate_session_id(&"a".repeat(129)).is_err(), "oversize");
     }
 }

@@ -16,11 +16,12 @@ use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
 use rig_compose::normalizer::dispatch_tool_invocations_with_hooks;
 use rig_compose::tool::{Tool, ToolSchema};
 use tracing::{info, warn};
+use zen_core::config::LlmPreference;
 use zen_core::types::{RetrievedNote, Sensitivity, SessionContext};
 use zen_provider::DefaultRouter;
 
 use crate::AgentContext;
-use crate::agent_profile::Role;
+use crate::agent_profile::{AgentProfile, Role};
 use crate::delegate_tools;
 use crate::executor::AgentExecutor;
 use crate::registry::{AgentRegistry, DefaultAgentRegistry};
@@ -59,6 +60,179 @@ pub type SharedSensitivity = Arc<Mutex<Sensitivity>>;
 /// depth-budgeted truncation into the sub-agent's `SessionContext`. Same
 /// last-writer-wins mirror semantics as the sensitivity cell.
 pub type SharedKnowledge = Arc<Mutex<Vec<RetrievedNote>>>;
+
+/// D25 SC-024 (background narrowing): the enumerated grant-reduction list
+/// applied to `background: true` admissions — the target agent's grants
+/// MINUS these five, so the same agent definition resolves to a smaller
+/// toolset behind the flag (Claude Code background filtering precedent).
+/// Delegate/plan tools stay stripped at the depth cap as before; this list
+/// is the spec, the admission-time grant test is the pin.
+pub const BACKGROUND_NARROWED_TOOLS: [&str; 5] = [
+    "fs.delete",
+    "fs.move",
+    "fs.copy",
+    "shell.exec",
+    "shell.kill",
+];
+
+/// One mirrored parent-conversation entry (D25 SC-021 `history` fork).
+/// The orchestrator refreshes the shared cell at every turn entry (same
+/// last-writer-wins semantics as `propagate_sensitivity`); composition
+/// strips tool-call noise per A1 before the sub-session inherits it.
+/// D30: the mirrored parent-conversation entry now lives in zen-core so the
+/// turn-scoped task-local can carry it (zen-plugin hooks read the same
+/// module). Re-exported here for the orchestrator's propagation site.
+pub use zen_core::turn_context::ParentHistoryMessage;
+
+pub type SharedHistory = Arc<Mutex<Vec<ParentHistoryMessage>>>;
+
+/// Per-task context fork mode (D25 SC-021, codex `fork_turns` precedent):
+/// `none` = empty context (byte-identical to the gate-closed path),
+/// `knowledge` = today's gate-ON inheritance path (per-task addressable),
+/// `history` = knowledge PLUS the stripped parent conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkMode {
+    None,
+    Knowledge,
+    History,
+}
+
+impl ForkMode {
+    /// Parse the model-supplied `fork_mode` argument.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "knowledge" => Ok(Self::Knowledge),
+            "history" => Ok(Self::History),
+            other => Err(format!(
+                "invalid fork_mode \"{other}\": expected none|knowledge|history"
+            )),
+        }
+    }
+
+    /// Lowercase label for audit/payload surfaces.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Knowledge => "knowledge",
+            Self::History => "history",
+        }
+    }
+}
+
+/// Per-task model hint resolution outcome (D25 SC-022): additive
+/// `model_source` falsifiability on `loop.delegate.outcome` and result
+/// payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    /// AgentProfile.llm_preferences won over the hint (sensitivity >
+    /// preference > hint).
+    Profile,
+    /// The hint steered the sub-agent (profile had no preference).
+    Hint,
+    /// No hint and no profile preference: routing default.
+    Default,
+}
+
+impl ModelSource {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Profile => "profile",
+            Self::Hint => "hint",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// One background-admission hold (W5.2, spec 006 D20 §8/D11-A): the armed
+/// token reservation from the parent turn's pool. Dropping it refunds the
+/// estimate (rig-compose `TokenReservation` refund-on-drop) — the refund
+/// path for collect/fail/kill/expiry is exactly that drop.
+pub(crate) struct BackgroundHolding {
+    /// The sub-turn budget default estimate, reserved at admission from the
+    /// same per-turn pool the blocking path uses. Dropped (⇒ refunded) when
+    /// the task reaches an observed terminal state.
+    pub(crate) _reservation: rig_compose::budget::TokenReservation,
+    /// Model hint resolution (`None` = no hint given) — surfaced read-only
+    /// by the W5.4 notice drain (`peek_model_source`); every other
+    /// admission fact (agent/task_index/session/status/result) lives
+    /// canonically in the registry entry + meta schema, so the holding
+    /// carries only what the registry cannot.
+    pub(crate) model_source: Option<ModelSource>,
+}
+
+/// Outlives-turn bookkeeping for background delegate admissions. Held by
+/// the tool (an `Arc` shared across rounds), so a reservation never bills
+/// against a turn that already returned and reconciled (D20 §8).
+#[derive(Clone, Default)]
+pub struct BackgroundBook(Arc<Mutex<HashMap<String, BackgroundHolding>>>);
+
+impl BackgroundBook {
+    /// Insert an admission hold. `pub(crate)`: the orchestrator test suite
+    /// seeds synthetic holds for notice-parity pins (W5.4).
+    pub(crate) fn insert(&self, task_id: String, holding: BackgroundHolding) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id, holding);
+    }
+
+    /// Release the hold for `task_id` (refund via drop). `None` when the id
+    /// is not a background delegate admission (e.g. a `shell.exec` task).
+    pub(crate) fn release(&self, task_id: &str) -> Option<BackgroundHolding> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(task_id)
+    }
+
+    /// A clone sharing the same underlying map — the collect/kill tools
+    /// observe and release the SAME holds the admission pass created
+    /// (W5.3). Cheap: one `Arc` bump.
+    #[must_use]
+    pub fn share(&self) -> BackgroundBook {
+        self.clone()
+    }
+
+    /// Read-only peek of an admission's resolved model source (W5.4 notice
+    /// parity) — unlike [`release`] this never refunds; the reservation is
+    /// still released by collect/kill/sweep.
+    #[must_use]
+    pub(crate) fn peek_model_source(&self, task_id: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(task_id)
+            .and_then(|h| h.model_source)
+            .map(|m| m.as_str().to_string())
+    }
+
+    /// Lazy sweep: release holds whose registry entry reached a terminal
+    /// state (expiry/failure paths this tool does not otherwise observe).
+    /// Called on every background admission AND at the round-boundary
+    /// notice drain (W11.16/T17 — expired holds release promptly, not
+    /// lazily at the next admission). Cheap (≤ live-task count).
+    pub(crate) fn sweep_terminal(&self) {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ids: Vec<String> = map
+            .keys()
+            .filter(|id| {
+                zen_plugin::task_registry::registry()
+                    .snapshot(id)
+                    .is_some_and(|s| s.status.is_terminal())
+            })
+            .cloned()
+            .collect();
+        for id in ids {
+            map.remove(&id); // drop ⇒ armed refund
+        }
+    }
+}
 
 /// One sub-agent's inherited context (Phase 31 T215, design F3-D1). The
 /// single contract carried across the delegation seam — prompt-string
@@ -121,6 +295,10 @@ pub struct DelegateTaskTool {
     memvid_store: Option<MemvidStore>,
     sensitivity: SharedSensitivity,
     knowledge: SharedKnowledge,
+    /// D25 SC-021 `history` fork source: parent-conversation mirror
+    /// refreshed by the orchestrator at every turn entry (last-writer-wins,
+    /// `propagate_knowledge` precedent).
+    history: SharedHistory,
     token_budget: Arc<AtomicTokenBudget>,
     timeout: Duration,
     max_depth: u32,
@@ -128,6 +306,29 @@ pub struct DelegateTaskTool {
     skill_router: SkillHitRouter,
     /// D10 per-agent accuracy weights (empty = cold start ⇒ uniform).
     weights: HashMap<String, f32>,
+    /// W5.2 background-admission bookkeeping (outlives turns — the tool is
+    /// an Arc shared across rounds): per-task token-reservation holds and
+    /// admission metadata, keyed by registry task id. Released (refund =
+    /// the armed reservation drop) on collect/fail/kill/expiry observation.
+    background: BackgroundBook,
+    /// Self-Arc cell (set by the constructor site BEFORE registry
+    /// insertion): the background future must be 'static for
+    /// `tokio::spawn`, and the `Tool::invoke(&self)` signature cannot
+    /// clone `Arc<Self>` from `&self` — the registered-by-construction
+    /// self reference closes that gap. The cycle is process-lifetime by
+    /// design (the tool registry already holds the Arc forever).
+    self_arc: std::sync::OnceLock<Arc<DelegateTaskTool>>,
+    /// G-13 (SC-001/SC-002) wave instrumentation: ordered `(agent, event)`
+    /// log, in-flight counter + peak, and per-agent test delays. Compiled
+    /// only for unit tests; zero production footprint.
+    #[cfg(test)]
+    test_wave_log: std::sync::Mutex<Vec<(String, &'static str)>>,
+    #[cfg(test)]
+    test_in_flight: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    test_peak_in_flight: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    test_wave_delays: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl DelegateTaskTool {
@@ -139,6 +340,7 @@ impl DelegateTaskTool {
         memvid_store: Option<MemvidStore>,
         sensitivity: SharedSensitivity,
         knowledge: SharedKnowledge,
+        history: SharedHistory,
         token_budget: Arc<AtomicTokenBudget>,
         timeout: Duration,
         max_depth: u32,
@@ -152,13 +354,38 @@ impl DelegateTaskTool {
             memvid_store,
             sensitivity,
             knowledge,
+            history,
             token_budget,
             timeout,
             max_depth,
             max_concurrent,
             skill_router: SkillHitRouter::new(),
             weights: HashMap::new(),
+            background: BackgroundBook::default(),
+            self_arc: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            test_wave_log: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_peak_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_wave_delays: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Constructor-site hook: capture `Arc<Self>` before registry
+    /// insertion so `invoke_background` can move an owned clone into the
+    /// spawned future (see the `self_arc` field doc).
+    pub fn set_self_arc(&self, arc: Arc<DelegateTaskTool>) {
+        let _ = self.self_arc.set(arc);
+    }
+
+    /// A clone of this tool's background book sharing the same underlying
+    /// hold map — the `delegate.collect`/`delegate.kill` tools (W5.3) use
+    /// it to release (⇒ refund) the admission holds they observe.
+    pub fn background_book(&self) -> BackgroundBook {
+        self.background.share()
     }
 
     /// Inject D10 per-agent aggregation weights. An empty map (the default)
@@ -166,6 +393,50 @@ impl DelegateTaskTool {
     pub fn with_weights(mut self, weights: HashMap<String, f32>) -> Self {
         self.weights = weights;
         self
+    }
+
+    /// G-13 wave instrumentation (test-only): append to the ordered
+    /// `(agent, event)` log — `enter` / `exit`.
+    #[cfg(test)]
+    fn test_log_wave_event(&self, agent: &str, event: &'static str) {
+        self.test_wave_log
+            .lock()
+            .unwrap()
+            .push((agent.to_string(), event));
+    }
+
+    /// G-13 (test-only): the per-agent hold injected via
+    /// `inject_test_wave_delay`, or `None`.
+    #[cfg(test)]
+    fn test_wave_delay(&self, agent: &str) -> Option<std::time::Duration> {
+        let millis = *self.test_wave_delays.lock().unwrap().get(agent)?;
+        Some(std::time::Duration::from_millis(millis))
+    }
+
+    /// G-13 test seam: hold each fan-out run of `agent` for `millis` after
+    /// its enter event, so width-2 wave siblings observably overlap
+    /// (SC-001). `tokio::time::sleep` always pends on first poll, so the
+    /// overlap is structural, not a timing race.
+    #[cfg(test)]
+    pub(crate) fn inject_test_wave_delay(&self, agent: &str, millis: u64) {
+        self.test_wave_delays
+            .lock()
+            .unwrap()
+            .insert(agent.to_string(), millis);
+    }
+
+    /// G-13 (test-only): snapshot of the ordered wave event log.
+    #[cfg(test)]
+    pub(crate) fn test_wave_events(&self) -> Vec<(String, &'static str)> {
+        self.test_wave_log.lock().unwrap().clone()
+    }
+
+    /// G-13 (test-only): peak in-flight sub-task concurrency observed
+    /// across the whole fan-out (SC-001 evidence; never derived from time).
+    #[cfg(test)]
+    pub(crate) fn test_peak_in_flight(&self) -> usize {
+        self.test_peak_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 001 arch A.1 spawn-hierarchy rules: Orchestrator(L0) may spawn
@@ -216,6 +487,19 @@ impl DelegateTaskTool {
         agent_name: &str,
         allow_child_delegation: bool,
     ) -> anyhow::Result<ZenAgent> {
+        self.build_sub_agent_with_grants(agent_name, allow_child_delegation, false)
+    }
+
+    /// W5.2 (SC-024): build the sub-agent with the background narrowing
+    /// applied — the target agent's grants minus
+    /// [`BACKGROUND_NARROWED_TOOLS`]. Only background admissions may set
+    /// `narrowed`; the blocking path's toolset is untouched (pin).
+    fn build_sub_agent_with_grants(
+        &self,
+        agent_name: &str,
+        allow_child_delegation: bool,
+        narrowed: bool,
+    ) -> anyhow::Result<ZenAgent> {
         let skills = delegate_tools::resolve_skill_ids_for_agent(agent_name);
         let mut tools: Vec<String> = delegate_tools::resolve_agent_tool_grants(
             agent_name,
@@ -228,6 +512,9 @@ impl DelegateTaskTool {
             tools.retain(|name| !name.starts_with("delegate."));
         }
         tools.retain(|name| name != crate::plan_task::PLAN_TOOL_NAME);
+        if narrowed {
+            tools.retain(|name| !BACKGROUND_NARROWED_TOOLS.contains(&name.as_str()));
+        }
 
         let mut builder = ZenAgent::builder(agent_name);
         for skill_id in &skills {
@@ -274,6 +561,14 @@ impl DelegateTaskTool {
                 let Some(prompt) = item.get("prompt").and_then(|v| v.as_str()) else {
                     return Err("each tasks[] item requires a \"prompt\" string".to_string());
                 };
+                let fork_mode = match item.get("fork_mode") {
+                    None => None,
+                    Some(v) => Some(ForkMode::parse(
+                        v.as_str()
+                            .ok_or("fork_mode must be a string (none|knowledge|history)")?,
+                    )?),
+                };
+                let model_hint = optional_nonempty_string(item, "model")?;
                 tasks.push(ParsedDelegate {
                     request: DelegateRequest {
                         agent: agent.to_string(),
@@ -287,6 +582,8 @@ impl DelegateTaskTool {
                             .and_then(|v| v.as_bool())
                             .unwrap_or(true),
                         artifact: optional_nonempty_string(item, "artifact")?,
+                        fork_mode,
+                        model_hint,
                     },
                     contract: DelegateContract {
                         output_format: optional_nonempty_string(item, "output_format")?,
@@ -320,6 +617,14 @@ impl DelegateTaskTool {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true),
                 artifact: optional_nonempty_string(args, "artifact")?,
+                fork_mode: match args.get("fork_mode") {
+                    None => None,
+                    Some(v) => Some(ForkMode::parse(
+                        v.as_str()
+                            .ok_or("fork_mode must be a string (none|knowledge|history)")?,
+                    )?),
+                },
+                model_hint: optional_nonempty_string(args, "model")?,
             },
             contract: DelegateContract {
                 output_format: optional_nonempty_string(args, "output_format")?,
@@ -332,9 +637,23 @@ impl DelegateTaskTool {
     /// independent = model-declared; consumer_decision = the parent can
     /// digest the batch width; bounded = self-contained prompt under the
     /// hard limit; worth_it = context spend below the advisory line.
+    ///
+    /// I2 (G-14): the `bounded` field here is INFORMATIONAL ONLY. The single
+    /// enforcement site for the bounded-prompt limit is `validate_task` (its
+    /// hard `prompt.len() > BOUNDED_PROMPT_CHARS` check) — never re-check
+    /// `bounded` to reject a task. The field survives because the
+    /// `loop.delegate.gates` audit line reports the advisory truth and
+    /// existing consumers keep parsing it.
+    ///
+    /// I3 (G-15): `consumer_decision` uses an INDEPENDENT advisory threshold
+    /// (literal 4), deliberately NOT bound to `max_concurrent` — see the
+    /// inline comment at the field.
     fn evaluate_gates(task: &DelegateRequest, batch_width: usize) -> GateReport {
         GateReport {
             independent: task.independent,
+            // I3 (G-15): INDEPENDENT advisory threshold. Deliberately NOT
+            // bound to `max_concurrent`: waves never exceed `max_concurrent`,
+            // so tying this literal to it would make the gate tautological.
             consumer_decision: batch_width <= 4,
             bounded: task.prompt.len() <= BOUNDED_PROMPT_CHARS,
             worth_it: (task.prompt.len() / 4 + 1024) as u64 <= ADVISORY_TOKEN_LINE,
@@ -409,10 +728,53 @@ impl DelegateTaskTool {
     /// plan-quality gate reuses it so plan reviews classify under the
     /// same policy as turn reviews.
     pub(crate) fn current_sensitivity(&self) -> Sensitivity {
-        *self
-            .sensitivity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.turn_sensitivity()
+    }
+
+    /// D30 turn-scoped sensitivity: the TurnContext task-local FIRST (race-
+    /// free under concurrent hosted sessions), shared cell as the documented
+    /// non-turn fallback (scheduler workers / direct tool invocation).
+    fn turn_sensitivity(&self) -> Sensitivity {
+        zen_core::turn_context::current_sensitivity().unwrap_or_else(|| {
+            *self
+                .sensitivity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
+    }
+
+    /// D30 turn-scoped knowledge snapshot (same precedence as
+    /// [`Self::turn_sensitivity`]; clone cost matches the cell snapshot).
+    fn turn_knowledge(&self) -> Vec<RetrievedNote> {
+        zen_core::turn_context::current_knowledge().unwrap_or_else(|| {
+            self.knowledge
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+    }
+
+    /// D30 turn-scoped parent-conversation snapshot (same precedence).
+    fn turn_history(&self) -> Vec<ParentHistoryMessage> {
+        zen_core::turn_context::current_history().unwrap_or_else(|| {
+            self.history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+    }
+
+    /// D30 background-admission capture: snapshot the ambient turn context
+    /// SYNCHRONOUSLY (task-locals do not cross `tokio::spawn`). Outside any
+    /// turn scope the shared cells are snapshotted instead — the documented
+    /// non-turn fallback, captured at admission so later cell overwrites
+    /// cannot retroactively change an in-flight background sub-turn.
+    fn capture_turn_context(&self) -> zen_core::turn_context::TurnContext {
+        zen_core::turn_context::current().unwrap_or_else(|| zen_core::turn_context::TurnContext {
+            sensitivity: self.turn_sensitivity(),
+            knowledge: self.turn_knowledge(),
+            history: self.turn_history(),
+        })
     }
 
     /// One `loop.delegate.gates` line in `<logs>/audit.jsonl`.
@@ -543,10 +905,7 @@ impl DelegateTaskTool {
         prompt: &str,
         depth: u32,
     ) -> (SessionContext, SubAgentContext) {
-        let sensitivity = *self
-            .sensitivity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sensitivity = self.turn_sensitivity();
         let mut session = SessionContext::new(agent_name.to_string(), String::new());
         session.sensitivity_policy = sensitivity;
         let Some(base_budget) = inheritance_budget_chars() else {
@@ -561,11 +920,7 @@ impl DelegateTaskTool {
         };
         let budget_chars =
             (base_budget >> depth.min(31)).max(zen_core::config::KNOWLEDGE_BUDGET_CHARS_MIN);
-        let snapshot = self
-            .knowledge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let snapshot = self.turn_knowledge();
         let (knowledge, _) = crate::orchestrator::truncate_notes_to_budget(snapshot, budget_chars);
         session.knowledge = knowledge.clone();
         let skill_hits =
@@ -583,6 +938,395 @@ impl DelegateTaskTool {
         )
     }
 
+    /// D25 SC-021 per-task fork composition. `None` (argument absent)
+    /// delegates to the session-wide `[agentic.delegate]
+    /// context_inheritance` default — byte-identical to the pre-D25 path.
+    /// `history` = knowledge fork PLUS the mirrored parent conversation
+    /// (user/developer + assistant prose; tool-call noise stripped — A1's
+    /// load-bearing detail) injected into the session's conversation.
+    fn compose_sub_session_forked(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        depth: u32,
+        fork_mode: Option<ForkMode>,
+    ) -> (SessionContext, SubAgentContext) {
+        let resolved = fork_mode.unwrap_or_else(|| {
+            if inheritance_budget_chars().is_some() {
+                ForkMode::Knowledge
+            } else {
+                ForkMode::None
+            }
+        });
+        match resolved {
+            ForkMode::None => {
+                // Gate-closed path: empty knowledge, no history.
+                let sensitivity = self.turn_sensitivity();
+                let mut session = SessionContext::new(agent_name.to_string(), String::new());
+                session.sensitivity_policy = sensitivity;
+                (
+                    session,
+                    SubAgentContext {
+                        knowledge: Vec::new(),
+                        skill_hits: Vec::new(),
+                        budget_chars: 0,
+                    },
+                )
+            }
+            ForkMode::Knowledge => self.compose_sub_session(agent_name, prompt, depth),
+            ForkMode::History => {
+                let (mut session, sub) = self.compose_sub_session(agent_name, prompt, depth);
+                let parent = self.turn_history();
+                for entry in parent {
+                    // Defensive re-strip: the mirror already strips at
+                    // propagation; composition must not trust producers.
+                    let content = crate::orchestrator::strip_fenced_tool_blocks(&entry.content);
+                    if content.trim().is_empty() {
+                        continue;
+                    }
+                    let role = match entry.role.as_str() {
+                        "user" => zen_core::types::MessageRole::User,
+                        "assistant" => zen_core::types::MessageRole::Assistant,
+                        _ => continue,
+                    };
+                    session.conversation.push(zen_core::types::Message {
+                        role,
+                        content,
+                        timestamp: None,
+                    });
+                }
+                (session, sub)
+            }
+        }
+    }
+
+    /// D25 SC-022 model-hint resolution: `sensitivity > LlmPreference >
+    /// hint > default`. Returns the source label for the additive
+    /// `model_source` falsifiability field. The hint is catalog-validated
+    /// at admission (unknown names rejected), and a profile with any
+    /// explicit preference wins over it. Honest scope note: the hint's
+    /// RUNTIME model override rides the recorded D2b follow-up (the
+    /// router's `preferred_model` plumbing — per-provider插管 was already
+    /// deferred there); this wave delivers validation, resolution order,
+    /// and the falsifiable source label, mirroring that precedent's
+    /// documentation discipline.
+    fn resolve_model_hint(
+        &self,
+        hint: Option<&str>,
+        profile: Option<&AgentProfile>,
+    ) -> ModelSource {
+        let has_explicit_preference = profile.is_some_and(|p| {
+            p.llm_preferences
+                .iter()
+                .any(|pref| !matches!(pref, LlmPreference::Any))
+        });
+        if has_explicit_preference {
+            ModelSource::Profile
+        } else if hint.is_some() {
+            ModelSource::Hint
+        } else {
+            ModelSource::Default
+        }
+    }
+
+    /// D25 SC-022: the configured model catalog (5-layer config,
+    /// `[providers.*] models` keys). `None` when config cannot load — the
+    /// admission then rejects hints (fail-closed) rather than accepting
+    /// unknown names.
+    fn model_catalog() -> Option<std::collections::HashSet<String>> {
+        let config = zen_core::config::load_config().ok()?;
+        let mut names = std::collections::HashSet::new();
+        for provider in config.providers.values() {
+            for key in provider.models.keys() {
+                names.insert(key.clone());
+            }
+        }
+        Some(names)
+    }
+
+    /// D25 SC-022 admission validation: catalog-validated hint, ≤5
+    /// distinct hints per batch.
+    fn validate_model_hints(tasks: &[ParsedDelegate]) -> Result<(), String> {
+        let hints: Vec<String> = tasks
+            .iter()
+            .filter_map(|t| t.request.model_hint.clone())
+            .collect();
+        Self::validate_model_hint_values(&hints)
+    }
+
+    /// Shared SC-022 hint-set validation (W11.5/T5): ≤5 distinct hints per
+    /// batch, each in the configured provider catalog. Reused by the
+    /// `plan.execute` parse path so plan and delegate batches enforce ONE
+    /// rule (Constitution XI — no second validator).
+    pub(crate) fn validate_model_hint_values(hints: &[String]) -> Result<(), String> {
+        let mut distinct = std::collections::HashSet::new();
+        for hint in hints {
+            distinct.insert(hint.clone());
+        }
+        if distinct.len() > MODEL_HINT_MAX_DISTINCT {
+            return Err(format!(
+                "batch declares {} distinct model hints; at most {MODEL_HINT_MAX_DISTINCT} are allowed",
+                distinct.len()
+            ));
+        }
+        let Some(catalog) = Self::model_catalog() else {
+            return Err(
+                "model hint rejected: provider catalog unavailable (config load failed)"
+                    .to_string(),
+            );
+        };
+        for hint in &distinct {
+            if !catalog.contains(hint) {
+                return Err(format!(
+                    "unknown model hint \"{hint}\": not in the configured provider catalog"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// W5.2 (D20 §1): the `background: true` admission path. Hard
+    /// `validate_task` + advisory `evaluate_gates` have ALREADY run (the
+    /// same shared pass as the blocking path); this admits each runnable
+    /// task to the task registry and returns immediately — the parent
+    /// round never waits on a sub-turn.
+    ///
+    /// Admission gates, in order: model-hint validation (SC-022), the
+    /// per-turn token reserve (D11-A — insufficient budget is a structured
+    /// rejection), then the registry's atomic concurrency gate. Depth was
+    /// resolved by the shared validate pass (parent depth + 1) and the
+    /// narrowed grant set is applied at sub-agent construction (SC-024);
+    /// `SESSION_SCOPE` is read synchronously here because task-locals do
+    /// not cross `tokio::spawn` (the APPROVAL_TURN precedent).
+    async fn invoke_background(
+        &self,
+        tasks: &[ParsedDelegate],
+        depth: u32,
+        parent: &str,
+    ) -> Result<serde_json::Value, rig_compose::registry::KernelError> {
+        Self::validate_model_hints(tasks).map_err(|e| {
+            rig_compose::registry::KernelError::InvalidArgument(format!(
+                "background admission rejected: {e}"
+            ))
+        })?;
+
+        let owned = Arc::clone(
+            self.self_arc
+                .get()
+                .ok_or_else(|| {
+                    rig_compose::registry::KernelError::InvalidArgument(
+                        "background admission rejected: delegate tool self-arc not wired                          (constructor must call set_self_arc before registration)"
+                            .to_string(),
+                    )
+                })?,
+        );
+        let session_id = zen_plugin::task_registry::current_session_scope();
+        let limits = self.background_limits();
+
+        let mut admitted: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+        let mut task_ids: Vec<String> = Vec::with_capacity(tasks.len());
+
+        for (i, task) in tasks.iter().enumerate() {
+            // Rejections carry slot order (task_index) exactly like the
+            // blocking path — re-attributable by consumers.
+            let rejected = self.validate_task(parent, depth, &task.request);
+            if let Some(error) = rejected {
+                admitted.push(serde_json::json!({
+                    "task_index": i,
+                    "agent": task.request.agent,
+                    "error": error,
+                    "background": true,
+                }));
+                continue;
+            }
+
+            let fork_mode = task.request.fork_mode;
+            let profile = self
+                .registry
+                .find_by_name(&task.request.agent)
+                .ok()
+                .cloned();
+            let model_source =
+                self.resolve_model_hint(task.request.model_hint.as_deref(), profile.as_ref());
+
+            // Compose BEFORE the reserve (W11.16/T17, OV-6): the composed
+            // context moves into the spawned future, and composing first
+            // lets the admission estimate include the inherited chars the
+            // sub-turn will actually carry (SC-021 additive clause). Depth
+            // resolved at admission; grants narrow inside the future via
+            // the BACKGROUND_TASK scope.
+            let (session, sub) = self.compose_sub_session_forked(
+                &task.request.agent,
+                &task.request.prompt,
+                depth,
+                fork_mode,
+            );
+
+            // Admission token reserve (D11-A): estimate = the delegate
+            // sub-turn budget default shape (prompt/4 + 1024) PLUS
+            // inherited_chars/4 (W11.16/T17 — the same bytes→tokens divisor
+            // as run_single_composed's runtime re-reserve, so the admission
+            // hold is honest about inherited knowledge). Held by
+            // BackgroundBook until collect/fail/kill/expiry — never billed
+            // against a turn that already returned.
+            let estimate =
+                (task.request.prompt.len() / 4 + 1024 + sub.knowledge_chars() / 4) as u64;
+            let reservation = match self.token_budget.try_reserve_tokens(estimate).await {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    admitted.push(serde_json::json!({
+                        "task_index": i,
+                        "agent": task.request.agent,
+                        "error": "background admission rejected: insufficient token budget for the sub-turn reserve",
+                        "background": true,
+                    }));
+                    continue;
+                }
+                Err(e) => {
+                    admitted.push(serde_json::json!({
+                        "task_index": i,
+                        "agent": task.request.agent,
+                        "error": format!("background admission rejected: token budget reservation failed: {e}"),
+                        "background": true,
+                    }));
+                    continue;
+                }
+            };
+
+            let task_id = uuid::Uuid::new_v4().simple().to_string();
+            self.background.insert(
+                task_id.clone(),
+                BackgroundHolding {
+                    _reservation: reservation,
+                    model_source: Some(model_source),
+                },
+            );
+
+            // D30: the captured turn context scopes the spawned future so
+            // the background sub-turn's hook gates and any composition read
+            // the ADMITTING session's policy, immune to concurrent-session
+            // cell overwrites (BACKGROUND_TASK.scope precedent — task-locals
+            // survive block_in_place/join_all, NOT tokio::spawn).
+            let turn_ctx = self.capture_turn_context();
+            let future = zen_core::turn_context::TURN_CONTEXT.scope(
+                turn_ctx,
+                zen_plugin::tools::approval_hook::BACKGROUND_TASK.scope(
+                    true,
+                    Arc::clone(&owned).run_single_background(
+                        task.request.clone(),
+                        depth,
+                        parent.to_string(),
+                        session,
+                        sub,
+                        model_source,
+                    ),
+                ),
+            );
+            let spawned = zen_plugin::task_registry::registry().spawn_async(
+                &task_id,
+                &session_id,
+                &task.request.agent,
+                Some(i),
+                &limits,
+                future,
+            );
+            match spawned {
+                Ok(_join) => {
+                    task_ids.push(task_id.clone());
+                    admitted.push(serde_json::json!({
+                        "task_index": i,
+                        "agent": task.request.agent,
+                        "task_id": task_id,
+                        "background": true,
+                        "status": "running",
+                        "fork_mode": fork_mode.map(|f| f.as_str()),
+                        "model_source": model_source.as_str(),
+                    }));
+                }
+                Err(e) => {
+                    // Registry gate (concurrency/drain/id): structured
+                    // rejection; release the reserve (drop ⇒ refund).
+                    self.background.release(&task_id);
+                    admitted.push(serde_json::json!({
+                        "task_index": i,
+                        "agent": task.request.agent,
+                        "error": format!("background admission rejected: {e}"),
+                        "background": true,
+                    }));
+                }
+            }
+        }
+
+        // Lazy release of holds whose tasks already reached terminal states
+        // through paths this tool does not observe (expiry, registry loss).
+        self.background.sweep_terminal();
+
+        Ok(serde_json::json!({
+            "started": task_ids.len(),
+            "task_ids": task_ids,
+            "background": true,
+            "admissions": admitted,
+        }))
+    }
+
+    /// The background sub-turn future body (W5.2): the SAME delegate loop
+    /// as `run_single_composed` — which re-verifies the depth guard and
+    /// reserves run-time budget exactly as blocking sub-turns do — with
+    /// the D25 result-payload seeds added. The narrowed grant set (SC-024)
+    /// is applied inside `build_sub_agent` via the `BACKGROUND_TASK`
+    /// task-local scope this future runs under, so no loop duplication is
+    /// needed.
+    async fn run_single_background(
+        self: Arc<Self>,
+        req: DelegateRequest,
+        depth: u32,
+        parent: String,
+        session: SessionContext,
+        sub: SubAgentContext,
+        model_source: ModelSource,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut outcome = self
+            .run_single_composed(
+                &req,
+                depth,
+                &parent,
+                session,
+                sub,
+                &DelegateContract::default(),
+            )
+            .await;
+        if let Some(obj) = outcome.as_object_mut() {
+            obj.insert(
+                "model_source".to_string(),
+                serde_json::json!(model_source.as_str()),
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Background admission limits: the TaskRegistry's
+    /// `[agentic.background] max_concurrent` is the single shared
+    /// enforcement point for ALL background work (shell.exec children AND
+    /// delegate futures) — the W5.2 union-cap design decision (merge gate,
+    /// spec D20 §6). The delegate `max_concurrent` key governs foreground
+    /// fan-out width only.
+    fn background_limits(&self) -> zen_plugin::task_registry::BackgroundLimits {
+        let config = zen_core::config::load_config().ok();
+        let max_wall_secs = config
+            .as_ref()
+            .and_then(|c| c.agentic.background.max_wall_secs)
+            .unwrap_or(zen_core::config::BACKGROUND_MAX_WALL_SECS_DEFAULT);
+        let max_concurrent = config
+            .as_ref()
+            .and_then(|c| c.agentic.background.max_concurrent)
+            .unwrap_or(zen_core::config::BACKGROUND_MAX_CONCURRENT_DEFAULT);
+        zen_plugin::task_registry::BackgroundLimits {
+            max_wall_secs,
+            max_concurrent: max_concurrent as usize,
+            output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
+        }
+    }
+
     /// Execute one validated delegation request (tier/depth/bounded checks
     /// already passed in `invoke`). Always returns a readable Value. Used by
     /// `plan.execute`, which has no D9 contract (empty ⇒ pre-D9 prompt).
@@ -592,7 +1336,10 @@ impl DelegateTaskTool {
         depth: u32,
         parent: &str,
     ) -> serde_json::Value {
-        let (session, sub) = self.compose_sub_session(&req.agent, &req.prompt, depth);
+        // W11.5/T5 (SC-021): the plan path honors the per-task fork_mode —
+        // `None` resolves to the session-wide default byte-identically.
+        let (session, sub) =
+            self.compose_sub_session_forked(&req.agent, &req.prompt, depth, req.fork_mode);
         self.run_single_composed(
             req,
             depth,
@@ -789,6 +1536,11 @@ impl DelegateTaskTool {
             if let Some(verification) = verification {
                 output["verification"] = serde_json::json!(verification);
             }
+            // W11.5/T5 (SC-022 falsifiability): the same model_source label
+            // the background path seeds — resolution order sensitivity >
+            // LlmPreference > hint > default (runtime override stays D2b).
+            let model_source = self.resolve_model_hint(req.model_hint.as_deref(), Some(&profile));
+            output["model_source"] = serde_json::json!(model_source.as_str());
             output
         };
         // T233 (006 D13/W3.1): post-`run_single` quality estimate — a
@@ -867,6 +1619,14 @@ pub struct DelegateRequest {
     /// its deliverable to (sandbox-validated; NO new tool grants — only
     /// agents already holding `fs.write` may declare one).
     pub artifact: Option<String>,
+    /// D25 SC-021 per-task fork mode. `None` (argument absent) preserves the
+    /// session-wide `[agentic.delegate] context_inheritance` behavior
+    /// byte-identically — the per-task argument wins when present.
+    pub fork_mode: Option<ForkMode>,
+    /// D25 SC-022 per-task model hint (catalog-validated upstream, ≤5
+    /// distinct per batch). Resolution: sensitivity > LlmPreference > hint
+    /// > default — the hint can never weaken sensitivity routing.
+    pub model_hint: Option<String>,
 }
 
 /// D9 optional delegation contract (Anthropic 4-part shape). Carried beside
@@ -1038,6 +1798,9 @@ pub struct GateReport {
 
 /// Hard limit: a delegation prompt must be a self-contained bounded brief.
 pub(crate) const BOUNDED_PROMPT_CHARS: usize = 32_000;
+
+/// D25 SC-022: at most this many DISTINCT model hints per admission batch.
+pub(crate) const MODEL_HINT_MAX_DISTINCT: usize = 5;
 /// Advisory line above which a delegation is flagged not-worth-it.
 const ADVISORY_TOKEN_LINE: u64 = 50_000;
 
@@ -1106,7 +1869,9 @@ impl Tool for DelegateTaskTool {
                                 "independent": {"type": "boolean", "description": "true when this subtask needs no other subtask's output (pre-spawn gate)"},
                                 "output_format": {"type": "string", "description": "Optional output shape for this subtask"},
                                 "task_boundaries": {"type": "string", "description": "Optional scope bounds for this subtask"},
-                                "artifact": {"type": "string", "description": "Optional sandbox-validated artifact output path"}
+                                "artifact": {"type": "string", "description": "Optional sandbox-validated artifact output path"},
+                                "fork_mode": {"type": "string", "enum": ["none", "knowledge", "history"], "description": "Per-task context fork (see top-level)"},
+                                "model": {"type": "string", "description": "Per-task catalog-validated model hint (see top-level)"}
                             },
                             "required": ["agent", "prompt"]
                         }
@@ -1114,9 +1879,29 @@ impl Tool for DelegateTaskTool {
                     "independent": {
                         "type": "boolean",
                         "description": "Single-task form: true when the parent needs no intermediate state (default true)"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Admit the task(s) to the background registry and return immediately ({started, task_ids, background:true}); collect later with delegate.collect. Applies to both the single and tasks[] forms. Narrowed tool grants apply (no fs.delete/fs.move/fs.copy/shell.exec/shell.kill)."
+                    },
+                    "fork_mode": {
+                        "type": "string",
+                        "enum": ["none", "knowledge", "history"],
+                        "description": "Per-task context fork (D25): none = fresh context; knowledge = parent's retrieved knowledge block; history = knowledge PLUS the parent conversation (tool-call noise stripped). Absent = session-wide context_inheritance default."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Per-task model hint (must exist in the configured provider catalog; at most 5 distinct per batch). Resolution: sensitivity routing > agent preference > this hint > default."
                     }
                 },
-                "required": ["agent", "prompt"]
+                // D25 A6.3: the runtime tolerates BOTH forms (parse_requests
+                // early-returns on tasks[]), so the schema must not lie —
+                // single-task requires agent+prompt, pure fan-out requires
+                // tasks[].
+                "anyOf": [
+                    { "required": ["agent", "prompt"] },
+                    { "required": ["tasks"] }
+                ]
             }),
             result_schema: serde_json::json!({
                 "type": "object",
@@ -1147,21 +1932,42 @@ impl Tool for DelegateTaskTool {
             Err(e) => return Ok(serde_json::json!({ "error": e })),
         };
 
+        // W5.2 (D20 §1): the background flag is a TOOL ARGUMENT (no config
+        // key). `false`/absent ⇒ the blocking path below byte-identical.
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let (depth, parent) = Self::chain_position();
         let rejected: Vec<Option<String>> = tasks
             .iter()
             .map(|task| self.validate_task(&parent, depth, &task.request))
             .collect();
 
-        // Codex-style pre-spawn gates (T374): bounded is a hard limit, the
-        // rest are advisory heuristics logged to the audit trail.
+        // Codex-style pre-spawn gates (T374): the bounded limit is hard and
+        // enforced solely by `validate_task` (above); the rest are advisory
+        // heuristics logged to the audit trail.
         let reports: Vec<GateReport> = tasks
             .iter()
             .map(|t| Self::evaluate_gates(&t.request, tasks.len()))
             .collect();
 
+        // W5.2: background admissions share the SAME hard validate +
+        // advisory gates (both already ran above), then return immediately.
+        if background {
+            return self.invoke_background(&tasks, depth, &parent).await;
+        }
+
+        // W11.5/T5 (SC-022): the BLOCKING path validates the hint set here
+        // (catalog + ≤5 distinct per batch). Background admission validates
+        // in invoke_background — one validation per path, not two.
+        if let Err(e) = Self::validate_model_hints(&tasks) {
+            return Ok(serde_json::json!({ "error": e }));
+        }
+
         // Slot-ordered assembly: results[i] always corresponds to tasks[i],
-        // whether the task was rejected, unbounded, or executed. Each result
+        // whether the task was rejected or executed. Each result
         // also carries `task_index` (0-based) so any post-hoc reordering
         // (D10 weight ranking below) stays re-attributable by consumers —
         // positional pairing is only guaranteed while no weights are set.
@@ -1173,12 +1979,6 @@ impl Tool for DelegateTaskTool {
                     "agent": task.request.agent,
                     "task_index": i,
                     "error": error
-                })));
-            } else if !reports[i].bounded {
-                slots.push(Some(serde_json::json!({
-                    "agent": task.request.agent,
-                    "task_index": i,
-                    "error": "unbounded delegation rejected: prompt exceeds the bounded-task limit"
                 })));
             } else {
                 slots.push(None);
@@ -1192,10 +1992,13 @@ impl Tool for DelegateTaskTool {
         let mut composed: Vec<Option<(SessionContext, SubAgentContext)>> =
             (0..tasks.len()).map(|_| None).collect();
         for &i in &runnable {
-            composed[i] = Some(self.compose_sub_session(
+            // W11.5/T5 (SC-021): per-task fork_mode wins on the blocking
+            // path too; `None` is byte-identical to the session-wide default.
+            composed[i] = Some(self.compose_sub_session_forked(
                 &tasks[i].request.agent,
                 &tasks[i].request.prompt,
                 depth,
+                tasks[i].request.fork_mode,
             ));
         }
         self.append_gates_audit(&parent, depth, &tasks, &reports, &composed);
@@ -1207,14 +2010,19 @@ impl Tool for DelegateTaskTool {
                     let (session, sub) = composed[i]
                         .take()
                         .expect("runnable slots are composed above");
-                    self.run_single_composed(
-                        &tasks[i].request,
-                        depth,
-                        &parent,
-                        session,
-                        sub,
-                        &tasks[i].contract,
-                    )
+                    let request = &tasks[i].request;
+                    let contract = &tasks[i].contract;
+                    let parent: &str = parent.as_str();
+                    async move {
+                        #[cfg(test)]
+                        let _wave = tests::FanOutWaveGuard::enter(self, request.agent.as_str());
+                        #[cfg(test)]
+                        if let Some(delay) = self.test_wave_delay(request.agent.as_str()) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        self.run_single_composed(request, depth, parent, session, sub, contract)
+                            .await
+                    }
                 })
                 .collect();
             let results = futures::future::join_all(futures).await;
@@ -1256,6 +2064,36 @@ impl Tool for DelegateTaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // D25 A6.3: the declared schema must accept BOTH forms the runtime
+    // accepts — a top-level required:["agent","prompt"] rejects the pure
+    // fan-out {tasks:[...]} payload the parse path early-returns on.
+    #[test]
+    fn delegate_task_schema_allows_pure_fan_out() {
+        let budget = Arc::new(AtomicTokenBudget::new(10_000));
+        let schema = tool_with(Arc::new(ZenWiring::new()), Vec::new(), budget).schema();
+        let any_of = schema.args_schema["anyOf"]
+            .as_array()
+            .expect("top-level anyOf replaces bare required");
+        let single = any_of
+            .iter()
+            .find(|arm| arm["required"] == serde_json::json!(["agent", "prompt"]));
+        let fanout = any_of
+            .iter()
+            .find(|arm| arm["required"] == serde_json::json!(["tasks"]));
+        assert!(single.is_some(), "single-task arm present: {any_of:?}");
+        assert!(fanout.is_some(), "fan-out arm present: {any_of:?}");
+        assert!(
+            schema.args_schema.get("required").is_none(),
+            "no bare top-level required may remain: {:?}",
+            schema.args_schema.get("required")
+        );
+        assert_eq!(
+            schema.args_schema["properties"]["tasks"]["items"]["required"],
+            serde_json::json!(["agent", "prompt"]),
+            "per-item schema keeps agent+prompt mandatory"
+        );
+    }
 
     fn mock_router() -> DefaultRouter {
         zen_provider::DefaultRouter::new(zen_provider::LlmConfig {
@@ -1308,6 +2146,7 @@ mod tests {
             overlay,
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(std::sync::Mutex::new(Vec::new())),
             budget,
             Duration::from_secs(300),
@@ -1521,6 +2360,8 @@ mod tests {
             description: None,
             independent: true,
             artifact: None,
+            fork_mode: None,
+            model_hint: None,
         };
         let gates = DelegateTaskTool::evaluate_gates(&small, 2);
         assert!(gates.bounded && gates.worth_it && gates.independent && gates.consumer_decision);
@@ -1631,6 +2472,7 @@ mod tests {
             overlay,
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(std::sync::Mutex::new(Vec::new())),
             budget,
             Duration::from_secs(300),
@@ -1781,6 +2623,7 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
             Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::clone(&budget),
             Duration::from_secs(300),
             1,
@@ -1847,6 +2690,7 @@ mod tests {
             Vec::new(),
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Confidential)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(AtomicTokenBudget::new(100_000)),
             Duration::from_secs(60),
@@ -1957,6 +2801,112 @@ mod tests {
         );
     }
 
+    /// G-13 (SC-001/SC-002) wave-overlap guard: records `enter` and bumps
+    /// the in-flight counter at construction, records `exit` and decrements
+    /// on drop — i.e. on every settle path (ok / error output), because the
+    /// guard lives in the task-body scope. `pub(super)`: the cfg(test) call
+    /// site in the fan-out chunk body (parent module) names this type.
+    pub(super) struct FanOutWaveGuard<'a> {
+        tool: &'a DelegateTaskTool,
+        agent: String,
+    }
+
+    impl<'a> FanOutWaveGuard<'a> {
+        pub(super) fn enter(tool: &'a DelegateTaskTool, agent: &str) -> Self {
+            tool.test_log_wave_event(agent, "enter");
+            let now = tool
+                .test_in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let _ = tool
+                .test_peak_in_flight
+                .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            Self {
+                tool,
+                agent: agent.to_string(),
+            }
+        }
+    }
+
+    impl std::ops::Drop for FanOutWaveGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self
+                .tool
+                .test_in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.tool.test_log_wave_event(&self.agent, "exit");
+        }
+    }
+
+    /// G-13 (SC-001/SC-002): sibling of
+    /// `max_concurrent_chunks_preserve_slot_order` asserting the full wave
+    /// contract over a 5-task fan-out at width 2. SC-001: peak in-flight
+    /// counted from enter/exit events (never elapsed time) is ≥2 and ≤
+    /// max_concurrent. SC-002: wave N+1 enters only after every wave-N
+    /// task exited. Slot ordering itself stays pinned by the existing
+    /// test, untouched.
+    #[tokio::test]
+    async fn fan_out_waves_barriers_and_peak_in_flight_sc001_sc002() {
+        let tool = tool_with_concurrency(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+            1,
+            2,
+        );
+        let agents = ["Explore", "Librarian", "Hephaestus", "Atlas", "Junior"];
+        for agent in agents {
+            tool.inject_test_wave_delay(agent, 50);
+        }
+        let tasks: Vec<serde_json::Value> = agents
+            .iter()
+            .map(|a| serde_json::json!({ "agent": a, "prompt": format!("wave work for {a}") }))
+            .collect();
+        let out = tool
+            .invoke(serde_json::json!({ "tasks": tasks }))
+            .await
+            .unwrap();
+        let results = out["results"].as_array().expect("batch shape: {out}");
+        assert_eq!(results.len(), 5, "all five subtasks return: {out}");
+        assert!(
+            results
+                .iter()
+                .all(|r| r["response"].as_str().is_some_and(|s| !s.is_empty())),
+            "every result carries a response: {out}"
+        );
+
+        // SC-001: peak in-flight from enter/exit events, never time.
+        let peak = tool.test_peak_in_flight();
+        assert!(
+            peak >= 2,
+            "SC-001: width-2 waves must observably overlap (peak={peak})"
+        );
+        assert!(
+            peak <= 2,
+            "SC-001: in-flight must never exceed max_concurrent=2 (peak={peak})"
+        );
+
+        // SC-002: waves are barriers — wave N+1 enters only after every
+        // wave-N task exited. Waves are the width-2 chunks over the
+        // runnable order (all five tasks are valid here).
+        let events = tool.test_wave_events();
+        let pos_of = |agent: &str, event: &str| {
+            events
+                .iter()
+                .position(|(a, e)| a == agent && *e == event)
+                .unwrap_or_else(|| panic!("missing {event} event for {agent}: {events:?}"))
+        };
+        let waves: Vec<&[&str]> = agents.chunks(2).collect();
+        for pair in waves.windows(2) {
+            let last_exit_prev = pair[0].iter().map(|a| pos_of(a, "exit")).max().unwrap();
+            let first_enter_next = pair[1].iter().map(|a| pos_of(a, "enter")).min().unwrap();
+            assert!(
+                last_exit_prev < first_enter_next,
+                "SC-002: wave barrier violated ({events:?})"
+            );
+        }
+    }
+
     // ── Phase 31 T215: sub-agent context inheritance ──────────────────
 
     fn note(content: &str) -> RetrievedNote {
@@ -1983,6 +2933,7 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
             knowledge,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             budget,
             Duration::from_secs(300),
             3,
@@ -2021,6 +2972,7 @@ mod tests {
             None,
             Arc::new(std::sync::Mutex::new(Sensitivity::Confidential)),
             knowledge,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(AtomicTokenBudget::new(100_000)),
             Duration::from_secs(300),
             3,
@@ -2278,6 +3230,8 @@ mod tests {
             description: None,
             independent: true,
             artifact: None,
+            fork_mode: None,
+            model_hint: None,
         };
         let bare = compose_sub_prompt(&req, &DelegateContract::default());
         assert!(bare.starts_with("do it"));
@@ -2303,6 +3257,8 @@ mod tests {
             prompt: "build it".into(),
             description: None,
             independent: true,
+            fork_mode: None,
+            model_hint: None,
             artifact: None,
         };
         let bare = compose_sub_prompt(&base, &DelegateContract::default());
@@ -2452,5 +3408,610 @@ mod tests {
         assert!(failed.starts_with("tool failed:"), "{failed}");
         let missing = dispatch_error_feedback(&KernelError::ToolNotFound("nope".into()));
         assert!(missing.starts_with("tool failed:"), "{missing}");
+    }
+
+    // ====================================================================
+    // W5.2 — background admissions (D20 §1/§6/§7/§8/§10 + D25 SC-021/022/024)
+    // ====================================================================
+
+    fn background_tool(
+        wiring: Arc<ZenWiring>,
+        budget: Arc<AtomicTokenBudget>,
+        max_depth: u32,
+    ) -> Arc<DelegateTaskTool> {
+        let tool = Arc::new(DelegateTaskTool::new(
+            wiring,
+            mock_router(),
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            budget,
+            Duration::from_secs(300),
+            max_depth,
+            4,
+        ));
+        tool.set_self_arc(Arc::clone(&tool));
+        tool
+    }
+
+    #[tokio::test]
+    async fn background_absent_flag_keeps_blocking_shape_byte_identical() {
+        // Flag absent ⇒ the blocking path: single-task result carries
+        // `response`, never `task_ids`/`background`.
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let out = tool
+            .invoke(serde_json::json!({"agent": "Explore", "prompt": "say hi"}))
+            .await
+            .unwrap();
+        assert!(out.get("response").is_some(), "blocking shape: {out}");
+        assert!(out.get("background").is_none());
+        assert!(out.get("task_ids").is_none());
+        // Explicit `background: false` is the same path.
+        let out = tool
+            .invoke(
+                serde_json::json!({"agent": "Explore", "prompt": "say hi", "background": false}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.get("response").is_some(),
+            "explicit false = blocking: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_admission_returns_started_shape_and_registers_task() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118);
+        // spawn_async writes under user_root, so isolate it.
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+        let tool = background_tool(
+            Arc::new(ZenWiring::new()),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+            1,
+        );
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore",
+                "prompt": "research briefly",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["background"], serde_json::json!(true), "{out}");
+        assert_eq!(out["started"], serde_json::json!(1), "{out}");
+        let ids = out["task_ids"].as_array().expect("task_ids array");
+        assert_eq!(ids.len(), 1);
+        let task_id = ids[0].as_str().expect("task_id string").to_string();
+        let snap = zen_plugin::task_registry::registry().snapshot(&task_id);
+        assert!(snap.is_some(), "task registered in the TaskRegistry");
+        zen_plugin::task_registry::registry()
+            .kill(&task_id)
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn background_over_concurrency_cap_is_structured_rejection() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118);
+        // spawn_async writes under user_root, so isolate it.
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+        // The admission limit reads [agentic.background] max_concurrent
+        // through the 5-layer config; the documented env override pins it
+        // to 1 so one filler occupies the slot.
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_BACKGROUND_MAX_CONCURRENT", "1");
+        }
+        zen_core::config::invalidate_config_cache();
+        // Fill the registry to its [agentic.background] ceiling, then admit.
+        let limits = zen_plugin::task_registry::BackgroundLimits {
+            max_wall_secs: 60,
+            max_concurrent: 1,
+            output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
+        };
+        let filler = zen_plugin::task_registry::registry()
+            .spawn_async(
+                "c0ffee00-0000-4000-8000-000000000001",
+                "sess-cap",
+                "Explore",
+                None,
+                &limits,
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(serde_json::json!({}))
+                },
+            )
+            .expect("filler admitted");
+        let tool = background_tool(
+            Arc::new(ZenWiring::new()),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+            1,
+        );
+        let lim = tool.background_limits();
+        assert_eq!(
+            lim.max_concurrent, 1,
+            "env override must reach admission limits (got {})",
+            lim.max_concurrent
+        );
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore",
+                "prompt": "second task",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["started"],
+            serde_json::json!(0),
+            "over-cap admits nothing: {out}"
+        );
+        let admissions = out["admissions"].as_array().expect("admissions");
+        assert!(
+            admissions[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("max_concurrent"),
+            "rejection names the limit: {out}"
+        );
+        drop(filler);
+    }
+
+    #[tokio::test]
+    async fn background_under_budget_is_structured_rejection() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118);
+        // spawn_async writes under user_root, so isolate it.
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+        // A 10-token pool cannot fund the admission reserve (prompt/4 + 1024).
+        let tool = background_tool(
+            Arc::new(ZenWiring::new()),
+            Arc::new(AtomicTokenBudget::new(10)),
+            1,
+        );
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore",
+                "prompt": "a reasonably sized brief that needs a real reserve",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["started"],
+            serde_json::json!(0),
+            "under-budget admits nothing: {out}"
+        );
+        let admissions = out["admissions"].as_array().expect("admissions");
+        assert!(
+            admissions[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("insufficient token budget"),
+            "rejection names the reserve: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_depth_cap_rejected_before_registry_entry() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118);
+        // spawn_async writes under user_root, so isolate it.
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+        // max_depth=0 ⇒ child depth 1 exceeds the cap: validate_task rejects
+        // pre-admission; no budget consumed, no registry entry.
+        let tool = background_tool(
+            Arc::new(ZenWiring::new()),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+            0,
+        );
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore",
+                "prompt": "deep brief",
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["started"], serde_json::json!(0), "{out}");
+        let admissions = out["admissions"].as_array().expect("admissions");
+        assert!(
+            admissions[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("depth cap"),
+            "depth-cap rejection surfaces: {out}"
+        );
+        assert!(
+            zen_plugin::task_registry::registry().live_count() == 0,
+            "no registry entry for a depth-capped admission"
+        );
+    }
+
+    #[test]
+    fn fork_mode_absent_matches_session_default_byte_identically() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        // knowledge gate closed (empty inheritance budget ⇒ None):
+        let (session_absent, sub_absent) = tool.compose_sub_session_forked("Explore", "p", 0, None);
+        let (session_none, sub_none) =
+            tool.compose_sub_session_forked("Explore", "p", 0, Some(ForkMode::None));
+        assert_eq!(session_absent.knowledge.len(), session_none.knowledge.len());
+        assert_eq!(sub_absent.budget_chars, sub_none.budget_chars);
+    }
+
+    #[test]
+    fn history_fork_strips_tool_payloads_from_parent_conversation() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        {
+            let mut mirror = tool.history.lock().unwrap();
+            mirror.push(crate::delegate_task::ParentHistoryMessage {
+                role: "user".into(),
+                content: "find the config".into(),
+            });
+            mirror.push(crate::delegate_task::ParentHistoryMessage {
+                role: "assistant".into(),
+                content: "reading it.\n```json\n{\"tool\": \"fs.read\", \"args\": {}}\n```\nfound the config key.".into(),
+            });
+        }
+        let (session, _) =
+            tool.compose_sub_session_forked("Explore", "p", 0, Some(ForkMode::History));
+        let joined: String = session
+            .conversation
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("find the config"),
+            "user prose forks: {joined}"
+        );
+        assert!(
+            joined.contains("found the config key"),
+            "assistant prose forks: {joined}"
+        );
+        assert!(
+            !joined.contains("fs.read") && !joined.contains("```json"),
+            "tool-call noise must NOT fork (SC-021 load-bearing): {joined}"
+        );
+        // none/knowledge forks never see the conversation at all.
+        let (session_k, _) =
+            tool.compose_sub_session_forked("Explore", "p", 0, Some(ForkMode::Knowledge));
+        assert!(session_k.conversation.is_empty());
+    }
+
+    #[test]
+    fn background_grant_narrowing_drops_enumerated_tools() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        // The Sisyphus profile carries the widest grant surface.
+        let widened = tool
+            .build_sub_agent("Sisyphus", false)
+            .expect("unwidened build");
+        let narrowed = tool
+            .build_sub_agent_with_grants("Sisyphus", false, true)
+            .expect("narrowed build");
+        let widened_names: Vec<String> = widened
+            .generic
+            .tools()
+            .schemas()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let narrowed_names: std::collections::HashSet<String> = narrowed
+            .generic
+            .tools()
+            .schemas()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for stripped in crate::delegate_task::BACKGROUND_NARROWED_TOOLS {
+            if widened_names.iter().any(|n| n == stripped) {
+                assert!(
+                    !narrowed_names.contains(stripped),
+                    "narrowed admissions must drop `{stripped}` (SC-024)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_hint_validation_rejects_unknown_catalog_and_sixth_distinct() {
+        let tasks_unknown = |hint: &str| {
+            vec![ParsedDelegate {
+                request: DelegateRequest {
+                    agent: "Explore".into(),
+                    prompt: "p".into(),
+                    description: None,
+                    independent: true,
+                    artifact: None,
+                    fork_mode: None,
+                    model_hint: Some(hint.to_string()),
+                },
+                contract: DelegateContract::default(),
+            }]
+        };
+        let six: Vec<ParsedDelegate> = (0..6)
+            .map(|i| ParsedDelegate {
+                request: DelegateRequest {
+                    agent: "Explore".into(),
+                    prompt: "p".into(),
+                    description: None,
+                    independent: true,
+                    artifact: None,
+                    fork_mode: None,
+                    model_hint: Some(format!("model-{i}")),
+                },
+                contract: DelegateContract::default(),
+            })
+            .collect();
+        if let Some(catalog) = DelegateTaskTool::model_catalog() {
+            // A hint guaranteed absent from any real catalog.
+            let unknown = "definitely-not-a-model-xyz";
+            assert!(!catalog.contains(unknown));
+            let err = DelegateTaskTool::validate_model_hints(&tasks_unknown(unknown)).unwrap_err();
+            assert!(
+                err.contains("not in the configured provider catalog"),
+                "{err}"
+            );
+        } else {
+            // Catalog unavailable ⇒ fail-closed rejection.
+            assert!(DelegateTaskTool::validate_model_hints(&tasks_unknown("x")).is_err());
+        }
+        let err = DelegateTaskTool::validate_model_hints(&six).unwrap_err();
+        assert!(
+            err.contains("at most 5"),
+            "sixth distinct override rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn model_hint_resolution_order_prefers_profile_over_hint() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let mut profile = crate::registry::DefaultAgentRegistry::new()
+            .find_by_name("Explore")
+            .cloned()
+            .expect("Explore profile");
+        // Explicit preference ⇒ hint suppressed (SC-022 order).
+        profile.llm_preferences = vec![LlmPreference::LocalOnly];
+        assert_eq!(
+            tool.resolve_model_hint(Some("model-a"), Some(&profile)),
+            ModelSource::Profile
+        );
+        // Any-only ⇒ hint wins.
+        profile.llm_preferences = vec![LlmPreference::Any];
+        assert_eq!(
+            tool.resolve_model_hint(Some("model-a"), Some(&profile)),
+            ModelSource::Hint
+        );
+        // No hint ⇒ default.
+        assert_eq!(
+            tool.resolve_model_hint(None, Some(&profile)),
+            ModelSource::Default
+        );
+    }
+
+    /// W11.10/T10 (G3a): `fork_mode: knowledge` POSITIVELY inherits the
+    /// parent knowledge block content (the gate-ON path, per-task addressable).
+    #[test]
+    fn fork_mode_knowledge_inherits_parent_knowledge_content() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        set_inheritance_env(Some(dir.path()), Some("1"));
+        let knowledge: SharedKnowledge =
+            Arc::new(std::sync::Mutex::new(vec![note("parent knowledge alpha")]));
+        let tool = tool_with_knowledge(Arc::new(AtomicTokenBudget::new(100_000)), knowledge);
+        let (session, sub) =
+            tool.compose_sub_session_forked("Explore", "p", 0, Some(ForkMode::Knowledge));
+        assert!(
+            session
+                .knowledge
+                .iter()
+                .any(|n| n.content.contains("parent knowledge alpha")),
+            "knowledge fork must inherit the parent block: {:?}",
+            session.knowledge
+        );
+        assert!(sub.knowledge_chars() > 0, "inherited chars are nonzero");
+        set_inheritance_env(None, None);
+    }
+
+    /// W11.10/T10 (G3b): an invalid fork_mode string is a structured
+    /// rejection, never a silent default.
+    #[test]
+    fn fork_mode_parse_rejects_invalid_string() {
+        assert!(ForkMode::parse("bogus").is_err());
+        assert!(ForkMode::parse("").is_err());
+        assert!(ForkMode::parse("none").is_ok());
+        assert!(ForkMode::parse("knowledge").is_ok());
+        assert!(ForkMode::parse("history").is_ok());
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_invalid_fork_mode_string() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore", "prompt": "p", "fork_mode": "bogus"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out["error"].as_str().unwrap().contains("fork_mode"),
+            "invalid fork_mode surfaces a diagnostic: {out}"
+        );
+    }
+
+    /// W11.1/T1 (D30, F1+OV-1) race pin: a Confidential TurnContext wins over
+    /// a Public shared cell (a concurrent session's last write) — the
+    /// composition classifies under the TURN's policy, so no cloud leak.
+    #[tokio::test]
+    async fn turn_context_sensitivity_overrides_shared_cell() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        // The shared cell holds Public (the racy last-writer-wins value).
+        let ctx = zen_core::turn_context::TurnContext {
+            sensitivity: Sensitivity::Confidential,
+            knowledge: Vec::new(),
+            history: Vec::new(),
+        };
+        let (session, _sub) = zen_core::turn_context::TURN_CONTEXT
+            .scope(ctx, async {
+                tool.compose_sub_session_forked("Explore", "p", 0, Some(ForkMode::None))
+            })
+            .await;
+        assert_eq!(
+            session.sensitivity_policy,
+            Sensitivity::Confidential,
+            "the turn's policy must win over the concurrent-session cell"
+        );
+        // Outside any turn scope the cell fallback still applies.
+        let (fallback, _) =
+            tool.compose_sub_session_forked("Explore", "p", 0, Some(ForkMode::None));
+        assert_eq!(fallback.sensitivity_policy, Sensitivity::Public);
+    }
+
+    /// W11.1/T1 (D30) race pin: turn-scoped knowledge wins over a foreign
+    /// shared-cell block — no cross-session knowledge injection.
+    #[tokio::test]
+    async fn turn_context_knowledge_overrides_foreign_cell() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        set_inheritance_env(Some(dir.path()), Some("1"));
+        let foreign: SharedKnowledge = Arc::new(std::sync::Mutex::new(vec![note(
+            "foreign session knowledge",
+        )]));
+        let tool = tool_with_knowledge(Arc::new(AtomicTokenBudget::new(100_000)), foreign);
+        let ctx = zen_core::turn_context::TurnContext {
+            sensitivity: Sensitivity::Private,
+            knowledge: vec![note("turn-scoped knowledge")],
+            history: Vec::new(),
+        };
+        let (session, _) = zen_core::turn_context::TURN_CONTEXT
+            .scope(ctx, async {
+                tool.compose_sub_session_forked("Explore", "p", 0, Some(ForkMode::Knowledge))
+            })
+            .await;
+        assert!(
+            session
+                .knowledge
+                .iter()
+                .any(|n| n.content.contains("turn-scoped knowledge")),
+            "the turn's knowledge must be inherited"
+        );
+        assert!(
+            !session
+                .knowledge
+                .iter()
+                .any(|n| n.content.contains("foreign session knowledge")),
+            "foreign cell knowledge must NOT leak into the turn"
+        );
+        set_inheritance_env(None, None);
+    }
+
+    /// W11.8/T8 (G1): releasing a background hold refunds the admission
+    /// reservation — collect/kill/expiry restore budget.available().
+    #[tokio::test]
+    async fn background_hold_release_refunds_the_reservation() {
+        let budget = Arc::new(AtomicTokenBudget::new(100_000));
+        let reservation = budget
+            .try_reserve_tokens(5_000)
+            .await
+            .unwrap()
+            .expect("reserve");
+        let book = BackgroundBook::default();
+        book.insert(
+            "t-refund".to_string(),
+            BackgroundHolding {
+                _reservation: reservation,
+                model_source: None,
+            },
+        );
+        assert_eq!(budget.available(), 95_000, "the hold pins the estimate");
+        book.release("t-refund");
+        assert_eq!(budget.available(), 100_000, "release refunds the estimate");
+    }
+
+    /// W11.16/T17 (OV-6, SC-021): the background admission estimate includes
+    /// inherited chars — a budget that admits prompt/4+1024 but NOT the
+    /// inherited term must refuse the admission (compose-before-reserve).
+    #[tokio::test]
+    async fn background_admission_estimate_includes_inherited_chars() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        set_inheritance_env(Some(dir.path()), Some("1"));
+        let knowledge: SharedKnowledge =
+            Arc::new(std::sync::Mutex::new(vec![note(&"a".repeat(4000))]));
+        // prompt "hello" ⇒ 5/4 + 1024 = 1025; inherited 4000/4 = 1000 ⇒ 2025.
+        // A 1500 budget admits the base shape but NOT the inherited term.
+        let tool = Arc::new(DelegateTaskTool::new(
+            Arc::new(ZenWiring::new()),
+            mock_router(),
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            knowledge,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(AtomicTokenBudget::new(1500)),
+            Duration::from_secs(300),
+            1,
+            4,
+        ));
+        tool.set_self_arc(Arc::clone(&tool));
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore", "prompt": "hello", "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["started"], serde_json::json!(0), "{out}");
+        assert!(
+            out["admissions"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("insufficient token budget"),
+            "the inherited term must push the estimate over the budget: {out}"
+        );
+        set_inheritance_env(None, None);
     }
 }

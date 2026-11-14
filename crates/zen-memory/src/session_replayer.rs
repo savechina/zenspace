@@ -74,6 +74,11 @@ pub fn turn_replay_key(
 /// PURPOSE: decouples the replayer from zen-repo — zen-memory has no data-layer
 /// dependency, and the gateway (T052) owns state.db. Keys are session-file
 /// path strings; offsets are the byte position after the last applied line.
+// async_trait stamps `#[must_use]` on the desugared boxed-future signatures;
+// `Future` is already `#[must_use]`, so clippy ≥1.99 flags the duplication
+// (`double_must_use`). Silenced at the trait boundary — the macro expansion is
+// not ours to edit, and the must_use intent is correct.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ReplayCheckpointStore: Send + Sync {
     /// Load the applied byte offset for `session_path`.

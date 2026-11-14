@@ -18,6 +18,8 @@
 //! ERRORS: Enqueue fails when the queue is closed (pump gone = peer
 //! disconnected); callers treat that as connection death.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tokio::sync::{Mutex, mpsc};
 
 use crate::protocol::{Capabilities, Frame};
@@ -86,6 +88,9 @@ pub struct ClientConnection {
     identity: Mutex<Option<ClientIdentity>>,
     capabilities: Mutex<Capabilities>,
     outbound: mpsc::Sender<OutboundFrame>,
+    /// W8.2 surface kind: the HTTP carrier marks its connections
+    /// plain-text (qqbot/external clients render no markdown tables).
+    plain_text_surface: AtomicBool,
 }
 
 impl ClientConnection {
@@ -97,12 +102,23 @@ impl ClientConnection {
             identity: Mutex::new(None),
             capabilities: Mutex::new(Capabilities::default()),
             outbound,
+            plain_text_surface: AtomicBool::new(false),
         }
     }
 
     /// Cloned queue sender for transports/pumps sharing this connection.
     pub fn queue(&self) -> mpsc::Sender<OutboundFrame> {
         self.outbound.clone()
+    }
+
+    /// W8.2: marks this connection as a plain-text surface (HTTP carrier).
+    pub fn set_plain_text_surface(&self) {
+        self.plain_text_surface.store(true, Ordering::Relaxed);
+    }
+
+    /// W8.2: whether turns on this connection want plain-text rendering.
+    pub fn is_plain_text_surface(&self) -> bool {
+        self.plain_text_surface.load(Ordering::Relaxed)
     }
 
     /// Current lifecycle state.
@@ -264,6 +280,18 @@ mod tests {
         rx.recv().await;
         delta_task.await.unwrap().unwrap();
         structural_task.await.unwrap().unwrap();
+    }
+
+    // W8.2: the surface-kind flag defaults to markdown (UDS surfaces);
+    // only the HTTP carrier flips it.
+    #[test]
+    fn surface_flag_defaults_false_and_flips_explicitly() {
+        let (tx, rx) = mpsc::channel::<OutboundFrame>(4);
+        let conn = ClientConnection::new(tx);
+        drop(rx);
+        assert!(!conn.is_plain_text_surface());
+        conn.set_plain_text_surface();
+        assert!(conn.is_plain_text_surface());
     }
 
     #[tokio::test]

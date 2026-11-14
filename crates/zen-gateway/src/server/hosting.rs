@@ -73,6 +73,9 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(33);
 /// Owned-token payload (`String`) keeps the signature lifetime-free
 /// under `#[async_trait]` — no HRTB annotation, no boxing; call-site
 /// closures coerce to `&mut dyn FnMut` automatically.
+// async_trait's desugared `#[must_use]` futures duplicate Future's must_use —
+// clippy ≥1.99 `double_must_use`; macro output, not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait TurnExecutor: Send + Sync {
     async fn execute_stream(
@@ -917,6 +920,15 @@ pub async fn start(deps: Arc<SessionHost>, params: Value) -> Result<Value, RpcEr
     let requested = params.get("sessionId").and_then(Value::as_str);
     let agent = params.get("agent").and_then(Value::as_str);
 
+    // D31 (F2): a client-supplied sessionId is untrusted input — it flows
+    // into filesystem paths and SQL marker matches. Reject traversal /
+    // wildcard / oversize ids at the entry with the frozen -32602 catalog
+    // code; UUIDv7 / "local" / qqbot ids pass byte-identically.
+    if let Some(id) = requested {
+        zen_core::types::validate_session_id(id)
+            .map_err(|detail| RpcError::invalid_params("session/start", &detail))?;
+    }
+
     let mut sessions = deps.sessions.lock().await;
     let session_id = match requested {
         Some(id) => id.to_string(),
@@ -1001,7 +1013,7 @@ pub async fn turn(
     origin: Option<mpsc::Sender<OutboundFrame>>,
     params: Value,
 ) -> Result<Value, RpcError> {
-    turn_with(deps, origin, None, params).await
+    turn_with(deps, origin, None, false, params).await
 }
 
 /// Full-featured entry point used by the daemon (passes the origin's
@@ -1012,6 +1024,7 @@ pub async fn turn_with(
     deps: Arc<SessionHost>,
     origin: Option<mpsc::Sender<OutboundFrame>>,
     connection: Option<crate::server::dispatch::ConnectionHandle>,
+    plain_text_surface: bool,
     params: Value,
 ) -> Result<Value, RpcError> {
     tracing::Span::current().record("turn_id", params["turnId"].as_str().unwrap_or("?"));
@@ -1147,7 +1160,15 @@ pub async fn turn_with(
     // so turns on different sessions run truly concurrently.
     let mut ctx = {
         let mut sessions = deps.sessions.lock().await;
-        sessions.get_mut(&session_id).expect("checked").clone()
+        let slot = sessions.get_mut(&session_id).expect("checked");
+        // W8.2: server-side surface choice — the turn's originating
+        // connection decides the plan-result rendering.
+        slot.plan_result_format = if plain_text_surface {
+            zen_core::types::PlanResultFormat::PlainText
+        } else {
+            zen_core::types::PlanResultFormat::MarkdownTable
+        };
+        slot.clone()
     };
 
     record.set_state(TurnState::Running);
@@ -1221,13 +1242,41 @@ pub async fn turn_with(
     let watchdog = crate::server::guards::watchdog_deadline(
         crate::server::guards::local_llm_reachable_cached(),
     );
+    // W9.5-F3: shared deadline handle — the guard loop below re-reads it
+    // on every wake; plan-task completions renew it (extend-only, clamped
+    // to `turn_start + 4 × watchdog`).
+    let deadline = crate::server::guards::WatchdogDeadline::start(watchdog);
     let turn_scope = record.turn_id.clone();
     let prompt_for_persist = prompt.clone();
+    let renewal_handle = Arc::clone(&deadline);
+    let renewal: zen_plugin::tools::approval_hook::WatchdogRenewal = Arc::new(move || {
+        if renewal_handle.renew(watchdog) {
+            tracing::debug!(target: "zen_gateway_watchdog", "plan task renewed the turn watchdog");
+        }
+    });
+    let plan_record = Arc::clone(&record);
+    let plan_pending = Arc::clone(&pending);
+    let plan_notify = flush_notify.clone();
+    let plan_progress: zen_agents::plan_task::PlanProgressSink = Arc::new(move |line: String| {
+        // Same coalescing delta transport as LLM text: plan wave lines
+        // enter the pending buffer and leave as droppable delta frames.
+        if plan_record.state() == TurnState::Running {
+            plan_record.set_state(TurnState::Streaming);
+        }
+        lock_ok(&*plan_pending, "pending lock").push_str(&line);
+        plan_notify.notify_one();
+    });
     let execution = async move {
-        let outcome = zen_agents::APPROVAL_TURN
+        let outcome = zen_plugin::tools::approval_hook::WATCHDOG_RENEWAL
             .scope(
-                Some(turn_scope),
-                executor.execute_stream(&mut ctx, &prompt, &mut callback),
+                std::cell::RefCell::new(Some(renewal)),
+                zen_agents::APPROVAL_TURN.scope(
+                    Some(turn_scope),
+                    zen_agents::plan_task::PLAN_PROGRESS.scope(
+                        std::cell::RefCell::new(Some(plan_progress)),
+                        executor.execute_stream(&mut ctx, &prompt, &mut callback),
+                    ),
+                ),
             )
             .await;
         (outcome, ctx)
@@ -1249,7 +1298,29 @@ pub async fn turn_with(
             () = cancelled => Err(CancelReason::Client),
         }
     };
-    let outcome = tokio::time::timeout(watchdog, raced).await;
+    // W9.5-F3 guard loop: sleeps until the CURRENT deadline and re-reads
+    // the shared handle on every wake (replaces the single
+    // `tokio::time::timeout` snapshot at this site). With no renewals the
+    // deadline never moves and the loop fires exactly at the initial
+    // snapshot — byte-identical single-deadline semantics. Cancellation
+    // wins immediately via the raced arm: a renewal never fights the
+    // SIGTERM drain.
+    let guard_loop = {
+        let deadline = Arc::clone(&deadline);
+        async move {
+            loop {
+                let current = deadline.current();
+                if current <= tokio::time::Instant::now() {
+                    break;
+                }
+                tokio::time::sleep_until(current).await;
+            }
+        }
+    };
+    let outcome = tokio::select! {
+        res = raced => res,
+        () = guard_loop => Err(CancelReason::Watchdog),
+    };
 
     // Final delta drain before any terminal event so ordering holds.
     drain_pending(&record, &pending);
@@ -1257,7 +1328,7 @@ pub async fn turn_with(
 
     let mut merge_ctx: Option<SessionContext> = None;
     let result = match outcome {
-        Ok(Ok((Ok(response), ctx))) => {
+        Ok((Ok(response), ctx)) => {
             merge_ctx = Some(ctx);
             deps.guards.record_success(&session_id);
             record.set_state(TurnState::Completed);
@@ -1276,7 +1347,7 @@ pub async fn turn_with(
                 json!({ "turnId": turn_id, "response": record.final_response().unwrap_or_default() }),
             )
         }
-        Ok(Ok((Err(e), ctx))) => {
+        Ok((Err(e), ctx)) => {
             merge_ctx = Some(ctx);
             deps.guards.record_failure(&session_id);
             record.set_state(TurnState::Completed);
@@ -1287,11 +1358,11 @@ pub async fn turn_with(
             audit_turn_completed(&deps, &record, "completed");
             Err(RpcError::internal(&format!("agent execution failed: {e}")))
         }
-        Ok(Err(reason)) => {
-            finalize_cancelled_with_reason(&deps, &record, reason).await;
+        Err(CancelReason::Client) => {
+            finalize_cancelled_with_reason(&deps, &record, CancelReason::Client).await;
             Err(RpcError::internal("turn cancelled"))
         }
-        Err(_elapsed) => {
+        Err(CancelReason::Watchdog) => {
             // Watchdog fired: contains hung LLM/tool calls (design §6).
             deps.guards.record_failure(&session_id);
             record.emit_structural(
@@ -1352,6 +1423,42 @@ async fn finalize_cancelled_with_reason(
     reason: CancelReason,
 ) {
     record.set_state(TurnState::Cancelled);
+    // W6.2b (D24 §2): finalize the session's plan rows on the real
+    // terminal transition (cancel, watchdog, and drain all funnel here) —
+    // the orchestrator future is dropped on cancel, so nothing else runs
+    // to write terminal states. The registry peek keeps non-plan turns at
+    // zero DB cost; a persistence outage is fail-open and never blocks the
+    // cancel (the mark-only stale sweep is the backstop).
+    if zen_agents::plan_todos::peek_turn_plan(&record.session_id).is_some()
+        && let Some(record) = zen_agents::plan_todos::take_turn_plan(&record.session_id)
+    {
+        let finalize = async {
+            let Some(path) = zen_agents::plan_todos::resolve_state_db() else {
+                tracing::warn!(target: "zen_gateway_plan", "plan finalizer: state.db path unresolvable");
+                return;
+            };
+            let Ok(client) = zen_repo::SqliteClient::open(&path).await else {
+                tracing::warn!(target: "zen_gateway_plan", "plan finalizer: state.db unavailable");
+                return;
+            };
+            let now = chrono::Utc::now().timestamp();
+            let reason_str = match reason {
+                CancelReason::Client => "cancelled",
+                CancelReason::Watchdog => "watchdog",
+            };
+            match zen_agents::plan_todos::finalize_taken_plan(&client, &record, reason_str, now)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(target: "zen_gateway_plan", session = %record.plan_id, "plan rows finalized terminal")
+                }
+                Err(e) => {
+                    tracing::warn!(target: "zen_gateway_plan", error = %e, "plan finalizer failed (fail-open)")
+                }
+            }
+        };
+        finalize.await;
+    }
     let (kind, note) = match reason {
         CancelReason::Client => ("cancelled", "client requested"),
         CancelReason::Watchdog => ("watchdog", "watchdog deadline"),

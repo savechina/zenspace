@@ -126,6 +126,9 @@ pub fn parse_pairwise_score(reply: &str) -> Option<f32> {
 
 /// One model round-trip. Injectable so the cascade and the de-anchoring
 /// invariant are testable without a live provider.
+// async_trait's desugared `#[must_use]` futures duplicate Future's must_use —
+// clippy ≥1.99 `double_must_use`; macro output, not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait JudgeModel: Send + Sync {
     async fn complete(&self, prompt: &str) -> Result<String, String>;

@@ -1890,6 +1890,40 @@ impl GatewayConfig {
     }
 }
 
+/// The ONE live plan-claim staleness definition (W11.3/T3, SC-017 amended,
+/// SDD review F3): `2×` the resolved base turn watchdog, including the env
+/// layer. Shared by the daemon lifecycle sweep, every `claim_plan` resume
+/// fence, and the morning-brief stale display — a widened watchdog widens
+/// the fence identically (no mid-run claim steal), a shrunk one shrinks the
+/// sweep identically (no live-plan cancellation).
+///
+/// Resolution order (mirrors `zen-gateway guards::watchdog_deadline(false)`):
+/// 1. `ZEN_TURN_WATCHDOG_SECS` env override (explicit full override);
+/// 2. config `[gateway].turn_watchdog_secs` (clamped, warn-on-out-of-range);
+/// 3. [`GATEWAY_TURN_WATCHDOG_DEFAULT_SECS`] (900s ⇒ 1800s staleness).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: returns the staleness window in seconds for plan claims.
+/// - User impact: operators widening the turn watchdog no longer get their
+///   live plans' claims stolen mid-run by the resume fence.
+/// - Default: 1800 (2×900) when neither env nor config is set — the same
+///   value as `zen_repo::DEFAULT_STALE_CLAIM_SECS`, which remains the
+///   documented NON-CONFIG fallback for callers without config access.
+/// - Interaction: read live per call (config edits apply without restart);
+///   no new config key (D22) — derives from the existing watchdog knob.
+#[must_use]
+pub fn resolve_stale_claim_secs() -> i64 {
+    let base = std::env::var("ZEN_TURN_WATCHDOG_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            load_config()
+                .map(|c| c.gateway.turn_watchdog_secs_or_default())
+                .unwrap_or(GATEWAY_TURN_WATCHDOG_DEFAULT_SECS)
+        });
+    2 * base as i64
+}
+
 /// Skill sections — TOML `[skills.*]` (005-agentic-loop, T076).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -5738,5 +5772,34 @@ mod host_source_tests {
             !content.contains("default_model = \"old-model\""),
             "old model gone"
         );
+    }
+
+    /// W11.3/T3 (SC-017): the resolver honors the env override live —
+    /// 2× the override, the SAME value the sweep and the fence now share.
+    #[test]
+    fn resolve_stale_claim_secs_honors_the_env_override() {
+        // SAFETY: nextest process-per-test isolates env mutation.
+        unsafe { std::env::set_var("ZEN_TURN_WATCHDOG_SECS", "1200") };
+        assert_eq!(resolve_stale_claim_secs(), 2400, "2× the widened watchdog");
+        unsafe { std::env::set_var("ZEN_TURN_WATCHDOG_SECS", "60") };
+        assert_eq!(resolve_stale_claim_secs(), 120, "2× the shrunk watchdog");
+        unsafe { std::env::remove_var("ZEN_TURN_WATCHDOG_SECS") };
+    }
+
+    /// W11.3/T3: with no env override and no config, the resolver falls back
+    /// to 2× the default watchdog — the documented DEFAULT_STALE_CLAIM_SECS.
+    #[test]
+    fn resolve_stale_claim_secs_defaults_to_twice_the_default_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest process-per-test isolates env mutation.
+        unsafe {
+            std::env::set_var("ZEN_HOME", dir.path());
+            std::env::remove_var("ZEN_TURN_WATCHDOG_SECS");
+        }
+        assert_eq!(
+            resolve_stale_claim_secs(),
+            2 * GATEWAY_TURN_WATCHDOG_DEFAULT_SECS as i64
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
     }
 }

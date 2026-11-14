@@ -1,0 +1,15 @@
+-- W11.14 / T15 (006-agentic-orchestration, SDD review OV-2, decision D16):
+-- data backfill for the task-status vocabulary rename.
+--
+-- PURPOSE: the W6 wave renamed the completed-task vocabulary from 'ok' to
+-- 'completed' (plan_task.rs replays only status='completed' on resume). Rows
+-- written by pre-upgrade binaries still carry 'ok', so without this backfill
+-- a resume of any legacy plan re-runs every already-completed task (double
+-- spend + repeated side effects). Code-vs-spec passed review; code-vs-
+-- EXISTING-DATA was the blind spot (spec D21 §2(d) now mandates this check).
+-- USAGE: applied automatically by sqlx::migrate!() on every SqliteClient::open().
+-- EXPECTED: legacy 'ok' rows become 'completed'; all other statuses untouched.
+-- ERRORS: none — a forward-only data UPDATE (Principle XIII: additive, no
+--   schema change, no destructive rewrite). Idempotent: after the first
+--   application no 'ok' rows remain, so re-running is a no-op.
+UPDATE workflow_tasks SET status = 'completed' WHERE status = 'ok';

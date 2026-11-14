@@ -83,6 +83,72 @@ fn delegate_args() -> serde_json::Value {
     })
 }
 
+fn synthesis_audit_lines() -> Vec<serde_json::Value> {
+    audit_jsonl()
+        .into_iter()
+        .filter(|v| v["kind"] == "loop.plan.synthesis")
+        .collect()
+}
+
+// W6.5 (D21 §5): a plan turn's final answer carries the synthesis prose +
+// the deterministic block; the audit line reports the pass honestly.
+#[test]
+fn e2e_plan_turn_synthesis_runs_block_and_audits() {
+    let _guard = begin();
+    let reply = fenced_tool_call(
+        "plan.execute",
+        serde_json::json!({
+            "name": "synth-e2e",
+            "tasks": [
+                { "id": "a", "agent": "Hephaestus", "prompt": "step a" },
+                { "id": "b", "agent": "Hephaestus", "prompt": "step b", "depends_on": ["a"] }
+            ]
+        }),
+    );
+    let execution = run_turn(&reply, "run the plan and synthesize");
+    assert!(
+        execution.response.contains("Plan result"),
+        "block appended: {}",
+        execution.response
+    );
+    assert!(
+        execution.response.contains("verdict: plan_approved="),
+        "verdict line: {}",
+        execution.response
+    );
+    let synthesis = synthesis_audit_lines()
+        .into_iter()
+        .last()
+        .expect("one loop.plan.synthesis line for the plan turn");
+    assert_eq!(synthesis["ok"], serde_json::json!(true), "{synthesis}");
+    // Mock = local: the Private-default session synthesizes locally, never
+    // cloud (SC-012 sensitivity routing).
+    assert_eq!(
+        synthesis["provider"],
+        serde_json::json!("mock"),
+        "{synthesis}"
+    );
+}
+
+// W6.5: a no-batch turn emits zero synthesis calls — no block in the
+// answer, no loop.plan.synthesis audit line at all.
+#[test]
+fn e2e_no_batch_turn_emits_no_synthesis() {
+    let _guard = begin();
+    let before = synthesis_audit_lines().len();
+    let execution = run_turn("Just a plain answer.", "nothing to plan");
+    assert!(
+        !execution.response.contains("Plan result"),
+        "no block without a batch: {}",
+        execution.response
+    );
+    assert_eq!(
+        synthesis_audit_lines().len(),
+        before,
+        "zero synthesis audit lines for a no-batch turn"
+    );
+}
+
 fn audit_jsonl() -> Vec<serde_json::Value> {
     let path = zen_core::paths::ZenPaths::detect()
         .expect("ZEN_HOME paths")
@@ -187,7 +253,7 @@ fn e2e_plan_dag_runs_tasks_persists_and_closes_out() {
     let tasks = out["tasks"].as_array().expect("tasks array");
     assert_eq!(tasks.len(), 3, "out: {out}");
     for task in tasks {
-        assert_eq!(task["status"], "ok", "task {}: {}", task["id"], out);
+        assert_eq!(task["status"], "completed", "task {}: {}", task["id"], out);
         assert!(
             task["response"]
                 .as_str()
@@ -221,7 +287,7 @@ fn e2e_plan_dag_runs_tasks_persists_and_closes_out() {
         });
     assert_eq!(plan_row.status, "completed", "plan must close out");
     assert_eq!(task_rows.len(), 3, "all task checkpoints persisted");
-    assert!(task_rows.iter().all(|t| t.status == "ok"));
+    assert!(task_rows.iter().all(|t| t.status == "completed"));
 
     // Terminal plans refuse resume (mirrors plan_task.rs unit coverage).
     let resume_reply = fenced_tool_call(
@@ -260,7 +326,16 @@ fn e2e_resume_is_claim_fenced_mid_flight() {
             // Real clock: a fake epoch would read as a stale (stealable) claim.
             let now = chrono::Utc::now().timestamp();
             repo.create_plan(plan_id, None, "{}", now).await.unwrap();
-            assert!(repo.claim_plan(plan_id, "other-run", now).await.unwrap());
+            assert!(
+                repo.claim_plan(
+                    plan_id,
+                    "other-run",
+                    now,
+                    zen_repo::DEFAULT_STALE_CLAIM_SECS
+                )
+                .await
+                .unwrap()
+            );
         });
 
     let resume_reply = fenced_tool_call(

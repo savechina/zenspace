@@ -32,6 +32,9 @@ pub mod qqbot;
 /// transport server (user decision 2026-08-24: channels dial the
 /// loopback `/api/v1` surface like any external client — FR-019/021
 /// coexistence by construction).
+// async_trait's desugared `#[must_use]` futures duplicate Future's must_use —
+// clippy ≥1.99 `double_must_use`; macro output, not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait Channel: Send + Sync {
     /// Stable channel identifier (logs/audit correlation).

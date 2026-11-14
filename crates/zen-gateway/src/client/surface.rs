@@ -58,18 +58,29 @@ pub struct TurnNotification {
 /// exceed the server watchdog (`ZEN_TURN_WATCHDOG_SECS` default, config
 /// `[gateway].turn_watchdog_secs`) so the server's own guards resolve the
 /// turn before the client abandons it.
+///
+/// W9.5-F3: the effective ceiling is no longer this frozen 960s snapshot —
+/// it is derived renewal-aware in [`turn_timeout`] (`4 × watchdog +
+/// margin`), because the server watchdog is renewable for plan turns up
+/// to `guards::PLAN_WATCHDOG_CEILING` and the client cannot know in
+/// advance whether a turn is a plan turn. This constant remains as the
+/// pre-F3 default for reference.
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(960);
 
 /// Margin the ceiling adds above the widest server watchdog
-/// (`960 default = 900 watchdog + 60`).
+/// (`960 default = 900 watchdog + 60` pre-F3; the F3 derivation applies
+/// the same margin on top of the renewal bound `4 × watchdog`).
 const CEILING_MARGIN: Duration = Duration::from_secs(60);
 
 /// Effective turn ceiling: [`TURN_TIMEOUT`] unless `ZEN_TURN_TIMEOUT_SECS`
-/// overrides it (parsed once per process); otherwise config-derived
-/// `max(base, local probe) + CEILING_MARGIN` so the invariant
-/// "ceiling > server watchdog" holds with the same configs the daemon
-/// reads (local probe scales both sides together).
-fn turn_timeout() -> Duration {
+/// overrides it (parsed once per process); otherwise the renewal-aware
+/// derivation [`derive_turn_ceiling`] computes `4 × max(base, local probe)
+/// + CEILING_MARGIN` from the same config keys the daemon reads, so the
+/// invariant "client ceiling > server watchdog" holds under plan-turn
+/// watchdog renewal too (W9.5-F3: deadline-aware for plan turns rather
+/// than a frozen per-process snapshot).
+#[doc(hidden)]
+pub fn turn_timeout() -> Duration {
     static OVERRIDE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *OVERRIDE.get_or_init(|| {
         if let Some(v) = std::env::var("ZEN_TURN_TIMEOUT_SECS")
@@ -78,16 +89,30 @@ fn turn_timeout() -> Duration {
         {
             return Duration::from_secs(v);
         }
-        let base = Duration::from_secs(crate::server::guards::base_watchdog_secs());
-        let effective = if crate::server::guards::local_llm_reachable_cached() {
-            base.max(Duration::from_secs(
-                crate::server::guards::local_watchdog_secs(),
-            ))
-        } else {
-            base
-        };
-        effective + CEILING_MARGIN
+        derive_turn_ceiling(
+            crate::server::guards::base_watchdog_secs(),
+            crate::server::guards::local_watchdog_secs(),
+            crate::server::guards::local_llm_reachable_cached(),
+        )
     })
+}
+
+/// Pure renewal-aware ceiling derivation (W9.5-F3, `#[doc(hidden)]` test
+/// seam — the `set_local_llm_probe_override` precedent): the client turn
+/// ceiling covers the server's plan-turn watchdog renewal bound
+/// (`guards::PLAN_WATCHDOG_CEILING = 4 × watchdog`) plus the same
+/// response margin, so `client ceiling > watchdog` holds at defaults AND
+/// under the renewal ceiling.
+#[doc(hidden)]
+#[must_use]
+pub fn derive_turn_ceiling(base_secs: u64, local_secs: u64, local_reachable: bool) -> Duration {
+    let effective = if local_reachable {
+        base_secs.max(local_secs)
+    } else {
+        base_secs
+    };
+    Duration::from_secs(effective) * crate::server::guards::PLAN_WATCHDOG_CEILING_MULTIPLIER
+        + CEILING_MARGIN
 }
 
 /// Link states surfaced to UI banners (contracts/04 §Degraded-mode UX,

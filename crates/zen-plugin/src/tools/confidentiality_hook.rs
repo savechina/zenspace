@@ -197,11 +197,17 @@ impl ToolDispatchHook for ConfidentialityHook {
         &self,
         invocation: &ToolInvocation,
     ) -> Result<ToolDispatchAction, KernelError> {
-        let sensitivity = self
-            .sensitivity
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or(Sensitivity::Public);
+        // D30 (F1+OV-1): the turn-scoped TurnContext is the sanctioned
+        // source on the turn path — a concurrent hosted session can no
+        // longer flip this gate's policy through the shared cell. The cell
+        // remains the documented non-turn fallback (direct dispatch outside
+        // any orchestrator turn scope).
+        let sensitivity = zen_core::turn_context::current_sensitivity().unwrap_or_else(|| {
+            self.sensitivity
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or(Sensitivity::Public)
+        });
         if sensitivity == Sensitivity::Confidential && is_cloud_tool(&invocation.name) {
             return Ok(ToolDispatchAction::Skip {
                 output: json!({
@@ -244,6 +250,35 @@ mod tests {
         assert!(is_cloud_tool("network_call"));
         assert!(!is_cloud_tool("fs.read"));
         assert!(!is_cloud_tool("tier2_search"));
+    }
+
+    /// W11.1/T1 (D30, F1+OV-1) race pin: the cloud-tool gate reads the
+    /// turn-scoped TurnContext FIRST — a Confidential turn blocks cloud tools
+    /// even when a concurrent session left the shared cell at Public.
+    #[tokio::test]
+    async fn turn_context_confidential_blocks_cloud_tools_over_public_cell() {
+        // The shared cell is Public (a concurrent session's last write).
+        let hook = ConfidentialityHook::new(Sensitivity::Public);
+        let invocation = ToolInvocation {
+            name: "web.search".into(),
+            args: serde_json::json!({"query": "secret"}),
+        };
+        let ctx = zen_core::turn_context::TurnContext {
+            sensitivity: Sensitivity::Confidential,
+            knowledge: Vec::new(),
+            history: Vec::new(),
+        };
+        let action = zen_core::turn_context::TURN_CONTEXT
+            .scope(ctx, async { hook.before_invocation(&invocation).await })
+            .await
+            .unwrap();
+        assert!(
+            matches!(action, ToolDispatchAction::Skip { .. }),
+            "a Confidential turn must block cloud tools despite the Public cell"
+        );
+        // Outside the turn scope the Public cell allows the cloud tool.
+        let fallback = hook.before_invocation(&invocation).await.unwrap();
+        assert!(matches!(fallback, ToolDispatchAction::Continue));
     }
 
     #[tokio::test]

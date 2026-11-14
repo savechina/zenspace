@@ -28,6 +28,9 @@ use crate::protocol::Frame;
 /// The trait is [`async_trait`]-boxed so it is object-safe: daemons hold
 /// `Arc<dyn Transport>` and stay carrier-agnostic without generic
 /// plumbing (user decision 2026-08-23).
+// async_trait's desugared `#[must_use]` futures duplicate Future's must_use —
+// clippy ≥1.99 `double_must_use`; macro output, not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     /// Queues `frame` for delivery to the peer. Completes when accepted

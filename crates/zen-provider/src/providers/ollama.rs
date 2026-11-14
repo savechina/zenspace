@@ -1,9 +1,8 @@
 use rig_agent::AgentBuilder;
-use rig_agent::completion::Prompt;
-use rig_core::client::{CompletionClient, Nothing};
-use rig_core::completion::CompletionModel;
-use rig_core::providers::ollama;
-use rig_core::streaming::StreamedAssistantContent;
+use rig_core::completion::CompletionRequest;
+use rig_core::providers::ollama::{Ollama, OllamaConfig};
+use rig_core::streaming::{Item, StreamEvent};
+use rig_reqwest::ReqwestClient;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -25,33 +24,24 @@ impl OllamaProvider {
     /// Builds the rig Ollama client. Loopback endpoints bypass
     /// HTTP(S)_PROXY env vars: routing 127.0.0.1 through a system proxy
     /// (Privoxy et al) yields 500s and breaks every local completion.
-    fn rig_client(&self) -> Result<ollama::Client, LlmError> {
-        let http = if is_loopback_url(&self.base_url) {
-            Some(
+    ///
+    /// rig 0.46: `.completion(name)` is the OpenAI-compatible `/v1` wire
+    /// (upstream moved the default off the native `/api/chat`; the move is
+    /// adopted per DL-3). The native route survives as `native_completion`.
+    fn rig_client(&self) -> Result<Ollama, LlmError> {
+        let config = OllamaConfig::new().with_base_url(&self.base_url);
+        if is_loopback_url(&self.base_url) {
+            let http =
                 reqwest::Client::builder()
                     .no_proxy()
                     .build()
                     .map_err(|e| LlmError::Call {
                         reason: format!("Failed to build Ollama http client: {}", e),
-                    })?,
-            )
+                    })?;
+            Ok(config.connect(ReqwestClient::from(http)))
         } else {
-            None
-        };
-        match http {
-            Some(http) => ollama::Client::builder()
-                .api_key(Nothing)
-                .base_url(&self.base_url)
-                .http_client(http)
-                .build(),
-            None => ollama::Client::builder()
-                .api_key(Nothing)
-                .base_url(&self.base_url)
-                .build(),
+            Ok(config.client())
         }
-        .map_err(|e| LlmError::Call {
-            reason: format!("Failed to create Ollama client: {}", e),
-        })
     }
 
     /// D2b: per-call model override — `options.model` wins over the
@@ -68,7 +58,7 @@ impl OllamaProvider {
     ) -> Result<String, LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion_model(self.effective_model(options));
+        let model = client.completion(self.effective_model(options));
         let mut agent_builder = AgentBuilder::new(model);
         if let Some(t) = options.temperature {
             agent_builder = agent_builder.temperature(t);
@@ -82,12 +72,13 @@ impl OllamaProvider {
             reason: format!("Ollama completion failed: {}", e),
         })?;
 
+        let text = response.output();
         info!(
             model = self.effective_model(options),
-            response_len = response.len(),
+            response_len = text.len(),
             "OllamaProvider complete"
         );
-        Ok(response)
+        Ok(text)
     }
 
     pub fn complete(
@@ -131,15 +122,15 @@ impl OllamaProvider {
     ) -> Result<UsedCompletion, LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion_model(self.effective_model(options));
-        let mut request = model.completion_request(prompt);
+        let model = client.completion(self.effective_model(options));
+        let mut request = CompletionRequest::new(prompt);
         if let Some(t) = options.temperature {
             request = request.temperature(t);
         }
         if let Some(m) = options.max_tokens {
             request = request.max_tokens(m);
         }
-        let response = request.send().await.map_err(|e| LlmError::Call {
+        let response = model.call(request).await.map_err(|e| LlmError::Call {
             reason: format!("Ollama completion failed: {}", e),
         })?;
 
@@ -179,35 +170,35 @@ impl OllamaProvider {
     ) -> Result<(), LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion_model(self.effective_model(options));
+        let model = client.completion(self.effective_model(options));
 
-        let mut request = model.completion_request(prompt.to_string());
+        let mut request = CompletionRequest::new(prompt);
         if let Some(t) = options.temperature {
             request = request.temperature(t);
         }
         if let Some(m) = options.max_tokens {
             request = request.max_tokens(m);
         }
-        let request = request.build();
 
-        let mut stream = model.stream(request).await.map_err(|e| LlmError::Call {
+        let mut stream = model.stream(request).map_err(|e| LlmError::Call {
             reason: format!("Ollama stream failed: {}", e),
         })?;
 
         let mut full_response = String::new();
         while let Some(item) = stream.next().await {
             match item {
-                Ok(StreamedAssistantContent::Text(text)) => {
-                    let chunk = text.text.clone();
+                // rig 0.46 per-part events (DL-7): text deltas arrive as
+                // `StreamEvent::Text` fragments; tool-call argument fragments
+                // (`Arguments`) and reasoning are not forwarded as text.
+                Ok(Item::Event(StreamEvent::Text { text, .. })) => {
+                    let chunk = text.clone();
                     full_response.push_str(&chunk);
                     if token_tx.send(chunk).is_err() {
                         break;
                     }
                 }
-                Ok(StreamedAssistantContent::Final(_)) => break,
-                Ok(_) => {
-                    // Tool-call / reasoning deltas are not forwarded as text.
-                }
+                Ok(Item::Event(StreamEvent::End { .. })) => break,
+                Ok(_) => {}
                 Err(e) => {
                     warn!(error = %e, "Ollama streaming error");
                     break;

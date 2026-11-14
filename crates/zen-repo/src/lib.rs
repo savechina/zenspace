@@ -28,6 +28,9 @@ pub use qq_binding_repo::{QqBindingRepo, QqBindingRow};
 pub use self_model_repo::SelfModelRepo;
 pub use sessions_repo::{IndexedSession, SessionsRepo};
 pub use traits::notions::NotionsRepository;
-pub use workflow_repo::{TaskCheckpoint, WorkflowPlanRow, WorkflowRepo, WorkflowTaskRow};
+pub use workflow_repo::{
+    DEFAULT_STALE_CLAIM_SECS, DurationHistoryRow, TaskCheckpoint, TaskDraft, WorkflowPlanRow,
+    WorkflowRepo, WorkflowTaskRow,
+};
 pub mod workflow_repo;
 pub use types::*;

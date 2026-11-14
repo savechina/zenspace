@@ -80,24 +80,40 @@ const DRAIN_CHUNK_BYTES: usize = 8192;
 
 /// Lifecycle status of one background task.
 ///
-/// Terminal variants are `Completed`/`Failed`/`Timeout`/`Killed`/`Orphaned`;
-/// `Running` is the only non-terminal state. Serialized externally-tagged
-/// snake_case into `meta.json` (`{"completed": 0}`).
+/// Terminal variants are `Completed`/`Failed`/`Timeout`/`Killed`/`Expired`/
+/// `Orphaned`; `Running` is the only non-terminal state. Serialized
+/// externally-tagged snake_case into `meta.json` (`{"completed": 0}`).
+///
+/// Path mapping (W5.1, spec 006 D20 §2 — additive, not redefined): the
+/// process path (`spawn_background`) keeps every variant it had, including
+/// the boot-sweep-only `Orphaned`; the agent-future path (`spawn_async`)
+/// reuses `Completed`/`Failed`/`Timeout`-free `Killed` semantics and adds
+/// `Expired` for its wall-out and daemon-restart expiry mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Child still running.
     Running,
-    /// Child exited with the given exit code.
+    /// Child exited with the given exit code. The agent-future path reuses
+    /// this with code `0` (a future has no exit code; success is success).
     Completed(i32),
-    /// Child died without an exit code (signal) or the wait failed.
+    /// Child died without an exit code (signal), the wait failed, or the
+    /// agent future returned `Err`.
     Failed(String),
-    /// Wall-clock deadline expired; the group was SIGKILLed (D7).
+    /// Wall-clock deadline expired; the process group was SIGKILLed (D7).
+    /// Process path only — the agent-future path uses [`TaskStatus::Expired`].
     Timeout,
-    /// Killed via `shell.kill` / `kill_all` (SIGTERM → 3s → SIGKILL group).
+    /// Killed via `shell.kill` / `kill_all` (SIGTERM → 3s → SIGKILL group;
+    /// the agent-future path aborts the handle instead of signalling).
     Killed,
-    /// Boot sweep found a `running` meta.json with no live registry entry
-    /// (daemon crash) — mark-only, never signalled (D1).
+    /// Agent-future task exceeded its wall budget (GC tick) or was found
+    /// running after a daemon restart (boot sweep) — marked WITHOUT
+    /// aborting a live handle (the future may still finish; its late result
+    /// is dropped and the parent is told to re-delegate). Never produced by
+    /// the process path (which uses `Timeout`/`Orphaned`).
+    Expired,
+    /// Boot sweep found a `running` process-path meta with no live registry
+    /// entry (daemon crash) — mark-only, never signalled (D1).
     Orphaned,
 }
 
@@ -110,7 +126,7 @@ impl TaskStatus {
 
     /// Lowercase machine/human label used in tool result JSON and audit
     /// lines (`running`, `completed`, `failed`, `timeout`, `killed`,
-    /// `orphaned`).
+    /// `expired`, `orphaned`).
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -119,6 +135,7 @@ impl TaskStatus {
             TaskStatus::Failed(_) => "failed",
             TaskStatus::Timeout => "timeout",
             TaskStatus::Killed => "killed",
+            TaskStatus::Expired => "expired",
             TaskStatus::Orphaned => "orphaned",
         }
     }
@@ -337,6 +354,17 @@ pub struct TaskMeta {
     pub stdout_path: String,
     /// Absolute path of the stderr capture file.
     pub stderr_path: String,
+    /// Owning agent name (agent-future path only; `None` on the process
+    /// path so process-path serialization stays byte-identical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Fan-out slot index (W5.2 batch admissions only; omitted otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_index: Option<usize>,
+    /// Agent-future result payload (spec 006 D20 §2: the result lives in
+    /// meta; `None` until the future's own terminal transition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
 impl TaskMeta {
@@ -357,16 +385,24 @@ impl TaskMeta {
             truncated: snapshot.truncated,
             stdout_path: stdout_path.to_string_lossy().into_owned(),
             stderr_path: stderr_path.to_string_lossy().into_owned(),
+            // Additive agent-future fields (W5.1): the process path never
+            // sets them, so its serialized bytes stay identical.
+            agent: None,
+            task_index: None,
+            result: None,
         }
     }
 }
 
 /// One registry entry.
 ///
-/// `child` is the D8 strong hold: the entry (and the wait task's clone) keep
-/// the `tokio::process::Child` alive, which keeps the pipe handles open past
-/// the spawning scope. Dropping the Child closes the pipes and SIGPIPEs the
-/// child — entries are therefore never removed in v1.
+/// `child` is the D8 strong hold on the process path: the entry (and the
+/// wait task's clone) keep the `tokio::process::Child` alive, which keeps
+/// the pipe handles open past the spawning scope. Dropping the Child closes
+/// the pipes and SIGPIPEs the child — entries are therefore never removed
+/// in v1. Agent-future entries (W5.1) hold `child: None` and an
+/// [`tokio::task::AbortHandle`] instead — killing them aborts the future;
+/// there is nothing to signal.
 #[derive(Clone)]
 struct TaskEntry {
     session_id: String,
@@ -376,15 +412,32 @@ struct TaskEntry {
     // D8 strong hold: never READ, but keeping the Child alive keeps the pipe
     // handles open past the spawning scope — dropping it would close the
     // pipes and SIGPIPE the child. Entries are therefore never removed in v1.
+    // `None` on the agent-future path (no process; kill aborts instead).
     #[allow(dead_code)]
-    child: Arc<tokio::sync::Mutex<tokio::process::Child>>,
+    child: Option<Arc<tokio::sync::Mutex<tokio::process::Child>>>,
     /// Set by the wait task once `child.wait()` returned — the kill
     /// escalation thread checks it before SIGKILLing the (possibly dead)
-    /// group.
+    /// group. Always `false` on the agent-future path (nothing is reaped).
     reaped: Arc<AtomicBool>,
     /// Per-session push cursor (D4): set when `take_status_changes` has
     /// delivered this task's terminal transition to its owner.
     notified: Arc<AtomicBool>,
+    /// Agent-future abort handle (`None` on the process path): kill/drain
+    /// abort the future; expiry marks `Expired` WITHOUT aborting (W5.1
+    /// acceptance).
+    abort_handle: Option<tokio::task::AbortHandle>,
+    /// Owning agent name (agent-future path; `None` for process entries) —
+    /// preserved into every meta rewrite so the unified schema keeps the
+    /// boot-sweep discriminator.
+    agent: Option<String>,
+    /// Fan-out slot index (agent-future batch admissions; `None` otherwise),
+    /// preserved into every meta rewrite.
+    task_index: Option<usize>,
+    /// Agent-future result stash: the Ok payload written by the completion
+    /// wrapper under the SAME snapshot-lock critical section as the status
+    /// transition, so a collector that observes a terminal status never
+    /// races the meta.json rewrite (W5.3). `None` on failure/late results.
+    async_result: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
 /// Process-global background task registry (D8: de facto daemon-scoped —
@@ -515,9 +568,13 @@ impl TaskRegistry {
                 output_dir: output_dir.clone(),
                 limits: *limits,
                 snapshot: Arc::clone(&snapshot),
-                child: Arc::clone(&child),
+                child: Some(Arc::clone(&child)),
                 reaped: Arc::clone(&reaped),
                 notified: Arc::new(AtomicBool::new(false)),
+                abort_handle: None,
+                agent: None,
+                task_index: None,
+                async_result: Arc::new(Mutex::new(None)),
             };
             map.insert(task_id.clone(), entry);
             (
@@ -655,6 +712,229 @@ impl TaskRegistry {
         Ok(initial)
     }
 
+    /// Register and launch one background agent future (W5.1, spec 006 D20
+    /// §2): the agent-future sibling of [`TaskRegistry::spawn_background`].
+    ///
+    /// GIVEN a caller-supplied uuid-shaped `task_id`, the owning
+    /// `session_id`, the delegating `agent` name, the same
+    /// [`BackgroundLimits`] caps, and a future producing the task result,
+    /// WHEN the drain flag is clear, the concurrency gate passes, the id is
+    /// valid and unused, and the output dir is creatable,
+    /// THEN the entry is registered, an initial `meta.json` (unified schema,
+    /// `agent` set, `result` absent) lands BEFORE the future's first await,
+    /// and the returned [`tokio::task::JoinHandle`] yields the future's
+    /// `Ok` payload. On completion the status transitions
+    /// `Ok → Completed(0)` / `Err → Failed` (unless a kill/expire already
+    /// recorded a terminal status — never overwritten) and the meta is
+    /// rewritten with the result payload. There is NO process: nothing is
+    /// ever signalled, `stdout`/`stderr` capture files are unused (the
+    /// conventional paths are still recorded so one schema serves both
+    /// paths), and the GC marks wall-out expiry as [`TaskStatus::Expired`]
+    /// WITHOUT aborting the live handle.
+    ///
+    /// The concurrency slot is reserved under the same single
+    /// entries-lock critical section as the process path, and `task_id`
+    /// must pass the same uuid-shape validation (it reaches
+    /// [`meta_path`]).
+    ///
+    /// # Errors
+    /// - Drain flag set ([`is_draining`]).
+    /// - Invalid or duplicate `task_id`.
+    /// - Concurrency gate: `live_count() >= limits.max_concurrent`.
+    /// - Output-dir creation failure.
+    ///
+    /// Must be called from within a tokio runtime.
+    pub fn spawn_async<F>(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        agent: &str,
+        task_index: Option<usize>,
+        limits: &BackgroundLimits,
+        future: F,
+    ) -> anyhow::Result<tokio::task::JoinHandle<serde_json::Value>>
+    where
+        F: std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send + 'static,
+    {
+        if is_draining() {
+            bail!(
+                "background task rejected: the daemon is shutting down (drain \
+                 in progress); no new background tasks may be spawned"
+            );
+        }
+        if !is_valid_task_id(task_id) {
+            bail!(
+                "invalid background task id `{task_id}`: expected a uuid v4 \
+                 (simple or hyphenated)"
+            );
+        }
+
+        let (snapshot, output_dir, reaped, async_result) = {
+            // Atomic reservation (review fix g parity): ONE critical
+            // section covers the live-count check, the duplicate-id check,
+            // and the entry insert.
+            let mut map = lock_ok(&self.entries, "registry entries");
+            let live = map
+                .values()
+                .filter(|e| lock_ok(&e.snapshot, "task snapshot").status == TaskStatus::Running)
+                .count();
+            if live >= limits.max_concurrent {
+                bail!(
+                    "background task rejected: {live} live tasks already at the \
+                     max_concurrent limit of {}; collect or kill existing tasks \
+                     first",
+                    limits.max_concurrent
+                );
+            }
+            if map.contains_key(task_id) {
+                bail!("background task id {task_id} is already registered");
+            }
+
+            let output_dir = user_root()
+                .join(zen_core::constants::LOGS_DIR)
+                .join("tasks")
+                .join(task_id);
+            std::fs::create_dir_all(&output_dir).map_err(|e| {
+                anyhow!(
+                    "failed to create task output dir {}: {e}",
+                    output_dir.display()
+                )
+            })?;
+
+            let started_at_ms = now_ms();
+            let snapshot = Arc::new(Mutex::new(TaskSnapshot {
+                task_id: task_id.to_string(),
+                session_id: session_id.to_string(),
+                // No child process on the agent-future path.
+                pid: 0,
+                command_digest: truncate_char_safe(&format!("delegate:{agent}"), 80),
+                output_dir: output_dir.to_string_lossy().into_owned(),
+                status: TaskStatus::Running,
+                started_at_ms,
+                ended_at_ms: None,
+                bytes_stdout: 0,
+                bytes_stderr: 0,
+                truncated: false,
+            }));
+
+            let reaped = Arc::new(AtomicBool::new(false));
+            let async_result = Arc::new(Mutex::new(None));
+            let async_result_for_wrapper = Arc::clone(&async_result);
+            let entry = TaskEntry {
+                session_id: session_id.to_string(),
+                output_dir: output_dir.clone(),
+                limits: *limits,
+                snapshot: Arc::clone(&snapshot),
+                child: None,
+                reaped: Arc::clone(&reaped),
+                notified: Arc::new(AtomicBool::new(false)),
+                abort_handle: None,
+                agent: Some(agent.to_string()),
+                task_index,
+                async_result,
+            };
+            map.insert(task_id.to_string(), entry);
+            (snapshot, output_dir, reaped, async_result_for_wrapper)
+        };
+
+        // Initial meta BEFORE returning (design Section 5 spawn contract
+        // parity): the boot sweep and the collect fallback must see the
+        // task even if the daemon dies right after admission. The
+        // conventional stdout/stderr capture paths are recorded (files
+        // never created on this path) so `meta_capture_paths_are_safe`
+        // keeps validating.
+        let stdout_path = meta_stdout_path(&output_dir);
+        let stderr_path = meta_stderr_path(&output_dir);
+        let initial_snapshot = lock_ok(&snapshot, "task snapshot").clone();
+        write_async_meta(
+            &output_dir,
+            &initial_snapshot,
+            agent,
+            task_index,
+            None,
+            &stdout_path,
+            &stderr_path,
+        );
+
+        // Agent task: drives the future to completion, performs the
+        // terminal transition (unless a kill/expire already recorded one —
+        // an Expired task's late result is dropped; the parent re-delegates,
+        // spec D20 §8) and rewrites meta.json with the payload. Nothing is
+        // signalled; the returned JoinHandle is the only cancellation path.
+        let wait_dir = output_dir.clone();
+        let wait_agent = agent.to_string();
+        let wait_snapshot = Arc::clone(&snapshot);
+        let wait_async_result = Arc::clone(&async_result);
+        let join = tokio::spawn(async move {
+            let outcome = future.await;
+            let (result, terminal_snapshot) = {
+                let mut guard = lock_ok(&wait_snapshot, "task snapshot");
+                let result = match outcome {
+                    Ok(value) => {
+                        if !guard.status.is_terminal() {
+                            guard.status = TaskStatus::Completed(0);
+                            guard.ended_at_ms = Some(now_ms());
+                            // Same-lock stash (W5.3): a collector observing
+                            // the Completed status sees the payload without
+                            // racing the async meta.json rewrite.
+                            *lock_ok(&wait_async_result, "task async result") = Some(value.clone());
+                            Some(value)
+                        } else {
+                            // Expired/killed earlier: keep the recorded
+                            // terminal status, drop the late result.
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        if !guard.status.is_terminal() {
+                            guard.status = TaskStatus::Failed(format!("delegate task failed: {e}"));
+                            guard.ended_at_ms = Some(now_ms());
+                        }
+                        None
+                    }
+                };
+                (result, guard.clone())
+            };
+            // The handle's yield: the Ok payload when this completion drove
+            // the transition; Null on failure or when a kill/expire already
+            // owned the terminal status (collectors read meta, not this).
+            let ret = result.clone().unwrap_or(serde_json::Value::Null);
+            // Blocking small-file I/O off the async worker (house
+            // spawn_blocking discipline).
+            let _ = tokio::task::spawn_blocking(move || {
+                write_async_meta(
+                    &wait_dir,
+                    &terminal_snapshot,
+                    &wait_agent,
+                    task_index,
+                    result,
+                    &meta_stdout_path(&wait_dir),
+                    &meta_stderr_path(&wait_dir),
+                )
+            })
+            .await;
+            ret
+        });
+
+        // Wire the abort handle (kill/drain paths) — a kill racing BEFORE
+        // this line marks `Killed` without aborting; the future's own
+        // completion then never overwrites the terminal status, so the
+        // observable contract is unchanged.
+        if let Some(entry) = lock_ok(&self.entries, "registry entries").get_mut(task_id) {
+            entry.abort_handle = Some(join.abort_handle());
+        }
+        let _ = reaped; // process-path parity: never set on the async path
+
+        tracing::info!(
+            target: "zen_background",
+            task_id = %task_id,
+            session = %session_id,
+            agent = %agent,
+            "background agent task spawned"
+        );
+        Ok(join)
+    }
+
     /// Cheap clone of one task's snapshot, or `None` for an unknown id.
     #[must_use]
     pub fn snapshot(&self, task_id: &str) -> Option<TaskSnapshot> {
@@ -722,6 +1002,95 @@ impl TaskRegistry {
             .collect()
     }
 
+    /// Delegate-ness discriminator (W5.4): true when the task was admitted
+    /// through the agent-future path (no child process, delegate digest).
+    /// Registry miss falls back to the on-disk meta (daemon-restart case).
+    #[must_use]
+    pub fn is_delegate_task(&self, task_id: &str) -> bool {
+        let map = lock_ok(&self.entries, "registry entries");
+        if let Some(entry) = map.get(task_id) {
+            let guard = lock_ok(&entry.snapshot, "task snapshot");
+            return entry.child.is_none()
+                && (guard.command_digest.starts_with("delegate:") || entry.agent.is_some());
+        }
+        read_meta(task_id).is_some_and(|m| m.pid == 0 && m.agent.is_some())
+    }
+
+    /// Unified D25 A5 notice payload for a terminal delegate task (W5.4):
+    /// `{task_index, agent, status, response|error}` — `model_source` is
+    /// injected by the caller (it lives in the admission book, not the
+    /// registry). Registry miss falls back to `meta.json`. `None` when the
+    /// id is unknown everywhere.
+    #[must_use]
+    pub fn delegate_notice_payload(&self, task_id: &str) -> Option<serde_json::Value> {
+        let mut payload = serde_json::Map::new();
+        let mut have = false;
+        {
+            let map = lock_ok(&self.entries, "registry entries");
+            if let Some(entry) = map.get(task_id) {
+                have = true;
+                let guard = lock_ok(&entry.snapshot, "task snapshot");
+                payload.insert(
+                    "task_index".into(),
+                    entry
+                        .task_index
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                payload.insert(
+                    "agent".into(),
+                    entry
+                        .agent
+                        .clone()
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                payload.insert(
+                    "status".into(),
+                    serde_json::Value::from(guard.status.as_str()),
+                );
+                if guard.status.is_terminal() {
+                    let stash = lock_ok(&entry.async_result, "task async result").clone();
+                    let (response, error) = outcome_parts(&guard.status, stash);
+                    if let Some(v) = response {
+                        payload.insert("response".into(), v);
+                    }
+                    if let Some(e) = error {
+                        payload.insert("error".into(), serde_json::Value::from(e));
+                    }
+                }
+            }
+        }
+        if !have {
+            let meta = read_meta(task_id)?;
+            payload.insert(
+                "task_index".into(),
+                meta.task_index
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            payload.insert(
+                "agent".into(),
+                meta.agent
+                    .clone()
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            payload.insert(
+                "status".into(),
+                serde_json::Value::from(meta.status.as_str()),
+            );
+            let (response, error) = outcome_parts(&meta.status, meta.result.clone());
+            if let Some(v) = response {
+                payload.insert("response".into(), v);
+            }
+            if let Some(e) = error {
+                payload.insert("error".into(), serde_json::Value::from(e));
+            }
+        }
+        Some(serde_json::Value::Object(payload))
+    }
+
     /// Kill a task: SIGTERM the process group, escalate to SIGKILL after
     /// [`KILL_ESCALATION_SECS`] if the group is still alive, mark the
     /// status `Killed` and rewrite meta.json.
@@ -758,6 +1127,26 @@ impl TaskRegistry {
             (guard.pid, guard.clone(), !reaped)
         };
 
+        if entry.child.is_none() {
+            // Agent-future path (W5.1): abort the handle — there is no
+            // process group, and pid 0 would target OUR OWN group. The
+            // future's own completion can no longer overwrite the terminal
+            // status.
+            if let Some(handle) = &entry.abort_handle {
+                handle.abort();
+            }
+            write_async_meta(
+                &entry.output_dir,
+                &snapshot,
+                entry.agent.as_deref().unwrap_or("unknown"),
+                entry.task_index,
+                None,
+                &meta_stdout_path(&entry.output_dir),
+                &meta_stderr_path(&entry.output_dir),
+            );
+            tracing::info!(target: "zen_background", task_id = %task_id, "background agent task killed (future aborted)");
+            return Ok(snapshot);
+        }
         if signal {
             kill_group(pid, libc::SIGTERM);
             spawn_kill_escalation(pid);
@@ -772,6 +1161,95 @@ impl TaskRegistry {
         );
         tracing::info!(target: "zen_background", task_id = %task_id, pid, "background task killed (SIGTERM, escalation armed)");
         Ok(snapshot)
+    }
+
+    /// Yield-wait collect for an agent-future task (W5.3 `delegate.collect`).
+    ///
+    /// Polls the task snapshot on a fixed 25ms tick until a terminal state
+    /// or `wait_ms` elapses — never a busy-spin, never aborts. The Ok
+    /// payload comes from the same-lock stash (no meta rewrite race); a
+    /// registry-miss falls back to the on-disk `meta.json` (daemon-restart
+    /// case). Idempotent: terminal states are stable and repeated collects
+    /// observe the same status.
+    ///
+    /// # Errors
+    /// Unknown id with no `meta.json` fallback.
+    pub async fn collect_delegate(
+        &self,
+        task_id: &str,
+        wait_ms: u64,
+    ) -> anyhow::Result<DelegateCollect> {
+        const POLL_TICK_MS: u64 = 25;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        loop {
+            let entry = lock_ok(&self.entries, "registry entries")
+                .get(task_id)
+                .cloned();
+            if let Some(entry) = entry {
+                let (status, result, session_id) = {
+                    let guard = lock_ok(&entry.snapshot, "task snapshot");
+                    let result = if guard.status.is_terminal() {
+                        lock_ok(&entry.async_result, "task async result").clone()
+                    } else {
+                        None
+                    };
+                    (guard.status.clone(), result, entry.session_id.clone())
+                };
+                if status.is_terminal() {
+                    let (response, error) = outcome_parts(&status, result);
+                    return Ok(DelegateCollect {
+                        task_id: task_id.to_string(),
+                        status: status.as_str().to_string(),
+                        response,
+                        error,
+                        session_id: Some(session_id),
+                        agent: entry.agent.clone(),
+                        task_index: entry.task_index,
+                        from_meta_fallback: false,
+                    });
+                }
+            } else {
+                // Registry miss → meta.json fallback (daemon restart).
+                if let Some(meta) = read_meta(task_id) {
+                    let (response, error) = outcome_parts(&meta.status, meta.result.clone());
+                    return Ok(DelegateCollect {
+                        task_id: task_id.to_string(),
+                        status: meta.status.as_str().to_string(),
+                        response,
+                        error,
+                        session_id: Some(meta.session_id.clone()),
+                        agent: meta.agent.clone(),
+                        task_index: meta.task_index,
+                        from_meta_fallback: true,
+                    });
+                }
+                return Err(anyhow!(
+                    "unknown task_id {task_id}: no registry entry and no meta.json under logs/tasks/"
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                let agent_task_index = lock_ok(&self.entries, "registry entries")
+                    .get(task_id)
+                    .map(|e| (e.agent.clone(), e.task_index));
+                return Ok(DelegateCollect {
+                    task_id: task_id.to_string(),
+                    status: "running".to_string(),
+                    response: None,
+                    error: None,
+                    session_id: None,
+                    agent: agent_task_index.as_ref().and_then(|(a, _)| a.clone()),
+                    task_index: agent_task_index.and_then(|(_, t)| t),
+                    from_meta_fallback: false,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            tokio::time::timeout(
+                std::cmp::min(std::time::Duration::from_millis(POLL_TICK_MS), remaining),
+                std::future::pending::<()>(),
+            )
+            .await
+            .unwrap_or(());
+        }
     }
 
     /// GC-tick deadline hook (D7): SIGKILL the group of every Running task
@@ -795,6 +1273,7 @@ impl TaskRegistry {
             .collect();
         let mut ids = Vec::with_capacity(expired.len());
         for entry in expired {
+            let is_async = entry.child.is_none();
             let (pid, snapshot, signal) = {
                 let mut guard = lock_ok(&entry.snapshot, "task snapshot");
                 if guard.status != TaskStatus::Running {
@@ -803,10 +1282,33 @@ impl TaskRegistry {
                 // Pid-reuse guard (review fix b): an already-reaped child's
                 // pid may be recycled — never signal it.
                 let reaped = entry.reaped.load(Ordering::SeqCst);
-                guard.status = TaskStatus::Timeout;
+                // W5.1 expiry mapping: the agent-future path marks
+                // `Expired` (spec 006 D20 §2) WITHOUT aborting the live
+                // handle (acceptance) — the future may still finish; its
+                // late result is dropped and the parent re-delegates. The
+                // process path keeps `Timeout` + SIGKILL (D7).
+                guard.status = if is_async {
+                    TaskStatus::Expired
+                } else {
+                    TaskStatus::Timeout
+                };
                 guard.ended_at_ms = Some(now_ms);
                 (guard.pid, guard.clone(), !reaped)
             };
+            if is_async {
+                write_async_meta(
+                    &entry.output_dir,
+                    &snapshot,
+                    entry.agent.as_deref().unwrap_or("unknown"),
+                    entry.task_index,
+                    None,
+                    &meta_stdout_path(&entry.output_dir),
+                    &meta_stderr_path(&entry.output_dir),
+                );
+                tracing::warn!(target: "zen_background", task_id = %snapshot.task_id, "background agent task expired (deadline) — marked expired, handle NOT aborted");
+                ids.push(snapshot.task_id.clone());
+                continue;
+            }
             // Deadline is a hard kill (D7): no SIGTERM grace window.
             if signal {
                 kill_group(pid, libc::SIGKILL);
@@ -844,6 +1346,7 @@ impl TaskRegistry {
             .collect();
         let mut ids = Vec::with_capacity(live.len());
         for entry in live {
+            let is_async = entry.child.is_none();
             let (pid, snapshot) = {
                 let mut guard = lock_ok(&entry.snapshot, "task snapshot");
                 if guard.status != TaskStatus::Running {
@@ -853,6 +1356,24 @@ impl TaskRegistry {
                 guard.ended_at_ms = Some(now_ms());
                 (guard.pid, guard.clone())
             };
+            if is_async {
+                // Agent-future path (W5.1): abort — nothing to signal.
+                if let Some(handle) = &entry.abort_handle {
+                    handle.abort();
+                }
+                write_async_meta(
+                    &entry.output_dir,
+                    &snapshot,
+                    entry.agent.as_deref().unwrap_or("unknown"),
+                    entry.task_index,
+                    None,
+                    &meta_stdout_path(&entry.output_dir),
+                    &meta_stderr_path(&entry.output_dir),
+                );
+                tracing::info!(target: "zen_background", task_id = %snapshot.task_id, reason = %reason, "background agent task killed by drain (future aborted)");
+                ids.push(snapshot.task_id.clone());
+                continue;
+            }
             kill_group(pid, libc::SIGTERM);
             spawn_kill_escalation(pid);
             write_meta(
@@ -892,6 +1413,7 @@ impl TaskRegistry {
             .collect();
         let mut ids = Vec::with_capacity(live.len());
         for (entry, pid) in &live {
+            let is_async = entry.child.is_none();
             let snapshot = {
                 let mut guard = lock_ok(&entry.snapshot, "task snapshot");
                 if guard.status != TaskStatus::Running {
@@ -901,6 +1423,26 @@ impl TaskRegistry {
                 guard.ended_at_ms = Some(now_ms());
                 guard.clone()
             };
+            if is_async {
+                // Agent-future path (W5.1): abort — nothing to signal, and
+                // the blocking drain's thread-based escalation has no
+                // meaning for futures.
+                if let Some(handle) = &entry.abort_handle {
+                    handle.abort();
+                }
+                write_async_meta(
+                    &entry.output_dir,
+                    &snapshot,
+                    entry.agent.as_deref().unwrap_or("unknown"),
+                    entry.task_index,
+                    None,
+                    &meta_stdout_path(&entry.output_dir),
+                    &meta_stderr_path(&entry.output_dir),
+                );
+                tracing::info!(target: "zen_background", task_id = %snapshot.task_id, reason = %reason, "background agent task killed by blocking drain (future aborted)");
+                ids.push(snapshot.task_id.clone());
+                continue;
+            }
             kill_group(*pid, libc::SIGTERM);
             write_meta(
                 &entry.output_dir,
@@ -1057,9 +1599,16 @@ pub fn sweep_orphans_on_boot() -> usize {
                 }
                 // Two-tier decision (D1 amended): dead group ⇒ mark-only;
                 // verified-ours live group ⇒ SIGKILL; unverifiable live
-                // group ⇒ mark-only (pid-reuse fail-safe).
+                // group ⇒ mark-only (pid-reuse fail-safe). W5.1: the
+                // agent-future path has NO process group at all — its
+                // running metas are marked `Expired` (spec D20 §8 restart
+                // expiry; the parent re-delegates) with no probing and no
+                // signalling; `Orphaned` stays the process-path value.
+                let is_async = meta.agent.is_some();
                 #[cfg(unix)]
-                let (group_alive, verified_ours) = {
+                let (group_alive, verified_ours) = if is_async {
+                    (false, false)
+                } else {
                     // SAFETY: kill(pid, 0) is a pure permission/existence
                     // probe — no signal is delivered. Negative pid targets
                     // the process group led by the recorded child pid.
@@ -1072,7 +1621,11 @@ pub fn sweep_orphans_on_boot() -> usize {
                 #[cfg(not(unix))]
                 let (group_alive, verified_ours) = (false, false);
 
-                meta.status = TaskStatus::Orphaned;
+                meta.status = if is_async {
+                    TaskStatus::Expired
+                } else {
+                    TaskStatus::Orphaned
+                };
                 meta.ended_at_ms = Some(now_ms());
                 match serde_json::to_vec(&meta) {
                     Ok(bytes) => {
@@ -1080,11 +1633,18 @@ pub fn sweep_orphans_on_boot() -> usize {
                             tracing::warn!(
                                 path = %meta_path.display(),
                                 error = %e,
-                                "boot sweep: failed to rewrite orphaned meta (kept running)"
+                                "boot sweep: failed to rewrite expired/orphaned meta (kept running)"
                             );
                             continue;
                         }
-                        if verified_ours {
+                        if is_async {
+                            tracing::warn!(
+                                target: "zen_background",
+                                task_id = %meta.task_id,
+                                agent = meta.agent.as_deref().unwrap_or("unknown"),
+                                "boot sweep: running agent-future meta marked expired (daemon restart — parent must re-delegate)"
+                            );
+                        } else if verified_ours {
                             // SAFETY: the group is probed live AND its
                             // leader's kernel-recorded start time matches our
                             // spawn record within tolerance — identity is
@@ -1159,6 +1719,53 @@ pub fn meta_path(task_id: &str) -> PathBuf {
 
 /// Read and parse a task's meta.json, or `None` when absent/corrupt
 /// (structured fallback for the collect/kill tools — never a panic on
+/// One task's collect snapshot for `delegate.collect` (W5.3) — the
+/// registry-side half of the unified D25 A5 payload shape. `status`
+/// mirrors [`TaskStatus::as_str`] labels; `response` carries the Ok
+/// payload only for terminal-success collects; `error` carries the
+/// failure reason otherwise.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DelegateCollect {
+    /// Registry task id.
+    pub task_id: String,
+    /// Status label (`running`/`completed`/`failed`/`killed`/`timeout`/`expired`).
+    pub status: String,
+    /// Ok payload (terminal success only; `None` otherwise).
+    pub response: Option<serde_json::Value>,
+    /// Failure reason (terminal non-success or `None`).
+    pub error: Option<String>,
+    /// Owning session id (`None` on a still-running collect timeout).
+    pub session_id: Option<String>,
+    /// Owning agent name (agent-future path).
+    pub agent: Option<String>,
+    /// Fan-out slot index (batch admissions).
+    pub task_index: Option<usize>,
+    /// True when read from `meta.json` after a registry miss
+    /// (daemon-restart case) — surfaced for observability.
+    pub from_meta_fallback: bool,
+}
+
+/// Split a terminal task outcome into the unified `(response, error)`
+/// collect shape: Completed + non-null payload ⇒ response; Completed
+/// without payload ⇒ both empty; Failed ⇒ error message; any other
+/// terminal label (killed/timeout/expired/orphaned) ⇒ explanatory error.
+fn outcome_parts(
+    status: &TaskStatus,
+    result: Option<serde_json::Value>,
+) -> (Option<serde_json::Value>, Option<String>) {
+    match status {
+        TaskStatus::Completed(_) => {
+            if result.as_ref().is_some_and(|v| !v.is_null()) {
+                (result, None)
+            } else {
+                (None, None)
+            }
+        }
+        TaskStatus::Failed(msg) => (None, Some(msg.clone())),
+        other => (None, Some(format!("task ended as {}", other.as_str()))),
+    }
+}
+
 /// external data).
 #[must_use]
 pub fn read_meta(task_id: &str) -> Option<TaskMeta> {
@@ -1209,6 +1816,37 @@ fn write_meta(output_dir: &Path, snapshot: &TaskSnapshot, stdout_path: &Path, st
     let path = output_dir.join("meta.json");
     if let Err(e) = write_atomic(&path, &bytes) {
         tracing::warn!(path = %path.display(), error = %e, "meta.json write failed");
+    }
+}
+
+/// Persist the agent-future meta view (W5.1): the unified schema with
+/// `agent`/`task_index`/`result` set — atomic (tmp + fsync + rename),
+/// failures warn and never abort. `agent` is the boot sweep's
+/// async-vs-process discriminator, so EVERY rewrite on this path must
+/// preserve it (never route an async entry through [`write_meta`]).
+fn write_async_meta(
+    output_dir: &Path,
+    snapshot: &TaskSnapshot,
+    agent: &str,
+    task_index: Option<usize>,
+    result: Option<serde_json::Value>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) {
+    let mut meta = TaskMeta::from_snapshot(snapshot, stdout_path, stderr_path);
+    meta.agent = Some(agent.to_string());
+    meta.task_index = task_index;
+    meta.result = result;
+    let bytes = match serde_json::to_vec_pretty(&meta) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(task_id = %snapshot.task_id, error = %e, "async meta serialization failed");
+            return;
+        }
+    };
+    let path = output_dir.join("meta.json");
+    if let Err(e) = write_atomic(&path, &bytes) {
+        tracing::warn!(path = %path.display(), error = %e, "async meta.json write failed");
     }
 }
 
@@ -1432,6 +2070,9 @@ mod tests {
             truncated: false,
             stdout_path: "/o/stdout".into(),
             stderr_path: "/o/stderr".into(),
+            agent: None,
+            task_index: None,
+            result: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: TaskMeta = serde_json::from_str(&json).unwrap();

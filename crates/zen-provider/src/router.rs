@@ -239,15 +239,34 @@ impl std::fmt::Display for Provider {
 // MockProvider
 // ---------------------------------------------------------------------------
 
+/// Test-controllable streaming behavior for [`MockProvider`] — the
+/// `with_mock_response` test-hook precedent. The default [`Self::Reply`] is
+/// byte-identical to the historical mock; [`Self::Empty`] / [`Self::Error`]
+/// let the synthesis runtime-skip pins (006 G2) reach the `empty` /
+/// `timeout_or_error` branches deterministically without a live provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MockStreamMode {
+    /// Emit the canned `[mock] …` reply (historical behavior).
+    #[default]
+    Reply,
+    /// Emit no tokens and succeed — synthesis classifies this as `empty`.
+    Empty,
+    /// Fail the stream — synthesis classifies this as `timeout_or_error`.
+    Error,
+}
+
 #[derive(Debug, Clone)]
 pub struct MockProvider {
     pub response: String,
+    /// Streaming behavior (test hook; default [`MockStreamMode::Reply`]).
+    pub stream_mode: MockStreamMode,
 }
 
 impl Default for MockProvider {
     fn default() -> Self {
         Self {
             response: "mock completion response".into(),
+            stream_mode: MockStreamMode::Reply,
         }
     }
 }
@@ -273,6 +292,17 @@ impl MockProvider {
         prompt: &str,
         token_tx: mpsc::UnboundedSender<String>,
     ) -> Result<(), LlmError> {
+        match self.stream_mode {
+            // No tokens + success ⇒ the consumer sees an empty reply.
+            MockStreamMode::Empty => return Ok(()),
+            // Stream failure ⇒ the consumer sees a call error.
+            MockStreamMode::Error => {
+                return Err(LlmError::Call {
+                    reason: "mock stream failure (test mode)".into(),
+                });
+            }
+            MockStreamMode::Reply => {}
+        }
         let reply = format!(
             "[mock] task={task} prompt_len={} reply={}",
             prompt.len(),
@@ -407,25 +437,33 @@ pub fn text_from_choice(choice: &[rig_core::completion::AssistantContent]) -> St
 /// lift the real usage echo. Shared by every provider's
 /// `complete_async_with_usage` so the text-extraction and usage-extraction
 /// rules cannot drift between providers.
+///
+/// rig 0.46 usage semantics (DL-1): counters are `Option<u64>` — `None` means
+/// the provider never sent the counter (reported-zero stays `Some(0)`), and
+/// `Usage::is_reported()` gates the echo so an unreporting provider falls
+/// back to estimates instead of being billed as zero.
 pub fn used_completion(
     provider_label: &str,
     response: rig_core::completion::CompletionResponse,
 ) -> UsedCompletion {
     let text = text_from_choice(&response.choice);
+    let usage = response.usage;
+    let echo = if usage.is_reported() {
+        Some(SyncUsage {
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+        })
+    } else {
+        None
+    };
     info!(
         provider = provider_label,
         response_len = text.len(),
-        input_tokens = response.usage.input_tokens,
-        output_tokens = response.usage.output_tokens,
+        input_tokens = ?usage.input_tokens,
+        output_tokens = ?usage.output_tokens,
         "provider complete (usage-bearing)"
     );
-    UsedCompletion {
-        usage: Some(SyncUsage {
-            input_tokens: response.usage.input_tokens,
-            output_tokens: response.usage.output_tokens,
-        }),
-        text,
-    }
+    UsedCompletion { usage: echo, text }
 }
 
 /// Run an async completion on a dedicated thread with its own runtime.
@@ -1126,6 +1164,16 @@ impl DefaultRouter {
     /// None — pure field assignment.
     pub fn with_mock_response(mut self, response: impl Into<String>) -> Self {
         self.mock.response = response.into();
+        self
+    }
+
+    /// Test code only: set the mock streaming behavior (see [`MockStreamMode`]).
+    /// Default `Reply` keeps the historical mock byte-identical; `Empty`/`Error`
+    /// drive the synthesis `empty`/`timeout_or_error` skip pins deterministically.
+    /// # Errors
+    /// None — pure field assignment.
+    pub fn with_mock_stream_mode(mut self, mode: MockStreamMode) -> Self {
+        self.mock.stream_mode = mode;
         self
     }
 
@@ -2155,6 +2203,7 @@ mod tests {
     async fn mock_streaming_preserves_newlines_as_tokens() {
         let mock = MockProvider {
             response: "line one\nline two\nline three".into(),
+            ..Default::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         mock.complete_streaming("task", "prompt", tx).await.unwrap();

@@ -18,7 +18,9 @@ async fn owner_column_exists_and_claim_round_trips() {
         .await
         .unwrap();
     assert!(
-        repo.claim_plan("p1", "runner-a", 1001).await.unwrap(),
+        repo.claim_plan("p1", "runner-a", 1001, zen_repo::DEFAULT_STALE_CLAIM_SECS)
+            .await
+            .unwrap(),
         "claim should succeed on fresh running plan"
     );
 

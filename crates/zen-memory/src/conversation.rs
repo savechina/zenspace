@@ -36,6 +36,11 @@ impl ConversationStore {
     /// using the session's created_at date (which must be extractable from the
     /// UUID v7 session ID). For sessions where the date is unknown, use `with_file()`.
     pub fn open(session_id: &str) -> Result<Self> {
+        // D31 defense-in-depth: reject traversal ids independently of the
+        // session/start entry guard — the store must never resolve a path
+        // outside the sessions root even if a future caller skips the gate.
+        zen_core::types::validate_session_id(session_id)
+            .map_err(|detail| anyhow::anyhow!("invalid session id: {detail}"))?;
         let paths = ZenPaths::detect().context("failed to resolve zen paths")?;
 
         // Try to extract date from UUID v7 for path resolution
@@ -59,6 +64,10 @@ impl ConversationStore {
     /// The chat file will be placed at `<dir>/<session_id>.jsonl`.
     /// Prefer this over `open()` when the date directory is already known.
     pub fn with_dir(dir: PathBuf, session_id: &str) -> Result<Self> {
+        // D31 defense-in-depth (same seam as open()): the id is joined into
+        // the file name, so it must satisfy the session-id charset.
+        zen_core::types::validate_session_id(session_id)
+            .map_err(|detail| anyhow::anyhow!("invalid session id: {detail}"))?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create session directory: {}", dir.display()))?;
 
@@ -430,5 +439,28 @@ mod tests {
         let entries_b = store2.load().unwrap();
         assert_eq!(entries_b.len(), 1);
         assert_eq!(entries_b[0].1, "msg from B");
+    }
+
+    /// W11.2/T2 (D31 defense-in-depth): the store rejects traversal/wildcard
+    /// ids at the id→path seam independently of the session/start entry guard.
+    #[test]
+    fn session_id_traversal_is_rejected_at_the_store_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            ConversationStore::with_dir(dir.path().to_path_buf(), "../escape").is_err(),
+            "traversal id refused"
+        );
+        assert!(
+            ConversationStore::with_dir(dir.path().to_path_buf(), "a/b").is_err(),
+            "path-separator id refused"
+        );
+        assert!(
+            ConversationStore::with_dir(dir.path().to_path_buf(), "s%1").is_err(),
+            "wildcard id refused"
+        );
+        assert!(
+            ConversationStore::with_dir(dir.path().to_path_buf(), "local").is_ok(),
+            "legitimate id still works"
+        );
     }
 }

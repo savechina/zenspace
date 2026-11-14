@@ -27,6 +27,7 @@ fn tool() -> DelegateTaskTool {
         None,
         sensitivity,
         knowledge,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
         Arc::new(AtomicTokenBudget::new(100_000)),
         Duration::from_secs(30),
         1,

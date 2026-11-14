@@ -58,8 +58,12 @@ fn tool_loop_wiring_default_env_override_and_instance_override() {
 
 fn native_call(name: &str, args: serde_json::Value) -> NativeToolCall {
     NativeToolCall::new(
-        rig_core::completion::message::ToolCallId::new_or_mint("native-id"),
-        ToolFunction::new(name.to_string(), args),
+        rig_core::completion::message::CallId::from_wire("native-id"),
+        ToolFunction::new(
+            rig_core::message::ToolName::try_from(name.to_string())
+                .expect("test tool names are non-empty"),
+            args,
+        ),
     )
 }
 
@@ -118,14 +122,10 @@ fn t114_fenced_parse_errors_surface_when_no_native() {
     assert!(!errors.is_empty(), "T105: parse errors must surface");
 }
 
-#[test]
-fn t114_invalid_native_name_logged_not_dispatched() {
-    let native = vec![native_call("", serde_json::json!({}))];
-    let (invocations, errors, _degraded) =
-        AgentOrchestrator::resolve_invocations("answer", &native);
-    assert!(invocations.is_empty());
-    assert_eq!(errors.len(), 1);
-}
+// t114_invalid_native_name_logged_not_dispatched RETIRED with the 0.46
+// migration: rig's ToolName is TryFrom and rejects empty names at the type
+// level — a native call with an empty name is unrepresentable, so the
+// invalid-name case this pin guarded can no longer be constructed.
 
 #[test]
 fn t114_empty_response_no_native_no_dispatch() {
@@ -153,7 +153,7 @@ fn t115_executor_has_sync_and_async_model_call_methods() {
 /// T115: AgentRun builder chain compiles with all required fields.
 #[test]
 fn t115_agent_run_builder_compiles() {
-    use rig_agent::agent::run::AgentRun;
+    use rig_agent::run::AgentRun;
     use rig_core::message::Message;
 
     let _run = AgentRun::new(Message::user("test"))
@@ -203,7 +203,7 @@ fn t116_max_output_schema_retries_default() {
 /// T116: output_schema flows into AgentRun builder (not rejected by type system).
 #[test]
 fn t116_output_schema_wires_into_agent_run() {
-    use rig_agent::agent::run::AgentRun;
+    use rig_agent::run::AgentRun;
     use rig_core::message::Message;
 
     let schema = agent_output_schema_value("sisyphus").cloned();

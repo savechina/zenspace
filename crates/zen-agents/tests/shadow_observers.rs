@@ -56,6 +56,7 @@ fn production_ladder_decision() -> LadderDecision {
             acl: Acl::ReadOnly,
             confidence: 0.9,
             source: IntentSource::Llm,
+            multi_step: false,
         },
         telemetry: LlmTelemetry {
             outcome: LlmOutcome::L1Resolved,

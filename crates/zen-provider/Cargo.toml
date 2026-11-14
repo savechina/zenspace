@@ -21,6 +21,7 @@ async-trait = { workspace = true }
 rig-core = { workspace = true }
 rig-agent = { workspace = true }
 rig-compose = { workspace = true }
+rig-reqwest = { workspace = true }
 fastembed = { workspace = true }
 home = { workspace = true }
 

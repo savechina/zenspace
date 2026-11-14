@@ -324,6 +324,14 @@ impl QualityPipeline {
     pub fn zeus(&self) -> &ZeusEscalation {
         &self.zeus
     }
+
+    /// Whether the LLM semantic-review stage is wired (W11.4/T4 parity pin).
+    /// `QualityPipeline::new()` alone skips the stage; `review_pipeline`
+    /// wires it — the plan gate must carry the same reviewer as turn gates.
+    #[must_use]
+    pub fn has_semantic_reviewer(&self) -> bool {
+        self.semantic_reviewer.is_some()
+    }
 }
 
 impl Default for QualityPipeline {

@@ -5,4 +5,4 @@ set -x
 # Dev (debug) build for CI. Release binaries are produced exclusively by
 # cargo-dist (release.yml, tag-triggered); this CI job shares one debug
 # compilation with nextest instead of paying a second full release build.
-cargo build --all-features
+cargo build --release --locked --all-features

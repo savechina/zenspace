@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::Digest;
+
 use anyhow::{Context, Result};
 use tracing::warn;
 
@@ -31,6 +33,147 @@ fn reflection_slug(claim: &str) -> String {
         .collect::<Vec<_>>()
         .join("-");
     collapsed.chars().take(48).collect()
+}
+
+/// W9.2 named reader — the single seam for the `wisdom/plans/<slug>.md`
+/// filename. Returns EXACTLY the base slug [`record_plan_archive`] uses for
+/// its page filename (before the write-time collision suffix), so the writer
+/// and every reader (e.g. the morning-brief `done` count) cannot drift.
+///
+/// Resolution order: `plan_name` (when present and non-blank) →
+/// `first_task_id` → `plan_id`, then the shared [`reflection_slug`]
+/// normalization (lowercase, non-alphanumerics → `-`, collapsed, ≤48 chars).
+///
+/// Readers holding only a `workflow_plans` row pass `first_task_id = None`:
+/// a nameless plan whose page was slugged from its first task id is then
+/// (correctly, fail-closed) not matched — the row simply is not counted done.
+pub fn plan_archive_slug(
+    plan_name: Option<&str>,
+    first_task_id: Option<&str>,
+    plan_id: &str,
+) -> String {
+    let slug_source = plan_name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| first_task_id.unwrap_or(plan_id));
+    reflection_slug(slug_source)
+}
+
+/// SC-010 (D21 §4): one completed task's one-line summary for the archive
+/// table. Bounded at [`PLAN_RESULT_SUMMARY_CHARS`], newline-flattened and
+/// sanitizer-cleaned — an agent-authored response must never inject
+/// frontmatter/table syntax into the page.
+pub const PLAN_RESULT_SUMMARY_CHARS: usize = 300;
+
+/// Agent-writable page cap (the [`REWIND_MAX_BYTES`] precedent).
+pub const PLAN_ARCHIVE_MAX_BYTES: usize = 256 * 1024;
+
+/// One task row of a plan archive (SC-010).
+pub struct PlanArchiveTask<'a> {
+    pub id: &'a str,
+    pub agent: &'a str,
+    pub status: &'a str,
+    /// Full task response; the writer derives the one-line summary.
+    pub response: &'a str,
+}
+
+/// Inputs for a success-archive page (SC-010, D21 §4). `record_plan_archive`
+/// renders frontmatter + task table + verdict + duration; the slug derives
+/// from `plan_name` (else the first task id) with a short hash suffix on
+/// collision, so two same-named plans never overwrite each other.
+pub struct PlanArchive<'a> {
+    pub plan_name: Option<&'a str>,
+    pub plan_id: &'a str,
+    pub tasks: &'a [PlanArchiveTask<'a>],
+    pub plan_approved: bool,
+    pub delivery_ready: bool,
+    pub duration_ms: u128,
+}
+
+/// Write the success-twin page under `<plans_dir>/<slug>.md` — sibling of
+/// [`record_rewind`] (atomic write, same slug hygiene, same 256KiB cap and
+/// sanitizer discipline). The caller owns the mutual exclusivity with the
+/// rewind path (any failed task ⇒ rewind only) and the ≥2-tasks/≥1-completed
+/// gate.
+pub fn record_plan_archive(plans_dir: &Path, archive: &PlanArchive<'_>) -> Result<PathBuf> {
+    let sanitizer = InputSanitizer::new();
+    // Only the agent-authored response text is untrusted prose — plan ids,
+    // agent names and statuses are engine/registry-controlled values that
+    // must stay sentinel-free for machine readers (e.g. W9.2).
+    let clean_response = |text: &str| -> String {
+        let one_line = text.replace(['\n', '\r'], " ");
+        let trimmed = one_line.trim();
+        let bounded: String = trimmed.chars().take(PLAN_RESULT_SUMMARY_CHARS).collect();
+        sanitizer
+            .sanitize(&bounded)
+            .map(|c| c.sanitized)
+            .unwrap_or_else(|_| bounded)
+    };
+    let clean = |text: &str| -> String { text.replace(['\n', '\r'], " ").trim().to_string() };
+    let (completed, failed) =
+        archive
+            .tasks
+            .iter()
+            .fold((0usize, 0usize), |(c, f), t| match t.status {
+                "completed" => (c + 1, f),
+                "failed" => (c, f + 1),
+                _ => (c, f),
+            });
+    let mut rows = String::new();
+    for t in archive.tasks {
+        rows.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            clean(t.id),
+            clean(t.agent),
+            clean(t.status),
+            clean_response(t.response)
+        ));
+    }
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let body = format!(
+        "---\ntype: plan\ndate: {date}\nplan_id: {}\ntasks_total: {}\ntasks_completed: {completed}\ntasks_failed: {failed}\ndelivery_ready: {}\n---\n\n# Plan {}\n\n| id | agent | status | summary |\n|---|---|---|---|\n{rows}\nverdict: plan_approved={} delivery_ready={}\nduration_ms: {}\n",
+        clean(archive.plan_id),
+        archive.tasks.len(),
+        archive.delivery_ready,
+        clean(archive.plan_name.unwrap_or(archive.plan_id)),
+        archive.plan_approved,
+        archive.delivery_ready,
+        archive.duration_ms,
+    );
+    let body = if body.len() > PLAN_ARCHIVE_MAX_BYTES {
+        // Char-boundary-safe truncation with the shared marker shape.
+        let mut cut = PLAN_ARCHIVE_MAX_BYTES;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}\n\n…[truncated]\n", &body[..cut])
+    } else {
+        body
+    };
+    let base_slug = plan_archive_slug(
+        archive.plan_name,
+        archive.tasks.first().map(|t| t.id),
+        archive.plan_id,
+    );
+    std::fs::create_dir_all(plans_dir)
+        .with_context(|| format!("create {}", plans_dir.display()))?;
+    let mut target = plans_dir.join(format!("{}.md", base_slug));
+    if target.exists() {
+        // Collision: same slug, different plan — disambiguate with a short
+        // content-keyed suffix instead of overwriting the older page. The
+        // suffix is inherently write-time (it depends on what is already on
+        // disk) and stays out of [`plan_archive_slug`].
+        let digest = sha2::Sha256::digest(archive.plan_id.as_bytes());
+        let suffix: String = digest
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join("");
+        target = plans_dir.join(format!("{}-{suffix}.md", base_slug));
+    }
+    zen_core::atomic_file::write_atomic(&target, body.as_bytes())
+        .with_context(|| format!("write {}", target.display()))?;
+    Ok(target)
 }
 
 /// Write `body` to `<dir>/<slug>.md` atomically. Overwriting the same slug is
@@ -284,6 +427,174 @@ mod tests {
         assert!(
             recent_rewinds(dir.path(), 5)[0].contains("new falsifier"),
             "newest content wins"
+        );
+    }
+
+    fn archive_tasks() -> Vec<PlanArchiveTask<'static>> {
+        vec![
+            PlanArchiveTask {
+                id: "a",
+                agent: "Explore",
+                status: "completed",
+                response: "found docs\nwith a second line",
+            },
+            PlanArchiveTask {
+                id: "b",
+                agent: "Librarian",
+                status: "completed",
+                response: "ok",
+            },
+        ]
+    }
+
+    #[test]
+    fn plan_archive_writes_single_sanitized_page() {
+        let dir = TempDir::new().unwrap();
+        let tasks = archive_tasks();
+        let archive = PlanArchive {
+            plan_name: Some("Sweep Docs"),
+            plan_id: "p1",
+            tasks: &tasks,
+            plan_approved: true,
+            delivery_ready: true,
+            duration_ms: 4200,
+        };
+        let path = record_plan_archive(dir.path(), &archive).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.starts_with("---\ntype: plan\n"), "{body}");
+        assert!(body.contains("plan_id: p1"), "{body}");
+        assert!(body.contains("tasks_completed: 2"), "{body}");
+        assert!(body.contains("delivery_ready: true"), "{body}");
+        // Newline-flattened one-line summary: the response's second line
+        // must never break the table row.
+        assert!(
+            body.contains("[USER_CONTENT_START]found docs with a second line[USER_CONTENT_END]"),
+            "sanitizer sentinels the agent-authored summary: {body}"
+        );
+        assert!(!body.contains("docs\nwith"), "{body}");
+        assert!(
+            body.contains("verdict: plan_approved=true delivery_ready=true"),
+            "{body}"
+        );
+        assert!(body.contains("duration_ms: 4200"), "{body}");
+    }
+
+    #[test]
+    fn plan_archive_summary_caps_at_char_bound() {
+        let dir = TempDir::new().unwrap();
+        let long_response = "s".repeat(PLAN_RESULT_SUMMARY_CHARS + 100);
+        let tasks = vec![PlanArchiveTask {
+            id: "a",
+            agent: "Explore",
+            status: "completed",
+            response: long_response.as_str(),
+        }];
+        let archive = PlanArchive {
+            plan_name: None,
+            plan_id: "p1",
+            tasks: &tasks,
+            plan_approved: false,
+            delivery_ready: false,
+            duration_ms: 1,
+        };
+        let path = record_plan_archive(dir.path(), &archive).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let occurrences = body.matches('s').count();
+        assert!(
+            occurrences <= PLAN_RESULT_SUMMARY_CHARS + 40,
+            "summary must be bounded, got {occurrences} chars"
+        );
+        assert!(body.contains("plan_id: p1"), "{body}");
+    }
+
+    #[test]
+    fn plan_archive_slug_matches_written_filename() {
+        let dir = TempDir::new().unwrap();
+        let tasks = archive_tasks();
+        let named = PlanArchive {
+            plan_name: Some("Sweep Docs"),
+            plan_id: "p1",
+            tasks: &tasks,
+            plan_approved: true,
+            delivery_ready: true,
+            duration_ms: 1,
+        };
+        let path = record_plan_archive(dir.path(), &named).unwrap();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        assert_eq!(
+            stem,
+            plan_archive_slug(Some("Sweep Docs"), Some("a"), "p1"),
+            "named plan: reader helper must reconstruct the writer's filename"
+        );
+        assert_eq!(stem, "sweep-docs");
+
+        // Nameless: the writer falls back to the first task id; a reader
+        // holding only the row (first_task_id = None) resolves to plan_id
+        // and must NOT claim a match (fail-closed reader contract).
+        let nameless = PlanArchive {
+            plan_name: None,
+            plan_id: "p2",
+            tasks: &tasks,
+            plan_approved: true,
+            delivery_ready: true,
+            duration_ms: 1,
+        };
+        let path = record_plan_archive(dir.path(), &nameless).unwrap();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        assert_eq!(stem, plan_archive_slug(None, Some("a"), "p2"));
+        assert_eq!(stem, "a");
+        assert_ne!(
+            stem,
+            plan_archive_slug(None, None, "p2"),
+            "row-only reader must not match a first-task-id slug"
+        );
+
+        // No tasks at all: both writer and reader land on plan_id.
+        let empty: Vec<PlanArchiveTask<'static>> = Vec::new();
+        let bare = PlanArchive {
+            plan_name: None,
+            plan_id: "p3",
+            tasks: &empty,
+            plan_approved: false,
+            delivery_ready: false,
+            duration_ms: 1,
+        };
+        let path = record_plan_archive(dir.path(), &bare).unwrap();
+        assert_eq!(
+            path.file_stem().unwrap().to_str().unwrap(),
+            plan_archive_slug(None, None, "p3")
+        );
+    }
+
+    #[test]
+    fn plan_archive_collision_suffixes_instead_of_overwriting() {
+        let dir = TempDir::new().unwrap();
+        let tasks = archive_tasks();
+        let first = PlanArchive {
+            plan_name: Some("Same Name"),
+            plan_id: "p-one",
+            tasks: &tasks,
+            plan_approved: true,
+            delivery_ready: true,
+            duration_ms: 1,
+        };
+        let second = PlanArchive {
+            plan_name: Some("Same Name"),
+            plan_id: "p-two",
+            tasks: &tasks,
+            plan_approved: false,
+            delivery_ready: false,
+            duration_ms: 2,
+        };
+        let p1 = record_plan_archive(dir.path(), &first).unwrap();
+        let p2 = record_plan_archive(dir.path(), &second).unwrap();
+        assert_ne!(p1, p2, "second plan must not overwrite the first page");
+        let first_body = std::fs::read_to_string(&p1).unwrap();
+        assert!(first_body.contains("plan_id: p-one"), "{first_body}");
+        assert!(
+            std::fs::read_to_string(&p2)
+                .unwrap()
+                .contains("plan_id: p-two")
         );
     }
 

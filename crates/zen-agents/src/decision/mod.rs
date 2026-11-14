@@ -106,6 +106,9 @@ pub enum DecisionError {
 ///
 /// `Ok(None)` means the rung abstains (e.g. a keyword miss on L0); `Err`
 /// means the rung is unavailable and the caller should fail open.
+// async_trait's desugared `#[must_use]` futures duplicate Future's must_use —
+// clippy ≥1.99 `double_must_use`; macro output, not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DecisionFn<C>: Send + Sync {
     async fn decide(&self, query: &str) -> Result<Option<DecisionOutcome<C>>, DecisionError>;
@@ -114,6 +117,7 @@ pub trait DecisionFn<C>: Send + Sync {
 /// Embedder abstraction for the L1 rung — injectable so tests use a
 /// deterministic fake without ONNX. Object-safe async trait per repo
 /// convention (`#[async_trait]`, owned payloads).
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TextEmbedder: Send + Sync {
     async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
@@ -1394,6 +1398,7 @@ mod tests {
             acl,
             confidence: 0.8,
             source,
+            multi_step: false,
         }
     }
 
@@ -1536,6 +1541,56 @@ mod tests {
         assert_eq!(production_rung(IntentSource::Llm), "L2");
         assert_eq!(production_rung(IntentSource::Keyword), "L0");
         assert_eq!(production_rung(IntentSource::Fallback), "L0");
+    }
+
+    /// D21 W6.1 (decision/mod.rs): the ladder's verdict carries the advisory
+    /// `multi_step` planning hint, derived from the DECIDING rung:
+    /// L0 keyword (via the signal tag), L1/L2 (via the category —
+    /// execution-class ⇒ true), Fallback ⇒ false. Routing fields are
+    /// unaffected: same fixture with the hint derived true or false picks
+    /// the same agent (advisory-only hard rule).
+    #[test]
+    fn multi_step_hint_derives_from_the_deciding_rung() {
+        use crate::intent::{category_implies_multi_step, hint_source};
+
+        // L1 rung, execution category ⇒ true, provenance "l1".
+        let l1 = Intent::from_ladder(IntentCategory::Action, None, 0.9, IntentSource::L1);
+        assert!(l1.multi_step);
+        assert_eq!(hint_source(&l1), "l1");
+
+        // L1 rung, read category ⇒ false, same provenance.
+        let l1_read = Intent::from_ladder(IntentCategory::Query, None, 0.9, IntentSource::L1);
+        assert!(!l1_read.multi_step);
+
+        // L2 / keyword-fallback path (fast path OFF): the LLM rung's
+        // category drives it identically ⇒ provenance "prompt".
+        let l2 = Intent::from_ladder(IntentCategory::Action, None, 0.9, IntentSource::Llm);
+        assert!(l2.multi_step);
+        assert_eq!(hint_source(&l2), "prompt");
+        let l2_read = Intent::from_ladder(IntentCategory::Query, None, 0.9, IntentSource::Llm);
+        assert!(!l2_read.multi_step);
+
+        // Fallback (machinery unavailable) ⇒ false, provenance "none".
+        let fallback = Intent::from_ladder(
+            IntentCategory::Conversation,
+            None,
+            0.5,
+            IntentSource::Fallback,
+        );
+        assert!(!fallback.multi_step);
+        assert_eq!(hint_source(&fallback), "none");
+
+        // Category mapping is exactly: Action (execution class) ⇒ true.
+        assert!(category_implies_multi_step(IntentCategory::Action));
+        assert!(!category_implies_multi_step(IntentCategory::Query));
+        assert!(!category_implies_multi_step(IntentCategory::System));
+        assert!(!category_implies_multi_step(IntentCategory::Conversation));
+
+        // Advisory-only: hint on/off never changes the routed agent.
+        let mut hinted = Intent::from_ladder(IntentCategory::Query, None, 0.9, IntentSource::Llm);
+        hinted.multi_step = true;
+        assert_eq!(hinted.agent, l2_read.agent);
+        assert_eq!(hinted.acl, l2_read.acl);
     }
 
     #[test]

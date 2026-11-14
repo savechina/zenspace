@@ -117,6 +117,16 @@ async fn read_captures_blocking(state: &CollectState<'_>) -> (String, String) {
         .unwrap_or_default()
 }
 
+/// Surface the agent-future result payload (W5.1): async tasks store their
+/// output in `meta.result` (the stdout/stderr capture files are unused on
+/// that path). Adds the `result` key ONLY when the meta carries a payload,
+/// so process-path collect output stays byte-identical.
+fn attach_meta_result(out: &mut Value, meta: Option<&task_registry::TaskMeta>) {
+    if let Some(result) = meta.and_then(|m| m.result.as_ref()) {
+        out["result"] = result.clone();
+    }
+}
+
 /// Render the collect result from a status plus the capture paths.
 fn render(task_id: &str, state: &CollectState<'_>, stdout: String, stderr: String) -> Value {
     let mut out = json!({
@@ -206,7 +216,9 @@ impl Tool for ShellCollectTool {
                         stderr_path: &task_registry::meta_stderr_path(Path::new(&output_dir)),
                     };
                     let (stdout, stderr) = read_captures_blocking(&state).await;
-                    return Ok(render(task_id, &state, stdout, stderr));
+                    let mut out = render(task_id, &state, stdout, stderr);
+                    attach_meta_result(&mut out, task_registry::read_meta(task_id).as_ref());
+                    return Ok(out);
                 }
             } else if let Some(meta) = task_registry::read_meta(task_id) {
                 // Registry miss (daemon restart): the on-disk meta is the
@@ -235,7 +247,9 @@ impl Tool for ShellCollectTool {
                         stderr_path: &stderr_path,
                     };
                     let (stdout, stderr) = read_captures_blocking(&state).await;
-                    return Ok(render(task_id, &state, stdout, stderr));
+                    let mut out = render(task_id, &state, stdout, stderr);
+                    attach_meta_result(&mut out, Some(&meta));
+                    return Ok(out);
                 }
             } else {
                 return Ok(json!({
@@ -262,6 +276,7 @@ impl Tool for ShellCollectTool {
             };
             let (stdout, stderr) = read_captures_blocking(&state).await;
             let mut out = render(task_id, &state, stdout, stderr);
+            attach_meta_result(&mut out, task_registry::read_meta(task_id).as_ref());
             out["note"] = json!(format!(
                 "still {status} after waiting {wait_ms}ms; call shell.collect again later",
                 status = snapshot.status.as_str()
@@ -290,6 +305,7 @@ impl Tool for ShellCollectTool {
             };
             let (stdout, stderr) = read_captures_blocking(&state).await;
             let mut out = render(task_id, &state, stdout, stderr);
+            attach_meta_result(&mut out, Some(&meta));
             out["note"] = json!(format!(
                 "still {status} after waiting {wait_ms}ms (registry entry gone — daemon restart?); call shell.collect again later",
                 status = meta.status.as_str()

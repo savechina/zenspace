@@ -295,6 +295,9 @@ pub struct CandidateOutput {
 }
 
 /// Abstraction over the candidate endpoint so tests can inject a fake.
+// async_trait's desugared `#[must_use]` boxed futures duplicate Future's own
+// must_use — clippy ≥1.99 flags it (`double_must_use`); macro output, not ours.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CandidateCaller: Send + Sync {
     /// Send one decision prompt and return the raw text, or an error string.

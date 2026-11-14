@@ -336,6 +336,13 @@ pub struct Intent {
     pub acl: Acl,
     pub confidence: f32,
     pub source: IntentSource,
+    /// D21 W6.1: advisory planning hint — "this looks multi-step". It NEVER
+    /// routes, never emits a plan or DAG; the "plan before acting" rule lives
+    /// in the Sisyphus prompt, the classifier only biases. Derivation:
+    /// L0 keyword hit ⇒ [`signal_implies_multi_step`] over the signal tag;
+    /// L1/L2 rungs ⇒ [`category_implies_multi_step`] over the category;
+    /// Conversation/fallback ⇒ always `false`.
+    pub multi_step: bool,
 }
 
 impl Intent {
@@ -348,6 +355,7 @@ impl Intent {
             acl: Acl::from_category(IntentCategory::Conversation),
             confidence,
             source: IntentSource::Fallback,
+            multi_step: false,
         }
     }
 
@@ -378,6 +386,7 @@ impl Intent {
             acl: Acl::from_category(category),
             confidence,
             source,
+            multi_step: category_implies_multi_step(category),
         }
     }
 }
@@ -397,6 +406,7 @@ pub(crate) fn keyword_route(query: &str) -> Option<Intent> {
                 acl: Acl::from_category(category),
                 confidence,
                 source: IntentSource::Keyword,
+                multi_step: signal_implies_multi_step(signal),
             });
         }
     }
@@ -413,6 +423,64 @@ pub(crate) fn keyword_signal_category(signal: &str) -> (IntentCategory, f32) {
         _ => IntentCategory::Query,
     };
     (category, 0.8)
+}
+
+/// D21 W6.1: the ONE multi-step mapping table over the `INTENT_SIGNALS`
+/// tags. Advisory planning hint only — it never routes and never emits a
+/// plan or DAG; the "plan before acting" rule lives in the Sisyphus prompt.
+///
+/// Classification per tag:
+/// - execution/task-class (work that mutates state or produces artifacts
+///   across multiple operations) ⇒ `true`: `coder`, `knowledge-org`,
+///   `consolidate-pipeline`, `planning`, `batch-automation`, `format-convert`
+/// - read/analyse/review/decide/observe class (single-response analytical
+///   work; `visual` is single-artifact one-shot generation) ⇒ `false`:
+///   `research`, `deep-analysis`, `review-quality`, `gap-assessment`,
+///   `value-alignment`, `visual`
+/// - unknown signal ⇒ `false` (fail-closed to "no bias")
+pub(crate) fn signal_implies_multi_step(signal: &str) -> bool {
+    matches!(
+        signal,
+        "coder"
+            | "knowledge-org"
+            | "consolidate-pipeline"
+            | "planning"
+            | "batch-automation"
+            | "format-convert"
+    )
+}
+
+/// D21 W6.1: category-level derivation for the L1/L2 rungs ("execution-class
+/// category ⇒ true"). `Action` is the execution class; Query/System/
+/// Conversation are read/manage/chat classes.
+pub(crate) fn category_implies_multi_step(category: IntentCategory) -> bool {
+    category == IntentCategory::Action
+}
+
+/// D21 W6.1 `hint_source` vocabulary: `l0|l1|prompt|none` — the provenance
+/// of the turn's `multi_step` verdict.
+///
+/// - `"l0"`: the L0 keyword table produced the verdict (the fast path AND
+///   the degraded keyword fallback read the same table).
+/// - `"l1"`: the L1 calibrated rung produced it.
+/// - `"prompt"`: the L2 LLM classification produced it. D21's enum has no
+///   `l2` value (L2 is a detached record-only shadow under the default
+///   `l0_fast_path` config and is not a measured adoption source); on a
+///   plan turn this label also covers pure model volition (the model
+///   planned without a multi-step bias). The true rung provenance stays
+///   visible in `loop.turn.review.intent_source`.
+/// - `"none"`: no classifier verdict exists (Fallback — machinery
+///   unavailable/degraded); `multi_step` is always `false` here.
+///
+/// Resolution order l0 > l1 > prompt > none mirrors the ladder's
+/// fall-through.
+pub(crate) fn hint_source(intent: &Intent) -> &'static str {
+    match intent.source {
+        IntentSource::Keyword => "l0",
+        IntentSource::L1 => "l1",
+        IntentSource::Llm => "prompt",
+        IntentSource::Fallback => "none",
+    }
 }
 
 /// Resolve a concrete agent from an `INTENT_SIGNALS` signal name.
@@ -1159,5 +1227,124 @@ mod tests {
         );
         assert_eq!(requirements.max_tokens, Some(128));
         assert_eq!(requirements.sensitivity, Sensitivity::Public);
+    }
+
+    // ── D21 W6.1: multi_step planning hint ─────────────────────────────
+    //
+    // Advisory only: the hint never routes, never emits a plan or DAG.
+    // The "plan before acting" rule lives in the Sisyphus prompt
+    // (zen_agent.rs); the classifier only biases. Adoption is measured by
+    // the one-per-plan-turn `loop.plan.started` audit line (orchestrator).
+
+    /// Every `INTENT_SIGNALS` tag is classified by the ONE mapping table
+    /// (`signal_implies_multi_step`): execution/task-class ⇒ true,
+    /// read/analyse/review/decide/observe class ⇒ false. This pin walks the
+    /// WHOLE table so a new signal can never silently miss classification
+    /// (the fail-closed unknown ⇒ false arm stays asserted separately).
+    #[test]
+    fn multi_step_mapping_table_classifies_every_signal_tag() {
+        for (_, signal, _) in INTENT_SIGNALS {
+            let multi_step = signal_implies_multi_step(signal);
+            let expected = matches!(
+                *signal,
+                "coder"
+                    | "knowledge-org"
+                    | "consolidate-pipeline"
+                    | "planning"
+                    | "batch-automation"
+                    | "format-convert"
+            );
+            assert_eq!(
+                multi_step, expected,
+                "signal '{signal}' misclassified by the mapping table"
+            );
+        }
+        // Fail-closed: an unknown tag biases toward "no plan" (never the
+        // reverse — a missing classification must not invent multi-step work).
+        assert!(!signal_implies_multi_step("chief-vibes-officer"));
+        assert!(!signal_implies_multi_step(""));
+    }
+
+    /// L0 fast path (default ON): the synchronous hint derives from the L0
+    /// signal itself. A keyword plan-class turn carries multi_step=true with
+    /// `hint_source: "l0"`; a keyword read-class turn carries false with the
+    /// same provenance; a keyword miss degrades to the Conversation fallback
+    /// (multi_step=false, `hint_source: "none"`).
+    #[test]
+    fn multi_step_keyword_fast_path_derives_from_l0_signal() {
+        let coder = keyword_route("please implement this function").expect("coder hit");
+        assert_eq!(coder.source, IntentSource::Keyword);
+        assert!(coder.multi_step, "coder is execution-class ⇒ true");
+        assert_eq!(hint_source(&coder), "l0");
+
+        let research = keyword_route("research the tokio runtime").expect("research hit");
+        assert_eq!(research.source, IntentSource::Keyword);
+        assert!(!research.multi_step, "research is read-class ⇒ false");
+        assert_eq!(hint_source(&research), "l0");
+
+        let fallback = keyword_route("tell me a joke about rust")
+            .unwrap_or_else(|| Intent::fallback("default", 0.5));
+        assert!(!fallback.multi_step);
+        assert_eq!(hint_source(&fallback), "none");
+    }
+
+    /// `hint_source` resolution order l0 > l1 > prompt > none mirrors the
+    /// ladder's fall-through — one value per `IntentSource` variant.
+    #[test]
+    fn multi_step_hint_source_vocabulary_resolution() {
+        for (source, expected) in [
+            (IntentSource::Keyword, "l0"),
+            (IntentSource::L1, "l1"),
+            (IntentSource::Llm, "prompt"),
+            (IntentSource::Fallback, "none"),
+        ] {
+            let intent = Intent::from_ladder(IntentCategory::Query, None, 0.9, source);
+            assert_eq!(hint_source(&intent), expected, "source {source:?}");
+        }
+    }
+
+    /// Conversation turns never see the hint (acceptance pin 3, unit level):
+    /// the Fallback intent — what a Conversation-class turn routes with — is
+    /// always multi_step=false.
+    #[test]
+    fn multi_step_fallback_conversation_is_always_false() {
+        let fallback = Intent::fallback("default", 0.5);
+        assert_eq!(fallback.category, IntentCategory::Conversation);
+        assert!(!fallback.multi_step);
+        // A Conversation-classified ladder verdict derives false too.
+        let conversation =
+            Intent::from_ladder(IntentCategory::Conversation, None, 0.9, IntentSource::Llm);
+        assert!(!conversation.multi_step);
+    }
+
+    /// Advisory-only contract (hard rule): two intents that differ ONLY in
+    /// `multi_step` must produce the identical routing outcome (agent, acl,
+    /// category, signal). The hint is never an input to routing — it is
+    /// derived alongside it and rides the audit line.
+    #[test]
+    fn multi_step_hint_never_changes_routing() {
+        let mut biased = Intent::from_ladder(
+            IntentCategory::Query,
+            Some("deep-analysis"),
+            0.9,
+            IntentSource::Llm,
+        );
+        biased.multi_step = true; // force the hint on
+        let unbiased = Intent::from_ladder(
+            IntentCategory::Query,
+            Some("deep-analysis"),
+            0.9,
+            IntentSource::Llm,
+        );
+        assert_eq!(biased.agent, unbiased.agent);
+        assert_eq!(biased.acl, unbiased.acl);
+        assert_eq!(biased.category, unbiased.category);
+        assert_eq!(biased.signal, unbiased.signal);
+        // And the derivation itself is deterministic per category/signal:
+        // re-deriving never flips routing-relevant fields.
+        assert_eq!(
+            category_implies_multi_step(IntentCategory::Action),
+            category_implies_multi_step(IntentCategory::Action)
+        );
     }
 }

@@ -10,9 +10,9 @@ use zen_core::config::ZenConfig;
 
 use crate::providers::ollama::is_loopback_url;
 use crate::router::resolve_api_key;
-use rig_core::client::{EmbeddingsClient, Nothing};
-use rig_core::embeddings::EmbeddingModel as RigEmbeddingModel;
-use rig_core::providers::{ollama, openai};
+use rig_core::providers::ollama::{Ollama, OllamaConfig};
+use rig_core::providers::openai::{OpenAI, OpenAIConfig};
+use rig_reqwest::ReqwestClient;
 
 /// Bounds a local (Ollama) embed request so the blocking `.join()` below can
 /// never hang forever; absorbs a ~150s cold model load while staying finite.
@@ -104,7 +104,7 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
                 // Loopback MUST bypass HTTP(S)_PROXY: a system proxy (Privoxy
                 // et al) 500s and stalls every local embed, mirroring
                 // `providers::ollama::OllamaProvider::rig_client`.
-                let client = if is_loopback_url(&base_url) {
+                let client: Ollama = if is_loopback_url(&base_url) {
                     let http = reqwest::Client::builder()
                         .no_proxy()
                         .timeout(std::time::Duration::from_secs(EMBED_REQUEST_TIMEOUT_SECS))
@@ -112,11 +112,9 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
                         .map_err(|e| EmbeddingError::RequestFailed {
                             reason: format!("Ollama embed http client init error: {e}"),
                         })?;
-                    ollama::Client::builder()
-                        .api_key(Nothing)
-                        .base_url(&base_url)
-                        .http_client(http)
-                        .build()
+                    OllamaConfig::new()
+                        .with_base_url(&base_url)
+                        .connect(ReqwestClient::from(http))
                 } else {
                     let http = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(EMBED_REQUEST_TIMEOUT_SECS))
@@ -124,17 +122,12 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
                         .map_err(|e| EmbeddingError::RequestFailed {
                             reason: format!("Ollama embed http client init error: {e}"),
                         })?;
-                    ollama::Client::builder()
-                        .api_key(Nothing)
-                        .base_url(&base_url)
-                        .http_client(http)
-                        .build()
-                }
-                .map_err(|e| EmbeddingError::RequestFailed {
-                    reason: format!("Ollama client init error: {e}"),
-                })?;
+                    OllamaConfig::new()
+                        .with_base_url(&base_url)
+                        .connect(ReqwestClient::from(http))
+                };
 
-                let emb_model = client.embedding_model_with_ndims(&model, 4096);
+                let emb_model = client.embedding(&model, Some(4096));
                 let embedding = emb_model.embed_text(&text).await.map_err(|e| {
                     EmbeddingError::RequestFailed {
                         reason: format!("Ollama embed error: {e}"),
@@ -215,17 +208,13 @@ impl EmbeddingProvider for OpenAiEmbeddingProvider {
                     reason: format!("OpenAI embed http client init error: {e}"),
                 })?;
 
-                let mut builder = openai::Client::builder()
-                    .api_key(&api_key)
-                    .http_client(http);
+                let mut config = OpenAIConfig::new(&api_key);
                 if base_url != zen_core::constants::OPENAI_API_URL {
-                    builder = builder.base_url(&base_url);
+                    config = config.with_base_url(&base_url);
                 }
-                let client = builder.build().map_err(|e| EmbeddingError::RequestFailed {
-                    reason: format!("OpenAI client init error: {e}"),
-                })?;
+                let client: OpenAI = config.connect(ReqwestClient::from(http));
 
-                let emb_model = client.embedding_model(&model);
+                let emb_model = client.embedding(&model, None);
                 let embedding = emb_model.embed_text(&text).await.map_err(|e| {
                     EmbeddingError::RequestFailed {
                         reason: format!("OpenAI embed error: {e}"),

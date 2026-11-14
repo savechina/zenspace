@@ -370,8 +370,11 @@ fn audit_background_event(
 /// Audit/log reporting for drain-killed background tasks — split from
 /// [`drain_background_tasks`] so pins can assert the emission shape
 /// without a live child process. One `gateway.background.killed` audit
-/// line per id; an empty list writes nothing (zero-event = zero-lines).
+/// line per id (plus one `gateway.delegate.killed` line for each
+/// delegate-future task, W5.4); an empty list writes nothing
+/// (zero-event = zero-lines).
 pub fn report_killed_background_tasks(audit_path: Option<&std::path::Path>, killed: &[String]) {
+    let registry = zen_plugin::task_registry::registry();
     for task_id in killed {
         audit_background_event(
             audit_path,
@@ -379,6 +382,14 @@ pub fn report_killed_background_tasks(audit_path: Option<&std::path::Path>, kill
             task_id,
             "daemon-shutdown",
         );
+        if registry.is_delegate_task(task_id) {
+            audit_background_event(
+                audit_path,
+                "gateway.delegate.killed",
+                task_id,
+                "daemon-shutdown",
+            );
+        }
     }
 }
 
@@ -448,6 +459,74 @@ pub async fn expire_background_due(
     });
     report_expired_background_tasks(audit_path, &expired);
     expired
+}
+
+/// W6.2b (D24 §3/§4): plan-ledger sweep on the 30s GC cadence — mark-only
+/// stale cancellation (unified staleness = 2× the base turn watchdog, the
+/// resume fence's own steal window) then 90-day retention (tasks first,
+/// then plans; `running` exempt). Boot = one sweep before the loop. Zero
+/// events ⇒ zero audit lines. Fail-open: a DB outage logs and retires the
+/// tick — the registry-backed cancel finalizer covers the live case.
+async fn sweep_plans_due(audit_path: Option<&std::path::Path>) {
+    // std-Mutex cache (shuttle-safe const init): successes cached for the
+    // process, failures retried next tick — a DB mid-migration at boot must
+    // not wedge the sweep for the process lifetime. The guard is never held
+    // across the open await.
+    static DB: std::sync::Mutex<Option<std::sync::Arc<zen_repo::SqliteClient>>> =
+        std::sync::Mutex::new(None);
+    let cached = DB
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let client = match cached {
+        Some(c) => Some(c),
+        None => {
+            let opened = match zen_agents::plan_todos::resolve_state_db() {
+                Some(path) => zen_repo::SqliteClient::open(&path)
+                    .await
+                    .ok()
+                    .map(std::sync::Arc::new),
+                None => None,
+            };
+            if let Some(c) = &opened {
+                *DB.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(std::sync::Arc::clone(c));
+            }
+            opened
+        }
+    };
+    let Some(client) = client else {
+        tracing::debug!(target: "zen_gateway_plan", "plan sweep: state.db unavailable");
+        return;
+    };
+    let repo = zen_repo::WorkflowRepo::new(&client);
+    let now = chrono::Utc::now().timestamp();
+    // W11.3/T3 (SC-017): the sweep and the resume fence share ONE live
+    // resolver — 2× the resolved base watchdog incl. the env layer.
+    let stale_secs = zen_core::config::resolve_stale_claim_secs();
+    let cancelled = match repo.mark_stale_plans(now, stale_secs).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "plan stale sweep failed (fail-open)");
+            return;
+        }
+    };
+    let cutoff = now - 90 * 24 * 3600;
+    let expired_tasks = repo.delete_expired_tasks(cutoff, now).await.unwrap_or(0);
+    let expired_plans = repo.delete_expired_plans(cutoff, now).await.unwrap_or(0);
+    let expired = expired_tasks + expired_plans;
+    if cancelled.is_empty() && expired == 0 {
+        return;
+    }
+    if let Some(path) = audit_path {
+        let record = serde_json::json!({
+            "ts": background_audit_ts(),
+            "kind": "loop.plan.swept",
+            "cancelled": cancelled,
+            "expired_rows": expired,
+        });
+        let _ = zen_core::jsonl::append_jsonl_line(path, &record);
+    }
 }
 
 // ─────────────────── UDS gateway service (US1, T012) ───────────────────
@@ -1055,7 +1134,10 @@ impl GatewayService {
                     let hosting = std::sync::Arc::clone(&hosting);
                     let origin = conn.queue();
                     let handle = origin_handle.clone();
-                    async move { hosting_turn_with(hosting, Some(origin), Some(handle), p).await }
+                    let plain_text = conn.is_plain_text_surface();
+                    async move {
+                        hosting_turn_with(hosting, Some(origin), Some(handle), plain_text, p).await
+                    }
                 }
             })?
             .handle("session/cancel", {
@@ -1494,6 +1576,10 @@ impl GatewayService {
                         zen_plugin::task_registry::now_ms(),
                     )
                     .await;
+                    // W6.2b: plan stale sweep + 90-day retention ride the
+                    // same tick (D24 §3/§4 — mark-only, zero events ⇒ zero
+                    // lines).
+                    sweep_plans_due(gc_service.hosting.audit_path.as_deref()).await;
                 }
             })
         };

@@ -68,6 +68,9 @@ pub struct WorkerReport {
 ///
 /// Mirrors the naming convention of [`ZenSkill`] and [`ZenTool`]
 /// in the agent system — every "thing that does work" gets a `Zen` prefix.
+// async_trait's desugared `#[must_use]` futures duplicate Future's must_use —
+// clippy ≥1.99 `double_must_use`; macro output, not ours to edit.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ZenWorker: Send + Sync {
     /// Unique identifier for this worker (e.g. `"memory-curator"`, `"dream"`).
