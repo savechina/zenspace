@@ -27,3 +27,11 @@ pub mod secrets_verify;
 /// Kahn layering proofs (T278) — mounted here and by the zen-agents
 /// congruence test: one physical source, two consumers.
 pub mod plan_layers_verify;
+
+/// LoopBudget throughput-gate proofs (T278) — mounted here and by the
+/// zen-vault congruence test: one physical source, two consumers.
+pub mod loop_budget_verify;
+
+/// restore_incremental carry proofs (T278) — mounted here and by the
+/// zen-core congruence test: one physical source, two consumers.
+pub mod restore_carry_verify;

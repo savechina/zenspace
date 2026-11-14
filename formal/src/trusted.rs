@@ -12,5 +12,6 @@
 //! | 5 | `plan_layers_verify.rs::lemma_kahn_cover` | external_body proof fn | Kahn exactly-once accounting: ready entries are at-most-once per node (a re-entry needs a second full decrement of an exhausted counter) and `placed >= n` then sums one entry per task; the Σ-pigeonhole over ready-membership history is machinery-heavy here. Runtime-pinned by the chain/diamond/duplicate-dep/cycle/over-deep congruence fixtures | 2026-10-30 |
 //! | 6 | `plan_layers_verify.rs::lemma_mul_step` | external_body proof fn | Elementary ring identity `(x+1)*y == x*y + y`; Z3 nonlinear arithmetic lacks ring normalization and vstd's broadcast group is verus-mode-only (breaks plain-rustc mounting). Hand-checkable in seconds | 2026-10-30 |
 //! | 7 | `plan_layers_verify.rs::lemma_mul_distrib_add_other_way_local` | external_body broadcast proof fn | Elementary ring identity `(y+z)*x == y*x + z*x`; same rationale as #6 | 2026-10-30 |
+//! | 8 | `restore_carry_verify.rs::lemma_len_utf8_bridge` | external_body proof fn | Std `char::len_utf8` lookup table (1..=4 by scalar range), mechanically checkable in seconds; gives the opaque `len_utf8_spec` its meaning | 2026-11-14 |
 
 pub fn trusted_base_is_empty() {}

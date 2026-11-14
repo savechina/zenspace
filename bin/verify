@@ -51,6 +51,12 @@ dst_gate() {
 pins_gate() {
     # Verified reference impl == runtime SecretMap grammar (plain cargo).
     cargo test -p zen-core --test formal_placeholder
+    # T278: restore_incremental carry mirror == production split (bound +
+    # conservation congruence across boundary/exhaustion/CJK fixtures).
+    cargo test -p zen-core --test formal_restore_carry
+    # T278: LoopBudget mirrors == production gates (incl. saturating_add
+    # overflow edge + cycle grant-or-stall theorem).
+    cargo test -p zen-vault --test formal_loop_budget
     # Exhaustive frame-split differential (~9000 timelines): incremental
     # restore == whole-string restore for every chunking.
     cargo test -p zen-core --lib differential_split

@@ -45,6 +45,10 @@ tokio = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 divan = { workspace = true }
+# Verus (T278 bbtree Guard-3): formal_loop_budget.rs mounts the REAL proof
+# file (formal/src/loop_budget_verify.rs) via #[path] — test targets never
+# enter the production dependency graph, so vstd stays a pure test-time cost.
+vstd = { version = "=0.0.0-2026-10-18-0147" }
 
 [[bench]]
 name = "search_rrf"
