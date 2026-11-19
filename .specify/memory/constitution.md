@@ -1,16 +1,18 @@
 <!--
 Sync Impact Report:
-- Version: 1.7.0-pending → 1.8.0 (MINOR - Code Documentation & Scope Logic principle added)
-- Modified principles: None
-- Added principles: XV. Code Documentation & Scope Logic (2026-08-22)
+- Version: 1.8.0 → 1.8.1 (PATCH - descriptive correction + clarification; no principle added or weakened)
+- Modified principles: XIII (added #9 Data-Only Backfills — codifies the migration 015 precedent: row-preserving idempotent UPDATE, migration test, first-release coupling)
+- Added principles: None
 - Removed sections: None
-- Templates requiring updates: plan.md Constitution Check tables across feature specs (add XV row)
-- Deferred items: Principle XIV ratification requires a dedicated PR with review and explicit approval; spec 003-agentic-plugin FR-035..045 anticipate the principle and implement its intent ahead of ratification. Plan gate is conditional until the amendment lands.
+- Templates requiring updates: None (plan.md Constitution Check table shape unchanged)
+- Deferred items: Principle XIV ratification still requires a dedicated PR with review and explicit approval (unchanged).
+- Other fixes: Development Workflow workspace-structure sentence corrected to the actual zen (binary) / zen-cli (library) split; header blockquote version synced to the footer (was stale v1.7.0-pending).
+- Provenance: 006-agentic-orchestration $speckit-analyze findings K1/K2/K3 (2026-11-15), owner approval "fix it all"; ride the next PR per Governance.
 -->
 
 # ZenSpace Constitution
 
-> **v1.7.0-pending** — Principle XIV (Agent Safety) proposed 2026-08-11, pending ratification PR. Spec 003-agentic-plugin FR-004, FR-018..020, FR-023..045 implement the principle's intent ahead of formal ratification. See Governance section for amendment procedure.
+> **v1.8.1** — Principle XIV (Agent Safety) proposed 2026-08-11, pending ratification PR. Spec 003-agentic-plugin FR-004, FR-018..020, FR-023..045 implement the principle's intent ahead of formal ratification. See Governance section for amendment procedure.
 
 ## Core Principles
 
@@ -180,6 +182,8 @@ Rationale: Unified database eliminates schema sync issues, enables cross-domain 
    ```
    This is idempotent and safe to run on a freshly created FTS5 table (no-op).
 
+9. **Data-Only Backfills** — A migration that changes no schema MAY apply a row-preserving, idempotent data `UPDATE` to backfill a renamed vocabulary or repaired value (precedent: migration 015 `ok`→`completed`, spec 006 D21 §2(d)). Such backfills MUST NOT delete rows, MUST ship with the item-6 migration test including a legacy-fixture replay pin, and MUST ride the first release running the new code against old databases. A vocabulary rename is not complete until its backfill ships — code-vs-spec review MUST also check code-vs-EXISTING-DATA.
+
 **Enforcement requirements**:
 - All schema changes MUST go through numbered migration files in `crates/zen-repo/migrations/`
 - `SqliteClient::ensure_schema()` (per Principle XII) MUST run all pending migrations on connect
@@ -272,7 +276,7 @@ Rationale: Selected for CLI tool suitability, runtime performance, and developer
 - All code changes MUST pass `cargo clippy` and `cargo fmt`
 - All public APIs MUST include documentation comments
 - Integration tests MUST cover CLI command execution
-- **Workspace structure**: zen-cli is the binary crate (no lib.rs). Domain crates (zen-core, zen-service, zen-repo, zen-gateway, zen-provider) are library crates with lib.rs for DDD architecture. This separation enables reusable domain logic while maintaining a single CLI entry point.
+- **Workspace structure**: zen is the binary crate (thin `main.rs` wrapper); zen-cli is the CLI library crate (`lib.rs` exporting `shell()`). Domain crates (zen-core, zen-service, zen-repo, zen-gateway, zen-provider, zen-vault, zen-agents, zen-memory, zen-auth, zen-plugin) are library crates with lib.rs for DDD architecture. This separation enables reusable domain logic while maintaining a single CLI entry point.
 
 Rationale: Enforces code quality and maintains project structure conventions. DDD architecture requires domain separation via library crates.
 
@@ -347,4 +351,4 @@ All PRs MUST verify compliance with these principles. The AGENTS.md file serves 
 
 Rationale: Undocumented code is technical debt. Standardized documentation reduces support burden, improves onboarding, prevents misuse, and makes the codebase self-documenting. AGENTS.md serves as the runtime development guide and MUST reflect the current state of the codebase.
 
-**Version**: 1.8.0 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-08-22 (v1.8.0 — Principle XV Code Documentation & Scope Logic) | **Pending Amendment**: 2026-08-11 (v1.7.0 — Principle XIV Agent Safety)
+**Version**: 1.8.1 | **Ratified**: 2026-02-24 | **Last Amended**: 2026-11-15 (v1.8.1 — Development Workflow workspace-structure correction; XIII #9 Data-Only Backfills; header version sync) | **Pending Amendment**: 2026-08-11 (v1.7.0 — Principle XIV Agent Safety)
