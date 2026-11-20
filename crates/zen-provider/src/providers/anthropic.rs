@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::cache::{CacheSegments, CacheUsage, CachedCompletion, PromptCacheControl};
+use crate::providers::effective_model_name;
 use crate::router::{LlmError, UsedCompletion, blocking_usage_call, used_completion};
 
 #[derive(Debug, Clone)]
@@ -61,7 +62,7 @@ impl AnthropicProvider {
     ) -> Result<String, LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion(&self.model);
+        let model = client.completion(effective_model_name(&self.model, options));
         let mut agent_builder = AgentBuilder::new(model);
         let max_tokens = options.max_tokens.unwrap_or(4096);
         agent_builder = agent_builder.max_tokens(max_tokens);
@@ -76,7 +77,7 @@ impl AnthropicProvider {
 
         let text = response.output();
         info!(
-            model = self.model,
+            model = effective_model_name(&self.model, options),
             response_len = text.len(),
             "AnthropicProvider complete"
         );
@@ -120,7 +121,7 @@ impl AnthropicProvider {
     ) -> Result<UsedCompletion, LlmError> {
         let client = self.rig_client()?;
 
-        let model = client.completion(&self.model);
+        let model = client.completion(effective_model_name(&self.model, options));
         let mut request = CompletionRequest::new(prompt);
         request = request.max_tokens(options.max_tokens.unwrap_or(4096));
         if let Some(t) = options.temperature {
@@ -208,7 +209,12 @@ impl AnthropicProvider {
         task: &str,
         options: &zen_core::config::ModelOptions,
     ) -> Result<CachedCompletion, LlmError> {
-        let body = build_cached_request_body(&self.model, segments, task, options);
+        let body = build_cached_request_body(
+            effective_model_name(&self.model, options),
+            segments,
+            task,
+            options,
+        );
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(CACHED_COMPLETE_TIMEOUT)
@@ -246,7 +252,7 @@ impl AnthropicProvider {
             .unwrap_or_default()
             .to_string();
         info!(
-            model = self.model,
+            model = effective_model_name(&self.model, options),
             cache_creation = ?usage.cache_creation_input_tokens,
             cache_read = ?usage.cache_read_input_tokens,
             "AnthropicProvider cached complete"

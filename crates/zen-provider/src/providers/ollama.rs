@@ -47,8 +47,8 @@ impl OllamaProvider {
     /// D2b: per-call model override — `options.model` wins over the
     /// provider's configured default (ollama model names are per-request,
     /// so the override needs no client rebuild).
-    fn effective_model<'a>(&'a self, options: &'a zen_core::config::ModelOptions) -> &'a str {
-        options.model.as_deref().unwrap_or(&self.model)
+    pub fn effective_model<'a>(&'a self, options: &'a zen_core::config::ModelOptions) -> &'a str {
+        crate::providers::effective_model_name(&self.model, options)
     }
 
     pub async fn complete_async(

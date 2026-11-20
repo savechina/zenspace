@@ -395,10 +395,15 @@ pub struct UsedCompletion {
 /// Reconcile a provider usage echo against the bytes/4 estimate fallback.
 ///
 /// # Returns
-/// `(input_tokens, output_tokens)` — the real echo when the provider
-/// reported a non-zero total, otherwise the estimate pair unchanged.
-/// A `Some` echo whose tokens are ALL zero is rig's "provider failed to
-/// report" marker and is treated as absent (never billed as zero).
+/// `(input_tokens, output_tokens)` — the real echo per counter when the
+/// provider reported it, the estimate per counter it did not. A `Some`
+/// echo whose counters are ALL zero is rig's "provider failed to report"
+/// marker and is treated as absent (never billed as zero); the same
+/// never-trust-zeros rule applies PER COUNTER (W12.20): a provider that
+/// echoes only output tokens used to bill the input estimate as 0
+/// (under-counted cost) because the fallback fired only when the SUM was
+/// zero — now a zero/absent counter falls back to its estimate alone
+/// while the echoed counter passes through.
 ///
 /// # Examples
 /// ```
@@ -406,6 +411,8 @@ pub struct UsedCompletion {
 /// use zen_provider::SyncUsage;
 /// assert_eq!(reconcile_usage(Some(SyncUsage { input_tokens: 10, output_tokens: 5 }), 99, 99), (10, 5));
 /// assert_eq!(reconcile_usage(None, 7, 3), (7, 3));
+/// // Partial echo (output-only): the missing input counter is estimated.
+/// assert_eq!(reconcile_usage(Some(SyncUsage { input_tokens: 0, output_tokens: 45 }), 70, 30), (70, 45));
 /// ```
 pub fn reconcile_usage(
     usage: Option<SyncUsage>,
@@ -413,8 +420,20 @@ pub fn reconcile_usage(
     fallback_output: u64,
 ) -> (u64, u64) {
     match usage {
-        Some(u) if u.input_tokens + u.output_tokens > 0 => (u.input_tokens, u.output_tokens),
-        _ => (fallback_input, fallback_output),
+        Some(u) => {
+            let input = if u.input_tokens > 0 {
+                u.input_tokens
+            } else {
+                fallback_input
+            };
+            let output = if u.output_tokens > 0 {
+                u.output_tokens
+            } else {
+                fallback_output
+            };
+            (input, output)
+        }
+        None => (fallback_input, fallback_output),
     }
 }
 
@@ -441,7 +460,10 @@ pub fn text_from_choice(choice: &[rig_core::completion::AssistantContent]) -> St
 /// rig 0.46 usage semantics (DL-1): counters are `Option<u64>` — `None` means
 /// the provider never sent the counter (reported-zero stays `Some(0)`), and
 /// `Usage::is_reported()` gates the echo so an unreporting provider falls
-/// back to estimates instead of being billed as zero.
+/// back to estimates instead of being billed as zero. A `None` counter
+/// collapses to 0 here; [`reconcile_usage`] then applies its per-counter
+/// fallback (W12.20), so a partially-reporting provider is billed the echo
+/// for the counters it sent and the estimate for the rest.
 pub fn used_completion(
     provider_label: &str,
     response: rig_core::completion::CompletionResponse,
@@ -1296,9 +1318,10 @@ impl DefaultRouter {
                 .unwrap_or_else(|| "unknown".to_string())
         };
         let metadata = self.model_metadata(&provider_name, &model);
-        // Real provider usage when the surface echoed it; the bytes/4
-        // estimate only when it did not (mock, or an echo that was all
-        // zeros — rig's "provider failed to report" marker).
+        // Real provider usage when the surface echoed it, per counter; the
+        // bytes/4 estimate only for a counter it did not report (mock, an
+        // all-zero echo, or a partial echo's missing side — rig's "provider
+        // failed to report" marker and W12.20's per-counter fallback).
         let (input_tokens, output_tokens) = reconcile_usage(
             completion.usage,
             estimate_tokens(request),
@@ -1422,6 +1445,20 @@ impl DefaultRouter {
         match sensitivity {
             Sensitivity::Public => Ok(provider),
             Sensitivity::Private | Sensitivity::Confidential => {
+                // T225 parity: Mock is the offline stand-in (canned text,
+                // never cloud egress) that resolve_completion_provider already
+                // allows for Private/Confidential turns — the gate must not
+                // reject it. `parse_provider_name("mock")` lands in
+                // Unknown("mock") (plan_synthesis::is_local_provider handles
+                // both shapes), so the check is name-based here too.
+                let is_mock_stand_in = match &provider {
+                    Provider::Mock => true,
+                    Provider::Unknown(name) => name == "mock",
+                    _ => false,
+                };
+                if is_mock_stand_in {
+                    return Ok(provider);
+                }
                 if self.is_local(&provider) {
                     // Quick path: the routed provider itself is local.
                     // Verify it is actually reachable.
@@ -1560,7 +1597,7 @@ impl DefaultRouter {
     /// D2b seam: effective stream options for a provider with an optional
     /// per-call model override layered over the config-resolved options.
     /// Pure config resolution — pin-testable without a wire.
-    pub(crate) fn stream_options(
+    pub fn stream_options(
         &self,
         provider_name: &str,
         model_override: Option<String>,
@@ -1576,8 +1613,9 @@ impl DefaultRouter {
 
     /// `call_stream` with a per-call model override (D2b — `[agentic.intent]
     /// model` rides this seam). `None` is byte-identical to the trait method;
-    /// the override lands in [`ModelOptions::model`], which the ollama
-    /// provider honors (other providers keep their configured default).
+    /// the override lands in [`ModelOptions::model`], which every provider
+    /// resolves through `effective_model_name` (absent keeps its configured
+    /// default).
     pub fn call_stream_with_model(
         &self,
         provider: Provider,
@@ -1669,6 +1707,85 @@ impl DefaultRouter {
 
         Ok(stream_resp)
     }
+
+    /// `call_with_usage` with a per-call model override (A-02 — a task-level
+    /// model hint rides this seam).
+    ///
+    /// # Purpose
+    /// Non-streaming twin of [`Self::call_stream_with_model`]: the caller has
+    /// already routed the provider (sensitivity/`enforce_sensitivity` lives
+    /// upstream and is untouched here); only the model name within that
+    /// provider changes.
+    ///
+    /// # Usage
+    /// `router.call_with_usage_with_model(routed_provider, prompt, Some(hint))`.
+    /// `None` is byte-identical to [`LlmRouter::call_with_usage`] — same
+    /// options construction (`resolve_effective_options(..).unwrap_or_default()`),
+    /// same mock short-circuit and secrets-guard redaction/restore.
+    ///
+    /// # Scope logic
+    /// The override lands in [`zen_core::config::ModelOptions::model`];
+    /// providers resolve it through `effective_model_name` (override wins,
+    /// absent keeps the configured default). This crate adds no config key.
+    ///
+    /// # Cross-provider hint limitation
+    /// The hint is a model *name* validated against the model catalog union.
+    /// A name the routed provider does not serve is sent verbatim and fails
+    /// honestly at the provider's HTTP layer at runtime — the router never
+    /// silently switches provider families to find a matching model.
+    ///
+    /// # Errors
+    /// Same as [`LlmRouter::call_with_usage`]: unconfigured provider or a
+    /// provider call failure.
+    pub fn call_with_usage_with_model(
+        &self,
+        provider: Provider,
+        prompt: &str,
+        model_override: Option<String>,
+    ) -> Result<UsedCompletion, LlmError> {
+        let (guarded, secret_map) = self.secrets_guard_redact(&provider, prompt);
+        let prompt: &str = guarded.as_str();
+        let provider_name = match &provider {
+            Provider::Unknown(name) => name.clone(),
+            _ => provider.to_string(),
+        };
+
+        if provider_name == "mock" {
+            info!(
+                prompt_len = prompt.len(),
+                "DefaultRouter: delegating to MockProvider"
+            );
+            let text = self.mock.complete("call", prompt)?;
+            return Ok(UsedCompletion {
+                text: self.secrets_guard_restore(text, secret_map),
+                usage: None,
+            });
+        }
+
+        let options = self.stream_options(&provider_name, model_override);
+
+        if let Some(instance) = self.provider_instance(&provider_name) {
+            info!(
+                provider = provider_name,
+                model = options.model.as_deref().unwrap_or(instance.model_name()),
+                prompt_len = prompt.len(),
+                "DefaultRouter: calling provider (usage-bearing)"
+            );
+            let completion = instance.complete_with_usage(prompt, &options)?;
+            Ok(UsedCompletion {
+                text: self.secrets_guard_restore(completion.text, secret_map),
+                usage: completion.usage,
+            })
+        } else {
+            Err(LlmError::ProviderUnavailable {
+                provider: provider_name.clone(),
+                reason: format!(
+                    "Provider '{}' not configured. Add to ~/.zen/config.toml: [providers.{}]",
+                    provider_name, provider_name
+                ),
+            })
+        }
+    }
 }
 
 impl LlmRouter for DefaultRouter {
@@ -1735,50 +1852,7 @@ impl LlmRouter for DefaultRouter {
         provider: Provider,
         prompt: &str,
     ) -> Result<UsedCompletion, LlmError> {
-        let (guarded, secret_map) = self.secrets_guard_redact(&provider, prompt);
-        let prompt: &str = guarded.as_str();
-        let provider_name = match &provider {
-            Provider::Unknown(name) => name.clone(),
-            _ => provider.to_string(),
-        };
-
-        if provider_name == "mock" {
-            info!(
-                prompt_len = prompt.len(),
-                "DefaultRouter: delegating to MockProvider"
-            );
-            let text = self.mock.complete("call", prompt)?;
-            return Ok(UsedCompletion {
-                text: self.secrets_guard_restore(text, secret_map),
-                usage: None,
-            });
-        }
-
-        let options = self
-            .resolve_effective_options(&provider_name)
-            .unwrap_or_default();
-
-        if let Some(instance) = self.provider_instance(&provider_name) {
-            info!(
-                provider = provider_name,
-                model = instance.model_name(),
-                prompt_len = prompt.len(),
-                "DefaultRouter: calling provider (usage-bearing)"
-            );
-            let completion = instance.complete_with_usage(prompt, &options)?;
-            Ok(UsedCompletion {
-                text: self.secrets_guard_restore(completion.text, secret_map),
-                usage: completion.usage,
-            })
-        } else {
-            Err(LlmError::ProviderUnavailable {
-                provider: provider_name.clone(),
-                reason: format!(
-                    "Provider '{}' not configured. Add to ~/.zen/config.toml: [providers.{}]",
-                    provider_name, provider_name
-                ),
-            })
-        }
+        self.call_with_usage_with_model(provider, prompt, None)
     }
 
     fn call_stream(
@@ -2263,6 +2337,29 @@ mod tests {
             output_tokens: 0,
         };
         assert_eq!(reconcile_usage(Some(zero), 70, 30), (70, 30));
+    }
+
+    #[test]
+    fn reconcile_usage_estimates_only_the_missing_counter_on_partial_echo() {
+        // W12.20: an output-only echo used to bill the input estimate as 0
+        // (the fallback fired only when the SUM was zero). The missing
+        // counter must be estimated; the echoed counter passes through.
+        let output_only = SyncUsage {
+            input_tokens: 0,
+            output_tokens: 45,
+        };
+        assert_eq!(
+            reconcile_usage(Some(output_only), 70, 30),
+            (70, 45),
+            "input estimated (not 0), output keeps the echo"
+        );
+
+        // Mirror case: input-only echo, output estimated.
+        let input_only = SyncUsage {
+            input_tokens: 120,
+            output_tokens: 0,
+        };
+        assert_eq!(reconcile_usage(Some(input_only), 70, 30), (120, 30));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use rig_core::providers::openai::OpenAI;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::providers::effective_model_name;
 use crate::router::{LlmError, UsedCompletion, blocking_usage_call, used_completion};
 
 #[derive(Debug, Clone)]
@@ -32,7 +33,7 @@ impl MistralProvider {
     ) -> Result<String, LlmError> {
         let client = self.rig_client();
 
-        let model = client.chat(&self.model);
+        let model = client.chat(effective_model_name(&self.model, options));
         let mut agent_builder = AgentBuilder::new(model);
         if let Some(t) = options.temperature {
             agent_builder = agent_builder.temperature(t);
@@ -48,7 +49,7 @@ impl MistralProvider {
 
         let text = response.output();
         info!(
-            model = self.model,
+            model = effective_model_name(&self.model, options),
             response_len = text.len(),
             "MistralProvider complete"
         );
@@ -86,7 +87,7 @@ impl MistralProvider {
     ) -> Result<UsedCompletion, LlmError> {
         let client = self.rig_client();
 
-        let model = client.chat(&self.model);
+        let model = client.chat(effective_model_name(&self.model, options));
         let mut request = CompletionRequest::new(prompt);
         if let Some(t) = options.temperature {
             request = request.temperature(t);
