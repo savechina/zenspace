@@ -168,4 +168,21 @@ local_turn_watchdog_secs = 5678
                 && c.gateway.local_turn_watchdog_secs == Some(5678)
         },
     );
+
+    // Workflow-induction kill switch ([agentic.workflow_induction] — W13).
+    assert_key_lands(
+        r#"
+[agentic.workflow_induction]
+enabled = false
+"#,
+        "agentic.workflow_induction.enabled=false",
+        |c| {
+            c.agentic.workflow_induction.enabled == Some(false)
+                && !c.agentic.workflow_induction.enabled_or_default()
+        },
+    );
+    assert_key_lands("", "agentic.workflow_induction.enabled(absent)", |c| {
+        c.agentic.workflow_induction.enabled.is_none()
+            && c.agentic.workflow_induction.enabled_or_default()
+    });
 }

@@ -550,3 +550,36 @@ mod docs_consistency {
         );
     }
 }
+
+#[cfg(test)]
+mod discover_workflow_parse {
+    use super::*;
+
+    fn discover_operation(args: &[&str]) -> DiscoverCommands {
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Commands::Discover { operation }) => operation,
+            _ => panic!("expected a `discover` subcommand"),
+        }
+    }
+
+    #[test]
+    fn confirm_workflow_subcommand_parses_draft_name() {
+        match discover_operation(&["zen", "discover", "confirm-workflow", "research-synthesis"]) {
+            DiscoverCommands::ConfirmWorkflow { draft_name } => {
+                assert_eq!(draft_name, "research-synthesis");
+            }
+            _ => panic!("expected DiscoverCommands::ConfirmWorkflow"),
+        }
+    }
+
+    #[test]
+    fn reject_workflow_subcommand_parses_draft_name() {
+        match discover_operation(&["zen", "discover", "reject-workflow", "shape-deadbeef"]) {
+            DiscoverCommands::RejectWorkflow { draft_name } => {
+                assert_eq!(draft_name, "shape-deadbeef");
+            }
+            _ => panic!("expected DiscoverCommands::RejectWorkflow"),
+        }
+    }
+}

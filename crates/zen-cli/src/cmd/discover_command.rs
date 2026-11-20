@@ -10,6 +10,10 @@ use clap::Subcommand;
 use colored::Colorize;
 
 use zen_agents::scheduler::{PromotionWorker, WorkerContext, ZenLoopWorker, ZenWorker};
+use zen_agents::workflow_induction::{
+    ConfirmOutcome, RejectOutcome, confirm_workflow, read_drafts, read_last_run, reject_workflow,
+    shape_sha8,
+};
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_vault::distill::{
@@ -36,6 +40,16 @@ pub enum DiscoverCommands {
     Reject {
         /// Promotion id (e.g. `promo-orphan-cache`)
         id: String,
+    },
+    /// Promote a staged workflow draft into a wisdom template (human gate)
+    ConfirmWorkflow {
+        /// Draft name from the induction queue (`zen discover report`)
+        draft_name: String,
+    },
+    /// Reject a staged workflow draft and quarantine its shape signature
+    RejectWorkflow {
+        /// Draft name from the induction queue (`zen discover report`)
+        draft_name: String,
     },
     /// Show RSI health metrics aggregated from cycle reports
     Report,
@@ -118,6 +132,64 @@ fn render_reward_coverage(logs_dir: &std::path::Path) -> Result<serde_json::Valu
         .map(|coverage| coverage.unwrap_or_else(|| serde_json::json!({ "recorded": false })))
 }
 
+/// W13.8 advisory `workflow_induction` section for `zen discover report`.
+///
+/// Reads the last-run sidecar (per-run counters + insufficiency) and the
+/// drafts queue — both fail-open. A missing/corrupt sidecar renders
+/// `{"recorded": false}` (mirrors the `memory_strength` discipline); a
+/// recorded run renders the design §7 shape. Side-effect-free: reads only.
+fn render_workflow_induction(logs_dir: &std::path::Path) -> Result<serde_json::Value, ZenError> {
+    let Some(summary) = read_last_run(logs_dir) else {
+        return Ok(serde_json::json!({ "recorded": false }));
+    };
+    let drafts: Vec<serde_json::Value> = read_drafts(logs_dir)
+        .iter()
+        .map(|draft| {
+            serde_json::json!({
+                "name": draft.name,
+                "shape_signature": draft.shape_signature,
+                "cluster_size": draft.success_stats.cluster_size,
+                "success_rate": draft.success_stats.success_rate,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "advisory_only": true,
+        "insufficient": summary.insufficient,
+        "insufficient_reason": summary.missing,
+        "drafts_count": drafts.len(),
+        "skipped_corrupt": summary.skipped_corrupt,
+        "skipped_titles_only": summary.skipped_titles_only,
+        "drafts": drafts,
+    }))
+}
+
+fn print_workflow_induction(logs_dir: &std::path::Path) {
+    let Some(summary) = read_last_run(logs_dir) else {
+        return;
+    };
+    let drafts = read_drafts(logs_dir);
+    println!(
+        "{}",
+        format!("workflow induction (advisory, {} draft(s)):", drafts.len()).dimmed()
+    );
+    for draft in &drafts {
+        println!(
+            "  {}",
+            format!(
+                "- {} (cluster {}, success {:.0}%)",
+                draft.name,
+                draft.success_stats.cluster_size,
+                draft.success_stats.success_rate * 100.0,
+            )
+            .dimmed()
+        );
+    }
+    if let Some(reason) = &summary.missing {
+        println!("  {}", format!("insufficient: {reason}").dimmed());
+    }
+}
+
 pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(e.to_string()))?;
     let map_err = |e: anyhow::Error| ZenError::Message(e.to_string());
@@ -188,6 +260,63 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 return Err(ZenError::Message(format!(
                     "no staged promotion item with id '{id}' (see `zen discover queue`)"
                 )));
+            }
+        }
+        DiscoverCommands::RejectWorkflow { draft_name } => {
+            let now = chrono::Utc::now().timestamp();
+            match reject_workflow(&paths.logs(), draft_name, now).await {
+                Ok(RejectOutcome::Rejected { shape_signature }) => {
+                    println!(
+                        "{} {draft_name} (signature {}, permanently quarantined)",
+                        "workflow draft rejected".yellow().bold(),
+                        shape_sha8(&shape_signature),
+                    );
+                }
+                Ok(RejectOutcome::AlreadyRejected { shape_signature }) => {
+                    println!(
+                        "{} {draft_name} (signature {} already quarantined; queue entry removed)",
+                        "already rejected".yellow().bold(),
+                        shape_sha8(&shape_signature),
+                    );
+                }
+                Err(e) => {
+                    return Err(ZenError::Message(format!(
+                        "workflow reject failed: {e} — run `zen discover report` to see staged drafts"
+                    )));
+                }
+            }
+        }
+        DiscoverCommands::ConfirmWorkflow { draft_name } => {
+            let now = chrono::Utc::now().timestamp();
+            match confirm_workflow(&paths.logs(), &paths.vault(), draft_name, now).await {
+                Ok(ConfirmOutcome::Promoted {
+                    template_path,
+                    suffixed,
+                }) => {
+                    println!(
+                        "{} {draft_name} → {}",
+                        "workflow template promoted".green().bold(),
+                        template_path.display(),
+                    );
+                    if suffixed {
+                        println!(
+                            "  {}",
+                            "name collision: deterministic shape-suffixed variant written".dimmed()
+                        );
+                    }
+                }
+                Ok(ConfirmOutcome::AlreadyPromoted { template_path }) => {
+                    println!(
+                        "{} {draft_name} — {} (not rewritten)",
+                        "already promoted".yellow().bold(),
+                        template_path.display(),
+                    );
+                }
+                Err(e) => {
+                    return Err(ZenError::Message(format!(
+                        "workflow confirm failed: {e} — run `zen discover report` to see staged drafts"
+                    )));
+                }
             }
         }
         DiscoverCommands::Calibrate { write } => {
@@ -326,6 +455,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
             // Phase 34 T241: additive FR-034 reward-coverage section read from
             // the same report file — same fail-open shape as memory_strength.
             let reward_coverage = render_reward_coverage(&paths.logs())?;
+            let workflow_induction = render_workflow_induction(&paths.logs())?;
             let success_criteria = serde_json::json!({
                 "first_attempt_success": serde_json::to_value(&first_attempt_success)
                     .map_err(|e| ZenError::Message(e.to_string()))?,
@@ -344,6 +474,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                     "skill_eval": skill_eval,
                     "memory_strength": memory_strength,
                     "reward_coverage": reward_coverage,
+                    "workflow_induction": workflow_induction,
                 }))
                 .map_err(|e| ZenError::Message(e.to_string()))?
             );
@@ -364,6 +495,7 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                         .unwrap_or(0),
                 ),
             }
+            print_workflow_induction(&paths.logs());
         }
         DiscoverCommands::Arena {
             external,
@@ -471,6 +603,100 @@ mod tests {
         std::fs::write(dir.path().join("memory-strength-report.json"), "{ broken").unwrap();
         let section = render_reward_coverage(dir.path()).unwrap();
         assert_eq!(section, json!({ "recorded": false }));
+    }
+
+    use zen_agents::workflow_induction::{DRAFTS_FILE, LAST_RUN_FILE};
+
+    #[test]
+    fn workflow_induction_section_missing_sidecar_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = render_workflow_induction(dir.path()).unwrap();
+        assert_eq!(section, json!({ "recorded": false }));
+    }
+
+    #[test]
+    fn workflow_induction_section_corrupt_sidecar_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LAST_RUN_FILE), "{ broken").unwrap();
+        let section = render_workflow_induction(dir.path()).unwrap();
+        assert_eq!(section, json!({ "recorded": false }));
+    }
+
+    #[test]
+    fn workflow_induction_section_renders_insufficiency_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LAST_RUN_FILE),
+            r#"{"drafts_written":0,"skipped_corrupt":1,"skipped_titles_only":2,
+                "insufficient":true,"missing":"no similar shape cluster (threshold 0.72)",
+                "induced_at":"2026-11-18T10:30:00Z"}"#,
+        )
+        .unwrap();
+        let section = render_workflow_induction(dir.path()).unwrap();
+        assert_eq!(section["advisory_only"], json!(true));
+        assert_eq!(section["insufficient"], json!(true));
+        assert_eq!(
+            section["insufficient_reason"],
+            json!("no similar shape cluster (threshold 0.72)")
+        );
+        assert_eq!(section["drafts_count"], json!(0));
+        assert_eq!(section["skipped_corrupt"], json!(1));
+        assert_eq!(section["skipped_titles_only"], json!(2));
+        assert_eq!(section["drafts"], json!([]));
+    }
+
+    #[test]
+    fn workflow_induction_section_renders_recorded_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LAST_RUN_FILE),
+            r#"{"drafts_written":1,"skipped_corrupt":0,"skipped_titles_only":0,
+                "insufficient":false,"missing":null,
+                "induced_at":"2026-11-18T10:30:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(DRAFTS_FILE),
+            r#"[{"name":"research-then-synthesize",
+                "shape_signature":"analyst:1,1;researcher:0,1;synthesizer:1,0",
+                "source_plan_ids":["a","b"],"source_plan_dates":["2026-11-10","2026-11-15"],
+                "tasks":[],
+                "success_stats":{"cluster_size":2,"avg_duration_ms":45000,
+                    "avg_cost_usd":0.12,"success_rate":1.0},
+                "induced_at":"2026-11-18T10:30:00Z"}]"#,
+        )
+        .unwrap();
+        let section = render_workflow_induction(dir.path()).unwrap();
+        assert_eq!(section["advisory_only"], json!(true));
+        assert_eq!(section["insufficient"], json!(false));
+        assert_eq!(section["insufficient_reason"], json!(null));
+        assert_eq!(section["drafts_count"], json!(1));
+        assert_eq!(
+            section["drafts"][0]["name"],
+            json!("research-then-synthesize")
+        );
+        assert_eq!(section["drafts"][0]["cluster_size"], json!(2));
+        assert_eq!(section["drafts"][0]["success_rate"], json!(1.0));
+        assert!(
+            section["drafts"][0].get("source_plan_ids").is_none(),
+            "report drafts expose only the §7 summary fields"
+        );
+    }
+
+    #[test]
+    fn workflow_induction_section_corrupt_drafts_file_is_empty_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LAST_RUN_FILE),
+            r#"{"drafts_written":0,"skipped_corrupt":0,"skipped_titles_only":0,
+                "insufficient":false,"missing":null,
+                "induced_at":"2026-11-18T10:30:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(DRAFTS_FILE), "{ broken").unwrap();
+        let section = render_workflow_induction(dir.path()).unwrap();
+        assert_eq!(section["drafts_count"], json!(0));
+        assert_eq!(section["drafts"], json!([]));
     }
 
     #[test]

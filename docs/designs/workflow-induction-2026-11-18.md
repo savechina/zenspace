@@ -245,3 +245,53 @@ shape(plan) = sort_lexicographically([ (task.agent, in_degree(task), out_degree(
 **Design-first (Constitution XI).** This document is the design of record. No code lands until this design is owner-approved. Reuse-before-novel: every design element cites existing machinery (section 9 reuse map). Zero new dependencies, zero new config keys, zero auto-application.
 
 **Next step (not in this task).** Owner approval → implementation tasks (not designed here — this is design-only per the task brief). Implementation would land in `crates/zen-agents/src/workflow_induction.rs` (new module, ZenWorker trait impl) + `crates/zen-agents/src/scheduler/mod.rs` (register the worker) + `crates/zen-cli/src/cmd/discover_command.rs` (additive `confirm-workflow`/`reject-workflow` subcommands + additive `workflow_induction` section in report, mirrors `memory_strength` pattern).
+
+## 15. Corpus-observability amendment (2026-11-20, eng-review D2/T5, owner ultrawork authorization)
+
+**Problem (verified).** The canonical D21 flow cannot produce a DAG-shaped
+corpus row: `plan.todos` mints `spec_json = {items:[...], sensitivity,
+session_id}`, `plan.execute` ATTACHES to that row (plan_task.rs
+Some(lid) arm — "a live session ledger record wins over a fresh mint") and
+`spec_json` is never rewritten. Production probe (2026-11-20): 1 plan
+total, DAG-shaped but `failed` — a test artifact. The induction corpus is
+therefore structurally starved by the very flow the orchestrator
+mandates.
+
+**Decision (T5).** At ledger-attach, `plan.execute` merges the CURRENT
+batch's DAG into the plan row's `spec_json` via one additive
+`WorkflowRepo::update_plan_spec_json(plan_id, spec_json)` UPDATE:
+
+- Read-modify-write preserving `items` + `sensitivity` + `session_id` +
+  `name`; the `tasks` array is REPLACED with the current batch's
+  `{id, agent, prompt, depends_on}` — the row observes the
+  last-dispatched shape. Rationale: one row = one plan (mint-once
+  contract intact — the rewrite is an UPDATE, not a mint); per-batch
+  history already lives in `workflow_tasks`.
+- The §2 discriminator is unchanged: the parser prefers `tasks` when
+  present (`items` coexist harmlessly for the ledger UI); pre-attach
+  rows remain `TitlesOnly`; fresh DAG mints unchanged.
+- Constraints: the attach path already holds the DB claim fence — the
+  UPDATE adds no new lock; W12.17 marker keys preserved verbatim; the
+  write is idempotent per batch (same batch re-attach writes the same
+  DAG).
+
+**AC#10 (new).** Attach writes an observable DAG: e2e —
+`plan.todos` mint → `plan.execute` ledger-attach →
+`shape_signature_from_spec_json(row.spec_json)` classifies `Dag`.
+
+**Hardening amendments (T4, same authorization).** §2 parser: a MISSING
+`depends_on` key is tolerated as `[]` (mirror of the tool contract
+`plan_task.rs:457 depends_on?`); present-but-non-array stays corrupt.
+§2 corpus: admission requires plan `status == 'completed'` AND
+settled-row count ≥ expected (fresh mints: spec tasks; attached:
+`items`), so partial and cancelled plans never enter the corpus. §5a:
+clustering computes OUTSIDE the flock (the lock covers only
+drafts-queue + sidecar writes); `induction_corpus` gains an in-code
+LIMIT. §7: a zero-corpus run writes the LAST-RUN SIDECAR (recorded:
+true, `NoPlansInWindow`) but no drafts file — "never ran"
+(recorded:false) and "ran, nothing to do" become distinguishable; a
+titles-only-dominant empty corpus reports its own honest reason. §8:
+worker registration is gated by `[agentic.workflow_induction].enabled`
+(default true; delegate `[agentic.delegate].enabled` precedent — a D22
+exception ratified by the eng-review #9 finding and the owner's
+2026-11-20 authorization).

@@ -843,13 +843,21 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **W14 eng-review 收尾波：W13 归纳加固 + 语料可观测性（2026-11-20，owner ultrawork「finish all task」触发；lint 0 / verify 绿 / test 3889/0/28）** — T4×6 + T5 合一：
+  - **语料可观测性（T5）**：plan.execute 挂账臂合并批 DAG 入 workflow_plans.spec_json（attach_batch_spec 守卫 status='running' + 同语句心跳；items/session_id（mint-once LIKE 不变量）/sensitivity 保序，tasks 按批替换=观测最后派发形状）——归纳语料不再被规范流绕开；e2e 钉 mint→attach→Dag。
+  - **解析器对齐（T4a）**：depends_on 缺省容忍为 []（镜像 plan_task.rs:457 可选契约）；present-非数组仍 corrupt。
+  - **语料诚实（T4b）**：准入需 status='completed' + 行数-vs-期望（attached 行豁免）；cancelled/部分执行不再入语料；四 fixture 站点补 complete_plan。
+  - **锁界收敛（T4c）**：聚类移出 flock，临界区=quarantine 重读+双写；锁内 re-read+retain 关 pre-lock 追加窗；induction_corpus LIMIT 1000 内码常量。
+  - **零语料可观测（T4d）**：零语料写 last-run sidecar（recorded 区分「从未跑」/「跑了没事做」）——AC#2 按设计 §15 修订；TitlesOnlyCorpus 专属诚实 reason。
+  - **kill switch（T4e）**：[agentic.workflow_induction].enabled 默认 true + E11 三态 env；门在 worker execute（retention 姿态，调度器计数钉不动）；config 哨兵 case + 文档三处。
+
 - **W13 workflow induction 实现落地（2026-11-19，owner 批准 W2.3 设计 4 默认值 + speckit-tasks W13 台账 10 任务；`bin/lint` 0；`bin/test` 终局门禁见收口报告）** — D15/R8 advisory-only 三硬约束全守（零权重训练、零自动应用、LLM-free 确定性）：
   - **W13.1-4 核心模块**（`zen-agents/src/workflow_induction.rs` 新文件 ~770 行）：spec_json 解析 + plan.todos 判别器（items-only ⇒ TitlesOnly 非 corrupt）、Kahn 语义 in/out 度、字典序 canonical 签名（`agent:in,out;...` 洗牌声明序不变）；WorkflowRepo::induction_corpus 单查询（90d 窗/fully-completed 过滤/corrupt fail-open）；trigram_jaccard 复用（zen_vault 已 pub）+ greedy 聚类 0.72/≥2 内码常量；草稿队列原子覆写 + 拒收账本永久隔离；workflow-induction.lock flock 全周期持有。
   - **W13.5-6 人闸**：confirm（模板晋升 wisdom/workflow-templates/<name>.md + sha8 碰撞后缀、AC#3 字节幂等——渲染为 draft 纯函数无 confirmed_at）/reject（账本 append + 永久隔离、strict 读防 corrupt clobber）；`zen discover confirm-workflow/reject-workflow` daemonless 直文件操作 + docs 一致性门。
   - **W13.7 worker**：WorkflowInductionWorker 每日 3AM 双 profile 注册（自有 flock + scheduler lease 单 host）、fail-soft warn 姿态、zen_induction info 行；调度器计数断言 18→19/16→17。
   - **W13.8-9 面**：run() 同 flock 原子写 last-run sidecar（skipped_*/insufficient 计数诚实非伪造；零语料路径保持零副作用保 AC#2）；report `workflow_induction` 节 fail-open（missing/corrupt ⇒ recorded:false）+ 侧效无关；AC#5 grep 哨兵（5 字面量 allowlist = 核心模块 + worker）。
   - 钉账：workflow_induction_* 28 个（12 core + 7 gate + 4 worker + 5 sentinel/report）；cli parse ×2；docs_consistency 绿。偏差留档见设计 §7/§12 与 tasks.md W13 注记。
-  - **落库裁决（2026-11-20 eng-review，D2 收敛 A）**：W13 文件组**暂扣不落库**——生产语料只读探测实证 1 条 failed 测试计划（无重复 DAG 形状），触发器前提在生产数据中不存在；代码在盘全绿保留，待 T4 加固批（depends_on 可选容忍/部分计划排除/status 过滤/聚类移出锁/零语料 sidecar/reason 措辞/kill switch）+ T5 语料可观测性迷你设计（挂账写入 DAG spec_json）后再落。W12+A02 照常落库。
+  - **落库裁决（2026-11-20 eng-review，D2 收敛 A → 当日解除）**：曾暂扣（生产语料探测实证 1 条 failed 测试计划、无重复 DAG 形状）；同日 ultrawork 波 W14 完成 T4 加固批 + T5 语料可观测性（plan.execute 挂账把批 DAG 合并写入 spec_json——items/session_id/sensitivity 保序，tasks 按批替换）后解除，W13+W14 合一落库；门禁 lint 0 / verify 绿 / test 3889/0/28。
 
 - **Remain-task wave: A-02 + row13 + A-01 + W2.3 全清（2026-11-19，owner 触发三留案全推；`bin/lint` 0；`bin/test` 终局门禁见收口报告）** — tasks.md 仅剩 0 未勾（28 W12 + A-01/A-02/W2.3 全 [X]），TODOS.md 10/10 清账：
   - **A-02（D2b 收口）**：per-task model hint 真切换——Lane 1 provider 插管（`effective_model_name` 共享 helper ×12 站点、`call_with_usage_with_model` inherent seam（None 字节等同）、`stream_options` pub）+ Lane 2 runtime 接线（AgentContext.model_override 载体仅 Hint 时置位、TaskRequirements.preferred_model 接通（路由不读——验证）、executor 传递）；语义：仅切 provider 内模型名，不切 provider，敏感度闸门不动；钉 ×10（provider 4 + runtime 6：hint-switches/profile-wins/sensitivity-gate/no-hint 字节等同）；zen-provider 87/87、zen-agents 966/966。

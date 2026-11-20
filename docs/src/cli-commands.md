@@ -49,6 +49,8 @@ Zen's CLI surface is intentionally small: the TUI plus 23 subcommands. Heavy cap
 | `zen discover run` | Run one self-learning cycle (stages 5b/5c/5d) |
 | `zen discover stage` / `queue` | Stage and inspect improvement hypotheses |
 | `zen discover confirm` / `reject` | Review staged hypotheses |
+| `zen discover confirm-workflow <name>` | Promote a staged workflow draft into `vault/wiki/wisdom/workflow-templates/` |
+| `zen discover reject-workflow <name>` | Reject a staged workflow draft and quarantine its shape signature |
 | `zen discover report` | Learning metrics (routing, stalls, calibration, replay) |
 | `zen discover arena` | Run distill regression gate vs baselines |
 | `zen discover calibrate --write` | Derive decision thresholds from labeled data |

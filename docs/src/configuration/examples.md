@@ -278,6 +278,10 @@ max_depth = 1                    # how deep delegation can nest, clamp 1..=3
 max_concurrent = 4               # parallel fan-out, clamp 1..=8
 timeout_secs = 300               # clamp 30..=1800
 
+# Daily advisory workflow induction (W13)
+[agentic.workflow_induction]
+enabled = true                   # false = skip the pass (env ZEN_WORKFLOW_INDUCTION_ENABLED)
+
 # Daily retention sweep (log/archive rotation + age deletes)
 [agentic.retention]
 enabled = true

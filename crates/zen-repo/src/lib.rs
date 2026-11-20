@@ -29,8 +29,8 @@ pub use self_model_repo::SelfModelRepo;
 pub use sessions_repo::{IndexedSession, SessionsRepo};
 pub use traits::notions::NotionsRepository;
 pub use workflow_repo::{
-    DEFAULT_STALE_CLAIM_SECS, DurationHistoryRow, TaskCheckpoint, TaskDraft, WorkflowPlanRow,
-    WorkflowRepo, WorkflowTaskRow,
+    DEFAULT_STALE_CLAIM_SECS, DurationHistoryRow, InductionPlanRow, InductionTaskRow,
+    TaskCheckpoint, TaskDraft, WorkflowPlanRow, WorkflowRepo, WorkflowTaskRow,
 };
 pub mod workflow_repo;
 pub use types::*;

@@ -65,6 +65,7 @@ Full list by section:
 | `[agentic.cache]` | `ZEN_CACHE_BREAKPOINTS` |
 | `[agentic.review]` | `ZEN_REVIEW_MAX_MOMUS_RETRIES`, `_MAX_HERMES_REVISIONS`, `_LLM_HIGH_BLAST`, `_ESCALATE_THRESHOLD` |
 | `[agentic.delegate]` | `ZEN_DELEGATE_ENABLED`, `_TIMEOUT_SECS`, `_MAX_DEPTH`, `_MAX_CONCURRENT` |
+| `[agentic.workflow_induction]` | `ZEN_WORKFLOW_INDUCTION_ENABLED` |
 | `[agentic.orchestrator]` | `ZEN_ORCHESTRATOR_SURFACE` (`full` \| `delegation-only`) |
 | `[agentic.intent]` | `ZEN_INTENT_SHADOW_EMBEDDING`, `ZEN_INTENT_L1_THRESHOLD` |
 | `[agentic.classifiers]` | `ZEN_CLASSIFIER_CORRECTION_THRESHOLD`, `ZEN_CLASSIFIER_CITATION_THRESHOLD` |

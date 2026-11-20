@@ -36,6 +36,7 @@ pub mod skill_loader;
 pub mod skill_precipitation;
 pub mod skill_trigger_eval;
 pub mod wiring;
+pub mod workflow_induction;
 pub mod zen_agent;
 pub mod zen_skill;
 

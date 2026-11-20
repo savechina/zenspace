@@ -891,6 +891,13 @@ pub fn create_configured_scheduler_with(
         warn!("scheduler: failed to register embedding-refresher worker (non-critical): {e}");
     }
 
+    // Both profiles: workflow induction is advisory-only filesystem work
+    // guarded by its own flock — the cross-process scheduler lease guarantees
+    // exactly one host runs the daily pass.
+    if let Err(e) = scheduler.register(WorkflowInductionWorker::new()) {
+        warn!("scheduler: failed to register workflow-induction worker (non-critical): {e}");
+    }
+
     // Knowledge-processing loop: interval + enabled come from
     // [agentic.loop]; disabled → manual-only (`zen wiki loop run`).
     match zen_core::config::load_config() {
@@ -1411,10 +1418,10 @@ mod tests {
     #[test]
     fn test_create_configured_scheduler_core_workers() {
         // zen-loop is config-gated (enabled flag via load_config), so only
-        // the 17 core workers are asserted unconditionally.
+        // the 18 core workers are asserted unconditionally.
         let scheduler = create_configured_scheduler(&CronConfig::default());
         let items = scheduler.list();
-        assert!(items.len() >= 17);
+        assert!(items.len() >= 18);
         for id in [
             "memory-curator",
             "dream",
@@ -1433,6 +1440,7 @@ mod tests {
             "promotion",
             "retention",
             "embedding-refresher",
+            "workflow-induction",
         ] {
             assert!(
                 items.iter().any(|w| w.id == id),
@@ -1462,6 +1470,7 @@ mod tests {
         "promotion",
         "retention",
         "embedding-refresher",
+        "workflow-induction",
         "zen-loop",
     ];
 
@@ -1481,15 +1490,16 @@ mod tests {
         "promotion",
         "retention",
         "embedding-refresher",
+        "workflow-induction",
         "zen-loop",
     ];
 
     #[test]
-    fn test_full_profile_has_all_18_workers() {
+    fn test_full_profile_has_all_19_workers() {
         let scheduler =
             create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::Full);
         let ids = scheduler.worker_ids();
-        assert_eq!(ids.len(), 18, "Full profile must register 18 workers");
+        assert_eq!(ids.len(), 19, "Full profile must register 19 workers");
         for expected in FULL_WORKERS {
             assert!(
                 ids.contains(&expected.to_string()),
@@ -1499,20 +1509,20 @@ mod tests {
     }
 
     #[test]
-    fn test_inapp_profile_has_16_workers() {
+    fn test_inapp_profile_has_17_workers() {
         let scheduler =
             create_configured_scheduler_with(&CronConfig::default(), SchedulerProfile::InApp);
         let ids = scheduler.worker_ids();
 
-        // Exactly 16 workers (zen-loop may or may not register depending on
-        // load_config; assert >= 16 to handle the config-gated edge).
+        // At least 17 workers (zen-loop may or may not register depending on
+        // load_config; assert >= 17 to handle the config-gated edge).
         assert!(
-            ids.len() >= 16,
-            "InApp profile must register at least 16 workers, got {}",
+            ids.len() >= 17,
+            "InApp profile must register at least 17 workers, got {}",
             ids.len()
         );
 
-        // Inclusion: all 16 expected workers present.
+        // Inclusion: all 17 expected workers present.
         for expected in INAPP_WORKERS {
             assert!(
                 ids.contains(&expected.to_string()),

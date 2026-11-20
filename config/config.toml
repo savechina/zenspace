@@ -561,6 +561,19 @@ max_rounds = 8
 # context_inheritance = false
 
 # =============================================================================
+# Workflow induction (W13) — daily advisory pass
+# =============================================================================
+#
+# enabled: gates the daily 03:00 workflow-induction pass that clusters
+#   repeated plan DAG shapes into a drafts queue (advisory only, never
+#   auto-applied). false skips the pass; the worker stays registered so
+#   the scheduler worker counts never churn.
+# Env: ZEN_WORKFLOW_INDUCTION_ENABLED.
+#
+[agentic.workflow_induction]
+# enabled = true
+
+# =============================================================================
 # Intent classification ladder (D2 intent-speed fix; T168/T169)
 # =============================================================================
 #

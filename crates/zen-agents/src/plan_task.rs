@@ -1299,8 +1299,10 @@ impl Tool for PlanExecuteTool {
                         let rows = repo.load_task_rows(&lid).await.unwrap_or_default();
                         // W12.15: the ledger row's recorded policy governs
                         // this batch's sub-turns.
+                        let mut attach_spec: Option<String> = None;
                         if let Ok(Some(row)) = repo.load_plan(&lid).await {
                             plan_policy = plan_recorded_sensitivity(&row.spec_json);
+                            attach_spec = Some(row.spec_json.clone());
                         }
                         if let Some(missing) = plan
                             .tasks
@@ -1313,6 +1315,35 @@ impl Tool for PlanExecuteTool {
                                     missing.id
                                 )
                             }));
+                        }
+                        // W14.1 (eng-review T5): the mint wrote only the titles-only items —
+                        // merge this batch's DAG so the induction corpus can observe the
+                        // ATTACHED shape. Additive-by-key: `items`, `session_id` (mint-once
+                        // LIKE guard), `sensitivity` (W12.15 resume policy) are preserved
+                        // verbatim; only `tasks` is replaced (last-dispatched shape). Best
+                        // effort with a warn — observability must never fail the batch.
+                        if let Some(existing) = attach_spec.take().as_deref()
+                            && let Ok(mut spec) =
+                                serde_json::from_str::<serde_json::Value>(existing)
+                            && let Some(obj) = spec.as_object_mut()
+                        {
+                            obj.insert(
+                                "tasks".to_string(),
+                                serde_json::json!(plan.tasks.iter().map(|t| serde_json::json!({
+                                    "id": t.id, "agent": t.agent, "prompt": t.prompt, "depends_on": t.depends_on,
+                                })).collect::<Vec<_>>()),
+                            );
+                            if let Ok(merged) = serde_json::to_string(&spec)
+                                && let Err(e) = repo
+                                    .attach_batch_spec(
+                                        &lid,
+                                        &merged,
+                                        chrono::Utc::now().timestamp(),
+                                    )
+                                    .await
+                            {
+                                tracing::warn!(plan = %lid, error = %e, "attach spec_json merge failed — induction corpus stays stale");
+                            }
                         }
                         crate::plan_todos::register_turn_plan(&session, &lid, Vec::new());
                         lid
@@ -4208,5 +4239,73 @@ mod tests {
             "the model-keyed history (2 min), not the hintless row (10 min): {progress:?}"
         );
         unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // W14.1 (eng-review T5): a dispatched ledger batch merges its DAG into
+    // the minted plan's spec_json, so the induction corpus can observe the
+    // ATTACHED shape while `items`/`session_id`/`sensitivity` stay intact.
+    #[tokio::test]
+    async fn attach_merges_batch_dag_into_spec_json_for_induction() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(std::sync::Mutex::new(zen_core::types::Sensitivity::Private)),
+        );
+        let minted = todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "a", "title": "first", "status": "pending"},
+                {"id": "b", "title": "second", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        let plan_id = minted["plan_id"].as_str().unwrap().to_string();
+
+        let plan = plan_tool_with(Some(state_db.clone()));
+        let out = plan
+            .invoke(serde_json::json!({
+                "name": "attach-dag",
+                "tasks": [
+                    {"id": "a", "agent": "Explore", "prompt": "do a", "depends_on": []},
+                    {"id": "b", "agent": "Librarian", "prompt": "do b", "depends_on": []},
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let row = repo.load_plan(&plan_id).await.unwrap().expect("plan row");
+        let spec: serde_json::Value = serde_json::from_str(&row.spec_json).unwrap();
+        let tasks = spec["tasks"].as_array().expect("merged tasks array");
+        assert_eq!(
+            tasks[0]["agent"],
+            serde_json::json!("Explore"),
+            "tasks[0]: {tasks:?}"
+        );
+
+        match crate::workflow_induction::shape_signature_from_spec_json(&row.spec_json) {
+            Ok(crate::workflow_induction::SpecShape::Dag { signature, .. }) => {
+                assert!(!signature.is_empty(), "non-empty DAG signature");
+            }
+            other => panic!("expected a DAG shape, got {other:?}"),
+        }
+
+        assert!(
+            spec.get("items").is_some(),
+            "items preserved: {}",
+            row.spec_json
+        );
+        assert!(
+            spec.get("session_id").is_some(),
+            "session_id preserved: {}",
+            row.spec_json
+        );
+        assert!(
+            spec.get("sensitivity").is_some(),
+            "sensitivity preserved: {}",
+            row.spec_json
+        );
     }
 }

@@ -34,6 +34,12 @@ pub const DEFAULT_STALE_CLAIM_SECS: i64 = 3600;
 /// config key — a machine needing a different window edits the constant.
 pub const FORECAST_HISTORY_WINDOW: i64 = 500;
 
+/// W14.4b (D22 in-code policy): the induction corpus reads at most this
+/// many newest plan rows. A code constant, not a config key — truncation
+/// is deterministic newest-first so a large ledger cannot unboundedly
+/// inflate the corpus join.
+pub const INDUCTION_CORPUS_LIMIT: i64 = 1_000;
+
 /// One draft task row for [`WorkflowRepo::mint_plan_with_tasks`]. The item
 /// *title* never lands here — it lives in the plan row's `spec_json`
 /// (D21 §2 write-path rule (a)); the row carries only the id and the
@@ -73,6 +79,32 @@ impl<'a> WorkflowRepo<'a> {
                     "INSERT INTO workflow_plans (plan_id, name, status, spec_json, created_at, updated_at) \
                      VALUES (?1, ?2, 'running', ?3, ?4, ?4)",
                     rusqlite::params![plan_id, name, spec_json, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)?;
+        Ok(())
+    }
+
+    /// W14.1 (eng-review T5): merge a dispatched batch's DAG into the plan
+    /// row's spec_json — the corpus-observability seam. The rewrite is
+    /// additive-by-key: callers preserve `items`/`session_id`/`sensitivity`
+    /// (the mint-once LIKE guard and the W12.15 resume policy read them);
+    /// only the `tasks` array is replaced (the row observes the
+    /// last-dispatched shape). Heartbeat semantics: bumps `updated_at` in
+    /// the same statement (W12.2 discipline). Guarded `status = 'running'`
+    /// so a terminal row is never mutated.
+    pub async fn attach_batch_spec(&self, plan_id: &str, spec_json: &str, now: i64) -> Result<()> {
+        let plan_id = plan_id.to_string();
+        let spec_json = spec_json.to_string();
+        self.client
+            .writer()
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE workflow_plans SET spec_json = ?1, updated_at = ?2 \
+                     WHERE plan_id = ?3 AND status = 'running'",
+                    rusqlite::params![spec_json, now, plan_id],
                 )?;
                 Ok(())
             })
@@ -553,6 +585,102 @@ impl<'a> WorkflowRepo<'a> {
         .fetch_all(self.client.pool())
         .await?)
     }
+
+    /// W13.2 workflow-induction corpus: every plan row CREATED at or after
+    /// `cutoff` (epoch seconds) with its task outcome rows, newest first.
+    ///
+    /// One LEFT JOIN fetched in a single query and grouped in Rust: the
+    /// induction reader needs per-task status + `duration_ms`/`cost_usd`
+    /// (migration 014), which [`WorkflowTaskRow`] does not carry, and an
+    /// N+1 per-plan fetch would walk the ledger once per row. A plan with
+    /// no task rows yields an empty `tasks` vector — callers treat that as
+    /// not fully completed. Read-only; no side effects.
+    ///
+    /// `created_at` (not `updated_at`) anchors the window: induction
+    /// observes plan SHAPES as minted, and a resumed plan's `updated_at`
+    /// drifts forward with every checkpoint.
+    pub async fn induction_corpus(&self, cutoff: i64) -> Result<Vec<InductionPlanRow>> {
+        let flat = sqlx::query_as::<_, InductionCorpusFlatRow>(
+            "SELECT p.plan_id, p.name, p.status, p.spec_json, p.created_at, \
+                    t.task_id, t.agent, t.status AS task_status, t.duration_ms, t.cost_usd \
+             FROM workflow_plans p \
+             LEFT JOIN workflow_tasks t ON t.plan_id = p.plan_id \
+             WHERE p.plan_id IN ( \
+                 SELECT plan_id FROM workflow_plans WHERE created_at >= ?1 \
+                 ORDER BY created_at DESC, plan_id DESC LIMIT ?2 \
+             ) \
+             ORDER BY p.created_at DESC, p.plan_id DESC, t.task_id ASC",
+        )
+        .bind(cutoff)
+        .bind(INDUCTION_CORPUS_LIMIT)
+        .fetch_all(self.client.pool())
+        .await?;
+
+        let mut plans: Vec<InductionPlanRow> = Vec::new();
+        for row in flat {
+            let continue_plan = plans.last().is_some_and(|p| p.plan_id == row.plan_id);
+            if !continue_plan {
+                plans.push(InductionPlanRow {
+                    plan_id: row.plan_id.clone(),
+                    name: row.name.clone(),
+                    status: row.status.clone(),
+                    spec_json: row.spec_json.clone(),
+                    created_at: row.created_at,
+                    tasks: Vec::new(),
+                });
+            }
+            if let (Some(task_id), Some(task_status), Some(agent)) =
+                (row.task_id, row.task_status, row.agent)
+                && let Some(plan) = plans.last_mut()
+            {
+                plan.tasks.push(InductionTaskRow {
+                    task_id,
+                    agent,
+                    status: task_status,
+                    duration_ms: row.duration_ms,
+                    cost_usd: row.cost_usd,
+                });
+            }
+        }
+        Ok(plans)
+    }
+}
+
+/// One plan in the workflow-induction corpus, with its task outcome rows.
+#[derive(Debug, Clone)]
+pub struct InductionPlanRow {
+    pub plan_id: String,
+    pub name: Option<String>,
+    pub status: String,
+    pub spec_json: String,
+    pub created_at: i64,
+    pub tasks: Vec<InductionTaskRow>,
+}
+
+/// One task outcome row of an [`InductionPlanRow`].
+#[derive(Debug, Clone)]
+pub struct InductionTaskRow {
+    pub task_id: String,
+    pub agent: String,
+    pub status: String,
+    pub duration_ms: Option<i64>,
+    pub cost_usd: Option<f64>,
+}
+
+/// Flat JOIN row backing [`WorkflowRepo::induction_corpus`]; the `Option`
+/// task columns are NULL for a plan that has no task rows yet.
+#[derive(sqlx::FromRow)]
+struct InductionCorpusFlatRow {
+    plan_id: String,
+    name: Option<String>,
+    status: String,
+    spec_json: String,
+    created_at: i64,
+    task_id: Option<String>,
+    agent: Option<String>,
+    task_status: Option<String>,
+    duration_ms: Option<i64>,
+    cost_usd: Option<f64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1407,6 +1535,70 @@ mod tests {
             rows.iter().all(|r| r.duration_ms >= 1005),
             "old rows must be excluded: {:?}",
             rows.iter().map(|r| r.duration_ms).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn induction_corpus_caps_plan_count_at_limit() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wf_corpus_limit.db");
+        let client = crate::SqliteClient::open(&db).await.unwrap();
+        let repo = WorkflowRepo::new(&client);
+
+        let total = INDUCTION_CORPUS_LIMIT + 50;
+        for i in 0..total {
+            let pid = format!("p{i:05}");
+            repo.create_plan(&pid, None, "{}", 10_000 + i)
+                .await
+                .unwrap();
+        }
+
+        let rows = repo.induction_corpus(0).await.unwrap();
+        assert_eq!(
+            rows.len() as i64,
+            INDUCTION_CORPUS_LIMIT,
+            "the corpus caps the plan count"
+        );
+        let oldest_included = rows.iter().map(|r| r.created_at).min().unwrap();
+        assert_eq!(
+            oldest_included, 10_050,
+            "the oldest 50 plans are truncated; the 1000th newest is the floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_batch_spec_merges_while_running_and_guards_terminal() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wf_attach_spec.db");
+        let client = crate::SqliteClient::open(&db).await.unwrap();
+        let repo = WorkflowRepo::new(&client);
+
+        let original = r#"{"items":[{"id":"a","title":"first","status":"pending"}],"session_id":"s1","sensitivity":"private"}"#;
+        repo.create_plan("p1", None, original, 1_000).await.unwrap();
+
+        let merged = r#"{"items":[{"id":"a","title":"first","status":"pending"}],"tasks":[{"id":"a","agent":"Explore","prompt":"do a","depends_on":[]}],"session_id":"s1","sensitivity":"private"}"#;
+        repo.attach_batch_spec("p1", merged, 1_005).await.unwrap();
+        let row = repo.load_plan("p1").await.unwrap().expect("row");
+        assert_eq!(row.spec_json, merged, "spec_json replaced by the batch DAG");
+        assert_eq!(
+            row.updated_at, 1_005,
+            "heartbeat bump in the same statement"
+        );
+
+        assert!(
+            repo.complete_plan("p1", "completed", None, None, None, 1_010)
+                .await
+                .unwrap()
+        );
+        let unchanged = r#"{"tasks":[{"id":"z","agent":"Ghost","prompt":"x","depends_on":[]}]}"#;
+        repo.attach_batch_spec("p1", unchanged, 2_000)
+            .await
+            .unwrap();
+        let row = repo.load_plan("p1").await.unwrap().expect("row");
+        assert_eq!(row.spec_json, merged, "a terminal row must not be mutated");
+        assert_eq!(
+            row.updated_at, 1_010,
+            "terminal guard also skips the heartbeat"
         );
     }
 }

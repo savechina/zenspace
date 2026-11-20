@@ -504,6 +504,8 @@ pub struct AgenticConfig {
     /// Background tool execution caps — TOML `[agentic.background]`
     /// (design record `background-tool-execution-2026-10-30.md`, D7).
     pub background: BackgroundConfig,
+    /// Workflow-induction worker gate — TOML `[agentic.workflow_induction]` (W13).
+    pub workflow_induction: WorkflowInductionConfig,
     /// Binary-classifier thresholds — TOML `[agentic.classifiers]` (T171).
     pub classifiers: ClassifierConfig,
     /// Decision-audit content policy — TOML `[agentic.audit]` (T173/T175).
@@ -904,6 +906,30 @@ impl DelegateConfig {
     /// off ⇒ today's empty sub-agent `SessionContext` byte-identically).
     pub fn context_inheritance_or_default(&self) -> bool {
         self.context_inheritance.unwrap_or(false)
+    }
+}
+
+/// Workflow-induction worker gate — TOML `[agentic.workflow_induction]` (W13).
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: gates the daily advisory workflow-induction pass that
+///   clusters repeated plan DAG shapes into a drafts queue.
+/// - User impact: `enabled = false` skips the pass; the worker stays
+///   registered so the scheduler worker counts never churn.
+/// - Default: enabled=true.
+/// - Interaction: env `ZEN_WORKFLOW_INDUCTION_ENABLED` (5th layer) overrides;
+///   an invalid value warns and keeps the configured value (E11).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct WorkflowInductionConfig {
+    /// Daily advisory induction pass (absent → true).
+    pub enabled: Option<bool>,
+}
+
+impl WorkflowInductionConfig {
+    /// Whether the daily advisory induction pass runs (default true).
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
     }
 }
 
@@ -3014,6 +3040,10 @@ fn merge_agentic(base: AgenticConfig, ov: AgenticConfig) -> AgenticConfig {
                 .max_concurrent
                 .or(base.background.max_concurrent),
         },
+        workflow_induction: merge_workflow_induction(
+            base.workflow_induction,
+            ov.workflow_induction,
+        ),
         classifiers: ClassifierConfig {
             correction_threshold: ov
                 .classifiers
@@ -3076,6 +3106,15 @@ fn merge_delegate(base: DelegateConfig, ov: DelegateConfig) -> DelegateConfig {
         max_depth: ov.max_depth.or(base.max_depth),
         max_concurrent: ov.max_concurrent.or(base.max_concurrent),
         context_inheritance: ov.context_inheritance.or(base.context_inheritance),
+    }
+}
+
+fn merge_workflow_induction(
+    base: WorkflowInductionConfig,
+    ov: WorkflowInductionConfig,
+) -> WorkflowInductionConfig {
+    WorkflowInductionConfig {
+        enabled: ov.enabled.or(base.enabled),
     }
 }
 
@@ -3427,6 +3466,7 @@ fn apply_env_overrides(mut config: ZenConfig) -> ZenConfig {
     apply_orchestrator_env(&mut config.agentic.orchestrator);
     apply_intent_env(&mut config.agentic.intent);
     apply_background_env(&mut config.agentic.background);
+    apply_workflow_induction_env(&mut config.agentic.workflow_induction);
     apply_classifier_env(&mut config.agentic.classifiers);
     apply_audit_env(&mut config.agentic.audit);
     apply_retention_env(&mut config.agentic.retention);
@@ -3720,6 +3760,22 @@ fn apply_background_env(cfg: &mut BackgroundConfig) {
             Err(_) => tracing::warn!(
                 value = %v,
                 "ZEN_BACKGROUND_MAX_CONCURRENT is not a number; ignoring (default 4 stays)"
+            ),
+        }
+    }
+}
+
+fn apply_workflow_induction_env(cfg: &mut WorkflowInductionConfig) {
+    if let Ok(raw) = std::env::var("ZEN_WORKFLOW_INDUCTION_ENABLED") {
+        if raw.is_empty() {
+            return;
+        }
+        match raw.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => cfg.enabled = Some(true),
+            "false" | "0" | "no" | "off" => cfg.enabled = Some(false),
+            _ => tracing::warn!(
+                value = %raw,
+                "invalid ZEN_WORKFLOW_INDUCTION_ENABLED (expected true/false/1/0/yes/no/on/off); keeping the configured [agentic.workflow_induction] enabled value"
             ),
         }
     }

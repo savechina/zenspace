@@ -16,6 +16,7 @@ pub mod session_journaler;
 pub mod subconscious;
 pub mod wiki_compiler;
 pub mod wisdom_synth;
+pub mod workflow_induction;
 pub mod zen_loop;
 
 pub use commitment_tracker::CommitmentTracker;
@@ -43,4 +44,5 @@ pub use session_journaler::SessionJournaler;
 pub use subconscious::SubconsciousWorker;
 pub use wiki_compiler::WikiCompilerWorker;
 pub use wisdom_synth::WisdomSynthesizer;
+pub use workflow_induction::{WORKFLOW_INDUCTION_SCHEDULE, WorkflowInductionWorker};
 pub use zen_loop::{ZenLoopWorker, gaps_path, last_report_path};
