@@ -20,6 +20,17 @@ pub struct ExecutionMetadata {
     pub tokens_used: u32,
     pub cost_estimate: f64,
     pub model_used: String,
+    /// A-02 (D2b): the REAL model name the routed provider call resolved to
+    /// — the per-call override when a hint was carried, the provider's
+    /// configured default otherwise, `"mock"` on the mock stand-in. `None`
+    /// when the surface cannot resolve one (honest degradation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_model: Option<String>,
+    /// A-02/row13: the round's metered cost, derived from the provider's
+    /// REAL usage echo plus configured pricing. `None` when usage was not
+    /// reported or the provider is unmetered — cost is never fabricated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_cost_usd: Option<f64>,
     pub duration_ms: u64,
     pub sensitivity: Sensitivity,
     /// 006 US2: quality-gate review notes (None when the gate has not run).
@@ -51,6 +62,8 @@ impl AgentExecution {
                 tokens_used: 0,
                 cost_estimate: 0.0,
                 model_used: String::new(),
+                runtime_model: None,
+                usage_cost_usd: None,
                 duration_ms: 0,
                 sensitivity: Sensitivity::Private,
                 quality_notes: None,
@@ -86,6 +99,8 @@ mod tests {
                 tokens_used: 1500,
                 cost_estimate: 0.003,
                 model_used: "gpt-4o-mini".to_string(),
+                runtime_model: None,
+                usage_cost_usd: None,
                 duration_ms: 2345,
                 sensitivity: Sensitivity::Public,
                 quality_notes: None,

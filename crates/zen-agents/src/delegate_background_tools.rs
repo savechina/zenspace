@@ -5,9 +5,10 @@
 //!
 //! - **collect**: `{task_id | task_ids[], wait_ms?}` — yield-wait poll of a
 //!   task's terminal state (default 10s, clamp 0..=30000), idempotent,
-//!   `meta.json` fallback after a daemon restart. Releasing an observed
-//!   terminal hold refunds the admission token reservation (armed refund
-//!   on drop). Confidential sensitivity (collect returns sub-agent shell
+//!   `meta.json` fallback after a daemon restart. W12.26: releasing an
+//!   observed terminal hold is refund-NEUTRAL — the budget refund lives in
+//!   the spawned future's reconcile (remainder) or `Drop` (kill/abort).
+//!   Confidential sensitivity (collect returns sub-agent shell
 //!   output = `shell.exec`-grade data) but READ-ONLY for the quality gate
 //!   (orchestrator `is_mutating_tool` whitelist).
 //! - **kill**: `{task_id}` — aborts the live handle and marks `killed`;
@@ -179,24 +180,33 @@ impl Tool for DelegateCollectTool {
         let registry = zen_plugin::task_registry::registry();
         let mut results = Vec::with_capacity(ids.len());
         for id in &ids {
-            let hold_model = self
-                .book
-                .release(id)
-                .and_then(|h| h.model_source.map(|m| m.as_str().to_string()));
-            match registry.collect_delegate(id, wait_ms).await {
-                Ok(collect) => {
-                    let receipt =
-                        serde_json::to_value(receipt_from(collect, hold_model)).map_err(|e| {
-                            KernelError::ToolFailed(format!("receipt serialize failed: {e}"))
-                        })?;
-                    results.push(receipt);
+            // W12.10 (T6/Q2) resynced for W12.26: the hold (book entry) is
+            // released ONLY on a terminal observation — releasing before
+            // `collect_delegate` dropped the model_source for a
+            // still-running task. Mirror the kill path below: observe
+            // first, release after. The pool refund is NOT here — it lives
+            // in the future's reconcile/Drop (single armed reservation).
+            let collect = match registry.collect_delegate(id, wait_ms).await {
+                Ok(collect) => collect,
+                Err(e) => {
+                    results.push(json!({
+                        "task_id": id,
+                        "status": "unknown",
+                        "error": e.to_string(),
+                    }));
+                    continue;
                 }
-                Err(e) => results.push(json!({
-                    "task_id": id,
-                    "status": "unknown",
-                    "error": e.to_string(),
-                })),
-            }
+            };
+            let hold_model = if collect.status == "running" {
+                self.book.peek_model_source(id)
+            } else {
+                self.book
+                    .release(id)
+                    .and_then(|h| h.model_source.map(|m| m.as_str().to_string()))
+            };
+            let receipt = serde_json::to_value(receipt_from(collect, hold_model))
+                .map_err(|e| KernelError::ToolFailed(format!("receipt serialize failed: {e}")))?;
+            results.push(receipt);
         }
         Ok(json!({"background": true, "results": results}))
     }
@@ -227,8 +237,9 @@ impl Tool for DelegateKillTool {
             name: DELEGATE_KILL_TOOL_NAME.to_string(),
             description: "Kill (abort) a running background delegate task started with \
               delegate.task background:true. The task is marked killed with no partial \
-              result; its token reservation is released. Idempotent — killing an \
-              already-terminal task returns its current status unchanged."
+              result; its budget reservation is refunded when the aborted sub-turn is \
+              torn down. Idempotent — killing an already-terminal task returns its \
+              current status unchanged."
                 .to_string(),
             args_schema: json!({
                 "type": "object",
@@ -443,11 +454,40 @@ mod clamp_tests {
         assert_eq!(out["results"][0]["task_index"], json!(3));
     }
 
-    /// W5.3 acceptance: kill aborts the live handle and marks `killed`; a
-    /// following collect observes `killed` with no partial result.
+    /// W12.26 rewrite of the W12.10 (T6/Q2) pin: the refund happens at the
+    /// future's reconcile (pool already at capacity − real_total), NOT at
+    /// collect. A running collect RETAINS the book hold (nothing observable
+    /// happens); a terminal collect releases it exactly once; idempotent
+    /// repeats change nothing; `model_source` peek works post-release.
+    /// Budget-wise insert/release/collect never move the pool (the hold is
+    /// refund-neutral — the reservation never lived in the book).
     #[tokio::test]
-    async fn kill_yields_killed_with_no_partial_result() {
+    async fn running_collect_retains_hold_terminal_collect_releases_once() {
+        use crate::delegate_task::{BackgroundHolding, ModelSource};
+        use rig_compose::budget::TokenBudget;
         let _home = isolate_zen_home();
+        let budget = rig_compose::budget::AtomicTokenBudget::new(100_000);
+        let reservation = budget
+            .try_reserve_tokens(5_000)
+            .await
+            .unwrap()
+            .expect("reserve");
+        // Reconcile the way the spawned future does: remainder (5000 −
+        // 2000) refunded HERE — before any collect, before any release.
+        budget.record_usage(reservation, 1_200, 800).await;
+        assert_eq!(
+            budget.available(),
+            98_000,
+            "completion ⇒ available == capacity − real_total (reconcile, not collect)"
+        );
+        let id = "a5f30000-0000-4000-8000-000000000005";
+        let book = BackgroundBook::default();
+        book.insert(
+            id.to_string(),
+            BackgroundHolding {
+                model_source: Some(ModelSource::Hint),
+            },
+        );
         let registry = zen_plugin::task_registry::registry();
         let limits = zen_plugin::task_registry::BackgroundLimits {
             max_wall_secs: 60,
@@ -455,33 +495,141 @@ mod clamp_tests {
             output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
         };
         registry
-            .spawn_async(
-                "a5f30000-0000-4000-8000-000000000004",
-                "sess-k1",
-                "Explore",
-                None,
-                &limits,
-                async {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    Ok(json!({"never": true}))
-                },
-            )
+            .spawn_async(id, "sess-h1", "Explore", Some(0), &limits, async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(json!({"answer": "done"}))
+            })
             .expect("spawn");
-        let kill = DelegateKillTool::new(BackgroundBook::default());
-        let out = kill
-            .invoke(json!({"task_id": "a5f30000-0000-4000-8000-000000000004"}))
+        let tool = DelegateCollectTool::new(book.share());
+
+        // Zero-wait collect of the still-sleeping task: hold RETAINED.
+        let running = tool
+            .invoke(json!({"task_id": id, "wait_ms": 0}))
             .await
             .expect("invoke");
+        assert_eq!(running["results"][0]["status"], json!("running"));
+        assert_eq!(
+            running["results"][0]["model_source"],
+            json!("hint"),
+            "peek surfaces model_source without touching the book"
+        );
+        assert_eq!(
+            budget.available(),
+            98_000,
+            "a running collect must RETAIN the hold (nothing observable)"
+        );
+
+        // Terminal collect: released exactly once — refund-neutral.
+        let done = tool
+            .invoke(json!({"task_id": id, "wait_ms": 5000}))
+            .await
+            .expect("invoke");
+        assert_eq!(done["results"][0]["status"], json!("completed"));
+        assert_eq!(
+            budget.available(),
+            98_000,
+            "the terminal release must NOT refund — the remainder was already \
+             refunded at the future's reconcile (W12.26)"
+        );
+        assert_eq!(budget.tokens_consumed().await, 2_000, "billed once");
+
+        // Idempotent repeat: no movement, hold gone.
+        let again = tool
+            .invoke(json!({"task_id": id, "wait_ms": 0}))
+            .await
+            .expect("invoke");
+        assert_eq!(again["results"][0]["status"], json!("completed"));
+        assert_eq!(
+            budget.available(),
+            98_000,
+            "repeat collects never move the pool"
+        );
+        assert_eq!(
+            again["results"][0]["model_source"],
+            serde_json::Value::Null,
+            "the hold is gone after the terminal release"
+        );
+    }
+
+    /// W5.3 acceptance + W12.26 async-refund flag: kill aborts the live
+    /// handle and marks `killed` with no partial result; the ARMED
+    /// reservation riding inside the aborted future refunds the full
+    /// estimate asynchronously (tokio drops the future after the abort), so
+    /// the pin bounded-waits (≤1s, reap-wait discipline) until the pool is
+    /// restored, then proves the book release stayed refund-neutral.
+    #[tokio::test]
+    async fn kill_yields_killed_with_no_partial_result() {
+        use crate::delegate_task::{BackgroundHolding, ModelSource};
+        use rig_compose::budget::TokenBudget;
+        let _home = isolate_zen_home();
+        let registry = zen_plugin::task_registry::registry();
+        let limits = zen_plugin::task_registry::BackgroundLimits {
+            max_wall_secs: 60,
+            max_concurrent: 4,
+            output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
+        };
+        // Admission-shaped armed hold: the reservation moves INTO the
+        // future (single ownership, W12.26) — the book entry is
+        // refund-neutral.
+        let budget = rig_compose::budget::AtomicTokenBudget::new(100_000);
+        let reservation = budget
+            .try_reserve_tokens(5_000)
+            .await
+            .unwrap()
+            .expect("reserve");
+        let id = "a5f30000-0000-4000-8000-000000000004";
+        let book = BackgroundBook::default();
+        book.insert(
+            id.to_string(),
+            BackgroundHolding {
+                model_source: Some(ModelSource::Default),
+            },
+        );
+        registry
+            .spawn_async(id, "sess-k1", "Explore", None, &limits, async move {
+                let _armed = reservation;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(json!({"never": true}))
+            })
+            .expect("spawn");
+        assert_eq!(
+            budget.available(),
+            95_000,
+            "the armed hold pins the estimate"
+        );
+        let kill = DelegateKillTool::new(book.share());
+        let out = kill.invoke(json!({"task_id": id})).await.expect("invoke");
         assert_eq!(out["status"], json!("killed"), "{out}");
-        let collect = DelegateCollectTool::new(BackgroundBook::default());
+        // W12.26 FLAG: the refund is no longer synchronous with the kill —
+        // it lands when tokio drops the aborted future. Bounded poll (≤1s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while budget.available() != 100_000 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "kill must restore the armed estimate (async future Drop)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let collect = DelegateCollectTool::new(book.share());
         let collected = collect
-            .invoke(json!({"task_id": "a5f30000-0000-4000-8000-000000000004", "wait_ms": 0}))
+            .invoke(json!({"task_id": id, "wait_ms": 0}))
             .await
             .expect("invoke");
         assert_eq!(collected["results"][0]["status"], json!("killed"));
         assert!(
             collected["results"][0].get("response").is_none(),
             "no partial result survives a kill: {collected}"
+        );
+        assert_eq!(
+            collected["results"][0]["model_source"],
+            serde_json::Value::Null,
+            "kill already released the hold — post-kill collect peeks null"
+        );
+        assert_eq!(
+            budget.available(),
+            100_000,
+            "the post-kill book release is refund-neutral (full-estimate refund \
+             already landed via the future Drop)"
         );
     }
 

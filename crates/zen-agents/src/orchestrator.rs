@@ -11,7 +11,7 @@ use rig_agent::run::policy::InvalidToolCallAction;
 use rig_agent::run::{
     AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, PendingToolCall, TurnPolicy,
 };
-use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
+use rig_compose::budget::TokenBudget;
 use rig_compose::normalizer::{
     ToolDispatchHook, ToolInvocation, ToolInvocationResult, dispatch_tool_invocations_with_hooks,
 };
@@ -30,8 +30,9 @@ use zen_core::sanitize::InputSanitizer;
 use zen_core::types::{MessageRole, RetrievedNote, Sensitivity, SessionContext};
 use zen_memory::ZenMemvidStore;
 use zen_memory::memvid_store::MemvidStore;
-use zen_provider::{DefaultRouter, LlmRouter as _, Provider, TaskRequirements};
+use zen_provider::{DefaultRouter, LlmRouter as _, Provider, SyncUsage, TaskRequirements};
 
+use crate::budget::FairShareTokenBudget;
 use crate::delegate_tools;
 use crate::delegate_tools::ZenDelegateTools;
 use crate::execution::{AgentExecution, ExecutionMetadata, ToolCall};
@@ -138,7 +139,11 @@ pub struct AgentOrchestrator {
     wiring: Arc<ZenWiring>,
     delegates: ZenDelegateTools,
     executor: crate::executor::AgentExecutor,
-    token_budget: Arc<AtomicTokenBudget>,
+    /// W12.27: fair-share wrapper over the ONE global token pool — the
+    /// per-session outstanding-holds ledger shares the bucket across
+    /// concurrent hosted sessions; a lone session keeps raw-budget
+    /// decisions byte-identically.
+    token_budget: Arc<FairShareTokenBudget>,
     memvid_store: Option<MemvidStore>,
     quality_pipeline: QualityPipeline,
     /// FR-046 `[agents] tools` overlay applied on top of the builtin
@@ -533,6 +538,23 @@ fn push_tool_results_history(history: &mut Vec<String>, round: String) {
 /// W4.6c (G1-07): join the accumulated per-round history for prompt assembly.
 fn join_tool_results_history(history: &[String]) -> String {
     history.join("\n---\n")
+}
+
+/// W12.12 (T8): map the provider usage echo into the rig `Usage` a
+/// `ModelTurn` carries — the real echo per counter when the provider
+/// reported one, the char/4 estimate per counter when it did not
+/// (`reconcile_usage` per-counter fallback, W12.20). A `None` echo is
+/// byte-identical to the pre-echo estimate.
+fn round_usage_from_echo(
+    echo: Option<SyncUsage>,
+    fallback_input: u64,
+    fallback_output: u64,
+) -> Usage {
+    let (input, output) = zen_provider::reconcile_usage(echo, fallback_input, fallback_output);
+    let mut usage = Usage::new();
+    usage.input_tokens = Some(input);
+    usage.output_tokens = Some(output);
+    usage
 }
 
 /// Background-tool-execution design (D4): the push line for one completed
@@ -1120,7 +1142,16 @@ fn ensured_tool_results(
             PendingToolCall::Execute(exec) => exec
                 .clone()
                 .answer(ToolResult::success(ToolOutput::text(text))),
-            PendingToolCall::Malformed(malformed) => malformed.clone().answer(None),
+            PendingToolCall::Malformed(malformed) => {
+                // W12.19 (TD9): zen's computed rejection reason reaches the
+                // model verbatim as the call's error tool-result. rig-agent
+                // 0.46: `None` substitutes rig's generic echo — only
+                // `Retry { feedback }` carries caller text (Skip suppresses
+                // turn bookkeeping; Stop/Fail/Repair end the run).
+                malformed
+                    .clone()
+                    .answer(Some(InvalidToolCallAction::retry(text)))
+            }
             _ => unreachable!("PendingToolCall is a closed two-variant enum today"),
         }
     });
@@ -1464,7 +1495,7 @@ impl AgentOrchestrator {
         let tool_overlay = delegate_tools::load_tool_grant_overlay();
         let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
         let executor = crate::executor::AgentExecutor::new(router.clone());
-        let token_budget = Arc::new(AtomicTokenBudget::new(100_000));
+        let token_budget = Arc::new(FairShareTokenBudget::new(100_000));
         let max_tool_rounds = resolve_max_tool_rounds();
         Self {
             registry,
@@ -1486,6 +1517,8 @@ impl AgentOrchestrator {
         }
     }
 
+    /// Build with a caller-chosen token-budget capacity (tests, embedding
+    /// callers). W12.27: the capacity funds the same fair-share wrapper.
     pub fn with_token_budget(router: DefaultRouter, capacity: u64) -> Self {
         let registry = crate::registry::DefaultAgentRegistry::new();
         let wiring = Arc::new(ZenWiring::new());
@@ -1493,7 +1526,7 @@ impl AgentOrchestrator {
         let tool_overlay = delegate_tools::load_tool_grant_overlay();
         let delegates = ZenDelegateTools::with_tool_overlay(&wiring, &router, tool_overlay.clone());
         let executor = crate::executor::AgentExecutor::new(router.clone());
-        let token_budget = Arc::new(AtomicTokenBudget::new(capacity));
+        let token_budget = Arc::new(FairShareTokenBudget::new(capacity));
         let max_tool_rounds = resolve_max_tool_rounds();
         Self {
             registry,
@@ -1588,7 +1621,7 @@ impl AgentOrchestrator {
             Arc::clone(&self.delegate_sensitivity),
             Arc::clone(&self.delegate_knowledge),
             Arc::clone(&self.delegate_history),
-            Arc::clone(&self.token_budget),
+            Arc::clone(&self.token_budget) as Arc<dyn TokenBudget>,
             std::time::Duration::from_secs(timeout),
             max_depth,
             max_concurrent,
@@ -2480,6 +2513,28 @@ impl AgentOrchestrator {
         session: &mut SessionContext,
         user_query: &str,
     ) -> Result<AgentExecution> {
+        // W12.27 (fair-share gap fix): scope the WHOLE turn body to the
+        // owning session so EVERY budget reserve inside it — turn-level,
+        // per-round, and the plan-synthesis reserve that runs OUTSIDE the
+        // per-round dispatch scope — attributes to the same SESSION_SCOPE
+        // key the delegate admissions use. The value is identical to the
+        // existing per-round dispatch scope ⇒ inner re-scoping is
+        // harmless; CLI cold processes (no scope) already resolved
+        // "local" and keep byte-identical decisions (live == 1 ⇒ share ==
+        // capacity, see budget.rs).
+        zen_plugin::task_registry::SESSION_SCOPE
+            .scope(
+                session.session_id.to_string(),
+                self.execute_turn(session, user_query),
+            )
+            .await
+    }
+
+    async fn execute_turn(
+        &self,
+        session: &mut SessionContext,
+        user_query: &str,
+    ) -> Result<AgentExecution> {
         let start = Instant::now();
         self.ensure_delegate_tool();
         let paths = ZenPaths::detect().ok();
@@ -2718,7 +2773,7 @@ impl AgentOrchestrator {
                     };
 
                     let history_text = join_tool_results_history(&accumulated_results);
-                    let (response_text, native_calls) = run_blocking_llm(|| {
+                    let (response_text, native_calls, usage_echo) = run_blocking_llm(|| {
                         self.executor.execute_model_call(
                             &context,
                             &zen_agent,
@@ -2802,10 +2857,22 @@ impl AgentOrchestrator {
 
                     let policy = TurnPolicy::new(tool_names.iter().cloned().collect(), None, None)
                         .map_err(|e| anyhow::anyhow!("turn policy rejected: {e}"))?;
+                    // W12.12 (T8): real provider usage when the provider
+                    // echoes it (DefaultRouter::call_with_usage threaded
+                    // through the executor seam); the char/4 estimate
+                    // stays the per-counter fallback for unreporting
+                    // providers (mock under DL-1 semantics never reports)
+                    // — byte-identical to the pre-echo estimate. The
+                    // stream path keeps the estimate: see its site note.
+                    let round_usage = round_usage_from_echo(
+                        usage_echo,
+                        (user_query.len() / 4 + history_text.len() / 4) as u64,
+                        (response_text.len() / 4) as u64,
+                    );
                     let model_turn = ModelTurn::new(
                         AssistantMessage::new(assistant_content.clone()),
                         assistant_content,
-                        Usage::new(),
+                        round_usage,
                         policy,
                         serde_json::Value::Null,
                     );
@@ -2814,17 +2881,20 @@ impl AgentOrchestrator {
                         ModelTurnOutcome::Continue { .. } => {}
                         ModelTurnOutcome::NeedsResolution(_) => {
                             // W4.5b (G1-06): a following invalid name can leave
-                            // another resolution pending; loop (bounded by the
-                            // call count) so the next `next_step()` cannot
-                            // protocol-violate.
-                            for _ in 0..=granted.len() {
-                                match run.resolve_invalid_tool_call(InvalidToolCallAction::skip(
-                                    "invalid tool call",
-                                ))? {
-                                    ModelTurnOutcome::NeedsResolution(_) => continue,
-                                    _ => break,
-                                }
-                            }
+                            // another resolution pending; drain them all so the
+                            // next `next_step()` cannot protocol-violate.
+                            // W12.24 (TD4/N10): unbounded but PROVABLY
+                            // terminating — `Skip` strictly advances
+                            // `next_index` over a finite items list
+                            // (rig-agent 0.46 run/mod.rs:1311-1320); the old
+                            // `0..=granted.len()` bound conflated granted-tool
+                            // count with disallowed-call count.
+                            while matches!(
+                                run.resolve_invalid_tool_call(
+                                    InvalidToolCallAction::skip("invalid tool call"),
+                                )?,
+                                ModelTurnOutcome::NeedsResolution(_)
+                            ) {}
                         }
                         ModelTurnOutcome::TurnRetried => continue,
                     }
@@ -3066,9 +3136,12 @@ impl AgentOrchestrator {
             }
         }
 
-        let actual_tokens = (final_response.len() / 4 + user_query.len() / 4) as u64;
+        // W12.14 (T4b/N4): rig-compose `record_usage` SUMS prompt+completion
+        // — passing the total as BOTH args billed it twice (halved capacity).
+        let prompt_tokens = (user_query.len() / 4) as u64;
+        let completion_tokens = (final_response.len() / 4) as u64;
         self.token_budget
-            .record_usage(reservation, actual_tokens, actual_tokens)
+            .record_usage(reservation, prompt_tokens, completion_tokens)
             .await;
 
         // FIX-1: gate on MUTATING tool calls only — a read-only search turn
@@ -3177,6 +3250,8 @@ impl AgentOrchestrator {
                     + run.usage().output_tokens.unwrap_or(0) as u32,
                 cost_estimate: 0.0,
                 model_used: last_model_used,
+                runtime_model: None,
+                usage_cost_usd: None,
                 duration_ms,
                 sensitivity: session.sensitivity_policy,
                 quality_notes: Some(review.review_notes),
@@ -3426,6 +3501,24 @@ impl AgentOrchestrator {
     /// instead of a silent gap. No protocol change for the TUI path.
     #[instrument(skip(self, session, callback), fields(session_id = %session.session_id))]
     pub async fn execute_stream(
+        &self,
+        session: &mut SessionContext,
+        user_query: &str,
+        mut callback: impl FnMut(&str),
+    ) -> Result<String> {
+        // W12.27 (fair-share gap fix): whole-turn SESSION_SCOPE — the
+        // stream path's turn-level + per-round reserves attribute to the
+        // owning session; identical value to the per-round dispatch scope
+        // ⇒ inner re-scoping harmless (see execute).
+        zen_plugin::task_registry::SESSION_SCOPE
+            .scope(
+                session.session_id.to_string(),
+                self.execute_stream_turn(session, user_query, &mut callback),
+            )
+            .await
+    }
+
+    async fn execute_stream_turn(
         &self,
         session: &mut SessionContext,
         user_query: &str,
@@ -3750,10 +3843,25 @@ impl AgentOrchestrator {
 
                     let policy = TurnPolicy::new(tool_names.iter().cloned().collect(), None, None)
                         .map_err(|e| anyhow::anyhow!("turn policy rejected: {e}"))?;
+                    // W12.12 (T8): per-round usage estimate, consistent
+                    // with the char/4 ledger `record_usage` bills — the
+                    // turn telemetry (`run.usage()`) reads non-zero
+                    // instead of the `Usage::new()` zero. The execute
+                    // path threads the real provider echo
+                    // (DefaultRouter::call_with_usage); the stream path
+                    // keeps the estimate — `execute_stream_round`'s
+                    // return shape carries no usage and streaming usage
+                    // only arrives at done-time, after the ModelTurn is
+                    // already constructed (recorded limitation).
+                    let round_usage = round_usage_from_echo(
+                        None,
+                        (user_query.len() / 4 + history_text.len() / 4) as u64,
+                        (response_text.len() / 4) as u64,
+                    );
                     let model_turn = ModelTurn::new(
                         AssistantMessage::new(assistant_content.clone()),
                         assistant_content,
-                        Usage::new(),
+                        round_usage,
                         policy,
                         serde_json::Value::Null,
                     );
@@ -3761,14 +3869,21 @@ impl AgentOrchestrator {
                     match run.model_response(model_turn)? {
                         ModelTurnOutcome::Continue { .. } => {}
                         ModelTurnOutcome::NeedsResolution(_) => {
-                            for _ in 0..=granted.len() {
-                                match run.resolve_invalid_tool_call(InvalidToolCallAction::skip(
-                                    "invalid tool call",
-                                ))? {
-                                    ModelTurnOutcome::NeedsResolution(_) => continue,
-                                    _ => break,
-                                }
-                            }
+                            // W4.5b (G1-06): a following invalid name can leave
+                            // another resolution pending; drain them all so the
+                            // next `next_step()` cannot protocol-violate.
+                            // W12.24 (TD4/N10): unbounded but PROVABLY
+                            // terminating — `Skip` strictly advances
+                            // `next_index` over a finite items list
+                            // (rig-agent 0.46 run/mod.rs:1311-1320); the old
+                            // `0..=granted.len()` bound conflated granted-tool
+                            // count with disallowed-call count.
+                            while matches!(
+                                run.resolve_invalid_tool_call(
+                                    InvalidToolCallAction::skip("invalid tool call"),
+                                )?,
+                                ModelTurnOutcome::NeedsResolution(_)
+                            ) {}
                         }
                         ModelTurnOutcome::TurnRetried => continue,
                     }
@@ -3970,9 +4085,12 @@ impl AgentOrchestrator {
 
         // W1.4a: reconcile the turn-level reservation (with any per-round
         // probe reservations dropped at scope end).
-        let actual_tokens = (final_response.len() / 4 + user_query.len() / 4) as u64;
+        // W12.14 (T4b/N4): rig-compose `record_usage` SUMS prompt+completion
+        // — passing the total as BOTH args billed it twice (halved capacity).
+        let prompt_tokens = (user_query.len() / 4) as u64;
+        let completion_tokens = (final_response.len() / 4) as u64;
         self.token_budget
-            .record_usage(reservation, actual_tokens, actual_tokens)
+            .record_usage(reservation, prompt_tokens, completion_tokens)
             .await;
         drop(round_reservations);
 
@@ -5284,6 +5402,8 @@ mod tests {
                         tokens_used: 1,
                         cost_estimate: 0.0,
                         model_used: "mock".to_string(),
+                        runtime_model: None,
+                        usage_cost_usd: None,
                         duration_ms: 0,
                         sensitivity: Sensitivity::Public,
                         quality_notes: None,
@@ -6690,19 +6810,12 @@ mod tests {
                 async { Ok(serde_json::json!({"verdict": "ok"})) },
             )
             .expect("spawn");
-        // Synthetic admission hold with a resolved model source.
+        // Synthetic admission hold (W12.26: the hold is refund-neutral —
+        // model_source only; no reservation lives in the book).
         let book = crate::delegate_task::BackgroundBook::default();
         book.insert(
             "b4d40000-0000-4000-8000-000000000001".to_string(),
             crate::delegate_task::BackgroundHolding {
-                _reservation: {
-                    let budget = rig_compose::budget::AtomicTokenBudget::new(1_000_000);
-                    budget
-                        .try_reserve_tokens(100)
-                        .await
-                        .expect("reserve")
-                        .expect("capacity")
-                },
                 model_source: Some(crate::delegate_task::ModelSource::Hint),
             },
         );
@@ -6910,5 +7023,50 @@ mod tests {
             .await;
         assert!(prose.is_none());
         assert_eq!(label, "skipped:timeout_or_error");
+    }
+
+    /// W12.12 (T8) usage-echo pin: a reported echo rides into the
+    /// ModelTurn usage REAL — never char/4.
+    #[test]
+    fn w1212_round_usage_carries_the_real_echo_when_reported() {
+        let usage = round_usage_from_echo(
+            Some(zen_provider::SyncUsage {
+                input_tokens: 111,
+                output_tokens: 22,
+            }),
+            999,
+            999,
+        );
+        assert_eq!(usage.input_tokens, Some(111), "real echo, not char/4");
+        assert_eq!(usage.output_tokens, Some(22), "real echo, not char/4");
+    }
+
+    /// W12.12 (T8) fallback pin: an absent echo keeps the char/4
+    /// estimate byte-identical.
+    #[test]
+    fn w1212_round_usage_keeps_the_char4_estimate_when_absent() {
+        let usage = round_usage_from_echo(None, 7, 3);
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    /// W12.12 (T8) + W12.20: a partial echo estimates only the missing
+    /// counter (per-counter fallback).
+    #[test]
+    fn w1212_round_usage_estimates_only_the_missing_counter_on_partial_echo() {
+        let usage = round_usage_from_echo(
+            Some(zen_provider::SyncUsage {
+                input_tokens: 0,
+                output_tokens: 45,
+            }),
+            70,
+            30,
+        );
+        assert_eq!(usage.input_tokens, Some(70), "zero counter falls back");
+        assert_eq!(
+            usage.output_tokens,
+            Some(45),
+            "echoed counter passes through"
+        );
     }
 }

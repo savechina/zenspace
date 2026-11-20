@@ -12,6 +12,15 @@ pub struct AgentContext {
     pub max_tokens: usize,
     pub sensitivity: Sensitivity,
     pub metadata: HashMap<String, serde_json::Value>,
+    /// A-02 (D2b): per-call model-NAME override for the routed provider.
+    ///
+    /// Set ONLY when the D25 hint ladder resolved to
+    /// [`crate::delegate_task::ModelSource::Hint`] — a profile with any
+    /// explicit `LlmPreference` wins and MUST leave this `None` so routing
+    /// stays byte-identical. The override never changes the provider
+    /// (sensitivity/`enforce_sensitivity` ran upstream); it only names a
+    /// different model within the routed provider.
+    pub model_override: Option<String>,
 }
 
 impl AgentContext {
@@ -31,6 +40,7 @@ impl AgentContext {
             max_tokens,
             sensitivity,
             metadata: HashMap::new(),
+            model_override: None,
         }
     }
 
@@ -49,6 +59,12 @@ impl AgentContext {
     #[must_use]
     pub fn with_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
         self.sensitivity = sensitivity;
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_override(mut self, model: impl Into<String>) -> Self {
+        self.model_override = Some(model.into());
         self
     }
 

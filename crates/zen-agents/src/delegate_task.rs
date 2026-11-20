@@ -12,13 +12,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rig_compose::budget::{AtomicTokenBudget, TokenBudget};
+use rig_compose::budget::TokenBudget;
 use rig_compose::normalizer::dispatch_tool_invocations_with_hooks;
 use rig_compose::tool::{Tool, ToolSchema};
 use tracing::{info, warn};
 use zen_core::config::LlmPreference;
 use zen_core::types::{RetrievedNote, Sensitivity, SessionContext};
 use zen_provider::DefaultRouter;
+use zen_provider::LlmRouter;
 
 use crate::AgentContext;
 use crate::agent_profile::{AgentProfile, Role};
@@ -146,20 +147,60 @@ impl ModelSource {
     }
 }
 
-/// One background-admission hold (W5.2, spec 006 D20 §8/D11-A): the armed
-/// token reservation from the parent turn's pool. Dropping it refunds the
-/// estimate (rig-compose `TokenReservation` refund-on-drop) — the refund
-/// path for collect/fail/kill/expiry is exactly that drop.
+/// D25 SC-022 ladder, single source: `sensitivity > LlmPreference > hint >
+/// default`. A profile with ANY explicit preference wins, so its hint never
+/// steers. Kept as a free function so the runtime producer and the plan
+/// forecast share one implementation (Constitution XI — no second ladder).
+pub(crate) fn resolve_model_source(
+    hint: Option<&str>,
+    profile: Option<&AgentProfile>,
+) -> ModelSource {
+    let has_explicit_preference = profile.is_some_and(|p| {
+        p.llm_preferences
+            .iter()
+            .any(|pref| !matches!(pref, LlmPreference::Any))
+    });
+    if has_explicit_preference {
+        ModelSource::Profile
+    } else if hint.is_some() {
+        ModelSource::Hint
+    } else {
+        ModelSource::Default
+    }
+}
+
+/// A-02/row13 — the ONE `(agent, model)` history-key resolver shared by the
+/// delegate runtime producer (what the workflow checkpoint stores) and the
+/// plan forecast consumer (what it looks up), so the two can never drift.
+/// A steering hint is the key; otherwise the provider's default model name
+/// is (`""` when it cannot be resolved — the forecast then simply omits the
+/// pair instead of guessing).
+#[must_use]
+pub(crate) fn resolved_model_label(
+    hint: Option<&str>,
+    profile: Option<&AgentProfile>,
+    provider_default: Option<&str>,
+) -> String {
+    match resolve_model_source(hint, profile) {
+        ModelSource::Hint => hint.unwrap_or_default().to_string(),
+        ModelSource::Profile | ModelSource::Default => {
+            provider_default.unwrap_or_default().to_string()
+        }
+    }
+}
+
+/// One background-admission hold (W5.2, spec 006 D20 §8/D11-A). W12.26:
+/// the armed token reservation NO LONGER lives here — `TokenReservation`
+/// is not `Clone`, so single ownership through the spawned future is the
+/// only sound shape: the future's `record_usage` reconcile refunds the
+/// remainder (estimate − actual) on completion and its `Drop` refunds the
+/// full estimate on early failure / kill / never-spawned rejection. The
+/// book is refund-neutral; it carries only what the registry cannot.
 pub(crate) struct BackgroundHolding {
-    /// The sub-turn budget default estimate, reserved at admission from the
-    /// same per-turn pool the blocking path uses. Dropped (⇒ refunded) when
-    /// the task reaches an observed terminal state.
-    pub(crate) _reservation: rig_compose::budget::TokenReservation,
     /// Model hint resolution (`None` = no hint given) — surfaced read-only
     /// by the W5.4 notice drain (`peek_model_source`); every other
     /// admission fact (agent/task_index/session/status/result) lives
-    /// canonically in the registry entry + meta schema, so the holding
-    /// carries only what the registry cannot.
+    /// canonically in the registry entry + meta schema.
     pub(crate) model_source: Option<ModelSource>,
 }
 
@@ -179,7 +220,9 @@ impl BackgroundBook {
             .insert(task_id, holding);
     }
 
-    /// Release the hold for `task_id` (refund via drop). `None` when the id
+    /// Release the hold for `task_id`. W12.26: refund-NEUTRAL — the hold
+    /// carries no reservation; the budget refund lives in the spawned
+    /// future's reconcile (`record_usage`) or `Drop`. `None` when the id
     /// is not a background delegate admission (e.g. a `shell.exec` task).
     pub(crate) fn release(&self, task_id: &str) -> Option<BackgroundHolding> {
         self.0
@@ -197,8 +240,8 @@ impl BackgroundBook {
     }
 
     /// Read-only peek of an admission's resolved model source (W5.4 notice
-    /// parity) — unlike [`release`] this never refunds; the reservation is
-    /// still released by collect/kill/sweep.
+    /// parity) — unlike [`release`] this never mutates the book; the entry
+    /// itself is released by collect/kill/sweep (W12.26: refund-neutral).
     #[must_use]
     pub(crate) fn peek_model_source(&self, task_id: &str) -> Option<String> {
         self.0
@@ -229,7 +272,7 @@ impl BackgroundBook {
             .cloned()
             .collect();
         for id in ids {
-            map.remove(&id); // drop ⇒ armed refund
+            map.remove(&id); // W12.26: refund-neutral — the pool refund lives in the future
         }
     }
 }
@@ -299,7 +342,7 @@ pub struct DelegateTaskTool {
     /// refreshed by the orchestrator at every turn entry (last-writer-wins,
     /// `propagate_knowledge` precedent).
     history: SharedHistory,
-    token_budget: Arc<AtomicTokenBudget>,
+    token_budget: Arc<dyn TokenBudget>,
     timeout: Duration,
     max_depth: u32,
     max_concurrent: u32,
@@ -307,9 +350,10 @@ pub struct DelegateTaskTool {
     /// D10 per-agent accuracy weights (empty = cold start ⇒ uniform).
     weights: HashMap<String, f32>,
     /// W5.2 background-admission bookkeeping (outlives turns — the tool is
-    /// an Arc shared across rounds): per-task token-reservation holds and
-    /// admission metadata, keyed by registry task id. Released (refund =
-    /// the armed reservation drop) on collect/fail/kill/expiry observation.
+    /// an Arc shared across rounds): per-task admission metadata keyed by
+    /// registry task id. W12.26: refund-neutral — the hold carries NO
+    /// reservation; the budget refund lives entirely in the spawned
+    /// future's reconcile (`record_usage`) or `Drop`.
     background: BackgroundBook,
     /// Self-Arc cell (set by the constructor site BEFORE registry
     /// insertion): the background future must be 'static for
@@ -341,7 +385,7 @@ impl DelegateTaskTool {
         sensitivity: SharedSensitivity,
         knowledge: SharedKnowledge,
         history: SharedHistory,
-        token_budget: Arc<AtomicTokenBudget>,
+        token_budget: Arc<dyn TokenBudget>,
         timeout: Duration,
         max_depth: u32,
         max_concurrent: u32,
@@ -383,7 +427,8 @@ impl DelegateTaskTool {
 
     /// A clone of this tool's background book sharing the same underlying
     /// hold map — the `delegate.collect`/`delegate.kill` tools (W5.3) use
-    /// it to release (⇒ refund) the admission holds they observe.
+    /// it to observe and release the admission holds. W12.26: the release
+    /// is refund-neutral (the hold carries no reservation).
     pub fn background_book(&self) -> BackgroundBook {
         self.background.share()
     }
@@ -482,18 +527,36 @@ impl DelegateTaskTool {
     /// the hard stop (006 depth-1 behavior is the `max_depth = 1` case).
     /// `plan.execute` is stripped unconditionally: it is a Sisyphus-only
     /// tool and must never ride an overlay grant into a sub-agent.
+    ///
+    /// W12.1 (review A1, SC-024): this is the SINGLE production construction
+    /// site, so the background narrowing is wired HERE — the
+    /// `BACKGROUND_TASK` task-local is read (unset ⇒ `false`) instead of
+    /// hardcoded. Background sub-turn futures run under
+    /// `BACKGROUND_TASK.scope(true)` (see `invoke_background`), so their
+    /// sub-agents lose the [`BACKGROUND_NARROWED_TOOLS`] five; the blocking
+    /// path never scopes the flag and keeps byte-identical grants. The
+    /// explicit `narrowed` parameter on [`Self::build_sub_agent_with_grants`]
+    /// remains a test seam ONLY — a helper-only test is exactly how the dead
+    /// wiring stayed green while production kept destructive tools (review
+    /// A1 masked-dead-code lesson).
     fn build_sub_agent(
         &self,
         agent_name: &str,
         allow_child_delegation: bool,
     ) -> anyhow::Result<ZenAgent> {
-        self.build_sub_agent_with_grants(agent_name, allow_child_delegation, false)
+        let narrowed = zen_plugin::tools::approval_hook::BACKGROUND_TASK
+            .try_get()
+            .unwrap_or(false);
+        self.build_sub_agent_with_grants(agent_name, allow_child_delegation, narrowed)
     }
 
     /// W5.2 (SC-024): build the sub-agent with the background narrowing
     /// applied — the target agent's grants minus
-    /// [`BACKGROUND_NARROWED_TOOLS`]. Only background admissions may set
-    /// `narrowed`; the blocking path's toolset is untouched (pin).
+    /// [`BACKGROUND_NARROWED_TOOLS`]. W12.1 (review A1): production never
+    /// calls this with `narrowed: true` directly — [`Self::build_sub_agent`]
+    /// derives the flag from the `BACKGROUND_TASK` task-local — so this
+    /// explicit parameter is a test seam for the narrowing contract pins;
+    /// the blocking path's toolset is untouched (pin).
     fn build_sub_agent_with_grants(
         &self,
         agent_name: &str,
@@ -695,7 +758,64 @@ impl DelegateTaskTool {
         {
             return Some(error);
         }
+        // D3 (eng-review 2026-11-20): a hint must name a model the
+        // SENSITIVITY-ROUTED provider serves — reject at admission rather
+        // than at the wire (the batch-level SC-022 check still ran first).
+        if let Some(hint) = task.model_hint.as_deref()
+            && let Err(error) = self.validate_hint_routed(hint, self.current_sensitivity())
+        {
+            return Some(error);
+        }
         None
+    }
+
+    /// D3 (eng-review 2026-11-20, outside #6): validate one model hint
+    /// against the SENSITIVITY-ROUTED provider's configured `models` keys —
+    /// the admission scope the A-02 contract actually applies the hint in
+    /// ("switches the model NAME within the routed provider, never the
+    /// provider"). Fail-open when the routed provider cannot be resolved,
+    /// is the mock stand-in, or declares no `models` table: the global
+    /// catalog check (`validate_model_hint_values`) remains the gate for
+    /// those shapes, keeping offline/test paths byte-identical.
+    ///
+    /// Residual corner (documented): a resumed plan whose recorded policy
+    /// differs from the resuming session's sensitivity validates against
+    /// the session cell read here; the runtime keeps its honest structured
+    /// provider error for that case (W12.15 mismatched-cell resume).
+    fn validate_hint_routed(&self, hint: &str, sensitivity: Sensitivity) -> Result<(), String> {
+        let requirements = zen_provider::TaskRequirements {
+            max_tokens: None,
+            sensitivity,
+            preferred_model: None,
+            budget_limit: None,
+        };
+        let router = self.executor.router();
+        let Ok(provider) = router
+            .route_with_preferences(&requirements, &[])
+            .or_else(|_| router.route(&requirements))
+        else {
+            return Ok(());
+        };
+        let name = provider.to_string();
+        if name == "mock" {
+            return Ok(());
+        }
+        let Ok(config) = zen_core::config::load_config() else {
+            return Ok(());
+        };
+        let Some(entry) = config.providers.get(&name) else {
+            return Ok(());
+        };
+        if entry.models.is_empty() {
+            return Ok(());
+        }
+        if !entry.models.contains_key(hint) {
+            return Err(format!(
+                "model hint \"{hint}\" is not served by the sensitivity-routed provider \"{name}\" \
+                 (hints switch the model name within the routed provider, never the provider)"
+            ));
+        }
+        Ok(())
     }
 
     /// W2.2 (D12): validate a declared artifact output path with the SAME
@@ -769,7 +889,7 @@ impl DelegateTaskTool {
     /// turn scope the shared cells are snapshotted instead — the documented
     /// non-turn fallback, captured at admission so later cell overwrites
     /// cannot retroactively change an in-flight background sub-turn.
-    fn capture_turn_context(&self) -> zen_core::turn_context::TurnContext {
+    pub(crate) fn capture_turn_context(&self) -> zen_core::turn_context::TurnContext {
         zen_core::turn_context::current().unwrap_or_else(|| zen_core::turn_context::TurnContext {
             sensitivity: self.turn_sensitivity(),
             knowledge: self.turn_knowledge(),
@@ -1000,33 +1120,69 @@ impl DelegateTaskTool {
         }
     }
 
-    /// D25 SC-022 model-hint resolution: `sensitivity > LlmPreference >
-    /// hint > default`. Returns the source label for the additive
-    /// `model_source` falsifiability field. The hint is catalog-validated
-    /// at admission (unknown names rejected), and a profile with any
-    /// explicit preference wins over it. Honest scope note: the hint's
-    /// RUNTIME model override rides the recorded D2b follow-up (the
-    /// router's `preferred_model` plumbing — per-provider插管 was already
-    /// deferred there); this wave delivers validation, resolution order,
-    /// and the falsifiable source label, mirroring that precedent's
-    /// documentation discipline.
+    /// D25 SC-022 model-hint resolution (thin wrapper over the shared
+    /// [`resolve_model_source`] ladder). Returns the source label for the
+    /// additive `model_source` falsifiability field. A-02 (D2b): a
+    /// `ModelSource::Hint` outcome ALSO sets
+    /// [`AgentContext::model_override`] so the hint switches the runtime
+    /// MODEL NAME within the sensitivity-routed provider (never the
+    /// provider itself); `Profile`/`Default` stay byte-identical (`None`).
     fn resolve_model_hint(
         &self,
         hint: Option<&str>,
         profile: Option<&AgentProfile>,
     ) -> ModelSource {
-        let has_explicit_preference = profile.is_some_and(|p| {
-            p.llm_preferences
-                .iter()
-                .any(|pref| !matches!(pref, LlmPreference::Any))
-        });
-        if has_explicit_preference {
-            ModelSource::Profile
-        } else if hint.is_some() {
-            ModelSource::Hint
-        } else {
-            ModelSource::Default
+        resolve_model_source(hint, profile)
+    }
+
+    /// A-02/row13: resolve the provider's configured default model name the
+    /// delegate path would use for `agent` under `sensitivity`. Config-only
+    /// (`route_with_preferences` probes only for a `LocalOnly` profile);
+    /// `None` when no provider resolves — the forecast then omits the pair.
+    fn provider_default_model(
+        &self,
+        profile: Option<&AgentProfile>,
+        sensitivity: Sensitivity,
+    ) -> Option<String> {
+        let requirements = zen_provider::TaskRequirements {
+            max_tokens: None,
+            sensitivity,
+            preferred_model: None,
+            budget_limit: None,
+        };
+        let preferences = profile.map_or(&[][..], |p| p.llm_preferences.as_slice());
+        let router = self.executor.router();
+        let provider = router
+            .route_with_preferences(&requirements, preferences)
+            .or_else(|_| router.route(&requirements))
+            .ok()?;
+        let name = provider.to_string();
+        if name == "mock" {
+            return Some("mock".to_string());
         }
+        router
+            .provider_instance(&name)
+            .map(|instance| instance.model_name().to_string())
+    }
+
+    /// A-02/row13: the forecast-side world of
+    /// [`resolved_model_label`] — same ladder, same provider-default
+    /// resolution the runtime producer reports, so the `(agent, model)`
+    /// history key the checkpoint writes is the one the forecast looks up.
+    pub(crate) fn model_history_key(
+        &self,
+        agent: &str,
+        hint: Option<&str>,
+        sensitivity: Sensitivity,
+    ) -> String {
+        let profile = self.registry.find_by_name(agent).ok().cloned();
+        let provider_default = match resolve_model_source(hint, profile.as_ref()) {
+            ModelSource::Hint => None,
+            ModelSource::Profile | ModelSource::Default => {
+                self.provider_default_model(profile.as_ref(), sensitivity)
+            }
+        };
+        resolved_model_label(hint, profile.as_ref(), provider_default.as_deref())
     }
 
     /// D25 SC-022: the configured model catalog (5-layer config,
@@ -1095,9 +1251,12 @@ impl DelegateTaskTool {
     /// per-turn token reserve (D11-A — insufficient budget is a structured
     /// rejection), then the registry's atomic concurrency gate. Depth was
     /// resolved by the shared validate pass (parent depth + 1) and the
-    /// narrowed grant set is applied at sub-agent construction (SC-024);
+    /// narrowed grant set is applied at sub-agent construction via the
+    /// `BACKGROUND_TASK` task-local this future scopes (SC-024, W12.1);
     /// `SESSION_SCOPE` is read synchronously here because task-locals do
-    /// not cross `tokio::spawn` (the APPROVAL_TURN precedent).
+    /// not cross `tokio::spawn` (the APPROVAL_TURN precedent) — and
+    /// re-entered inside the spawned future (W12.3) so nested admissions
+    /// attribute to the real owning session.
     async fn invoke_background(
         &self,
         tasks: &[ParsedDelegate],
@@ -1162,15 +1321,17 @@ impl DelegateTaskTool {
                 fork_mode,
             );
 
-            // Admission token reserve (D11-A): estimate = the delegate
-            // sub-turn budget default shape (prompt/4 + 1024) PLUS
-            // inherited_chars/4 (W11.16/T17 — the same bytes→tokens divisor
-            // as run_single_composed's runtime re-reserve, so the admission
-            // hold is honest about inherited knowledge). Held by
-            // BackgroundBook until collect/fail/kill/expiry — never billed
-            // against a turn that already returned.
-            let estimate =
-                (task.request.prompt.len() / 4 + 1024 + sub.knowledge_chars() / 4) as u64;
+            // Admission token reserve (D11-A). W12.26: the estimate is the
+            // RUNTIME estimate shape — `compose_sub_prompt` bytes (D9
+            // contract + artifact block + the always-on REPORT_REQUEST
+            // trailer) / 4 + 1024 + inherited_chars/4 — so the admission
+            // hold ≡ the runtime hold by construction and the armed
+            // reservation can move INTO the spawned future with no second
+            // reserve and no latent ~REPORT_REQUEST-sized under-hold.
+            let estimate = (compose_sub_prompt(&task.request, &DelegateContract::default()).len()
+                / 4
+                + 1024
+                + sub.knowledge_chars() / 4) as u64;
             let reservation = match self.token_budget.try_reserve_tokens(estimate).await {
                 Ok(Some(reservation)) => reservation,
                 Ok(None) => {
@@ -1194,10 +1355,15 @@ impl DelegateTaskTool {
             };
 
             let task_id = uuid::Uuid::new_v4().simple().to_string();
+            // W12.26: the reservation-less holding enters the book BEFORE
+            // the spawn so sweep_terminal/release observe it from the first
+            // instant; the armed reservation itself moves INTO the future
+            // chain (single ownership — the future's `record_usage`
+            // reconcile or `Drop` is the only refund path; the book is
+            // refund-neutral).
             self.background.insert(
                 task_id.clone(),
                 BackgroundHolding {
-                    _reservation: reservation,
                     model_source: Some(model_source),
                 },
             );
@@ -1208,17 +1374,25 @@ impl DelegateTaskTool {
             // cell overwrites (BACKGROUND_TASK.scope precedent — task-locals
             // survive block_in_place/join_all, NOT tokio::spawn).
             let turn_ctx = self.capture_turn_context();
+            // W12.3 (review A3): task-locals do not cross `tokio::spawn` —
+            // re-enter SESSION_SCOPE inside the spawned future with the
+            // session id captured at admission, so nested admissions
+            // (depth ≥ 2) attribute to the REAL owning session instead of
+            // falling back to "local".
             let future = zen_core::turn_context::TURN_CONTEXT.scope(
                 turn_ctx,
                 zen_plugin::tools::approval_hook::BACKGROUND_TASK.scope(
                     true,
-                    Arc::clone(&owned).run_single_background(
-                        task.request.clone(),
-                        depth,
-                        parent.to_string(),
-                        session,
-                        sub,
-                        model_source,
+                    zen_plugin::task_registry::SESSION_SCOPE.scope(
+                        session_id.clone(),
+                        Arc::clone(&owned).run_single_background(
+                            task.request.clone(),
+                            depth,
+                            parent.to_string(),
+                            (session, sub),
+                            model_source,
+                            reservation,
+                        ),
                     ),
                 ),
             );
@@ -1245,7 +1419,10 @@ impl DelegateTaskTool {
                 }
                 Err(e) => {
                     // Registry gate (concurrency/drain/id): structured
-                    // rejection; release the reserve (drop ⇒ refund).
+                    // rejection. W12.26: the release is refund-neutral (the
+                    // book carries no reservation); the armed reservation
+                    // inside the never-spawned future refunds the full
+                    // estimate via `TokenReservation::drop`.
                     self.background.release(&task_id);
                     admitted.push(serde_json::json!({
                         "task_index": i,
@@ -1270,29 +1447,34 @@ impl DelegateTaskTool {
     }
 
     /// The background sub-turn future body (W5.2): the SAME delegate loop
-    /// as `run_single_composed` — which re-verifies the depth guard and
-    /// reserves run-time budget exactly as blocking sub-turns do — with
-    /// the D25 result-payload seeds added. The narrowed grant set (SC-024)
-    /// is applied inside `build_sub_agent` via the `BACKGROUND_TASK`
-    /// task-local scope this future runs under, so no loop duplication is
-    /// needed.
+    /// as `run_single_composed` — which re-verifies the depth guard exactly
+    /// as blocking sub-turns do — with the D25 result-payload seeds added.
+    /// W12.26: the admission's ARMED reservation rides in (`reservation`)
+    /// and is consumed by the completion reconcile inside the future — the
+    /// runtime re-reserve is gone (single armed reservation, no soft-deny
+    /// re-check). The narrowed grant set (SC-024) is applied inside
+    /// `build_sub_agent` via the `BACKGROUND_TASK` task-local scope this
+    /// future runs under, so no loop duplication is needed. `composed`
+    /// bundles `(session, sub)` so the future body stays within clippy's
+    /// arity gate (no allow-suppression, W12.26).
     async fn run_single_background(
         self: Arc<Self>,
         req: DelegateRequest,
         depth: u32,
         parent: String,
-        session: SessionContext,
-        sub: SubAgentContext,
+        composed: (SessionContext, SubAgentContext),
         model_source: ModelSource,
+        reservation: rig_compose::budget::TokenReservation,
     ) -> anyhow::Result<serde_json::Value> {
+        let (session, sub) = composed;
         let mut outcome = self
             .run_single_composed(
                 &req,
                 depth,
                 &parent,
-                session,
-                sub,
+                (session, sub),
                 &DelegateContract::default(),
+                Some(reservation),
             )
             .await;
         if let Some(obj) = outcome.as_object_mut() {
@@ -1338,15 +1520,15 @@ impl DelegateTaskTool {
     ) -> serde_json::Value {
         // W11.5/T5 (SC-021): the plan path honors the per-task fork_mode —
         // `None` resolves to the session-wide default byte-identically.
-        let (session, sub) =
+        let composed =
             self.compose_sub_session_forked(&req.agent, &req.prompt, depth, req.fork_mode);
         self.run_single_composed(
             req,
             depth,
             parent,
-            session,
-            sub,
+            composed,
             &DelegateContract::default(),
+            None,
         )
         .await
     }
@@ -1356,15 +1538,25 @@ impl DelegateTaskTool {
     /// the real per-task `{inherited_notes, inherited_chars, skill_hits}`
     /// values; composition is deterministic, so pre-composing here and
     /// inside `run_single` (the plan.execute path) cannot drift.
+    ///
+    /// W12.26: `armed` carries a PRE-PAID reservation (the background
+    /// admission's, computed against this same composed prompt). When
+    /// `Some`, the runtime reserve below is SKIPPED entirely — no soft-deny
+    /// re-check (admission already paid; the re-check was the double-hold
+    /// bug) — and the armed reservation is consumed by the completion
+    /// reconcile. `None` keeps the blocking paths byte-identical.
+    /// `composed` bundles `(session, sub)` (W12.26: clippy arity gate —
+    /// no allow-suppression).
     pub(crate) async fn run_single_composed(
         &self,
         req: &DelegateRequest,
         depth: u32,
         parent: &str,
-        session: SessionContext,
-        sub: SubAgentContext,
+        composed: (SessionContext, SubAgentContext),
         contract: &DelegateContract,
+        armed: Option<rig_compose::budget::TokenReservation>,
     ) -> serde_json::Value {
+        let (session, sub) = composed;
         let started = Instant::now();
         let agent_name = req.agent.as_str();
         let prompt = compose_sub_prompt(req, contract);
@@ -1383,8 +1575,14 @@ impl DelegateTaskTool {
             });
         };
 
+        let model_source = resolve_model_source(req.model_hint.as_deref(), Some(&profile));
         let mut context = AgentContext::new(profile.clone(), prompt.to_string(), session)
             .with_preferences(profile.llm_preferences.clone());
+        if model_source == ModelSource::Hint
+            && let Some(hint) = req.model_hint.as_deref()
+        {
+            context = context.with_model_override(hint);
+        }
         context
             .metadata
             .insert("delegate_depth".to_string(), serde_json::json!(child_depth));
@@ -1399,24 +1597,32 @@ impl DelegateTaskTool {
         // is untouched; the estimate additively includes knowledge_chars/4
         // (same bytes→tokens divisor as the prompt term) so reservations
         // stay honest.
+        // W12.26: `armed` (background admission) is consumed as-is — the
+        // admission already reserved THIS exact estimate from the composed
+        // prompt, so re-reserving would double-hold and re-checking the
+        // budget soft-deny would be the bug this wave removes. `None`
+        // (blocking fan-out / plan.execute) reserves below byte-identically.
         let inherited_chars = sub.knowledge_chars();
         let estimated = (prompt.len() / 4 + 1024 + inherited_chars / 4) as u64;
-        let reservation = match self.token_budget.try_reserve_tokens(estimated).await {
-            Ok(Some(reservation)) => reservation,
-            Ok(None) => {
-                return serde_json::json!({
-                    "error": "token budget exhausted; delegation refused"
-                });
-            }
-            Err(e) => {
-                return serde_json::json!({
-                    "error": format!("token budget reservation failed: {e}")
-                });
-            }
+        let reservation = match armed {
+            Some(reservation) => reservation,
+            None => match self.token_budget.try_reserve_tokens(estimated).await {
+                Ok(Some(reservation)) => reservation,
+                Ok(None) => {
+                    return serde_json::json!({
+                        "error": "token budget exhausted; delegation refused"
+                    });
+                }
+                Err(e) => {
+                    return serde_json::json!({
+                        "error": format!("token budget reservation failed: {e}")
+                    });
+                }
+            },
         };
 
-        let (early_error, mut response, rounds, timed_out) = DELEGATE_DEPTH
-            .scope(
+        let (early_error, mut response, rounds, timed_out, runtime_model, usage_cost_usd) =
+            DELEGATE_DEPTH.scope(
                 Cell::new(child_depth),
                 DELEGATE_PARENT.scope(
                     RefCell::new(Some(agent_name.to_string())),
@@ -1427,6 +1633,8 @@ impl DelegateTaskTool {
         let mut response = String::new();
         let mut rounds = 0usize;
         let mut timed_out = false;
+        let mut runtime_model: Option<String> = None;
+        let mut usage_cost_usd: Option<f64> = None;
 
         while rounds < MAX_DELEGATE_ROUNDS {
             if let Some(note) = Self::deadline_exceeded(deadline) {
@@ -1446,9 +1654,17 @@ impl DelegateTaskTool {
                     response,
                     rounds,
                     timed_out,
+                    runtime_model,
+                    usage_cost_usd,
                 );
             };
             rounds += 1;
+            if execution.metadata.runtime_model.is_some() {
+                runtime_model = execution.metadata.runtime_model.clone();
+            }
+            if let Some(cost) = execution.metadata.usage_cost_usd {
+                *usage_cost_usd.get_or_insert(0.0) += cost;
+            }
             response = execution.response;
 
             let (invocations, parse_errors) =
@@ -1475,7 +1691,14 @@ impl DelegateTaskTool {
                 }
             }
         }
-                        (None, response, rounds, timed_out)
+                        (
+                            None,
+                            response,
+                            rounds,
+                            timed_out,
+                            runtime_model,
+                            usage_cost_usd,
+                        )
                     },
                 ),
             )
@@ -1490,9 +1713,18 @@ impl DelegateTaskTool {
 
         let (clean_response, reasoning, verification) = split_report_markers(&response);
         let response_chars = clean_response.chars().count();
-        let actual = (prompt.len() / 4 + clean_response.len() / 4) as u64;
+        // W12.4 (review N4): rig-compose `BudgetGuard::record_usage` SUMS
+        // its prompt+completion arguments into one consumption debit
+        // (`prompt.saturating_add(completion)`, budget.rs record_usage) —
+        // the historical `record_usage(actual, actual)` billed every
+        // delegate sub-turn at 2× its real size, silently halving the
+        // effective budget capacity. Report the REAL split instead (the
+        // same bytes→tokens divisor the estimate uses); the arguments sum
+        // back to the identical total, billed exactly once.
+        let prompt_tokens = (prompt.len() / 4) as u64;
+        let completion_tokens = (clean_response.len() / 4) as u64;
         self.token_budget
-            .record_usage(reservation, actual, actual)
+            .record_usage(reservation, prompt_tokens, completion_tokens)
             .await;
 
         // FIX-5: an empty or tool-JSON-only sub-agent response must not
@@ -1538,9 +1770,24 @@ impl DelegateTaskTool {
             }
             // W11.5/T5 (SC-022 falsifiability): the same model_source label
             // the background path seeds — resolution order sensitivity >
-            // LlmPreference > hint > default (runtime override stays D2b).
-            let model_source = self.resolve_model_hint(req.model_hint.as_deref(), Some(&profile));
+            // LlmPreference > hint > default. A-02: the label is display
+            // honesty only; the RUNTIME model name (and the
+            // forecast-keyed history value) is `model` below.
             output["model_source"] = serde_json::json!(model_source.as_str());
+            // A-02/row13: the REAL model name the sub-turn ran under and its
+            // metered cost. Both additive/optional — a provider that reports
+            // neither leaves the keys absent (honest degradation).
+            let model_label = resolved_model_label(
+                req.model_hint.as_deref(),
+                Some(&profile),
+                runtime_model.as_deref(),
+            );
+            if !model_label.is_empty() {
+                output["model"] = serde_json::json!(model_label);
+            }
+            if let Some(cost) = usage_cost_usd {
+                output["cost_usd"] = serde_json::json!(cost);
+            }
             output
         };
         // T233 (006 D13/W3.1): post-`run_single` quality estimate — a
@@ -2007,7 +2254,7 @@ impl Tool for DelegateTaskTool {
             let futures: Vec<_> = chunk
                 .iter()
                 .map(|&i| {
-                    let (session, sub) = composed[i]
+                    let composed = composed[i]
                         .take()
                         .expect("runnable slots are composed above");
                     let request = &tasks[i].request;
@@ -2020,7 +2267,7 @@ impl Tool for DelegateTaskTool {
                         if let Some(delay) = self.test_wave_delay(request.agent.as_str()) {
                             tokio::time::sleep(delay).await;
                         }
-                        self.run_single_composed(request, depth, parent, session, sub, contract)
+                        self.run_single_composed(request, depth, parent, composed, contract, None)
                             .await
                     }
                 })
@@ -2064,6 +2311,7 @@ impl Tool for DelegateTaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_compose::budget::AtomicTokenBudget;
 
     // D25 A6.3: the declared schema must accept BOTH forms the runtime
     // accepts — a top-level required:["agent","prompt"] rejects the pure
@@ -2624,7 +2872,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
             Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(std::sync::Mutex::new(Vec::new())),
-            Arc::clone(&budget),
+            Arc::clone(&budget) as Arc<dyn rig_compose::budget::TokenBudget>,
             Duration::from_secs(300),
             1,
             4,
@@ -3748,6 +3996,281 @@ mod tests {
         }
     }
 
+    /// W12.1 (review A1 E2E pin): the PRODUCTION construction entry must
+    /// honor the `BACKGROUND_TASK` task-local. The pre-fix world hardcoded
+    /// `narrowed: false` while only the helper seam carried the flag — tests
+    /// stayed green while production background sub-agents kept the
+    /// destructive five (the masked-dead-code lesson). This pin builds
+    /// through `build_sub_agent` under the exact task-local state
+    /// `invoke_background` establishes around its spawned future and asserts
+    /// the BUILT toolset; flag-absent (foreground) keeps the full surface
+    /// byte-identical (W5.2 contract).
+    #[tokio::test]
+    async fn background_task_scope_narrows_production_entry_toolset() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        // Foreground byte-identity: no BACKGROUND_TASK ⇒ widest surface.
+        // Pin precondition: Sisyphus (widest grants) over ZenWiring::new()
+        // must actually carry the five, or the narrowing half proves
+        // nothing.
+        let foreground = tool
+            .build_sub_agent("Sisyphus", false)
+            .expect("foreground build");
+        let foreground_names: std::collections::HashSet<String> = foreground
+            .generic
+            .tools()
+            .schemas()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for stripped in BACKGROUND_NARROWED_TOOLS {
+            assert!(
+                foreground_names.contains(stripped),
+                "pin precondition: foreground Sisyphus must carry `{stripped}`"
+            );
+        }
+
+        // Production entry under the background scope — the same task-local
+        // state a spawned background future runs under (invoke_background).
+        let narrowed = zen_plugin::tools::approval_hook::BACKGROUND_TASK
+            .scope(true, async {
+                tool.build_sub_agent("Sisyphus", false)
+                    .expect("scoped production build")
+            })
+            .await;
+        let narrowed_names: std::collections::HashSet<String> = narrowed
+            .generic
+            .tools()
+            .schemas()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for stripped in BACKGROUND_NARROWED_TOOLS {
+            assert!(
+                !narrowed_names.contains(stripped),
+                "background sub-agents built through the PRODUCTION entry \
+                 must lose `{stripped}` (SC-024/W12.1)"
+            );
+        }
+        // Narrowing removes ONLY the enumerated five — no collateral loss.
+        let five: std::collections::HashSet<&str> =
+            BACKGROUND_NARROWED_TOOLS.iter().copied().collect();
+        let expected: std::collections::HashSet<String> = foreground_names
+            .iter()
+            .filter(|n| !five.contains(n.as_str()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            narrowed_names, expected,
+            "narrowing must remove exactly the enumerated five, nothing else"
+        );
+    }
+
+    /// W12.4 (review N4 pin): consumption must equal the REAL total exactly
+    /// once. rig-compose `record_usage` sums its prompt+completion args, so
+    /// the historical `(actual, actual)` billed every successful sub-turn at
+    /// 2× its size — effective capacity halved. The pin drives the blocking
+    /// production path with the deterministic mock and compares
+    /// `tokens_consumed()` against the exact composition the production
+    /// site bills (`compose_sub_prompt` bytes/4 + final-response bytes/4).
+    #[tokio::test]
+    async fn record_usage_bills_real_total_exactly_once() {
+        let budget = Arc::new(AtomicTokenBudget::new(1_000_000));
+        let tool = tool_with(Arc::new(ZenWiring::new()), Vec::new(), Arc::clone(&budget));
+        let prompt_text = "measure the billed total exactly once";
+        let out = tool
+            .invoke(serde_json::json!({ "agent": "Explore", "prompt": prompt_text }))
+            .await
+            .unwrap();
+        let response = out["response"]
+            .as_str()
+            .expect("ok-shaped result carries the sub-agent reply");
+        let req = DelegateRequest {
+            agent: "Explore".into(),
+            prompt: prompt_text.into(),
+            description: None,
+            independent: true,
+            artifact: None,
+            fork_mode: None,
+            model_hint: None,
+        };
+        let composed = compose_sub_prompt(&req, &DelegateContract::default());
+        let expected = (composed.len() / 4 + response.len() / 4) as u64;
+        assert_eq!(
+            budget.tokens_consumed().await,
+            expected,
+            "consumption must equal the real total exactly once — a \
+             (actual, actual) call would bill {expected}×2 (W12.4)"
+        );
+        assert_eq!(
+            budget.available(),
+            budget.capacity() - expected,
+            "the reconciled reservation must leave availability at \
+             capacity minus the real total"
+        );
+    }
+
+    /// W12.3 (review A3 pin): a nested background admission (depth ≥ 2)
+    /// must record the REAL owning session id, never "local". Task-locals
+    /// do not cross `tokio::spawn` — pre-W12.3, the spawned future lost
+    /// `SESSION_SCOPE`, so any `delegate.task background` admitted inside a
+    /// background sub-turn attributed "local" and the owning session's
+    /// completion push never saw the task. The pin drives BOTH admissions
+    /// through the production `invoke` entry: depth-1 exactly as the
+    /// orchestrator dispatches (inside `SESSION_SCOPE`), then the depth-2
+    /// admission inside the scope shape `invoke_background` wraps around
+    /// its spawned future (BACKGROUND_TASK × SESSION_SCOPE × the
+    /// DELEGATE_DEPTH/PARENT chain state `run_single_composed` establishes
+    /// around its loop). Planner→Specialist keeps the spawn-hierarchy gate
+    /// open (Prometheus parent), and `max_depth = 2` admits child_depth 2.
+    /// Honest seam note: the mock LLM cannot emit a nested delegate JSON,
+    /// so the depth-2 admission is entered at the seam the production
+    /// future provides rather than through a second LLM round — the raw-
+    /// spawn contrast below pins the failure mode the re-entry closes.
+    #[tokio::test]
+    async fn nested_background_admission_inside_spawned_future_attributes_real_owning_session() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118);
+        // spawn_async writes under user_root, so isolate it.
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+
+        let tool = background_tool(
+            Arc::new(ZenWiring::new()),
+            Arc::new(AtomicTokenBudget::new(1_000_000)),
+            2,
+        );
+
+        // Depth-1 admission through the production entry, exactly as the
+        // orchestrator runs it: dispatch inside the owning session's
+        // SESSION_SCOPE. invoke_background captures the session id here.
+        let d1 = zen_plugin::task_registry::SESSION_SCOPE
+            .scope("sess-owner".to_string(), async {
+                tool.invoke(serde_json::json!({
+                    "tasks": [{ "agent": "Explore", "prompt": "depth-1 wave" }],
+                    "background": true
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+        assert_eq!(
+            d1["started"],
+            serde_json::json!(1),
+            "depth-1 admitted: {d1}"
+        );
+        let d1_id = d1["task_ids"].as_array().expect("task_ids")[0]
+            .as_str()
+            .expect("task id string")
+            .to_string();
+        let d1_snap = zen_plugin::task_registry::registry()
+            .snapshot(&d1_id)
+            .expect("depth-1 task registered");
+        assert_eq!(d1_snap.session_id, "sess-owner", "depth-1 attribution");
+
+        // Contrast — the raw failure mode: a plain tokio::spawn drops the
+        // task-local, which is precisely why the fix re-enters the scope.
+        let seen = Arc::new(Mutex::new(None::<String>));
+        {
+            let seen = Arc::clone(&seen);
+            zen_plugin::task_registry::SESSION_SCOPE
+                .scope("sess-owner".to_string(), async move {
+                    tokio::spawn(async move {
+                        *seen.lock().unwrap() =
+                            Some(zen_plugin::task_registry::current_session_scope());
+                    })
+                    .await
+                    .unwrap();
+                })
+                .await;
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some("local".to_string()),
+            "task-locals do NOT cross tokio::spawn — the state W12.3 re-enters"
+        );
+
+        // Depth-2 admission inside the production future-body scope shape:
+        // BACKGROUND_TASK(true) × SESSION_SCOPE(owner) × depth chain, the
+        // exact nesting invoke_background establishes around the spawned
+        // run_single_background future (Planner parent keeps spawn_allowed
+        // true; child_depth 2 ≤ max_depth 2).
+        let d2 = zen_plugin::tools::approval_hook::BACKGROUND_TASK
+            .scope(
+                true,
+                zen_plugin::task_registry::SESSION_SCOPE.scope(
+                    "sess-owner".to_string(),
+                    DELEGATE_DEPTH.scope(Cell::new(1), {
+                        DELEGATE_PARENT.scope(RefCell::new(Some("Prometheus".to_string())), async {
+                            tool.invoke(serde_json::json!({
+                                "tasks": [{ "agent": "Explore",
+                                            "prompt": "nested depth-2 wave" }],
+                                "background": true
+                            }))
+                            .await
+                            .unwrap()
+                        })
+                    }),
+                ),
+            )
+            .await;
+        assert_eq!(
+            d2["started"],
+            serde_json::json!(1),
+            "depth-2 admitted inside the future scope shape: {d2}"
+        );
+        let d2_id = d2["task_ids"].as_array().expect("task_ids")[0]
+            .as_str()
+            .expect("task id string")
+            .to_string();
+        let d2_snap = zen_plugin::task_registry::registry()
+            .snapshot(&d2_id)
+            .expect("depth-2 task registered");
+        assert_eq!(
+            d2_snap.session_id, "sess-owner",
+            "nested depth-2 admission must attribute the REAL owning \
+             session, never \"local\" (W12.3)"
+        );
+
+        // Consumer contract (D4): the owning session's completion push
+        // surfaces BOTH tasks once they reach terminal states.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let done = |id: &str| {
+                zen_plugin::task_registry::registry()
+                    .snapshot(id)
+                    .map(|s| s.status.is_terminal())
+                    .unwrap_or(false)
+            };
+            if done(&d1_id) && done(&d2_id) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background futures must complete within the pin deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut notified: Vec<String> = zen_plugin::task_registry::registry()
+            .take_status_changes("sess-owner")
+            .iter()
+            .map(|s| s.task_id.clone())
+            .collect();
+        notified.sort();
+        let mut expected_ids = vec![d1_id.clone(), d2_id.clone()];
+        expected_ids.sort();
+        assert_eq!(
+            notified, expected_ids,
+            "the owning session's push cursor must surface both admissions"
+        );
+    }
+
     #[test]
     fn model_hint_validation_rejects_unknown_catalog_and_sixth_distinct() {
         let tasks_unknown = |hint: &str| {
@@ -3950,40 +4473,81 @@ mod tests {
         set_inheritance_env(None, None);
     }
 
-    /// W11.8/T8 (G1): releasing a background hold refunds the admission
-    /// reservation — collect/kill/expiry restore budget.available().
+    /// W12.26 (replaces `background_hold_release_refunds_the_reservation`):
+    /// the book hold carries NO reservation — insert/release never move the
+    /// budget. The refund lives in the spawned future's `record_usage`
+    /// reconcile (remainder) or `Drop` (full estimate); the pin reconciles
+    /// a reservation the way the future does, then proves the book path is
+    /// refund-neutral.
     #[tokio::test]
-    async fn background_hold_release_refunds_the_reservation() {
+    async fn release_is_refund_neutral_after_reconcile() {
+        use rig_compose::budget::TokenBudget;
         let budget = Arc::new(AtomicTokenBudget::new(100_000));
         let reservation = budget
             .try_reserve_tokens(5_000)
             .await
             .unwrap()
             .expect("reserve");
+        assert_eq!(
+            budget.available(),
+            95_000,
+            "the armed hold pins the estimate"
+        );
+        // Reconcile the way the future does: the remainder (5000 − 4000)
+        // is refunded HERE, never at collect/release.
+        budget.record_usage(reservation, 3_000, 1_000).await;
+        assert_eq!(
+            budget.available(),
+            96_000,
+            "reconcile refunds the remainder (estimate − actual)"
+        );
         let book = BackgroundBook::default();
         book.insert(
-            "t-refund".to_string(),
-            BackgroundHolding {
-                _reservation: reservation,
-                model_source: None,
-            },
+            "t-neutral".to_string(),
+            BackgroundHolding { model_source: None },
         );
-        assert_eq!(budget.available(), 95_000, "the hold pins the estimate");
-        book.release("t-refund");
-        assert_eq!(budget.available(), 100_000, "release refunds the estimate");
+        book.release("t-neutral");
+        assert_eq!(
+            budget.available(),
+            96_000,
+            "insert/release are refund-neutral — the hold carries no reservation"
+        );
+        assert_eq!(budget.tokens_consumed().await, 4_000, "billed exactly once");
     }
 
-    /// W11.16/T17 (OV-6, SC-021): the background admission estimate includes
-    /// inherited chars — a budget that admits prompt/4+1024 but NOT the
-    /// inherited term must refuse the admission (compose-before-reserve).
+    /// W11.16/T17 (OV-6, SC-021) resynced for W12.26: the background
+    /// admission estimate is computed from the COMPOSED prompt (D9 default
+    /// contract + artifact + the always-on REPORT_REQUEST trailer) plus the
+    /// inherited chars — a budget one token short of that estimate must
+    /// refuse the admission. The pre-W12.26 shape (raw prompt/4 + 1024)
+    /// was strictly smaller, so this pin also fails if the estimate
+    /// regresses to the raw prompt.
     #[tokio::test]
     async fn background_admission_estimate_includes_inherited_chars() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         set_inheritance_env(Some(dir.path()), Some("1"));
         let knowledge: SharedKnowledge =
             Arc::new(std::sync::Mutex::new(vec![note(&"a".repeat(4000))]));
-        // prompt "hello" ⇒ 5/4 + 1024 = 1025; inherited 4000/4 = 1000 ⇒ 2025.
-        // A 1500 budget admits the base shape but NOT the inherited term.
+        // prompt "hello" ⇒ composed (5 + REPORT_REQUEST + contract-empty
+        // trailer bytes)/4 + 1024 + inherited 4000/4 = 1000. Compute the
+        // estimate the admission computes so the pin never drifts on
+        // trailer-text edits, then fund the budget exactly one token short.
+        let req = DelegateRequest {
+            agent: "Explore".into(),
+            prompt: "hello".into(),
+            description: None,
+            independent: true,
+            artifact: None,
+            fork_mode: None,
+            model_hint: None,
+        };
+        let composed = compose_sub_prompt(&req, &DelegateContract::default());
+        let estimate = (composed.len() / 4 + 1024 + 4000 / 4) as u64;
+        let raw_estimate = (req.prompt.len() / 4 + 1024 + 4000 / 4) as u64;
+        assert!(
+            estimate > raw_estimate,
+            "the REPORT_REQUEST trailer must add to the estimate (W12.26)"
+        );
         let tool = Arc::new(DelegateTaskTool::new(
             Arc::new(ZenWiring::new()),
             mock_router(),
@@ -3992,7 +4556,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
             knowledge,
             Arc::new(std::sync::Mutex::new(Vec::new())),
-            Arc::new(AtomicTokenBudget::new(1500)),
+            Arc::new(AtomicTokenBudget::new(estimate - 1)),
             Duration::from_secs(300),
             1,
             4,
@@ -4010,8 +4574,402 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("insufficient token budget"),
-            "the inherited term must push the estimate over the budget: {out}"
+            "the composed estimate must push the admission over the budget: {out}"
         );
         set_inheritance_env(None, None);
+    }
+
+    /// Bounded terminal wait (reap-wait discipline): poll the registry
+    /// snapshot until the task is terminal, or panic past `secs`.
+    async fn wait_terminal(task_id: &str, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if zen_plugin::task_registry::registry()
+                .snapshot(task_id)
+                .is_some_and(|s| s.status.is_terminal())
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background task {task_id} must reach a terminal state within {secs}s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// W12.26 pin ①: ONE armed reservation end-to-end. The budget is funded
+    /// with EXACTLY the admission estimate (computed from the composed
+    /// prompt), so a single hold consumes the whole pool — admission
+    /// succeeds and the sub-turn completes ok-shaped. Under the pre-fix
+    /// world the runtime re-reserve of the same estimate would soft-deny
+    /// (available == 0 < estimate) and the task would complete with the
+    /// "token budget exhausted" error instead of a response. This is also
+    /// the behavioral composed-estimate equality pin (④): the admission
+    /// estimate must equal the runtime estimate for the default contract.
+    #[tokio::test]
+    async fn background_single_reserve_no_double_hold() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118);
+        // spawn_async writes under user_root, so isolate it.
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+
+        let prompt_text = "single armed reservation wave";
+        let req = DelegateRequest {
+            agent: "Explore".into(),
+            prompt: prompt_text.into(),
+            description: None,
+            independent: true,
+            artifact: None,
+            fork_mode: None,
+            model_hint: None,
+        };
+        let composed = compose_sub_prompt(&req, &DelegateContract::default());
+        let estimate = (composed.len() / 4 + 1024) as u64;
+        let budget = Arc::new(AtomicTokenBudget::new(estimate));
+        let tool = background_tool(Arc::new(ZenWiring::new()), Arc::clone(&budget), 1);
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore", "prompt": prompt_text, "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["started"], serde_json::json!(1), "{out}");
+        let id = out["task_ids"].as_array().expect("task_ids")[0]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        wait_terminal(&id, 10).await;
+
+        let collected = zen_plugin::task_registry::registry()
+            .collect_delegate(&id, 5_000)
+            .await
+            .expect("collect");
+        assert_eq!(collected.status, "completed", "{:?}", collected.error);
+        let response = collected.response.expect("ok-shaped result");
+        let sub_response = response["response"].as_str().expect("sub-agent reply");
+        let real = (composed.len() / 4 + sub_response.len() / 4) as u64;
+        assert_eq!(
+            budget.tokens_consumed().await,
+            real,
+            "billed exactly the real total once (single hold end-to-end)"
+        );
+        assert_eq!(
+            budget.available(),
+            estimate - real,
+            "availability = capacity − real_total: the remainder was refunded \
+             at reconcile, and no second hold ever existed"
+        );
+    }
+
+    /// W12.26 pin ②: after the future completes, the pool is ALREADY at
+    /// capacity − real_total (remainder refunded at the reconcile INSIDE
+    /// the future) — collecting afterwards (running → terminal → idempotent)
+    /// moves the budget by exactly zero.
+    #[tokio::test]
+    async fn remainder_refunded_at_reconcile_not_collect() {
+        use crate::delegate_background_tools::DelegateCollectTool;
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118).
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+
+        let prompt_text = "remainder refund probe";
+        let req = DelegateRequest {
+            agent: "Explore".into(),
+            prompt: prompt_text.into(),
+            description: None,
+            independent: true,
+            artifact: None,
+            fork_mode: None,
+            model_hint: None,
+        };
+        let composed = compose_sub_prompt(&req, &DelegateContract::default());
+        let budget = Arc::new(AtomicTokenBudget::new(100_000));
+        let tool = background_tool(Arc::new(ZenWiring::new()), Arc::clone(&budget), 1);
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore", "prompt": prompt_text, "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["started"], serde_json::json!(1), "{out}");
+        let id = out["task_ids"].as_array().expect("task_ids")[0]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        wait_terminal(&id, 10).await;
+
+        let real = {
+            let collected = zen_plugin::task_registry::registry()
+                .collect_delegate(&id, 0)
+                .await
+                .expect("peek result");
+            let response = collected.response.expect("ok-shaped result");
+            let sub_response = response["response"].as_str().expect("sub-agent reply");
+            (composed.len() / 4 + sub_response.len() / 4) as u64
+        };
+        assert_eq!(
+            budget.tokens_consumed().await,
+            real,
+            "the future's reconcile billed the real total BEFORE any collect"
+        );
+        assert_eq!(
+            budget.available(),
+            100_000 - real,
+            "the remainder (estimate − actual) was refunded at reconcile, \
+             not at collect"
+        );
+
+        // Collect through the real tool: running/terminal/idempotent passes
+        // must not move the budget (the book release is refund-neutral).
+        let collect = DelegateCollectTool::new(tool.background_book());
+        for wait_ms in [0u64, 5_000, 0] {
+            let receipt = collect
+                .invoke(serde_json::json!({ "task_id": id, "wait_ms": wait_ms }))
+                .await
+                .expect("collect invoke");
+            assert_eq!(
+                receipt["results"][0]["status"],
+                serde_json::json!("completed")
+            );
+            assert_eq!(
+                budget.tokens_consumed().await,
+                real,
+                "collect wait_ms={wait_ms} must not bill"
+            );
+            assert_eq!(
+                budget.available(),
+                100_000 - real,
+                "collect wait_ms={wait_ms} must not refund"
+            );
+        }
+    }
+
+    /// W12.26 pin ③: a spawn rejection (registry concurrency gate) refunds
+    /// the armed reservation — the reservation moved into the never-spawned
+    /// future is dropped synchronously, so availability is fully restored
+    /// the moment the structured rejection returns.
+    #[tokio::test]
+    async fn spawn_rejection_refunds_armed_reservation() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118).
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_BACKGROUND_MAX_CONCURRENT", "1");
+        }
+        zen_core::config::invalidate_config_cache();
+        // Fill the registry to its [agentic.background] ceiling.
+        let limits = zen_plugin::task_registry::BackgroundLimits {
+            max_wall_secs: 60,
+            max_concurrent: 1,
+            output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
+        };
+        let filler = zen_plugin::task_registry::registry()
+            .spawn_async(
+                "c0ffee00-0000-4000-8000-000000000002",
+                "sess-reject",
+                "Explore",
+                None,
+                &limits,
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(serde_json::json!({}))
+                },
+            )
+            .expect("filler admitted");
+
+        let budget = Arc::new(AtomicTokenBudget::new(100_000));
+        let tool = background_tool(Arc::new(ZenWiring::new()), Arc::clone(&budget), 1);
+        let out = tool
+            .invoke(serde_json::json!({
+                "agent": "Explore", "prompt": "rejected at spawn", "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["started"], serde_json::json!(0), "{out}");
+        assert!(
+            out["admissions"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("max_concurrent"),
+            "rejection names the registry gate: {out}"
+        );
+        assert_eq!(
+            budget.tokens_consumed().await,
+            0,
+            "a rejected admission never bills"
+        );
+        assert_eq!(
+            budget.available(),
+            100_000,
+            "the armed reservation in the never-spawned future refunded via Drop"
+        );
+        drop(filler);
+        zen_core::config::invalidate_config_cache();
+    }
+
+    /// W12.26 pin ④ (expression-level twin of the behavioral differential in
+    /// `background_single_reserve_no_double_hold`): the admission estimate
+    /// expression and the runtime estimate expression are the same value
+    /// for the default contract, and both strictly exceed the pre-W12.26
+    /// raw-prompt shape (the latent ~REPORT_REQUEST-sized under-hold).
+    #[test]
+    fn composed_admission_estimate_equals_runtime_estimate_for_default_contract() {
+        let req = DelegateRequest {
+            agent: "Explore".into(),
+            prompt: "estimate parity".into(),
+            description: None,
+            independent: true,
+            artifact: None,
+            fork_mode: None,
+            model_hint: None,
+        };
+        let composed = compose_sub_prompt(&req, &DelegateContract::default());
+        // Fixture knowledge terms (non-const so clippy's const-folding
+        // lints stay quiet): both sites add `<chars>/4`, 0 for this fixture.
+        let admission_knowledge_chars = 0usize;
+        let runtime_inherited_chars = 0usize;
+        // Admission site (invoke_background): composed bytes/4 + 1024 +
+        // sub.knowledge_chars()/4.
+        let admission = (composed.len() / 4 + 1024 + admission_knowledge_chars / 4) as u64;
+        // Runtime site (run_single_composed): prompt.len()/4 + 1024 +
+        // inherited_chars/4 — `prompt` there IS compose_sub_prompt's output.
+        let runtime = (composed.len() / 4 + 1024 + runtime_inherited_chars / 4) as u64;
+        assert_eq!(admission, runtime, "one estimate shape, both sites");
+        let raw = (req.prompt.len() / 4 + 1024) as u64;
+        assert!(
+            admission > raw,
+            "the always-on REPORT_REQUEST trailer must make the composed \
+             estimate strictly larger than the pre-W12.26 raw shape"
+        );
+    }
+
+    /// W12.26: background-path twin of
+    /// `early_llm_round_failure_refunds_reservation` — the ARMED reservation
+    /// rides inside the spawned future; an early LLM round failure returns
+    /// BEFORE the completion reconcile, so the future drops the armed
+    /// reservation and the full estimate refunds (the blocking path keeps
+    /// its own pin unchanged).
+    #[tokio::test]
+    async fn background_armed_future_early_error_refunds_full_estimate() {
+        // nextest process-per-test ⇒ the ZEN_HOME mutation is safe (T118).
+        let home = tempfile::tempdir().expect("temp home");
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+        }
+        zen_core::config::invalidate_config_cache();
+
+        // Deterministic non-retryable LLM failure: the 401 responder puts
+        // "401" in the error text ⇒ ErrorCategory::ClientError ⇒
+        // non-retryable ⇒ execute_round Errs on the FIRST attempt (same
+        // fixture as the blocking twin pin).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 18\r\nconnection: close\r\n\r\n{\"error\":\"401-no\"}",
+                );
+            }
+        });
+        // NO_PROXY: reqwest honors proxy env vars, and a machine-level HTTP
+        // proxy would swallow the loopback request (T217 lesson).
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::set_var("FAIL401_API_KEY", "test-key");
+            std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+            std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        }
+        let config = zen_core::config::ZenConfig {
+            default_provider: Some("fail401".to_string()),
+            providers: std::collections::HashMap::from([(
+                "fail401".to_string(),
+                zen_core::config::ProviderConfig {
+                    provider_type: Some("openai-compatible".to_string()),
+                    base_url: Some(format!("http://127.0.0.1:{port}")),
+                    default_model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let budget = Arc::new(AtomicTokenBudget::new(100_000));
+        let tool = Arc::new(DelegateTaskTool::new(
+            Arc::new(ZenWiring::new()),
+            DefaultRouter::from_agentic(&config),
+            Vec::new(),
+            None,
+            Arc::new(std::sync::Mutex::new(Sensitivity::Public)),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::clone(&budget) as Arc<dyn rig_compose::budget::TokenBudget>,
+            Duration::from_secs(300),
+            1,
+            4,
+        ));
+        tool.set_self_arc(Arc::clone(&tool));
+
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [{ "agent": "Explore", "prompt": "trigger the failing round" }],
+                "background": true
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["started"], serde_json::json!(1), "admitted: {out}");
+        let id = out["task_ids"].as_array().expect("task_ids")[0]
+            .as_str()
+            .expect("task id")
+            .to_string();
+        wait_terminal(&id, 10).await;
+
+        let collected = zen_plugin::task_registry::registry()
+            .collect_delegate(&id, 5_000)
+            .await
+            .expect("collect");
+        assert_eq!(collected.status, "completed");
+        let response = collected.response.expect("error-shaped result");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("LLM round failed"),
+            "the early-error path surfaces its structured error: {response}"
+        );
+        assert_eq!(
+            budget.tokens_consumed().await,
+            0,
+            "the armed reservation in the future refunded on its early return — \
+             a failed background delegation never consumes budget"
+        );
+        assert_eq!(budget.available(), budget.capacity());
+        // SAFETY: single-threaded test process (nextest discipline).
+        unsafe {
+            std::env::remove_var("FAIL401_API_KEY");
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
     }
 }

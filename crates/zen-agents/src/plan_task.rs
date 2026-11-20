@@ -340,7 +340,14 @@ impl PlanExecuteTool {
     /// plan store is unavailable or NO task's (agent, model) pair has
     /// recorded durations: history-less pairs are omitted, never guessed.
     /// Never errors, never blocks the walk.
-    async fn forecast_line(&self, plan: &PlanSpec) -> Option<String> {
+    ///
+    /// A-02/row13: keys are resolved with the SAME
+    /// [`crate::delegate_task::resolved_model_label`] helper the delegate
+    /// runtime producer uses, so the forecast looks up exactly what the
+    /// checkpoint stores. Rows written by pre-A-02 binaries keyed on the
+    /// declared hint are still honored as a fallback (the forecast is
+    /// advisory; a legacy match only sharpens the estimate).
+    async fn forecast_line(&self, plan: &PlanSpec, sensitivity: Sensitivity) -> Option<String> {
         let db = self.db().await?;
         let repo = zen_repo::WorkflowRepo::new(db);
         let history = repo.duration_history().await.ok()?;
@@ -363,7 +370,18 @@ impl PlanExecuteTool {
         let mut cost_lo = 0.0f64;
         let mut cost_hi = 0.0f64;
         for t in &plan.tasks {
-            let key = (t.agent.clone(), String::new());
+            // The resolved key is what the checkpoint stores now (real
+            // model name); the declared hint is the pre-A-02 row key kept
+            // as a fallback so durable older rows still contribute.
+            let resolved =
+                self.delegate
+                    .model_history_key(&t.agent, t.model_hint.as_deref(), sensitivity);
+            let legacy = t.model_hint.clone().unwrap_or_default();
+            let key = if pairs.contains_key(&(t.agent.clone(), resolved.clone())) {
+                (t.agent.clone(), resolved)
+            } else {
+                (t.agent.clone(), legacy)
+            };
             let Some(durations) = pairs.get(&key) else {
                 continue;
             };
@@ -407,6 +425,7 @@ impl PlanExecuteTool {
         plan: &PlanSpec,
         outcomes: &mut [Option<TaskOutcome>],
         in_flight: &[usize],
+        warnings: &mut Vec<String>,
     ) {
         for &i in in_flight {
             if outcomes[i].is_some() {
@@ -416,7 +435,8 @@ impl PlanExecuteTool {
                 status: "failed",
                 value: serde_json::json!({ "error": "plan cancelled mid-batch" }),
             };
-            self.checkpoint(plan_id, &plan.tasks[i], &outcome).await;
+            self.checkpoint_logged(plan_id, &plan.tasks[i], &outcome, warnings)
+                .await;
             outcomes[i] = Some(outcome);
         }
         for (i, slot) in outcomes.iter_mut().enumerate() {
@@ -427,7 +447,8 @@ impl PlanExecuteTool {
                 status: "skipped",
                 value: serde_json::json!({ "error": "plan cancelled" }),
             };
-            self.checkpoint(plan_id, &plan.tasks[i], &outcome).await;
+            self.checkpoint_logged(plan_id, &plan.tasks[i], &outcome, warnings)
+                .await;
             *slot = Some(outcome);
             fire_watchdog_renewal();
         }
@@ -567,26 +588,154 @@ impl PlanExecuteTool {
     }
 
     /// Persist one task outcome checkpoint; no-op without state.db.
-    async fn checkpoint(&self, plan_id: &str, task: &PlanTaskSpec, outcome: &TaskOutcome) {
+    /// W12.18 (review Q5): persistence failures propagate — a discarded
+    /// checkpoint error is a silent double-spend risk on resume (the task
+    /// re-runs although its result exists). Callers go through
+    /// [`Self::checkpoint_logged`].
+    async fn checkpoint(
+        &self,
+        plan_id: &str,
+        task: &PlanTaskSpec,
+        outcome: &TaskOutcome,
+    ) -> Result<(), String> {
         if plan_id.is_empty() {
-            return;
+            return Ok(());
         }
-        let Some(db) = self.db().await else { return };
+        let Some(db) = self.db().await else {
+            return Ok(());
+        };
         let repo = zen_repo::WorkflowRepo::new(db);
-        let _ = repo
-            .checkpoint_task(zen_repo::TaskCheckpoint {
+        repo.checkpoint_task(zen_repo::TaskCheckpoint {
+            plan_id,
+            task_id: &task.id,
+            agent: &task.agent,
+            status: outcome.status,
+            response: outcome.value.get("response").and_then(|v| v.as_str()),
+            error: outcome.value.get("error").and_then(|v| v.as_str()),
+            now: chrono::Utc::now().timestamp(),
+            // A-02/row13: `model` is the REAL runtime model name the
+            // delegate produced (`resolved_model_label`: the steering hint
+            // or the provider's configured default). The `model_source`
+            // label survives only as an honest fallback for outcomes that
+            // could not resolve a real name. `cost_usd` is metered from the
+            // provider's real usage echo — absent (NULL), never estimated.
+            model: outcome
+                .value
+                .get("model")
+                .or_else(|| outcome.value.get("model_source"))
+                .and_then(|v| v.as_str()),
+            duration_ms: outcome.value.get("duration_ms").and_then(|v| v.as_u64()),
+            cost_usd: outcome.value.get("cost_usd").and_then(|v| v.as_f64()),
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// W12.18 (review Q5): checkpoint + structured persistence-failure
+    /// capture. A failed checkpoint is a WARN with plan/task context and a
+    /// `persistence_warnings` entry in the result payload — visible, never
+    /// silent — while sibling tasks continue untouched (per-task error
+    /// isolation, the batch-loop discipline).
+    async fn checkpoint_logged(
+        &self,
+        plan_id: &str,
+        task: &PlanTaskSpec,
+        outcome: &TaskOutcome,
+        warnings: &mut Vec<String>,
+    ) {
+        if let Err(e) = self.checkpoint(plan_id, task, outcome).await {
+            tracing::warn!(
                 plan_id,
-                task_id: &task.id,
-                agent: &task.agent,
-                status: outcome.status,
-                response: outcome.value.get("response").and_then(|v| v.as_str()),
-                error: outcome.value.get("error").and_then(|v| v.as_str()),
-                now: chrono::Utc::now().timestamp(),
-                model: outcome.value.get("model").and_then(|v| v.as_str()),
-                duration_ms: outcome.value.get("duration_ms").and_then(|v| v.as_u64()),
-                cost_usd: outcome.value.get("cost_usd").and_then(|v| v.as_f64()),
-            })
-            .await;
+                task = %task.id,
+                error = %e,
+                "plan checkpoint persistence failed — the outcome is not durable and a resume may re-run this task"
+            );
+            warnings.push(format!("checkpoint task `{}` failed: {e}", task.id));
+        }
+    }
+
+    /// W12.15 (review N2): dispatch one plan sub-turn under the PLAN's
+    /// recorded policy. The captured TurnContext keeps the session's
+    /// knowledge/history; only `sensitivity` is restored from spec_json so
+    /// provider routing + hook gates classify under the plan's policy —
+    /// a Confidential plan resumed by a Public session never leaks to
+    /// cloud. `None` = no recorded policy ⇒ turn default, byte-identical.
+    async fn run_task_under_policy(
+        &self,
+        req: &DelegateRequest,
+        plan_policy: Option<Sensitivity>,
+    ) -> serde_json::Value {
+        match plan_policy {
+            None => self.delegate.run_single(req, 0, DELEGATE_ROOT_PARENT).await,
+            Some(policy) => {
+                let mut ctx = self.delegate.capture_turn_context();
+                ctx.sensitivity = policy;
+                zen_core::turn_context::TURN_CONTEXT
+                    .scope(ctx, self.delegate.run_single(req, 0, DELEGATE_ROOT_PARENT))
+                    .await
+            }
+        }
+    }
+
+    /// W12.16 (review Q1): the terminal plan-row write with the
+    /// finalization-window cancel re-check. A cancel landing between the
+    /// quality gate and this write (quality-gate tail window) must not be
+    /// silently reverted: the watch signal is checked first (in-process
+    /// `plan.control` cancels), and the SQL `status = 'running'` guard
+    /// inside `complete_plan` is the authoritative backstop for flips this
+    /// process never saw (drain finalizer, mark-only stale sweep,
+    /// cross-process cancel). Returns `true` when the cancel won the tail
+    /// window — the caller records `cancelled` and never rewrites the row.
+    async fn complete_plan_checked(
+        &self,
+        repo: &zen_repo::WorkflowRepo<'_>,
+        completion: PlanCompletion<'_>,
+        cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+        warnings: &mut Vec<String>,
+    ) -> bool {
+        let PlanCompletion {
+            plan_id,
+            final_status,
+            summary,
+            plan_approved,
+            delivery_ready,
+        } = completion;
+        if cancel_rx.is_some_and(|rx| *rx.borrow()) {
+            tracing::warn!(
+                plan_id,
+                "plan cancel observed in the finalization window — row stays terminal-cancelled, no complete_plan rewrite"
+            );
+            return true;
+        }
+        match repo
+            .complete_plan(
+                plan_id,
+                final_status,
+                Some(summary),
+                Some(plan_approved),
+                Some(delivery_ready),
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+        {
+            Ok(true) => false,
+            Ok(false) => {
+                tracing::warn!(
+                    plan_id,
+                    attempted = final_status,
+                    "plan completion lost the terminal race — row already terminal (cancel wins), outcome preserved not rewritten"
+                );
+                true
+            }
+            Err(e) => {
+                // W12.18 (review Q5): structured persistence failure — the
+                // row stays `running` so resume remains possible; the
+                // failure surfaces in the result payload, never silently.
+                tracing::warn!(plan_id, error = %e, "plan completion persistence failed");
+                warnings.push(format!("complete_plan failed: {e}"));
+                false
+            }
+        }
     }
 
     /// The pipeline `Task` for the plan review — same shape as the
@@ -619,6 +768,14 @@ impl PlanExecuteTool {
             }
         }
     }
+}
+
+struct PlanCompletion<'a> {
+    plan_id: &'a str,
+    final_status: &'a str,
+    summary: &'a str,
+    plan_approved: bool,
+    delivery_ready: bool,
 }
 
 const UPSTREAM_SNIPPET_MAX_CHARS: usize = 4000;
@@ -677,15 +834,61 @@ fn upstream_snippet(value: &serde_json::Value) -> String {
 /// unpersisted "success", an impossible resume — all silent. Failures now
 /// propagate as a structured, model-readable rejection (the surrounding
 /// `plan claim failed` error shape), never a phantom run.
+/// The plan-todos `spec_json` sensitivity tag (D24 §5) — mirrored here
+/// because `plan_todos.rs` keeps its helper private and this file may not
+/// grow a cross-module dependency for one match arm.
+fn sensitivity_tag(sensitivity: &Sensitivity) -> &'static str {
+    match sensitivity {
+        Sensitivity::Public => "public",
+        Sensitivity::Private => "private",
+        Sensitivity::Confidential => "confidential",
+    }
+}
+
+/// W12.15 (review N2): the sensitivity a plan row recorded at mint time.
+/// Both producers use the lowercase tag shape (`plan.todos` D24 §5 and the
+/// W12.17 direct-mint marker); the capitalized `Sensitivity::to_string()`
+/// forms are accepted for forward compatibility. `None` = legacy row with
+/// no recorded policy — the resuming session's policy stays in force
+/// (byte-identical pre-W12.15 behavior).
+fn plan_recorded_sensitivity(spec_json: &str) -> Option<Sensitivity> {
+    let raw = serde_json::from_str::<serde_json::Value>(spec_json)
+        .ok()?
+        .get("sensitivity")?
+        .as_str()?
+        .to_lowercase();
+    match raw.as_str() {
+        "public" => Some(Sensitivity::Public),
+        "private" => Some(Sensitivity::Private),
+        "confidential" => Some(Sensitivity::Confidential),
+        _ => None,
+    }
+}
+
 async fn mint_fresh_plan(
     db: &Arc<zen_repo::SqliteClient>,
     args: &serde_json::Value,
     name: Option<&str>,
     session: &str,
+    sensitivity: &Sensitivity,
 ) -> Result<String, serde_json::Value> {
     let plan_id = uuid::Uuid::new_v4().to_string();
     let repo = zen_repo::WorkflowRepo::new(db);
-    let spec_json = serde_json::to_string(args).unwrap_or_default();
+    // W12.17 (review Q4): the fresh-mint path writes the SAME session_id +
+    // sensitivity marker `plan.todos` set writes (D24 §5 spec_json shape) —
+    // without it the mint-once guard (`latest_plan_for_session`) is blind
+    // to direct-mint plans and W12.15's resume policy restore has nothing
+    // to read. The model's args are preserved verbatim as sibling keys.
+    let mut spec_json = match args.as_object() {
+        Some(obj) => obj.clone(),
+        None => serde_json::Map::new(),
+    };
+    spec_json.insert("sensitivity".to_string(), json_sensitivity(sensitivity));
+    spec_json.insert(
+        "session_id".to_string(),
+        serde_json::Value::String(session.to_string()),
+    );
+    let spec_json = serde_json::Value::Object(spec_json).to_string();
     repo.mint_plan_with_tasks(
         &plan_id,
         name,
@@ -698,6 +901,10 @@ async fn mint_fresh_plan(
     .map_err(|e| serde_json::json!({ "error": format!("plan mint failed: {e}") }))?;
     crate::plan_todos::register_turn_plan(session, &plan_id, Vec::new());
     Ok(plan_id)
+}
+
+fn json_sensitivity(sensitivity: &Sensitivity) -> serde_json::Value {
+    serde_json::Value::String(sensitivity_tag(sensitivity).to_string())
 }
 
 /// `depends_on` previously ordered execution only — downstream tasks ran
@@ -933,6 +1140,12 @@ impl Tool for PlanExecuteTool {
         // invented staleness threshold. The age rides the completion audit
         // line instead, making staleness observable without gating on it.
         let mut replayed_ages: Vec<(String, i64)> = Vec::new();
+        // W12.15 (review N2): the plan's RECORDED policy overrides the
+        // resuming session's for every sub-turn (a Confidential plan
+        // resumed by a Public session must never leak to cloud). Set from
+        // spec_json on resume/ledger-attach; fresh mints carry the turn's
+        // own policy in the marker (W12.17) — no override needed.
+        let mut plan_policy: Option<Sensitivity> = None;
         let plan_id = match (self.db().await, resumed_id) {
             (Some(db), Some(rid)) => {
                 let repo = zen_repo::WorkflowRepo::new(db);
@@ -966,6 +1179,7 @@ impl Tool for PlanExecuteTool {
                             }
                         }
                         resumed = true;
+                        plan_policy = plan_recorded_sensitivity(&row.spec_json);
                         crate::plan_todos::register_turn_plan(&session, &rid, Vec::new());
                         let resumed_now = chrono::Utc::now().timestamp();
                         for t in repo.load_task_rows(&rid).await.unwrap_or_default() {
@@ -1083,6 +1297,11 @@ impl Tool for PlanExecuteTool {
                         _batch_guard = Some(crate::plan_todos::BatchGuard::arm(&session));
                         let repo = zen_repo::WorkflowRepo::new(db);
                         let rows = repo.load_task_rows(&lid).await.unwrap_or_default();
+                        // W12.15: the ledger row's recorded policy governs
+                        // this batch's sub-turns.
+                        if let Ok(Some(row)) = repo.load_plan(&lid).await {
+                            plan_policy = plan_recorded_sensitivity(&row.spec_json);
+                        }
                         if let Some(missing) = plan
                             .tasks
                             .iter()
@@ -1099,7 +1318,17 @@ impl Tool for PlanExecuteTool {
                         lid
                     }
                     None => {
-                        match mint_fresh_plan(db, &args, plan.name.as_deref(), &session).await {
+                        // W12.17: the fresh-mint marker records the TURN's
+                        // sensitivity (TurnContext-first, shared-cell fallback).
+                        match mint_fresh_plan(
+                            db,
+                            &args,
+                            plan.name.as_deref(),
+                            &session,
+                            &self.delegate.current_sensitivity(),
+                        )
+                        .await
+                        {
                             Ok(id) => id,
                             Err(error) => return Ok(error),
                         }
@@ -1118,9 +1347,15 @@ impl Tool for PlanExecuteTool {
         let mut halted = false;
         let mut cancelled_mid = false;
         let mut progress_lines: Vec<String> = Vec::new();
+        // W12.18 (review Q5): checkpoint/complete_plan persistence failures
+        // land here — surfaced as `persistence_warnings` in the result
+        // payload, never silently discarded.
+        let mut persistence_warnings: Vec<String> = Vec::new();
         // W9.1: one advisory forecast line before the first batch —
         // omitted entirely when no task's pair has recorded history.
-        if let Some(line) = self.forecast_line(&plan).await {
+        let forecast_sensitivity =
+            plan_policy.unwrap_or_else(|| self.delegate.current_sensitivity());
+        if let Some(line) = self.forecast_line(&plan, forecast_sensitivity).await {
             fire_plan_progress(line.clone());
             progress_lines.push(line);
         }
@@ -1139,8 +1374,14 @@ impl Tool for PlanExecuteTool {
             if let Some(rx) = cancel_rx.as_mut() {
                 let cancel_now = *rx.borrow_and_update();
                 if cancel_now {
-                    self.mark_cancelled(&plan_id, &plan, &mut outcomes, &[])
-                        .await;
+                    self.mark_cancelled(
+                        &plan_id,
+                        &plan,
+                        &mut outcomes,
+                        &[],
+                        &mut persistence_warnings,
+                    )
+                    .await;
                     cancelled_mid = true;
                     crate::plan_todos::clear_turn_plan(&session, &plan_id);
                     break 'layers;
@@ -1180,7 +1421,13 @@ impl Tool for PlanExecuteTool {
                     };
                     #[cfg(test)]
                     self.test_log_wave_event(&plan.tasks[i].agent, "skipped");
-                    self.checkpoint(&plan_id, &plan.tasks[i], &outcome).await;
+                    self.checkpoint_logged(
+                        &plan_id,
+                        &plan.tasks[i],
+                        &outcome,
+                        &mut persistence_warnings,
+                    )
+                    .await;
                     outcomes[i] = Some(outcome);
                     last_settled = Some(i);
                     continue;
@@ -1205,7 +1452,13 @@ impl Tool for PlanExecuteTool {
                         status: "failed",
                         value: serde_json::json!({ "error": error }),
                     };
-                    self.checkpoint(&plan_id, &plan.tasks[i], &outcome).await;
+                    self.checkpoint_logged(
+                        &plan_id,
+                        &plan.tasks[i],
+                        &outcome,
+                        &mut persistence_warnings,
+                    )
+                    .await;
                     outcomes[i] = Some(outcome);
                     last_settled = Some(i);
                     layer_failed.push(i);
@@ -1247,10 +1500,7 @@ impl Tool for PlanExecuteTool {
                                     };
                                 }
                             }
-                            let value = self
-                                .delegate
-                                .run_single(&req, 0, DELEGATE_ROOT_PARENT)
-                                .await;
+                            let value = self.run_task_under_policy(&req, plan_policy).await;
                             let status = if value.get("error").is_some() {
                                 "failed"
                             } else {
@@ -1289,8 +1539,14 @@ impl Tool for PlanExecuteTool {
                     // then finalized per W6.2b: in-flight `failed`,
                     // pending `skipped`.
                     BatchRace::Cancelled => {
-                        self.mark_cancelled(&plan_id, &plan, &mut outcomes, &batch_indices)
-                            .await;
+                        self.mark_cancelled(
+                            &plan_id,
+                            &plan,
+                            &mut outcomes,
+                            &batch_indices,
+                            &mut persistence_warnings,
+                        )
+                        .await;
                         cancelled_mid = true;
                         crate::plan_todos::clear_turn_plan(&session, &plan_id);
                         break 'layers;
@@ -1317,7 +1573,13 @@ impl Tool for PlanExecuteTool {
                 }
 
                 for (&(i, _), outcome) in batch.iter().zip(&results) {
-                    self.checkpoint(&plan_id, &plan.tasks[i], outcome).await;
+                    self.checkpoint_logged(
+                        &plan_id,
+                        &plan.tasks[i],
+                        outcome,
+                        &mut persistence_warnings,
+                    )
+                    .await;
                     // W9.5-F3: one watchdog heartbeat per settled task.
                     fire_watchdog_renewal();
                 }
@@ -1342,17 +1604,20 @@ impl Tool for PlanExecuteTool {
                     }
                     #[cfg(test)]
                     self.test_note_call(&req.agent);
-                    let value = self
-                        .delegate
-                        .run_single(&req, 0, DELEGATE_ROOT_PARENT)
-                        .await;
+                    let value = self.run_task_under_policy(&req, plan_policy).await;
                     let status = if value.get("error").is_some() {
                         "failed"
                     } else {
                         "completed"
                     };
                     let outcome = TaskOutcome { status, value };
-                    self.checkpoint(&plan_id, &plan.tasks[i], &outcome).await;
+                    self.checkpoint_logged(
+                        &plan_id,
+                        &plan.tasks[i],
+                        &outcome,
+                        &mut persistence_warnings,
+                    )
+                    .await;
                     outcomes[i] = Some(outcome);
                     retry_count += 1;
                     last_settled = Some(i);
@@ -1440,7 +1705,9 @@ impl Tool for PlanExecuteTool {
         // quality gate as an orchestrator turn, classified under the SAME
         // session sensitivity the delegate tool mirrors. A veto does not
         // roll back completed work — it marks the plan not delivery-ready.
-        let sensitivity = self.delegate.current_sensitivity();
+        // W12.15: the gate review classifies under the plan's recorded
+        // policy when one is in force.
+        let sensitivity = plan_policy.unwrap_or_else(|| self.delegate.current_sensitivity());
         let review_task = Self::review_task(&summary, sensitivity);
         let plan_str = serde_json::to_string(&args).unwrap_or_default();
         let gate = self
@@ -1480,16 +1747,27 @@ impl Tool for PlanExecuteTool {
                 _ => false,
             };
             if !ledger_pending && !cancelled_mid {
-                let _ = repo
-                    .complete_plan(
-                        &plan_id,
-                        final_status,
-                        Some(&summary),
-                        Some(gate.plan_approved),
-                        Some(gate.delivery_ready),
-                        chrono::Utc::now().timestamp(),
+                // W12.16 (review Q1): cancel-vs-finalize tail window — the
+                // watch re-check + SQL `status='running'` guard decide the
+                // winner; a cancel landing here keeps the row terminal-
+                // cancelled (no completion rewrite).
+                let cancel_won = self
+                    .complete_plan_checked(
+                        &repo,
+                        PlanCompletion {
+                            plan_id: &plan_id,
+                            final_status,
+                            summary: &summary,
+                            plan_approved: gate.plan_approved,
+                            delivery_ready: gate.delivery_ready,
+                        },
+                        cancel_rx.as_ref(),
+                        &mut persistence_warnings,
                     )
                     .await;
+                if cancel_won {
+                    cancelled_mid = true;
+                }
                 crate::plan_todos::clear_turn_plan(&session, &plan_id);
             }
         }
@@ -1528,6 +1806,12 @@ impl Tool for PlanExecuteTool {
         }
         if cancelled_mid {
             audit_entry["cancelled"] = serde_json::json!(true);
+        }
+        // W12.18 (review Q5): persistence failures are visible — one
+        // additive audit key (zero lines when clean) and the same list in
+        // the result payload below.
+        if !persistence_warnings.is_empty() {
+            audit_entry["persistence_warnings"] = serde_json::json!(persistence_warnings);
         }
         // W2.2 (D12): the plan-failure rollback boundary persists a rewind
         // memory so the next attempt does not repeat the failed path. Best-
@@ -1572,6 +1856,9 @@ impl Tool for PlanExecuteTool {
         });
         if !progress_lines.is_empty() {
             out["progress"] = serde_json::json!(progress_lines);
+        }
+        if !persistence_warnings.is_empty() {
+            out["persistence_warnings"] = serde_json::json!(persistence_warnings);
         }
         // W9.4: triage proposals for recognized failure classes only —
         // absent entirely when no class matched (raw errors stay visible
@@ -3530,7 +3817,7 @@ mod tests {
             .await
             .unwrap();
         let args = serde_json::json!({ "tasks": [] });
-        let err = mint_fresh_plan(&client, &args, None, "s1")
+        let err = mint_fresh_plan(&client, &args, None, "s1", &Sensitivity::Private)
             .await
             .expect_err("a forced create failure must reject");
         assert!(
@@ -3551,5 +3838,375 @@ mod tests {
             .unwrap();
         assert_eq!(plans, 0, "no phantom plan row");
         assert_eq!(tasks, 0, "no orphan task rows");
+    }
+
+    /// W12.15 pin (half 1/2): the spec_json reader accepts both producer
+    /// shapes — lowercase tags from `plan.todos` / the direct mint, and the
+    /// capitalized `Sensitivity::to_string()` form for forward
+    /// compatibility — while absent/invalid/non-string/non-JSON markers
+    /// stay `None` (legacy row ⇒ the resuming session's policy, the
+    /// byte-identical pre-W12.15 behavior).
+    #[test]
+    fn plan_recorded_sensitivity_maps_every_tag_shape() {
+        for (raw, want) in [
+            (
+                r#"{"sensitivity":"confidential"}"#,
+                Sensitivity::Confidential,
+            ),
+            (r#"{"sensitivity":"private"}"#, Sensitivity::Private),
+            (r#"{"sensitivity":"public"}"#, Sensitivity::Public),
+            (
+                r#"{"sensitivity":"Confidential"}"#,
+                Sensitivity::Confidential,
+            ),
+        ] {
+            assert_eq!(plan_recorded_sensitivity(raw), Some(want), "{raw}");
+        }
+        for raw in [
+            "{}",
+            r#"{"sensitivity":"bogus"}"#,
+            r#"{"sensitivity":3}"#,
+            "not json",
+        ] {
+            assert_eq!(plan_recorded_sensitivity(raw), None, "{raw}");
+        }
+    }
+
+    /// W12.15 pin (half 2/2): a plan row recorded Confidential is resumed
+    /// by a session whose delegate shared-cell is Public (`plan_tool_with`
+    /// hard-codes it) and STILL completes. The sub-turn policy itself is a
+    /// task-local inside `run_task_under_policy` — not observable through
+    /// the public seam — so the contract is pinned by the reader test above
+    /// plus this mismatched-cell resume: the record is read at resume
+    /// (`plan_recorded_sensitivity`) and the turn runs under it.
+    #[tokio::test]
+    async fn resume_scopes_sub_turns_under_recorded_plan_sensitivity() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        // A crashed Confidential plan: same spec_json shape `plan.todos`
+        // writes (D24 §5), owner released by the crash, aged past the
+        // resume fence's staleness window so the claim can be taken.
+        let spec = serde_json::json!({
+            "items": [{"id": "a", "title": "audit", "status": "pending"}],
+            "sensitivity": "confidential",
+            "session_id": "local",
+        })
+        .to_string();
+        let plan_id = "confidential-plan".to_string();
+        repo.mint_plan_with_tasks(
+            &plan_id,
+            None,
+            &spec,
+            "crashed-run",
+            &[zen_repo::TaskDraft {
+                id: "a".into(),
+                status: "pending".into(),
+            }],
+            chrono::Utc::now().timestamp() - 7_200,
+        )
+        .await
+        .unwrap();
+        let row = repo.load_plan(&plan_id).await.unwrap().expect("row");
+        assert_eq!(
+            plan_recorded_sensitivity(&row.spec_json),
+            Some(Sensitivity::Confidential),
+            "recorded plan policy: {}",
+            row.spec_json
+        );
+
+        let out = plan_tool_with(Some(state_db))
+            .invoke(serde_json::json!({
+                "resume_plan_id": plan_id,
+                "tasks": [{"id": "a", "agent": "Explore", "prompt": "audit"}]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        assert_eq!(out["resumed"], serde_json::json!(true), "{out}");
+        assert_eq!(out["tasks"][0]["status"], "completed", "{out}");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    /// W12.16b pin: a cancel that landed in the finalization window (the
+    /// watch is ALREADY signalled when the terminal write is attempted)
+    /// wins — `complete_plan_checked` reports the cancel and NEVER rewrites
+    /// the row, so a cancelled plan cannot be resurrected as completed.
+    ///
+    /// W12.16c deviation (W12.6 precedent): the DST twin is not runnable
+    /// at this stack depth. A 40-seed shuttle sweep over the same race was
+    /// attempted and panics inside tokio-rusqlite's background OS thread
+    /// (`ExecutionState is not set` — the writer thread's real-tokio oneshot
+    /// wake cannot enter a Shuttle schedule), so this deterministic pin plus
+    /// the SQL-guard pin in `workflow_repo.rs` are the gate.
+    #[tokio::test]
+    async fn cancel_signal_in_finalization_window_wins_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("p1", None, "{}", 1_000).await.unwrap();
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        let mut warnings: Vec<String> = Vec::new();
+        let cancel_won = plan_tool()
+            .complete_plan_checked(
+                &repo,
+                PlanCompletion {
+                    plan_id: "p1",
+                    final_status: "completed",
+                    summary: "late engine outcome",
+                    plan_approved: true,
+                    delivery_ready: true,
+                },
+                Some(&rx),
+                &mut warnings,
+            )
+            .await;
+        assert!(cancel_won, "the pre-signalled cancel owns the tail window");
+        assert!(
+            warnings.is_empty(),
+            "a won cancel is not a warning: {warnings:?}"
+        );
+        let row = repo.load_plan("p1").await.unwrap().expect("row");
+        assert_eq!(row.status, "running", "no complete_plan rewrite");
+        assert!(row.summary.is_none(), "engine summary discarded");
+    }
+
+    /// W12.17 pin: the direct fresh mint writes the SAME session_id +
+    /// sensitivity marker `plan.todos` writes, so the mint-once guard
+    /// (`latest_plan_for_session`) sees it — the blind spot where
+    /// `plan.execute`-minted plans were invisible to a second `set` is
+    /// closed.
+    #[tokio::test]
+    async fn fresh_mint_marker_visible_to_mint_once_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let client = Arc::new(zen_repo::SqliteClient::open(&state_db).await.unwrap());
+        let plan_id = mint_fresh_plan(
+            &client,
+            &serde_json::json!({"tasks": []}),
+            None,
+            "local",
+            &Sensitivity::Confidential,
+        )
+        .await
+        .expect("fresh mint");
+
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let row = repo.load_plan(&plan_id).await.unwrap().expect("minted row");
+        let spec: serde_json::Value = serde_json::from_str(&row.spec_json).unwrap();
+        assert_eq!(
+            spec["session_id"],
+            serde_json::json!("local"),
+            "session marker: {}",
+            row.spec_json
+        );
+        assert_eq!(
+            spec["sensitivity"],
+            serde_json::json!("confidential"),
+            "sensitivity marker: {}",
+            row.spec_json
+        );
+
+        // The mint-once guard now sees the direct-mint row: a ledger set
+        // for the same session is refused instead of minting a second
+        // active plan.
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db),
+            Arc::new(std::sync::Mutex::new(Sensitivity::Private)),
+        );
+        let out = todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "x", "title": "second ledger", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        assert!(
+            out["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("mint-once")),
+            "direct-mint row is visible to the guard: {out}"
+        );
+        assert_eq!(out["plan_id"], serde_json::json!(plan_id), "{out}");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    /// W12.18 pin: a checkpoint persistence failure is not discarded — it
+    /// surfaces as a `persistence_warnings` entry in the result payload
+    /// while the sibling outcome stays visible (fail-visible, not
+    /// fail-silent double-spend).
+    #[tokio::test]
+    async fn checkpoint_failure_surfaces_in_persistence_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        // Mint the ledger first (its task inserts must succeed), THEN make
+        // every later task write abort — the checkpoint path.
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(std::sync::Mutex::new(Sensitivity::Private)),
+        );
+        let minted = todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "a", "title": "only", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        assert!(minted["plan_id"].is_string(), "{minted}");
+
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_checkpoint BEFORE INSERT ON workflow_tasks \
+                     BEGIN SELECT RAISE(ABORT, 'forced checkpoint failure'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let out = plan_tool_with(Some(state_db))
+            .invoke(serde_json::json!({
+                "tasks": [{"id": "a", "agent": "Explore", "prompt": "x"}]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["tasks"][0]["status"], "completed", "{out}");
+        let warnings = out["persistence_warnings"]
+            .as_array()
+            .expect("persistence_warnings array");
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .is_some_and(|s| s.contains("checkpoint task `a` failed"))),
+            "checkpoint failure surfaced: {out}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    /// W12.25a pin: the checkpoint records a model label from the delegate
+    /// output — a real `model` key wins, otherwise the falsifiable
+    /// `model_source` label (the only producer today) is stored. cost_usd
+    /// stays honest NULL (no usage-cost producer at the delegate sites).
+    #[tokio::test]
+    async fn checkpoint_records_model_from_source_label_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("p", None, "{}", 1_000).await.unwrap();
+        let tool = plan_tool_with(Some(state_db));
+
+        tool.checkpoint(
+            "p",
+            &spec("a", "Explore", &[]),
+            &TaskOutcome {
+                status: "completed",
+                value: serde_json::json!({
+                    "response": "r1",
+                    "model_source": "hint",
+                    "duration_ms": 1_500,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        tool.checkpoint(
+            "p",
+            &spec("b", "Explore", &[]),
+            &TaskOutcome {
+                status: "completed",
+                value: serde_json::json!({
+                    "response": "r2",
+                    "model": "literal-model",
+                    "model_source": "hint",
+                    "duration_ms": 2_500,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let history = repo.duration_history().await.unwrap();
+        let models: Vec<Option<String>> = history.iter().map(|r| r.model.clone()).collect();
+        assert!(
+            models.contains(&Some("hint".to_string())),
+            "model_source fallback recorded: {models:?}"
+        );
+        assert!(
+            models.contains(&Some("literal-model".to_string())),
+            "a real model key wins over the label: {models:?}"
+        );
+        assert!(
+            history.iter().all(|r| r.cost_usd.is_none()),
+            "no fabricated cost: {history:?}"
+        );
+    }
+
+    /// W12.25b/c pin: forecast history is keyed by (agent, model) on BOTH
+    /// sides. Rows written with a real model label only match a task that
+    /// declares the same `model` hint; the hintless row of the same agent
+    /// (the old unconditional `""` key) must not contribute.
+    #[tokio::test]
+    async fn forecast_reads_real_model_history_key() {
+        let home = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", home.path()) };
+        // The task's model hint must exist in the configured catalog.
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[providers.openai.models.hint-x]\nmodel = \"hint-x\"\n",
+        )
+        .unwrap();
+        zen_core::config::invalidate_config_cache();
+
+        let state_db = home.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("hist", None, "{}", 1_000).await.unwrap();
+        for (tid, model, ms) in [
+            ("h1", Some("hint-x"), 120_000i64),
+            // The discriminator: the OLD lookup key ("" for every task)
+            // would sum this hintless row's 10 minutes instead.
+            ("h2", None, 600_000i64),
+        ] {
+            repo.checkpoint_task(zen_repo::TaskCheckpoint {
+                plan_id: "hist",
+                task_id: tid,
+                agent: "Explore",
+                status: "completed",
+                response: Some("done"),
+                error: None,
+                now: 1_100,
+                model,
+                duration_ms: Some(ms as u64),
+                cost_usd: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let out = plan_tool_with(Some(state_db))
+            .invoke(serde_json::json!({
+                "tasks": [{
+                    "id": "a", "agent": "Explore", "prompt": "x", "model": "hint-x"
+                }]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        let progress = out["progress"].as_array().expect("progress blob");
+        assert_eq!(
+            progress[0],
+            serde_json::json!("plan 1 tasks · ~2-2 min (estimate)"),
+            "the model-keyed history (2 min), not the hintless row (10 min): {progress:?}"
+        );
+        unsafe { std::env::remove_var("ZEN_HOME") };
     }
 }

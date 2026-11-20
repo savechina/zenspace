@@ -21,7 +21,9 @@ use rig_core::message::ToolCall as NativeToolCall;
 use tracing::{info, instrument, warn};
 
 use zen_core::sanitize::InputSanitizer;
-use zen_provider::{DefaultRouter, LlmRouter, Provider, TaskRequirements};
+use zen_provider::{
+    DefaultRouter, LlmRouter, Provider, SyncUsage, TaskRequirements, UsedCompletion,
+};
 
 use crate::AgentContext;
 use crate::execution::{AgentExecution, ExecutionMetadata};
@@ -172,7 +174,7 @@ impl AgentExecutor {
         let requirements = TaskRequirements {
             max_tokens: Some(context.max_tokens as u32),
             sensitivity,
-            preferred_model: None,
+            preferred_model: context.model_override.clone(),
             budget_limit: None,
         };
 
@@ -196,10 +198,17 @@ impl AgentExecutor {
 
         // Build prompt with agent identity (SOUL.md/MEMORY.md/AGENTS.md)
         let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
-        let (response, tokens) = self.execute_with_retry(&provider, &prompt, &agent_name)?;
+        let model_override = context.model_override.clone();
+        let (response, tokens, usage) =
+            self.execute_with_retry_model(&provider, &prompt, &agent_name, model_override.clone())?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let cost = tokens as f64 * 0.002 / 1000.0; // ~$0.002/1K tokens estimate
+        let runtime_model = self.resolved_runtime_model(&provider, model_override.as_deref());
+        let usage_cost_usd = match (&usage, runtime_model.as_deref()) {
+            (Some(echo), Some(model)) => self.usage_cost_usd(&provider, model, echo),
+            _ => None,
+        };
 
         Ok(AgentExecution {
             agent_name,
@@ -208,12 +217,49 @@ impl AgentExecutor {
                 tokens_used: tokens,
                 cost_estimate: (cost * 1000.0).round() / 1000.0,
                 model_used: provider.to_string(),
+                runtime_model,
+                usage_cost_usd,
                 duration_ms,
                 sensitivity,
                 quality_notes: None,
                 delivery_ready: true,
             },
             tool_calls: Vec::new(),
+        })
+    }
+
+    /// A-02: the REAL model name the routed provider call used. The
+    /// override wins; otherwise the provider's configured default (the
+    /// mock stand-in names itself). `None` when unresolvable — honest
+    /// degradation, never a guessed model.
+    fn resolved_runtime_model(
+        &self,
+        provider: &Provider,
+        model_override: Option<&str>,
+    ) -> Option<String> {
+        if let Some(model) = model_override {
+            return Some(model.to_string());
+        }
+        let name = provider.to_string();
+        if name == "mock" {
+            return Some("mock".to_string());
+        }
+        self.router
+            .provider_instance(&name)
+            .map(|instance| instance.model_name().to_string())
+    }
+
+    /// A-02/row13: meter one round from the provider's REAL usage echo plus
+    /// configured pricing. `None` when usage was not reported or the
+    /// provider is unmetered (no pricing keys, not local) — cost is never
+    /// fabricated from an estimate.
+    fn usage_cost_usd(&self, provider: &Provider, model: &str, usage: &SyncUsage) -> Option<f64> {
+        let metadata = self.router.model_metadata(&provider.to_string(), model);
+        let priced = metadata.is_local
+            || metadata.input_cost_per_million > 0.0
+            || metadata.output_cost_per_million > 0.0;
+        priced.then(|| {
+            zen_provider::usage_to_cost_usd(&metadata, usage.input_tokens, usage.output_tokens)
         })
     }
 
@@ -338,12 +384,67 @@ impl AgentExecutor {
     }
 
     #[instrument(skip(self), fields(agent_name, prompt_len = prompt.len(), provider = %provider))]
+    /// W12.13 (T9, review P3): the main non-stream execute path acquires
+    /// the SAME primary-timeout bound the streaming machinery uses (W7.1)
+    /// — a hung provider call fails at `first_token_budget_secs` instead
+    /// of waiting for the 900s turn watchdog. The router call is sync
+    /// (blocking client on this thread), so the bound is a dedicated
+    /// thread + `recv_timeout` (`health_check` precedent); a timed-out
+    /// call's thread is abandoned to finish on its own (bounded leak,
+    /// same acceptance as the dedicated-thread probe). The "timed out"
+    /// error text classifies transient ⇒ the retry ladder handles it,
+    /// byte-consistent with the stream path's W7.1 behavior.
+    ///
+    /// W12.12 (T8): the call rides `LlmRouter::call_with_usage` so the
+    /// provider's usage echo rides out alongside the text (`usage: None`
+    /// when the surface does not report — mock under DL-1 semantics).
+    fn call_with_non_stream_bound(
+        &self,
+        provider: &Provider,
+        prompt: &str,
+        agent_name: &str,
+        model_override: Option<String>,
+    ) -> Result<UsedCompletion> {
+        let bound =
+            std::time::Duration::from_secs(crate::completion_model::first_token_budget_secs());
+        let router = self.router.clone();
+        let provider = provider.clone();
+        let prompt = prompt.to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<UsedCompletion>>();
+        std::thread::Builder::new()
+            .name("zen-nonstream-bound".to_string())
+            .spawn(move || {
+                let _ = tx.send(
+                    router
+                        .call_with_usage_with_model(provider, &prompt, model_override)
+                        .map_err(anyhow::Error::from),
+                );
+            })?;
+        match rx.recv_timeout(bound) {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "non-streaming completion timed out after {bound:?} (agent {agent_name})"
+            )),
+        }
+    }
+
+    #[cfg(test)]
     fn execute_with_retry(
         &self,
         provider: &Provider,
         prompt: &str,
         agent_name: &str,
-    ) -> Result<(String, u32)> {
+    ) -> Result<(String, u32, Option<SyncUsage>)> {
+        self.execute_with_retry_model(provider, prompt, agent_name, None)
+    }
+
+    fn execute_with_retry_model(
+        &self,
+        provider: &Provider,
+        prompt: &str,
+        agent_name: &str,
+        model_override: Option<String>,
+    ) -> Result<(String, u32, Option<SyncUsage>)> {
         let mut last_error = None;
 
         for attempt in 0..=self.retry_policy.max_retries {
@@ -361,13 +462,32 @@ impl AgentExecutor {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
 
-            match self.router.call(provider.clone(), prompt) {
-                Ok(response) => {
-                    let estimated_tokens = (prompt.len() + response.len()) as u32 / 4;
+            match self.call_with_non_stream_bound(
+                provider,
+                prompt,
+                agent_name,
+                model_override.clone(),
+            ) {
+                Ok(completion) => {
+                    // W12.12: real echo per counter when the provider
+                    // reports one (per-counter estimate fallback,
+                    // W12.20); the char/4 sum stays the fallback when
+                    // nothing is reported (byte-identical).
+                    let (tokens, usage) = match completion.usage {
+                        Some(echo) => {
+                            let (input, output) = zen_provider::reconcile_usage(
+                                Some(echo),
+                                (prompt.len() / 4) as u64,
+                                (completion.text.len() / 4) as u64,
+                            );
+                            ((input + output) as u32, Some(echo))
+                        }
+                        None => ((prompt.len() + completion.text.len()) as u32 / 4, None),
+                    };
                     if attempt > 0 {
                         info!(attempt, agent = agent_name, "Retry succeeded");
                     }
-                    return Ok((response, estimated_tokens));
+                    return Ok((completion.text, tokens, usage));
                 }
                 Err(e) => {
                     let category = ErrorCategory::from_error_message(&e.to_string());
@@ -436,6 +556,10 @@ impl AgentExecutor {
     /// this by inventing a native path here without rewriting the executor's
     /// provider plumbing — the contract is pinned by
     /// `execute_model_call_is_fenced_only`.
+    ///
+    /// W12.12 (T8): the third slot carries the provider's usage echo when
+    /// its surface reports one (`None` = fall back to estimates — mock
+    /// under DL-1 semantics never reports).
     #[instrument(skip(self, context, agent), fields(agent_name = %context.agent_profile.name, sensitivity = ?context.sensitivity))]
     pub fn execute_model_call(
         &self,
@@ -443,11 +567,11 @@ impl AgentExecutor {
         agent: &crate::ZenAgent,
         tool_manifest: &str,
         tool_results: &str,
-    ) -> Result<(String, Vec<NativeToolCall>)> {
+    ) -> Result<(String, Vec<NativeToolCall>, Option<SyncUsage>)> {
         let requirements = TaskRequirements {
             max_tokens: Some(context.max_tokens as u32),
             sensitivity: context.sensitivity,
-            preferred_model: None,
+            preferred_model: context.model_override.clone(),
             budget_limit: None,
         };
 
@@ -471,12 +595,16 @@ impl AgentExecutor {
         };
 
         let prompt = self.build_prompt_with_identity(context, agent, tool_manifest, tool_results);
-        let (response, _tokens) =
-            self.execute_with_retry(&provider, &prompt, &context.agent_profile.name)?;
+        let (response, _tokens, usage) = self.execute_with_retry_model(
+            &provider,
+            &prompt,
+            &context.agent_profile.name,
+            context.model_override.clone(),
+        )?;
 
         let native_calls: Vec<NativeToolCall> = Vec::new();
 
-        Ok((response, native_calls))
+        Ok((response, native_calls, usage))
     }
 }
 
@@ -494,6 +622,15 @@ mod tests {
                 jitter: false,
             },
         )
+    }
+
+    fn test_executor_with_router(router: DefaultRouter) -> AgentExecutor {
+        AgentExecutor::new(router).with_retry_policy(RetryPolicy {
+            max_retries: 0,
+            base_delay_ms: 0,
+            max_delay_ms: 0,
+            jitter: false,
+        })
     }
 
     #[test]
@@ -515,7 +652,7 @@ mod tests {
     #[test]
     fn mock_provider_direct_succeeds() {
         let executor = test_executor_no_retries();
-        let (response, _) = executor
+        let (response, _, _) = executor
             .execute_with_retry(&Provider::Mock, "hi", "test")
             .expect("mock direct succeeds");
         assert!(!response.is_empty());
@@ -610,7 +747,7 @@ mod tests {
             max_delay_ms: 0,
             jitter: false,
         });
-        let (response, native_calls) = executor
+        let (response, native_calls, _usage) = executor
             .execute_model_call(&context, &agent, "", "")
             .expect("model call");
 
@@ -621,6 +758,169 @@ mod tests {
         assert!(
             response.contains("```json"),
             "the fenced block is the only tool-call channel here: {response}"
+        );
+    }
+
+    /// W12.12 test harness: a one-shot OpenAI-compatible
+    /// `/chat/completions` responder on a loopback port whose reply
+    /// carries a real usage echo (prompt_tokens=111 / completion_tokens=22).
+    /// Reads the full request (headers + Content-Length body) before
+    /// answering so the connection closes cleanly instead of RST-ing the
+    /// client mid-response-read.
+    fn spawn_usage_echo_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let body = r#"{"id":"chatcmpl-w1212","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"echo reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":111,"completion_tokens":22,"total_tokens":133}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break buf.len(),
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let content_length: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            let target = head_end + 4 + content_length;
+            while buf.len() < target {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        port
+    }
+
+    /// W12.12 (T8) usage-echo pin: when the provider surface reports
+    /// usage, the executor seam threads the REAL echo out (not char/4)
+    /// and the token ledger bills the echoed total. The char/4 estimate
+    /// for this fixture would be (2 + 10) / 4 = 3 — the pin
+    /// discriminates precisely because 133 ≠ 3.
+    #[test]
+    fn w1212_provider_usage_echo_reaches_the_executor_seam() {
+        let port = spawn_usage_echo_server();
+        // SAFETY: nextest runs each test in its own process; valid UTF-8.
+        unsafe { std::env::set_var("ZEN_TEST_USAGE_ECHO_KEY", "test-key") };
+        let router = DefaultRouter::from_agentic(&zen_core::config::ZenConfig {
+            default_provider: Some("echo-test".to_string()),
+            providers: std::collections::HashMap::from([(
+                "echo-test".to_string(),
+                zen_core::config::ProviderConfig {
+                    provider_type: Some("openai".to_string()),
+                    base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+                    default_model: Some("test-model".to_string()),
+                    api_key_env: Some("ZEN_TEST_USAGE_ECHO_KEY".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let executor = test_executor_with_router(router);
+        let prompt = "hi";
+        let (response, tokens, usage) = executor
+            .execute_with_retry(&Provider::Unknown("echo-test".to_string()), prompt, "test")
+            .expect("echo provider call succeeds");
+        assert_eq!(response, "echo reply");
+        let echo = usage.expect("the reporting provider must surface its echo");
+        assert_eq!(echo.input_tokens, 111, "real prompt tokens, not char/4");
+        assert_eq!(echo.output_tokens, 22, "real completion tokens, not char/4");
+        assert_eq!(tokens, 133, "the ledger bills the echoed total");
+        assert_ne!(
+            tokens,
+            (prompt.len() + response.len()) as u32 / 4,
+            "the real echo must not collapse into the char/4 estimate"
+        );
+    }
+
+    /// W12.12 (T8) fallback pin: when the provider does NOT report usage
+    /// (mock under DL-1 semantics never reports), the echo slot stays
+    /// None and the char/4 estimate fallback stays byte-identical.
+    #[test]
+    fn w1212_usage_absent_falls_back_to_char4_estimate() {
+        let executor = test_executor_no_retries();
+        let prompt = "hello there";
+        let (response, tokens, usage) = executor
+            .execute_with_retry(&Provider::Mock, prompt, "test")
+            .expect("mock direct succeeds");
+        assert!(usage.is_none(), "mock never reports usage (DL-1)");
+        assert_eq!(
+            tokens,
+            (prompt.len() + response.len()) as u32 / 4,
+            "the char/4 estimate fallback must stay byte-identical"
+        );
+    }
+
+    /// W12.13 (T9) tightening pin: the EXECUTOR seam the orchestrator
+    /// actually drives cuts a hanging provider call at the primary-timeout
+    /// bound and surfaces the "non-streaming completion timed out" error
+    /// through the retry ladder instead of hanging on the provider's own
+    /// (120s+) timeout. Mirrors the completion_model W7.1 pin harness
+    /// (hanging TCP listener + tiny explicit env override).
+    #[test]
+    fn w1213_hanging_provider_call_is_cut_by_the_nonstream_bound() {
+        // SAFETY: process-per-test (nextest); valid UTF-8 value.
+        unsafe { std::env::set_var("ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS", "2") };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            // Accept and hold connections open forever — a deterministic
+            // HTTP hang without writing a byte. Leak the accepted sockets:
+            // dropping them would close the connection (RST) and turn the
+            // deterministic hang into a fast error, voiding the bound proof.
+            for stream in listener.incoming().flatten() {
+                std::mem::forget(stream);
+            }
+        });
+        let router = DefaultRouter::from_agentic(&zen_core::config::ZenConfig {
+            default_provider: Some("ollama".to_string()),
+            providers: std::collections::HashMap::from([(
+                "ollama".to_string(),
+                zen_core::config::ProviderConfig {
+                    provider_type: Some("ollama".to_string()),
+                    base_url: Some(format!("http://127.0.0.1:{port}")),
+                    default_model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let executor = test_executor_with_router(router);
+        let started = std::time::Instant::now();
+        let err = executor
+            .execute_with_retry(&Provider::Unknown("ollama".to_string()), "hi", "test")
+            .expect_err("the hanging provider must be cut by the bound");
+        let elapsed = started.elapsed();
+        unsafe { std::env::remove_var("ZEN_STREAM_FIRST_TOKEN_TIMEOUT_SECS") };
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("non-streaming completion timed out"),
+            "the failure must be the executor's primary-timeout bound: {text}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the bound must fire at ~2s, not the provider's own 120s: {elapsed:?}"
         );
     }
 }
