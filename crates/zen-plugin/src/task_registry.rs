@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -951,7 +952,25 @@ impl TaskRegistry {
         let wait_snapshot = Arc::clone(&snapshot);
         let wait_async_result = Arc::clone(&async_result);
         let join = tokio::spawn(async move {
-            let outcome = future.await;
+            // F6 (W15): a panic inside the agent future would unwind this
+            // wrapper task and leave the status Running until expiry. Catch
+            // it and map to the terminal Failed state (the same shape
+            // kill/expiry write). The future is dropped here, so its token
+            // reservation Drop refund is unchanged.
+            let outcome = match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                Ok(outcome) => outcome,
+                Err(panic) => {
+                    let detail = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    Err(anyhow!(
+                        "delegate task panicked: {}",
+                        truncate_char_safe(&detail, 200)
+                    ))
+                }
+            };
             let (result, terminal_snapshot) = {
                 let mut guard = lock_ok(&wait_snapshot, "task snapshot");
                 let result = match outcome {
@@ -1193,10 +1212,7 @@ impl TaskRegistry {
     /// # Errors
     /// Unknown `task_id` (the tool layer falls back to meta.json).
     pub fn kill(&self, task_id: &str) -> anyhow::Result<TaskSnapshot> {
-        let entry = self
-            .entries
-            .lock()
-            .unwrap()
+        let entry = lock_ok(&self.entries, "registry entries")
             .get(task_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown task_id {task_id}"))?;
@@ -1351,10 +1367,7 @@ impl TaskRegistry {
     /// `now_ms` is injected so tests (and the scheduler) are deterministic.
     #[must_use]
     pub fn expire_due(&self, now_ms: i64) -> Vec<String> {
-        let expired: Vec<TaskEntry> = self
-            .entries
-            .lock()
-            .unwrap()
+        let expired: Vec<TaskEntry> = lock_ok(&self.entries, "registry entries")
             .values()
             .filter(|e| {
                 let guard = lock_ok(&e.snapshot, "task snapshot");
@@ -1428,10 +1441,7 @@ impl TaskRegistry {
     /// (review fix d).
     #[must_use]
     pub fn kill_all(&self, reason: &str) -> Vec<String> {
-        let live: Vec<TaskEntry> = self
-            .entries
-            .lock()
-            .unwrap()
+        let live: Vec<TaskEntry> = lock_ok(&self.entries, "registry entries")
             .values()
             .filter(|e| lock_ok(&e.snapshot, "task snapshot").status == TaskStatus::Running)
             .cloned()
@@ -2177,6 +2187,23 @@ mod tests {
         let digest = make_command_digest("/bin/echo", &args);
         assert_eq!(digest.chars().count(), 80);
         assert!(digest.starts_with("/bin/echo"));
+    }
+
+    // F15 (W15): a poisoned entries lock must not wedge the registry — the
+    // kill/expire/kill_all paths recover the inner map (lock_ok, T264).
+    #[test]
+    fn poisoned_entries_lock_is_recovered_by_kill_expire_and_kill_all() {
+        let reg = TaskRegistry::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reg.entries.lock().unwrap();
+            panic!("poison the registry lock");
+        }));
+        assert!(
+            reg.kill("missing").is_err(),
+            "kill recovers and reports the unknown id"
+        );
+        assert!(reg.expire_due(i64::MAX).is_empty(), "expire_due recovers");
+        assert!(reg.kill_all("test").is_empty(), "kill_all recovers");
     }
 
     #[test]

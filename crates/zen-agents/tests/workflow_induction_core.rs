@@ -864,3 +864,57 @@ async fn workflow_induction_titles_only_corpus_reports_its_own_reason() {
     assert_eq!(run.skipped_titles_only, 2);
     assert_eq!(run.insufficient, Some(InsufficientReason::TitlesOnlyCorpus));
 }
+
+// F12 (W15): `has_items_key` is a parsed-key check, so a DAG whose task id
+// (or any other string value) is literally `items` is NOT exempted from the
+// partial-row admission gate — the substring probe falsely admitted it.
+#[tokio::test]
+async fn workflow_induction_task_id_named_items_without_items_key_is_not_exempt() {
+    let logs = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let client = open_db(db.path()).await;
+    let spec_json = serde_json::json!({
+        "tasks": [
+            {"id": "items", "agent": "researcher", "prompt": "p", "depends_on": []},
+            {"id": "t2", "agent": "writer", "prompt": "q", "depends_on": ["items"]}
+        ]
+    })
+    .to_string();
+    // Only 1 of the 2 spec tasks settled — a partial observation. With the
+    // substring probe the `"items"` task id faked the mint exemption and the
+    // plan was admitted; the parsed check excludes it.
+    let rows: Vec<(&str, &str, &str)> = vec![("items", "researcher", "completed")];
+    seed_plan(
+        &client,
+        "items-a",
+        "shape",
+        &spec_json,
+        NOW - 10,
+        "completed",
+        &rows,
+    )
+    .await;
+    seed_plan(
+        &client,
+        "items-b",
+        "shape",
+        &spec_json,
+        NOW - 20,
+        "completed",
+        &rows,
+    )
+    .await;
+
+    let run = WorkflowInduction::new(logs.path().to_path_buf())
+        .run(&client, NOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        run.drafts_written, 0,
+        "a task id `items` must not exempt the partial-row gate"
+    );
+    assert_eq!(
+        run.insufficient,
+        Some(InsufficientReason::NoFullyCompletedPlans)
+    );
+}

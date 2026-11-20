@@ -2433,6 +2433,7 @@ impl AgentOrchestrator {
                 .is_ok()
         {
             tools.push(crate::delegate_task::DELEGATE_TOOL_NAME.to_string());
+            tools.push(crate::plan_todos::PLAN_TODOS_TOOL_NAME.to_string());
             tools.push(crate::plan_task::PLAN_TOOL_NAME.to_string());
             tools.push(crate::plan_control::PLAN_CONTROL_TOOL_NAME.to_string());
         }
@@ -4438,6 +4439,32 @@ mod tests {
             assert!(
                 tools.iter().any(|t| t == "fs.read"),
                 "{name} missing fs.read: {joined}"
+            );
+        }
+    }
+
+    // Review F1 (CEO wave): plan.todos is registered by the delegate
+    // lifecycle but was missing from the Sisyphus grant push list, leaving
+    // it registered-but-unreachable. The sentinel pins the whole plan.*
+    // surface on the orchestrator toolset.
+    #[tokio::test]
+    async fn sisyphus_toolset_grants_all_plan_tools() {
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let orchestrator = AgentOrchestrator::new(router);
+        orchestrator.ensure_delegate_tool();
+        let agent = orchestrator
+            .build_agent("Sisyphus", Sensitivity::Public)
+            .await
+            .expect("agent builds");
+        let tools = agent.generic.tools();
+        for name in [
+            crate::plan_todos::PLAN_TODOS_TOOL_NAME,
+            crate::plan_task::PLAN_TOOL_NAME,
+            crate::plan_control::PLAN_CONTROL_TOOL_NAME,
+        ] {
+            assert!(
+                tools.get(name).is_ok(),
+                "{name} must be granted to the Sisyphus toolset"
             );
         }
     }

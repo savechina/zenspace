@@ -614,16 +614,13 @@ impl PlanExecuteTool {
             error: outcome.value.get("error").and_then(|v| v.as_str()),
             now: chrono::Utc::now().timestamp(),
             // A-02/row13: `model` is the REAL runtime model name the
-            // delegate produced (`resolved_model_label`: the steering hint
-            // or the provider's configured default). The `model_source`
-            // label survives only as an honest fallback for outcomes that
-            // could not resolve a real name. `cost_usd` is metered from the
-            // provider's real usage echo — absent (NULL), never estimated.
-            model: outcome
-                .value
-                .get("model")
-                .or_else(|| outcome.value.get("model_source"))
-                .and_then(|v| v.as_str()),
+            // delegate produced (`resolved_model_label`). F11: no
+            // `model_source` label fallback — a label like "default" can
+            // never join forecast history, so a nameless outcome records
+            // NULL (honest exclusion), never a fake key. `cost_usd` is
+            // metered from the provider's real usage echo — absent (NULL),
+            // never estimated.
+            model: outcome.value.get("model").and_then(|v| v.as_str()),
             duration_ms: outcome.value.get("duration_ms").and_then(|v| v.as_u64()),
             cost_usd: outcome.value.get("cost_usd").and_then(|v| v.as_f64()),
         })
@@ -684,15 +681,18 @@ impl PlanExecuteTool {
     /// `plan.control` cancels), and the SQL `status = 'running'` guard
     /// inside `complete_plan` is the authoritative backstop for flips this
     /// process never saw (drain finalizer, mark-only stale sweep,
-    /// cross-process cancel). Returns `true` when the cancel won the tail
-    /// window — the caller records `cancelled` and never rewrites the row.
+    /// cross-process cancel). Returns [`FinalizationOutcome::CancelWon`]
+    /// when the cancel won the tail window — the caller records `cancelled`
+    /// and never rewrites the row — and [`FinalizationOutcome::PersistenceFailed`]
+    /// on a `complete_plan` error so the caller can keep the ledger record
+    /// (F9) instead of clearing it.
     async fn complete_plan_checked(
         &self,
         repo: &zen_repo::WorkflowRepo<'_>,
         completion: PlanCompletion<'_>,
         cancel_rx: Option<&tokio::sync::watch::Receiver<bool>>,
         warnings: &mut Vec<String>,
-    ) -> bool {
+    ) -> FinalizationOutcome {
         let PlanCompletion {
             plan_id,
             final_status,
@@ -705,7 +705,7 @@ impl PlanExecuteTool {
                 plan_id,
                 "plan cancel observed in the finalization window — row stays terminal-cancelled, no complete_plan rewrite"
             );
-            return true;
+            return FinalizationOutcome::CancelWon;
         }
         match repo
             .complete_plan(
@@ -718,14 +718,14 @@ impl PlanExecuteTool {
             )
             .await
         {
-            Ok(true) => false,
+            Ok(true) => FinalizationOutcome::Completed,
             Ok(false) => {
                 tracing::warn!(
                     plan_id,
                     attempted = final_status,
                     "plan completion lost the terminal race — row already terminal (cancel wins), outcome preserved not rewritten"
                 );
-                true
+                FinalizationOutcome::CancelWon
             }
             Err(e) => {
                 // W12.18 (review Q5): structured persistence failure — the
@@ -733,7 +733,7 @@ impl PlanExecuteTool {
                 // failure surfaces in the result payload, never silently.
                 tracing::warn!(plan_id, error = %e, "plan completion persistence failed");
                 warnings.push(format!("complete_plan failed: {e}"));
-                false
+                FinalizationOutcome::PersistenceFailed
             }
         }
     }
@@ -776,6 +776,16 @@ struct PlanCompletion<'a> {
     summary: &'a str,
     plan_approved: bool,
     delivery_ready: bool,
+}
+
+/// F9: the terminal-write outcome. `PersistenceFailed` is distinct from
+/// `CancelWon` so the caller keeps the ledger record on a failed write
+/// (the row stays `running`; a later batch ATTACHES instead of minting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizationOutcome {
+    Completed,
+    CancelWon,
+    PersistenceFailed,
 }
 
 const UPSTREAM_SNIPPET_MAX_CHARS: usize = 4000;
@@ -1146,6 +1156,11 @@ impl Tool for PlanExecuteTool {
         // spec_json on resume/ledger-attach; fresh mints carry the turn's
         // own policy in the marker (W12.17) — no override needed.
         let mut plan_policy: Option<Sensitivity> = None;
+        // W12.18 (review Q5): checkpoint/complete_plan persistence failures
+        // land here — surfaced as `persistence_warnings` in the result
+        // payload, never silently discarded. Declared before the plan-id
+        // resolution so the resume replay read (F4) can report there too.
+        let mut persistence_warnings: Vec<String> = Vec::new();
         let plan_id = match (self.db().await, resumed_id) {
             (Some(db), Some(rid)) => {
                 let repo = zen_repo::WorkflowRepo::new(db);
@@ -1182,7 +1197,24 @@ impl Tool for PlanExecuteTool {
                         plan_policy = plan_recorded_sensitivity(&row.spec_json);
                         crate::plan_todos::register_turn_plan(&session, &rid, Vec::new());
                         let resumed_now = chrono::Utc::now().timestamp();
-                        for t in repo.load_task_rows(&rid).await.unwrap_or_default() {
+                        // F4: an unreadable task-row set must not silently
+                        // degrade to "no checkpoints" — report it and skip
+                        // replay so every task re-runs (no silent no-replay).
+                        let replayed_rows = match repo.load_task_rows(&rid).await {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                tracing::warn!(
+                                    plan_id = %rid,
+                                    error = %e,
+                                    "plan resume: task rows unreadable — replay skipped, every task re-runs"
+                                );
+                                persistence_warnings.push(format!(
+                                    "resume task rows unreadable for plan `{rid}`: {e}; replay skipped"
+                                ));
+                                Vec::new()
+                            }
+                        };
+                        for t in replayed_rows {
                             if t.status != "completed" {
                                 continue;
                             }
@@ -1284,6 +1316,13 @@ impl Tool for PlanExecuteTool {
                     // pending ledger items; an id outside the ledger would
                     // checkpoint an orphan row.
                     Some(lid) => {
+                        // F2: register the live record BEFORE arming the
+                        // batch marker — `register_turn_plan` replaces the
+                        // record with `batch_in_flight: false`, so arming
+                        // after it keeps the second-batch refusal for the
+                        // WHOLE invoke (BatchGuard drop clears at invoke
+                        // end) instead of being clobbered back to false.
+                        crate::plan_todos::register_turn_plan(&session, &lid, Vec::new());
                         // W6.3: the DB claim fence admits same-owner
                         // re-claims (crash recovery), so the second-batch
                         // refusal lives in the registry marker.
@@ -1296,7 +1335,24 @@ impl Tool for PlanExecuteTool {
                         }
                         _batch_guard = Some(crate::plan_todos::BatchGuard::arm(&session));
                         let repo = zen_repo::WorkflowRepo::new(db);
-                        let rows = repo.load_task_rows(&lid).await.unwrap_or_default();
+                        // F4: an unreadable ledger refuses the whole invoke —
+                        // a partial batch from an empty row set would
+                        // checkpoint orphan tasks.
+                        let rows = match repo.load_task_rows(&lid).await {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                tracing::warn!(
+                                    plan_id = %lid,
+                                    error = %e,
+                                    "plan attach: ledger task rows unreadable — refusing the batch"
+                                );
+                                return Ok(serde_json::json!({
+                                    "error": format!(
+                                        "plan {lid}: ledger unreadable — {e}; refusing a partial batch"
+                                    )
+                                }));
+                            }
+                        };
                         // W12.15: the ledger row's recorded policy governs
                         // this batch's sub-turns.
                         let mut attach_spec: Option<String> = None;
@@ -1345,7 +1401,6 @@ impl Tool for PlanExecuteTool {
                                 tracing::warn!(plan = %lid, error = %e, "attach spec_json merge failed — induction corpus stays stale");
                             }
                         }
-                        crate::plan_todos::register_turn_plan(&session, &lid, Vec::new());
                         lid
                     }
                     None => {
@@ -1378,10 +1433,6 @@ impl Tool for PlanExecuteTool {
         let mut halted = false;
         let mut cancelled_mid = false;
         let mut progress_lines: Vec<String> = Vec::new();
-        // W12.18 (review Q5): checkpoint/complete_plan persistence failures
-        // land here — surfaced as `persistence_warnings` in the result
-        // payload, never silently discarded.
-        let mut persistence_warnings: Vec<String> = Vec::new();
         // W9.1: one advisory forecast line before the first batch —
         // omitted entirely when no task's pair has recorded history.
         let forecast_sensitivity =
@@ -1689,6 +1740,29 @@ impl Tool for PlanExecuteTool {
             }
         }
 
+        // F5: halt/cancel early-break leaves never-scheduled tasks with no
+        // outcome — they rendered "skipped" but were never checkpointed, so
+        // the ledger could not observe the tail. Settle each as a skipped
+        // checkpoint (upstream-skip vocabulary) here at the assembly point;
+        // on normal completion every outcome is Some, so this is a no-op.
+        for (i, slot) in outcomes.iter_mut().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            let outcome = TaskOutcome {
+                status: "skipped",
+                value: serde_json::json!({ "error": "never scheduled" }),
+            };
+            self.checkpoint_logged(
+                &plan_id,
+                &plan.tasks[i],
+                &outcome,
+                &mut persistence_warnings,
+            )
+            .await;
+            *slot = Some(outcome);
+        }
+
         // Assemble per-task output + merged deliverable summary.
         let mut task_rows = Vec::with_capacity(plan.tasks.len());
         let mut summary_lines = Vec::new();
@@ -1769,12 +1843,26 @@ impl Tool for PlanExecuteTool {
             // resumed runs see all rows terminal here and behave exactly
             // as before.
             let ledger_pending = match crate::plan_todos::peek_turn_plan(&session) {
-                Some(record) if record.plan_id == plan_id => repo
-                    .load_task_rows(&plan_id)
-                    .await
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|row| row.status == "pending" || row.status == "progressing"),
+                Some(record) if record.plan_id == plan_id => {
+                    match repo.load_task_rows(&plan_id).await {
+                        Ok(rows) => rows
+                            .iter()
+                            .any(|row| row.status == "pending" || row.status == "progressing"),
+                        // F4: an unreadable ledger is treated as pending —
+                        // never complete a plan whose tail we cannot read.
+                        Err(e) => {
+                            tracing::warn!(
+                                plan_id,
+                                error = %e,
+                                "plan completion: ledger rows unreadable — completion refused"
+                            );
+                            persistence_warnings.push(format!(
+                                "ledger rows unreadable for plan `{plan_id}`: {e}; completion refused"
+                            ));
+                            true
+                        }
+                    }
+                }
                 _ => false,
             };
             if !ledger_pending && !cancelled_mid {
@@ -1782,7 +1870,7 @@ impl Tool for PlanExecuteTool {
                 // watch re-check + SQL `status='running'` guard decide the
                 // winner; a cancel landing here keeps the row terminal-
                 // cancelled (no completion rewrite).
-                let cancel_won = self
+                let outcome = self
                     .complete_plan_checked(
                         &repo,
                         PlanCompletion {
@@ -1796,10 +1884,18 @@ impl Tool for PlanExecuteTool {
                         &mut persistence_warnings,
                     )
                     .await;
-                if cancel_won {
-                    cancelled_mid = true;
+                match outcome {
+                    FinalizationOutcome::Completed | FinalizationOutcome::CancelWon => {
+                        if outcome == FinalizationOutcome::CancelWon {
+                            cancelled_mid = true;
+                        }
+                        crate::plan_todos::clear_turn_plan(&session, &plan_id);
+                    }
+                    // F9: the row stays `running`; keep the record so the
+                    // next batch attaches to THIS plan instead of minting a
+                    // duplicate, and resume remains reachable.
+                    FinalizationOutcome::PersistenceFailed => {}
                 }
-                crate::plan_todos::clear_turn_plan(&session, &plan_id);
             }
         }
         let mut audit_entry = serde_json::json!({
@@ -2618,10 +2714,12 @@ mod tests {
         );
     }
 
-    // W6.3: a second batch is refused while one is non-terminal. The DB
+    // W6.3/F2: a second batch is refused while one is non-terminal. The DB
     // claim fence admits same-owner re-claims (crash recovery), so the
-    // refusal lives in the registry's in-flight marker; the two-batch
-    // acceptance pin above proves the real begin/end bracket releases it.
+    // refusal lives in the registry's in-flight marker. F2 reorder: the
+    // invoke registers the record FIRST and then arms it, so the marker is
+    // held for the WHOLE invoke (pre-arming before invoke is now reset by
+    // that registration — hence the in-flight probe below).
     #[tokio::test]
     async fn ledger_second_batch_refused_while_in_flight() {
         let dir = tempfile::tempdir().unwrap();
@@ -2633,39 +2731,50 @@ mod tests {
         let minted = todos
             .invoke(serde_json::json!({"op": "set", "items": [
                 {"id": "a", "title": "first", "status": "pending"},
+                {"id": "b", "title": "second", "status": "pending"},
             ]}))
             .await
             .unwrap();
         let plan_id = minted["plan_id"].as_str().unwrap().to_string();
 
+        let plan = Arc::new(plan_tool_with(Some(state_db.clone())));
+        plan.inject_test_wave_delay("Explore", 1_500);
+        let runner = Arc::clone(&plan);
+        let handle = tokio::spawn(async move {
+            runner
+                .invoke(serde_json::json!({
+                    "name": "collide",
+                    "tasks": [{"id": "a", "agent": "Explore", "prompt": "p"}]
+                }))
+                .await
+        });
+        // Wait until the invoke is inside its batch (the wave guard logs
+        // `enter` only after register + arm), then probe the refusal.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !plan
+            .test_wave_events()
+            .iter()
+            .any(|(agent, event)| agent == "Explore" && *event == "enter")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "invoke never reached its batch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !crate::plan_todos::try_begin_batch("local", &plan_id),
+            "the armed marker refuses a second batch across the whole invoke"
+        );
+        let out = handle.await.unwrap().unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        // The BatchGuard drop released the marker at invoke end; the record
+        // survives (b is still pending), so a fresh batch admits.
         assert!(
             crate::plan_todos::try_begin_batch("local", &plan_id),
-            "first batch admits"
-        );
-        let plan = plan_tool_with(Some(state_db.clone()));
-        let out = plan
-            .invoke(serde_json::json!({
-                "name": "collide",
-                "tasks": [{"id": "a", "agent": "Explore", "prompt": "p"}]
-            }))
-            .await
-            .unwrap();
-        assert!(
-            out["error"]
-                .as_str()
-                .unwrap()
-                .contains("already has a batch in flight"),
-            "{out}"
+            "marker released after the invoke ends"
         );
         crate::plan_todos::end_batch("local");
-        let out = plan
-            .invoke(serde_json::json!({
-                "name": "collide",
-                "tasks": [{"id": "a", "agent": "Explore", "prompt": "p"}]
-            }))
-            .await
-            .unwrap();
-        assert!(out["error"].is_null(), "marker released: {out}");
     }
 
     #[tokio::test]
@@ -3983,7 +4092,7 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         tx.send(true).unwrap();
         let mut warnings: Vec<String> = Vec::new();
-        let cancel_won = plan_tool()
+        let outcome = plan_tool()
             .complete_plan_checked(
                 &repo,
                 PlanCompletion {
@@ -3997,7 +4106,11 @@ mod tests {
                 &mut warnings,
             )
             .await;
-        assert!(cancel_won, "the pre-signalled cancel owns the tail window");
+        assert_eq!(
+            outcome,
+            FinalizationOutcome::CancelWon,
+            "the pre-signalled cancel owns the tail window"
+        );
         assert!(
             warnings.is_empty(),
             "a won cancel is not a warning: {warnings:?}"
@@ -4122,12 +4235,14 @@ mod tests {
         unsafe { std::env::remove_var("ZEN_HOME") };
     }
 
-    /// W12.25a pin: the checkpoint records a model label from the delegate
-    /// output — a real `model` key wins, otherwise the falsifiable
-    /// `model_source` label (the only producer today) is stored. cost_usd
-    /// stays honest NULL (no usage-cost producer at the delegate sites).
+    /// F11 pin: the checkpoint stores the REAL model name or NULL — never
+    /// the `model_source` label (a "default"/"profile" label can never join
+    /// forecast history, so it would be a permanently unmatched key).
+    /// cost_usd stays honest NULL (no usage-cost producer at these sites).
+    ///
+    /// Rationale (F11): label fallback keys were unjoinable by construction.
     #[tokio::test]
-    async fn checkpoint_records_model_from_source_label_fallback() {
+    async fn checkpoint_model_key_is_real_name_or_null_never_label() {
         let dir = tempfile::tempdir().unwrap();
         let state_db = dir.path().join("state.db");
         let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
@@ -4168,12 +4283,16 @@ mod tests {
         let history = repo.duration_history().await.unwrap();
         let models: Vec<Option<String>> = history.iter().map(|r| r.model.clone()).collect();
         assert!(
-            models.contains(&Some("hint".to_string())),
-            "model_source fallback recorded: {models:?}"
+            models.contains(&None),
+            "a label-only outcome records NULL, not the label: {models:?}"
+        );
+        assert!(
+            !models.contains(&Some("hint".to_string())),
+            "the model_source label is never stored as a key: {models:?}"
         );
         assert!(
             models.contains(&Some("literal-model".to_string())),
-            "a real model key wins over the label: {models:?}"
+            "the real model name wins: {models:?}"
         );
         assert!(
             history.iter().all(|r| r.cost_usd.is_none()),
@@ -4306,6 +4425,337 @@ mod tests {
             spec.get("sensitivity").is_some(),
             "sensitivity preserved: {}",
             row.spec_json
+        );
+    }
+
+    /// F4 pin (resume): an unreadable task-row set must not be read as "no
+    /// checkpoints" — replay is skipped WITH a warning and the task re-runs
+    /// (a silent no-replay would ship a stale/empty resume unnoticed).
+    #[tokio::test]
+    async fn resume_replay_read_failure_reruns_tasks_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let rid = "resume-unreadable";
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan(rid, None, "{}", 1_000).await.unwrap();
+        repo.checkpoint_task(zen_repo::TaskCheckpoint {
+            plan_id: rid,
+            task_id: "a",
+            agent: "Explore",
+            status: "completed",
+            response: Some("REPLAYED"),
+            error: None,
+            now: 1_001,
+            model: None,
+            duration_ms: None,
+            cost_usd: None,
+        })
+        .await
+        .unwrap();
+        // F4 injection: the plan row stays readable while the task-row set
+        // is gone (the two reads are independent in `invoke`).
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch("ALTER TABLE workflow_tasks RENAME TO workflow_tasks_gone")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let tool = plan_tool_with(Some(state_db));
+        let out = tool
+            .invoke(serde_json::json!({
+                "resume_plan_id": rid,
+                "tasks": [{ "id": "a", "agent": "Explore", "prompt": "x" }]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        assert_eq!(out["resumed"], serde_json::json!(true), "{out}");
+        assert_eq!(
+            tool.test_call_count("Explore"),
+            1,
+            "the task re-ran instead of silently replaying nothing: {out}"
+        );
+        assert_ne!(
+            out["tasks"][0]["response"].as_str(),
+            Some("REPLAYED"),
+            "no stale replay: {out}"
+        );
+        let warnings = out["persistence_warnings"]
+            .as_array()
+            .expect("persistence_warnings array");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("replay skipped"))),
+            "unreadable rows surfaced, not silent: {out}"
+        );
+    }
+
+    /// F4 pin (attach): an unreadable ledger refuses the WHOLE invoke — a
+    /// partial batch built from an empty row set would checkpoint orphans.
+    #[tokio::test]
+    async fn attach_refuses_whole_invoke_when_ledger_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(std::sync::Mutex::new(zen_core::types::Sensitivity::Private)),
+        );
+        todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "a", "title": "first", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch("ALTER TABLE workflow_tasks RENAME TO workflow_tasks_gone")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let tool = plan_tool_with(Some(state_db));
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [{ "id": "a", "agent": "Explore", "prompt": "p" }]
+            }))
+            .await
+            .unwrap();
+        assert!(
+            out["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("ledger unreadable")),
+            "structured refusal naming the unreadable ledger: {out}"
+        );
+        assert!(out["tasks"].is_null(), "no partial batch rows: {out}");
+        assert_eq!(tool.test_call_count("Explore"), 0, "no task ran");
+    }
+
+    /// F4 pin (completion gate): an unreadable ledger is treated as PENDING —
+    /// a plan whose tail cannot be read is never completed prematurely.
+    #[tokio::test]
+    async fn ledger_read_failure_refuses_premature_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        // Poison the row set only AFTER the last checkpoint: the trigger
+        // inserts a wrong-typed `updated_at` row, so `load_task_rows`
+        // decodes-fails exactly at the completion gate (attach ran clean).
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER poison_task_read AFTER INSERT ON workflow_tasks \
+                     WHEN NEW.task_id = 'b' \
+                     BEGIN \
+                       INSERT INTO workflow_tasks \
+                         (plan_id, task_id, agent, status, response, error, updated_at) \
+                       VALUES (NEW.plan_id, 'zzz-poison', 'Explore', 'pending', \
+                               NULL, NULL, 'not-an-int'); \
+                     END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let tool = plan_tool_with(Some(state_db.clone()));
+        let out = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "p1" },
+                    { "id": "b", "agent": "Explore", "prompt": "p2" }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        let warnings = out["persistence_warnings"]
+            .as_array()
+            .expect("persistence_warnings array");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("completion refused"))),
+            "unreadable ledger refused completion: {out}"
+        );
+        let plan_id = out["plan_id"].as_str().unwrap().to_string();
+
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch(
+                    "DELETE FROM workflow_tasks WHERE task_id = 'zzz-poison'; \
+                     DROP TRIGGER poison_task_read;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let row = repo.load_plan(&plan_id).await.unwrap().expect("plan row");
+        assert_eq!(
+            row.status, "running",
+            "completion refused keeps the row running"
+        );
+    }
+
+    /// F5 pin: a halt break leaves never-scheduled tasks with no outcome;
+    /// the settle pass must checkpoint each as skipped so every task id is
+    /// durable in the ledger (the result already rendered them skipped).
+    #[tokio::test]
+    async fn halt_settles_never_scheduled_tasks_in_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(std::sync::Mutex::new(zen_core::types::Sensitivity::Private)),
+        );
+        let minted = todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "a", "title": "first", "status": "pending"},
+                {"id": "b", "title": "second", "status": "pending"},
+                {"id": "c", "title": "third", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        let plan_id = minted["plan_id"].as_str().unwrap().to_string();
+
+        let plan = plan_tool_with(Some(state_db.clone()));
+        plan.inject_test_failure("Atlas", 1);
+        let out = plan
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Atlas", "prompt": "boom", "on_failure": "halt" },
+                    { "id": "b", "agent": "Explore", "prompt": "independent" },
+                    { "id": "c", "agent": "Explore", "prompt": "next layer", "depends_on": ["b"] }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out["error"].is_null(), "{out}");
+        assert_eq!(out["tasks"][2]["status"], "skipped", "{out}");
+
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let rows = repo.load_task_rows(&plan_id).await.unwrap();
+        let statuses: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.task_id.as_str(), r.status.as_str()))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            3,
+            "every task id has a ledger row: {statuses:?}"
+        );
+        let c = rows.iter().find(|r| r.task_id == "c").expect("row c");
+        assert_eq!(
+            c.status, "skipped",
+            "never-scheduled task settled: {}",
+            c.task_id
+        );
+        assert_eq!(c.error.as_deref(), Some("never scheduled"), "{}", c.task_id);
+    }
+
+    /// F9 pin: a failed terminal write keeps the ledger record — a following
+    /// batch ATTACHES to the same (still `running`) plan row instead of
+    /// minting a duplicate, and resume stays reachable.
+    #[tokio::test]
+    async fn complete_failure_keeps_record_and_next_batch_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_db = dir.path().join("state.db");
+        let todos = crate::plan_todos::PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(std::sync::Mutex::new(zen_core::types::Sensitivity::Private)),
+        );
+        let minted = todos
+            .invoke(serde_json::json!({"op": "set", "items": [
+                {"id": "a", "title": "first", "status": "pending"},
+                {"id": "b", "title": "second", "status": "pending"},
+            ]}))
+            .await
+            .unwrap();
+        let plan_id = minted["plan_id"].as_str().unwrap().to_string();
+
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        // Fail ONLY the terminal write (status transition); claim/attach and
+        // checkpoint heartbeats keep `status = 'running'` and pass.
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_plan_final BEFORE UPDATE ON workflow_plans \
+                     WHEN NEW.status <> 'running' \
+                     BEGIN SELECT RAISE(ABORT, 'forced complete failure'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let plan = plan_tool_with(Some(state_db.clone()));
+        let out1 = plan
+            .invoke(serde_json::json!({
+                "tasks": [
+                    { "id": "a", "agent": "Explore", "prompt": "p1" },
+                    { "id": "b", "agent": "Explore", "prompt": "p2" }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert!(out1["error"].is_null(), "{out1}");
+        let warnings = out1["persistence_warnings"]
+            .as_array()
+            .expect("persistence_warnings array");
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .is_some_and(|s| s.contains("complete_plan failed"))),
+            "terminal-write failure surfaced: {out1}"
+        );
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        assert_eq!(
+            repo.load_plan(&plan_id).await.unwrap().unwrap().status,
+            "running",
+            "failed terminal write leaves the row running"
+        );
+        let kept = crate::plan_todos::peek_turn_plan("local").expect("record kept on failure");
+        assert_eq!(
+            kept.plan_id, plan_id,
+            "F9: record survives the failed write"
+        );
+
+        client
+            .writer()
+            .call(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_plan_final")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let out2 = plan
+            .invoke(serde_json::json!({
+                "tasks": [{ "id": "a", "agent": "Explore", "prompt": "again" }]
+            }))
+            .await
+            .unwrap();
+        assert!(out2["error"].is_null(), "{out2}");
+        assert_eq!(
+            out2["plan_id"],
+            serde_json::json!(plan_id),
+            "the next batch ATTACHES to the same plan row"
+        );
+        assert_eq!(
+            repo.load_plan(&plan_id).await.unwrap().unwrap().status,
+            "completed",
+            "the kept record let the plan finish without a duplicate mint"
         );
     }
 }

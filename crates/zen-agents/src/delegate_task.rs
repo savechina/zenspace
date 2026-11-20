@@ -525,8 +525,8 @@ impl DelegateTaskTool {
     /// `delegate.*` grants survive only when the child sits below the
     /// configured depth cap (`max_depth`); at the cap the name filter is
     /// the hard stop (006 depth-1 behavior is the `max_depth = 1` case).
-    /// `plan.execute` is stripped unconditionally: it is a Sisyphus-only
-    /// tool and must never ride an overlay grant into a sub-agent.
+    /// `plan.*` tools are stripped unconditionally: they are Sisyphus-only
+    /// and must never ride a grant into a sub-agent.
     ///
     /// W12.1 (review A1, SC-024): this is the SINGLE production construction
     /// site, so the background narrowing is wired HERE — the
@@ -574,7 +574,7 @@ impl DelegateTaskTool {
         if !allow_child_delegation {
             tools.retain(|name| !name.starts_with("delegate."));
         }
-        tools.retain(|name| name != crate::plan_task::PLAN_TOOL_NAME);
+        tools.retain(|name| !name.starts_with("plan."));
         if narrowed {
             tools.retain(|name| !BACKGROUND_NARROWED_TOOLS.contains(&name.as_str()));
         }
@@ -1482,6 +1482,16 @@ impl DelegateTaskTool {
                 "model_source".to_string(),
                 serde_json::json!(model_source.as_str()),
             );
+        }
+        // Review F6 (CEO wave): an error-shaped outcome must fail the task
+        // so the spawn wrapper records `Failed`, not a `Completed` carrying
+        // an error payload.
+        if let Some(error) = outcome.get("error") {
+            let text = error
+                .as_str()
+                .map_or_else(|| error.to_string(), str::to_string);
+            let bounded: String = text.chars().take(200).collect();
+            return Err(anyhow::anyhow!("{bounded}"));
         }
         Ok(outcome)
     }
@@ -2705,6 +2715,34 @@ mod tests {
                 .is_err(),
             "plan.execute must never ride a grant into a sub-agent, even below the depth cap"
         );
+    }
+
+    // Review F14 (CEO wave): the strip is plan.* prefix-wide, so all three
+    // Sisyphus-only plan tools are removed from a sub-agent even below the
+    // depth cap when an overlay grant carries them.
+    #[tokio::test]
+    async fn build_sub_agent_strips_all_plan_tools() {
+        let wiring = Arc::new(ZenWiring::new());
+        let plan_names = [
+            crate::plan_todos::PLAN_TODOS_TOOL_NAME,
+            crate::plan_task::PLAN_TOOL_NAME,
+            crate::plan_control::PLAN_CONTROL_TOOL_NAME,
+        ];
+        for name in plan_names {
+            wiring.tools.register(Arc::new(ProbeTool(name)));
+        }
+        let tool = tool_with(
+            Arc::clone(&wiring),
+            plan_names.iter().map(|n| n.to_string()).collect(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let sub = tool.build_sub_agent("Explore", true).unwrap();
+        for name in plan_names {
+            assert!(
+                sub.generic.tools().get(name).is_err(),
+                "{name} must never ride a grant into a sub-agent, even below the depth cap"
+            );
+        }
     }
 
     fn tool_with_concurrency(
@@ -4949,14 +4987,17 @@ mod tests {
             .collect_delegate(&id, 5_000)
             .await
             .expect("collect");
-        assert_eq!(collected.status, "completed");
-        let response = collected.response.expect("error-shaped result");
+        // Review F6 contract change: error-shaped outcomes now fail the
+        // task (previously recorded Completed with an error payload).
+        assert_eq!(collected.status, "failed");
         assert!(
-            response["error"]
-                .as_str()
+            collected
+                .error
+                .as_deref()
                 .unwrap_or_default()
                 .contains("LLM round failed"),
-            "the early-error path surfaces its structured error: {response}"
+            "the early-error path surfaces its structured error: {:?}",
+            collected.error
         );
         assert_eq!(
             budget.tokens_consumed().await,

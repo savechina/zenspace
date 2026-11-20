@@ -206,6 +206,11 @@ fn count_plans(rows: &[WorkflowPlanRow], plans_dir: &Path, now: i64) -> PlanCoun
     for row in rows {
         match row.status.as_str() {
             "completed" => {
+                // F13 (W15): the reader reuses the writer's slug helper, so
+                // the two cannot drift. A same-name collision page carries a
+                // write-time hash suffix that this row-only reader does not
+                // re-derive; it matches the shared base page instead
+                // (fail-closed: a completed row is never counted running).
                 let slug = plan_archive_slug(row.name.as_deref(), None, &row.plan_id);
                 if plans_dir.join(format!("{slug}.md")).exists() {
                     counts.done += 1;
@@ -591,6 +596,36 @@ mod tests {
                 needs_call: 0,
                 running: 0
             }
+        );
+    }
+
+    // F13 (W15): a second same-named plan's archive page (written with the
+    // collision suffix) is detected as archived — the reader and writer share
+    // one slug helper, and the shared base page covers the collision case.
+    #[test]
+    fn second_same_named_plan_archive_is_detected_as_archived() {
+        let (_dir, paths) = setup();
+        let plans_dir = paths.wiki().join("wisdom").join("plans");
+        write_archive_page(&plans_dir, Some("Same Name"), "p-first");
+        write_archive_page(&plans_dir, Some("Same Name"), "p-second");
+        assert!(
+            plans_dir.join("same-name.md").exists(),
+            "first page at the base slug"
+        );
+        let pages = fs::read_dir(&plans_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .count();
+        assert_eq!(pages, 2, "the second page got a collision suffix");
+
+        let rows = [
+            plan_row("p-first", Some("Same Name"), "completed", 9_000),
+            plan_row("p-second", Some("Same Name"), "completed", 9_000),
+        ];
+        assert_eq!(
+            count_plans(&rows, &plans_dir, 10_000).done,
+            2,
+            "both same-named completed plans are detected as archived"
         );
     }
 

@@ -882,10 +882,13 @@ fn fully_completed(tasks: &[InductionTaskRow]) -> bool {
 /// W14.3: an attached plan row carries BOTH `items` (the mint's ledger)
 /// and the merged `tasks` (W14.1) — its settled rows are ledger items, so
 /// the spec-task-count gate exempts it (the `completed` status gate
-/// governs). The parser has already validated the `items` array when
-/// this returns true.
+/// governs). F12 (W15): parsed-key check, not a substring probe — a task
+/// id or any other string VALUE equal to `items` must not fake the key.
 fn has_items_key(spec_json: &str) -> bool {
-    spec_json.contains("\"items\"")
+    serde_json::from_str::<serde_json::Value>(spec_json)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key("items")))
+        .unwrap_or(false)
 }
 
 /// Greedy seed-around-first-plan clustering (skill precipitation

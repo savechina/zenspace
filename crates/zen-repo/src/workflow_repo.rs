@@ -165,8 +165,12 @@ impl<'a> WorkflowRepo<'a> {
                 // ceiling, `PLAN_WATCHDOG_CEILING` = 4× watchdog in
                 // zen-gateway guards.rs) got stale-swept (owner NULLed) and
                 // its claim stolen by a second resume — a true double-spend.
+                // F8 (W15): guarded `status = 'running'` like
+                // `attach_batch_spec` — a late checkpoint must never move a
+                // terminal (cancelled/completed/failed) row's heartbeat.
                 tx.execute(
-                    "UPDATE workflow_plans SET updated_at = ?1 WHERE plan_id = ?2",
+                    "UPDATE workflow_plans SET updated_at = ?1 \
+                     WHERE plan_id = ?2 AND status = 'running'",
                     rusqlite::params![now, plan_id],
                 )?;
                 tx.commit()?;
@@ -226,37 +230,6 @@ impl<'a> WorkflowRepo<'a> {
             .await
             .map_err(SqliteError::TokioRusqlite)?;
         Ok(())
-    }
-
-    /// UPDATE-only status write for model-set statuses (W6.2 D21 §2 rule
-    /// (b)): never touches `response`/`error`/`agent`, so a settled task's
-    /// recorded outcome survives a later status write (never
-    /// `checkpoint_task`'s `INSERT OR REPLACE`, which would NULL them).
-    /// Returns rows affected — `0` means the (plan, task) row does not
-    /// exist and is a structured rejection upstream.
-    pub async fn update_task_status(
-        &self,
-        plan_id: &str,
-        task_id: &str,
-        status: &str,
-        now: i64,
-    ) -> Result<u64> {
-        let plan_id = plan_id.to_string();
-        let task_id = task_id.to_string();
-        let status = status.to_string();
-        let changed = self
-            .client
-            .writer()
-            .call(move |conn| {
-                Ok(conn.execute(
-                    "UPDATE workflow_tasks SET status = ?1, updated_at = ?2 \
-                     WHERE plan_id = ?3 AND task_id = ?4",
-                    rusqlite::params![status, now, plan_id, task_id],
-                )?)
-            })
-            .await
-            .map_err(SqliteError::TokioRusqlite)?;
-        Ok(changed as u64)
     }
 
     /// Mark-only stale sweep (W6.2b / D24 §3): every `running` plan whose
@@ -364,8 +337,9 @@ impl<'a> WorkflowRepo<'a> {
     /// batches. Rows mirror [`WorkflowRepo::mint_plan_with_tasks`]'s draft
     /// arm: `''` agent sentinel (agent is written at dispatch time) and the
     /// caller-supplied status (`pending` from the control tool). The task
-    /// specs themselves (agent/prompt/deps) ride the in-process live-plan
-    /// control surface — the row is the persistence receipt. A duplicate
+    /// specs themselves (agent/prompt/deps) are merged into the plan's
+    /// `spec_json` by the caller via [`WorkflowRepo::attach_batch_spec`]
+    /// (F3); the row is the persistence receipt. A duplicate
     /// (plan_id, task_id) violates the PK and surfaces as [`SqliteError`].
     /// Returns rows inserted.
     pub async fn append_tasks(&self, plan_id: &str, tasks: &[TaskDraft], now: i64) -> Result<u64> {
@@ -843,6 +817,44 @@ mod tests {
         assert_eq!(tasks[0].response.as_deref(), Some("second"));
     }
 
+    /// F8 (W15): the checkpoint heartbeat is guarded `status = 'running'` —
+    /// a checkpoint arriving after a cancel/complete must still write the
+    /// task row but leave the terminal plan row's `updated_at` untouched.
+    #[tokio::test]
+    async fn checkpoint_does_not_bump_a_cancelled_plan_row() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wf_cp_guard.db");
+        let client = crate::SqliteClient::open(&db).await.unwrap();
+        let repo = WorkflowRepo::new(&client);
+
+        repo.create_plan("p1", None, "{}", 1000).await.unwrap();
+        assert!(repo.cancel_running_plan("p1", 1500).await.unwrap());
+        repo.checkpoint_task(TaskCheckpoint {
+            plan_id: "p1",
+            task_id: "late",
+            agent: "Explore",
+            status: "completed",
+            response: Some("late answer"),
+            error: None,
+            now: 2000,
+            model: None,
+            duration_ms: None,
+            cost_usd: None,
+        })
+        .await
+        .unwrap();
+
+        let row = repo.load_plan("p1").await.unwrap().expect("row");
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            row.updated_at, 1500,
+            "a terminal plan row must not be heartbeated by a late checkpoint"
+        );
+        let tasks = repo.load_task_rows("p1").await.unwrap();
+        assert_eq!(tasks.len(), 1, "the checkpoint task row still lands");
+        assert_eq!(tasks[0].response.as_deref(), Some("late answer"));
+    }
+
     #[tokio::test]
     async fn claim_plan_fences_concurrent_resumes() {
         let dir = tempdir().unwrap();
@@ -985,58 +997,6 @@ mod tests {
         );
         assert_eq!(rows[0].status, "pending");
         assert_eq!(rows[1].status, "progressing");
-    }
-
-    /// W6.2 pin: the UPDATE-only status write preserves a settled task's
-    /// `response` and `agent` (D21 §2 rule (b) — never checkpoint_task's
-    /// INSERT OR REPLACE, which would NULL them); an unknown row reports 0
-    /// affected (structured rejection upstream).
-    #[tokio::test]
-    async fn update_task_status_preserves_response_and_reports_unknown() {
-        let dir = tempdir().unwrap();
-        let db = dir.path().join("wf_upd.db");
-        let client = crate::SqliteClient::open(&db).await.unwrap();
-        let repo = WorkflowRepo::new(&client);
-
-        repo.create_plan("p1", None, "{}", 1000).await.unwrap();
-        repo.checkpoint_task(TaskCheckpoint {
-            plan_id: "p1",
-            task_id: "a",
-            agent: "Explore",
-            status: "completed",
-            response: Some("THE ANSWER"),
-            error: None,
-            now: 1001,
-
-            model: None,
-            duration_ms: None,
-            cost_usd: None,
-        })
-        .await
-        .unwrap();
-
-        let changed = repo
-            .update_task_status("p1", "a", "progressing", 1002)
-            .await
-            .unwrap();
-        assert_eq!(changed, 1);
-
-        let row = &repo.load_task_rows("p1").await.unwrap()[0];
-        assert_eq!(row.status, "progressing", "status updated");
-        assert_eq!(
-            row.response.as_deref(),
-            Some("THE ANSWER"),
-            "completed response survives a model status write"
-        );
-        assert_eq!(row.agent, "Explore", "agent untouched");
-
-        assert_eq!(
-            repo.update_task_status("p1", "ghost", "failed", 1003)
-                .await
-                .unwrap(),
-            0,
-            "unknown task id → 0 affected (structured rejection upstream)"
-        );
     }
 
     /// W6.2b pin: the mark-only sweep cancels ONLY `running` plans older

@@ -8,10 +8,11 @@
 //! - Default: `set` mints one `workflow_plans` row (owner = session id,
 //!   claim-at-create) plus its draft `workflow_tasks` rows (`agent = ''`
 //!   until dispatch); `get` joins spec_json titles with row outcomes.
-//! - Interaction: model status writes are UPDATE-only (a settled task's
-//!   `response`/`error` survive); `set` is mint-once per session — a
-//!   second `set` while a plan for this session is still `running` is a
-//!   structured rejection (terminal plans allow a fresh mint).
+//! - Interaction: `set` and `get` are the only ops — per-task statuses
+//!   transition via the engine's checkpoints, never a model status write
+//!   (F10); `set` is mint-once per session — a second `set` while a plan
+//!   for this session is still `running` is a structured rejection
+//!   (terminal plans allow a fresh mint).
 //! - Sensitivity: mirrors the session's [`Sensitivity`] into `spec_json`
 //!   (D24 §5 — future surfaces are safe by construction, gates nothing
 //!   today). Unset mirror ⇒ `"unknown"`.

@@ -169,10 +169,97 @@ impl PlanControlTool {
             return client.as_ref();
         }
         let path = self.state_db.as_ref()?;
-        let client = zen_repo::SqliteClient::open_lazy(path).await.ok()?;
+        // F7 (W15): a plan-store outage must be visible, not silently
+        // swallowed — warn once (T264/E11 warn-not-silent) while keeping the
+        // graceful "store unavailable" return so the round still completes.
+        let client = match zen_repo::SqliteClient::open_lazy(path).await {
+            Ok(client) => client,
+            Err(e) => {
+                if !DB_OPEN_FAILED_LOGGED.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "plan.control: plan store open failed — control surface unavailable"
+                    );
+                }
+                return None;
+            }
+        };
         let _ = self.db.set(Some(std::sync::Arc::new(client)));
         self.db.get().and_then(|c| c.as_ref())
     }
+}
+
+/// Once-per-process gate for the plan-store open failure (F7).
+static DB_OPEN_FAILED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// F3 (W15): merge appended task specs into the plan's live `spec_json`.
+/// `tasks` is insert-or-replace by task id; a minimal `items` entry
+/// (`{id, title, status:"pending"}`) is added per appended task so
+/// `plan.todos op=get` sees it. Every other key (`session_id`,
+/// `sensitivity`, existing items) is preserved verbatim.
+fn merge_appended_spec(spec_json: &str, appended: &[serde_json::Value]) -> Result<String, String> {
+    let mut spec: serde_json::Value = serde_json::from_str(spec_json).map_err(|e| e.to_string())?;
+    let obj = spec
+        .as_object_mut()
+        .ok_or_else(|| "spec_json is not a JSON object".to_string())?;
+    if !obj.contains_key("tasks") {
+        obj.insert("tasks".to_string(), serde_json::Value::Array(Vec::new()));
+    }
+    if !obj.contains_key("items") {
+        obj.insert("items".to_string(), serde_json::Value::Array(Vec::new()));
+    }
+    if !obj["tasks"].is_array() {
+        return Err("spec_json `tasks` is not an array".to_string());
+    }
+    if !obj["items"].is_array() {
+        return Err("spec_json `items` is not an array".to_string());
+    }
+    for task in appended {
+        let id = task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let tasks = obj
+            .get_mut("tasks")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| "spec_json `tasks` is not an array".to_string())?;
+        if let Some(slot) = tasks
+            .iter_mut()
+            .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        {
+            *slot = task.clone();
+        } else {
+            tasks.push(task.clone());
+        }
+        let title = task
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(title_from_prompt)
+            .unwrap_or_default();
+        let item = serde_json::json!({ "id": id, "title": title, "status": "pending" });
+        let items = obj
+            .get_mut("items")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| "spec_json `items` is not an array".to_string())?;
+        if let Some(slot) = items
+            .iter_mut()
+            .find(|i| i.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        {
+            *slot = item;
+        } else {
+            items.push(item);
+        }
+    }
+    serde_json::to_string(&spec).map_err(|e| e.to_string())
+}
+
+/// F3: the ledger title for an appended task — the first ≤80 chars of the
+/// prompt, newline-flattened and char-boundary-safe.
+fn title_from_prompt(prompt: &str) -> String {
+    let one_line = prompt.replace(['\n', '\r'], " ");
+    one_line.trim().chars().take(80).collect()
 }
 
 #[async_trait::async_trait]
@@ -327,6 +414,7 @@ impl Tool for PlanControlTool {
                 };
                 let existing = repo.load_task_rows(plan_id).await.unwrap_or_default();
                 let mut validated: Vec<zen_repo::TaskDraft> = Vec::new();
+                let mut appended_specs: Vec<serde_json::Value> = Vec::new();
                 for d in drafts {
                     let Some(id) = d.get("id").and_then(|v| v.as_str()) else {
                         return Ok(serde_json::json!({
@@ -394,21 +482,60 @@ impl Tool for PlanControlTool {
                         id: id.to_string(),
                         status: "pending".to_string(),
                     });
+                    appended_specs.push(serde_json::json!({
+                        "id": id,
+                        "agent": agent,
+                        "prompt": prompt,
+                        "depends_on": depends_on,
+                    }));
                 }
                 if validated.is_empty() {
                     return Ok(serde_json::json!({
                         "error": "append requires at least one task"
                     }));
                 }
-                match repo.append_tasks(plan_id, &validated, now).await {
-                    Ok(n) => Ok(serde_json::json!({
-                        "appended": n,
-                        "plan_id": plan_id,
-                    })),
-                    Err(e) => Ok(serde_json::json!({
-                        "error": format!("append failed: {e}")
-                    })),
+                let appended = match repo.append_tasks(plan_id, &validated, now).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Ok(serde_json::json!({
+                            "error": format!("append failed: {e}")
+                        }));
+                    }
+                };
+                // F3 (W15): the row append above is the persistence receipt;
+                // persisting the specs is best-effort observability — a merge
+                // failure warns and never un-does the ledger rows.
+                match repo.load_plan(plan_id).await {
+                    Ok(Some(current)) => {
+                        match merge_appended_spec(&current.spec_json, &appended_specs) {
+                            Ok(merged) => {
+                                if let Err(e) = repo.attach_batch_spec(plan_id, &merged, now).await
+                                {
+                                    tracing::warn!(
+                                        plan = %plan_id,
+                                        error = %e,
+                                        "plan.control append: spec_json merge failed — appended task specs not persisted"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                plan = %plan_id,
+                                error = %e,
+                                "plan.control append: spec_json parse failed — appended task specs not persisted"
+                            ),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        plan = %plan_id,
+                        error = %e,
+                        "plan.control append: spec_json read failed — appended task specs not persisted"
+                    ),
                 }
+                Ok(serde_json::json!({
+                    "appended": appended,
+                    "plan_id": plan_id,
+                }))
             }
             other => Ok(serde_json::json!({
                 "error": format!("unknown op `{other}` — cancel or append")
@@ -505,6 +632,124 @@ mod tests {
         // W6.2: draft rows carry no agent until dispatch (agent-drift
         // replay rule) — append lands pending scaffolding only.
         assert_eq!(rows[0].agent, "");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // F3 (W15): an append persists the task specs it validated — the merged
+    // spec_json carries the `tasks` DAG (corpus-observable) and a minimal
+    // `items` ledger entry per task, while session_id/sensitivity survive.
+    #[tokio::test]
+    async fn append_persists_task_specs_and_items_into_spec_json() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = dir.path().join("state.db");
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan(
+            "p1",
+            None,
+            r#"{"items":[{"id":"a","title":"A","status":"pending"}],"session_id":"local","sensitivity":"private"}"#,
+            1_000,
+        )
+        .await
+        .unwrap();
+        drop(client);
+
+        let tool = control_tool(state_db.clone());
+        let out = tool
+            .invoke(serde_json::json!({
+                "op": "append",
+                "plan_id": "p1",
+                "tasks": [
+                    { "id": "b", "agent": "Explore", "prompt": "find the thing" },
+                    { "id": "c", "agent": "Explore", "prompt": "use the thing", "depends_on": ["b"] }
+                ]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["appended"], serde_json::json!(2), "{out}");
+
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let row = repo.load_plan("p1").await.unwrap().expect("row");
+        let spec: serde_json::Value = serde_json::from_str(&row.spec_json).unwrap();
+        assert_eq!(spec["session_id"], "local", "session marker preserved");
+        assert_eq!(spec["sensitivity"], "private", "sensitivity preserved");
+
+        let tasks = spec["tasks"].as_array().expect("tasks array");
+        let b = tasks.iter().find(|t| t["id"] == "b").expect("task b");
+        assert_eq!(b["agent"], "Explore");
+        assert_eq!(b["prompt"], "find the thing");
+        let c = tasks.iter().find(|t| t["id"] == "c").expect("task c");
+        assert_eq!(c["depends_on"], serde_json::json!(["b"]));
+
+        let items = spec["items"].as_array().expect("items array");
+        assert!(
+            items.iter().any(|i| i["id"] == "a"),
+            "existing ledger items preserved"
+        );
+        let b_item = items.iter().find(|i| i["id"] == "b").expect("item b");
+        assert_eq!(b_item["title"], "find the thing");
+        assert_eq!(b_item["status"], "pending");
+
+        // Corpus-shape read: the induction parser now sees the appended DAG.
+        match crate::workflow_induction::shape_signature_from_spec_json(&row.spec_json) {
+            Ok(crate::workflow_induction::SpecShape::Dag { tasks, .. }) => {
+                let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+                assert!(ids.contains(&"b") && ids.contains(&"c"), "{ids:?}");
+            }
+            other => panic!("appended spec must parse as a DAG: {other:?}"),
+        }
+        assert!(row.updated_at > 1_000, "attach heartbeat bumped updated_at");
+        unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    // F3 (W15): appended items are visible through `plan.todos op=get` —
+    // the model can observe tasks it added between batches.
+    #[tokio::test]
+    async fn append_items_are_visible_via_plan_todos_get() {
+        use crate::plan_todos::{PlanTodosTool, resolve_state_db};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZEN_HOME", dir.path()) };
+        let state_db = resolve_state_db().expect("state.db path");
+        let todos = PlanTodosTool::new(
+            Some(state_db.clone()),
+            Arc::new(Mutex::new(zen_core::types::Sensitivity::Private)),
+        );
+        let minted = todos
+            .invoke(serde_json::json!({
+                "op": "set",
+                "items": [{ "id": "a", "title": "A" }]
+            }))
+            .await
+            .unwrap();
+        let plan_id = minted["plan_id"].as_str().expect("plan id").to_string();
+
+        let control = control_tool(state_db);
+        let out = control
+            .invoke(serde_json::json!({
+                "op": "append",
+                "plan_id": plan_id,
+                "tasks": [{ "id": "b", "agent": "Explore", "prompt": "do the appended thing" }]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["appended"], serde_json::json!(1), "{out}");
+
+        let got = todos
+            .invoke(serde_json::json!({ "op": "get" }))
+            .await
+            .unwrap();
+        let items = got["items"].as_array().unwrap();
+        let b = items
+            .iter()
+            .find(|i| i["id"] == "b")
+            .expect("appended item b");
+        assert_eq!(b["title"], "do the appended thing");
+        assert_eq!(b["status"], "pending");
+        assert!(items.iter().any(|i| i["id"] == "a"), "minted item kept");
         unsafe { std::env::remove_var("ZEN_HOME") };
     }
 

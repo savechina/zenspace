@@ -1329,3 +1329,39 @@ async fn expire_due_marks_agent_future_expired_without_aborting() {
         "a late result must not overwrite the Expired terminal state"
     );
 }
+
+// F6 (W15): a panic inside the agent future is caught by the wrapper and
+// mapped to the terminal Failed status instead of leaving the task Running
+// until expiry (the wrapper task would otherwise die on the unwind).
+#[tokio::test]
+#[allow(unreachable_code)]
+async fn async_panic_maps_to_failed_terminal_status() {
+    const PANIC_ID: &str = "c3d4e5f6-1111-2222-3333-444455556666";
+    let _home = set_zen_home();
+    let join = registry()
+        .spawn_async(
+            PANIC_ID,
+            "sess-w51",
+            "Explore",
+            None,
+            &async_limits(60),
+            async {
+                panic!("boom inside the delegate future");
+                Ok::<serde_json::Value, anyhow::Error>(json!({}))
+            },
+        )
+        .expect("spawn_async admits");
+    let _ = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("wrapper completes promptly despite the panic");
+
+    let snap = registry().snapshot(PANIC_ID).expect("registered");
+    assert!(
+        matches!(snap.status, TaskStatus::Failed(ref m) if m.contains("panicked")),
+        "a panicking future maps to Failed, not Running: {:?}",
+        snap.status
+    );
+    assert!(snap.status.is_terminal());
+    let meta = task_registry::read_meta(PANIC_ID).expect("terminal meta");
+    assert!(matches!(meta.status, TaskStatus::Failed(_)));
+}
