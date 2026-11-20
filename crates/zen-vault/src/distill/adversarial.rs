@@ -34,7 +34,7 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 
 use super::correlation::{Opportunity, correlate};
-use super::hypothesis::generate_from_gaps;
+use super::hypothesis::{gap_type, generate_from_gaps};
 use super::types::{GapKind, GapRecord, HypothesisSlug, HypothesisStatus};
 
 /// Name of the incumbent contestant. Ties keep this title.
@@ -399,15 +399,31 @@ fn judge_hypothesize(
     let determinism = f64::from(same_output(&first, &second));
     // v2: coverage counts correlate groups (not raw gaps) with at least one
     // hypothesis, so deduped outputs are rewarded instead of punished.
+    // v3 (arena-loss-bare-singletons, 2026-11-20): groups holding ONLY
+    // hypothesis-ineligible gap kinds never demand coverage — ineligible
+    // kinds (LlmFailure &c, pinned in `hypothesis::gap_type`) are ops
+    // telemetry by contract, and demanding their coverage rewarded the
+    // naive baseline for validity-0 slug spam. The gate measures "every
+    // gap that SHOULD get a hypothesis gets one".
+    let eligible_gaps: HashSet<&str> = case
+        .gaps
+        .iter()
+        .filter(|gap| gap_type(gap.kind).is_some())
+        .map(|gap| gap.id.as_str())
+        .collect();
+    let eligible_groups: Vec<&HashSet<String>> = groups
+        .iter()
+        .filter(|group| group.iter().any(|id| eligible_gaps.contains(id.as_str())))
+        .collect();
     let got: HashSet<String> = first.iter().map(|slug| slug.created_from.clone()).collect();
-    let coverage = if groups.is_empty() {
+    let coverage = if eligible_groups.is_empty() {
         f64::from(first.is_empty())
     } else {
-        groups
+        eligible_groups
             .iter()
             .filter(|group| group.iter().any(|id| got.contains(id)))
             .count() as f64
-            / groups.len() as f64
+            / eligible_groups.len() as f64
     };
     let unique: HashSet<&str> = first.iter().map(|slug| slug.slug.as_str()).collect();
     let dedup = if first.is_empty() {
@@ -508,7 +524,10 @@ pub fn corpus() -> Vec<EvalCase> {
                 gap(GapKind::OrphanEntity, "bs3", "orphan: Cache").with_entity("Cache"),
             ],
             expected_opps: (3, 3),
-            expected_slugs: (2, 3),
+            // v3: only bs3 (OrphanEntity) is hypothesis-eligible; the two
+            // bare LlmFailure gaps are ops telemetry by pinned contract and
+            // never demand hypotheses (judge coverage is eligibility-aware).
+            expected_slugs: (1, 1),
         },
         EvalCase {
             id: "mixed-domains",
@@ -775,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_singletons_documents_filter_policy() {
+    fn bare_singletons_ineligible_gaps_never_demand_hypotheses() {
         let case = corpus()
             .into_iter()
             .find(|c| c.id == "bare-singletons")
@@ -793,11 +812,19 @@ mod tests {
         let naive = verdict("naive-baseline");
         // Bare gaps always stand alone under zen (uuid-v7 id fallback).
         assert_eq!(zen.correlate.isolation, 1.0);
-        // Zen filters ineligible kinds (LlmFailure) out of hypothesize;
-        // naive emits for every gap. Whether filtering is correct is an
-        // RSI question — the arena stages the divergence either way.
-        assert!(zen.hypothesize.coverage < 1.0);
+        // v3 (arena-loss-bare-singletons resolved 2026-11-20): the RSI
+        // question "is filtering correct?" is settled — it is the pinned
+        // contract (ops telemetry never becomes knowledge hypotheses), and
+        // the judge's coverage demand is eligibility-aware, so ineligible
+        // bare LlmFailure gaps no longer hand the case to validity-0 slug
+        // spam. The case returns to the incumbent.
+        assert_eq!(
+            zen.hypothesize.coverage, 1.0,
+            "only the eligible group (bs3) may demand coverage"
+        );
         assert_eq!(naive.hypothesize.coverage, 1.0);
+        assert!(zen.hypothesize.validity > naive.hypothesize.validity);
+        assert_eq!(result.winner, INCUMBENT);
         assert_eq!(result.verdicts.len(), 2);
     }
 
