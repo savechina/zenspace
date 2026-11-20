@@ -10,14 +10,18 @@
 //! lone session the whole bucket by construction.
 //!
 //! Session identity: `zen_plugin::task_registry::current_session_scope()`
-//! read at reserve/reconcile time (fallback `"local"`). CLI cold processes
-//! and tests outside any session scope always resolve `"local"` ⇒ exactly
-//! one live holder ⇒ `share == capacity` ⇒ decisions are mathematically
-//! identical to the raw [`rig_compose::budget::AtomicTokenBudget`] (the
-//! outstanding ledger ≡ `capacity − available` because holds are the only
-//! thing removing availability). No config keys (Constitution D22).
+//! read at RESERVE time only (fallback `"local"`). The hold's release
+//! carries the admission-time key snapshot inside the reservation's own
+//! destructor path (T6) — reconcile never re-derives the key from ambient
+//! scope. CLI cold processes and tests outside any session scope always
+//! resolve `"local"` ⇒ exactly one live holder ⇒ `share == capacity` ⇒
+//! decisions are mathematically identical to the raw
+//! [`rig_compose::budget::AtomicTokenBudget`] (the outstanding ledger ≡
+//! `capacity − available` because holds are the only thing removing
+//! availability). No config keys (Constitution D22).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -84,20 +88,55 @@ impl FairShareTokenBudget {
             .copied()
             .unwrap_or(0)
     }
+}
 
-    /// Ledger subtract with entry removal at zero (poison-tolerant lock,
-    /// T264 discipline). `saturating_sub` keeps a lost race with a Drop
-    /// refund from over-drafting the ledger.
-    fn ledger_subtract(&self, key: &str, amount: u64) {
+/// T6 — one armed hold's self-releasing identity.
+///
+/// Captured BY VALUE inside the reservation's refund closure, so it
+/// travels wherever the reservation travels. Whichever path rig takes —
+/// invoking the closure body (armed Drop) or discarding it inside
+/// `record_usage` — the release fires exactly once under the ADMISSION
+/// key: the body claims the flag first, the destructor claims it
+/// otherwise. Reconcile therefore never re-derives the session key from
+/// ambient task-local scope (the old shape would book the release under
+/// a wrong key if a future spawn path forgot the scope wrap, leaking a
+/// phantom live holder that dilutes every session's share forever).
+struct HoldState {
+    ledger: Outstanding,
+    key: String,
+    est: u64,
+    released: AtomicBool,
+}
+
+impl HoldState {
+    /// Release the ledger hold under the admission key (single subtract
+    /// site; shared by the closure body and the destructor).
+    fn release(&self) {
         let mut map = self
-            .outstanding
+            .ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = map.get_mut(key) {
-            *entry = entry.saturating_sub(amount);
+        if let Some(entry) = map.get_mut(&self.key) {
+            *entry = entry.saturating_sub(self.est);
             if *entry == 0 {
-                map.remove(key);
+                map.remove(&self.key);
             }
+        }
+    }
+
+    /// Claim the exactly-once right to release (closure body wins over
+    /// Drop by construction: the body runs while the capture is alive).
+    fn claim_release(&self) -> bool {
+        !self.released.swap(true, Ordering::AcqRel)
+    }
+}
+
+impl Drop for HoldState {
+    fn drop(&mut self) {
+        // Destructor path: the sole releaser when rig discards the
+        // closure without invoking it (the record_usage reconcile path).
+        if !self.released.load(Ordering::Acquire) {
+            self.release();
         }
     }
 }
@@ -144,29 +183,27 @@ impl TokenBudget for FairShareTokenBudget {
                 .or_insert(est_armed);
         }
         let ledger = Arc::clone(&self.outstanding);
-        let refund_key = key;
+        let hold = HoldState {
+            ledger,
+            key,
+            est: est_armed,
+            released: AtomicBool::new(false),
+        };
         let combined: TokenRefund = Box::new(move |amount| {
             global_refund(amount);
-            let mut map = ledger
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(entry) = map.get_mut(&refund_key) {
-                *entry = entry.saturating_sub(amount);
-                if *entry == 0 {
-                    map.remove(&refund_key);
-                }
+            if hold.claim_release() {
+                hold.release();
             }
         });
         Ok(Some(TokenReservation::new(est_armed, combined)))
     }
 
-    /// Reconcile one reservation against actual usage. The ledger hold is
-    /// released EXPLICITLY here; the inner `record_usage` disarms the
-    /// combined closure, so the ledger is adjusted exactly once (closure
-    /// on the abort path, this explicit path on reconcile).
+    /// Reconcile one reservation against actual usage. The ledger hold
+    /// releases via the reservation's own destructor path (T6): rig
+    /// discards the refund closure inside its `record_usage`, the
+    /// captured [`HoldState`] drops, and its Drop releases under the
+    /// ADMISSION key — ambient session scope is never consulted.
     async fn record_usage(&self, reservation: TokenReservation, prompt: u64, completion: u64) {
-        let est = reservation.estimate();
-        self.ledger_subtract(&current_session_scope(), est);
         self.inner
             .record_usage(reservation, prompt, completion)
             .await;
@@ -423,5 +460,40 @@ mod tests {
         assert_eq!(fair.outstanding_of("multi"), 0);
         assert_eq!(fair.available(), 92_000);
         assert_eq!(fair.inner.tokens_consumed().await, 8_000);
+    }
+
+    /// T6 (eng-review 2026-11-20, D4 leftover): the ledger releases
+    /// under the ADMISSION key even when reconcile runs OUTSIDE any
+    /// session scope — the old shape re-derived the key from ambient
+    /// task-local scope here and leaked the hold forever (phantom live
+    /// holder ⇒ every later session's share diluted). The hold travels
+    /// inside the reservation, so a future spawn path that forgets the
+    /// SESSION_SCOPE wrap can no longer corrupt the ledger.
+    #[tokio::test]
+    async fn reconcile_without_admission_scope_releases_under_admission_key() {
+        let fair = FairShareTokenBudget::new(100_000);
+        let res = reserve(&fair, "sess-x", 5_000).await.expect("hold");
+        assert_eq!(fair.outstanding_of("sess-x"), 5_000);
+        // Reconcile with NO session scope in scope: ambient resolves to
+        // the "local" fallback — the release must still land on sess-x.
+        fair.record_usage(res, 3_000, 0).await;
+        assert_eq!(
+            fair.outstanding_of("sess-x"),
+            0,
+            "release must ride the admission key snapshot, not ambient scope"
+        );
+        assert_eq!(
+            fair.available(),
+            97_000,
+            "rig internal reconcile unaffected: capacity − consumed"
+        );
+        // No phantom live holder: a fresh lone-session reserve sees the
+        // whole-bucket share (a leaked entry would cap share at 50k).
+        let big = reserve(&fair, "fresh", 80_000).await;
+        assert!(
+            big.is_some(),
+            "leaked phantom holder would dilute the fresh session's share"
+        );
+        drop(big);
     }
 }
