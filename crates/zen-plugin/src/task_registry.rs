@@ -78,6 +78,13 @@ pub const KILL_ALL_GRACE_SECS: u64 = 2;
 /// large enough that an 8MiB stream costs ~1k lock acquisitions.
 const DRAIN_CHUNK_BYTES: usize = 8192;
 
+/// 7d retention window in ms — the age past which a `running` meta is a
+/// stale relic. Shared by the boot sweep's stale-relic skip (probe/signal
+/// work is never spent on relics retention will delete) and the W12.7
+/// collect-fallback normalization (a relic can never terminalize — its
+/// registry entry and wait task died with the daemon).
+const RETENTION_WINDOW_MS: i64 = 7 * 86_400_000;
+
 /// Lifecycle status of one background task.
 ///
 /// Terminal variants are `Completed`/`Failed`/`Timeout`/`Killed`/`Expired`/
@@ -192,6 +199,15 @@ tokio::task_local! {
     /// The orchestrator (Lane O) wraps dispatch in `SESSION_SCOPE`; tools
     /// read it via [`current_session_scope`]. Unset ⇒ `"local"`.
     pub static SESSION_SCOPE: String;
+
+    /// MCP-surface marker (W12.28, review 2026-11-17 A2): the
+    /// `HookedMcpTool` wrapper scopes `true` around every MCP-surface
+    /// `tools/call`. MCP clients have no approval UX and no turn affinity,
+    /// so any approval-requiring invocation dispatched under this marker
+    /// resolves deny + audit + structured `approval-required` (the W5.2
+    /// background-task fail-closed ruling, mirrored for MCP). Unset ⇒ the
+    /// pre-W12.28 direct dispatch behavior is unchanged.
+    pub static MCP_CALL: bool;
 }
 
 /// Real `tokio::process::Command`, re-exported for callers whose own `tokio`
@@ -208,6 +224,14 @@ pub fn current_session_scope() -> String {
     SESSION_SCOPE
         .try_with(|s| s.clone())
         .unwrap_or_else(|_| "local".to_string())
+}
+
+/// Whether the current task runs under the MCP-surface marker (W12.28/A2).
+/// Unset outside the [`HookedMcpTool`](crate::mcp_hooked_tool::HookedMcpTool)
+/// invoke scope ⇒ `false`.
+#[must_use]
+pub fn is_mcp_call() -> bool {
+    MCP_CALL.try_get().unwrap_or(false)
 }
 
 /// Daemon-shutdown drain flag (review fix i): set by the gateway daemon at
@@ -440,6 +464,45 @@ struct TaskEntry {
     async_result: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
+/// W12.5 (review P1-perf/N11): does this entry still hold a LIVE handle —
+/// the unit the `[agentic.background] max_concurrent` union cap actually
+/// bounds?
+///
+/// A `Running` status is live by definition. A TERMINAL status is still
+/// live while its handle has not terminated/been reaped:
+/// - `Expired` (agent-future path, W5.1): expiry marks the status WITHOUT
+///   aborting the handle — the future keeps polling and holds its token
+///   reserve, so it consumes a slot until the handle finishes.
+/// - `Killed`: the async kill's abort lands at the future's next await
+///   point (live until `is_finished()`); the process kill's SIGTERM grace
+///   window leaves the child alive until the wait task reaps it
+///   (`reaped` flag).
+/// - `Timeout` (process path): the group was SIGKILLed — dead by
+///   construction, only the microsecond reap window remains; not live.
+/// - `Completed`/`Failed`/`Orphaned`: terminal with nothing running.
+///
+/// A missing `abort_handle` on the async path (the pre-wiring window
+/// between entry insert and handle wiring inside `spawn_async`) is
+/// treated as LIVE — conservative in the safe direction: the cap may
+/// briefly over-count, never under-count.
+fn entry_holds_live_handle(entry: &TaskEntry) -> bool {
+    let status = lock_ok(&entry.snapshot, "task snapshot").status.clone();
+    match status {
+        TaskStatus::Running => true,
+        TaskStatus::Expired => entry.abort_handle.as_ref().is_none_or(|h| !h.is_finished()),
+        TaskStatus::Killed => {
+            if entry.child.is_none() {
+                // Agent-future path: live until the abort lands.
+                entry.abort_handle.as_ref().is_none_or(|h| !h.is_finished())
+            } else {
+                // Process path: live until the wait task reaps the child.
+                !entry.reaped.load(Ordering::SeqCst)
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Process-global background task registry (D8: de facto daemon-scoped —
 /// all hosted turns run in the daemon per 004).
 pub struct TaskRegistry {
@@ -508,10 +571,23 @@ impl TaskRegistry {
             // is sync (dir create, fork/exec, meta build), so holding the
             // entries lock across it is safe and bounds the overshoot race.
             let mut map = lock_ok(&self.entries, "registry entries");
-            let live = map
-                .values()
-                .filter(|e| lock_ok(&e.snapshot, "task snapshot").status == TaskStatus::Running)
-                .count();
+            // W12.6: re-check inside the critical section. A spawn whose
+            // outer check passed can still race the drain (flag set +
+            // kill_all landing between the outer check and this lock
+            // acquisition) — an entry inserted here would be a live pump
+            // the drain already decided it had killed. Same structured
+            // rejection as the outer check.
+            if is_draining() {
+                bail!(
+                    "background task rejected: the daemon is shutting down (drain \
+                     in progress); no new background tasks may be spawned"
+                );
+            }
+            // W12.5: the union cap counts LIVE handles, not merely `Running`
+            // statuses — an expiry-zombie (terminal status, handle still
+            // alive; W5.1 expiry never aborts) consumes a slot until its
+            // handle terminates or is reaped.
+            let live = map.values().filter(|e| entry_holds_live_handle(e)).count();
             if live >= limits.max_concurrent {
                 bail!(
                     "background task rejected: {live} live tasks already at the \
@@ -774,10 +850,19 @@ impl TaskRegistry {
             // section covers the live-count check, the duplicate-id check,
             // and the entry insert.
             let mut map = lock_ok(&self.entries, "registry entries");
-            let live = map
-                .values()
-                .filter(|e| lock_ok(&e.snapshot, "task snapshot").status == TaskStatus::Running)
-                .count();
+            // W12.6 parity: the drain re-check must sit inside the same
+            // critical section as the insert — the outer check alone
+            // leaves the flag-set + kill_all vs lock-acquisition window
+            // open (leaked live future the drain never saw).
+            if is_draining() {
+                bail!(
+                    "background task rejected: the daemon is shutting down (drain \
+                     in progress); no new background tasks may be spawned"
+                );
+            }
+            // W12.5 parity: same live-handle union cap as the process path
+            // (expiry-zombie futures consume a slot until they finish).
+            let live = map.values().filter(|e| entry_holds_live_handle(e)).count();
             if live >= limits.max_concurrent {
                 bail!(
                     "background task rejected: {live} live tasks already at the \
@@ -1169,8 +1254,10 @@ impl TaskRegistry {
     /// or `wait_ms` elapses — never a busy-spin, never aborts. The Ok
     /// payload comes from the same-lock stash (no meta rewrite race); a
     /// registry-miss falls back to the on-disk `meta.json` (daemon-restart
-    /// case). Idempotent: terminal states are stable and repeated collects
-    /// observe the same status.
+    /// case), where a stale `running` meta older than the 7d retention
+    /// window is normalized to `Expired` for the response and on disk
+    /// (W12.7 — never running-forever). Idempotent: terminal states are
+    /// stable and repeated collects observe the same status.
     ///
     /// # Errors
     /// Unknown id with no `meta.json` fallback.
@@ -1210,7 +1297,12 @@ impl TaskRegistry {
                 }
             } else {
                 // Registry miss → meta.json fallback (daemon restart).
-                if let Some(meta) = read_meta(task_id) {
+                if let Some(mut meta) = read_meta(task_id) {
+                    // W12.7: a stale (>7d) running meta can never
+                    // terminalize — normalize the response to Expired and
+                    // persist the rewrite (warn on failure) instead of
+                    // reporting running-forever.
+                    normalize_stale_running_meta(&mut meta);
                     let (response, error) = outcome_parts(&meta.status, meta.result.clone());
                     return Ok(DelegateCollect {
                         task_id: task_id.to_string(),
@@ -1594,7 +1686,7 @@ pub fn sweep_orphans_on_boot() -> usize {
                 }
                 // Sweep-cost bound: retention deletes these dirs at 7d
                 // anyway; older-than-7d running metas are stale relics.
-                if now_ms().saturating_sub(meta.started_at_ms) > 7 * 86_400_000 {
+                if now_ms().saturating_sub(meta.started_at_ms) > RETENTION_WINDOW_MS {
                     continue;
                 }
                 // Two-tier decision (D1 amended): dead group ⇒ mark-only;
@@ -1800,6 +1892,51 @@ pub fn mark_meta_status(task_id: &str, status: TaskStatus) -> Option<TaskMeta> {
     let path = meta_path(task_id);
     write_atomic(&path, &bytes).ok()?;
     Some(meta)
+}
+
+/// W12.7 (review Q7): normalize a stale `running` meta at collect-fallback
+/// READ time. A meta stuck `running` with `started_at_ms` older than the
+/// 7d retention window ([`RETENTION_WINDOW_MS`] — the same age rule the
+/// boot sweep uses for stale relics) can never terminalize: its registry
+/// entry and wait task died with the daemon, so `collect` would report
+/// `running` forever.
+///
+/// GIVEN such a meta, WHEN this runs, THEN the meta is normalized to
+/// [`TaskStatus::Expired`] (in place, for the caller's response) and the
+/// rewrite is persisted via [`write_atomic`]. The response normalization
+/// happens regardless; a persist failure warns (never a silent `let _ =`)
+/// and leaves the disk meta for the next retention pass. Fresh (<7d)
+/// running metas and already-terminal metas are returned untouched.
+///
+/// Returns `true` when the meta was normalized.
+fn normalize_stale_running_meta(meta: &mut TaskMeta) -> bool {
+    if meta.status != TaskStatus::Running {
+        return false;
+    }
+    if now_ms().saturating_sub(meta.started_at_ms) <= RETENTION_WINDOW_MS {
+        return false;
+    }
+    meta.status = TaskStatus::Expired;
+    meta.ended_at_ms = Some(now_ms());
+    let path = meta_path(&meta.task_id);
+    match serde_json::to_vec_pretty(&meta) {
+        Ok(bytes) => {
+            if let Err(e) = write_atomic(&path, &bytes) {
+                tracing::warn!(
+                    path = %path.display(),
+                    task_id = %meta.task_id,
+                    error = %e,
+                    "collect fallback: stale running meta normalized to expired, but the terminal-state meta rewrite failed (disk meta left for retention)"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            task_id = %meta.task_id,
+            error = %e,
+            "collect fallback: stale running meta re-serialization failed (response still expired, disk meta untouched)"
+        ),
+    }
+    true
 }
 
 /// Persist a task's meta view atomically (tmp + fsync + rename). Failures
@@ -2125,5 +2262,93 @@ mod tests {
             !group_alive(pid),
             "reaped child's group must probe gone (ESRCH)"
         );
+    }
+
+    /// W12.6 tight-window pin (review Q6): the drain decision landing
+    /// BETWEEN a spawn's outer `is_draining` check and its entries-lock
+    /// acquisition must be caught by the IN-lock re-check — the spawn is
+    /// refused and NO entry is inserted behind the drain's back.
+    ///
+    /// The interleaving is driven explicitly through the lock, not by
+    /// timing: the test thread HOLDS the entries lock while the spawn
+    /// thread runs (its outer check passes — the flag is still clear — and
+    /// it parks at the lock acquisition), sets the drain flag while the
+    /// spawn is parked, then releases the lock so the spawn enters the
+    /// critical section with the flag already set. Deterministic under
+    /// nextest (process-per-test). No shuttle DST sweep: zen-plugin has no
+    /// `shuttle` feature (the shuttle-tokio feature chain lives in
+    /// zen-agents/zen-gateway/zen-cli only), so a deterministic pin is the
+    /// available and sufficient proof here.
+    #[test]
+    fn spawn_parked_on_the_entries_lock_is_refused_when_drain_lands_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // SAFETY: single-threaded test process under nextest
+        // (process-per-test); std::env::set_var is process-global.
+        unsafe {
+            std::env::set_var("ZEN_HOME", dir.path());
+        }
+        zen_core::config::invalidate_config_cache();
+        clear_draining();
+
+        let reg = registry();
+        {
+            // Hold the entries lock: any concurrent spawn passes its outer
+            // check (flag clear) and parks at the critical-section entry.
+            let _map_guard = lock_ok(&reg.entries, "test entries");
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let mut cmd = tokio::process::Command::new("/bin/sleep");
+                cmd.arg("5");
+                cmd.process_group(0);
+                let limits = BackgroundLimits {
+                    max_wall_secs: 60,
+                    max_concurrent: 4,
+                    output_cap_bytes: OUTPUT_CAP_BYTES,
+                };
+                // spawn_background needs a runtime context for its spawned
+                // drain/wait tasks; a current-thread runtime suffices. The
+                // child is never forked on the expected (refusal) path —
+                // the in-lock bail fires BEFORE cmd.spawn().
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let res =
+                    rt.block_on(async { reg.spawn_background(cmd, "local", "sleep 5", &limits) });
+                done_tx.send(res).expect("receiver alive");
+            });
+
+            // Bounded window for the spawn thread to pass its outer check
+            // and park on the lock (the flag is still clear at that point).
+            // Either interleaving is safe when the fix is present — both
+            // checks refuse — so the pin is stable; the held lock makes the
+            // discriminating interleaving (outer passed, flag set, then
+            // lock entered) the overwhelmingly likely one.
+            std::thread::sleep(Duration::from_millis(200));
+
+            // The drain decision: flag set FIRST (daemon drain-start order),
+            // while we still hold the lock the spawn is parked on.
+            set_draining();
+            drop(_map_guard);
+
+            let res = done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("spawn thread must finish");
+            let err = res.expect_err("spawn parked across the drain decision must be refused");
+            assert!(
+                err.to_string().contains("shutting down"),
+                "structured drain rejection, got: {err}"
+            );
+            handle.join().expect("spawn thread joins");
+        }
+
+        // Nothing was inserted behind the drain's back.
+        assert_eq!(
+            reg.live_count(),
+            0,
+            "a drain-window refusal must not leave a live entry behind"
+        );
+        clear_draining();
     }
 }

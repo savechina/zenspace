@@ -67,9 +67,27 @@ pub use mcp_server::McpServer;
 /// Builds the Confidential-filtered MCP tool registry served on every
 /// carrier (FR-020: stdio and HTTP must expose identical tools).
 ///
+/// W12.28 (review A2 + D24d): the underlying wiring resolves its sandbox
+/// mode via the daemon ladder (`ZEN_SANDBOX_MODE` env → `WorkspaceWrite`
+/// default — `daemon.rs::build_orchestrator` precedent, minus the explicit
+/// param this surface does not have) so the MCP hook pipeline matches the
+/// hosted-turn pipeline's mode instead of a hardcoded `WorkspaceWrite`.
+///
 /// # Errors
 /// Never fails — registry construction degrades internally; a build
 /// failure yields an empty (but valid) registry.
 pub fn mcp_registry_for_http() -> rig_compose::registry::ToolRegistry {
-    zen_agents::wiring::ZenWiring::new().build_mcp_registry()
+    use zen_core::sandbox::SandboxMode;
+
+    let mode = std::env::var("ZEN_SANDBOX_MODE")
+        .ok()
+        .and_then(|v| SandboxMode::parse_str(&v))
+        .unwrap_or(SandboxMode::WorkspaceWrite);
+    let workspace_roots = zen_core::paths::ZenPaths::detect()
+        .ok()
+        .and_then(|p| p.workspace_root().cloned())
+        .map(|w| vec![w])
+        .unwrap_or_default();
+    zen_agents::wiring::ZenWiring::with_sandbox_mode(mode, workspace_roots, None)
+        .build_mcp_registry()
 }

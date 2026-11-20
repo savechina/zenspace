@@ -134,6 +134,20 @@ fn append_cancel_audit(plan_id: &str) {
     let _ = zen_core::jsonl::append_jsonl_line(&path, &line);
 }
 
+/// W12.11 (T15/Q8): the cancel result payload is a pure function of the
+/// observed outcomes — `cancelled` mirrors the REAL DB row flip (a failed
+/// flip reports `cancelled: false`, never a false success) and `signalled`
+/// records whether a live in-process executor received the watch signal
+/// (previously discarded).
+fn cancel_payload(plan_id: &str, flipped: bool, signalled: bool) -> serde_json::Value {
+    serde_json::json!({
+        "cancelled": flipped,
+        "plan_id": plan_id,
+        "row_flipped": flipped,
+        "signalled": signalled,
+    })
+}
+
 /// W9.3 control tool: `{op: "cancel"|"append", plan_id, tasks?}`.
 pub struct PlanControlTool {
     delegate: std::sync::Arc<DelegateTaskTool>,
@@ -208,6 +222,8 @@ impl Tool for PlanControlTool {
                 "type": "object",
                 "properties": {
                     "cancelled": { "type": "boolean" },
+                    "row_flipped": { "type": "boolean" },
+                    "signalled": { "type": "boolean" },
                     "appended": { "type": "integer" },
                     "plan_id": { "type": "string" },
                     "error": { "type": "string" }
@@ -253,17 +269,24 @@ impl Tool for PlanControlTool {
                         )
                     }));
                 }
-                let flipped = repo
-                    .cancel_running_plan(plan_id, now)
-                    .await
-                    .unwrap_or(false);
-                let _signalled = signal_cancel(plan_id);
+                let flipped = match repo.cancel_running_plan(plan_id, now).await {
+                    Ok(flipped) => flipped,
+                    Err(e) => {
+                        tracing::warn!(plan_id, error = %e, "plan cancel row flip failed");
+                        false
+                    }
+                };
+                let signalled = signal_cancel(plan_id);
+                if !signalled {
+                    tracing::debug!(
+                        plan_id,
+                        "cancel signal found no live executor in-process (the DB row flip is authoritative)"
+                    );
+                }
                 append_cancel_audit(plan_id);
-                Ok(serde_json::json!({
-                    "cancelled": true,
-                    "plan_id": plan_id,
-                    "row_flipped": flipped,
-                }))
+                // W12.11 (T15/Q8): `cancelled` reports the REAL row outcome —
+                // a failed flip must never masquerade as success.
+                Ok(cancel_payload(plan_id, flipped, signalled))
             }
             "append" => {
                 // Between-batches gate only — a live executor holding a
@@ -546,6 +569,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["cancelled"], serde_json::json!(true), "{out}");
+        // W12.11 (T15/Q8): the payload carries the real outcomes — the
+        // happy path flipped the row AND delivered the watch signal.
+        assert_eq!(out["row_flipped"], serde_json::json!(true), "{out}");
+        assert_eq!(out["signalled"], serde_json::json!(true), "{out}");
         let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
         let repo = zen_repo::WorkflowRepo::new(&client);
         let row = repo.load_plan("p1").await.unwrap().unwrap();
@@ -587,6 +614,27 @@ mod tests {
             "{out}"
         );
         unsafe { std::env::remove_var("ZEN_HOME") };
+    }
+
+    /// W12.11 (T15/Q8) pin: a failed row flip must never masquerade as
+    /// success — `cancelled` mirrors the REAL DB outcome (`row_flipped`),
+    /// and the watch-signal result stays visible instead of discarded.
+    /// The failed-flip leg is only reachable via a load→update TOCTOU race,
+    /// so the honesty contract is pinned at the pure payload seam (repo
+    /// precedent: `fingerprint_gate`, `enter_decision`) while the happy
+    /// path above proves `invoke` routes through it.
+    #[test]
+    fn failed_row_flip_reports_cancelled_false_no_false_success() {
+        let failed = cancel_payload("p1", false, true);
+        assert_eq!(failed["cancelled"], serde_json::json!(false), "{failed}");
+        assert_eq!(failed["row_flipped"], serde_json::json!(false), "{failed}");
+        assert_eq!(failed["signalled"], serde_json::json!(true), "{failed}");
+        let silent = cancel_payload("p1", false, false);
+        assert_eq!(silent["cancelled"], serde_json::json!(false), "{silent}");
+        assert_eq!(silent["signalled"], serde_json::json!(false), "{silent}");
+        let ok = cancel_payload("p1", true, false);
+        assert_eq!(ok["cancelled"], serde_json::json!(true), "{ok}");
+        assert_eq!(ok["row_flipped"], serde_json::json!(true), "{ok}");
     }
 
     /// W11.12/T13 (G6): a cancel arriving between register_live_plan and the

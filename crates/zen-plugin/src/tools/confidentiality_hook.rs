@@ -203,10 +203,21 @@ impl ToolDispatchHook for ConfidentialityHook {
         // remains the documented non-turn fallback (direct dispatch outside
         // any orchestrator turn scope).
         let sensitivity = zen_core::turn_context::current_sensitivity().unwrap_or_else(|| {
-            self.sensitivity
-                .lock()
-                .map(|guard| *guard)
-                .unwrap_or(Sensitivity::Public)
+            // W12.9 (T16/N8) fail-closed: a poisoned cell must never skip the
+            // confidentiality gate (the old `unwrap_or(Public)` fallback was
+            // fail-open — a poisoned Confidential cell would have allowed
+            // cloud egress). Mirror the zen-gateway guards::lock_ok posture
+            // locally (zen-core has no shared lock_ok helper): warn on
+            // poison, recover the guard, and gate on the last-written value.
+            match self.sensitivity.lock() {
+                Ok(guard) => *guard,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "confidentiality sensitivity cell poisoned; recovering last value"
+                    );
+                    *poisoned.into_inner()
+                }
+            }
         });
         if sensitivity == Sensitivity::Confidential && is_cloud_tool(&invocation.name) {
             return Ok(ToolDispatchAction::Skip {
@@ -279,6 +290,29 @@ mod tests {
         // Outside the turn scope the Public cell allows the cloud tool.
         let fallback = hook.before_invocation(&invocation).await.unwrap();
         assert!(matches!(fallback, ToolDispatchAction::Continue));
+    }
+
+    /// W12.9 (T16/N8): a poisoned sensitivity cell never skips the
+    /// confidentiality gate — the recovered value still enforces the
+    /// decision (the old Public fallback was fail-open).
+    #[tokio::test]
+    async fn poisoned_cell_still_enforces_confidentiality() {
+        let hook = ConfidentialityHook::new(Sensitivity::Confidential);
+        let cell = hook.shared_sensitivity();
+        // Poison the cell: panic while holding the lock, suppressed here.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cell.lock().unwrap();
+            panic!("poison the sensitivity cell");
+        }));
+        let invocation = ToolInvocation {
+            name: "web.search".into(),
+            args: serde_json::json!({"query": "secret"}),
+        };
+        let action = hook.before_invocation(&invocation).await.unwrap();
+        assert!(
+            matches!(action, ToolDispatchAction::Skip { .. }),
+            "a poisoned Confidential cell must still block cloud tools"
+        );
     }
 
     #[tokio::test]

@@ -82,6 +82,11 @@ impl ConversationStore {
 
     /// Create a conversation store from a specific file path.
     pub fn with_file(file_path: PathBuf, session_id: &str) -> Result<Self> {
+        // D31 defense-in-depth (W12.8/T17): the id is stored and echoed in
+        // logs, so it must satisfy the session-id charset at every store
+        // seam — symmetric with open()/with_dir() above.
+        zen_core::types::validate_session_id(session_id)
+            .map_err(|detail| anyhow::anyhow!("invalid session id: {detail}"))?;
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create parent directory: {}", parent.display())
@@ -460,6 +465,29 @@ mod tests {
         );
         assert!(
             ConversationStore::with_dir(dir.path().to_path_buf(), "local").is_ok(),
+            "legitimate id still works"
+        );
+    }
+
+    /// W12.8 (T17/N9): `with_file` validates the session id symmetrically
+    /// with open()/with_dir() — a traversal-shaped id is refused at every
+    /// store constructor (defense-in-depth against path traversal).
+    #[test]
+    fn with_file_validates_session_id_like_open_and_with_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["../escape", "a/b", "s%1", ""] {
+            assert!(
+                ConversationStore::with_file(dir.path().join("x.jsonl"), bad).is_err(),
+                "traversal-shaped id `{bad}` refused"
+            );
+        }
+        let long = "a".repeat(129);
+        assert!(
+            ConversationStore::with_file(dir.path().join("x.jsonl"), &long).is_err(),
+            "over-length id refused"
+        );
+        assert!(
+            ConversationStore::with_file(dir.path().join("ok.jsonl"), "local").is_ok(),
             "legitimate id still works"
         );
     }

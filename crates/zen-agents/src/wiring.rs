@@ -874,13 +874,43 @@ impl ZenWiring {
     /// tool registry itself (not the sensitivity map) so that any newly
     /// registered tool defaults to the safe `Private` exposure level via
     /// [`Self::tool_sensitivity`].
+    ///
+    /// W12.28 (review A2): every exposed tool is wrapped in
+    /// [`zen_plugin::mcp_hooked_tool::HookedMcpTool`] so BOTH MCP carriers
+    /// (stdio via rig-mcp `serve_stdio`, HTTP via the `mcp_handler`) route
+    /// `tools/call` through the same 5-hook pipeline as agent rounds
+    /// (confidentiality → budget → seatbelt → audit → approval). The
+    /// Confidential filter itself is unchanged, so `tools/list` output and
+    /// the exposure contract stay byte-identical.
     pub fn build_mcp_registry(&self) -> ToolRegistry {
         let filtered = ToolRegistry::new();
+        // One shared unit-cost budget per registry — the SAME concurrency-
+        // limiter shape (AtomicBudget::new(20), hardcoded default) as the
+        // agent pipeline's build_sandbox_hooks. D22: no new config keys.
+        let mcp_budget = Arc::new(AtomicBudget::new(20));
+        let workspace_roots = ZenPaths::detect()
+            .ok()
+            .and_then(|p| p.workspace_root().cloned())
+            .map(|w| vec![w])
+            .unwrap_or_default();
+        let policy = SeatbeltPolicy::new(self.sandbox_mode, workspace_roots)
+            .with_timeout(300)
+            .with_arg_registry(Self::build_tool_arg_registry());
+        let audit_log_path = Self::audit_log_path();
+
         for schema in self.tools.schemas() {
-            if self.tool_sensitivity(&schema.name) != Sensitivity::Confidential
+            let sensitivity = self.tool_sensitivity(&schema.name);
+            if sensitivity != Sensitivity::Confidential
                 && let Ok(tool) = self.tools.get(&schema.name)
             {
-                filtered.register(tool);
+                filtered.register(Arc::new(zen_plugin::mcp_hooked_tool::HookedMcpTool::new(
+                    tool,
+                    sensitivity,
+                    Arc::clone(&mcp_budget),
+                    policy.clone(),
+                    audit_log_path.clone(),
+                    self.sandbox_mode,
+                )));
             }
         }
         filtered

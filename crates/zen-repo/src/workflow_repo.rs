@@ -21,10 +21,13 @@ pub struct TaskCheckpoint<'a> {
 /// a fresh resume — a crashed run must not wedge the plan forever.
 ///
 /// W6.2b (D24 §3): this is the DOCUMENTED FALLBACK value of the unified
-/// staleness definition — 2× the default turn watchdog (900s ⇒ 1800s).
-/// Callers resolve the live value (2× `[gateway].turn_watchdog_secs`) and
+/// staleness definition — 4× the default turn watchdog (900s ⇒ 3600s),
+/// aligned with the watchdog-renewal ceiling (`PLAN_WATCHDOG_CEILING` =
+/// 4× watchdog, zen-gateway guards.rs; W12.2/eng-review N1 — a smaller
+/// window stale-sweeps live plans mid-task and invites a double-spend).
+/// Callers resolve the live value (4× `[gateway].turn_watchdog_secs`) and
 /// pass it explicitly; the sweep and the resume fence share one definition.
-pub const DEFAULT_STALE_CLAIM_SECS: i64 = 1800;
+pub const DEFAULT_STALE_CLAIM_SECS: i64 = 3600;
 
 /// W11.13/T14 (F8, D22 code-constant policy): the forecast reads at most
 /// this many recent completed-task duration rows. A code constant, not a
@@ -102,7 +105,8 @@ impl<'a> WorkflowRepo<'a> {
         self.client
             .writer()
             .call(move |conn| {
-                conn.execute(
+                let tx = conn.transaction()?;
+                tx.execute(
                     "INSERT OR REPLACE INTO workflow_tasks \
                      (plan_id, task_id, agent, status, response, error, updated_at, \
                       model, duration_ms, cost_usd) \
@@ -120,6 +124,20 @@ impl<'a> WorkflowRepo<'a> {
                         cost_usd
                     ],
                 )?;
+                // W12.2 (eng-review N1): progress heartbeat — bump the plan
+                // row's `updated_at` in the SAME transaction as the task
+                // write. A live plan checkpoints per task, so a fresh
+                // `updated_at` proves liveness to the stale-claim sweep and
+                // the resume fence. Without this bump the plan row froze at
+                // mint time and a sanctioned long task (the watchdog-renewal
+                // ceiling, `PLAN_WATCHDOG_CEILING` = 4× watchdog in
+                // zen-gateway guards.rs) got stale-swept (owner NULLed) and
+                // its claim stolen by a second resume — a true double-spend.
+                tx.execute(
+                    "UPDATE workflow_plans SET updated_at = ?1 WHERE plan_id = ?2",
+                    rusqlite::params![now, plan_id],
+                )?;
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -415,7 +433,8 @@ impl<'a> WorkflowRepo<'a> {
     /// claim, `Ok(false)` when another run holds it or the plan went
     /// terminal. A claim with no progress for `stale_secs` may be stolen
     /// so a crashed resume does not wedge the plan forever (W6.2b: the
-    /// caller passes the unified staleness value — 2× the turn watchdog;
+    /// caller passes the unified staleness value — 4× the turn watchdog,
+    /// the `PLAN_WATCHDOG_CEILING` renewal ceiling (W12.2/N1);
     /// [`DEFAULT_STALE_CLAIM_SECS`] is the documented fallback).
     pub async fn claim_plan(
         &self,
@@ -441,6 +460,20 @@ impl<'a> WorkflowRepo<'a> {
             .map_err(SqliteError::TokioRusqlite)
     }
 
+    /// Engine-outcome terminal write (T376): flip the plan row to
+    /// `completed`/`failed` with the gate verdict and merged summary.
+    ///
+    /// W12.16 (review Q1): the write is GUARDED to flip only still-
+    /// `running` rows — a `cancelled` row written by `plan.control`, the
+    /// drain finalizer, or the mark-only stale sweep during the
+    /// quality-gate tail window is never silently reverted to a terminal
+    /// engine outcome (cancel irreversibility, W9.3 semantics).
+    ///
+    /// Returns `Ok(true)` when THIS call flipped the row, `Ok(false)` when
+    /// the row was already terminal or does not exist — the caller treats a
+    /// non-flip as having lost the terminal race (engine outcome yields to
+    /// the recorded cancel). Pre-existing callers (`.unwrap()` sites in the
+    /// morning-brief worker and the migration 006 pin) compile unchanged.
     pub async fn complete_plan(
         &self,
         plan_id: &str,
@@ -449,25 +482,26 @@ impl<'a> WorkflowRepo<'a> {
         plan_approved: Option<bool>,
         delivery_ready: Option<bool>,
         now: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let plan_id = plan_id.to_string();
         let status = status.to_string();
         let summary = summary.map(|s| s.to_string());
         let plan_approved = plan_approved.map(|b| b as i64);
         let delivery_ready = delivery_ready.map(|b| b as i64);
-        self.client
+        let changed = self
+            .client
             .writer()
             .call(move |conn| {
-                conn.execute(
+                Ok(conn.execute(
                     "UPDATE workflow_plans SET status = ?1, summary = ?2, plan_approved = ?3, \
-                     delivery_ready = ?4, updated_at = ?5, owner = NULL WHERE plan_id = ?6",
+                     delivery_ready = ?4, updated_at = ?5, owner = NULL \
+                     WHERE plan_id = ?6 AND status = 'running'",
                     rusqlite::params![status, summary, plan_approved, delivery_ready, now, plan_id],
-                )?;
-                Ok(())
+                )?)
             })
             .await
             .map_err(SqliteError::TokioRusqlite)?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     pub async fn load_plan(&self, plan_id: &str) -> Result<Option<WorkflowPlanRow>> {
@@ -605,6 +639,34 @@ mod tests {
         );
     }
 
+    // W12.16a: `complete_plan` is guarded `AND status = 'running'` — a
+    // late engine completion must not resurrect a plan the cancel path
+    // already finalized (engine outcome yields to recorded cancel, W9.3).
+    #[tokio::test]
+    async fn complete_plan_after_cancel_keeps_cancelled_row() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wf_cancel_guard.db");
+        let client = crate::SqliteClient::open(&db).await.unwrap();
+        let repo = WorkflowRepo::new(&client);
+
+        repo.create_plan("p1", None, "{}", 1000).await.unwrap();
+        assert!(
+            repo.cancel_running_plan("p1", 1001).await.unwrap(),
+            "running plan should cancel"
+        );
+        let flipped = repo
+            .complete_plan("p1", "completed", Some("late engine"), None, None, 1002)
+            .await
+            .unwrap();
+        assert!(
+            !flipped,
+            "complete_plan must not flip an already-cancelled row"
+        );
+        let row = repo.load_plan("p1").await.unwrap().expect("row exists");
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(row.summary.as_deref(), Some("cancelled"));
+    }
+
     #[tokio::test]
     async fn checkpoint_task_is_idempotent_per_plan_task() {
         let dir = tempdir().unwrap();
@@ -730,15 +792,16 @@ mod tests {
         );
     }
 
-    /// W6.2b pin: the documented fallback staleness value is 2× the
-    /// default turn watchdog (900s ⇒ 1800s) — the unified definition the
-    /// sweep and the resume fence share.
+    /// W6.2b pin + W12.2 (N1): the documented fallback staleness value is
+    /// 4× the default turn watchdog (900s ⇒ 3600s) — the unified definition
+    /// the sweep and the resume fence share, aligned with the
+    /// `PLAN_WATCHDOG_CEILING` renewal ceiling (4× watchdog).
     #[test]
-    fn default_stale_claim_is_twice_the_default_watchdog() {
+    fn default_stale_claim_is_four_times_the_default_watchdog() {
         assert_eq!(
             DEFAULT_STALE_CLAIM_SECS,
-            2 * 900,
-            "unified staleness = 2× turn watchdog default"
+            4 * 900,
+            "unified staleness = 4× turn watchdog default (≥ renewal ceiling)"
         );
     }
 

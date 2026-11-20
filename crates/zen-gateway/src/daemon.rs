@@ -316,7 +316,20 @@ fn spawn_boot_time_sweep() {
                 tracing::warn!(error = %e, "background-task boot sweep task failed");
             }
         }
+        // W12.22 (TD7, review C-F3): plan stale-claim sweep at BOOT — the
+        // GC tick alone left plans from a crashed daemon `running` for the
+        // first ~30s of the next daemon's life (spec claims boot+GC). One
+        // fire-and-forget pass here closes the gap; `sweep_plans_due` is
+        // fail-open and writes its own audit line when it cancels rows.
+        sweep_plans_due(default_audit_path().as_deref()).await;
     });
+}
+
+/// W12.22: the boot sweep's audit sink — same `<logs>/audit.jsonl` the GC
+/// tick uses when the hosting service is unreachable here.
+fn default_audit_path() -> Option<std::path::PathBuf> {
+    let paths = zen_core::paths::ZenPaths::detect().ok()?;
+    Some(paths.logs().join("audit.jsonl"))
 }
 
 /// Blocking body of the background-task crash-orphan sweep (design D1,
@@ -462,11 +475,13 @@ pub async fn expire_background_due(
 }
 
 /// W6.2b (D24 §3/§4): plan-ledger sweep on the 30s GC cadence — mark-only
-/// stale cancellation (unified staleness = 2× the base turn watchdog, the
-/// resume fence's own steal window) then 90-day retention (tasks first,
-/// then plans; `running` exempt). Boot = one sweep before the loop. Zero
-/// events ⇒ zero audit lines. Fail-open: a DB outage logs and retires the
-/// tick — the registry-backed cancel finalizer covers the live case.
+/// stale cancellation (unified staleness = 4× the base turn watchdog —
+/// `resolve_stale_claim_secs`, shared with the resume fence's steal
+/// window) then 90-day retention (tasks first,
+/// then plans; `running` exempt). Boot = one sweep before the loop (see
+/// [`spawn_boot_time_sweep`]). Zero events ⇒ zero audit lines. Fail-open:
+/// a DB outage logs and retires the tick — the registry-backed cancel
+/// finalizer covers the live case.
 async fn sweep_plans_due(audit_path: Option<&std::path::Path>) {
     // std-Mutex cache (shuttle-safe const init): successes cached for the
     // process, failures retried next tick — a DB mid-migration at boot must
@@ -1945,6 +1960,48 @@ mod boot_sweep_tests {
         let swept = sweep_global_root_blocking();
         if let Some(root) = swept {
             assert!(root.is_absolute(), "sweep root must be an absolute path");
+        }
+    }
+
+    /// W12.22 pin: the BOOT plan sweep (the fn `spawn_boot_time_sweep`
+    /// invokes before the GC loop starts) cancels a plan left `running` by
+    /// a crashed daemon. Fixture: an isolated ZEN_HOME holding state.db
+    /// with one aged running row + one live row.
+    #[tokio::test]
+    async fn boot_plan_sweep_cancels_stale_running_rows() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: nextest process-per-test isolates env mutation.
+        unsafe {
+            std::env::set_var("ZEN_HOME", home.path());
+            std::env::set_var("ZEN_TURN_WATCHDOG_SECS", "900");
+        }
+        zen_core::config::invalidate_config_cache();
+        let state_db = zen_agents::plan_todos::resolve_state_db().expect("global state.db path");
+        std::fs::create_dir_all(state_db.parent().unwrap()).unwrap();
+        let client = zen_repo::SqliteClient::open(&state_db).await.unwrap();
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        let now = chrono::Utc::now().timestamp();
+        repo.create_plan("crashed-plan", None, "{}", now - 7_200)
+            .await
+            .unwrap();
+        repo.create_plan("live-plan", None, "{}", now - 10)
+            .await
+            .unwrap();
+
+        let audit = home.path().join("logs/audit.jsonl");
+        sweep_plans_due(Some(&audit)).await;
+
+        let swept = repo.load_plan("crashed-plan").await.unwrap().unwrap();
+        assert_eq!(swept.status, "cancelled");
+        assert_eq!(swept.summary.as_deref(), Some("stale"));
+        let live = repo.load_plan("live-plan").await.unwrap().unwrap();
+        assert_eq!(live.status, "running", "live row untouched");
+        let line = std::fs::read_to_string(&audit).expect("sweep audit line");
+        assert!(line.contains("\"kind\":\"loop.plan.swept\""), "{line}");
+        assert!(line.contains("crashed-plan"), "{line}");
+        unsafe {
+            std::env::remove_var("ZEN_HOME");
+            std::env::remove_var("ZEN_TURN_WATCHDOG_SECS");
         }
     }
 }

@@ -1,4 +1,5 @@
 pub mod hook_isolation;
+pub mod mcp_hooked_tool;
 pub mod platform;
 pub mod plugin_wasm;
 pub mod registry;

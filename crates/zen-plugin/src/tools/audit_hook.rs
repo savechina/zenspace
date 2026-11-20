@@ -16,6 +16,12 @@ pub struct ToolAuditHook {
     log_path: PathBuf,
     writer: Arc<Mutex<()>>,
     start_time: Arc<Mutex<Option<Instant>>>,
+    /// W12.28 (A2): additive dispatch-origin marker (`None` = agent pipeline
+    /// default, records unchanged). `"mcp"` marks invocations that arrived
+    /// through the MCP surfaces (stdio / HTTP) via the `HookedMcpTool`
+    /// wrapper, so the audit trail can distinguish MCP callers from agent
+    /// rounds. JSONL readers ignore unknown fields — additive only.
+    origin: Option<String>,
 }
 
 impl ToolAuditHook {
@@ -24,7 +30,16 @@ impl ToolAuditHook {
             log_path,
             writer: Arc::new(Mutex::new(())),
             start_time: Arc::new(Mutex::new(None)),
+            origin: None,
         }
+    }
+
+    /// Tag every record this hook writes with a dispatch origin
+    /// (e.g. `with_origin("mcp")` for the MCP surface wrapper).
+    #[must_use]
+    pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
     }
 }
 
@@ -53,12 +68,14 @@ pub(crate) fn arg_keys(args: &Value) -> Vec<String> {
 /// Build a JSONL audit record. `duration_ms` is `None` when no matching
 /// `before_invocation` start was captured (e.g. an error path that bypassed
 /// the before hook); the field is omitted from the JSON in that case to keep
-/// the shape backward-compatible with older readers.
+/// the shape backward-compatible with older readers. `origin` (W12.28/A2)
+/// is likewise omitted when unset — additive only.
 fn build_record(
     invocation: &ToolInvocation,
     success: bool,
     error: Option<&KernelError>,
     duration_ms: Option<u64>,
+    origin: Option<&str>,
 ) -> Value {
     let mut record = json!({
         "timestamp": Utc::now().to_rfc3339(),
@@ -69,6 +86,9 @@ fn build_record(
     });
     if let Some(ms) = duration_ms {
         record["duration_ms"] = json!(ms);
+    }
+    if let Some(origin) = origin {
+        record["origin"] = json!(origin);
     }
     record
 }
@@ -127,7 +147,13 @@ impl ToolDispatchHook for ToolAuditHook {
 
     async fn after_invocation(&self, result: &ToolInvocationResult) -> Result<(), KernelError> {
         let duration_ms = self.take_elapsed().await.map(|e| e.as_millis() as u64);
-        let record = build_record(&result.invocation, true, None, duration_ms);
+        let record = build_record(
+            &result.invocation,
+            true,
+            None,
+            duration_ms,
+            self.origin.as_deref(),
+        );
         let _guard = self.writer.lock().await;
         append_record(&record, &self.log_path);
         Ok(())
@@ -139,7 +165,13 @@ impl ToolDispatchHook for ToolAuditHook {
         error: &KernelError,
     ) -> Result<(), KernelError> {
         let duration_ms = self.take_elapsed().await.map(|e| e.as_millis() as u64);
-        let record = build_record(invocation, false, Some(error), duration_ms);
+        let record = build_record(
+            invocation,
+            false,
+            Some(error),
+            duration_ms,
+            self.origin.as_deref(),
+        );
         let _guard = self.writer.lock().await;
         append_record(&record, &self.log_path);
         Ok(())
@@ -226,6 +258,45 @@ mod tests {
         let parsed: Value = serde_json::from_str(written.trim()).unwrap();
         assert!(parsed.get("duration_ms").is_none(), "line: {written}");
         assert_eq!(parsed["tool"], "fs.read");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// W12.28 (A2): `with_origin` tags every record the hook writes; unset
+    /// origin keeps records byte-compatible (no `origin` key at all).
+    #[tokio::test]
+    async fn origin_marker_is_additive_and_omitted_when_unset() {
+        let dir = std::env::temp_dir().join(format!(
+            "zen_audit_origin_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("audit.jsonl");
+
+        let inv = make_invocation("fs.read");
+        let result = ToolInvocationResult {
+            invocation: inv.clone(),
+            output: json!({}),
+        };
+        let tagged = ToolAuditHook::new(log_path.clone()).with_origin("mcp");
+        tagged.after_invocation(&result).await.unwrap();
+        let parsed: Value =
+            serde_json::from_str(std::fs::read_to_string(&log_path).unwrap().trim()).unwrap();
+        assert_eq!(parsed["origin"], "mcp");
+        assert_eq!(parsed["tool"], "fs.read");
+
+        std::fs::remove_file(&log_path).unwrap();
+        let untagged = ToolAuditHook::new(log_path.clone());
+        untagged.after_invocation(&result).await.unwrap();
+        let written = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: Value = serde_json::from_str(written.trim()).unwrap();
+        assert!(
+            parsed.get("origin").is_none(),
+            "unset origin must keep the legacy record shape: {written}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

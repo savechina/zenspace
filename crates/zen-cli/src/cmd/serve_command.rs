@@ -1371,8 +1371,10 @@ fn print_process_stats(pid: u32) {
 async fn run_mcp_stdio() -> Result<(), ZenError> {
     use zen_gateway::McpServer;
 
-    let wiring = zen_agents::wiring::ZenWiring::new();
-    let registry = wiring.build_mcp_registry();
+    // W12.28 (A2): the stdio carrier shares the mode-resolved registry
+    // factory with the HTTP carrier (`ZEN_SANDBOX_MODE` env →
+    // WorkspaceWrite) — one sandbox ladder for every MCP surface.
+    let registry = zen_gateway::mcp_registry_for_http();
     let server = McpServer::with_registry(Default::default(), registry);
 
     println!(

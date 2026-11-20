@@ -136,16 +136,27 @@ impl ToolDispatchHook for AskApprovalHook {
             return Ok(ToolDispatchAction::Continue);
         }
 
-        // Background fail-closed (W5.2, D20 §10): a sub-turn running inside
-        // the task registry has no originating surface and no turn affinity.
-        // Deny BEFORE any callback/legacy-fallback path can claim a free
-        // route; the audit line lands via the audit hook that observes the
-        // denial action.
+        // Fail-closed approvals (W5.2 D20 §10 + W12.28/A2): a sub-turn
+        // running inside the task registry AND any MCP-surface invocation
+        // (HookedMcpTool scopes MCP_CALL) have no originating approval UX —
+        // an interactive prompt could only hang the MCP client or render on
+        // an unrelated session's connection (T103 class hazard). Deny BEFORE
+        // any callback/legacy-fallback path can claim a free route; the
+        // audit line lands via the audit hook that observes the denial
+        // action.
         let background = BACKGROUND_TASK.try_get().unwrap_or(false);
-        if background {
+        let mcp = crate::task_registry::MCP_CALL.try_get().unwrap_or(false);
+        if background || mcp {
+            let origin = match (mcp, background) {
+                (true, true) => "mcp+background",
+                (true, false) => "mcp",
+                (false, true) => "background",
+                (false, false) => unreachable!("denied branch requires one marker set"),
+            };
+            let context = if mcp { "no approval UX" } else { "no surface" };
             return Ok(ToolDispatchAction::Terminate {
                 reason: format!(
-                    "approval denied (background: no surface) — approval-required: {}",
+                    "approval denied ({origin}: {context}) — approval-required: {}",
                     invocation.name
                 ),
             });
@@ -265,5 +276,49 @@ mod tests {
         let action = hook.before_invocation(&inv).await.unwrap();
         assert!(matches!(action, ToolDispatchAction::Continue));
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    /// W12.28 (A2): under the MCP-surface marker, an Ask-mode mutating
+    /// invocation resolves deny + structured `approval-required` — never the
+    /// callback-less direct-allow fallback (MCP clients have no approval UX).
+    #[tokio::test]
+    async fn mcp_call_marker_denies_mutating_without_callback() {
+        let hook = AskApprovalHook::new(SandboxMode::Ask);
+        let inv = make_invocation("fs.write");
+        let action = crate::task_registry::MCP_CALL
+            .scope(true, async { hook.before_invocation(&inv).await })
+            .await
+            .unwrap();
+        let ToolDispatchAction::Terminate { reason } = action else {
+            panic!("MCP-call mutating invocation must deny, got {action:?}");
+        };
+        assert!(reason.contains("approval-required"), "reason: {reason}");
+        assert!(reason.contains("mcp:"), "reason: {reason}");
+    }
+
+    /// W12.28 (A2) happy path: read-only tools stay ungated under the MCP
+    /// marker, and the legacy background message keeps its exact wording.
+    #[tokio::test]
+    async fn mcp_call_marker_leaves_readonly_ungated_and_background_wording_intact() {
+        let hook = AskApprovalHook::new(SandboxMode::Ask);
+        let read = make_invocation("fs.read");
+        let action = crate::task_registry::MCP_CALL
+            .scope(true, async { hook.before_invocation(&read).await })
+            .await
+            .unwrap();
+        assert!(matches!(action, ToolDispatchAction::Continue));
+
+        let write = make_invocation("fs.write");
+        let background_only = BACKGROUND_TASK
+            .scope(true, async { hook.before_invocation(&write).await })
+            .await
+            .unwrap();
+        let ToolDispatchAction::Terminate { reason } = background_only else {
+            panic!("background mutating invocation must deny, got {background_only:?}");
+        };
+        assert_eq!(
+            reason, "approval denied (background: no surface) — approval-required: fs.write",
+            "legacy background deny message must stay byte-identical"
+        );
     }
 }
