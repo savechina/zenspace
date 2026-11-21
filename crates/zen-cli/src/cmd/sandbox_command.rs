@@ -8,30 +8,16 @@ use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_core::sandbox::{OsSandboxProfile, SandboxMode, sandbox_spawn};
 
-/// Command-line arguments for the `zen sandbox` subcommand.
+/// Sandboxed command execution with OS-level isolation.
 ///
-/// Provides sandboxed execution of commands with OS-level isolation.
+/// Platform support: macOS uses Seatbelt (sandbox-exec) with SBPL profiles;
+/// Linux stacks Bubblewrap (bwrap) for namespace/mount isolation, Landlock
+/// for filesystem access control (kernel 5.13+), and Seccomp for syscall
+/// filtering (ptrace, io_uring, network).
 ///
-/// # Platform Support
-///
-/// - **macOS**: Seatbelt (sandbox-exec) with SBPL profiles
-/// - **Linux**: 3-layer stack:
-///   - Bubblewrap (bwrap): Namespace/mount isolation
-///   - Landlock: Filesystem access control (Linux 5.13+)
-///   - Seccomp: Syscall filtering (ptrace, io_uring, network)
-///
-/// # Examples
-///
-/// ```bash
-/// # Run a command in workspace-write sandbox mode
-/// zen sandbox run --binary echo "hello"
-///
-/// # Show current sandbox status
-/// zen sandbox status
-///
-/// # Test if sandbox is working
-/// zen sandbox test
-/// ```
+/// Examples: run a command under the active mode with
+/// `zen sandbox run --binary echo "hello"`; inspect the active profile with
+/// `zen sandbox status`; verify isolation with `zen sandbox test`.
 #[derive(Args)]
 pub struct SandboxArgs {
     #[command(subcommand)]

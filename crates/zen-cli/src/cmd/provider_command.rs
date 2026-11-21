@@ -13,6 +13,9 @@ pub enum ProviderCommands {
         /// Task type: notion_extraction, synthesis, consolidation, dispatch
         #[arg(short, long)]
         task: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Test provider connectivity
     Test {
@@ -21,7 +24,11 @@ pub enum ProviderCommands {
         provider: Option<String>,
     },
     /// List configured providers
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
@@ -29,12 +36,32 @@ pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
     let router = DefaultRouter::from_agentic(config);
 
     match operation {
-        ProviderCommands::Route { task } => {
+        ProviderCommands::Route { task, json } => {
             debug!("routing task: {}", task);
+
+            let providers = router.list_providers();
+            let local_available = router.is_local_llm_available();
+
+            if *json {
+                let payload = serde_json::json!({
+                    "task": task,
+                    "providers": providers
+                        .iter()
+                        .map(|(name, model)| serde_json::json!({ "name": name, "model": model }))
+                        .collect::<Vec<_>>(),
+                    "local_llm_available": local_available,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
             println!("{}", "🔀 Provider Route Selection".bold());
             println!("  Task: {}", task.cyan().bold());
 
-            let providers = router.list_providers();
             if providers.is_empty() {
                 println!("  {}", "No providers configured".yellow());
             } else {
@@ -44,7 +71,6 @@ pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
                 }
             }
 
-            let local_available = router.is_local_llm_available();
             println!(
                 "  Local LLM: {}",
                 if local_available {
@@ -72,9 +98,27 @@ pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
             }
             Ok(())
         }
-        ProviderCommands::List => {
+        ProviderCommands::List { json } => {
             debug!("listing providers");
             let providers = router.list_providers();
+            let local_available = router.is_local_llm_available();
+
+            if *json {
+                let payload = serde_json::json!({
+                    "providers": providers
+                        .iter()
+                        .map(|(name, model)| serde_json::json!({ "name": name, "model": model }))
+                        .collect::<Vec<_>>(),
+                    "local_llm_available": local_available,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
             println!("{}", "📡 Configured Providers".bold());
 
             if providers.is_empty() {
@@ -86,7 +130,6 @@ pub fn execute_command(operation: &ProviderCommands) -> Result<(), ZenError> {
                 }
             }
 
-            let local_available = router.is_local_llm_available();
             println!(
                 "\n  Local LLM status: {}",
                 if local_available {

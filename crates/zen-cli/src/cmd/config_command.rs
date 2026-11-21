@@ -12,7 +12,11 @@ use zen_core::errors::ZenError;
 #[derive(Subcommand)]
 pub enum ConfigCommands {
     /// Show merged configuration (priority order)
-    Show,
+    Show {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Open config editor
     Edit {
         /// Config layer to edit: workspace | global | embedded
@@ -25,9 +29,48 @@ pub enum ConfigCommands {
 
 pub fn execute_command(operation: &ConfigCommands) -> Result<(), ZenError> {
     match operation {
-        ConfigCommands::Show => {
+        ConfigCommands::Show { json } => {
             debug!("showing merged config");
             let config = load_config()?;
+
+            if *json {
+                let agents: serde_json::Map<String, serde_json::Value> = config
+                    .agents
+                    .iter()
+                    .map(|(name, agent)| {
+                        (
+                            name.clone(),
+                            serde_json::json!({
+                                "provider": agent.provider,
+                                "model": agent.model,
+                            }),
+                        )
+                    })
+                    .collect();
+                let qqbot = config.channels.qqbot.as_ref().map(|bot| {
+                    serde_json::json!({
+                        "app_id": bot.app_id,
+                        "client_secret": "[set]",
+                        "allowed_users": bot.allowed_users,
+                    })
+                });
+                let payload = serde_json::json!({
+                    "default_provider": config.default_provider,
+                    "agents": agents,
+                    "channels": { "qqbot": qqbot },
+                    "cron": {
+                        "consolidation_time": config.cron.consolidation_time,
+                        "timezone": config.cron.timezone,
+                    },
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
             println!("{}", "📋 Merged Configuration".bold());
             println!("\n{}", "─── LLM Settings ───".bright_white());
             println!(

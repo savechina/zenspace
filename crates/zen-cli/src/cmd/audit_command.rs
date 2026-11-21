@@ -15,6 +15,9 @@ pub enum AuditCommands {
         /// Session ID to query
         #[arg(short, long)]
         session: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Export audit log
     Export {
@@ -35,8 +38,21 @@ pub enum AuditCommands {
 
 pub fn execute_command(operation: &AuditCommands) -> Result<(), ZenError> {
     match operation {
-        AuditCommands::Log { session } => {
+        AuditCommands::Log { session, json } => {
             debug!("showing audit log for session: {}", session);
+            if *json {
+                let payload = serde_json::json!({
+                    "session": session,
+                    "entries": [],
+                    "note": "audit log storage deferred to zen-service",
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
             println!(
                 "{} Audit Log: {}",
                 "📜".bright_white().bold(),

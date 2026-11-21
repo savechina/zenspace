@@ -2,6 +2,8 @@
 
 Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy capabilities (search, research, dispatch, briefs) run autonomously through the background scheduler and distill loop rather than as manual commands — drop notes into `~/.zen/vault/inbox/` and the system works on them.
 
+**JSON convention:** list/status/report-shaped subcommands honor `--json` (human output stays the default; action subcommands are excluded).
+
 ## General
 
 | Command | Description |
@@ -16,15 +18,15 @@ Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy cap
 |---------|-------------|
 | `zen chat` | Interactive LLM chat (non-TUI) |
 | `zen session start` | Start an agentic session |
-| `zen session status` | Show session status |
-| `zen session list` | List sessions |
+| `zen session status` | Show session status (`--json`) |
+| `zen session list` | List sessions (`--json`) |
 | `zen session archive` | Archive a session |
 
 ## Knowledge Pipeline
 
 | Command | Description |
 |---------|-------------|
-| `zen wiki list` | List wiki pages |
+| `zen wiki list` | List wiki pages (`--json`) |
 | `zen wiki show <page>` | Show a wiki page |
 | `zen wiki reindex` | Rebuild the knowledge index (FTS5 + embeddings; also heals legacy non-NFC alias rows; `--dry-run` preview, `--fts-only` resync) |
 | `zen wiki lint` | Lint wiki (orphan pages, broken links, stale claims) |
@@ -39,7 +41,7 @@ Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy cap
 
 | Command | Description |
 |---------|-------------|
-| `zen agent list` | List registered agents |
+| `zen agent list` | List registered agents (`--json`) |
 | `zen skill list --json` | List learned skills |
 | `zen skill run <name>` | Run a skill |
 | `zen skill progress` | Show skill learning progress |
@@ -47,7 +49,7 @@ Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy cap
 | `zen skill precipitate` | Stage a distilled skill draft |
 | `zen skill confirm <name>` | Confirm a staged skill |
 | `zen discover run` | Run one self-learning cycle (stages 5b/5c/5d) |
-| `zen discover stage` / `queue` | Stage and inspect improvement hypotheses |
+| `zen discover stage` / `queue` | Stage and inspect improvement hypotheses (`queue --json`) |
 | `zen discover confirm` / `reject` | Review staged hypotheses |
 | `zen discover confirm-workflow <name>` | Promote a staged workflow draft into `vault/wiki/wisdom/workflow-templates/` |
 | `zen discover reject-workflow <name>` | Reject a staged workflow draft and quarantine its shape signature |
@@ -69,7 +71,7 @@ Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy cap
 | `zen clean cache` | Clean caches (ungated) |
 | `zen clean all` / `trash` | Destructive cleanup — asks for confirmation unless `--yes` |
 | `zen logs <service>` | View structured logs |
-| `zen audit` | Audit log operations |
+| `zen audit` | Audit log operations (`zen audit log --session <id> --json`) |
 | `zen admission list` | Trust ledger: would-accepts, rejections, unresolved, admitted, duplicates (`--mode` filter, `--json`) |
 | `zen admission show <id>` | Full why-when-what decision record (sender, rule, scope, mode, policy version, trigger) |
 | `zen admission mode [<off\|observe\|auto>]` | Show effective accept mode + source + policy hash, or flip it at runtime via the state.db override row — hot effect on the live daemon, `--clear` reverts to config (`--channel`, `--json`) |
@@ -80,11 +82,11 @@ Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy cap
 | Command | Description |
 |---------|-------------|
 | `zen workspace init` | Initialize `~/.zen/` workspace structure |
-| `zen config show` | Show effective configuration (layers merged) |
-| `zen provider list` | List available LLM providers |
+| `zen config show` | Show effective configuration (layers merged, `--json`) |
+| `zen provider list` | List available LLM providers (`--json`) |
 | `zen provider test <name>` | Test a provider connection |
-| `zen auth list` | List stored credentials |
-| `zen model` | Model metadata + routing info |
+| `zen auth list` | List stored credentials (`--json`) |
+| `zen model` | Model metadata + routing info (`zen model list --json`) |
 
 ## Utilities
 
@@ -92,9 +94,9 @@ Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy cap
 |---------|-------------|
 | `zen starter <template>` | Generate project scaffold from template |
 | `zen wps <action>` | Work process utilities |
-| `zen habit log` / `list` | Habit tracking |
-| `zen goal create` / `list` / `status` | Goal management |
-| `zen plugin list` / `install` / `enable` / `disable` / `rehash` | Plugin management (WASM tools, MCP) |
+| `zen habit log` / `list` | Habit tracking (`list --json`, `zen habit stats <name> --json`) |
+| `zen goal create` / `list` / `status` | Goal management (`list --json`) |
+| `zen plugin list` / `install` / `enable` / `disable` / `rehash` | Plugin management (WASM tools, MCP; `list --json`, `zen plugin tools --json`) |
 
 ## Quick Reference
 

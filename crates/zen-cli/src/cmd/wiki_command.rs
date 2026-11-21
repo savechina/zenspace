@@ -41,7 +41,11 @@ impl From<SkillExportTargetArg> for zen_vault::SkillExportTarget {
 #[derive(Subcommand)]
 pub enum WikiCommands {
     /// List all wiki notion pages
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a wiki page by notion name
     Show {
         /// Notion name (slug or display name)
@@ -118,9 +122,9 @@ pub enum WikiCommands {
 
 pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
     match operation {
-        WikiCommands::List => {
+        WikiCommands::List { json } => {
             let paths = ZenPaths::detect()?;
-            list_wiki_pages(&paths.wiki())
+            list_wiki_pages(&paths.wiki(), *json)
         }
         WikiCommands::RebuildMemory => {
             // D3=A RPC model: the rebuild runs inside the sole-owner
@@ -380,8 +384,16 @@ pub async fn execute_command(operation: &WikiCommands) -> Result<(), ZenError> {
     }
 }
 
-fn list_wiki_pages(wiki_dir: &std::path::Path) -> Result<(), ZenError> {
+fn list_wiki_pages(wiki_dir: &std::path::Path, json: bool) -> Result<(), ZenError> {
     if !wiki_dir.is_dir() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!([]))
+                    .map_err(|e| ZenError::Message(format!("json: {e}")))?
+            );
+            return Ok(());
+        }
         println!("No wiki pages found. Run `zen wiki distill` first.");
         // T230: first-run discoverability — the wiki only builds itself while
         // a long-lived learning host (the serve daemon) is running; never let
@@ -393,6 +405,26 @@ fn list_wiki_pages(wiki_dir: &std::path::Path) -> Result<(), ZenError> {
     }
 
     let pages = enumerate_wiki_pages(wiki_dir);
+
+    if json {
+        let payload: Vec<_> = pages
+            .iter()
+            .map(|page| {
+                serde_json::json!({
+                    "name": page.name,
+                    "group": page.group.label(),
+                    "path": page.path.display().to_string(),
+                    "summary": get_page_summary(&page.path).unwrap_or_default(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .map_err(|e| ZenError::Message(format!("json: {e}")))?
+        );
+        return Ok(());
+    }
 
     if pages.is_empty() {
         println!("No wiki pages found.");

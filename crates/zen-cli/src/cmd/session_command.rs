@@ -24,9 +24,17 @@ pub enum SessionCommands {
         workspace: Option<String>,
     },
     /// Show current session status
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List all sessions
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Archive the current session
     Archive {
         /// Session ID (defaults to current session)
@@ -97,19 +105,50 @@ pub fn execute_command(operation: &SessionCommands) -> Result<(), ZenError> {
 
             Ok(())
         }
-        SessionCommands::Status => {
+        SessionCommands::Status { json } => {
             debug!("showing session status");
+            if *json {
+                let payload = serde_json::json!({
+                    "active": false,
+                    "sessions_dir": "not yet configured",
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
             println!("{}", "📋 Session Status".bold());
             println!("  Status: {}", "No active session".yellow());
             println!("  Sessions dir: {}", "not yet configured".dimmed());
             Ok(())
         }
-        SessionCommands::List => {
+        SessionCommands::List { json } => {
             debug!("listing sessions");
             let orchestrator = SessionOrchestrator::new();
             let sessions = orchestrator
                 .list_sessions()
                 .map_err(|e| ZenError::Message(format!("failed to list sessions: {e}")))?;
+
+            if *json {
+                let payload: Vec<_> = sessions
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id,
+                            "status": format!("{:?}", s.status),
+                            "workspace": s.workspace,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
 
             if sessions.is_empty() {
                 println!("{}", "No sessions found".yellow());

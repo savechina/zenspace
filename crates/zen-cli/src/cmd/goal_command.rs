@@ -23,7 +23,11 @@ pub enum GoalCommands {
         progress: Option<f64>,
     },
     /// List all goals
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Mark goal as completed
     Complete { name: String },
 }
@@ -91,8 +95,30 @@ pub fn execute_command(cmd: &GoalCommands) -> Result<(), ZenError> {
             Ok(())
         }
 
-        GoalCommands::List => {
+        GoalCommands::List { json } => {
             let goals = service.load_goals()?;
+
+            if *json {
+                let payload: Vec<_> = goals
+                    .iter()
+                    .map(|goal| {
+                        serde_json::json!({
+                            "name": goal.name,
+                            "status": goal.status,
+                            "progress": goal.progress,
+                            "target": goal.target,
+                            "deadline": goal.deadline,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
             if goals.is_empty() {
                 println!(
                     "No goals defined. Use {} to add one.",

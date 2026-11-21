@@ -52,7 +52,7 @@ use crate::cmd::workspace_command::{self, WorkspaceCommands};
 use crate::cmd::wps_command::{self, WpsCommands};
 
 #[derive(Parser)]
-#[command(author = "JenYen", version, about = "About zenspace utils", long_about = None)]
+#[command(author = "JenYen", version, about = "Your personal AI agentic workspace — notes in, wiki out", long_about = None)]
 #[command(propagate_version = false)]
 struct Cli {
     #[command(flatten)]
@@ -63,42 +63,55 @@ struct Cli {
     #[arg(long, hide = true)]
     internal_sandbox_launcher: bool,
 
+    /// Sandbox mode for agent tool calls in this invocation
+    /// (read-only, workspace-write, ask, danger-full-access)
     #[arg(long, value_enum, default_value_t = SandboxModeArg::WorkspaceWrite)]
     sandbox: SandboxModeArg,
 
+    /// Approval policy for agent tool calls (e.g. "ask"); exported as
+    /// ZEN_ASK_FOR_APPROVAL for this invocation
     #[arg(long)]
     ask_for_approval: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Cleanup: cache is ungated; all/trash prompt y/N (they destroy data
+    /// outside ~/.zen)
     Clean {
         #[command(subcommand)]
         operation: Option<CleanupCommands>,
         #[arg(short, long, action, default_value = "false")]
         dry_run: bool,
     },
+    /// Interactive LLM chat (non-TUI)
     Chat {
         #[command(flatten)]
         args: ChatArgs,
     },
+    /// Generate project scaffolds from templates
     Starter {
         #[command(subcommand)]
         operation: StarterCommands,
     },
+    /// Work-process utilities
     Wps {
         #[command(subcommand)]
         operation: WpsCommands,
     },
+    /// Show version information
     Version,
+    /// Agentic session lifecycle: start, status, list, archive
     Session {
         #[command(subcommand)]
         operation: SessionCommands,
     },
+    /// Gateway daemon control: start, stop, restart, status, launchd install
     Serve {
         #[command(subcommand)]
         operation: ServeCommands,
     },
+    /// List registered agents and their tiers
     Agent {
         #[command(subcommand)]
         operation: AgentCommands,
@@ -108,24 +121,29 @@ enum Commands {
         #[command(subcommand)]
         operation: AdmissionCommands,
     },
+    /// Initialize or inspect the ~/.zen workspace structure
     Workspace {
         #[command(subcommand)]
         operation: WorkspaceCommands,
         #[arg(short, long, action, default_value = "false")]
         dry_run: bool,
     },
+    /// Show the merged effective configuration (5-layer priority)
     Config {
         #[command(subcommand)]
         operation: ConfigCommands,
     },
+    /// LLM provider management: list, route, connectivity test
     Provider {
         #[command(subcommand)]
         operation: ProviderCommands,
     },
+    /// Audit log operations: per-session log, export, integrity verify
     Audit {
         #[command(subcommand)]
         operation: AuditCommands,
     },
+    /// View structured logs: tail, filter by level, search
     Logs {
         /// Number of lines to display (default: 50)
         #[arg(short = 'n', long, default_value = "50")]
@@ -143,38 +161,47 @@ enum Commands {
         #[command(subcommand)]
         operation: Option<LogCommands>,
     },
+    /// Wiki operations: list, show, reindex, lint, distill, loop, rollback
     Wiki {
         #[command(subcommand)]
         operation: WikiCommands,
     },
+    /// List available models across configured providers
     Model {
         #[command(subcommand)]
         operation: ModelCommands,
     },
+    /// Plugin management: list, install, enable, disable, rehash, tools
     Plugin {
         #[command(subcommand)]
         operation: PluginCommands,
     },
+    /// Auth and keychain operations: list, login, logout, status
     Auth {
         #[command(subcommand)]
         operation: AuthCommands,
     },
+    /// Habit tracking: check-in, list, stats, add, remove
     Habit {
         #[command(subcommand)]
         operation: HabitCommands,
     },
+    /// Goal management: set, progress, list, complete
     Goal {
         #[command(subcommand)]
         operation: GoalCommands,
     },
+    /// Skill learning surface: list, run, progress, show, precipitate, confirm
     Skill {
         #[command(subcommand)]
         operation: SkillCommands,
     },
+    /// Self-learning gates: run, stage, queue, confirm, report, arena
     Discover {
         #[command(subcommand)]
         operation: DiscoverCommands,
     },
+    /// Run a command under OS-level sandbox isolation; status, policy, test
     Sandbox {
         #[command(flatten)]
         args: SandboxArgs,
@@ -557,6 +584,256 @@ mod docs_consistency {
              Commands enum has {n} — update every '<N> commands' claim above the \
              '{AGENTS_HISTORY_MARKER}' marker"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Help-about sentinel (2026-11-21 plan-eng-review, F1)
+//
+// PURPOSE: Fail the test gate when a Commands variant ships without a clap
+//          about line — `zen --help` described only 3/24 commands because
+//          nothing pinned help-text quality (docs_consistency pins the docs
+//          table against the registry, not the live about strings).
+// USAGE: Runs under `bin/test` with the rest of the suite; behavioral via
+//        clap introspection, no source parsing.
+// EXPECTED: PASS while every subcommand renders a non-empty, non-placeholder
+//           about and the top-level tagline is real.
+// ERRORS: A red test names the exact command that went blank — add the `///`
+//         one-liner (docs/src/cli-commands.md is the copy source).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod help_about_sentinel {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Pre-backfill placeholder strings that must never return as abouts
+    /// (receipts: cli.rs:55 tagline, SandboxArgs doc leak).
+    const PLACEHOLDER_ABOUTS: [&str; 2] = [
+        "About zenspace utils",
+        "Command-line arguments for the `zen sandbox` subcommand",
+    ];
+
+    #[test]
+    fn every_subcommand_carries_a_real_about() {
+        let blank: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|s| s.get_name() != "help")
+            .filter(|s| match s.get_about().map(|a| a.to_string()) {
+                Some(about) => {
+                    let t = about.trim();
+                    t.is_empty() || PLACEHOLDER_ABOUTS.contains(&t)
+                }
+                None => true,
+            })
+            .map(|s| s.get_name().to_string())
+            .collect();
+        assert!(
+            blank.is_empty(),
+            "commands render blank or placeholder rows in `zen --help`: {} — add the \
+             `///` one-liner (docs/src/cli-commands.md is the copy source)",
+            blank.join(", ")
+        );
+    }
+
+    #[test]
+    fn top_level_about_is_not_the_placeholder() {
+        let about = Cli::command()
+            .get_about()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let t = about.trim();
+        assert!(
+            !t.is_empty() && !PLACEHOLDER_ABOUTS.contains(&t),
+            "top-level about is blank or the '{t}' placeholder — `zen --help` opens with it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod json_flags_parse {
+    use super::*;
+
+    // 2026-11-21 plan-eng-review T2: list/status/report-shaped subcommands
+    // honor `--json` (human output stays the default). Parse-level contract
+    // pin; the output-shape e2e pins live in crates/zen/tests/.
+    #[test]
+    fn readout_subcommands_parse_the_json_flag() {
+        match Cli::try_parse_from(["zen", "session", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Session {
+                operation: SessionCommands::List { json },
+            }) => assert!(json, "session list --json must parse to json=true"),
+            _ => panic!("expected `zen session list --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "session", "status", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Session {
+                operation: SessionCommands::Status { json },
+            }) => assert!(json, "session status --json must parse to json=true"),
+            _ => panic!("expected `zen session status --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "model", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Model {
+                operation: ModelCommands::List { json },
+            }) => assert!(json, "model list --json must parse to json=true"),
+            _ => panic!("expected `zen model list --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "provider", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Provider {
+                operation: ProviderCommands::List { json },
+            }) => assert!(json, "provider list --json must parse to json=true"),
+            _ => panic!("expected `zen provider list --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "provider", "route", "--task", "synthesis", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Provider {
+                operation: ProviderCommands::Route { task: _, json },
+            }) => assert!(json, "provider route --json must parse to json=true"),
+            _ => panic!("expected `zen provider route --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "config", "show", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Config {
+                operation: ConfigCommands::Show { json },
+            }) => assert!(json, "config show --json must parse to json=true"),
+            _ => panic!("expected `zen config show --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "habit", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Habit {
+                operation: HabitCommands::List { json },
+            }) => assert!(json, "habit list --json must parse to json=true"),
+            _ => panic!("expected `zen habit list --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "habit", "stats", "reading", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Habit {
+                operation:
+                    HabitCommands::Stats {
+                        name: _,
+                        days: _,
+                        json,
+                    },
+            }) => assert!(json, "habit stats --json must parse to json=true"),
+            _ => panic!("expected `zen habit stats <name> --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "goal", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Goal {
+                operation: GoalCommands::List { json },
+            }) => assert!(json, "goal list --json must parse to json=true"),
+            _ => panic!("expected `zen goal list --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "auth", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Auth {
+                operation: AuthCommands::List { json },
+            }) => assert!(json, "auth list --json must parse to json=true"),
+            _ => panic!("expected `zen auth list --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "auth", "status", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Auth {
+                operation: AuthCommands::Status { json },
+            }) => assert!(json, "auth status --json must parse to json=true"),
+            _ => panic!("expected `zen auth status --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "audit", "log", "--session", "s1", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Audit {
+                operation: AuditCommands::Log { session: _, json },
+            }) => assert!(json, "audit log --json must parse to json=true"),
+            _ => panic!("expected `zen audit log --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "plugin", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Plugin {
+                operation:
+                    PluginCommands::List {
+                        kind: _,
+                        enabled: _,
+                        json,
+                    },
+            }) => assert!(json, "plugin list --json must parse to json=true"),
+            _ => panic!("expected `zen plugin list --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "plugin", "tools", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Plugin {
+                operation: PluginCommands::Tools { json },
+            }) => assert!(json, "plugin tools --json must parse to json=true"),
+            _ => panic!("expected `zen plugin tools --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "discover", "queue", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Discover {
+                operation: DiscoverCommands::Queue { json },
+            }) => assert!(json, "discover queue --json must parse to json=true"),
+            _ => panic!("expected `zen discover queue --json` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "wiki", "list", "--json"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Wiki {
+                operation: WikiCommands::List { json },
+            }) => assert!(json, "wiki list --json must parse to json=true"),
+            _ => panic!("expected `zen wiki list --json` to parse"),
+        }
+    }
+
+    #[test]
+    fn json_flag_absent_keeps_the_human_default() {
+        match Cli::try_parse_from(["zen", "session", "list"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Session {
+                operation: SessionCommands::List { json },
+            }) => assert!(!json, "human output stays the default"),
+            _ => panic!("expected `zen session list` to parse"),
+        }
+        match Cli::try_parse_from(["zen", "provider", "list"])
+            .unwrap()
+            .command
+        {
+            Some(Commands::Provider {
+                operation: ProviderCommands::List { json },
+            }) => assert!(!json, "human output stays the default"),
+            _ => panic!("expected `zen provider list` to parse"),
+        }
     }
 }
 

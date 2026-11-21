@@ -30,7 +30,11 @@ pub enum DiscoverCommands {
     /// Stage validated hypotheses into the promotion queue (same as stage 5d)
     Stage,
     /// List staged promotion proposals awaiting confirmation
-    Queue,
+    Queue {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Confirm a staged promotion by id (Hybrid C gate)
     Confirm {
         /// Promotion id (e.g. `promo-orphan-cache`)
@@ -220,9 +224,27 @@ pub async fn execute_command(cmd: &DiscoverCommands) -> Result<(), ZenError> {
                 report.fact_count,
             );
         }
-        DiscoverCommands::Queue => {
+        DiscoverCommands::Queue { json } => {
             let worker = PromotionWorker::with_paths();
             let pending = worker.pending(&paths.logs()).map_err(map_err)?;
+            if *json {
+                let payload: Vec<_> = pending
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "id": item.id,
+                            "target": format!("{:?}", item.target),
+                            "summary": item.summary,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
             if pending.is_empty() {
                 println!("{}", "promotion queue is empty".dimmed());
                 return Ok(());

@@ -17,6 +17,10 @@ pub enum PluginCommands {
 
         #[arg(short, long)]
         enabled: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Install a plugin from a directory
     Install {
@@ -50,7 +54,11 @@ pub enum PluginCommands {
     /// Discover and load plugins from plugin directory
     Discover,
     /// List all registered agent tools
-    Tools,
+    Tools {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage MCP server trust (which servers the agent may connect to)
     Mcp {
         #[command(subcommand)]
@@ -86,7 +94,11 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
     let mut registry = PluginRegistry::new();
 
     match operation {
-        PluginCommands::List { kind, enabled } => {
+        PluginCommands::List {
+            kind,
+            enabled,
+            json,
+        } => {
             debug!(
                 "listing {} plugins from {}",
                 if *enabled { "enabled" } else { "all" },
@@ -120,6 +132,29 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
             } else {
                 registry.list().cloned().collect()
             };
+
+            if *json {
+                let payload: Vec<_> = entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "id": entry.manifest.id,
+                            "name": entry.manifest.name,
+                            "version": entry.manifest.version,
+                            "kind": format!("{:?}", entry.manifest.kind).to_lowercase(),
+                            "enabled": entry.enabled,
+                            "lifecycle": format!("{:?}", entry.lifecycle),
+                            "dir": entry.dir.display().to_string(),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
 
             if entries.is_empty() {
                 println!("{} No plugins installed", "⛔".red());
@@ -457,15 +492,55 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
             Ok(())
         }
 
-        PluginCommands::Tools => {
+        PluginCommands::Tools { json } => {
             let wiring = zen_agents::wiring::ZenWiring::new();
+            let mut names: Vec<&String> = wiring.tool_sensitivity.keys().collect();
+            names.sort();
+
+            let tool_source = |name: &str| {
+                if name.contains('.')
+                    && !name.starts_with("fs.")
+                    && !name.starts_with("web.")
+                    && !name.starts_with("system.")
+                    && !name.starts_with("plugin.")
+                    && !name.starts_with("shell.")
+                {
+                    "plugin"
+                } else {
+                    "builtin"
+                }
+            };
+
+            if *json {
+                let payload: Vec<_> = names
+                    .iter()
+                    .filter_map(|name| {
+                        let sensitivity = match wiring.tool_sensitivity.get(*name) {
+                            Some(zen_core::types::Sensitivity::Public) => "public",
+                            Some(zen_core::types::Sensitivity::Private) => "private",
+                            Some(zen_core::types::Sensitivity::Confidential) => "confidential",
+                            None => return None,
+                        };
+                        Some(serde_json::json!({
+                            "name": name,
+                            "sensitivity": sensitivity,
+                            "source": tool_source(name),
+                        }))
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
             println!(
                 "{} Registered Agent Tools ({} total)\n",
                 "─".dimmed(),
                 wiring.tools.len()
             );
-            let mut names: Vec<&String> = wiring.tool_sensitivity.keys().collect();
-            names.sort();
             for name in names {
                 let sensitivity = &wiring.tool_sensitivity[name];
                 let sens_label = match sensitivity {
@@ -474,22 +549,11 @@ pub fn execute_command(operation: &PluginCommands) -> Result<(), ZenError> {
                     zen_core::types::Sensitivity::Confidential => "CONFIDENTIAL".red(),
                 };
                 if wiring.tools.get(name).is_ok() {
-                    let source = if name.contains('.')
-                        && !name.starts_with("fs.")
-                        && !name.starts_with("web.")
-                        && !name.starts_with("system.")
-                        && !name.starts_with("plugin.")
-                        && !name.starts_with("shell.")
-                    {
-                        "plugin"
-                    } else {
-                        "builtin"
-                    };
                     println!(
                         "  {} [{}] [{}] {}",
                         name.cyan(),
                         sens_label,
-                        source,
+                        tool_source(name),
                         "✓".green()
                     );
                 }

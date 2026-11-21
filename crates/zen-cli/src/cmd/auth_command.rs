@@ -14,7 +14,11 @@ use zen_core::errors::ZenError;
 pub enum AuthCommands {
     /// List providers and credentials (alias: ls)
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Log in to a provider (stores API key in Keychain)
     Login {
         /// Provider name (e.g., "openai", "aliyun", "deepseek")
@@ -30,7 +34,11 @@ pub enum AuthCommands {
         provider: Option<String>,
     },
     /// Show authentication status
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Service naming convention: zen-{provider}-api-key
@@ -50,37 +58,91 @@ fn mask_secret_tail(key: &str) -> String {
     format!("••••••••{tail}")
 }
 
+/// Per-provider credential probe shared by the JSON and human render paths.
+/// `source` is "keychain" | "env:<VAR>" | "access_denied" | None; `masked`
+/// carries the display tail only (never the key body).
+struct CredProbe {
+    provider: &'static str,
+    source: Option<String>,
+    masked: Option<String>,
+}
+
 pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
     match operation {
-        AuthCommands::List => {
+        AuthCommands::List { json } => {
             debug!("listing all stored credentials");
-            println!("{}", "🔑 Providers & Credentials".bold());
 
             let providers = SUPPORTED_LLM_PROVIDERS;
 
-            let mut found_count = 0;
-
+            let mut probes: Vec<CredProbe> = Vec::new();
             for provider in providers {
                 let service = service_name(provider);
-                let keychain_status = match Keychain::retrieve(&service, "zen") {
-                    Ok(key) => {
-                        found_count += 1;
-                        let masked = mask_secret_tail(&key);
-                        format!("{} {}", "✓".green(), masked.dimmed())
-                    }
+                let probe = match Keychain::retrieve(&service, "zen") {
+                    Ok(key) => CredProbe {
+                        provider,
+                        source: Some("keychain".to_string()),
+                        masked: Some(mask_secret_tail(&key)),
+                    },
                     Err(AuthError::CredentialNotFound { .. }) => {
                         let env_var = format!("{}_API_KEY", provider.to_uppercase());
                         if std::env::var(&env_var).is_ok() {
-                            found_count += 1;
-                            format!("{} {}", "⚠".yellow(), format!("env:{}", env_var).dimmed())
+                            CredProbe {
+                                provider,
+                                source: Some(format!("env:{env_var}")),
+                                masked: None,
+                            }
                         } else {
-                            format!("{} {}", "✗".bright_black(), "no credential".dimmed())
+                            CredProbe {
+                                provider,
+                                source: None,
+                                masked: None,
+                            }
                         }
                     }
-                    Err(_) => format!("{} {}", "✗".red(), "access denied".dimmed()),
+                    Err(_) => CredProbe {
+                        provider,
+                        source: Some("access_denied".to_string()),
+                        masked: None,
+                    },
                 };
+                probes.push(probe);
+            }
 
-                println!("  {} {}", provider.cyan().bold(), keychain_status);
+            if *json {
+                let payload = serde_json::json!({
+                    "providers": probes
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "provider": p.provider,
+                            "source": p.source,
+                            "masked": p.masked,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
+            println!("{}", "🔑 Providers & Credentials".bold());
+
+            let found_count = probes.iter().filter(|p| p.source.is_some()).count();
+
+            for p in &probes {
+                let keychain_status = match (&p.source, &p.masked) {
+                    (Some(_), Some(masked)) => {
+                        format!("{} {}", "✓".green(), masked.dimmed())
+                    }
+                    (Some(src), None) if src.starts_with("env:") => {
+                        format!("{} {}", "⚠".yellow(), src.dimmed())
+                    }
+                    (Some(_), None) => format!("{} {}", "✗".red(), "access denied".dimmed()),
+                    (None, _) => format!("{} {}", "✗".bright_black(), "no credential".dimmed()),
+                };
+                println!("  {} {}", p.provider.cyan().bold(), keychain_status);
             }
 
             println!();
@@ -165,45 +227,92 @@ pub fn execute_command(operation: &AuthCommands) -> Result<(), ZenError> {
             Ok(())
         }
 
-        AuthCommands::Status => {
+        AuthCommands::Status { json } => {
             debug!("showing auth status");
-            println!("{}", "🔐 Authentication Status".bold());
 
             let providers = SUPPORTED_LLM_PROVIDERS;
             let mut any_found = false;
 
+            let mut probes: Vec<CredProbe> = Vec::new();
             for provider in providers {
                 let service = service_name(provider);
-                match Keychain::retrieve(&service, "zen") {
+                let probe = match Keychain::retrieve(&service, "zen") {
                     Ok(key) => {
                         any_found = true;
-                        println!(
-                            "  {} {} — {}",
-                            "✓".green(),
-                            provider.cyan(),
-                            format!("logged in (Keychain), {}", mask_secret_tail(&key)).dimmed()
-                        );
+                        CredProbe {
+                            provider,
+                            source: Some("keychain".to_string()),
+                            masked: Some(mask_secret_tail(&key)),
+                        }
                     }
                     Err(AuthError::CredentialNotFound { .. }) => {
                         let env_var = format!("{}_API_KEY", provider.to_uppercase());
                         if std::env::var(&env_var).is_ok() {
                             any_found = true;
-                            println!(
-                                "  {} {} — {}",
-                                "⚠".yellow(),
-                                provider.cyan(),
-                                format!("env var {} set", env_var).dimmed()
-                            );
+                            CredProbe {
+                                provider,
+                                source: Some(format!("env:{env_var}")),
+                                masked: None,
+                            }
+                        } else {
+                            CredProbe {
+                                provider,
+                                source: None,
+                                masked: None,
+                            }
                         }
                     }
-                    Err(e) => {
+                    Err(e) => CredProbe {
+                        provider,
+                        source: Some("error".to_string()),
+                        masked: Some(e.to_string()),
+                    },
+                };
+                probes.push(probe);
+            }
+
+            if *json {
+                let payload = serde_json::json!({
+                    "authenticated": any_found,
+                    "providers": probes
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "provider": p.provider,
+                            "source": p.source,
+                            "masked": p.masked,
+                        }))
+                        .collect::<Vec<_>>(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
+            println!("{}", "🔐 Authentication Status".bold());
+
+            for p in &probes {
+                match (&p.source, &p.masked) {
+                    (Some(src), Some(masked)) if src == "keychain" => println!(
+                        "  {} {} — {}",
+                        "✓".green(),
+                        p.provider.cyan(),
+                        format!("logged in (Keychain), {masked}").dimmed()
+                    ),
+                    (Some(src), None) if src.starts_with("env:") => {
                         println!(
                             "  {} {} — {}",
-                            "✗".red(),
-                            provider.cyan(),
-                            e.to_string().dimmed()
-                        );
+                            "⚠".yellow(),
+                            p.provider.cyan(),
+                            format!("{src} var set").dimmed()
+                        )
                     }
+                    (Some(_), Some(msg)) => {
+                        println!("  {} {} — {}", "✗".red(), p.provider.cyan(), msg.dimmed())
+                    }
+                    _ => {}
                 }
             }
 

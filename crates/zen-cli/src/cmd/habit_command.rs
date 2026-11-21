@@ -13,12 +13,19 @@ pub enum HabitCommands {
         note: Option<String>,
     },
     /// List all habits with streaks
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show habit statistics
     Stats {
         name: String,
         #[arg(short = 'd', long, default_value = "30")]
         days: u32,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Add a new habit definition
     Add {
@@ -47,8 +54,30 @@ pub fn execute_command(cmd: &HabitCommands) -> Result<(), ZenError> {
             Ok(())
         }
 
-        HabitCommands::List => {
+        HabitCommands::List { json } => {
             let habits = service.load_habits()?;
+
+            if *json {
+                let payload: Vec<_> = habits
+                    .iter()
+                    .map(|habit| {
+                        let streak = service.get_streak(&habit.name).unwrap_or(0);
+                        serde_json::json!({
+                            "name": habit.name,
+                            "frequency": habit.frequency,
+                            "streak_days": streak,
+                            "target": habit.target,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
+
             if habits.is_empty() {
                 println!(
                     "No habits defined. Use {} to add one.",
@@ -81,7 +110,7 @@ pub fn execute_command(cmd: &HabitCommands) -> Result<(), ZenError> {
             Ok(())
         }
 
-        HabitCommands::Stats { name, days } => {
+        HabitCommands::Stats { name, days, json } => {
             let habit = service
                 .load_habits()?
                 .into_iter()
@@ -91,6 +120,24 @@ pub fn execute_command(cmd: &HabitCommands) -> Result<(), ZenError> {
             let streak = service.get_streak(&habit.name)?;
             let rate = service.get_completion_rate(&habit.name, *days)?;
             let checkins = service.get_checkins(&habit.name)?;
+
+            if *json {
+                let payload = serde_json::json!({
+                    "name": habit.name,
+                    "frequency": habit.frequency,
+                    "target": habit.target,
+                    "streak_days": streak,
+                    "completion_rate": rate,
+                    "window_days": days,
+                    "checkins": checkins.len(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|e| ZenError::Message(format!("json: {e}")))?
+                );
+                return Ok(());
+            }
 
             println!("{}", format!("Stats for '{}'", habit.name).bold());
             println!("  Frequency:  {}", habit.frequency);

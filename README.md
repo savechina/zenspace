@@ -62,7 +62,7 @@ zen serve start                       # background learning loop (wiki distill, 
 |---------|-------------|
 | [Installation](https://savechina.github.io/zenspace/installation.html) | Homebrew, source, binary (macOS & Linux) |
 | [Quick Start](https://savechina.github.io/zenspace/quickstart.html) | 5-minute walkthrough |
-| [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 23 commands |
+| [CLI Commands](https://savechina.github.io/zenspace/cli-commands.html) | All 24 commands |
 | [Providers & Auth](https://savechina.github.io/zenspace/configuration/providers.html) | 9 protocol types, API keys |
 | [Agent Routing](https://savechina.github.io/zenspace/configuration/agent-routing.html) | Per-agent model assignment |
 | [System Overview](https://savechina.github.io/zenspace/architecture/overview.html) | Architecture & data flow |
