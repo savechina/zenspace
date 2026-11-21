@@ -3385,6 +3385,35 @@ impl AgentOrchestrator {
     /// response, native wins and fenced payloads are logged as degraded,
     /// never double-dispatched.
     ///
+    /// True when the ENTIRE trimmed response consists of newline-separated
+    /// `{"tool": <string>, "args": {…}}` objects with no enclosing fence —
+    /// the tool dialect attempted bare. Strict whole-response shape so
+    /// prose answers that merely embed JSON never trip it.
+    fn is_bare_tool_json(response: &str) -> bool {
+        let trimmed = response.trim();
+        if trimmed.is_empty() || trimmed.contains("```") {
+            return false;
+        }
+        let mut saw_tool_object = false;
+        for line in trimmed.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(serde_json::Value::Object(map)) = serde_json::from_str(line) else {
+                return false;
+            };
+            let is_tool_object = map.len() == 2
+                && matches!(map.get("tool"), Some(serde_json::Value::String(_)))
+                && matches!(map.get("args"), Some(serde_json::Value::Object(_)));
+            if !is_tool_object {
+                return false;
+            }
+            saw_tool_object = true;
+        }
+        saw_tool_object
+    }
+
     /// Returns `(invocations, parse_errors, degraded)`.
     pub fn resolve_invocations(
         response: &str,
@@ -3392,6 +3421,25 @@ impl AgentOrchestrator {
     ) -> (Vec<ToolInvocation>, Vec<String>, bool) {
         if native_calls.is_empty() {
             let (invocations, parse_errors) = Self::parse_tool_invocations_verbose(response);
+            if invocations.is_empty()
+                && parse_errors.is_empty()
+                && Self::is_bare_tool_json(response)
+            {
+                // The model attempted the tool dialect without its fence
+                // (production 2026-11-21: deepseek emitted bare
+                // `{"tool":…, "args":…}` lines; the fenced-only parser saw
+                // nothing, so the raw JSON shipped as the final answer).
+                // Routing into the parse-reject channel gives the model the
+                // existing corrective re-prompt instead of a dead-end.
+                return (
+                    vec![],
+                    vec![
+                        "bare JSON tool calls without a ```json fence are not executable"
+                            .to_string(),
+                    ],
+                    false,
+                );
+            }
             return (invocations, parse_errors, false);
         }
 
@@ -4633,6 +4681,44 @@ mod tests {
         assert_eq!(invocations[0].args["path"], "/tmp/x");
         assert!(errors.is_empty());
         assert!(!degraded, "no native calls → not degraded");
+    }
+
+    /// Production 2026-11-21 shape: deepseek emitted bare (unfenced)
+    /// `{"tool":…, "args":…}` lines; the fenced-only parser saw nothing and
+    /// the raw JSON shipped as the final answer. The bare shape must route
+    /// into the parse-reject channel so the corrective re-prompt fires.
+    #[test]
+    fn resolve_invocations_bare_json_lines_route_to_parse_reject() {
+        let response = "{\"tool\": \"fs.read\", \"args\": {\"path\": \"/tmp/x\"}}\n\
+                        {\"tool\": \"tier3_search\", \"args\": {\"query\": \"buffett\", \"limit\": 10}}";
+
+        let (invocations, errors, degraded) = AgentOrchestrator::resolve_invocations(response, &[]);
+        assert!(invocations.is_empty(), "bare lines must NOT execute");
+        assert_eq!(errors.len(), 1, "one structured parse-reject error");
+        assert!(errors[0].contains("```json"));
+        assert!(!degraded);
+    }
+
+    #[test]
+    fn prose_with_embedded_json_is_not_bare_tool_json() {
+        let response = "Here is the call I would make:\n{\"tool\": \"fs.read\", \"args\": {\"path\": \"/tmp/x\"}}\nThat's the shape.";
+        let (invocations, errors, _) = AgentOrchestrator::resolve_invocations(response, &[]);
+        assert!(invocations.is_empty());
+        assert!(errors.is_empty(), "prose stays a plain answer: {errors:?}");
+    }
+
+    #[test]
+    fn bare_tool_json_requires_string_tool_and_object_args() {
+        let bad_args = "{\"tool\": \"fs.read\", \"args\": \"/tmp/x\"}";
+        let (invocations, errors, _) = AgentOrchestrator::resolve_invocations(bad_args, &[]);
+        assert!(invocations.is_empty());
+        assert!(errors.is_empty(), "non-object args stay a plain answer");
+
+        let extra_key =
+            "{\"tool\": \"fs.read\", \"args\": {\"path\": \"/tmp/x\"}, \"why\": \"extra\"}";
+        let (invocations, errors, _) = AgentOrchestrator::resolve_invocations(extra_key, &[]);
+        assert!(invocations.is_empty());
+        assert!(errors.is_empty(), "extra keys stay a plain answer");
     }
 
     #[test]
