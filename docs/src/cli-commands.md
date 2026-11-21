@@ -72,7 +72,7 @@ Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy cap
 | `zen audit` | Audit log operations |
 | `zen admission list` | Trust ledger: would-accepts, rejections, unresolved, admitted, duplicates (`--mode` filter, `--json`) |
 | `zen admission show <id>` | Full why-when-what decision record (sender, rule, scope, mode, policy version, trigger) |
-| `zen admission mode [<off\|observe\|auto>]` | Show effective accept mode + policy hash, or print the exact `config.toml` flip (`--channel`, `--json`) |
+| `zen admission mode [<off\|observe\|auto>]` | Show effective accept mode + source + policy hash, or flip it at runtime via the state.db override row — hot effect on the live daemon, `--clear` reverts to config (`--channel`, `--json`) |
 | `zen sandbox test` | Verify sandbox isolation works |
 
 ## Workspace & Configuration

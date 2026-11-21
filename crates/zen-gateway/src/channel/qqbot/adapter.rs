@@ -40,7 +40,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use zen_core::admission::{AdmissionStrength, Disposition, GateInput, evaluate};
+use zen_core::admission::{
+    AdmissionStrength, Disposition, GateInput, evaluate, resolve_effective_accept_mode,
+};
 use zen_core::config::AcceptMode;
 
 use super::api::QqBotApi;
@@ -99,7 +101,9 @@ pub struct QqBotAdapterOptions {
     pub allowed_users: Vec<String>,
     /// Admission accept mode — raw `[channels.qqbot] accept_mode` (007 T006,
     /// FR-004). Absent ⇒ observe (owner Q2=A). Parsed once at adapter
-    /// construction; there is no env or CLI override key (D22).
+    /// construction as the fallback; the effective mode resolves per
+    /// message against the `admission_mode_override` row (migration 017,
+    /// written by `zen admission mode <value>`). No env key (D22).
     pub accept_mode: Option<String>,
     /// SQLite file for `qq_bindings` persistence (also the admission ledger).
     pub bindings_db: std::path::PathBuf,
@@ -217,10 +221,12 @@ fn strength_str(strength: AdmissionStrength) -> &'static str {
     }
 }
 
-/// Policy-version hash over the effective `[channels.qqbot]` admission
-/// section, reusing the zen-core definition so the CLI and the seam can
-/// never disagree (007 D6).
-fn policy_version_for(options: &QqBotAdapterOptions) -> String {
+/// Policy-version hash over the effective admission section, reusing the
+/// zen-core definition so the CLI and the seam can never disagree (007 D6).
+/// Takes the RESOLVED mode (migration 017): a runtime override row changes
+/// the effective policy, and the ledger must stamp what was actually in
+/// effect — a config-derived mode would freeze the boot-time version.
+fn policy_version_for(mode: AcceptMode, options: &QqBotAdapterOptions) -> String {
     let config = zen_core::config::QqBotChannelConfig {
         app_id: options.app_id.clone(),
         client_secret: options.client_secret.clone(),
@@ -229,7 +235,7 @@ fn policy_version_for(options: &QqBotAdapterOptions) -> String {
         accept_mode: options.accept_mode.clone(),
         outbox_drain_interval_secs: None,
     };
-    zen_core::config::admission_policy_version_for(Some(&config))
+    zen_core::config::admission_policy_version_for_mode(mode, Some(&config))
 }
 
 fn epoch_secs() -> i64 {
@@ -377,11 +383,10 @@ fn normalize_event(event: QqWsEvent) -> Option<MessageEvent> {
 #[derive(Clone)]
 pub struct QqBotAdapter {
     options: QqBotAdapterOptions,
-    /// Effective accept mode for this channel (007 T006, FR-004).
+    /// Configured accept mode — the fallback when no runtime override row
+    /// exists (`admission_mode_override`, migration 017); the effective mode
+    /// is resolved per inbound message.
     mode: AcceptMode,
-    /// Stable hash of the effective admission policy recorded per decision
-    /// (007 D6).
-    policy_version: String,
     /// Single shared token authority: REST send path and WS identify
     /// flow MUST refresh against one cache or they race double-fetch.
     auth: Arc<QqBotAuth>,
@@ -428,13 +433,11 @@ impl QqBotAdapter {
         ));
         let bridge = GatewayBridge::new(options.chat_base.clone(), None)?;
         let mode = AcceptMode::parse(options.accept_mode.as_deref());
-        let policy_version = policy_version_for(&options);
         Ok(Self {
             api: Arc::new(QqBotApi::new(Arc::clone(&auth), options.api_base.clone())),
             auth,
             bridge: Arc::new(bridge),
             mode,
-            policy_version,
             options,
         })
     }
@@ -544,6 +547,23 @@ impl QqBotAdapter {
         Ok(())
     }
 
+    /// Resolves the per-message effective admission policy (migration 017):
+    /// runtime override row > configured mode. A repository failure fails
+    /// OPEN to the configured mode (warn, never a dispatch blocker) — the
+    /// override is an owner convenience, not a gate input.
+    async fn effective_policy(&self, client: &zen_repo::SqliteClient) -> (AcceptMode, String) {
+        let repo = zen_repo::AdmissionRepo::new(client);
+        let override_row = match repo.mode_override().await {
+            Ok(row) => row,
+            Err(e) => {
+                warn!(error = %e, "admission override read failed (fail-open to config)");
+                None
+            }
+        };
+        let mode = resolve_effective_accept_mode(self.mode, override_row.as_deref());
+        (mode, policy_version_for(mode, &self.options))
+    }
+
     /// Admission seam (007 T006/T009, FR-002/FR-004/FR-012/FR-014).
     ///
     /// Records one decision for every work request, then dispatches only
@@ -569,8 +589,9 @@ impl QqBotAdapter {
                 return Ok(());
             }
         };
+        let (mode, policy_version) = self.effective_policy(client).await;
         let decision = evaluate(&GateInput {
-            mode: self.mode,
+            mode,
             allowlist: &self.options.allowed_users,
             sender: &event.author_id,
             is_thread_continuation,
@@ -621,9 +642,9 @@ impl QqBotAdapter {
                 disposition,
                 matched_rule,
                 scope,
-                accept_mode: self.mode.as_str(),
+                accept_mode: mode.as_str(),
                 strength,
-                policy_version: &self.policy_version,
+                policy_version: &policy_version,
                 reason,
                 created_at,
             })
@@ -631,7 +652,18 @@ impl QqBotAdapter {
         match outcome {
             Ok(zen_repo::DecisionOutcome::New) => {}
             Ok(zen_repo::DecisionOutcome::Duplicate { id }) => {
-                self.audit_decision(&id, "duplicate", event, None, None, None);
+                self.audit_decision(
+                    &id,
+                    "duplicate",
+                    event,
+                    AuditContext {
+                        mode,
+                        policy_version: &policy_version,
+                        matched_rule: None,
+                        scope: None,
+                        reason: None,
+                    },
+                );
                 return Ok(());
             }
             Err(e) => {
@@ -640,9 +672,13 @@ impl QqBotAdapter {
                     &decision_id,
                     "unresolved",
                     event,
-                    None,
-                    None,
-                    Some(&e.to_string()),
+                    AuditContext {
+                        mode,
+                        policy_version: &policy_version,
+                        matched_rule: None,
+                        scope: None,
+                        reason: Some(&e.to_string()),
+                    },
                 );
                 return Ok(());
             }
@@ -651,9 +687,13 @@ impl QqBotAdapter {
             &decision_id,
             disposition,
             event,
-            matched_rule,
-            scope,
-            reason,
+            AuditContext {
+                mode,
+                policy_version: &policy_version,
+                matched_rule,
+                scope,
+                reason,
+            },
         );
         if let Some(reason) = reason
             && reason == "sender not allowlisted"
@@ -677,8 +717,8 @@ impl QqBotAdapter {
                 matched_rule,
                 scope: scope.unwrap_or("sender"),
                 strength: strength.unwrap_or("explicit"),
-                accept_mode: self.mode.as_str(),
-                policy_version: &self.policy_version,
+                accept_mode: mode.as_str(),
+                policy_version: &policy_version,
                 granted_at: created_at,
             })
             .await
@@ -777,6 +817,7 @@ impl QqBotAdapter {
         detail: &str,
     ) {
         let admission = zen_repo::AdmissionRepo::new(client);
+        let (mode, policy_version) = self.effective_policy(client).await;
         let id = uuid::Uuid::now_v7().to_string();
         let synthetic_event_id = format!("unresolved:{id}");
         let hash = content_hash(&event.author_id, &event.text);
@@ -793,9 +834,9 @@ impl QqBotAdapter {
                 disposition: "unresolved",
                 matched_rule: None,
                 scope: None,
-                accept_mode: self.mode.as_str(),
+                accept_mode: mode.as_str(),
                 strength: None,
-                policy_version: &self.policy_version,
+                policy_version: &policy_version,
                 reason: Some(detail),
                 created_at,
             })
@@ -803,9 +844,33 @@ impl QqBotAdapter {
         {
             warn!(error = %e, "unresolved admission record failed (fail-closed)");
         }
-        self.audit_decision(&id, "unresolved", event, None, None, Some(detail));
+        self.audit_decision(
+            &id,
+            "unresolved",
+            event,
+            AuditContext {
+                mode,
+                policy_version: &policy_version,
+                matched_rule: None,
+                scope: None,
+                reason: Some(detail),
+            },
+        );
     }
+}
 
+/// Per-disposition audit context: the effective policy under which the
+/// decision was made (migration 017 — stamped, never boot-cached), plus
+/// the recorded rule/scope/reason details.
+struct AuditContext<'a> {
+    mode: AcceptMode,
+    policy_version: &'a str,
+    matched_rule: Option<&'a str>,
+    scope: Option<&'a str>,
+    reason: Option<&'a str>,
+}
+
+impl QqBotAdapter {
     /// One `admission.decision` audit line per disposition (007 T006,
     /// FR-006/FR-003 observability).
     fn audit_decision(
@@ -813,9 +878,7 @@ impl QqBotAdapter {
         decision_id: &str,
         disposition: &str,
         event: &MessageEvent,
-        matched_rule: Option<&str>,
-        scope: Option<&str>,
-        reason: Option<&str>,
+        ctx: AuditContext<'_>,
     ) {
         self.audit(serde_json::json!({
             "kind": "admission.decision",
@@ -824,11 +887,11 @@ impl QqBotAdapter {
             "source": SOURCE,
             "sender": event.author_id,
             "threadKey": event.chat_id,
-            "matchedRule": matched_rule,
-            "scope": scope,
-            "mode": self.mode.as_str(),
-            "policyVersion": self.policy_version,
-            "reason": reason,
+            "matchedRule": ctx.matched_rule,
+            "scope": ctx.scope,
+            "mode": ctx.mode.as_str(),
+            "policyVersion": ctx.policy_version,
+            "reason": ctx.reason,
         }));
     }
 

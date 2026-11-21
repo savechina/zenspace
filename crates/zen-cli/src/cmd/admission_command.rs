@@ -12,7 +12,8 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use colored::Colorize;
 
-use zen_core::config::{AcceptMode, QqBotChannelConfig, load_config};
+use zen_core::admission::resolve_effective_accept_mode;
+use zen_core::config::{AcceptMode, admission_policy_version_for_mode, load_config};
 use zen_core::errors::ZenError;
 use zen_core::paths::ZenPaths;
 use zen_repo::{AdmissionRepo, DecisionRow, DispositionFilter, SqliteClient};
@@ -39,13 +40,16 @@ pub enum AdmissionCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Show the effective accept mode, or print the exact config.toml edit for a flip
+    /// Show the effective accept mode, or flip it at runtime (state.db override row)
     Mode {
         /// Requested mode: off | observe | auto (omit to show the current mode)
         value: Option<String>,
         /// Channel instance (v1 supports: qqbot)
         #[arg(long, default_value = "qqbot")]
         channel: String,
+        /// Remove the runtime override — the effective mode falls back to config.toml
+        #[arg(long, conflicts_with = "value")]
+        clear: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -59,8 +63,9 @@ pub async fn execute_command(operation: &AdmissionCommands) -> Result<(), ZenErr
         AdmissionCommands::Mode {
             value,
             channel,
+            clear,
             json,
-        } => mode(value.as_deref(), channel, *json).await,
+        } => mode(value.as_deref(), channel, *clear, *json).await,
     }
 }
 
@@ -165,78 +170,127 @@ async fn show(id: &str, json: bool) -> Result<(), ZenError> {
     Ok(())
 }
 
-async fn mode(value: Option<&str>, channel: &str, json: bool) -> Result<(), ZenError> {
+async fn mode(value: Option<&str>, channel: &str, clear: bool, json: bool) -> Result<(), ZenError> {
     if channel != "qqbot" {
         return Err(ZenError::Message(format!(
             "unknown channel '{channel}' (v1 supports: qqbot)"
         )));
     }
     let config = load_config()?;
-    let current = config
-        .channels
-        .qqbot
-        .as_ref()
-        .map(QqBotChannelConfig::accept_mode_or_default)
+    let qqbot_cfg = config.channels.qqbot.as_ref();
+    let config_mode = qqbot_cfg
+        .map(|q| q.accept_mode_or_default())
         .unwrap_or_default();
-    let policy_version = config.admission_policy_version();
     let config_path = ZenPaths::detect()
         .map(|p| p.config_file())
         .map_err(|e| ZenError::Message(format!("path error: {e}")))?;
 
-    let Some(requested) = value else {
+    let override_row = read_mode_override().await?;
+    let effective = resolve_effective_accept_mode(config_mode, override_row.as_deref());
+    let policy_version = admission_policy_version_for_mode(effective, qqbot_cfg);
+
+    if clear {
+        let cleared = clear_mode_override_row().await?;
+        let reverted = resolve_effective_accept_mode(config_mode, None);
+        let reverted_version = admission_policy_version_for_mode(reverted, qqbot_cfg);
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "channel": channel,
-                    "acceptMode": current.as_str(),
+                    "cleared": cleared,
+                    "acceptMode": reverted.as_str(),
+                    "policyVersion": reverted_version,
+                    "source": "config.toml",
+                }))
+                .map_err(|e| ZenError::Message(format!("serialize mode: {e}")))?
+            );
+        } else if cleared {
+            println!("{}", "Runtime override cleared".bold());
+            println!(
+                "  accept mode now follows config: {}",
+                reverted.as_str().cyan()
+            );
+        } else {
+            println!("{}", "No runtime override present".bold());
+            println!(
+                "  accept mode already follows config: {}",
+                reverted.as_str().cyan()
+            );
+        }
+        return Ok(());
+    }
+
+    let Some(requested) = value else {
+        let source = if override_row.is_some() {
+            "runtime override (state.db)"
+        } else {
+            "config.toml"
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "channel": channel,
+                    "acceptMode": effective.as_str(),
+                    "source": source,
                     "policyVersion": policy_version,
                     "configPath": config_path.display().to_string(),
-                    "source": "config.toml (5-layer read-only surface)",
                 }))
                 .map_err(|e| ZenError::Message(format!("serialize mode: {e}")))?
             );
         } else {
             println!("{}", "Admission accept mode".bold());
             println!("  channel        = {channel}");
-            println!("  accept_mode    = {}", current.as_str().cyan());
+            println!("  accept_mode    = {}", effective.as_str().cyan());
+            println!("  source         = {source}");
             println!("  policy_version = {}", policy_version.dimmed());
-            println!("  config         = {}", config_path.display());
+            if override_row.is_some() {
+                println!(
+                    "  {}",
+                    "runtime override active — `zen admission mode --clear` reverts to config"
+                        .dimmed()
+                );
+            } else {
+                println!("  config         = {}", config_path.display());
+            }
         }
         return Ok(());
     };
 
     let requested = parse_requested_mode(requested)?;
     let open_tickets = open_ticket_count().await;
-    let snippet = format!("[channels.qqbot]\naccept_mode = \"{}\"", requested.as_str());
+    write_mode_override(requested.as_str()).await?;
+    let new_version = admission_policy_version_for_mode(requested, qqbot_cfg);
+
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "channel": channel,
-                "currentMode": current.as_str(),
+                "currentMode": effective.as_str(),
                 "requestedMode": requested.as_str(),
-                "policyVersion": policy_version,
-                "configPath": config_path.display().to_string(),
-                "snippet": snippet,
-                "effect": "future admissions only (FR-014)",
+                "policyVersion": new_version,
+                "effect": "future admissions only (FR-014); live daemon picks it up on the next message",
                 "openTickets": open_tickets,
-                "applied": false,
+                "revert": "zen admission mode --clear",
+                "applied": true,
             }))
             .map_err(|e| ZenError::Message(format!("serialize mode: {e}")))?
         );
         return Ok(());
     }
 
-    println!("{}", "Accept-mode change requested".bold());
+    println!("{}", "Accept mode set (runtime override)".bold());
     println!("  channel        = {channel}");
-    println!("  current_mode   = {}", current.as_str().cyan());
+    println!("  current_mode   = {}", effective.as_str().cyan());
     println!("  requested_mode = {}", requested.as_str().cyan());
-    println!("  policy_version = {}", policy_version.dimmed());
+    println!("  policy_version = {}", new_version.dimmed());
     println!();
-    println!("Runtime mode follows config.toml (5-layer read-only surface). Apply:");
-    println!("  file: {}", config_path.display());
-    println!("  {snippet}");
+    println!(
+        "Applied: the daemon resolves the override on the next inbound message — no restart needed."
+    );
+    println!("config.toml is untouched; the override wins until cleared.");
     println!();
     println!(
         "Effect: future admissions only — in-flight work continues under its granted mandate (FR-014)."
@@ -246,8 +300,40 @@ async fn mode(value: Option<&str>, channel: &str, json: bool) -> Result<(), ZenE
             "Note: {open_tickets} open admission ticket(s); their work continues under its recorded mandate."
         );
     }
-    println!("Then reload the channel: `zen serve restart`.");
+    println!("Revert: `zen admission mode --clear`.");
     Ok(())
+}
+
+async fn read_mode_override() -> Result<Option<String>, ZenError> {
+    let Some(client) = open_ledger().await? else {
+        return Ok(None);
+    };
+    AdmissionRepo::new(&client)
+        .mode_override()
+        .await
+        .map_err(|e| ZenError::Message(format!("read accept-mode override: {e}")))
+}
+
+async fn write_mode_override(mode: &str) -> Result<(), ZenError> {
+    let paths = ZenPaths::detect().map_err(|e| ZenError::Message(format!("path error: {e}")))?;
+    let db = paths.data().join("state.db");
+    let client = SqliteClient::open(&db)
+        .await
+        .map_err(|e| ZenError::Message(format!("open state.db: {e}")))?;
+    AdmissionRepo::new(&client)
+        .set_mode_override(mode)
+        .await
+        .map_err(|e| ZenError::Message(format!("write accept-mode override: {e}")))
+}
+
+async fn clear_mode_override_row() -> Result<bool, ZenError> {
+    let Some(client) = open_ledger().await? else {
+        return Ok(false);
+    };
+    AdmissionRepo::new(&client)
+        .clear_mode_override()
+        .await
+        .map_err(|e| ZenError::Message(format!("clear accept-mode override: {e}")))
 }
 
 fn parse_requested_mode(raw: &str) -> Result<AcceptMode, ZenError> {

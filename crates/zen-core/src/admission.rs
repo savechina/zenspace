@@ -13,6 +13,23 @@
 pub use crate::config::AcceptMode;
 use serde::{Deserialize, Serialize};
 
+/// Effective accept mode (007 deviation closeout, migration 017): a runtime
+/// override row (`admission_mode_override`, written by `zen admission mode`)
+/// wins over the configured mode; no row leaves config in charge.
+///
+/// The stored value is validated at write time; an invalid stored value
+/// (hand-edited db) degrades loudly through `AcceptMode::parse`'s E11 path
+/// (warn + Observe) — never silent, never a gate bypass.
+pub fn resolve_effective_accept_mode(
+    configured: AcceptMode,
+    override_row: Option<&str>,
+) -> AcceptMode {
+    match override_row {
+        None => configured,
+        Some(raw) => AcceptMode::parse(Some(raw)),
+    }
+}
+
 /// How an inbound request is grounded (FR-003) — binary by design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

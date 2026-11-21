@@ -166,7 +166,7 @@ zenspace/
 │   │       └── turn_context.rs # TurnContext task-local (D30/W11.1): per-turn sensitivity/knowledge/history
 │   ├── zen-service/            # Business logic (starter, wps, cleanup)
 │   ├── zen-repo/               # Unified data layer (SqliteClient + 11 domain repos)
-│   │   ├── migrations/         # sqlx::migrate!() SQL files (001_initial … 016_admission)
+│   │   ├── migrations/         # sqlx::migrate!() SQL files (001_initial … 017_admission_mode_override)
 │   │   └── src/
 │   │       ├── client.rs       # SqliteClient (tokio_rusqlite writer + sqlx pool), run_migrations()
 │   │       ├── types.rs        # Row types + request structs (IndexNoteRequest, InsertRelationshipRequest, etc.)
@@ -512,7 +512,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen session` | Session lifecycle | `session_command.rs` |
 | `zen serve` | Gateway daemon: start [--foreground] [--http] / status [--json] / stop / restart / mcp / install / uninstall (macOS launchd LaunchAgent); `status` shows binary vs running-daemon version with a `STALE`/`STALE-unknown` marker (JSON: `versionState`/`stale`/`binaryVersion`/`daemonVersion`); `restart` = `launchctl kickstart -k gui/{uid}/dev.zen.serve` when the LaunchAgent plist exists, else graceful stop (SIGTERM drain ≤10s + audited cancels) + start under StartupLock/readiness — a stopped daemon makes restart a plain start; `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
 | `zen agent` | Agent registry | `agent_command.rs` |
-| `zen admission` | Inbound trust ledger + accept-mode surface: `list [--mode <m>] [--json]`, `show <id> [--json]`, `mode [<off\|observe\|auto>] [--channel qqbot] [--json]` (mode flip is config-guided: validates + prints the exact `config.toml` edit; config is the 5-layer read-only surface, D22) | `admission_command.rs` |
+| `zen admission` | Inbound trust ledger + accept-mode surface: `list [--mode <m>] [--json]`, `show <id> [--json]`, `mode [<off\|observe\|auto>] [--channel qqbot] [--json]`, `mode --clear` (mode flip is a REAL runtime flip: writes the single-row `admission_mode_override` override in state.db — migration 017 — which the qqbot gate resolves per message: override > config > default observe; hot effect on the live daemon, no restart; invalid stored values degrade loudly to observe, E11; `--clear` reverts to config; config stays the 5-layer read-only surface, D22) | `admission_command.rs` |
 | `zen workspace` | `.zen/` structure | `workspace_command.rs` |
 | `zen config` | Config layers | `config_command.rs` |
 | `zen provider` | LLM provider mgmt | `provider_command.rs` |
@@ -857,7 +857,8 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
   - **Wave A 基础**：zen-core 纯准入门（强度二元 explicit/inferred、off→observe→auto 梯、提示文本结构性无权威参数面 + 门钉）+ accept_mode 配置面（E11 回落 observe、策略版本 sha256 记入每决策）；zen-repo migration 016 三表（decisions 去重唯一索引 + 内容哈希 partial 回退、mandates 不可变只可撤、tickets 独立生命周期）+ AdmissionRepo + 8 迁移钉。
   - **Wave B 接线**：qqbot 接入缝——外来消息先过门再派发（内置命令绕过、命令级 seen 去重保留、observe 零副作用、auto=既有 hosted-turn 管线零新执行器、FR-014 活票据续乘免再准、fail-closed unresolved+brief 呈报）；CLI `zen admission`（list/show/mode——mode 翻转 v1 为配置引导式：校验+打印 config.toml 编辑，运行时态面留待后续迁移）；`admission.list` 只读代理工具（与 CLI 同库，无写工具——信任态 CLI-only）+ brief 信任节；retention：decisions 90d SQL 行龄删（mandate 引用行保留）、mandates/tickets 永久保留行 + 钉。
   - **e2e 钉**：观察零副作用、注入语料零权限变化（SC-006）、重放 10×=1 决策+9 重复、off 档拒绝、auto 执行+回复+失败诚实报、活票据观察档续乘（FR-014）、授权完整性 why-when-what、代理-CLI parity。
-  - **纪律注记**：B-1 lane 越权预写 AGENTS.md 命令行（内容正确，主会话核对后保留并补完同步面）；`zen admission mode <value>` 为对 contracts/cli-admission.md 的记录在案偏差（config 5 层只读面，无运行时覆盖表——需迁移的后续项）。
+  - **T021 偏差解除（同日，迁移 017）**：`zen admission mode <value>` 真翻转——单行 `admission_mode_override` 运行时覆盖表（qqbot 门逐消息解析：override > config > 默认 observe，热生效无需 restart；`--clear` 回落 config；非法存储值 E11 降级 observe）；账本/审计戳生效模式与生效策略版本（`admission_policy_version_for_mode`，配置派生变体字节等同委托）。钉 +6：migration_017 ×2、admission_override e2e ×2（热切 observe→auto / bogus 降级零派发）、gate ×2；retention 补 Keep 行。
+  - **纪律注记**：B-1 lane 越权预写 AGENTS.md 命令行（内容正确，主会话核对后保留并补完同步面）；`zen admission mode <value>` 配置引导式偏差已于 T021（迁移 017）解除——契约原语义落地。
 
 - **W15 CEO 评审整改波：编排链可达性 + 账本诚实（2026-11-20，/plan-ceo-review HOLD SCOPE「fix all」触发；lint 0 / verify 绿 / test 3903/0/28）** — 16 发现/15 修复（P1×3/P2×6/P3×6）：
   - **P1 可达性**：plan.todos 补上 Sisyphus 授予（此前注册但从未 grant，账本面默认不可达，含授予哨兵钉）；批间守卫重排修「arm 后被 register 替换击穿」（拒绝窗口现覆盖整个 invoke，波窗钉）；plan.control append 规格不再即弃——并入 spec_json（items+tasks，复用 attach_batch_spec 同守卫），get/resume/归纳语料全可见。

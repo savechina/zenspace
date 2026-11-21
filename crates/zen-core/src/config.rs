@@ -321,11 +321,23 @@ impl QqBotChannelConfig {
 /// allowlist or repeating an identity never churns the version; changing the
 /// set or the mode always does. Recorded on every admission decision.
 pub fn admission_policy_version_for(qqbot: Option<&QqBotChannelConfig>) -> String {
-    use sha2::{Digest, Sha256};
-
     let mode = qqbot
         .map(QqBotChannelConfig::accept_mode_or_default)
         .unwrap_or_default();
+    admission_policy_version_for_mode(mode, qqbot)
+}
+
+/// Mode-parameterized variant (migration 017): the qqbot seam resolves the
+/// effective accept mode per message (runtime override row > config) and
+/// must stamp the version of the policy that was actually in effect — a
+/// config-derived mode here would record a stale version on every flipped
+/// decision. Same hash inputs as [`admission_policy_version_for`] otherwise.
+pub fn admission_policy_version_for_mode(
+    mode: AcceptMode,
+    qqbot: Option<&QqBotChannelConfig>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
     let mut identities: Vec<&str> = qqbot
         .map(|q| q.allowed_users.iter().map(String::as_str).collect())
         .unwrap_or_default();

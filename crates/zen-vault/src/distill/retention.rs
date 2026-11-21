@@ -424,6 +424,13 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
             root: paths.data().join("state.db"),
             action: Action::Keep,
         },
+        // The runtime accept-mode override (migration 017) is channel STATE,
+        // not stream data: KEPT — only `zen admission mode` writes/clears it.
+        Policy {
+            home: "state.db/admission_mode_override",
+            root: paths.data().join("state.db"),
+            action: Action::Keep,
+        },
         Policy {
             home: "vault/archive/quarantine",
             root: paths.archive().join("quarantine"),

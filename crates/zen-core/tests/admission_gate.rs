@@ -314,3 +314,76 @@ accept_mode = "observe"
     // The process-wide helper never panics and hashes the effective config.
     assert!(!admission_policy_version().is_empty());
 }
+
+/// Migration 017 resolution precedence: override row > configured mode, an
+/// invalid stored value degrades loudly (E11) to observe — never silent,
+/// never a gate bypass.
+#[test]
+fn resolve_effective_accept_mode_prefers_override_then_config_then_degrades_loudly() {
+    use zen_core::admission::resolve_effective_accept_mode;
+    use zen_core::config::AcceptMode;
+
+    assert_eq!(
+        resolve_effective_accept_mode(AcceptMode::Observe, Some("auto")),
+        AcceptMode::Auto
+    );
+    assert_eq!(
+        resolve_effective_accept_mode(AcceptMode::Observe, Some("off")),
+        AcceptMode::Off
+    );
+    assert_eq!(
+        resolve_effective_accept_mode(AcceptMode::Off, None),
+        AcceptMode::Off,
+        "no row leaves config in charge"
+    );
+    assert_eq!(
+        resolve_effective_accept_mode(AcceptMode::Auto, Some("bogus")),
+        AcceptMode::Observe,
+        "an invalid stored value degrades loudly to observe"
+    );
+}
+
+/// Migration 017 version stamping: a flipped decision records the flipped
+/// policy's hash; the config-derived variant stays byte-identical.
+#[test]
+fn admission_policy_version_for_mode_stamps_effective_mode_and_delegates_byte_identically() {
+    use zen_core::config::{
+        AcceptMode, QqBotChannelConfig, admission_policy_version_for,
+        admission_policy_version_for_mode,
+    };
+
+    let cfg = QqBotChannelConfig {
+        app_id: String::new(),
+        client_secret: String::new(),
+        allowed_users: vec!["u1".to_string(), "u2".to_string()],
+        home_channel: None,
+        accept_mode: Some("observe".to_string()),
+        outbox_drain_interval_secs: None,
+    };
+    assert_eq!(
+        admission_policy_version_for_mode(AcceptMode::Observe, Some(&cfg)),
+        admission_policy_version_for(Some(&cfg)),
+        "delegation: same mode must hash byte-identically"
+    );
+
+    let auto = admission_policy_version_for_mode(AcceptMode::Auto, Some(&cfg));
+    assert_ne!(
+        auto,
+        admission_policy_version_for(Some(&cfg)),
+        "an override flip must churn the recorded version"
+    );
+
+    let wider = QqBotChannelConfig {
+        app_id: String::new(),
+        client_secret: String::new(),
+        allowed_users: vec!["u1".to_string(), "u2".to_string(), "u3".to_string()],
+        home_channel: None,
+        accept_mode: Some("observe".to_string()),
+        outbox_drain_interval_secs: None,
+    };
+    assert_ne!(
+        admission_policy_version_for_mode(AcceptMode::Auto, Some(&wider)),
+        auto,
+        "allowlist changes must churn the version under an override too"
+    );
+}

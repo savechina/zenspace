@@ -150,6 +150,66 @@ impl<'a> AdmissionRepo<'a> {
         Self { client }
     }
 
+    /// Read the runtime accept-mode override row (migration 017).
+    ///
+    /// `Ok(None)` when no row was written (fresh database, or after
+    /// [`Self::clear_mode_override`]) — the caller falls back to the
+    /// configured `[channels.qqbot] accept_mode`. An invalid stored value is
+    /// the caller's E11 concern (`AcceptMode::parse` warns + Observe).
+    ///
+    /// # Errors
+    /// SQLite failure — callers on the hot path fail open to config.
+    pub async fn mode_override(&self) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT accept_mode FROM admission_mode_override WHERE id = 1",
+        )
+        .fetch_optional(self.client.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Write the runtime accept-mode override (single-row UPSERT on `id = 1`).
+    ///
+    /// The CLI write path validates the value first (`off|observe|auto`);
+    /// the daemon picks the row up on the next inbound message — no restart.
+    /// Config remains untouched: the override WINS until cleared.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub async fn set_mode_override(&self, mode: &str) -> Result<()> {
+        // `writer().call` needs a 'static closure — own the param.
+        let mode = mode.to_string();
+        self.client
+            .writer()
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO admission_mode_override(id, accept_mode) \
+                     VALUES(1, ?1) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         accept_mode = excluded.accept_mode, \
+                         updated_at = datetime('now')",
+                    rusqlite::params![mode],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(SqliteError::TokioRusqlite)
+    }
+
+    /// Clears the runtime override row: the effective mode falls back to
+    /// config. Returns whether a row existed.
+    ///
+    /// # Errors
+    /// SQLite failure.
+    pub async fn clear_mode_override(&self) -> Result<bool> {
+        self.client
+            .writer()
+            .call(|conn| Ok(conn.execute("DELETE FROM admission_mode_override WHERE id = 1", [])?))
+            .await
+            .map(|deleted| deleted > 0)
+            .map_err(SqliteError::TokioRusqlite)
+    }
+
     /// Insert one decision row, dedup-aware (FR-011): a replay of the same
     /// `(source, event_id)` — or, for sources without stable ids, the same
     /// `(source, content_hash)` — is recorded as a `duplicate` row with a
