@@ -5,7 +5,7 @@
 CREATE TABLE IF NOT EXISTS workflow_plans (
     plan_id        TEXT PRIMARY KEY,
     name           TEXT,
-    status         TEXT NOT NULL DEFAULT 'running', -- running|completed|failed|cancelled
+    status         TEXT NOT NULL DEFAULT 'running', -- running|completed|failed
     spec_json      TEXT NOT NULL,
     summary        TEXT,
     plan_approved  INTEGER,

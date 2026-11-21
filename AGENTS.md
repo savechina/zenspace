@@ -472,6 +472,7 @@ When adding new CLI commands:
 
 ## ANTI-PATTERNS (THIS PROJECT)
 
+- **Applied-migration immutability**: an in-place edit of an already-applied migration file (W15's 006 comment-token change `failed`→`failed|cancelled`) breaks sqlx checksum verification against every db that already applied it — production hard-failed at the next `SqliteClient::open` until the original bytes were restored (2026-11-21, sha `4194b1da…`). Vocabulary notes belong in NEW migrations or docs, never in shipped files (Principle XIII).
 - **Typo history**: `excute_command` appeared in all 24 cmd files; corrected to `execute_command` across all command files
 - **Tests/main.rs**: Unusual pattern -- only declares modules, no `#[test]` functions
 - **Stale files**: `crates/zen-cli/src/cmd/workspace.rs`, `session.rs`, `config.rs`, `agent.rs`, `audit.rs` (no extension) are stale/unused
