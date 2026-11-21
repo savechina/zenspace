@@ -85,13 +85,27 @@ impl Tool for FsGlobTool {
                 // A pattern whose leading component is a zen-root subtree
                 // anchors at the global root even without an explicit
                 // `cwd` — from the daemon (cwd=/) a bare "vault/**/*.md"
-                // would otherwise silently match nothing.
+                // would otherwise silently match nothing. A bare relative
+                // pattern under the daemon's filesystem-root cwd walks the
+                // whole disk (production measured 70s for one such call);
+                // anchor it at the zen root too, where the documented
+                // relative spelling applies. A dev-shell cwd keeps its
+                // normal relative-pattern semantics.
                 let leading = std::path::Path::new(pattern)
                     .components()
                     .next()
                     .map(|c| c.as_os_str().to_string_lossy().to_string());
+                let daemon_root_cwd = std::env::current_dir()
+                    .map(|d| d == std::path::Path::new("/"))
+                    .unwrap_or(false);
                 match leading.as_deref() {
                     Some(c) if zen_core::sandbox::is_global_root_subtree(c) => {
+                        zen_core::paths::user_root()
+                            .join(pattern)
+                            .to_string_lossy()
+                            .to_string()
+                    }
+                    _ if daemon_root_cwd && std::path::Path::new(pattern).is_relative() => {
                         zen_core::paths::user_root()
                             .join(pattern)
                             .to_string_lossy()

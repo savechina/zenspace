@@ -227,3 +227,32 @@ async fn fs_glob_anchors_pattern_leading_subtree_at_user_root() {
         "expected {expected} in {out}"
     );
 }
+
+#[tokio::test]
+async fn fs_glob_bare_pattern_anchors_when_cwd_is_filesystem_root() {
+    let _lock = ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".zen")).unwrap();
+    let _guard = ZenHomeGuard::install(&home.path().join(".zen"));
+    let page = home.path().join(".zen/notes/buffett.md");
+    std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+    std::fs::write(&page, "letters").unwrap();
+
+    let prior = std::env::current_dir().unwrap();
+    std::env::set_current_dir("/").unwrap();
+    let tool = FsGlobTool::new(SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![]));
+    let result = tool
+        .invoke(serde_json::json!({ "pattern": "notes/*.md" }))
+        .await;
+    std::env::set_current_dir(&prior).unwrap();
+    let out = result.unwrap();
+
+    let matches = out["matches"].as_array().cloned().unwrap_or_default();
+    let expected = lexical(&page).to_string_lossy().to_string();
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.as_str() == Some(expected.as_str())),
+        "expected {expected} in {out}"
+    );
+}
