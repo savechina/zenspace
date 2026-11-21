@@ -81,7 +81,25 @@ impl Tool for FsGlobTool {
                     .map_err(KernelError::ToolFailed)?;
                 b.join(pattern).to_string_lossy().to_string()
             }
-            None => pattern.to_string(),
+            None => {
+                // A pattern whose leading component is a zen-root subtree
+                // anchors at the global root even without an explicit
+                // `cwd` — from the daemon (cwd=/) a bare "vault/**/*.md"
+                // would otherwise silently match nothing.
+                let leading = std::path::Path::new(pattern)
+                    .components()
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy().to_string());
+                match leading.as_deref() {
+                    Some(c) if zen_core::sandbox::is_global_root_subtree(c) => {
+                        zen_core::paths::user_root()
+                            .join(pattern)
+                            .to_string_lossy()
+                            .to_string()
+                    }
+                    _ => pattern.to_string(),
+                }
+            }
         };
 
         // The glob iterator walks the filesystem synchronously — under the

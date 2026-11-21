@@ -352,6 +352,81 @@ pub fn is_tool_intermediate(line: &str) -> bool {
     trimmed.starts_with(TOOL_STARTED_MARKER) || trimmed.starts_with(TOOL_COMPLETED_MARKER)
 }
 
+/// Stateful ```json tool-fence suppressor for the hosted-turn token
+/// stream.
+///
+/// The fenced ```json block is the recorded tool-call dialect (the
+/// executor prompt instructs it; `strip_fenced_tool_blocks` strips it on
+/// history projection) — but streaming those fences verbatim rendered
+/// them as visible `┌─ json` code blocks on every surface. This filter
+/// drops lines between an exact "```json" opener (mirroring the
+/// `strip_fenced_tool_blocks` grammar) and its closing "```" line.
+///
+/// Tool-line atomicity is preserved: only a trailing fragment that is a
+/// PREFIX of the opener ("```", "```j", …) is held back until the next
+/// chunk classifies it — every other partial tail flows immediately, so
+/// 🔧/✅ lifecycle lines and arbitrary text splits stay byte-identical
+/// to the unfiltered stream (gluing a held text fragment onto a
+/// following tool line would break the per-token classification
+/// contract the T056 harness pins). [`JsonFenceSuppressor::flush`]
+/// releases a trailing residue at turn end.
+#[derive(Default)]
+pub struct JsonFenceSuppressor {
+    in_fence: bool,
+    pending: String,
+}
+
+const FENCE_OPENER_LINE: &str = "```json";
+
+impl JsonFenceSuppressor {
+    /// Filter one callback chunk: returns the text that may surface.
+    pub fn filter(&mut self, chunk: &str) -> String {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.push_str(chunk);
+        let mut kept = String::new();
+        while let Some(idx) = buf.find('\n') {
+            let line: String = buf.drain(..=idx).collect();
+            let body = &line[..line.len() - 1];
+            if !self.in_fence && body.trim() == FENCE_OPENER_LINE {
+                self.in_fence = true;
+                continue;
+            }
+            if self.in_fence {
+                if body.trim_start().starts_with("```") {
+                    self.in_fence = false;
+                }
+                continue;
+            }
+            kept.push_str(&line);
+        }
+        if buf.is_empty() {
+            return kept;
+        }
+        if self.in_fence {
+            self.pending = buf;
+            return kept;
+        }
+        if FENCE_OPENER_LINE.starts_with(buf.as_str()) {
+            self.pending = buf;
+            return kept;
+        }
+        kept.push_str(&buf);
+        kept
+    }
+
+    /// Release a trailing held fragment at turn end. An unterminated
+    /// fence drops its residue — a half-open tool block is noise, and the
+    /// authoritative `turn_completed` response still carries the full
+    /// text for repair paths.
+    pub fn flush(&mut self) -> String {
+        let residue = std::mem::take(&mut self.pending);
+        if self.in_fence {
+            return String::new();
+        }
+        residue
+    }
+}
+
 /// Splits one orchestrator callback token into plain text (feeds the
 /// delta pipeline unchanged) and tool intermediates (T056 structural
 /// frames).
@@ -1187,6 +1262,8 @@ pub async fn turn_with(
     let token_record = Arc::clone(&record);
     let token_pending = Arc::clone(&pending);
     let token_notify = flush_notify.clone();
+    let fence_filter: Arc<StdMutex<JsonFenceSuppressor>> = Arc::default();
+    let token_fence = Arc::clone(&fence_filter);
     let mut callback = move |tok: String| {
         // T056 (research D17): the orchestrator interleaves 🔧/✅ tool
         // lifecycle lines with LLM text on this single callback. Tool
@@ -1194,8 +1271,12 @@ pub async fn turn_with(
         // structural frames — dropping a `tool_completed` would tear
         // the event stream like a dropped `turn_completed`, and
         // replaying them as deltas would double-render on clients
-        // that understand the structured kinds.
-        let (text, tool_events) = split_tool_intermediates(&tok);
+        // that understand the structured kinds. The fence filter runs
+        // FIRST so a ```json tool-dialect block never reaches the
+        // delta stream (stateful across callbacks — openers can split
+        // across token boundaries).
+        let filtered = lock_ok(&*token_fence, "fence filter lock").filter(&tok);
+        let (text, tool_events) = split_tool_intermediates(&filtered);
         for event in &tool_events {
             match event {
                 ToolIntermediate::Started { tool, args } => {
@@ -1322,6 +1403,12 @@ pub async fn turn_with(
         () = guard_loop => Err(CancelReason::Watchdog),
     };
 
+    // Release any fence-filter residue (a held partial line) before the
+    // final drain so the delta stream never drops trailing text.
+    let fence_residue = lock_ok(&*fence_filter, "fence filter lock").flush();
+    if !fence_residue.is_empty() {
+        lock_ok(&*pending, "pending lock").push_str(&fence_residue);
+    }
     // Final delta drain before any terminal event so ordering holds.
     drain_pending(&record, &pending);
     flush_done_signal(&flusher);
@@ -2139,6 +2226,79 @@ mod tests {
                 assert_eq!(preview.chars().count(), TOOL_PREVIEW_MAX_CHARS);
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_tool_fence_suppressed_in_a_single_chunk() {
+        let mut f = JsonFenceSuppressor::default();
+        let out = f.filter("before\n```json\n[{\"tool\":\"web.search\"}]\n```\nafter\n");
+        assert_eq!(out, "before\nafter\n");
+        assert_eq!(f.flush(), "");
+    }
+
+    #[test]
+    fn json_tool_fence_suppressed_across_chunk_boundaries() {
+        let mut f = JsonFenceSuppressor::default();
+        let out = f.filter("before\n```js")
+            + &f.filter("on\n[{\"t")
+            + &f.filter("ool\": 1}]\n``")
+            + &f.filter("`\nafter\n");
+        assert_eq!(out, "before\nafter\n");
+        assert_eq!(f.flush(), "");
+    }
+
+    #[test]
+    fn ordinary_code_fences_and_markers_pass_through() {
+        let mut f = JsonFenceSuppressor::default();
+        let input = "```rust\nfn x() {}\n```\n🔧 web.search {\"q\":\"rust\"}\n✅ web.search done 1 hits 5ms\n";
+        assert_eq!(f.filter(input), input);
+    }
+
+    #[test]
+    fn non_prefix_partial_tail_flows_immediately() {
+        // Tool-line atomicity: an arbitrary partial tail must NOT be held
+        // and glued onto the next chunk's lines (the T056 harness pins
+        // that a text fragment followed by a ✅ line classifies the line).
+        let mut f = JsonFenceSuppressor::default();
+        assert_eq!(f.filter("tail without newline"), "tail without newline");
+        assert_eq!(f.flush(), "");
+    }
+
+    #[test]
+    fn opener_prefix_tail_holds_until_classified() {
+        let mut f = JsonFenceSuppressor::default();
+        assert_eq!(f.filter("text\n```jso"), "text\n");
+        assert_eq!(f.filter("n\n[{\"tool\":1}]\n```\nafter\n"), "after\n");
+        assert_eq!(f.flush(), "");
+    }
+
+    #[test]
+    fn unterminated_fence_drops_residue() {
+        let mut f = JsonFenceSuppressor::default();
+        assert_eq!(f.filter("```json\n[{\"partial\""), "");
+        assert_eq!(f.flush(), "");
+    }
+
+    /// Differential pin: the fence filter composes across arbitrary chunk
+    /// splits — the stateful line-carry must yield exactly the
+    /// whole-stream classification (the property the per-token
+    /// `split_tool_intermediates` contract cannot express).
+    #[test]
+    fn fence_filter_composes_across_every_chunk_split() {
+        let stream = "head line\n```json\n[{\"tool\":\"fs.read\"}]\n```\ntail line\nmore\n";
+        let mut whole = JsonFenceSuppressor::default();
+        let reference = whole.filter(stream);
+        assert_eq!(reference, "head line\ntail line\nmore\n");
+        for split in 1..stream.len() {
+            let (a, b) = stream.split_at(split);
+            let mut f = JsonFenceSuppressor::default();
+            let composed = f.filter(a) + &f.filter(b);
+            assert_eq!(
+                composed + &f.flush(),
+                reference,
+                "split at byte {split} must compose to the whole-stream result"
+            );
         }
     }
 

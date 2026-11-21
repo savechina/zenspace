@@ -2953,6 +2953,32 @@ impl Default for FinanceConfig {
 // Config loading (T023) — Priority: env → global → embedded → Default
 // ---------------------------------------------------------------------------
 
+/// Load the global root's `.env` (`~/.zen/.env`) into the process
+/// environment.
+///
+/// Scope logic (Constitution XV):
+/// - Functionality: makes `.env`-designated values (search API keys,
+///   egress proxy vars) reachable from the daemonized binary — launchd
+///   runs the gateway with cwd `/`, so the cwd-relative
+///   `dotenvy::dotenv()` walk can never find a file there.
+/// - User impact: none for interactive surfaces (a dev-shell `.env` wins —
+///   dotenvy never overrides variables already present in the
+///   environment; a var set in both places keeps the first-loaded cwd
+///   value).
+/// - Default behavior: absent file is a silent no-op.
+/// - Interaction: runs after `ZenPaths::detect()` and before the 4-layer
+///   config merge, so `ZEN_*` overrides in the global `.env` participate
+///   in the env layer like any other exported variable.
+fn load_global_env_file(global_root: &Path) {
+    let env_path = global_root.join(".env");
+    if !env_path.is_file() {
+        return;
+    }
+    if let Err(e) = dotenvy::from_path(&env_path) {
+        tracing::warn!(path = %env_path.display(), error = %e, "global .env load failed");
+    }
+}
+
 /// Load AgenticConfig with the full priority chain (cached):
 /// 1. Rust `Default` impl
 /// 2. Embedded `config/config.toml`
@@ -2973,6 +2999,7 @@ pub fn load_config() -> Result<&'static ZenConfig, ZenError> {
     {
         dotenvy::dotenv().ok();
         let paths = ZenPaths::detect().map_err(ZenError::Path)?;
+        load_global_env_file(paths.global_root());
         let embedded = load_embedded_config()?;
         let global = load_file_config(paths.global_root().join("config.toml")).unwrap_or_default();
         // Path Spec v2 (T18/D8-rev1): 4-layer merge only.
@@ -2997,6 +3024,7 @@ pub fn load_config() -> Result<&'static ZenConfig, ZenError> {
         dotenvy::dotenv().ok();
 
         let paths = ZenPaths::detect().map_err(ZenError::Path)?;
+        load_global_env_file(paths.global_root());
 
         // 1. Embedded defaults (T026)
         let embedded = load_embedded_config()?;

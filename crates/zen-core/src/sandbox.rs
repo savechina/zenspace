@@ -80,6 +80,12 @@ pub fn is_zen_path(path: &Path) -> bool {
 /// there are not a supported surface.
 const GLOBAL_ROOT_SUBTREES: &[&str] = &["vault", "memories", "logs", "skills"];
 
+/// True when `name` is one of the global-root subtrees that agent-facing
+/// tools may address by their documented relative spelling.
+pub fn is_global_root_subtree(name: &str) -> bool {
+    GLOBAL_ROOT_SUBTREES.contains(&name)
+}
+
 /// Resolve a tool-supplied path string to the filesystem location a zen
 /// agent actually addresses. Absolute paths pass through unchanged.
 ///

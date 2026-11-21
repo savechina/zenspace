@@ -22,7 +22,7 @@ static ARGS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "type": "object",
         "properties": {
-            "path": { "type": "string", "description": "Absolute or workspace-relative file path" },
+            "path": { "type": "string", "description": "Absolute path, or a zen-root-relative path (vault/..., memories/..., logs/..., skills/...). Bare filenames resolve against the process cwd — find the real path with fs.glob {\"cwd\":\"vault\"} or tier2_search first" },
             "offset": { "type": "integer", "description": "Starting line number (1-based, default 1)" },
             "limit": { "type": "integer", "description": "Maximum lines to read (default 2000)" },
             "offset_bytes": { "type": "integer", "description": "Byte offset to start reading from (default 0)" },
@@ -154,7 +154,17 @@ impl Tool for FsReadTool {
 
         let metadata = match tokio::fs::metadata(&path).await {
             Ok(m) => m,
-            Err(e) => return Ok(json!({ "error": format!("Failed to read {}: {}", path_str, e) })),
+            Err(e) => {
+                let root = zen_core::paths::user_root();
+                return Ok(json!({ "error": format!(
+                    "Failed to read {} (resolved: {}): {}. \
+                     Zen-root paths anchor under {} (vault/, memories/, logs/, skills/); \
+                     a bare filename resolves against the process cwd — \
+                     find the real path with fs.glob {{\"cwd\":\"vault\",\"pattern\":\"**/*<name>*\"}} \
+                     or tier2_search",
+                    path_str, path.display(), e, root.display()
+                ) }));
+            }
         };
         let file_size = metadata.len() as usize;
 

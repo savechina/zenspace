@@ -105,6 +105,7 @@ pub(crate) const INTENT_SIGNALS: &[(&str, &str, &[&str])] = &[
             "discover",
             "find information",
             "investigate",
+            "search",
         ],
     ),
     (
@@ -1346,5 +1347,23 @@ mod tests {
             category_implies_multi_step(IntentCategory::Action),
             category_implies_multi_step(IntentCategory::Action)
         );
+    }
+}
+
+#[cfg(test)]
+mod search_keyword_pin {
+    use super::*;
+
+    /// FIX-3 pin (2026-11-21 search wave): a prompt literally asking to
+    /// "search" must hit the L0 keyword fast path — production evidence had
+    /// the LLM classify "search buffet letters" as Conversation, which
+    /// skipped knowledge injection and burned the turn on dead tool calls.
+    #[test]
+    fn search_keyword_routes_to_explore_on_the_l0_fast_path() {
+        let intent = keyword_route("search buffet letters").expect("'search' routes");
+        assert_eq!(intent.agent, "Explore");
+        assert_eq!(intent.signal, "research");
+        assert_eq!(intent.category, IntentCategory::Query);
+        assert!(matches!(intent.source, IntentSource::Keyword));
     }
 }

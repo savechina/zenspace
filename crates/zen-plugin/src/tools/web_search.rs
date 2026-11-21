@@ -217,8 +217,9 @@ fn all_backends_failed_error(attempts: &[(impl AsRef<str>, impl AsRef<str>)]) ->
         msg.push_str(&format!("\n  - {}: {}", backend.as_ref(), reason.as_ref()));
     }
     msg.push_str(
-        "\nFix: set BRAVE_API_KEY or TAVILY_API_KEY \
-         (config [web_search].api_key_brave/api_key_tavily), \
+        "\nFix: set BRAVE_SEARCH_API_KEY or TAVILY_API_KEY \
+         (config [web_search].api_key_brave/api_key_tavily, or the global ~/.zen/.env — \
+         a shell cwd .env is invisible to the daemon), \
          or provide HTTPS_PROXY for duckduckgo",
     );
     msg
@@ -642,7 +643,7 @@ mod tests {
         for backend in ["brave", "tavily", "duckduckgo"] {
             assert!(msg.contains(backend), "must name {backend}, got: {msg}");
         }
-        for hint in ["BRAVE_API_KEY", "TAVILY_API_KEY", "HTTPS_PROXY"] {
+        for hint in ["BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY", "HTTPS_PROXY"] {
             assert!(msg.contains(hint), "must contain hint {hint}, got: {msg}");
         }
         assert!(

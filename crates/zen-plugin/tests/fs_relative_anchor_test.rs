@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 use rig_compose::tool::Tool;
 use zen_core::sandbox::{SandboxMode, SandboxValidator, resolve_agent_path};
+use zen_plugin::tools::fs_glob::FsGlobTool;
 use zen_plugin::tools::fs_read::FsReadTool;
 use zen_plugin::tools::fs_write::FsWriteTool;
 
@@ -170,5 +171,59 @@ async fn fs_write_anchors_new_note_into_global_vault() {
     assert_eq!(
         std::fs::read_to_string(&written).unwrap(),
         "# Buffett Letters\n"
+    );
+}
+
+// FIX-5 pins (2026-11-21 search wave): the fs.read not-found error must
+// carry the resolved path + a recovery hint (a bare hallucinated filename
+// previously ENOENTed with no guidance, so the model retried blindly in
+// production), and fs.glob must anchor a pattern-leading subtree at the
+// zen root even without an explicit cwd (the daemon's cwd=/ would
+// otherwise glob the filesystem root, and "vault/**" matched nothing).
+#[tokio::test]
+async fn fs_read_not_found_error_carries_resolved_path_and_hint() {
+    let _lock = ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".zen")).unwrap();
+    let _guard = ZenHomeGuard::install(&home.path().join(".zen"));
+    let tool = FsReadTool::new(SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![]));
+    let out = tool
+        .invoke(serde_json::json!({ "path": "no-such-file-anywhere.md" }))
+        .await
+        .unwrap();
+    let text = out.to_string();
+    assert!(
+        text.contains("resolved"),
+        "error must name the resolved path: {text}"
+    );
+    assert!(
+        text.contains("fs.glob"),
+        "error must hint the recovery tool: {text}"
+    );
+    assert!(text.contains("no-such-file-anywhere.md"));
+}
+
+#[tokio::test]
+async fn fs_glob_anchors_pattern_leading_subtree_at_user_root() {
+    let _lock = ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".zen")).unwrap();
+    let _guard = ZenHomeGuard::install(&home.path().join(".zen"));
+    let page = home.path().join(".zen/vault/wiki/buffett.md");
+    std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+    std::fs::write(&page, "letters").unwrap();
+
+    let tool = FsGlobTool::new(SandboxValidator::new(SandboxMode::WorkspaceWrite, vec![]));
+    let out = tool
+        .invoke(serde_json::json!({ "pattern": "vault/wiki/*.md" }))
+        .await
+        .unwrap();
+    let matches = out["matches"].as_array().cloned().unwrap_or_default();
+    let expected = lexical(&page).to_string_lossy().to_string();
+    assert!(
+        matches
+            .iter()
+            .any(|m| m.as_str() == Some(expected.as_str())),
+        "expected {expected} in {out}"
     );
 }

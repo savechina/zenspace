@@ -74,8 +74,8 @@ const AGENT_SKILLS: &[(&str, &[&str])] = &[
 /// | Tool | Holders |
 /// |------|---------|
 /// | `tier2_search` | 12 of 13 — every agent except `Prometheus` (FTS reach) |
-/// | `tier3_search` | 6 — Sisyphus, Hermes, Momus, Oracle, Hephaestus, Zeus |
-/// | `tier4_search` | 6 — same six as `tier3_search` (graph reach) |
+/// | `tier3_search` | 8 — Sisyphus, Hermes, Momus, Oracle, Hephaestus, Zeus, Explore, Librarian |
+/// | `tier4_search` | 8 — same eight as `tier3_search` (graph reach) |
 /// | `compute_embeddings` | 6 — Sisyphus, Junior, Prometheus, Librarian, Hephaestus, Atlas |
 /// | `shell.exec` | 1 — Sisyphus only |
 /// | `shell.collect` | 1 — Sisyphus only (background-task retrieval) |
@@ -208,6 +208,8 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Explore",
         &[
             "tier2_search",
+            "tier3_search",
+            "tier4_search",
             "fs.read",
             "fs.list",
             "fs.glob",
@@ -220,6 +222,8 @@ const AGENT_TOOLS: &[(&str, &[&str])] = &[
         "Librarian",
         &[
             "tier2_search",
+            "tier3_search",
+            "tier4_search",
             "compute_embeddings",
             "fs.read",
             "fs.list",
@@ -610,19 +614,23 @@ mod tests {
             }
         }
 
-        // tier3_search / tier4_search: the same documented six holders.
-        const SIX: [&str; 6] = [
+        // tier3_search / tier4_search: the same documented eight holders
+        // (the semantic+graph pair travels together; the KB-facing search
+        // agents Explore/Librarian joined in the 2026-11-21 search wave).
+        const EIGHT: [&str; 8] = [
             "Sisyphus",
             "Hermes",
             "Momus",
             "Oracle",
             "Hephaestus",
             "Zeus",
+            "Explore",
+            "Librarian",
         ];
         for tool in ["tier3_search", "tier4_search"] {
             let holders = agents_holding(tool);
-            assert_eq!(holders.len(), 6, "{tool} documented as six holders");
-            for name in SIX {
+            assert_eq!(holders.len(), 8, "{tool} documented as eight holders");
+            for name in EIGHT {
                 assert!(holders.contains(&name), "{tool} must be held by {name}");
             }
         }
@@ -809,6 +817,8 @@ mod tests {
             "Explore",
             &[
                 "tier2_search",
+                "tier3_search",
+                "tier4_search",
                 "fs.read",
                 "fs.list",
                 "fs.glob",
@@ -821,6 +831,8 @@ mod tests {
             "Librarian",
             &[
                 "tier2_search",
+                "tier3_search",
+                "tier4_search",
                 "compute_embeddings",
                 "fs.read",
                 "fs.list",
