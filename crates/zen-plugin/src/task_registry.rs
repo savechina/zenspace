@@ -1560,6 +1560,17 @@ impl TaskRegistry {
         }
         std::thread::sleep(Duration::from_secs(KILL_ALL_GRACE_SECS));
         for (entry, pid) in &live {
+            // G-40 (FR-029 drain e2e, 2026-11-21): agent-future entries carry
+            // `pid: 0` and were already aborted + marked above. POSIX pid-0
+            // kill semantics target the CALLER's own process group, so
+            // probing or escalating them here would SIGKILL the daemon's
+            // whole group mid-drain — the process dies inside
+            // `kill_all_blocking` and the kill audit lines are never
+            // written. No child process ⇒ nothing to escalate (the same
+            // pid-0 hazard class the delegate.kill tool path documents).
+            if entry.child.is_none() {
+                continue;
+            }
             if !group_alive(*pid) {
                 continue;
             }

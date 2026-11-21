@@ -166,6 +166,105 @@ async fn drain_kills_live_background_task_and_audits_the_kill() {
     );
 }
 
+// ── (a′, G-40/FR-029, 2026-11-21) drain kills a live DELEGATE future ──
+// The shell e2e above covers process-backed tasks only. This pin covers
+// the agent-future path end-to-end: spawn_async registers a delegate
+// task (digest `delegate:<agent>`), the drain ABORTS the future, marks
+// Killed, and the audit emission writes the generic
+// `gateway.background.killed` line PLUS the additive
+// `gateway.delegate.killed` line — proving the drain path survives long
+// enough to write its audits (pre-fix, the escalation loop probed the
+// pid-0 async entry and SIGKILLed the caller's own process group
+// mid-drain; see task_registry.rs kill_all_blocking guard).
+#[tokio::test]
+async fn delegate_future_drain_kills_and_audits_one_line_each() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Registry contract: background task ids must be uuid-v4 shaped.
+    let task_id = "d40e0a00-aaaa-4bbb-8ccc-444455556666".to_string();
+    let _guard = test_lock();
+    unsafe { std::env::set_var("ZEN_HOME", tmp.path()) };
+    let audit = tmp.path().join("audit.jsonl");
+
+    let join = zen_plugin::task_registry::registry()
+        .spawn_async(
+            &task_id,
+            "sess-g40",
+            "Explore",
+            None,
+            &zen_plugin::task_registry::BackgroundLimits {
+                max_wall_secs: 1800,
+                max_concurrent: 4,
+                output_cap_bytes: zen_plugin::task_registry::OUTPUT_CAP_BYTES,
+            },
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(serde_json::json!({}))
+            },
+        )
+        .expect("spawn_async admits");
+    assert!(
+        zen_plugin::task_registry::registry().is_delegate_task(&task_id),
+        "spawn_async registers a delegate task (digest delegate:Explore)"
+    );
+
+    // Drain is env-independent (in-memory registry + absolute output_dir
+    // + explicit audit path): drop the guard before the await
+    // (clippy::await_holding_lock), re-acquire for the env-sensitive
+    // meta read below.
+    drop(_guard);
+    let killed = drain_background_tasks(Some(&audit)).await;
+
+    assert_eq!(
+        killed,
+        vec![task_id.clone()],
+        "drain returns the delegate id"
+    );
+    assert_eq!(
+        zen_plugin::task_registry::registry().live_count(),
+        0,
+        "no live tasks after drain"
+    );
+
+    let lines = read_audit_lines(&audit);
+    assert_eq!(lines.len(), 2, "generic + additive delegate audit lines");
+    assert_eq!(lines[0]["kind"], "gateway.background.killed");
+    assert_eq!(
+        lines[0]["taskId"],
+        &task_id[..8],
+        "taskId is the first 8 chars"
+    );
+    assert_eq!(lines[0]["taskIdFull"], task_id.as_str());
+    assert_eq!(lines[0]["reason"], "daemon-shutdown");
+    assert_eq!(lines[1]["kind"], "gateway.delegate.killed");
+    assert_eq!(lines[1]["taskIdFull"], task_id.as_str());
+    assert_eq!(lines[1]["reason"], "daemon-shutdown");
+    assert!(lines[1]["ts"].is_string(), "ts present (hosting.rs shape)");
+
+    // The future WAS aborted by the drain: the join resolves cancelled.
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), join)
+        .await
+        .expect("aborted join resolves promptly");
+    assert!(
+        res.is_err_and(|e| e.is_cancelled()),
+        "drain aborts the delegate future handle"
+    );
+
+    // Disk truth: the drain rewrote meta.json to Killed. Re-acquire the
+    // lock: read_meta resolves user_root() from ZEN_HOME.
+    let _guard = test_lock();
+    let meta = zen_plugin::task_registry::read_meta(&task_id).expect("meta exists");
+    assert_eq!(
+        meta.status,
+        zen_plugin::task_registry::TaskStatus::Killed,
+        "drain marks the delegate future Killed in meta"
+    );
+    assert_eq!(
+        meta.agent.as_deref(),
+        Some("Explore"),
+        "kill rewrite preserves the agent field"
+    );
+}
+
 // ── (b) boot sweep wrapper is fail-soft ──
 
 #[test]

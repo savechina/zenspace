@@ -1035,6 +1035,62 @@ async fn async_completion_marks_completed_zero_and_persists_result_in_meta() {
     );
 }
 
+// G-39 (FR-033, 2026-11-21): background results are in-memory + meta.json
+// ONLY — the registry machinery never appends to session jsonl. The
+// restart-Expired half of FR-033 is pinned above (expiry/boot-sweep
+// tests); this is the missing negative half. A real session file sits on
+// disk (meta-first, D7 daemon shape) while a background task completes
+// with a distinctive payload: the session bytes must stay identical and
+// the payload must land in meta.json.
+#[tokio::test]
+async fn background_result_is_never_appended_to_session_jsonl() {
+    let home = set_zen_home();
+    let sess_dir = home.join("sessions/2026/11/21");
+    std::fs::create_dir_all(&sess_dir).expect("session dir");
+    let sess_path = sess_dir.join("sess-w51-neg.jsonl");
+    let meta_line = json!({
+        "type": "session/meta",
+        "sessionId": "sess-w51-neg",
+        "agent": "Sisyphus",
+    })
+    .to_string()
+        + "\n";
+    std::fs::write(&sess_path, &meta_line).expect("session file seed");
+    let before = std::fs::read(&sess_path).expect("session bytes before");
+
+    // &'static str literal moved into the future: spawn_async requires
+    // 'static captures (E0373 otherwise).
+    let payload_marker = "G39_NEGATIVE_RESULT_PAYLOAD_7f3a";
+    let join = registry()
+        .spawn_async(
+            W51_ID_A,
+            "sess-w51",
+            "Explore",
+            None,
+            &async_limits(60),
+            async move { Ok(json!({ "marker": payload_marker })) },
+        )
+        .expect("spawn_async admits");
+    let _ = tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("completes promptly")
+        .expect("join ok");
+
+    let meta = task_registry::read_meta(W51_ID_A).expect("terminal meta");
+    assert!(
+        meta.result
+            .as_ref()
+            .is_some_and(|r| r["marker"] == payload_marker),
+        "result payload lives in meta.json"
+    );
+
+    let after = std::fs::read(&sess_path).expect("session bytes after");
+    assert_eq!(
+        before, after,
+        "background machinery never appends to session jsonl (FR-033)"
+    );
+}
+
 #[tokio::test]
 async fn async_error_marks_failed_without_result() {
     let _home = set_zen_home();

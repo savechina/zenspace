@@ -1574,14 +1574,23 @@ impl DelegateTaskTool {
         let allow_child_delegation = child_depth < self.max_depth;
 
         let Ok(agent) = self.build_sub_agent(agent_name, allow_child_delegation) else {
+            // G-35 (SC-023/FR-049): the error branch carries the requested
+            // agent; model resolution has NOT run yet, so the honest label
+            // is `unresolved` (the invoke-level stamp fills status/task_index).
             return serde_json::json!({
-                "error": format!("failed to build delegate agent \"{agent_name}\"")
+                "agent": agent_name,
+                "error": format!("failed to build delegate agent \"{agent_name}\""),
+                "model_source": "unresolved",
             });
         };
 
         let Ok(profile) = self.registry.find_by_name(agent_name).cloned() else {
+            // G-35 (SC-023/FR-049): same pre-resolution error shape as the
+            // build failure above.
             return serde_json::json!({
-                "error": format!("no profile registered for delegate agent \"{agent_name}\"")
+                "agent": agent_name,
+                "error": format!("no profile registered for delegate agent \"{agent_name}\""),
+                "model_source": "unresolved",
             });
         };
 
@@ -1619,13 +1628,19 @@ impl DelegateTaskTool {
             None => match self.token_budget.try_reserve_tokens(estimated).await {
                 Ok(Some(reservation)) => reservation,
                 Ok(None) => {
+                    // G-35 (SC-023/FR-049): resolution already ran, so the
+                    // error receipt carries the real model_source label.
                     return serde_json::json!({
-                        "error": "token budget exhausted; delegation refused"
+                        "agent": agent_name,
+                        "error": "token budget exhausted; delegation refused",
+                        "model_source": model_source.as_str(),
                     });
                 }
                 Err(e) => {
                     return serde_json::json!({
-                        "error": format!("token budget reservation failed: {e}")
+                        "agent": agent_name,
+                        "error": format!("token budget reservation failed: {e}"),
+                        "model_source": model_source.as_str(),
                     });
                 }
             },
@@ -1659,7 +1674,9 @@ impl DelegateTaskTool {
             }) else {
                 return (
                     Some(serde_json::json!({
-                        "error": format!("delegate agent \"{agent_name}\" LLM round failed")
+                        "agent": agent_name,
+                        "error": format!("delegate agent \"{agent_name}\" LLM round failed"),
+                        "model_source": model_source.as_str(),
                     })),
                     response,
                     rounds,
@@ -1748,7 +1765,13 @@ impl DelegateTaskTool {
             rounds,
         );
         let output = if let Some(error) = honesty_error {
-            serde_json::json!({ "error": error })
+            // G-35 (SC-023/FR-049): honesty failures are error receipts too;
+            // model resolution already ran, so report the real label.
+            serde_json::json!({
+                "agent": agent_name,
+                "error": error,
+                "model_source": model_source.as_str(),
+            })
         } else {
             // W2.2 (D12) artifact pattern: surface the declared output pointer
             // and a bounded summary alongside the answer (additive — a request
@@ -2030,6 +2053,38 @@ fn optional_nonempty_string(args: &serde_json::Value, key: &str) -> Result<Optio
     }
 }
 
+/// G-35 (spec 006 SC-023/FR-049): stamp the unified D25 A5 receipt keys onto
+/// ONE blocking delegate result entry.
+///
+/// Functionality: guarantees every blocking result carries
+/// `{task_index, agent, status, response|error, model_source}` — the same
+/// shape `delegate.collect` receipts use (owner ruling: unify additively,
+/// never amend the spec). `status` is `completed` when no `error` key is
+/// present, `failed` otherwise; a missing `agent` falls back to the
+/// requested agent name; a missing `model_source` becomes the honest
+/// `"unresolved"` label (an error that fired before sensitivity/
+/// preference/hint/default resolution ran).
+/// User impact: consumers read one receipt shape for single, batch, and
+/// error results; pre-existing keys (`rounds`, `duration_ms`,
+/// `artifact_path`, `summary`, ...) are preserved untouched.
+/// Default behavior: additive only — no key is removed or renamed.
+fn stamp_blocking_receipt(value: &mut serde_json::Value, index: usize, requested_agent: &str) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let status = if obj.contains_key("error") {
+        "failed"
+    } else {
+        "completed"
+    };
+    obj.insert("task_index".to_string(), serde_json::json!(index));
+    obj.entry("agent".to_string())
+        .or_insert_with(|| serde_json::json!(requested_agent));
+    obj.insert("status".to_string(), serde_json::json!(status));
+    obj.entry("model_source".to_string())
+        .or_insert_with(|| serde_json::json!("unresolved"));
+}
+
 /// G1-09: label a dispatch failure accurately. A hook `Terminate`
 /// (approval/seatbelt) or a budget failure is a *blocked* dispatch; every
 /// other kernel error is a tool-execution failure. The old single label
@@ -2186,7 +2241,20 @@ impl Tool for DelegateTaskTool {
     ) -> Result<serde_json::Value, rig_compose::registry::KernelError> {
         let tasks = match Self::parse_requests(&args) {
             Ok(tasks) => tasks,
-            Err(e) => return Ok(serde_json::json!({ "error": e })),
+            // G-35 (SC-023/FR-049): even an invocation-level parse error is a
+            // unified D25 A5 receipt (task_index 0, agent when the args name
+            // one, status failed, unresolved model_source).
+            Err(e) => {
+                let mut value = serde_json::json!({ "error": e });
+                stamp_blocking_receipt(
+                    &mut value,
+                    0,
+                    args.get("agent")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default(),
+                );
+                return Ok(value);
+            }
         };
 
         // W5.2 (D20 §1): the background flag is a TOOL ARGUMENT (no config
@@ -2220,7 +2288,19 @@ impl Tool for DelegateTaskTool {
         // (catalog + ≤5 distinct per batch). Background admission validates
         // in invoke_background — one validation per path, not two.
         if let Err(e) = Self::validate_model_hints(&tasks) {
-            return Ok(serde_json::json!({ "error": e }));
+            // G-35 (SC-023/FR-049): hint-set rejection is a blocking error
+            // receipt too; it fires before any model was resolved, so the
+            // label is `unresolved` and slot 0 supplies the agent.
+            let mut value = serde_json::json!({ "error": e });
+            stamp_blocking_receipt(
+                &mut value,
+                0,
+                tasks
+                    .first()
+                    .map(|t| t.request.agent.as_str())
+                    .unwrap_or_default(),
+            );
+            return Ok(value);
         }
 
         // Slot-ordered assembly: results[i] always corresponds to tasks[i],
@@ -2295,9 +2375,11 @@ impl Tool for DelegateTaskTool {
                 let mut value = slot.unwrap_or_else(
                     || serde_json::json!({ "error": "delegation produced no result" }),
                 );
-                if let Some(obj) = value.as_object_mut() {
-                    obj.insert("task_index".to_string(), serde_json::json!(i));
-                }
+                // G-35 (SC-023/FR-049): every blocking entry — success or
+                // error, single or batch — is stamped into the unified D25
+                // A5 receipt shape here (task_index/agent/status/model_source;
+                // response|error already carried by the outcome).
+                stamp_blocking_receipt(&mut value, i, tasks[i].request.agent.as_str());
                 value
             })
             .collect();
@@ -2608,6 +2690,73 @@ mod tests {
             results.iter().all(|r| r["response"].as_str().is_some()),
             "each result carries the sub-agent reply: {out}"
         );
+    }
+
+    /// G-35 (spec 006 SC-023/FR-049): the BLOCKING `delegate.task` result
+    /// must carry the unified D25 A5 receipt shape
+    /// `{task_index, agent, status, response|error, model_source}` for
+    /// single, batch, and error outcomes.
+    ///
+    /// Functionality: pins all five keys per entry so the additive
+    /// unification (owner ruling: unify additively, do NOT amend the spec)
+    /// cannot silently regress to the pre-G-35 shapes.
+    /// User impact: consumers read one receipt shape across blocking
+    /// results and `delegate.collect` receipts — no per-surface guessing.
+    #[tokio::test]
+    async fn blocking_result_uses_unified_d25_a5_shape() {
+        let tool = tool_with(
+            Arc::new(ZenWiring::new()),
+            Vec::new(),
+            Arc::new(AtomicTokenBudget::new(100_000)),
+        );
+        let assert_success = |entry: &serde_json::Value, index: usize| {
+            assert_eq!(
+                entry["task_index"],
+                serde_json::json!(index),
+                "task_index mismatch: {entry}"
+            );
+            assert!(entry["agent"].is_string(), "agent string: {entry}");
+            assert_eq!(entry["status"], "completed", "status: {entry}");
+            assert!(entry["response"].is_string(), "response string: {entry}");
+            assert!(
+                entry["model_source"].is_string(),
+                "model_source string: {entry}"
+            );
+        };
+
+        // Single success.
+        let single = tool
+            .invoke(serde_json::json!({"agent": "Explore", "prompt": "unified single"}))
+            .await
+            .unwrap();
+        assert_success(&single, 0);
+
+        // Batch success: every slot carries the unified receipt.
+        let batch = tool
+            .invoke(serde_json::json!({
+                "tasks": [
+                    {"agent": "Explore", "prompt": "slot zero"},
+                    {"agent": "Librarian", "prompt": "slot one"}
+                ]
+            }))
+            .await
+            .unwrap();
+        let results = batch["results"].as_array().expect("batch shape");
+        assert_eq!(results.len(), 2, "{batch}");
+        for (i, entry) in results.iter().enumerate() {
+            assert_success(entry, i);
+        }
+
+        // Error branch (unknown agent rejected before the sub-turn runs).
+        let failed = tool
+            .invoke(serde_json::json!({"agent": "Nope", "prompt": "unknown agent"}))
+            .await
+            .unwrap();
+        assert_eq!(failed["task_index"], serde_json::json!(0), "{failed}");
+        assert_eq!(failed["agent"], "Nope", "{failed}");
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert!(failed["error"].is_string(), "{failed}");
+        assert!(failed["model_source"].is_string(), "{failed}");
     }
 
     #[test]
@@ -3077,6 +3226,13 @@ mod tests {
                 results[i]["agent"].as_str().unwrap(),
                 *expected_agent,
                 "slot {i} must match task agent: {out}"
+            );
+            // G-38 (SC-003): results[i] ≡ tasks[i] also at the receipt level —
+            // the unified D25 A5 `task_index` must equal the slot position.
+            assert_eq!(
+                results[i]["task_index"],
+                serde_json::json!(i),
+                "slot {i} must carry task_index {i}: {out}"
             );
         }
         assert!(

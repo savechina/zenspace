@@ -199,13 +199,45 @@ impl ToolDispatchHook for AskApprovalHook {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rig_compose::normalizer::dispatch_tool_invocations_with_hooks;
+    use rig_compose::registry::ToolRegistry;
+
+    use crate::tools::audit_hook::ToolAuditHook;
+
+    /// G-37 / FR-035 / SC-019: what a surface callback enqueues, in order —
+    /// `(originating turn, tool name)` per would-be approval request.
+    type ParentApprovalLog = Arc<Mutex<Vec<(Option<String>, String)>>>;
 
     fn make_invocation(name: &str) -> ToolInvocation {
         ToolInvocation {
             name: name.to_string(),
             args: serde_json::json!({}),
         }
+    }
+
+    /// PURPOSE: Drive ONE invocation through the real dispatch kernel with
+    ///          the two stages this module owns wired in their production
+    ///          order — audit immediately before approval (wiring.rs:733-738;
+    ///          G-37 / FR-035 / SC-019). The empty registry is deliberate:
+    ///          the deny path must never reach tool lookup, so a `Continue`
+    ///          leak surfaces as a registry NotFound instead of a silent pass.
+    /// USAGE: The three `background_denial_*` pins below; callers scope the
+    ///        BACKGROUND_TASK / APPROVAL_TURN task-locals around the call.
+    /// EXPECTED: `Err(KernelError::ToolDispatchTerminated(reason))` with the
+    ///           structured `approval-required` reason.
+    /// ERRORS: Any non-terminate error means the deny-first branch was not
+    ///         taken; the pins treat that as a failure.
+    async fn dispatch_audit_then_approval(
+        audit: ToolAuditHook,
+        approval: AskApprovalHook,
+        invocation: ToolInvocation,
+    ) -> Result<Vec<ToolInvocationResult>, KernelError> {
+        let tools = ToolRegistry::new();
+        let hooks: [&dyn ToolDispatchHook; 2] = [&audit, &approval];
+        dispatch_tool_invocations_with_hooks(&tools, &[invocation], &hooks).await
     }
 
     /// Callback that records how many times it was invoked.
@@ -320,5 +352,173 @@ mod tests {
             reason, "approval denied (background: no surface) — approval-required: fs.write",
             "legacy background deny message must stay byte-identical"
         );
+    }
+
+    /// PURPOSE: Pin G-37 sub-claim (a) — a background-denied Ask approval
+    ///          leaves an AUDIT record for the invocation (FR-035 / SC-019).
+    ///          The audit stage precedes approval in the pipeline, and the
+    ///          kernel's terminate path notifies every hook via
+    ///          `on_invocation_error`, so the denial line is the existing
+    ///          audit-hook record — asserted here end-to-end, not assumed.
+    /// USAGE: Run under nextest (process-per-test: the ZEN_HOME env mutation
+    ///        below is process-global).
+    /// EXPECTED: Exactly one JSONL line: tool `fs.write`, `success: false`,
+    ///           error embedding the same `approval-required` deny reason.
+    /// ERRORS: Zero lines = the denial escaped the audit trail (feature gap).
+    #[tokio::test]
+    async fn background_denial_produces_an_audit_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest runs one test per process; no other reader races
+        // this process-global env mutation. The audit path is passed
+        // explicitly below, so the hook never touches the real ~/.zen.
+        unsafe {
+            std::env::set_var("ZEN_HOME", dir.path());
+        }
+        zen_core::config::invalidate_config_cache();
+
+        let audit_path = dir.path().join("logs").join("audit.jsonl");
+        let audit = ToolAuditHook::new(audit_path.clone());
+        let approval = AskApprovalHook::new(SandboxMode::Ask);
+
+        let outcome = BACKGROUND_TASK
+            .scope(
+                true,
+                dispatch_audit_then_approval(audit, approval, make_invocation("fs.write")),
+            )
+            .await;
+
+        let Err(KernelError::ToolDispatchTerminated(reason)) = outcome else {
+            panic!("background approval must terminate with the deny reason, got {outcome:?}");
+        };
+        assert!(reason.contains("approval-required"), "reason: {reason}");
+
+        let written = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = written.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one audit line per denied invocation: {written}"
+        );
+        let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record["tool"], "fs.write");
+        assert_eq!(record["success"], false);
+        let audited_error = record["error"].as_str().unwrap();
+        assert!(
+            audited_error.contains(&reason),
+            "audit line must carry the denial reason: {audited_error}"
+        );
+
+        std::fs::remove_dir_all(dir.path()).ok();
+    }
+
+    /// PURPOSE: Pin G-37 sub-claim (b) — the background deny fires BEFORE any
+    ///          approval callback, so it can never claim a free route
+    ///          (FR-035 / SC-019). The pre-existing pin wires no callback,
+    ///          which proves nothing about invocation; this one wires a
+    ///          counting callback and asserts zero calls.
+    /// USAGE: Same isolated dispatch path as pin (a).
+    /// EXPECTED: Structured deny AND `callback_count == 0`.
+    /// ERRORS: A callback count of 1 means the deny-first branch regressed
+    ///         into the interactive path (the T103 hazard).
+    #[tokio::test]
+    async fn background_denial_never_invokes_the_callback() {
+        let (callback, callback_count) = counting_callback(true);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = ToolAuditHook::new(dir.path().join("audit.jsonl"));
+        let approval = AskApprovalHook::new(SandboxMode::Ask).with_callback(callback);
+
+        let outcome = BACKGROUND_TASK
+            .scope(
+                true,
+                dispatch_audit_then_approval(audit, approval, make_invocation("fs.write")),
+            )
+            .await;
+
+        let Err(KernelError::ToolDispatchTerminated(reason)) = outcome else {
+            panic!("background approval must terminate with the deny reason, got {outcome:?}");
+        };
+        assert!(reason.contains("approval-required"), "reason: {reason}");
+        assert_eq!(
+            callback_count.load(Ordering::SeqCst),
+            0,
+            "background denial must never invoke the approval callback"
+        );
+
+        std::fs::remove_dir_all(dir.path()).ok();
+    }
+
+    /// PURPOSE: Pin G-37 sub-claim (c) — a background approval never enqueues
+    ///          a request toward the parent/originating surface, so the parent
+    ///          turn is neither cancelled nor blocked (FR-035 / SC-019).
+    ///          Coverage is exactly this: the callback closure is the hook's
+    ///          ONLY emission path to a surface, so a populated emission log
+    ///          would mean a pending parent approval; the control half proves
+    ///          the observer is live by enqueueing on the non-background path.
+    /// USAGE: Same isolated dispatch path; APPROVAL_TURN models the parent's
+    ///        turn affinity.
+    /// EXPECTED: Background half — structured deny, emission log empty.
+    ///           Control half — same callback/turn without the background
+    ///           marker records one emission carrying the parent turn.
+    /// ERRORS: A non-empty background emission log means the deny path leaked
+    ///         an interactive request to the parent surface.
+    #[tokio::test]
+    async fn background_denial_leaves_no_parent_approval_pending() {
+        let emitted: ParentApprovalLog = Arc::new(Mutex::new(Vec::new()));
+        let emitted_by_marker = emitted.clone();
+        let callback: ApprovalCallback = Arc::new(move |turn, invocation| {
+            emitted_by_marker
+                .lock()
+                .unwrap()
+                .push((turn, invocation.name.clone()));
+            ApprovalDecision::Allow
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let audit = ToolAuditHook::new(dir.path().join("audit.jsonl"));
+        let approval = AskApprovalHook::new(SandboxMode::Ask).with_callback(callback.clone());
+
+        let outcome = BACKGROUND_TASK
+            .scope(
+                true,
+                APPROVAL_TURN.scope(
+                    Some("parent-turn".to_string()),
+                    dispatch_audit_then_approval(audit, approval, make_invocation("fs.write")),
+                ),
+            )
+            .await;
+
+        let Err(KernelError::ToolDispatchTerminated(reason)) = outcome else {
+            panic!("background approval must terminate with the deny reason, got {outcome:?}");
+        };
+        assert!(reason.contains("approval-required"), "reason: {reason}");
+        assert!(
+            emitted.lock().unwrap().is_empty(),
+            "background denial must enqueue no approval request toward the parent surface"
+        );
+
+        let control_audit = ToolAuditHook::new(dir.path().join("audit-control.jsonl"));
+        let control_approval =
+            AskApprovalHook::new(SandboxMode::Ask).with_callback(callback.clone());
+        let control = APPROVAL_TURN
+            .scope(
+                Some("parent-turn".to_string()),
+                dispatch_audit_then_approval(
+                    control_audit,
+                    control_approval,
+                    make_invocation("fs.write"),
+                ),
+            )
+            .await;
+        assert!(
+            control.is_err(),
+            "control path runs the callback then hits the empty registry"
+        );
+        assert_eq!(
+            *emitted.lock().unwrap(),
+            vec![(Some("parent-turn".to_string()), "fs.write".to_string())],
+            "control half must prove the emission observer is live"
+        );
+
+        std::fs::remove_dir_all(dir.path()).ok();
     }
 }
