@@ -3385,10 +3385,12 @@ impl AgentOrchestrator {
     /// response, native wins and fenced payloads are logged as degraded,
     /// never double-dispatched.
     ///
-    /// True when the ENTIRE trimmed response consists of newline-separated
-    /// `{"tool": <string>, "args": {…}}` objects with no enclosing fence —
-    /// the tool dialect attempted bare. Strict whole-response shape so
-    /// prose answers that merely embed JSON never trip it.
+    /// True when the ENTIRE trimmed response is tool-dialect without its
+    /// fence — every non-empty line is a `{"tool": <string>, "args": {…}}`
+    /// object or a dialect wrapper token (`<tool_code>`-style tags, `[`/`]`
+    /// array brackets). Strict whole-response shape so prose answers that
+    /// merely embed JSON never trip it. Production drift observed so far:
+    /// bare JSON lines and `<tool_code>`-wrapped JSON.
     fn is_bare_tool_json(response: &str) -> bool {
         let trimmed = response.trim();
         if trimmed.is_empty() || trimmed.contains("```") {
@@ -3400,7 +3402,12 @@ impl AgentOrchestrator {
             if line.is_empty() {
                 continue;
             }
+            let is_wrapper_tag = line.starts_with('<') && line.ends_with('>');
+            let is_array_bracket = line == "[" || line == "]";
             let Ok(serde_json::Value::Object(map)) = serde_json::from_str(line) else {
+                if is_wrapper_tag || is_array_bracket {
+                    continue;
+                }
                 return false;
             };
             let is_tool_object = map.len() == 2
@@ -4719,6 +4726,31 @@ mod tests {
         let (invocations, errors, _) = AgentOrchestrator::resolve_invocations(extra_key, &[]);
         assert!(invocations.is_empty());
         assert!(errors.is_empty(), "extra keys stay a plain answer");
+    }
+
+    /// Production drift round 2 (2026-11-21): the model wrapped its tool
+    /// JSON in a pseudo-XML `<tool_code>` block — a wrapper line must not
+    /// defeat the tool-intent detector, or the turn dead-ends with the raw
+    /// dialect shipped as the answer.
+    #[test]
+    fn resolve_invocations_xml_wrapped_tool_json_routes_to_parse_reject() {
+        let response = "<tool_code>\n\
+                        {\"tool\": \"tier2_search\", \"args\": {\"query\": \"buffett letters\", \"limit\": 5}}\n\
+                        {\"tool\": \"web.search\", \"args\": {\"query\": \"Warren Buffett shareholder letters\"}}\n\
+                        </tool_code>";
+
+        let (invocations, errors, _) = AgentOrchestrator::resolve_invocations(response, &[]);
+        assert!(invocations.is_empty(), "wrapped lines must NOT execute");
+        assert_eq!(errors.len(), 1, "one structured parse-reject error");
+
+        let array_wrapped = "[\n{\"tool\": \"fs.read\", \"args\": {\"path\": \"/tmp/x\"}}\n]";
+        let (invocations, errors, _) = AgentOrchestrator::resolve_invocations(array_wrapped, &[]);
+        assert!(invocations.is_empty());
+        assert_eq!(
+            errors.len(),
+            1,
+            "array-bracket wrapper also routes to reject"
+        );
     }
 
     #[test]

@@ -280,8 +280,10 @@ impl AgentExecutor {
             prompt.push_str(
                 "\n\n## Available tools\n\
                  You can call tools to read/write files, fetch web pages, search the web, and more.\n\
-                 When you need a tool, respond with ONLY a fenced JSON block:\n\
+                 When you need a tool, respond with ONLY a fenced JSON block — exactly this shape:\n\
                  ```json\n{\"tool\": \"<tool_name>\", \"args\": { ... }}\n```\n\
+                 No XML-style wrappers (e.g. <tool_code>), no bare JSON lines, no extra prose:\n\
+                 unfenced or wrapped tool calls are NOT executed.\n\
                  You may include multiple calls as a JSON array. After receiving results,\
                  continue the conversation normally.\n\
                  Tools:\n",
