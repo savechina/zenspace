@@ -22,7 +22,7 @@ static ARGS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "type": "object",
         "properties": {
             "pattern": { "type": "string", "description": "Regex pattern to search for" },
-            "path": { "type": "string", "description": "File or directory to search in" },
+            "path": { "type": "string", "description": "File or directory to search in. Relative paths anchor under the zen root (~/.zen); bare names that only exist in the vault (~/.zen/vault/...) fall back there. Version snapshots under vault/iterations/ are excluded from walks" },
             "include": { "type": "string", "description": "File name glob filter (e.g. \"*.rs\")" },
             "max_matches": { "type": "integer", "description": "Maximum matches to return (default 50)" },
             "case_insensitive": { "type": "boolean", "description": "Case-insensitive matching (default false)" }
@@ -117,7 +117,7 @@ impl Tool for FsGrepTool {
         }
         let re = re_builder;
 
-        let root = zen_core::sandbox::resolve_agent_path(path_str);
+        let root = zen_core::sandbox::resolve_agent_read_path(path_str);
         self.validator
             .validate_path_for_read(&root)
             .map_err(KernelError::ToolFailed)?;
@@ -151,8 +151,29 @@ impl Tool for FsGrepTool {
             let files: Vec<PathBuf> = if root.is_file() {
                 vec![root.clone()]
             } else {
+                // `filter_entry` prunes the whole excluded subtree the moment
+                // the noise directory itself is yielded (depth >= 1); depth 0
+                // is the explicit walk root and always survives — an agent
+                // deliberately grepping `vault/iterations` still can.
+                // Components are matched RELATIVE to the walk root (the
+                // reindex `is_excluded_entry` precedent): with absolute
+                // matching, a walk rooted inside an excluded directory
+                // would prune its own children and defeat the exemption.
                 walkdir::WalkDir::new(&root)
                     .into_iter()
+                    .filter_entry(|e| {
+                        e.depth() == 0
+                            || !e
+                                .path()
+                                .strip_prefix(&root)
+                                .unwrap_or(e.path())
+                                .components()
+                                .any(|c| {
+                                    zen_core::sandbox::is_walk_excluded_component(
+                                        c.as_os_str().to_string_lossy().as_ref(),
+                                    )
+                                })
+                    })
                     .filter_map(|e| e.ok())
                     .filter(|e| e.file_type().is_file())
                     .map(|e| e.into_path())
@@ -290,5 +311,61 @@ mod tests {
             res["matches"][0]["content"], inside,
             "found the in-cap hit, not the beyond-cap one"
         );
+    }
+
+    #[test]
+    fn grep_walk_prunes_iteration_snapshots() {
+        // `iterations` snapshots are stale copies of live pages: the walk
+        // prunes the whole subtree, so only the live hit surfaces.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("iterations/wiki")).unwrap();
+        std::fs::write(dir.path().join("iterations/wiki/live.md"), "needle").unwrap();
+        std::fs::write(dir.path().join("live.md"), "needle").unwrap();
+
+        let tool = FsGrepTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({
+            "pattern": "needle",
+            "path": dir.path().to_string_lossy()
+        })))
+        .unwrap();
+        assert_eq!(res["count"], 1, "snapshot copy must be pruned: {res}");
+        let file = res["matches"][0]["file"].as_str().unwrap();
+        assert!(file.ends_with("live.md"), "live hit expected: {file}");
+    }
+
+    #[test]
+    fn grep_explicit_iterations_root_still_scans() {
+        // Depth 0 is the explicit walk root and always survives — a
+        // deliberate grep of the snapshots directory still works.
+        let dir = tempdir().unwrap();
+        let iterations = dir.path().join("iterations");
+        std::fs::create_dir_all(&iterations).unwrap();
+        std::fs::write(iterations.join("snap.md"), "needle").unwrap();
+
+        let tool = FsGrepTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({
+            "pattern": "needle",
+            "path": iterations.to_string_lossy()
+        })))
+        .unwrap();
+        assert_eq!(res["count"], 1, "explicit root exempt from pruning: {res}");
+    }
+
+    #[test]
+    fn grep_sibling_names_are_not_pruned() {
+        // Component matching only: `iterations.md` and `my-iterations/`
+        // are ordinary names, never pruned.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("iterations.md"), "needle").unwrap();
+        std::fs::create_dir_all(dir.path().join("my-iterations")).unwrap();
+        std::fs::write(dir.path().join("my-iterations/x.md"), "needle").unwrap();
+
+        let tool = FsGrepTool::new(make_validator(dir.path()));
+        let res = block_on(tool.invoke(json!({
+            "pattern": "needle",
+            "path": dir.path().to_string_lossy()
+        })))
+        .unwrap();
+        assert_eq!(res["count"], 2, "sibling names stay visible: {res}");
     }
 }

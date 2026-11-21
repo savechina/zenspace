@@ -1330,7 +1330,12 @@ impl ZenAgent {
                 "You can call tools to read/write files, fetch web pages, search the web, \
                  and more. To call a tool, emit a fenced ```json block with the shape \
                  {\"tool\": \"<name>\", \"args\": { ... }} (or an array of such objects). \
-                 The runtime parses, dispatches, and feeds results back for the next round.\n\n",
+                 The runtime parses, dispatches, and feeds results back for the next round.\n\
+                 For knowledge-base and note questions, search the indexed tiers first \
+                 (tier2_search for keywords, tier3_search for meaning, tier4_search for \
+                 entity links) before falling back to raw fs.grep/fs.read scans; fs tool \
+                 paths anchor under the zen root (~/.zen) with bare names falling back to \
+                 the vault (~/.zen/vault).\n\n",
             );
             prompt.push_str(&tool_manifest);
         }

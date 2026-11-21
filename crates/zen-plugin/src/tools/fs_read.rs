@@ -146,7 +146,7 @@ impl Tool for FsReadTool {
             .unwrap_or("utf8");
         let is_base64 = encoding.eq_ignore_ascii_case("base64");
 
-        let path = zen_core::sandbox::resolve_agent_path(path_str);
+        let path = zen_core::sandbox::resolve_agent_read_path(path_str);
 
         self.validator
             .validate_path_for_read(&path)

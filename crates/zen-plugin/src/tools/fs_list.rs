@@ -68,6 +68,9 @@ fn entry_visible(
     name: &std::ffi::OsStr,
 ) -> bool {
     let name_str = name.to_string_lossy();
+    if zen_core::sandbox::is_walk_excluded_component(name_str.as_ref()) {
+        return false;
+    }
     if !include_hidden && name_str.starts_with('.') {
         return false;
     }
@@ -117,7 +120,7 @@ impl Tool for FsListTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let path = zen_core::sandbox::resolve_agent_path(path_str);
+        let path = zen_core::sandbox::resolve_agent_read_path(path_str);
 
         self.validator
             .validate_path_for_read(&path)
@@ -139,7 +142,28 @@ impl Tool for FsListTool {
                 if let Some(d) = depth {
                     walker = walker.max_depth(d as usize);
                 }
-                for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                let walker = walker
+                    .into_iter()
+                    // Depth 0 (the explicit walk root) always survives, so a
+                    // deliberate `fs.list vault/iterations` still lists it —
+                    // same exemption contract as fs.grep. Components match
+                    // RELATIVE to the walk root (reindex precedent): absolute
+                    // matching would prune an explicit iterations-root's own
+                    // children.
+                    .filter_entry(|e| {
+                        e.depth() == 0
+                            || !e
+                                .path()
+                                .strip_prefix(&walk_root)
+                                .unwrap_or(e.path())
+                                .components()
+                                .any(|c| {
+                                    zen_core::sandbox::is_walk_excluded_component(
+                                        c.as_os_str().to_string_lossy().as_ref(),
+                                    )
+                                })
+                    });
+                for entry in walker.filter_map(|e| e.ok()) {
                     if entries.len() >= max_entries {
                         truncated = true;
                         break;
@@ -312,6 +336,59 @@ mod tests {
                 .as_str()
                 .is_some_and(|m| m.contains("Failed to read dir")),
             "expected structured error, got: {res}"
+        );
+    }
+
+    #[test]
+    fn recursive_walk_skips_iteration_snapshots() {
+        let dir = tempdir().unwrap();
+        let iterations = dir.path().join("iterations");
+        std::fs::create_dir_all(&iterations).unwrap();
+        std::fs::write(iterations.join("snap.md"), "x").unwrap();
+        std::fs::write(dir.path().join("live.md"), "x").unwrap();
+
+        let tool = FsListTool::new(make_validator(dir.path()));
+        let res = invoke(
+            &tool,
+            json!({
+                "path": dir.path().to_string_lossy(),
+                "recursive": true
+            }),
+        );
+        let names: Vec<String> = res["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "iterations"),
+            "snapshot dir hidden from recursive listing: {res}"
+        );
+        assert!(
+            names.iter().any(|n| n == "live.md"),
+            "live file stays visible: {res}"
+        );
+    }
+
+    #[test]
+    fn non_recursive_listing_hides_iteration_child() {
+        let dir = tempdir().unwrap();
+        let iterations = dir.path().join("iterations");
+        std::fs::create_dir_all(&iterations).unwrap();
+        std::fs::write(dir.path().join("live.md"), "x").unwrap();
+
+        let tool = FsListTool::new(make_validator(dir.path()));
+        let res = invoke(&tool, json!({ "path": dir.path().to_string_lossy() }));
+        let names: Vec<String> = res["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["name"].as_str().map(String::from))
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "iterations"),
+            "snapshot dir hidden from plain listing: {res}"
         );
     }
 }

@@ -477,8 +477,10 @@ fn builtin_agents() -> Vec<AgentProfile> {
             definition: Some(AgentSpec {
                 name: "explore".to_string(),
                 prompt_template: "You are Explore, the research and exploration specialist in the Zen agent system. \
-                    You gather information from external sources, explore documentation, analyze web content, \
-                    and synthesize findings into actionable reports. You research without executing."
+                    You search the local knowledge base first — tier2_search for keyword hits, \
+                    tier3_search for meaning-based lookups, tier4_search for entity links — \
+                    then external sources and web content, and synthesize findings into \
+                    actionable reports. You research without executing."
                     .to_string(),
                 tool_permissions: vec![ToolPermission::Read, ToolPermission::Search],
                 context_injection: vec![
@@ -487,6 +489,10 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 ],
                 category_routing: Some("research".to_string()),
                 behavior_constraints: vec![
+                    "Search the indexed knowledge tiers (tier2/tier3/tier4) before raw \
+                     filesystem scans (fs.grep/fs.list) or the web; the indexed tiers are \
+                     faster and cover the same vault text"
+                        .to_string(),
                     "Gather facts from reliable sources; cite references".to_string(),
                     "Summarize findings concisely; highlight key insights".to_string(),
                     "Never execute code or modify workspace files".to_string(),
@@ -528,6 +534,10 @@ fn builtin_agents() -> Vec<AgentProfile> {
                 ],
                 category_routing: Some("organization".to_string()),
                 behavior_constraints: vec![
+                    "Answer knowledge-base questions with the indexed tiers \
+                     (tier2/tier3/tier4) before raw filesystem scans; fs tool \
+                     paths anchor under the zen root with vault fallback"
+                        .to_string(),
                     "Maintain consistent naming conventions and taxonomy".to_string(),
                     "Index and cross-link related content for discoverability".to_string(),
                     "Never delete user content without explicit approval".to_string(),

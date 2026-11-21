@@ -19,8 +19,8 @@ static ARGS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "type": "object",
         "properties": {
-            "pattern": { "type": "string", "description": "Glob pattern (e.g. \"**/*.rs\", \"src/*.ts\")" },
-            "cwd": { "type": "string", "description": "Base directory for relative patterns (default workspace root)" },
+            "pattern": { "type": "string", "description": "Glob pattern (e.g. \"**/*.rs\", \"wiki/**/*.md\")" },
+            "cwd": { "type": "string", "description": "Base directory for relative patterns. Unset: a leading global subtree (vault/, logs/, ...) anchors at the zen root ~/.zen; a leading name that exists under the vault (wiki/, inbox/, ...) anchors in ~/.zen/vault; other relative patterns anchor at the zen root only when the process cwd is the filesystem root, else stay cwd-relative. vault/iterations/ snapshots never match" },
             "max_results": { "type": "integer", "description": "Maximum matches to return (default 100)" }
         },
         "required": ["pattern"]
@@ -85,12 +85,16 @@ impl Tool for FsGlobTool {
                 // A pattern whose leading component is a zen-root subtree
                 // anchors at the global root even without an explicit
                 // `cwd` — from the daemon (cwd=/) a bare "vault/**/*.md"
-                // would otherwise silently match nothing. A bare relative
-                // pattern under the daemon's filesystem-root cwd walks the
-                // whole disk (production measured 70s for one such call);
-                // anchor it at the zen root too, where the documented
-                // relative spelling applies. A dev-shell cwd keeps its
-                // normal relative-pattern semantics.
+                // would otherwise silently match nothing. A leading name
+                // that only exists under the vault (wiki/, inbox/...)
+                // anchors there: agents name knowledge dirs by their
+                // vault-relative spelling, which the zen root does not
+                // carry. A bare relative pattern under the daemon's
+                // filesystem-root cwd walks the whole disk (production
+                // measured 70s for one such call); anchor it at the zen
+                // root too, where the documented relative spelling
+                // applies. A dev-shell cwd keeps its normal
+                // relative-pattern semantics.
                 let leading = std::path::Path::new(pattern)
                     .components()
                     .next()
@@ -98,6 +102,15 @@ impl Tool for FsGlobTool {
                 let daemon_root_cwd = std::env::current_dir()
                     .map(|d| d == std::path::Path::new("/"))
                     .unwrap_or(false);
+                let vault_leading_exists = leading
+                    .as_deref()
+                    .filter(|c| !zen_core::sandbox::is_global_root_subtree(c))
+                    .is_some_and(|c| {
+                        zen_core::paths::user_root()
+                            .join(zen_core::constants::VAULT_DIR)
+                            .join(c)
+                            .is_dir()
+                    });
                 match leading.as_deref() {
                     Some(c) if zen_core::sandbox::is_global_root_subtree(c) => {
                         zen_core::paths::user_root()
@@ -105,6 +118,11 @@ impl Tool for FsGlobTool {
                             .to_string_lossy()
                             .to_string()
                     }
+                    _ if vault_leading_exists => zen_core::paths::user_root()
+                        .join(zen_core::constants::VAULT_DIR)
+                        .join(pattern)
+                        .to_string_lossy()
+                        .to_string(),
                     _ if daemon_root_cwd && std::path::Path::new(pattern).is_relative() => {
                         zen_core::paths::user_root()
                             .join(pattern)
@@ -142,6 +160,12 @@ impl Tool for FsGlobTool {
                         if matches.len() >= max_results {
                             truncated = true;
                             break;
+                        }
+                        // glob() cannot prune mid-walk; matching is
+                        // post-filtered so stale snapshot copies never
+                        // surface in results.
+                        if zen_core::sandbox::is_walk_excluded_path(&path) {
+                            continue;
                         }
                         if validator.validate_path_for_read(&path).is_err() {
                             continue;

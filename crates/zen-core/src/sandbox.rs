@@ -126,6 +126,56 @@ pub fn resolve_agent_path(input: &str) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Resolve a read-class tool path: same ladder as
+/// [`resolve_agent_path`], plus a vault fallback for relative inputs
+/// that resolve nowhere — a bare `wiki/notes.md` or `chairman.md` that
+/// does not exist in the process cwd nor the zen root is probed under
+/// the vault (`~/.zen/vault/...`) before giving up, because read-class
+/// agents habitually name knowledge files by their vault-relative
+/// spelling. The daemon (cwd `/`) previously turned every such name
+/// into an ENOENT at the filesystem root. Write tools keep
+/// [`resolve_agent_path`] — a vault fallback there would silently
+/// redirect writes and change their blast radius.
+pub fn resolve_agent_read_path(input: &str) -> PathBuf {
+    let resolved = resolve_agent_path(input);
+    if resolved.is_absolute() || resolved.exists() {
+        return resolved;
+    }
+    let vault_probe = crate::paths::user_root()
+        .join(crate::constants::VAULT_DIR)
+        .join(input);
+    if vault_probe.exists() {
+        return vault_probe;
+    }
+    resolved
+}
+
+/// Directory components pruned from read-class tool directory
+/// traversals (`fs.grep` / `fs.list` / `fs.glob`). `iterations` holds
+/// the PageIterations version snapshots — 97.8% of the production vault
+/// tree (114k files / 525MB vs ~2.5k live files) — and every snapshot
+/// is a STALE duplicate of a live page, so walking it both crawls
+/// (production-measured 16.7s vs 0.04s for the knowledge-only walk)
+/// and pollutes results with outdated copies. Mirrors the reindex
+/// exclusion precedent (`tindy/reindex.rs`). Matching is by path
+/// COMPONENT, never a display-string prefix: `iterations.md` and
+/// `my-iterations/` are not pruned.
+pub const WALK_EXCLUDED_DIR_COMPONENTS: &[&str] = &["iterations"];
+
+/// True when `name` is a walk-noise directory component pruned by
+/// read-class fs tool traversals.
+pub fn is_walk_excluded_component(name: &str) -> bool {
+    WALK_EXCLUDED_DIR_COMPONENTS.contains(&name)
+}
+
+/// True when any component of `path` (relative to the walk root or
+/// absolute) is a walk-excluded directory — the shared predicate for
+/// pruning entries from a traversal.
+pub fn is_walk_excluded_path(path: &Path) -> bool {
+    path.components()
+        .any(|c| is_walk_excluded_component(c.as_os_str().to_string_lossy().as_ref()))
+}
+
 pub fn is_metadata_path(path: &Path) -> bool {
     is_env_file(path)
         || path.components().any(|c| {
