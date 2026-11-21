@@ -286,6 +286,7 @@ impl AgentExecutor {
                  unfenced or wrapped tool calls are NOT executed.\n\
                  You may include multiple calls as a JSON array. After receiving results,\
                  continue the conversation normally.\n\
+                 Respond in the user's language — 除非用户要求，回答的语言与用户提问的语言保持一致。\n\
                  Tools:\n",
             );
             prompt.push_str(tool_manifest);
@@ -760,6 +761,45 @@ mod tests {
         assert!(
             response.contains("```json"),
             "the fenced block is the only tool-call channel here: {response}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_with_identity_carries_the_language_rule() {
+        use crate::context::AgentContext;
+        use crate::registry::{AgentRegistry, DefaultAgentRegistry};
+        use crate::wiring::ZenWiring;
+        use crate::zen_agent::ZenAgent;
+        use zen_core::types::SessionContext;
+
+        let router = DefaultRouter::new(LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let wiring = ZenWiring::new();
+        let agent = ZenAgent::builder("Sisyphus")
+            .build(&wiring, &router)
+            .expect("agent builds");
+        let profile = DefaultAgentRegistry::new()
+            .find_by_name("Sisyphus")
+            .expect("profile")
+            .clone();
+        let context = AgentContext::new(
+            profile,
+            "你好".to_string(),
+            SessionContext::new("Sisyphus".to_string(), String::new()),
+        );
+        let executor = AgentExecutor::new(router);
+
+        let prompt =
+            executor.build_prompt_with_identity(&context, &agent, "fs.read: read files", "");
+        assert!(
+            prompt.contains("除非用户要求"),
+            "executor protocol must carry the language-matching rule"
+        );
+        assert!(
+            prompt.contains("## Available tools"),
+            "executor protocol header present with a manifest"
         );
     }
 

@@ -854,6 +854,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **多语言意图识别 + 提示词语言规则（2026-11-21 续，research 先行：deepseek 官方文档 + codex-rs 提示词考古 + zen 提示词装配全量盘点；lint 0 / test 4005/0/28 = +6 钉）** —
+  - **L0 关键词多语言**：INTENT_SIGNALS 12 行全表补中文动词（Explore 得 搜索/查找/查询/检索/查一下/找一下/找出/搜一下/看看/调查/探索；coder 得 实现/编写/重构/调试/修复……）；匹配面为 case-fold+substring（CJK 恒等、无词界），纯表行追加零代码改动；三类表不变量钉（信号↔代理单射/13 可达/L1 seed 覆盖）约束只加行不加信号；刻意排除的裸名词（"代码"会劫持"搜索代码"、"查"会误吞检查/调查、"应该"太常见）以行内注释钉死选择依据；英文行为钉 `english_search_codebase_precedence_quirk_stays`（row-1 "code" 先于 row-2 "search" 的既有怪癖不得扰动）。
+  - **L2 分类提示词**：加 "The request may be written in ANY language — classify by intent, not by language, and answer with the exact English category and signal names above."（回复解析是英文 token 表，中文类目名会 parse 失败降级）。
+  - **语言匹配规则**：两条装配路径的工具前言语（zen_agent 流式 + executor 协议块）各加 deepseek 官方生产句 "Respond in the user's language — 除非用户要求，回答的语言与用户提问的语言保持一致。"（V3.1 官方 changelog 自认 CN/EN 混排是缺陷类；codex 的先例是主提示词只 implicit mirror、隔离生成器才显式钉语言——zen 的对话轮在 deepseek 上显式规则是证据支持的修法）。
+  - **env_info Path B 渲染修复**：executor 装配自始设置 `.env_info(...)` 但 `build_agent_prompt` 从不渲染（agent-definition 路径整个丢失 Environment Info——Path A/B 分歧实锤）；现按默认 18 节路径的顺序（boundary 后首个动态节）渲染，钉锁位置（动态区）。
+  - **研究留档**：deepseek 官方工具提示形状（`## Tools`/`### name`/`Description:`/`Parameters:` + `IMPORTANT: ALWAYS adhere`）与 V2.5 参考输出（围栏 ```json 是原生行为）记录在案；codex 装配序（base/developer → permissions/developer → AGENTS.md+env/user → 用户消息；env 变更才重发）与"行为指导在系统提示词、工具 schema 保持简短"原则；zen 侧盘点发现的下一波候选留档——工具清单渲染在可变内容之后（缓存前缀断裂）、会话历史在系统提示词与消息序列双份、两条装配路径合同收敛（流式丢 agent template/constraints）。
+
 - **fs 搜索链 vault 优先与剪枝（2026-11-21 续，`87aba06`；生产实测 vault 全树 grep 16.7s/116k 文件（97.8% 是 `iterations/` 快照）vs 知识面 0.04s——400× 差；test 3999/0/28 = +13 钉；检索动词入 L0 为追加提交）** —
   - **iterations 剪枝**：fs.grep/fs.list 走 walkdir `filter_entry` 整枝跳过（组件匹配按**相对 walk 根**——首版绝对路径匹配把显式 iterations 根自己的子树也剪光，被 `grep_explicit_iterations_root_still_scans` 钉当场抓到；depth-0 显式根豁免：deliberate grep vault/iterations 仍可达）、fs.list read_dir 分支同名过滤、fs.glob 结果后滤（glob 引擎无法中途剪枝——结果正确但走读成本在，诚实入 schema 文案）。共享常量 `zen-core/sandbox.rs::WALK_EXCLUDED_DIR_COMPONENTS = ["iterations"]` + `is_walk_excluded_component`/`is_walk_excluded_path`。
   - **vault 回落锚定**：新增 `resolve_agent_read_path`（读类专用；写类保持 `resolve_agent_path`——vault 回落会静默改写落点、爆区漂移）——裸名/未知相对路径在 cwd 与 zen 根都未命中时探测 `~/.zen/vault/<input>`；fs.read/fs.list/fs.grep 接入。fs.glob 无 cwd 分支增 vault-leading 存在性锚定（`wiki/**` 直达 `~/.zen/vault/wiki/**`，修正 `fs_glob.rs:23` 的 "default workspace root" 文案漂移）。

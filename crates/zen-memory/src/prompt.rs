@@ -407,6 +407,17 @@ impl PromptAssembly {
             static_parts.push(format!("## Output Format\n{}", format));
         }
 
+        // Section 13: Environment Info — rendered as the FIRST dynamic
+        // section, mirroring the default 18-section path's order
+        // (env_info → memory → signals). The executor assembly has set
+        // `.env_info(...)` since it landed; this path previously dropped
+        // the slot silently (Path A/B divergence fixed 2026-11-21).
+        if let Some(ref env) = self.env_info
+            && !env.is_empty()
+        {
+            dynamic_parts.push(env.clone());
+        }
+
         // Section 17: Memory (conversation + knowledge)
         let memory_parts = self.build_memory_section();
         if !memory_parts.is_empty() {
@@ -1106,11 +1117,26 @@ mod tests {
         let assembly = PromptAssembly::builder()
             .agent_definition(def)
             .sensitivity(Sensitivity::Public)
+            .env_info("CWD: /test")
             .build();
         let result = assembly.assemble();
         assert!(result.contains("You are Zen"));
         assert!(result.contains("Blast Radius"));
         assert!(result.contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"));
+        // Path B contract (2026-11-21 multilingual wave): the agent-definition
+        // path must render env_info like the default 18-section path — the
+        // executor has always set the slot; this path previously dropped it.
+        assert!(
+            result.contains("CWD: /test"),
+            "agent-definition path must render env_info"
+        );
+        assert!(
+            result
+                .find("CWD: /test")
+                .zip(result.find("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"))
+                .is_some_and(|(env, boundary)| env > boundary),
+            "env_info renders in the dynamic zone"
+        );
     }
 
     #[test]

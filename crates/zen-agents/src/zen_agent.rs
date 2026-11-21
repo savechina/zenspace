@@ -1335,7 +1335,8 @@ impl ZenAgent {
                  (tier2_search for keywords, tier3_search for meaning, tier4_search for \
                  entity links) before falling back to raw fs.grep/fs.read scans; fs tool \
                  paths anchor under the zen root (~/.zen) with bare names falling back to \
-                 the vault (~/.zen/vault).\n\n",
+                 the vault (~/.zen/vault).\n\
+                 Respond in the user's language — 除非用户要求，回答的语言与用户提问的语言保持一致。\n\n",
             );
             prompt.push_str(&tool_manifest);
         }
@@ -2172,6 +2173,14 @@ mod chain_tests {
         assert!(
             !prompt.contains("fs.write"),
             "non-granted fs.write leaked into scoped manifest"
+        );
+        // Language-matching rule (2026-11-21 multilingual wave): the
+        // official DeepSeek production sentence — English system prompt +
+        // Chinese user input previously left response language to chance
+        // (V3.1's own release notes admit CN/EN mixing as a defect class).
+        assert!(
+            prompt.contains("除非用户要求"),
+            "streaming prompt missing the language-matching rule"
         );
     }
 

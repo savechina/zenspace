@@ -94,6 +94,14 @@ pub(crate) const INTENT_SIGNALS: &[(&str, &str, &[&str])] = &[
             "class",
             "refactor",
             "debug",
+            // Verb-anchored Chinese only: bare nouns like "代码" would
+            // shadow row-later search phrases ("搜索代码" must stay
+            // Explore — row 1 is scanned first, first row wins).
+            "实现",
+            "编写",
+            "重构",
+            "调试",
+            "修复",
         ],
     ),
     (
@@ -110,57 +118,168 @@ pub(crate) const INTENT_SIGNALS: &[(&str, &str, &[&str])] = &[
             "find",
             "look up",
             "lookup",
+            // 2+ char retrieval verbs; single chars like "查" would also
+            // match 检查/调查/审查 and misroute review prompts here.
+            "搜索",
+            "查找",
+            "查询",
+            "检索",
+            "查一下",
+            "找一下",
+            "找出",
+            "搜一下",
+            "看看",
+            "调查",
+            "探索",
         ],
     ),
     (
         "Oracle",
         "deep-analysis",
-        &["analyze", "analysis", "deep", "architecture", "design"],
+        &[
+            "analyze",
+            "analysis",
+            "deep",
+            "architecture",
+            "design",
+            "分析",
+            "深入",
+            "架构",
+            "设计",
+        ],
     ),
     (
         "Librarian",
         "knowledge-org",
-        &["organize", "knowledge", "wiki", "notes", "catalog", "dedup"],
+        &[
+            "organize",
+            "knowledge",
+            "wiki",
+            "notes",
+            "catalog",
+            "dedup",
+            // No bare "笔记": noun keywords in this late row lose to the
+            // retrieval verbs above by design ("搜索笔记" is Explore).
+            "整理",
+            "归类",
+            "组织",
+            "去重",
+        ],
     ),
     (
         "Hermes",
         "consolidate-pipeline",
-        &["consolidate", "pipeline", "merge", "compile wiki"],
+        &[
+            "consolidate",
+            "pipeline",
+            "merge",
+            "compile wiki",
+            "合并",
+            "编译",
+            "汇总",
+            "整合",
+        ],
     ),
     (
         "Momus",
         "review-quality",
-        &["review", "audit", "check quality", "security"],
+        &[
+            "review",
+            "audit",
+            "check quality",
+            "security",
+            "审查",
+            "审计",
+            "质量",
+            "安全",
+        ],
     ),
     (
         "Prometheus",
         "planning",
-        &["plan", "strategy", "roadmap", "spec", "milestone"],
+        &[
+            "plan",
+            "strategy",
+            "roadmap",
+            "spec",
+            "milestone",
+            "计划",
+            "规划",
+            "策略",
+            "里程碑",
+        ],
     ),
     (
         "Metis",
         "gap-assessment",
-        &["gap", "tactical", "assumption", "feasibility"],
+        &[
+            "gap",
+            "tactical",
+            "assumption",
+            "feasibility",
+            "差距",
+            "战术",
+            "假设",
+            "可行性",
+        ],
     ),
     (
         "Atlas",
         "batch-automation",
-        &["batch", "automate", "routine", "schedule"],
+        &[
+            "batch",
+            "automate",
+            "routine",
+            "schedule",
+            "批量",
+            "自动化",
+            "例行",
+            "定时",
+        ],
     ),
     (
         "Junior",
         "format-convert",
-        &["format", "convert", "download", "clean"],
+        &[
+            "format",
+            "convert",
+            "download",
+            "clean",
+            "格式化",
+            "转换",
+            "下载",
+            "清理",
+        ],
     ),
     (
         "Zeus",
         "value-alignment",
-        &["value", "align", "priority", "should we"],
+        // No "应该": it appears in ordinary conversation ("应该可以吧")
+        // and would route plain chat turns to value analysis.
+        &[
+            "value",
+            "align",
+            "priority",
+            "should we",
+            "价值观",
+            "优先级",
+        ],
     ),
     (
         "Argus",
         "visual",
-        &["image", "chart", "visual", "diagram", "screenshot"],
+        &[
+            "image",
+            "chart",
+            "visual",
+            "diagram",
+            "screenshot",
+            "图片",
+            "图表",
+            "截图",
+            "可视化",
+            "图示",
+        ],
     ),
 ];
 
@@ -743,6 +862,7 @@ pub(crate) fn classification_prompt(query: &str) -> String {
         "Classify the user's request into exactly one category and, when one clearly applies, one routing signal.\n\
          Categories: \"Query\" (search or read knowledge), \"Action\" (create, modify, or execute something), \"System\" (manage configuration or services), \"Conversation\" (chat, help, or clarification).\n\
          Signals: {}\n\
+         The request may be written in ANY language — classify by intent, not by language, and answer with the exact English category and signal names above.\n\
          User request: {query}\n\
          Respond with ONLY a JSON object: {{\"category\": \"<Category>\", \"confidence\": <0.0-1.0>, \"signal\": \"<signal-or-omit>\"}}",
         signal_vocabulary()
@@ -1390,5 +1510,64 @@ mod search_keyword_pin {
                 "prompt: {prompt}"
             );
         }
+    }
+
+    /// Multilingual L0 pins (2026-11-21 multilingual wave): the fast path
+    /// is case-fold + substring (CJK identity, no word boundaries), so
+    /// Chinese retrieval verbs route the same production failure shape
+    /// ("搜索/查一下 ..." prompts previously fell to LLM classify →
+    /// Conversation fallback → knowledge injection skipped) without any
+    /// matching-code change. The precedence quirk pin is the guard rail:
+    /// adding bare Chinese nouns to early rows would silently reroute
+    /// English/Chinese search prompts to coder.
+    #[test]
+    fn chinese_retrieval_prompts_route_to_explore_on_the_l0_fast_path() {
+        for prompt in [
+            "搜索我的笔记里的复利概念",
+            "查一下巴菲特",
+            "帮我找一下投资相关的笔记",
+        ] {
+            let intent = keyword_route(prompt)
+                .unwrap_or_else(|| panic!("Chinese retrieval verb must route: {prompt}"));
+            assert_eq!(intent.agent, "Explore", "prompt: {prompt}");
+            assert_eq!(intent.category, IntentCategory::Query, "prompt: {prompt}");
+            assert!(
+                matches!(intent.source, IntentSource::Keyword),
+                "prompt: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn chinese_coding_and_org_prompts_route_to_their_agents() {
+        let code = keyword_route("帮我实现一个解析函数").expect("实现 routes");
+        assert_eq!(code.agent, "Hephaestus");
+        assert_eq!(code.category, IntentCategory::Action);
+
+        let org = keyword_route("整理一下我的 wiki").expect("整理 routes");
+        assert_eq!(org.agent, "Librarian");
+        assert_eq!(org.category, IntentCategory::Query);
+    }
+
+    #[test]
+    fn chinese_smalltalk_stays_a_keyword_miss() {
+        assert!(keyword_route("你好").is_none());
+        assert!(keyword_route("今天天气不错").is_none());
+    }
+
+    #[test]
+    fn mixed_language_prompt_routes_on_the_verb() {
+        let intent =
+            keyword_route("用中文搜索 buffett letters").expect("mixed-language search routes");
+        assert_eq!(intent.agent, "Explore");
+    }
+
+    #[test]
+    fn english_search_codebase_precedence_quirk_stays() {
+        // Pre-existing behavior, deliberately unperturbed: "code" in row 1
+        // beats "search" in row 2. The Chinese additions must not change
+        // any English routing outcome.
+        let intent = keyword_route("search the codebase").expect("routes");
+        assert_eq!(intent.agent, "Hephaestus");
     }
 }
