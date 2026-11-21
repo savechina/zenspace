@@ -854,6 +854,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **fs 搜索链 vault 优先与剪枝（2026-11-21 续，`87aba06`；生产实测 vault 全树 grep 16.7s/116k 文件（97.8% 是 `iterations/` 快照）vs 知识面 0.04s——400× 差；test 3999/0/28 = +13 钉；检索动词入 L0 为追加提交）** —
+  - **iterations 剪枝**：fs.grep/fs.list 走 walkdir `filter_entry` 整枝跳过（组件匹配按**相对 walk 根**——首版绝对路径匹配把显式 iterations 根自己的子树也剪光，被 `grep_explicit_iterations_root_still_scans` 钉当场抓到；depth-0 显式根豁免：deliberate grep vault/iterations 仍可达）、fs.list read_dir 分支同名过滤、fs.glob 结果后滤（glob 引擎无法中途剪枝——结果正确但走读成本在，诚实入 schema 文案）。共享常量 `zen-core/sandbox.rs::WALK_EXCLUDED_DIR_COMPONENTS = ["iterations"]` + `is_walk_excluded_component`/`is_walk_excluded_path`。
+  - **vault 回落锚定**：新增 `resolve_agent_read_path`（读类专用；写类保持 `resolve_agent_path`——vault 回落会静默改写落点、爆区漂移）——裸名/未知相对路径在 cwd 与 zen 根都未命中时探测 `~/.zen/vault/<input>`；fs.read/fs.list/fs.grep 接入。fs.glob 无 cwd 分支增 vault-leading 存在性锚定（`wiki/**` 直达 `~/.zen/vault/wiki/**`，修正 `fs_glob.rs:23` 的 "default workspace root" 文案漂移）。
+  - **提示词排序**：工具前言 + Explore/Librarian 约束明示 KB tier 先于裸扫与 web（原 Explore 提示词只说 external sources/web content——反向偏置的实锤）。
+  - **检索动词 L0**（追加提交）：`grep`/`find`/`look up`/`lookup` 入 Explore 关键词表——生产实证 "grep my vault..." 走 LLM 分类 8s 超时 → Conversation 回落 → 知识注入跳过。
+  - **上机实测**：部署后真轮 `fs.grep path=vault pattern=anthropic` **warm 0.41s**（剪枝生效实锤——同参第二次调用）；同轮首次调用 344s 为冷缓存 + 17:19 复兴 pass 后 mds 更新风暴窗口的一次性事件（3ms/文件 × 116k 与未剪枝特征吻合），非代码缺陷，留档观察；deepseek 当晚云延迟主导轮墙（intent 8s 超时 + 首轮 6min46s——provider 侧）。
+
 - **实体图复活波（2026-11-21 续，`ca93457`；验证波取证发现：`store_entity_embedding` 与 `extract_relationships` 自始零 caller——生产 62 实体 / 0 边 / 0 实体向量；lint 0 / test 3986/0/28 = +3 钉）** —
   - **canonical id 修复（接线即爆的实锤）**：`persist_cooccurrence_edges` 按名解析 canonical——known-tech 与 capitalized-word 双策略对同一概念产出 "Sqlite"/"SQLite" 两种拼法，upsert 折叠到首个 canonical 行，raw per-batch id 建边会 FK 悬挂（e2e 钉当场抓到）；折叠变体跳过（自边是噪声）、确定性 pair id `rel-<sorted>` 幂等、逐边 warn-continue 永不 all-or-nothing；输入上限 `MAX_COOCCURRENCE_NOTIONS=10`。
   - **三提取面接线**：distill Join（per-note 批次累积后统一持久）、graph_router host-doc Join（同批建边）、journal notion-extractor worker（嵌入随 upsert；journal 边刻意不提取——fact 级共现是噪声）。

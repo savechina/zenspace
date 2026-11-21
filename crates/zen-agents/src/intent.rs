@@ -106,6 +106,10 @@ pub(crate) const INTENT_SIGNALS: &[(&str, &str, &[&str])] = &[
             "find information",
             "investigate",
             "search",
+            "grep",
+            "find",
+            "look up",
+            "lookup",
         ],
     ),
     (
@@ -1358,6 +1362,9 @@ mod search_keyword_pin {
     /// "search" must hit the L0 keyword fast path — production evidence had
     /// the LLM classify "search buffet letters" as Conversation, which
     /// skipped knowledge injection and burned the turn on dead tool calls.
+    /// The fast-search wave (same day) extended the same defect class with
+    /// the retrieval verbs from the production transcript ("grep my vault
+    /// ..." → LLM classify 8s timeout → Conversation fallback).
     #[test]
     fn search_keyword_routes_to_explore_on_the_l0_fast_path() {
         let intent = keyword_route("search buffet letters").expect("'search' routes");
@@ -1365,5 +1372,23 @@ mod search_keyword_pin {
         assert_eq!(intent.signal, "research");
         assert_eq!(intent.category, IntentCategory::Query);
         assert!(matches!(intent.source, IntentSource::Keyword));
+    }
+
+    #[test]
+    fn retrieval_verbs_route_to_explore_on_the_l0_fast_path() {
+        for prompt in [
+            "grep my vault for mentions of anthropic and list the files",
+            "find the buffett letters note",
+            "look up what I saved about compounding",
+        ] {
+            let intent = keyword_route(prompt)
+                .unwrap_or_else(|| panic!("retrieval verb must route: {prompt}"));
+            assert_eq!(intent.agent, "Explore", "prompt: {prompt}");
+            assert_eq!(intent.category, IntentCategory::Query, "prompt: {prompt}");
+            assert!(
+                matches!(intent.source, IntentSource::Keyword),
+                "prompt: {prompt}"
+            );
+        }
     }
 }
