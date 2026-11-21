@@ -74,6 +74,14 @@ pub struct ReindexReport {
     pub embeddings_skipped: usize,
     /// Non-fatal error messages encountered while processing files.
     pub errors: Vec<String>,
+    /// Entities re-embedded into `notion_embeddings` (vec0) by the
+    /// graph-revival pass — zero when the reindex runs without a DB
+    /// client.
+    pub entities_embedded: usize,
+    /// RELATED_TO co-occurrence edges written by the graph-revival pass
+    /// (deterministic pair ids; re-running replaces rather than
+    /// duplicates). Zero when the reindex runs without a DB client.
+    pub edges_written: usize,
 }
 
 // ── Note identity ────────────────────────────────────────────────────
@@ -448,6 +456,29 @@ impl Reindexer {
             report.embeddings_degraded
         );
 
+        // ── Graph-revival pass ──────────────────────────────────────────
+        // Derived graph indexes had no writers (store_entity_embedding and
+        // extract_relationships were dead APIs — production ran 62 nodes /
+        // 0 edges / 0 entity vectors after the 10-30 vec0 reset).
+        // Re-embed every existing entity, then rebuild co-occurrence edges
+        // from the current wiki content. Fail-open: a revival error never
+        // aborts the reindex.
+        if let Some(client) = &self.db_client {
+            match run_graph_revival(client, knowledge_dir).await {
+                Ok((entities_embedded, edges_written)) => {
+                    report.entities_embedded = entities_embedded;
+                    report.edges_written = edges_written;
+                    info!(
+                        entities_embedded,
+                        edges_written, "Graph revival pass complete"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "Graph revival pass failed (fail-open)");
+                }
+            }
+        }
+
         Ok(report)
     }
 
@@ -710,6 +741,94 @@ fn fingerprint_gate(
         (Some(stored), Some(active)) => GateDecision::Mismatch(stored, active),
         (None, None) | (Some(_), None) => GateDecision::UnknownEngine,
     }
+}
+
+/// Rebuild the derived graph indexes: re-embed every existing entity
+/// into `notion_embeddings`, then re-extract the wiki content and persist
+/// co-occurrence RELATED_TO edges (deterministic pair ids — re-running
+/// replaces rather than duplicates).
+///
+/// Fail-open by design: per-entity embed failures warn and continue; the
+/// pass itself never aborts the enclosing reindex.
+async fn run_graph_revival(client: &SqliteClient, knowledge_dir: &Path) -> Result<(usize, usize)> {
+    let service = crate::notion::NotionService::new();
+    let extractor = crate::distill::NotionExtractor::new();
+
+    let mut entities_embedded = 0usize;
+    for notion in service.load_all_entities(client).await? {
+        let mut text = notion.name.clone();
+        if !notion.description.is_empty() {
+            text.push(' ');
+            text.push_str(&notion.description);
+        }
+        if let Err(e) = service
+            .store_entity_embedding(client, &notion.id, &text)
+            .await
+        {
+            warn!(notion = %notion.name, error = %e, "entity re-embed failed, continuing");
+            continue;
+        }
+        entities_embedded += 1;
+    }
+
+    let mut edges_written = 0usize;
+    for entry in WalkDir::new(knowledge_dir)
+        .into_iter()
+        .filter_entry(|e| !is_excluded_entry(e, knowledge_dir))
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "graph revival walk failed on one entry, continuing");
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "graph revival read failed, continuing");
+                continue;
+            }
+        };
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let page_note = note::Note {
+            id,
+            content,
+            ..note::Note::default()
+        };
+        let per_page = match extractor.extract(&page_note) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "graph revival extract failed, continuing");
+                continue;
+            }
+        };
+        for notion in &per_page {
+            match service.upsert_entity_with_embedding(client, notion).await {
+                Ok(true) => entities_embedded += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(notion = %notion.name, error = %e, "graph revival upsert failed, continuing");
+                }
+            }
+        }
+        edges_written += service
+            .persist_cooccurrence_edges(client, &per_page)
+            .await
+            .unwrap_or(0);
+    }
+
+    Ok((entities_embedded, edges_written))
 }
 
 #[cfg(test)]

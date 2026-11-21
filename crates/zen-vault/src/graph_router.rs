@@ -272,11 +272,18 @@ impl GraphRouter {
         };
 
         // Join stage — same NotionService upsert the distill pipeline uses;
-        // idempotent on re-route, warn-and-continue per notion.
+        // idempotent on re-route, warn-and-continue per notion. The
+        // 2026-11-21 graph-revival wiring: upserts embed each entity and
+        // the same-batch co-occurrence edges persist with deterministic
+        // pair ids (both were dead APIs).
         let mut joined_count = 0usize;
         for notion in &notions {
-            match self.notion_service.upsert_entity(client, notion).await {
-                Ok(()) => joined_count += 1,
+            match self
+                .notion_service
+                .upsert_entity_with_embedding(client, notion)
+                .await
+            {
+                Ok(_) => joined_count += 1,
                 Err(e) => warn!(
                     cycle_id,
                     notion = %notion.name,
@@ -284,6 +291,21 @@ impl GraphRouter {
                     "Router join failed for notion, continuing"
                 ),
             }
+        }
+        let edges_joined = self
+            .notion_service
+            .persist_cooccurrence_edges(client, &notions)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(cycle_id, error = %e, "Router edge join failed, continuing");
+                0
+            });
+        if edges_joined > 0 {
+            info!(
+                cycle_id,
+                edges = edges_joined,
+                "Router co-occurrence edges joined"
+            );
         }
 
         info!(

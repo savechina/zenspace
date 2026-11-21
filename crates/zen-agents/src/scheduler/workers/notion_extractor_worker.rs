@@ -254,7 +254,7 @@ async fn process_entry(
     for (notion_name, fact_list) in &matched {
         let canonical = notion_name.to_lowercase();
         let notion = Notion::new(canonical, NotionKind::Technology, "notion-extractor");
-        if let Err(e) = svc.upsert_entity(client, &notion).await {
+        if let Err(e) = svc.upsert_entity_with_embedding(client, &notion).await {
             warn!(notion = %notion_name, error = %e, "failed to upsert notion");
             continue;
         }
@@ -360,7 +360,11 @@ async fn upsert_entities(
     let mut upserted = 0usize;
     for (name, kind) in &notions {
         let notion = Notion::new(name.clone(), kind.clone(), "notion-extractor");
-        if let Err(e) = svc.upsert_entity(client, &notion).await {
+        // 2026-11-21 graph-revival wiring: the embedding rides the upsert
+        // (store_entity_embedding was a dead API — production entities had
+        // zero vectors). Journal co-occurrence edges are intentionally NOT
+        // extracted: facts within one entry are keyword-level noise.
+        if let Err(e) = svc.upsert_entity_with_embedding(client, &notion).await {
             warn!(notion = %name, error = %e, "failed to upsert notion");
             continue;
         }

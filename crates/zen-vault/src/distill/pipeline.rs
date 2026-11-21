@@ -24,6 +24,7 @@ use super::types::{GapKind, GapRecord, LoopBudget, VerificationNode};
 use super::wiki_compile::{GhostlinkPolicy, WikiCompiler};
 use crate::graph_router::validate_slug;
 use crate::graph_verify::PlaceholderRegistry;
+use crate::notion::Notion;
 use crate::notion::service::NotionService;
 
 use crate::note::{Note, parse_frontmatter};
@@ -1068,18 +1069,38 @@ impl DistillationPipeline {
             "Loaded notes from inbox, starting consolidation pipeline"
         );
 
-        let mut notions = self.extractor.extract_batch(&notes)?;
+        let mut notions: Vec<Notion> = Vec::new();
+        let mut per_note_batches: Vec<Vec<Notion>> = Vec::new();
+        for note in &notes {
+            let per_note = self.extractor.extract(note)?;
+            for notion in &per_note {
+                if !notions.iter().any(|existing| existing.name == notion.name) {
+                    notions.push(notion.clone());
+                }
+            }
+            if !per_note.is_empty() {
+                per_note_batches.push(per_note);
+            }
+        }
         let entities_extracted = notions.len();
         info!(entities_extracted, "Notion extraction complete");
 
         // T003: persist extracted notions into the DB graph (Principle XII).
         // DB mutations share the TransactionScope lifetime with FS mutations;
         // rollback deletes FS files while upsert idempotency keeps DB safe for reprocess.
+        // The 2026-11-21 graph-revival wiring: upserts embed each entity and
+        // the per-note co-occurrence edges persist with deterministic pair
+        // ids (both were dead APIs — production ran 62 nodes / 0 edges / 0
+        // entity vectors).
         let mut entities_persisted = 0usize;
         if let Some(client) = db {
             for notion in &notions {
-                match self.notion_service.upsert_entity(client, notion).await {
-                    Ok(()) => entities_persisted += 1,
+                match self
+                    .notion_service
+                    .upsert_entity_with_embedding(client, notion)
+                    .await
+                {
+                    Ok(_) => entities_persisted += 1,
                     Err(e) => tracing::warn!(
                         notion = %notion.name,
                         error = %e,
@@ -1087,7 +1108,21 @@ impl DistillationPipeline {
                     ),
                 }
             }
-            info!(entities_persisted, "Notion persistence complete");
+            let mut edges_persisted = 0usize;
+            for batch in &per_note_batches {
+                edges_persisted += self
+                    .notion_service
+                    .persist_cooccurrence_edges(client, batch)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to persist notion edges, continuing");
+                        0
+                    });
+            }
+            info!(
+                entities_persisted,
+                edges_persisted, "Notion persistence complete"
+            );
         } else {
             tracing::debug!("No DB client — skipping notion persistence (test mode)");
         }

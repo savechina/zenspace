@@ -120,6 +120,11 @@ fn self_node_to_row(node: &super::self_node::SelfNode) -> zen_repo::types::SelfN
     }
 }
 
+/// Co-occurrence edge inputs are capped at this many notions per batch —
+/// extraction can yield large sets from capitalized-word scans and pairwise
+/// edge output grows quadratically.
+const MAX_COOCCURRENCE_NOTIONS: usize = 10;
+
 /// Service for extracting notions and relationships from workspace content.
 pub struct NotionService;
 
@@ -136,27 +141,146 @@ impl NotionService {
 
     /// Extract relationships between co-occurring notions.
     ///
-    /// Creates RELATED_TO relationships for every pair of notions.
-    /// Future enhancement: use LLM to classify relationship types
-    /// (e.g., USES, DEPENDS_ON, IMPLEMENTS).
+    /// Creates RELATED_TO relationships for every pair of notions (capped
+    /// at [`MAX_COOCCURRENCE_NOTIONS`] inputs — extraction can yield large
+    /// sets from capitalized-word scans and pairwise output grows
+    /// quadratically). Future enhancement: use LLM to classify relationship
+    /// types (e.g., USES, DEPENDS_ON, IMPLEMENTS).
     pub fn extract_relationships(&self, notions: &[Notion]) -> Result<Vec<Relationship>> {
         let mut relationships = Vec::new();
         let now = chrono::Utc::now();
 
-        for i in 0..notions.len() {
-            for j in (i + 1)..notions.len() {
+        let capped: &[Notion] = if notions.len() > MAX_COOCCURRENCE_NOTIONS {
+            &notions[..MAX_COOCCURRENCE_NOTIONS]
+        } else {
+            notions
+        };
+
+        for i in 0..capped.len() {
+            for j in (i + 1)..capped.len() {
                 relationships.push(Relationship {
                     id: uuid::Uuid::now_v7().to_string(),
-                    source_notion_id: notions[i].id.clone(),
-                    target_notion_id: notions[j].id.clone(),
+                    source_notion_id: capped[i].id.clone(),
+                    target_notion_id: capped[j].id.clone(),
                     relation_type: RelationKind::RelatedTo,
-                    description: format!("{} relates to {}", notions[i].name, notions[j].name),
-                    source_note_id: notions[i].source_note_id.clone(),
+                    description: format!("{} relates to {}", capped[i].name, capped[j].name),
+                    source_note_id: capped[i].source_note_id.clone(),
                     created_at: now,
                 });
             }
         }
         Ok(relationships)
+    }
+
+    /// Persist RELATED_TO co-occurrence edges for one extraction batch,
+    /// against CANONICAL entity ids.
+    ///
+    /// `upsert_entity` collapses spelling variants ("Sqlite" / "SQLite")
+    /// onto one canonical row, so edges built from raw per-batch ids would
+    /// dangle on the relationships FK (the 2026-11-21 wiring hit exactly
+    /// this: known-tech and capitalized-word extraction produce both
+    /// spellings of the same concept in one note). Variants that resolve
+    /// to the same canonical entity are skipped — a self-edge is noise.
+    /// Inputs cap at [`MAX_COOCCURRENCE_NOTIONS`]; the deterministic
+    /// pair-level id plus the repo's `INSERT OR REPLACE` make
+    /// reprocessing idempotent; one failed edge warns and continues
+    /// (never all-or-nothing).
+    pub async fn persist_cooccurrence_edges(
+        &self,
+        client: &SqliteClient,
+        notions: &[Notion],
+    ) -> Result<usize> {
+        let repo = NotionsRepo::new(client);
+        let mut canonical_ids: Vec<String> = Vec::new();
+        for notion in notions.iter().take(MAX_COOCCURRENCE_NOTIONS) {
+            let canonical = repo
+                .resolve_alias(&zen_repo::normalize_alias(&notion.name))
+                .await?
+                .unwrap_or_else(|| notion.id.clone());
+            if !canonical_ids.contains(&canonical) {
+                canonical_ids.push(canonical);
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut written = 0usize;
+        for i in 0..canonical_ids.len() {
+            for j in (i + 1)..canonical_ids.len() {
+                let (a, b) = if canonical_ids[i] <= canonical_ids[j] {
+                    (&canonical_ids[i], &canonical_ids[j])
+                } else {
+                    (&canonical_ids[j], &canonical_ids[i])
+                };
+                let id = format!("rel-{a}-{b}");
+                let description = format!("co-occurrence pair {a} ↔ {b}");
+                if let Err(e) = repo
+                    .insert_relationship(&InsertRelationshipRequest {
+                        id: &id,
+                        source_id: a,
+                        target_id: b,
+                        rel_type: "RelatedTo",
+                        confidence: 0.5,
+                        source_note_ids: Some(
+                            notions
+                                .first()
+                                .map(|n| n.source_note_id.as_str())
+                                .unwrap_or(""),
+                        ),
+                        created_at: &now,
+                        description: Some(&description),
+                        valid_from: None,
+                        valid_until: None,
+                        weight: None,
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        edge = %id,
+                        error = %e,
+                        "co-occurrence edge insert failed, continuing"
+                    );
+                    continue;
+                }
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    /// Upsert an entity, then store its semantic embedding under the
+    /// canonical id (alias hits embed the canonical notion they resolve
+    /// to — the raw `upsert_entity` alias path returns before any id is
+    /// known to the caller). Embedding failure is fail-open: extraction
+    /// must proceed; the returned bool reports whether the vector landed.
+    pub async fn upsert_entity_with_embedding(
+        &self,
+        client: &SqliteClient,
+        notion: &Notion,
+    ) -> Result<bool> {
+        self.upsert_entity(client, notion).await?;
+        let canonical_id = NotionsRepo::new(client)
+            .resolve_alias(&zen_repo::normalize_alias(&notion.name))
+            .await?
+            .unwrap_or_else(|| notion.id.clone());
+        let mut text = notion.name.clone();
+        if !notion.description.is_empty() {
+            text.push(' ');
+            text.push_str(&notion.description);
+        }
+        match self
+            .store_entity_embedding(client, &canonical_id, &text)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::warn!(
+                    notion = %notion.name,
+                    error = %e,
+                    "entity embedding skipped (fail-open)"
+                );
+                Ok(false)
+            }
+        }
     }
 
     /// Load all known notion names from the unified graph store (state.db).
