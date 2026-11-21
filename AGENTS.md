@@ -854,6 +854,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **实体图复活波（2026-11-21 续，`ca93457`；验证波取证发现：`store_entity_embedding` 与 `extract_relationships` 自始零 caller——生产 62 实体 / 0 边 / 0 实体向量；lint 0 / test 3986/0/28 = +3 钉）** —
+  - **canonical id 修复（接线即爆的实锤）**：`persist_cooccurrence_edges` 按名解析 canonical——known-tech 与 capitalized-word 双策略对同一概念产出 "Sqlite"/"SQLite" 两种拼法，upsert 折叠到首个 canonical 行，raw per-batch id 建边会 FK 悬挂（e2e 钉当场抓到）；折叠变体跳过（自边是噪声）、确定性 pair id `rel-<sorted>` 幂等、逐边 warn-continue 永不 all-or-nothing；输入上限 `MAX_COOCCURRENCE_NOTIONS=10`。
+  - **三提取面接线**：distill Join（per-note 批次累积后统一持久）、graph_router host-doc Join（同批建边）、journal notion-extractor worker（嵌入随 upsert；journal 边刻意不提取——fact 级共现是噪声）。
+  - **reindex 复兴通道**：`zen wiki reindex` 尾部 fail-open pass——全体实体重嵌 + wiki 内容重提取建边；`ReindexReport` 增 `entities_embedded`/`edges_written`；walk 复用 `iterations` 排除规则。
+  - **上机实测**：生产 relationships **0 → 2236**、notion_embeddings_rowids **0 → 1138**（wiki 重提取发现大量 heading/capitalized 实体）；活体验证 tier4 图遍历真实工作（anthropic 入链 ai/ml/berkshire/hathaway/letter/rest/go、出链 chairman/chairman's letter-1993）。
+  - 遗留留档：beliefs/self/goal DB 层仍 0 写者（I12 既有留档——wiring 是产品决策非接线缺失）、原生 tool-call 传参（provider 层工程）。
+
 - **搜索链七处修复（2026-11-21，`f3b8443`+`ed15656`+`d633e03`+`af4a2de`；触发：生产 "search buffet letters" 轮 189s 全废——web.search 8s 死、fs.read 猜文件名、```json 栅栏泄漏、最终零答案；lint 0 / test 3983/0/28）** — 四次探针取证（DDG 直连 000/8s vs 代理 202/1.3s）+ 四路 explore 定位后七修：
   - **daemon 环境可达（根修）**：launchd cwd=/ 永远找不到 cwd 相对 `.env` → `load_config` 增载全局 `~/.zen/.env`（cwd 优先、dotenvy 不覆盖已设值，2 钉）——搜索键/egress 代理自此有指定落点；`~/.zen/.env` 写入代理四键（no_proxy 保 loopback），web.search DDG 经代理 2.7s 实测恢复。
   - **L0 search 路由**：`search` 入 INTENT_SIGNALS（生产实证 LLM 把该句误分类 Conversation → 知识注入 skipped_reason=conversation_intent、错误代理跑轮）——关键词命中 0ms 直达 Explore/Query；钉 1。
