@@ -854,6 +854,16 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **搜索链七处修复（2026-11-21，`f3b8443`+`ed15656`+`d633e03`+`af4a2de`；触发：生产 "search buffet letters" 轮 189s 全废——web.search 8s 死、fs.read 猜文件名、```json 栅栏泄漏、最终零答案；lint 0 / test 3983/0/28）** — 四次探针取证（DDG 直连 000/8s vs 代理 202/1.3s）+ 四路 explore 定位后七修：
+  - **daemon 环境可达（根修）**：launchd cwd=/ 永远找不到 cwd 相对 `.env` → `load_config` 增载全局 `~/.zen/.env`（cwd 优先、dotenvy 不覆盖已设值，2 钉）——搜索键/egress 代理自此有指定落点；`~/.zen/.env` 写入代理四键（no_proxy 保 loopback），web.search DDG 经代理 2.7s 实测恢复。
+  - **L0 search 路由**：`search` 入 INTENT_SIGNALS（生产实证 LLM 把该句误分类 Conversation → 知识注入 skipped_reason=conversation_intent、错误代理跑轮）——关键词命中 0ms 直达 Explore/Query；钉 1。
+  - **语义检索授权**：Explore/Librarian（Query 默认代理）补授 tier3/tier4（此前仅 6 代理持有，FTS-only 语义检索结构性不可达）；prose 表+FR-046 等值钉 lockstep 翻 8 持有者。
+  - **fs 工具诚实化**：fs.read schema 停止 "workspace-relative" 误导措辞 + not-found 错误携带 resolved 路径与 fs.glob/tier2 恢复提示；fs.glob pattern 前导子树名无 cwd 锚定 zen 根 + **裸 pattern 在 cwd=/ 场景同锚**（生产实测一次 70s 全盘走）；钉 4。
+  - **流式栅栏抑制**：网关 token 回调 `JsonFenceSuppressor`（仅持有 ```json opener 前缀片段——工具行原子性字节保持，首版任意 partial-line holdback 被 T056 harness 抓到 glueing 破坏后重构；turn 尾 flush 残留）+ 逐字节切分穷举差分钉。
+  - **工具方言自愈**：deepseek 漂移两连（裸 JSON 行、`<tool_code>` 伪 XML 包裹）→ 全响应严格判形命中走既有纠正重提（"Re-emit a valid ```json block"），散文/多键/非对象 args 不误伤；executor 指令钉死唯一围栏形状；钉 4。
+  - **web.search 提示勘误**：`BRAVE_API_KEY`→`BRAVE_SEARCH_API_KEY`（原提示教人设错名）+ 注明 daemon 不可见 shell .env；钉 lockstep。
+  - 活体验证（部署后真轮）：l0_fast_path 0ms 路由 ✓ knowledge_pre_supplied ✓ tier3 142ms 执行 ✓ web.search 代理直通 ✓ 最终答案实引信件内容并主动提出 MEMORY.md 缺口填充方案；遗留留档：zen completion 路径从未向 provider 原生传 `tools`（全靠文本方言合规——原生接线为后续 provider 层工程）、deepseek 云轮延迟主导 wall（4:14 中 LLM 占绝对多数）、belief/self/goal DB 层仍 0 写者（I12 既有留档）。
+
 - **007 个人代理主动准入派发（super-agent 接入层）落地（2026-11-21，/sdd 全流程 specify→plan→tasks→实施；owner Q1=A 外部入口收敛 + Q2=A observe 默认档）** — 20 任务/8 相：
   - **Wave A 基础**：zen-core 纯准入门（强度二元 explicit/inferred、off→observe→auto 梯、提示文本结构性无权威参数面 + 门钉）+ accept_mode 配置面（E11 回落 observe、策略版本 sha256 记入每决策）；zen-repo migration 016 三表（decisions 去重唯一索引 + 内容哈希 partial 回退、mandates 不可变只可撤、tickets 独立生命周期）+ AdmissionRepo + 8 迁移钉。
   - **Wave B 接线**：qqbot 接入缝——外来消息先过门再派发（内置命令绕过、命令级 seen 去重保留、observe 零副作用、auto=既有 hosted-turn 管线零新执行器、FR-014 活票据续乘免再准、fail-closed unresolved+brief 呈报）；CLI `zen admission`（list/show/mode——mode 翻转 v1 为配置引导式：校验+打印 config.toml 编辑，运行时态面留待后续迁移）；`admission.list` 只读代理工具（与 CLI 同库，无写工具——信任态 CLI-only）+ brief 信任节；retention：decisions 90d SQL 行龄删（mandate 引用行保留）、mandates/tickets 永久保留行 + 钉。
