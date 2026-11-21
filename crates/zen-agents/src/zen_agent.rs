@@ -2185,6 +2185,101 @@ mod chain_tests {
     }
 
     #[test]
+    fn characterization_path_a_omits_agent_definition_sections() {
+        use crate::wiring::ZenWiring;
+
+        let wiring = ZenWiring::new();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let agent = ZenAgent::builder("Sisyphus")
+            .build(&wiring, &router)
+            .expect("agent build");
+
+        let session = SessionContext::new("s1".into(), "ignored".into());
+        let prompt = agent.build_system_prompt_with_assembly(&session, None);
+
+        // Characterization lock (spec.md C9 / F13, 2026-11-21): Path A —
+        // the streaming assembly, which the orchestrator itself drives —
+        // never receives the agent definition (no `.agent_definition` call;
+        // grep-verified zero references in this file), so the
+        // agent-definition sections cannot render here while the executor
+        // path (mirror pin in executor.rs) renders them. Two prompt
+        // contracts for one turn type, locked: a convergence wave that
+        // unifies the paths must flip this assertion together with its
+        // executor twin — never silently.
+        assert!(
+            !prompt.contains("## Behavior Constraints"),
+            "Path A characteristically omits agent behavior constraints"
+        );
+        assert!(
+            !prompt.contains("## Output Format"),
+            "Path A characteristically omits the agent output format"
+        );
+    }
+
+    #[test]
+    fn characterization_path_a_manifest_lands_after_dynamic_boundary() {
+        use crate::wiring::ZenWiring;
+
+        let wiring = ZenWiring::new();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let agent = ZenAgent::builder("Sisyphus")
+            .with_tool("fs.read")
+            .build(&wiring, &router)
+            .expect("agent build");
+
+        let session = SessionContext::new("s1".into(), "ignored".into());
+        let prompt = agent.build_system_prompt_with_assembly(&session, None);
+        let boundary = prompt
+            .find("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__")
+            .expect("boundary present (env_info always renders a dynamic zone)");
+        let manifest = prompt
+            .find("## Available tools")
+            .expect("manifest appended inside the assembly fn");
+
+        // KV-cache characterization (spec.md C9 / F13): the tool manifest
+        // lands AFTER the dynamic zone, so per-turn variable content
+        // (env/memory/signals) precedes it and a byte-stable prefix is
+        // impossible (DeepSeek prices the prefix cache ~50x cheaper). A
+        // wave that hoists the manifest above the boundary must flip this
+        // pin and re-measure cache hit rate.
+        assert!(
+            manifest > boundary,
+            "Path A manifest lands after the dynamic boundary (cache-prefix break, locked)"
+        );
+    }
+
+    #[test]
+    fn characterization_path_a_system_prompt_carries_full_unwindowed_history() {
+        use crate::wiring::ZenWiring;
+        use zen_core::types::MessageRole;
+
+        let wiring = ZenWiring::new();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let agent = ZenAgent::builder("Sisyphus")
+            .build(&wiring, &router)
+            .expect("agent build");
+
+        let mut session = SessionContext::new("s1".into(), "ignored".into());
+        for i in 0..25 {
+            session.add_turn(MessageRole::User, &format!("TURNMARK_{i:02}"));
+        }
+        let prompt = agent.build_system_prompt_with_assembly(&session, None);
+
+        // Duplication half of record (spec.md C9 / F12): §17 renders the
+        // FULL conversation — unwindowed, including turns older than the
+        // 20-turn window the provider Message list uses (zen_agent.rs
+        // `window_size = 20` sites) — so the same old history reaches the
+        // provider twice on the streaming path (system prompt §17 AND the
+        // message list). This pin locks the unwindowed prompt half; a
+        // dedup wave must touch BOTH sites and flip this pin.
+        assert!(
+            prompt.contains("TURNMARK_00"),
+            "§17 must render the full unwindowed history (locked shape)"
+        );
+        assert!(prompt.contains("TURNMARK_24"));
+    }
+
+    #[test]
     fn build_system_prompt_omits_manifest_when_agent_has_no_tools() {
         use crate::wiring::ZenWiring;
 

@@ -803,6 +803,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn characterization_path_b_renders_agent_definition_sections() {
+        use crate::context::AgentContext;
+        use crate::registry::{AgentRegistry, DefaultAgentRegistry};
+        use crate::wiring::ZenWiring;
+        use crate::zen_agent::ZenAgent;
+        use zen_core::definition::AgentSpec;
+        use zen_core::types::SessionContext;
+
+        let router = DefaultRouter::new(LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let wiring = ZenWiring::new();
+        let agent = ZenAgent::builder("Sisyphus")
+            .build(&wiring, &router)
+            .expect("agent builds");
+
+        // Mirror of the zen_agent.rs Path A pin: Path B renders the agent
+        // definition sections (prompt template / behavior constraints /
+        // output format) that Path A structurally cannot. Locked pair —
+        // spec.md C9 / F13; a convergence wave flips BOTH pins or neither.
+        let mut spec = AgentSpec::default_agent();
+        spec.prompt_template = "PATHB_TEMPLATE_MARKER_9f2".to_string();
+        spec.behavior_constraints = vec!["PATHB_CONSTRAINT_MARKER_7c1".to_string()];
+        spec.output_format = Some("PATHB_FORMAT_MARKER_3ee".to_string());
+        let mut profile = DefaultAgentRegistry::new()
+            .find_by_name("Sisyphus")
+            .expect("profile")
+            .clone();
+        profile.definition = Some(spec);
+
+        let context = AgentContext::new(
+            profile,
+            "hello".to_string(),
+            SessionContext::new("Sisyphus".to_string(), String::new()),
+        );
+        let executor = AgentExecutor::new(router);
+        let prompt = executor.build_prompt_with_identity(&context, &agent, "", "");
+
+        assert!(
+            prompt.contains("PATHB_TEMPLATE_MARKER_9f2"),
+            "Path B renders the agent prompt template"
+        );
+        assert!(
+            prompt.contains("## Behavior Constraints")
+                && prompt.contains("PATHB_CONSTRAINT_MARKER_7c1"),
+            "Path B renders behavior constraints + the blast-radius block"
+        );
+        assert!(
+            prompt.contains("## Output Format") && prompt.contains("PATHB_FORMAT_MARKER_3ee"),
+            "Path B renders the agent output format"
+        );
+    }
+
+    #[test]
+    fn characterization_path_b_manifest_lands_after_dynamic_boundary() {
+        use crate::context::AgentContext;
+        use crate::registry::{AgentRegistry, DefaultAgentRegistry};
+        use crate::wiring::ZenWiring;
+        use crate::zen_agent::ZenAgent;
+        use zen_core::types::SessionContext;
+
+        let router = DefaultRouter::new(LlmConfig {
+            default_provider: Some("mock".to_string()),
+            ..Default::default()
+        });
+        let wiring = ZenWiring::new();
+        let agent = ZenAgent::builder("Sisyphus")
+            .build(&wiring, &router)
+            .expect("agent builds");
+        let profile = DefaultAgentRegistry::new()
+            .find_by_name("Sisyphus")
+            .expect("profile")
+            .clone();
+        let context = AgentContext::new(
+            profile,
+            "hello".to_string(),
+            SessionContext::new("Sisyphus".to_string(), String::new()),
+        );
+        let executor = AgentExecutor::new(router);
+        let prompt =
+            executor.build_prompt_with_identity(&context, &agent, "fs.read: read files", "");
+
+        let boundary = prompt
+            .find("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__")
+            .expect("boundary present (env_info always renders a dynamic zone)");
+        let manifest = prompt
+            .find("## Available tools")
+            .expect("executor manifest appended after the system prompt");
+
+        // Twin of the zen_agent.rs Path A pin (spec.md C9 / F13): the
+        // manifest lands after the dynamic zone on BOTH paths — a
+        // convergence wave hoisting it above the boundary flips both.
+        assert!(
+            manifest > boundary,
+            "Path B manifest lands after the dynamic boundary (cache-prefix break, locked)"
+        );
+    }
+
     /// W12.12 test harness: a one-shot OpenAI-compatible
     /// `/chat/completions` responder on a loopback port whose reply
     /// carries a real usage echo (prompt_tokens=111 / completion_tokens=22).

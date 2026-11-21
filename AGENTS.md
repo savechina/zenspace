@@ -854,6 +854,17 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **006 spec-remediation 波（2026-11-21，/speckit.analyze 14 findings → owner "continue fix it and implemented"；docs-only 零代码变更；lint 0，全测不受影响=4005/0/28）** — 三工件修复全落地：
+  - **plan.md 复原（F1）**：retroactive 索引（波次→设计记录映射 + 技术约束 8 条 + 数据模型指针），解除 check-prerequisites 三工件阻塞——/sdd 波次时代从未生成过常规 plan.md，这是工作流债不是设计缺失。
+  - **staleness 勘误（F2）**：spec 四处 2×/1800s → 4×/3600s——W12.2（11-18）已把代码改 4× 且 AGENTS.md 记录在案，spec 文本滞后；normative 两处就地修正、历史记录两处加日期前向注（历史不重写）。
+  - **watchdog 表勘误（F3）**：local 默认 960s → 2700s（`config.rs:1897`；10-31 慢本地模型修复加宽后 Config Surface 表未更新）。
+  - **deferred 三行翻转（F4）**：W2.3/A-01/A-02 标记 DELIVERED（11-19/20 交付）+ SC-022 增补 A-02 收口修正案（hint 在敏感度路由 provider 内真切换 runtime 模型名——"until it lands" 子句 superseded）。
+  - **FR-069..074 落地（F5/F6）**：多语言 L0 双语行 + L2 ANY-language 分类钉 / 两条前言语语言匹配句 / env_info Path B 渲染 / 检索动词入 L0（`a55c2f4`+`5aea09c` 已部署已活体验证行为的 FR 锚回填——占位表预留槽恰好用满）+ `MAX_DELEGATE_ROUNDS=4` 与 token pool `100_000` 两个 code-constant 文档行（D22 合规仍可文档化）；标识表升 ..FR-074。
+  - **常量名对齐（F7）**+ **FR-031 双键修正（F8）** + **FR-044 派生论证（F10：waves ≤ MAX_PLAN_LAYERS=3 ⇒ ≤3 行 by-construction，无幽灵常量）** + **C1 20s 注（F14）**。
+  - **C9 收敛记录（F11）**：同日 fs-search / graph-revival 两波记录为跨特性（归属 003/005，trigger-gated 回填）；F12/F13（Path A 历史双份 / A-B 合同分歧 / manifest 在可变内容后——KV 前缀断裂）钉为 characterization-tests-first 下一波候选。
+  - tasks.md W16 波次行 + 全套 spec 勘误落地（spec 工件按属主 2026-11-21 指令**仅存盘、不入 git**——`.gitignore` `docs/specs` 设计意图维持；git 载体仅 AGENTS.md 台账）。
+  - **续波（同日 owner "continue fix it"）**：F12/F13 特征化钉 ×5 全绿（Path A 漏渲染 agent 定义段 / Path B 渲染——A/B 分歧锁成对钉、双路径 manifest 在动态区后——KV 前缀断裂锁、§17 全量未窗口历史锁+消息半侧 file:line 留档）——收敛波今後必须显式翻钉；005 tasks.md 增 Phase 43（搜索链七修/fs vault 优先/实体图复活/多语言四波台账行）+ 003 tasks.md 增 Addendum（fs 工具波）——003/005/006 spec 目录整树从未入 git（gitignore）；曾 force-add 随库，**同日属主指令撤回：`docs/specs` 全树维持仅存盘，git store 不留 spec 工件（两提交本地未推、历史重写清零，磁盘文件原样）**。
+
 - **多语言意图识别 + 提示词语言规则（2026-11-21 续，research 先行：deepseek 官方文档 + codex-rs 提示词考古 + zen 提示词装配全量盘点；lint 0 / test 4005/0/28 = +6 钉）** —
   - **L0 关键词多语言**：INTENT_SIGNALS 12 行全表补中文动词（Explore 得 搜索/查找/查询/检索/查一下/找一下/找出/搜一下/看看/调查/探索；coder 得 实现/编写/重构/调试/修复……）；匹配面为 case-fold+substring（CJK 恒等、无词界），纯表行追加零代码改动；三类表不变量钉（信号↔代理单射/13 可达/L1 seed 覆盖）约束只加行不加信号；刻意排除的裸名词（"代码"会劫持"搜索代码"、"查"会误吞检查/调查、"应该"太常见）以行内注释钉死选择依据；英文行为钉 `english_search_codebase_precedence_quirk_stays`（row-1 "code" 先于 row-2 "search" 的既有怪癖不得扰动）。
   - **L2 分类提示词**：加 "The request may be written in ANY language — classify by intent, not by language, and answer with the exact English category and signal names above."（回复解析是英文 token 表，中文类目名会 parse 失败降级）。
