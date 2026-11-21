@@ -31,6 +31,9 @@ const MIB: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HomeReport {
     pub removed_files: u64,
+    /// SQLite rows removed by a database-backed policy (admission ledger);
+    /// zero for every filesystem home.
+    pub removed_rows: u64,
     pub rotated: u64,
     pub bytes_freed: u64,
     /// Report-only observation (quarantine): files counted, never deleted.
@@ -47,7 +50,10 @@ pub struct RetentionReport {
 
 impl RetentionReport {
     pub fn removed(&self) -> u64 {
-        self.homes.values().map(|h| h.removed_files).sum()
+        self.homes
+            .values()
+            .map(|h| h.removed_files + h.removed_rows)
+            .sum()
     }
 
     pub fn rotated(&self) -> u64 {
@@ -74,6 +80,15 @@ enum Action {
         pattern: &'static str,
         keep: usize,
     },
+    /// SQLite rows older than `days` in the admission decision ledger.
+    /// Decisions referenced by a mandate are retained with their authority
+    /// record, so the age bound applies to the un-mandated ledger.
+    AdmissionDecisions {
+        days: i64,
+    },
+    /// Records of authority (mandates/tickets): deliberately unbounded —
+    /// never age-deleted, never silently deleted (FR-016).
+    Keep,
     ReportOnly,
 }
 
@@ -386,6 +401,29 @@ fn policies(paths: &ZenPaths) -> Vec<Policy> {
                 recursive: true,
             },
         },
+        // 007 T018 (FR-016, research D10): admission trust ledger. Decisions
+        // are the high-volume rehearsal/rejection stream — 90d mirrors the
+        // journal window. A decision that granted a mandate is retained with
+        // it (authority records are unbounded), so the age bound applies to
+        // the un-mandated ledger (would_accept/rejected/unresolved/duplicate).
+        Policy {
+            home: "state.db/admission_decisions",
+            root: paths.data().join("state.db"),
+            action: Action::AdmissionDecisions { days: 90 },
+        },
+        // Mandates are records of authority: KEPT with their tickets (never
+        // age-deleted, never silently deleted — FR-016). These rows exist so
+        // the policy table states the decision explicitly.
+        Policy {
+            home: "state.db/admission_mandates",
+            root: paths.data().join("state.db"),
+            action: Action::Keep,
+        },
+        Policy {
+            home: "state.db/admission_tickets",
+            root: paths.data().join("state.db"),
+            action: Action::Keep,
+        },
         Policy {
             home: "vault/archive/quarantine",
             root: paths.archive().join("quarantine"),
@@ -426,6 +464,10 @@ fn run_policy(policy: &Policy, now: DateTime<Utc>, dry_run: bool) -> HomeReport 
             recursive,
         } => delete_older(&policy.root, *pattern, *days, *recursive, now, dry_run),
         Action::KeepNewest { pattern, keep } => keep_newest(&policy.root, pattern, *keep, dry_run),
+        Action::AdmissionDecisions { days } => {
+            admission_decisions(&policy.root, *days, now, dry_run)
+        }
+        Action::Keep => HomeReport::default(),
         Action::ReportOnly => report_only(&policy.root),
     }
 }
@@ -545,6 +587,59 @@ fn delete_older(
             ),
         }
     });
+    home
+}
+
+/// 007 T018 (FR-016): age-delete un-mandated admission decisions from the
+/// daemon's `state.db`. Fail-open: a missing DB (never created as a side
+/// effect), a missing table, or a busy/locked database warns and leaves the
+/// ledger untouched. Decisions referenced by an `admission_mandates` row are
+/// retained with their authority record (mandates/tickets are unbounded).
+fn admission_decisions(db_path: &Path, days: i64, now: DateTime<Utc>, dry_run: bool) -> HomeReport {
+    let mut home = HomeReport::default();
+    if !db_path.exists() {
+        return home;
+    }
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            warn!(
+                path = %db_path.display(), error = %e,
+                "retention: admission ledger open failed (fail-open)"
+            );
+            return home;
+        }
+    };
+    // The daemon owns the writer connection; WAL lets this short writer wait
+    // out a concurrent checkpoint instead of dropping the sweep.
+    if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+        warn!(
+            path = %db_path.display(), error = %e,
+            "retention: admission busy_timeout unavailable (continuing)"
+        );
+    }
+    let cutoff = now.timestamp() - days * 86_400;
+    let where_clause = "created_at < ?1 AND NOT EXISTS \
+         (SELECT 1 FROM admission_mandates m WHERE m.decision_id = admission_decisions.id)";
+    if dry_run {
+        let sql = format!("SELECT COUNT(*) FROM admission_decisions WHERE {where_clause}");
+        match conn.query_row(&sql, [cutoff], |row| row.get::<_, u64>(0)) {
+            Ok(rows) => home.removed_rows = rows,
+            Err(e) => warn!(
+                path = %db_path.display(), error = %e,
+                "retention: admission count failed (ledger kept, fail-open)"
+            ),
+        }
+        return home;
+    }
+    let sql = format!("DELETE FROM admission_decisions WHERE {where_clause}");
+    match conn.execute(&sql, [cutoff]) {
+        Ok(rows) => home.removed_rows = rows as u64,
+        Err(e) => warn!(
+            path = %db_path.display(), error = %e,
+            "retention: admission delete failed (ledger kept, fail-open)"
+        ),
+    }
     home
 }
 
@@ -695,20 +790,28 @@ mod tests {
 
     /// T249b: tracing-appender owns the `zen.log` lifecycle, so no retention
     /// policy may target the bare path (a Rotate row there never fires).
+    /// T018 (FR-016): the admission ledger's retention posture is explicit —
+    /// decisions age out at 90d, mandates/tickets are records of authority
+    /// and stay unbounded (no delete action).
     #[test]
-    fn policy_table_has_no_zen_log_row() {
+    fn admission_policy_rows_age_decisions_and_keep_authority_records() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = ZenPaths::for_testing(tmp.path().to_path_buf());
         let table = policies(&paths);
-        assert!(
-            table.iter().all(|p| p.home != "logs/zen.log"),
-            "no retention home may claim logs/zen.log"
-        );
-        assert!(
-            table
-                .iter()
-                .all(|p| p.root.file_name() != Some(std::ffi::OsStr::new("zen.log"))),
-            "no policy may point its root at the bare zen.log path"
-        );
+        let decisions = table
+            .iter()
+            .find(|p| p.home == "state.db/admission_decisions")
+            .expect("decisions row");
+        assert!(matches!(
+            decisions.action,
+            Action::AdmissionDecisions { days: 90 }
+        ));
+        for home in ["state.db/admission_mandates", "state.db/admission_tickets"] {
+            let policy = table.iter().find(|p| p.home == home).expect(home);
+            assert!(
+                matches!(policy.action, Action::Keep),
+                "{home} must never be age-deleted"
+            );
+        }
     }
 }

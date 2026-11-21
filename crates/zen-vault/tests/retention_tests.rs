@@ -580,3 +580,139 @@ fn background_task_dirs_age_out_at_seven_days() {
     assert!(!tasks.join("task-old/meta.json").exists());
     assert!(tasks.join("task-fresh/stdout").exists());
 }
+
+// T018 (007 US5/FR-016): the admission ledger joins the retention sweep —
+// decisions age out at 90d, while mandates/tickets (records of authority)
+// are never silently deleted. A decision that granted a mandate stays with it.
+async fn insert_decision(
+    repo: &zen_repo::AdmissionRepo<'_>,
+    id: &str,
+    disposition: &str,
+    thread_key: &str,
+    created_at: i64,
+) {
+    repo.record_decision(zen_repo::DecisionRecord {
+        id,
+        source: "qqbot",
+        event_id: Some(id),
+        content_hash: id,
+        sender: "ada",
+        thread_key,
+        content: "deploy the staging build",
+        disposition,
+        matched_rule: Some("allowlist"),
+        scope: Some("chat"),
+        accept_mode: "auto",
+        strength: Some("explicit"),
+        policy_version: "v1",
+        reason: None,
+        created_at,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn admission_decisions_age_out_but_authority_records_are_kept() {
+    let (_dir, paths) = setup();
+    fs::create_dir_all(paths.data()).unwrap();
+    let db = paths.data().join("state.db");
+    let client = zen_repo::SqliteClient::open(&db).await.unwrap();
+    let repo = zen_repo::AdmissionRepo::new(&client);
+    let old = now().timestamp() - 91 * 86_400;
+    let fresh = now().timestamp() - 86_400;
+
+    insert_decision(&repo, "d-old", "rejected", "t-old", old).await;
+    insert_decision(&repo, "d-fresh", "would_accept", "t-fresh", fresh).await;
+    insert_decision(&repo, "d-mandated", "admitted", "t-mandated", old).await;
+    let mandate = repo
+        .grant_mandate(zen_repo::MandateGrant {
+            decision_id: "d-mandated",
+            matched_rule: Some("allowlist"),
+            scope: "chat",
+            strength: "explicit",
+            accept_mode: "auto",
+            policy_version: "v1",
+            granted_at: old,
+        })
+        .await
+        .unwrap();
+    repo.open_ticket(zen_repo::TicketOpen {
+        mandate_id: &mandate,
+        reply_address: "qq:c2c:ada",
+        turn_ref: None,
+        created_at: old,
+    })
+    .await
+    .unwrap();
+    drop(client);
+
+    let report = apply_policies(&paths, &cfg(), now());
+    assert_eq!(
+        report.homes["state.db/admission_decisions"].removed_rows, 1,
+        "only the un-mandated 91-day-old decision is deleted"
+    );
+    assert_eq!(
+        report.homes["state.db/admission_mandates"].removed_rows, 0,
+        "mandates are never age-deleted"
+    );
+    assert_eq!(
+        report.homes["state.db/admission_tickets"].removed_rows, 0,
+        "tickets are never age-deleted"
+    );
+    assert_eq!(report.removed(), 1, "top-line removed count includes rows");
+
+    let client = zen_repo::SqliteClient::open(&db).await.unwrap();
+    let repo = zen_repo::AdmissionRepo::new(&client);
+    assert!(
+        repo.get_decision("d-old").await.unwrap().is_none(),
+        "un-mandated stale decision removed"
+    );
+    assert!(
+        repo.get_decision("d-fresh").await.unwrap().is_some(),
+        "fresh decision survives"
+    );
+    assert!(
+        repo.get_decision("d-mandated").await.unwrap().is_some(),
+        "a mandated decision is retained with its authority record"
+    );
+    assert!(repo.get_mandate(&mandate).await.unwrap().is_some());
+    assert!(
+        repo.open_ticket_for_thread("t-mandated")
+            .await
+            .unwrap()
+            .is_some(),
+        "the ticket survives with its mandate and decision"
+    );
+}
+
+#[tokio::test]
+async fn admission_retention_dry_run_counts_without_deleting() {
+    let (_dir, paths) = setup();
+    fs::create_dir_all(paths.data()).unwrap();
+    let db = paths.data().join("state.db");
+    let client = zen_repo::SqliteClient::open(&db).await.unwrap();
+    let repo = zen_repo::AdmissionRepo::new(&client);
+    insert_decision(
+        &repo,
+        "d-stale",
+        "would_accept",
+        "t-stale",
+        now().timestamp() - 91 * 86_400,
+    )
+    .await;
+    drop(client);
+
+    let report = apply_policies(&paths, &dry_cfg(), now());
+    assert_eq!(
+        report.homes["state.db/admission_decisions"].removed_rows, 1,
+        "dry-run computes the same row count"
+    );
+
+    let client = zen_repo::SqliteClient::open(&db).await.unwrap();
+    let repo = zen_repo::AdmissionRepo::new(&client);
+    assert!(
+        repo.get_decision("d-stale").await.unwrap().is_some(),
+        "dry-run mutates nothing"
+    );
+}

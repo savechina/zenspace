@@ -807,6 +807,7 @@ mod tests {
             client_secret: "secret".into(),
             allowed_users: Vec::new(),
             home_channel: None,
+            accept_mode: None,
             outbox_drain_interval_secs: None,
         });
         assert!(

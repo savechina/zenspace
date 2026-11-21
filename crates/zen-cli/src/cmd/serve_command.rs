@@ -1041,6 +1041,9 @@ fn resolve_qqbot_channel(
         api_base: zen_gateway::channel::qqbot::DEFAULT_API_BASE.to_string(),
         token_url: zen_gateway::channel::qqbot::DEFAULT_TOKEN_URL.to_string(),
         allowed_users: q.allowed_users.clone(),
+        // 007 T006: admission accept mode rides the channel config (absent ⇒
+        // observe, owner Q2=A; D22 — no env/CLI override).
+        accept_mode: q.accept_mode.clone(),
         bindings_db,
         // T101: drain tick from config, clamped 60..=3600 (default 300s).
         outbox_drain_interval: std::time::Duration::from_secs(

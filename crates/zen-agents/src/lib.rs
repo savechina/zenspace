@@ -1,3 +1,4 @@
+pub mod admission_list;
 pub mod agent_profile;
 pub mod aggregate_weights;
 pub mod budget;

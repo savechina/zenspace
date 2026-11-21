@@ -22,6 +22,8 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 007 T006: trigger content-hash dedup fallback (already a workspace dep).
+sha2 = { workspace = true }
 # FR-009 DST: feature OFF = shuttle-tokio re-exports real tokio
 # byte-identically; feature ON swaps in shuttle primitives for the dst_
 # schedule sweeps (bbtree Guard-3).

@@ -974,6 +974,9 @@ pub(crate) fn is_mutating_tool(name: &str) -> bool {
             | "system.health"
             | "shell.collect"
             | "delegate.collect"
+            // T014 (US4/FR-009): admission.list only reads the trust ledger —
+            // a review query must never fire the quality gate.
+            | "admission.list"
             // G-21 / W6.2: plan.todos mutates only plan rows, not the
             // world — a mutating classification would fire
             // Metis→Momus→Hermes on every checklist tick (the 2026-10-30
@@ -2436,6 +2439,8 @@ impl AgentOrchestrator {
             tools.push(crate::plan_todos::PLAN_TODOS_TOOL_NAME.to_string());
             tools.push(crate::plan_task::PLAN_TOOL_NAME.to_string());
             tools.push(crate::plan_control::PLAN_CONTROL_TOOL_NAME.to_string());
+            // T014 (US4/FR-009): the agent reads its own trust ledger.
+            tools.push(crate::admission_list::ADMISSION_LIST_TOOL_NAME.to_string());
         }
         // T378 `delegation-only`: the 001 A.8 ultra surface — Sisyphus
         // keeps exactly the delegation tools; all direct tools move to

@@ -451,6 +451,12 @@ impl ZenWiring {
         ));
         tools.register(Arc::new(zen_plugin::tools::shell_kill::ShellKillTool::new()));
 
+        // T014 (US4/FR-009): the read-only admission trust ledger, over the
+        // same state.db the `zen admission` CLI reads. No write surface.
+        tools.register(Arc::new(crate::admission_list::AdmissionListTool::new(
+            crate::plan_todos::resolve_state_db(),
+        )));
+
         let memvid_store = Self::try_open_memvid_store();
 
         let mut tool_sensitivity = HashMap::new();
@@ -478,6 +484,7 @@ impl ZenWiring {
         tool_sensitivity.insert("fs.glob".to_string(), Sensitivity::Public);
         tool_sensitivity.insert("web.fetch".to_string(), Sensitivity::Private);
         tool_sensitivity.insert("web.search".to_string(), Sensitivity::Private);
+        tool_sensitivity.insert("admission.list".to_string(), Sensitivity::Public);
 
         let (mut sandbox_hooks, confidentiality_sensitivity) =
             Self::build_sandbox_hooks(mode, &workspace_roots);
@@ -656,6 +663,8 @@ impl ZenWiring {
         // the registry by accident).
         registry.register_tool_args("shell.collect", &[], &[]);
         registry.register_tool_args("shell.kill", &[], &[]);
+        // admission.list carries only status/limit — no path or command args.
+        registry.register_tool_args("admission.list", &[], &[]);
         registry.register_tool_args("plugin.wasm_sandbox", &["wasm_path"], &[]);
 
         // fs.* tools already match the default `path` fallback; register
@@ -944,8 +953,8 @@ mod tests {
         let wiring = ZenWiring::new();
         assert_eq!(
             wiring.tools.len(),
-            24,
-            "24 builtin tools incl. shell.collect/shell.kill"
+            25,
+            "25 builtin tools incl. shell.collect/shell.kill + admission.list"
         );
 
         assert!(wiring.tools.get("tier2_search").is_ok());
@@ -1175,7 +1184,7 @@ mod tests {
             Some(&registry),
         );
         // Failure is isolated: wiring still constructs with all builtin tools.
-        assert_eq!(wiring.tools.len(), 24);
+        assert_eq!(wiring.tools.len(), 25);
     }
 
     fn write_wasm_plugin(dir: &std::path::Path, id: &str) {
@@ -1222,7 +1231,7 @@ mod tests {
         // Exported func registered under {plugin_id}.{func}; _start excluded.
         assert!(wiring.tools.get("demo_plugin.ping").is_ok());
         assert!(wiring.tools.get("demo_plugin._start").is_err());
-        assert_eq!(wiring.tools.len(), 25);
+        assert_eq!(wiring.tools.len(), 26);
 
         // Plugin tools default to Private sensitivity and stay MCP-exposed
         // (non-Confidential) per build_mcp_registry filtering.
@@ -1329,7 +1338,7 @@ mod tests {
 
         // Integrity-failed plugin is isolated: no tools, echo unaffected.
         assert!(wiring.tools.get("bogus.hello").is_err());
-        assert_eq!(wiring.tools.len(), 25, "24 builtin tools + echo.hello");
+        assert_eq!(wiring.tools.len(), 26, "25 builtin tools + echo.hello");
     }
 
     // ── FR-035: arg-registry end-to-end via ZenWiring hook pipeline ─────────
@@ -1738,7 +1747,7 @@ mod tests {
             wiring.tools.get("good.ping").is_ok(),
             "sibling plugin's tools must still register"
         );
-        assert_eq!(wiring.tools.len(), 25, "24 builtin tools + good.ping only");
+        assert_eq!(wiring.tools.len(), 26, "25 builtin tools + good.ping only");
     }
 
     // ── FR-046c(4): grant overlay does not change MCP exposure ───────────

@@ -61,7 +61,19 @@ pub enum PluginKind {
 /// Single source of truth — shared by plugin id/name validation (registry),
 /// the tool-registration collision guard (`PluginApi::register_tool`), and
 /// agent grant matching (the `plugin:*` wildcard excludes reserved namespaces).
-pub const RESERVED_NAMESPACE_PREFIXES: &[&str] = &["fs", "web", "system", "plugin", "shell"];
+/// `plan` + `admission` added 2026-11-21 (007): builtin tools registered
+/// outside the static AGENT_TOOLS map — the plan.* trio (W15's latent
+/// plugin:*-overlay grant hole, exposed by 007's fr046 idle pin) and
+/// admission.list (same class, caught by the pin this time).
+pub const RESERVED_NAMESPACE_PREFIXES: &[&str] = &[
+    "fs",
+    "web",
+    "system",
+    "plugin",
+    "shell",
+    "plan",
+    "admission",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {

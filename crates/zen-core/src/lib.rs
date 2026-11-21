@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod atomic_file;
 pub mod audit;
 pub mod config;

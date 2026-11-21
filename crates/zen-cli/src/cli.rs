@@ -27,6 +27,7 @@ impl From<SandboxModeArg> for SandboxMode {
     }
 }
 
+use crate::cmd::admission_command::{self, AdmissionCommands};
 use crate::cmd::agent_command::{self, AgentCommands};
 use crate::cmd::audit_command::{self, AuditCommands};
 use crate::cmd::auth_command::{self, AuthCommands};
@@ -101,6 +102,11 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         operation: AgentCommands,
+    },
+    /// Inspect the inbound trust ledger and request channel accept-mode changes
+    Admission {
+        #[command(subcommand)]
+        operation: AdmissionCommands,
     },
     Workspace {
         #[command(subcommand)]
@@ -314,6 +320,9 @@ async fn dispatch_command(command: Commands) -> Result<(), ZenError> {
         Commands::Session { ref operation } => session_command::execute_command(operation),
         Commands::Serve { ref operation } => serve_command::execute_command(operation).await,
         Commands::Agent { ref operation } => agent_command::execute_command(operation),
+        Commands::Admission { ref operation } => {
+            admission_command::execute_command(operation).await
+        }
         Commands::Workspace {
             ref operation,
             ref dry_run,

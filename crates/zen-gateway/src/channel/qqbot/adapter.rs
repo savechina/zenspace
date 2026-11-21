@@ -36,14 +36,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
+
+use zen_core::admission::{AdmissionStrength, Disposition, GateInput, evaluate};
+use zen_core::config::AcceptMode;
 
 use super::api::QqBotApi;
 use super::auth::QqBotAuth;
 use super::client::{QqBotClient, QqWsEvent, QqWsEventKind};
 use super::constants::INTENT_GROUP_AND_C2C;
 use crate::channel::Channel;
+
+/// The v1 Source key recorded on every admission decision (007 T006, FR-001).
+const SOURCE: &str = "qqbot";
 
 /// Upper bound of the duplicate-message suppression window.
 const SEEN_CAP: usize = 1024;
@@ -87,9 +94,14 @@ pub struct QqBotAdapterOptions {
     /// QQ token endpoint URL.
     pub token_url: String,
     /// Allowlisted author openids (group member or C2C user); empty
-    /// deny-by-default per contracts/05.
+    /// deny-by-default per contracts/05. Doubles as the admission gate's
+    /// explicit identity list (007 D5 — no second allowlist).
     pub allowed_users: Vec<String>,
-    /// SQLite file for `qq_bindings` persistence.
+    /// Admission accept mode — raw `[channels.qqbot] accept_mode` (007 T006,
+    /// FR-004). Absent ⇒ observe (owner Q2=A). Parsed once at adapter
+    /// construction; there is no env or CLI override key (D22).
+    pub accept_mode: Option<String>,
+    /// SQLite file for `qq_bindings` persistence (also the admission ledger).
     pub bindings_db: std::path::PathBuf,
     /// Morning-brief outbox drain tick (T101). Mapped from
     /// `[channels.qqbot] outbox_drain_interval_secs` (default 300s,
@@ -176,6 +188,55 @@ fn build_turn_id(chat_id: &str, msg_id: &str) -> Option<String> {
     }
     let ns = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"zen-gateway:qqbot");
     Some(uuid::Uuid::new_v5(&ns, format!("{chat_id}:{msg_id}").as_bytes()).to_string())
+}
+
+/// Built-in channel plumbing commands that bypass the admission gate
+/// unchanged (007 T006).
+fn is_builtin_command(text: &str) -> bool {
+    matches!(text, "/new" | "/status")
+}
+
+/// Stable trigger content hash — sha256 of `sender + "\n" + content`
+/// (007 T006, FR-001/D8 dedup fallback).
+fn content_hash(sender: &str, content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(sender.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(content.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn strength_str(strength: AdmissionStrength) -> &'static str {
+    match strength {
+        AdmissionStrength::Explicit => "explicit",
+        AdmissionStrength::Inferred => "inferred",
+    }
+}
+
+/// Policy-version hash over the effective `[channels.qqbot]` admission
+/// section, reusing the zen-core definition so the CLI and the seam can
+/// never disagree (007 D6).
+fn policy_version_for(options: &QqBotAdapterOptions) -> String {
+    let config = zen_core::config::QqBotChannelConfig {
+        app_id: options.app_id.clone(),
+        client_secret: options.client_secret.clone(),
+        allowed_users: options.allowed_users.clone(),
+        home_channel: None,
+        accept_mode: options.accept_mode.clone(),
+        outbox_drain_interval_secs: None,
+    };
+    zen_core::config::admission_policy_version_for(Some(&config))
+}
+
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Char-boundary-safe truncation to `max` chars.
@@ -316,6 +377,11 @@ fn normalize_event(event: QqWsEvent) -> Option<MessageEvent> {
 #[derive(Clone)]
 pub struct QqBotAdapter {
     options: QqBotAdapterOptions,
+    /// Effective accept mode for this channel (007 T006, FR-004).
+    mode: AcceptMode,
+    /// Stable hash of the effective admission policy recorded per decision
+    /// (007 D6).
+    policy_version: String,
     /// Single shared token authority: REST send path and WS identify
     /// flow MUST refresh against one cache or they race double-fetch.
     auth: Arc<QqBotAuth>,
@@ -361,10 +427,14 @@ impl QqBotAdapter {
             options.token_url.clone(),
         ));
         let bridge = GatewayBridge::new(options.chat_base.clone(), None)?;
+        let mode = AcceptMode::parse(options.accept_mode.as_deref());
+        let policy_version = policy_version_for(&options);
         Ok(Self {
             api: Arc::new(QqBotApi::new(Arc::clone(&auth), options.api_base.clone())),
             auth,
             bridge: Arc::new(bridge),
+            mode,
+            policy_version,
             options,
         })
     }
@@ -388,9 +458,13 @@ impl QqBotAdapter {
         Ok(self)
     }
 
-    /// Fast admission gates — allowlist, idempotency-key presence,
-    /// emptiness, and duplicate suppression. Pure in-memory checks so
-    /// the WS dispatch loop NEVER awaits business logic (D1/oracle P3).
+    /// Fast structural gates — idempotency-key presence, emptiness, and the
+    /// adapter-side replay guard for built-in channel commands. Allowlist and
+    /// duplicate decisions belong to the admission gate: non-allowlisted work
+    /// requests are queued so their rejection can be recorded (007 T006,
+    /// FR-005/FR-011), and replayed work events reach the repository's dedup
+    /// index instead of being swallowed here (SC-005). Pure in-memory checks
+    /// so the WS dispatch loop NEVER awaits business logic (D1/oracle P3).
     /// Returns `true` when the event should enter its chat's queue.
     fn admitted(
         &self,
@@ -398,17 +472,6 @@ impl QqBotAdapter {
         seen: &mut HashSet<String>,
         seen_order: &mut VecDeque<String>,
     ) -> bool {
-        if !self.options.allowed_users.contains(&event.author_id) {
-            debug!(chat_id = %event.chat_id, author = %event.author_id, "qqbot non-allowlisted author; ignoring");
-            self.audit(serde_json::json!({
-                "kind": "qqbot.rejected",
-                "reason": "not-allowlisted",
-                "chatId": event.chat_id,
-                "authorId": event.author_id,
-                "msgId": event.msg_id,
-            }));
-            return false;
-        }
         // Events without a platform msg_id have no idempotency key and
         // would collide in the dedup set — drop before tracking (they
         // also cannot be replied to passively).
@@ -419,35 +482,44 @@ impl QqBotAdapter {
         if event.chat_id.is_empty() || event.text.is_empty() {
             return false;
         }
-        if seen.contains(&event.msg_id) {
-            debug!(msg_id = %event.msg_id, "qqbot duplicate event suppressed");
-            return false;
+        // Built-in channel commands are plumbing, not work requests: they
+        // bypass admission unchanged and keep the adapter's replay guard.
+        if is_builtin_command(&event.text) {
+            if seen.contains(&event.msg_id) {
+                debug!(msg_id = %event.msg_id, "qqbot duplicate channel command suppressed");
+                return false;
+            }
+            seen.insert(event.msg_id.clone());
+            seen_order.push_back(event.msg_id.clone());
+            if seen_order.len() > SEEN_CAP
+                && let Some(evicted) = seen_order.pop_front()
+            {
+                seen.remove(&evicted);
+            }
         }
-        seen.insert(event.msg_id.clone());
-        seen_order.push_back(event.msg_id.clone());
-        if seen_order.len() > SEEN_CAP
-            && let Some(evicted) = seen_order.pop_front()
-        {
-            seen.remove(&evicted);
+        if self.options.allowed_users.contains(&event.author_id) {
+            self.audit(serde_json::json!({
+                "kind": "qqbot.accepted",
+                "eventKind": if event.kind == QqWsEventKind::GroupAtMessage { "group" } else { "c2c" },
+                "chatId": event.chat_id,
+                "authorId": event.author_id,
+                "msgId": event.msg_id,
+            }));
         }
-        self.audit(serde_json::json!({
-            "kind": "qqbot.accepted",
-            "eventKind": if event.kind == QqWsEventKind::GroupAtMessage { "group" } else { "c2c" },
-            "chatId": event.chat_id,
-            "authorId": event.author_id,
-            "msgId": event.msg_id,
-        }));
         true
     }
 
-    /// Slow path for one ADMITTED message: binding IO, gateway turn,
-    /// reply sends. Runs on the chat's private worker task.
+    /// Slow path for one queued message: built-in commands keep their
+    /// existing behavior; every work request passes the host-enforced
+    /// admission gate before any session/turn dispatch (007 T006, FR-002).
+    /// Runs on the chat's private worker task.
     async fn process_message(
         &self,
         event: &MessageEvent,
-        repo: &zen_repo::QqBindingRepo<'_>,
+        client: &zen_repo::SqliteClient,
     ) -> Result<()> {
         let is_group = event.kind == QqWsEventKind::GroupAtMessage;
+        let repo = zen_repo::QqBindingRepo::new(client);
         match event.text.as_str() {
             "/new" => {
                 repo.delete(&event.chat_id).await?;
@@ -465,42 +537,299 @@ impl QqBotAdapter {
                 }
             },
             prompt => {
-                let bound_session = repo.get(&event.chat_id).await?.map(|row| row.session_id);
-                let turn_id = build_turn_id(&event.chat_id, &event.msg_id);
-                let deadline = if is_group {
-                    GROUP_DEADLINE
-                } else {
-                    C2C_DEADLINE
-                };
-                match self
-                    .bridge
-                    .chat(prompt, bound_session.as_deref(), turn_id.clone(), deadline)
-                    .await
-                {
-                    Ok(outcome) => {
-                        if let Some(session_id) = outcome.session_id
-                            && bound_session.as_deref() != Some(session_id.as_str())
-                        {
-                            repo.upsert(&event.chat_id, &session_id).await?;
-                        }
-                        self.reply(event, is_group, &outcome.reply).await?;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "qqbot chat call failed");
-                        self.audit(serde_json::json!({
-                            "kind": "qqbot.chat_error",
-                            "chatId": event.chat_id,
-                            "msgId": event.msg_id,
-                            "turnId": turn_id,
-                            "error": e.to_string(),
-                        }));
-                        self.reply(event, is_group, "agent 暂时不可用，请稍后再试")
-                            .await?;
-                    }
-                }
+                self.process_work_request(event, client, &repo, prompt)
+                    .await?;
             }
         }
         Ok(())
+    }
+
+    /// Admission seam (007 T006/T009, FR-002/FR-004/FR-012/FR-014).
+    ///
+    /// Records one decision for every work request, then dispatches only
+    /// `Admitted` verdicts through the EXISTING hosted-turn path. `Observe`
+    /// and `Rejected` write the ledger and return with zero side effects (no
+    /// turn, no reply, no binding write). Any repository failure fails closed:
+    /// an unresolved row when possible, never a dispatch.
+    async fn process_work_request(
+        &self,
+        event: &MessageEvent,
+        client: &zen_repo::SqliteClient,
+        repo: &zen_repo::QqBindingRepo<'_>,
+        prompt: &str,
+    ) -> Result<()> {
+        let admission = zen_repo::AdmissionRepo::new(client);
+        let thread_key = event.chat_id.as_str();
+        let is_thread_continuation = match admission.open_ticket_for_thread(thread_key).await {
+            Ok(ticket) => ticket.is_some(),
+            Err(e) => {
+                warn!(error = %e, thread = %thread_key, "admission continuation lookup failed");
+                self.record_unresolved(event, client, &format!("continuation lookup failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        };
+        let decision = evaluate(&GateInput {
+            mode: self.mode,
+            allowlist: &self.options.allowed_users,
+            sender: &event.author_id,
+            is_thread_continuation,
+            matched_inference_rule: None,
+        });
+
+        let decision_id = uuid::Uuid::now_v7().to_string();
+        let hash = content_hash(&event.author_id, prompt);
+        let event_id = (!event.msg_id.is_empty()).then_some(event.msg_id.as_str());
+        let created_at = epoch_secs();
+        let (disposition, matched_rule, scope, strength, reason) = match &decision.disposition {
+            Disposition::Rejected { reason } => {
+                ("rejected", None, None, None, Some(reason.as_str()))
+            }
+            Disposition::WouldAccept {
+                scope,
+                strength,
+                rule,
+            } => (
+                "would_accept",
+                Some(rule.as_str()),
+                Some(scope.as_str()),
+                Some(strength_str(*strength)),
+                None,
+            ),
+            Disposition::Admitted {
+                scope,
+                strength,
+                rule,
+            } => (
+                "admitted",
+                Some(rule.as_str()),
+                Some(scope.as_str()),
+                Some(strength_str(*strength)),
+                None,
+            ),
+        };
+
+        let outcome = admission
+            .record_decision(zen_repo::DecisionRecord {
+                id: &decision_id,
+                source: SOURCE,
+                event_id,
+                content_hash: &hash,
+                sender: &event.author_id,
+                thread_key,
+                content: prompt,
+                disposition,
+                matched_rule,
+                scope,
+                accept_mode: self.mode.as_str(),
+                strength,
+                policy_version: &self.policy_version,
+                reason,
+                created_at,
+            })
+            .await;
+        match outcome {
+            Ok(zen_repo::DecisionOutcome::New) => {}
+            Ok(zen_repo::DecisionOutcome::Duplicate { id }) => {
+                self.audit_decision(&id, "duplicate", event, None, None, None);
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(error = %e, "admission decision record failed (fail-closed)");
+                self.audit_decision(
+                    &decision_id,
+                    "unresolved",
+                    event,
+                    None,
+                    None,
+                    Some(&e.to_string()),
+                );
+                return Ok(());
+            }
+        }
+        self.audit_decision(
+            &decision_id,
+            disposition,
+            event,
+            matched_rule,
+            scope,
+            reason,
+        );
+        if let Some(reason) = reason
+            && reason == "sender not allowlisted"
+        {
+            self.audit(serde_json::json!({
+                "kind": "qqbot.rejected",
+                "reason": "not-allowlisted",
+                "chatId": event.chat_id,
+                "authorId": event.author_id,
+                "msgId": event.msg_id,
+            }));
+        }
+
+        if !decision.disposition.is_admitted() {
+            return Ok(());
+        }
+
+        let mandate_id = match admission
+            .grant_mandate(zen_repo::MandateGrant {
+                decision_id: &decision_id,
+                matched_rule,
+                scope: scope.unwrap_or("sender"),
+                strength: strength.unwrap_or("explicit"),
+                accept_mode: self.mode.as_str(),
+                policy_version: &self.policy_version,
+                granted_at: created_at,
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = %e, "admission mandate grant failed (fail-closed)");
+                self.record_unresolved(event, client, &format!("mandate grant failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        };
+        let turn_id = build_turn_id(&event.chat_id, &event.msg_id);
+        let ticket_id = match admission
+            .open_ticket(zen_repo::TicketOpen {
+                mandate_id: &mandate_id,
+                reply_address: &event.chat_id,
+                turn_ref: turn_id.as_deref(),
+                created_at,
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = %e, "admission ticket open failed (fail-closed)");
+                self.record_unresolved(event, client, &format!("ticket open failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        };
+
+        let result = self.run_prompt(event, repo, prompt).await;
+        let report_state = if result.is_ok() { "ready" } else { "failed" };
+        if let Err(e) = admission.close_ticket(&ticket_id, report_state).await {
+            warn!(error = %e, ticket = %ticket_id, "admission ticket close failed");
+        }
+        result
+    }
+
+    /// The EXISTING hosted-turn dispatch (chat-binding session → gateway
+    /// `/api/v1/chat` → reply). Factored out unchanged so the admitted path
+    /// reuses it byte-for-byte (007 D4).
+    async fn run_prompt(
+        &self,
+        event: &MessageEvent,
+        repo: &zen_repo::QqBindingRepo<'_>,
+        prompt: &str,
+    ) -> Result<()> {
+        let is_group = event.kind == QqWsEventKind::GroupAtMessage;
+        let bound_session = repo.get(&event.chat_id).await?.map(|row| row.session_id);
+        let turn_id = build_turn_id(&event.chat_id, &event.msg_id);
+        let deadline = if is_group {
+            GROUP_DEADLINE
+        } else {
+            C2C_DEADLINE
+        };
+        match self
+            .bridge
+            .chat(prompt, bound_session.as_deref(), turn_id.clone(), deadline)
+            .await
+        {
+            Ok(outcome) => {
+                if let Some(session_id) = outcome.session_id
+                    && bound_session.as_deref() != Some(session_id.as_str())
+                {
+                    repo.upsert(&event.chat_id, &session_id).await?;
+                }
+                self.reply(event, is_group, &outcome.reply).await?;
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "qqbot chat call failed");
+                self.audit(serde_json::json!({
+                    "kind": "qqbot.chat_error",
+                    "chatId": event.chat_id,
+                    "msgId": event.msg_id,
+                    "turnId": turn_id,
+                    "error": e.to_string(),
+                }));
+                self.reply(event, is_group, "agent 暂时不可用，请稍后再试")
+                    .await?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Fail-closed ledger write (007 FR-012): an unresolved row with the
+    /// precise reason, best-effort (a dead store cannot record its own
+    /// failure). A synthetic non-NULL event id keeps the row outside both
+    /// dedup indexes so a later replay of the same event can still land its
+    /// real decision.
+    async fn record_unresolved(
+        &self,
+        event: &MessageEvent,
+        client: &zen_repo::SqliteClient,
+        detail: &str,
+    ) {
+        let admission = zen_repo::AdmissionRepo::new(client);
+        let id = uuid::Uuid::now_v7().to_string();
+        let synthetic_event_id = format!("unresolved:{id}");
+        let hash = content_hash(&event.author_id, &event.text);
+        let created_at = epoch_secs();
+        if let Err(e) = admission
+            .record_decision(zen_repo::DecisionRecord {
+                id: &id,
+                source: SOURCE,
+                event_id: Some(&synthetic_event_id),
+                content_hash: &hash,
+                sender: &event.author_id,
+                thread_key: &event.chat_id,
+                content: &event.text,
+                disposition: "unresolved",
+                matched_rule: None,
+                scope: None,
+                accept_mode: self.mode.as_str(),
+                strength: None,
+                policy_version: &self.policy_version,
+                reason: Some(detail),
+                created_at,
+            })
+            .await
+        {
+            warn!(error = %e, "unresolved admission record failed (fail-closed)");
+        }
+        self.audit_decision(&id, "unresolved", event, None, None, Some(detail));
+    }
+
+    /// One `admission.decision` audit line per disposition (007 T006,
+    /// FR-006/FR-003 observability).
+    fn audit_decision(
+        &self,
+        decision_id: &str,
+        disposition: &str,
+        event: &MessageEvent,
+        matched_rule: Option<&str>,
+        scope: Option<&str>,
+        reason: Option<&str>,
+    ) {
+        self.audit(serde_json::json!({
+            "kind": "admission.decision",
+            "decisionId": decision_id,
+            "disposition": disposition,
+            "source": SOURCE,
+            "sender": event.author_id,
+            "threadKey": event.chat_id,
+            "matchedRule": matched_rule,
+            "scope": scope,
+            "mode": self.mode.as_str(),
+            "policyVersion": self.policy_version,
+            "reason": reason,
+        }));
     }
 
     /// Audit wrapper around [`Self::try_reply`]: every reply outcome
@@ -712,8 +1041,10 @@ impl Channel for QqBotAdapter {
                             let handle = tokio::spawn(async move {
                                 let mut rx = rx;
                                 while let Some(event) = rx.recv().await {
-                                    let repo = zen_repo::QqBindingRepo::new(worker_bindings.as_ref());
-                                    if let Err(err) = worker.process_message(&event, &repo).await {
+                                    if let Err(err) = worker
+                                        .process_message(&event, worker_bindings.as_ref())
+                                        .await
+                                    {
                                         warn!(error = %err, chat_id = %event.chat_id, msg_id = %event.msg_id, "qqbot message processing failed");
                                     }
                                 }
@@ -820,6 +1151,7 @@ mod tests {
             api_base: "http://127.0.0.1:1".into(),
             token_url: "http://127.0.0.1:1/token".into(),
             allowed_users: vec!["a".into()],
+            accept_mode: None,
             bindings_db: std::env::temp_dir().join("qqbot-adapter-tests.db"),
             outbox_drain_interval: Duration::from_secs(60),
             audit_path: None,
@@ -833,12 +1165,13 @@ mod tests {
             chat_id: "g".into(),
             author_id: "a".into(),
             msg_id: msg_id.into(),
-            text: "t".into(),
+            text: "/status".into(),
         }
     }
 
-    /// T072/D5: the dedup window is bounded — inserting past SEEN_CAP
-    /// evicts the oldest id, which becomes admissible again.
+    /// T072/D5 (scoped by 007 T006 to channel commands — work-request replay
+    /// is the admission repository's concern): the command dedup window is
+    /// bounded — inserting past SEEN_CAP evicts the oldest id.
     #[test]
     fn seen_set_evicts_oldest_beyond_cap() {
         let adapter = test_adapter();

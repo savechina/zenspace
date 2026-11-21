@@ -1,3 +1,4 @@
+pub mod admission_command;
 pub mod agent_command;
 pub mod audit_command;
 pub mod auth_command;

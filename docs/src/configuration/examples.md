@@ -296,6 +296,9 @@ Enable the QQ official-bot channel so allowlisted chats converse with your persi
 
 ```toml
 [channels.qqbot]
+# accept_mode: off | observe (default) | auto — inbound admission posture (007)
+accept_mode = "observe"
+
 app_id = "your-qq-app-id"              # or env ZEN_QQBOT_APP_ID
 client_secret = "your-qq-secret"       # or env ZEN_QQBOT_CLIENT_SECRET
 allowed_users = [                      # deny-by-default; group member openids

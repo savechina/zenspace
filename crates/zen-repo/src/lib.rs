@@ -1,3 +1,4 @@
+pub mod admission_repo;
 pub mod beliefs_repo;
 pub mod client;
 pub mod communities;
@@ -13,6 +14,10 @@ pub mod sessions_repo;
 pub mod traits;
 pub mod types;
 
+pub use admission_repo::{
+    AdmissionRepo, DecisionOutcome, DecisionRecord, DecisionRow, DispositionFilter, MandateGrant,
+    MandateRow, TicketOpen, TicketRow,
+};
 pub use beliefs_repo::BeliefsRepo;
 pub use client::{
     SqliteClient, SqliteError, detect_schema_skew, embedded_migration_max, probe_latest_version,

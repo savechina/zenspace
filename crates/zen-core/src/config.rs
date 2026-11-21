@@ -220,8 +220,59 @@ pub struct ChannelsConfig {
     pub qqbot: Option<QqBotChannelConfig>,
 }
 
+/// Per-channel admission accept mode (007 T001, FR-004).
+///
+/// `Off` records-and-rejects; `Observe` records a would-accept and executes
+/// nothing; `Auto` admits into the standard hosted-turn pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AcceptMode {
+    /// Record and reject every new inbound request.
+    Off,
+    /// Default per owner decision Q2=A (2026-11-21): rehearse, execute nothing.
+    #[default]
+    Observe,
+    /// Execute admitted requests through the existing hosted-turn pipeline.
+    Auto,
+}
+
+impl AcceptMode {
+    /// Stable lowercase wire/ledger spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AcceptMode::Off => "off",
+            AcceptMode::Observe => "observe",
+            AcceptMode::Auto => "auto",
+        }
+    }
+
+    /// Parse the `[channels.qqbot] accept_mode` string.
+    ///
+    /// Absent ⇒ `Observe` (Q2=A default, no warning — absence is the
+    /// documented default). Anything else is parsed case-insensitively; an
+    /// unrecognized value warns and falls back to `Observe` (E11
+    /// warn-not-silent, mirroring `ZEN_SECRETS_GUARD` parsing).
+    pub fn parse(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return AcceptMode::Observe;
+        };
+        match raw.trim().to_lowercase().as_str() {
+            "off" => AcceptMode::Off,
+            "observe" => AcceptMode::Observe,
+            "auto" => AcceptMode::Auto,
+            _ => {
+                tracing::warn!(
+                    value = %raw,
+                    "invalid [channels.qqbot] accept_mode (expected off/observe/auto); falling back to observe"
+                );
+                AcceptMode::Observe
+            }
+        }
+    }
+}
+
 /// QQ Bot channel configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct QqBotChannelConfig {
     pub app_id: String,
     pub client_secret: String,
@@ -229,6 +280,20 @@ pub struct QqBotChannelConfig {
     pub allowed_users: Vec<String>,
     #[serde(default)]
     pub home_channel: Option<String>,
+    /// Admission accept mode — `[channels.qqbot] accept_mode` (007 T001).
+    ///
+    /// Functionality: selects what the intake admission gate does with an
+    /// allowlisted (or rule-matched) inbound work request.
+    /// User impact: `off` rejects, `observe` rehearses with zero execution,
+    /// `auto` executes through the existing work pipeline.
+    /// Default: absent → `observe` (owner decision Q2=A, 2026-11-21 — the
+    /// D22 one-key exception; deliberately NOT default-off).
+    /// Values: `off` | `observe` | `auto`; anything else warns and falls
+    /// back to `observe`.
+    /// Interaction: config-only; there is no env key (D22). `allowed_users`
+    /// is the explicit identity list the gate consumes.
+    #[serde(default)]
+    pub accept_mode: Option<String>,
     /// Morning-brief outbox drain tick, seconds (T101).
     ///
     /// Functionality: cadence at which the qqbot carrier sweeps
@@ -240,6 +305,55 @@ pub struct QqBotChannelConfig {
     /// Interaction: independent of the WS gateway/intent knobs.
     #[serde(default)]
     pub outbox_drain_interval_secs: Option<u64>,
+}
+
+impl QqBotChannelConfig {
+    /// Effective accept mode for this channel — absent ⇒ `Observe` (Q2=A).
+    pub fn accept_mode_or_default(&self) -> AcceptMode {
+        AcceptMode::parse(self.accept_mode.as_deref())
+    }
+}
+
+/// Stable policy-version hash (lowercase sha256 hex) over the EFFECTIVE
+/// admission policy: accept mode + explicit identity set (007 D6).
+///
+/// `allowed_users` is sorted and de-duplicated first, so reordering the
+/// allowlist or repeating an identity never churns the version; changing the
+/// set or the mode always does. Recorded on every admission decision.
+pub fn admission_policy_version_for(qqbot: Option<&QqBotChannelConfig>) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mode = qqbot
+        .map(QqBotChannelConfig::accept_mode_or_default)
+        .unwrap_or_default();
+    let mut identities: Vec<&str> = qqbot
+        .map(|q| q.allowed_users.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    identities.sort_unstable();
+    identities.dedup();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"accept_mode=");
+    hasher.update(mode.as_str().as_bytes());
+    hasher.update(b"\nallowed_users=");
+    for identity in identities {
+        hasher.update(identity.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Policy version of the process-wide effective config (a config-load failure
+/// hashes the defaults — never panics, never gates).
+pub fn admission_policy_version() -> String {
+    match load_config() {
+        Ok(config) => config.admission_policy_version(),
+        Err(_) => admission_policy_version_for(None),
+    }
 }
 
 /// Provider definition — connection settings defined once, referenced by name.
@@ -4004,6 +4118,7 @@ fn apply_channels_env(channels: &mut ChannelsConfig) {
                 client_secret: String::new(),
                 allowed_users: Vec::new(),
                 home_channel: None,
+                accept_mode: None,
                 outbox_drain_interval_secs: None,
             });
         }
@@ -4047,6 +4162,23 @@ impl ZenConfig {
     /// - `false` only when explicitly disabled (config or env kill-switch).
     pub fn secrets_guard_enabled(&self) -> bool {
         self.security.secrets_guard.enabled.unwrap_or(true)
+    }
+
+    /// Effective qqbot admission accept mode (007 T001/FR-004).
+    ///
+    /// An unconfigured channel resolves to `Observe` — the Q2=A default is
+    /// also the safe posture when nothing is configured.
+    pub fn qqbot_accept_mode(&self) -> AcceptMode {
+        self.channels
+            .qqbot
+            .as_ref()
+            .map(QqBotChannelConfig::accept_mode_or_default)
+            .unwrap_or_default()
+    }
+
+    /// Policy version this config would stamp on an admission decision (D6).
+    pub fn admission_policy_version(&self) -> String {
+        admission_policy_version_for(self.channels.qqbot.as_ref())
     }
 }
 

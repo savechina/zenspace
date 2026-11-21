@@ -3,8 +3,10 @@
 //! The brief is 3 wisdom lines (decisions / people+preferences / watch-outs
 //! incl. ignored topics) plus an optional 4th W9.2 plan line
 //! (`plans: N done overnight · M needs your call · K running`, emitted iff
-//! the 24h `workflow_plans` window is non-empty), capped at
-//! [`BRIEF_MAX_CHARS`]. Delivery is an outbox handoff:
+//! the 24h `workflow_plans` window is non-empty) and an optional 5th
+//! admissions trust line (007 T015/US4/FR-010/FR-012 — pending would-accepts,
+//! executed admitted work, rejections, unresolved fail-closed items since the
+//! previous brief), capped at [`BRIEF_MAX_CHARS`]. Delivery is an outbox handoff:
 //! the worker writes `logs/outbox/morning-brief-<date>.json` (recipient-agnostic
 //! `{date, lines, chat_hint, sensitivity}`), which the gateway qqbot carrier
 //! drains with an active send (`msg_id=None`). zen-agents must not depend on
@@ -28,7 +30,7 @@ use tracing::{info, warn};
 
 use zen_core::paths::ZenPaths;
 use zen_core::types::Sensitivity;
-use zen_repo::{WorkflowPlanRow, WorkflowRepo};
+use zen_repo::{AdmissionRepo, DecisionRow, DispositionFilter, WorkflowPlanRow, WorkflowRepo};
 use zen_vault::SharedSqliteClient;
 use zen_vault::distill::reflection::plan_archive_slug;
 
@@ -42,6 +44,16 @@ pub const BRIEF_MAX_CHARS: usize = 300;
 
 /// W9.2 plan-line window: `workflow_plans` rows touched in the last 24h.
 const PLAN_WINDOW_SECS: i64 = 24 * 3600;
+
+/// T015 (FR-010): admission rows recorded since the previous daily brief.
+const ADMISSION_WINDOW_SECS: i64 = 24 * 3600;
+/// Bounded ledger read for the brief line — counts are honest within this
+/// page; a single day of channel traffic never approaches it.
+const ADMISSION_FETCH_LIMIT: i64 = 500;
+/// Latest pending would-accepts shown inline.
+const ADMISSION_SNIPPETS: usize = 2;
+/// Per-snippet character cap (the total body is capped by `BRIEF_MAX_CHARS`).
+const ADMISSION_SNIPPET_CHARS: usize = 24;
 
 /// Outbox file the qqbot carrier drains (push, not CLI pull).
 pub fn outbox_path(paths: &ZenPaths, date: &str) -> std::path::PathBuf {
@@ -163,11 +175,11 @@ pub fn consumer_may_deliver(sensitivity: Sensitivity, consumer_allowlisted: bool
 }
 
 /// Render lines into the capped body (3 wisdom lines + the optional W9.2
-/// plan line).
+/// plan line + the optional T015 admissions line).
 pub fn render_brief(lines: &[BriefLine]) -> String {
     let mut body = lines
         .iter()
-        .take(4)
+        .take(5)
         .map(BriefLine::render)
         .collect::<Vec<_>>()
         .join("\n");
@@ -269,6 +281,102 @@ async fn recent_plan_rows(db_path: &Path, cutoff: i64) -> Option<Vec<WorkflowPla
         Ok(rows) => Some(rows),
         Err(e) => {
             warn!(error = %e, "morning-brief plan stats: query failed; plan line omitted");
+            None
+        }
+    }
+}
+
+/// T015 (FR-010/FR-012) admission tallies since the previous brief.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AdmissionCounts {
+    would_accept: usize,
+    admitted: usize,
+    rejected: usize,
+    unresolved: usize,
+    pending: Vec<String>,
+}
+
+fn admission_snippet(row: &DecisionRow) -> String {
+    let mut text = row.content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > ADMISSION_SNIPPET_CHARS {
+        text = text
+            .chars()
+            .take(ADMISSION_SNIPPET_CHARS)
+            .collect::<String>()
+            + "…";
+    }
+    format!("{}: {}", row.sender, text)
+}
+
+fn count_admissions(rows: &[DecisionRow]) -> AdmissionCounts {
+    let mut counts = AdmissionCounts::default();
+    for row in rows {
+        match row.disposition.as_str() {
+            "would_accept" => {
+                counts.would_accept += 1;
+                if counts.pending.len() < ADMISSION_SNIPPETS {
+                    counts.pending.push(admission_snippet(row));
+                }
+            }
+            "admitted" => counts.admitted += 1,
+            "rejected" => counts.rejected += 1,
+            "unresolved" => counts.unresolved += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+/// The admissions trust line — `Some` iff the window holds at least one
+/// non-duplicate decision row. Replay duplicates are ledger evidence, not
+/// work state, and never produce a line on their own.
+fn admission_line(rows: &[DecisionRow]) -> Option<BriefLine> {
+    if rows.is_empty() {
+        return None;
+    }
+    let counts = count_admissions(rows);
+    if counts.would_accept + counts.admitted + counts.rejected + counts.unresolved == 0 {
+        return None;
+    }
+    let mut body = format!(
+        "{} would-accept pending · {} executed · {} rejected · {} unresolved",
+        counts.would_accept, counts.admitted, counts.rejected, counts.unresolved
+    );
+    if !counts.pending.is_empty() {
+        body.push_str(&format!(" (latest: {})", counts.pending.join(" · ")));
+    }
+    Some(BriefLine {
+        label: "admissions",
+        body,
+    })
+}
+
+/// T015 window fetch: `admission_decisions` rows at/after `cutoff`, newest
+/// first. Fail-open by contract like [`recent_plan_rows`] — a missing
+/// `state.db` is never created as a side effect and contributes no line.
+async fn recent_admission_rows(db_path: &Path, cutoff: i64) -> Option<Vec<DecisionRow>> {
+    if !db_path.exists() {
+        return None;
+    }
+    let shared = SharedSqliteClient::new(db_path.to_path_buf());
+    let client = match shared.get().await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(error = %e, "morning-brief admissions: state.db unavailable; line omitted");
+            return None;
+        }
+    };
+    let filter = DispositionFilter {
+        disposition: None,
+        since: Some(cutoff),
+    };
+    match AdmissionRepo::new(&client)
+        .list_decisions(filter, ADMISSION_FETCH_LIMIT)
+        .await
+    {
+        Ok(rows) => Some(rows),
+        Err(e) => {
+            warn!(error = %e, "morning-brief admissions: query failed; line omitted");
             None
         }
     }
@@ -388,6 +496,18 @@ impl MorningBriefWorker {
         if let Some(rows) =
             recent_plan_rows(&paths.data().join("state.db"), now_ts - PLAN_WINDOW_SECS).await
             && let Some(line) = plan_line(&rows, &paths.wiki().join("wisdom").join("plans"), now_ts)
+        {
+            lines.push(line);
+        }
+        // T015 (FR-010/FR-012): admissions trust line — appended after the
+        // plan line. Fail-open: a missing/unreadable ledger contributes no
+        // line and never fails the worker.
+        if let Some(rows) = recent_admission_rows(
+            &paths.data().join("state.db"),
+            now_ts - ADMISSION_WINDOW_SECS,
+        )
+        .await
+            && let Some(line) = admission_line(&rows)
         {
             lines.push(line);
         }
@@ -775,6 +895,128 @@ mod tests {
         );
         // Real workflow history is personal: the plan line is not a
         // placeholder sentinel, so the brief flips to Private.
+        assert_eq!(payload["sensitivity"], "Private");
+    }
+
+    // T015 (FR-010/FR-012) admissions trust-line pins.
+
+    fn decision_row(
+        disposition: &str,
+        sender: &str,
+        content: &str,
+        created_at: i64,
+    ) -> DecisionRow {
+        DecisionRow {
+            id: format!("d-{sender}-{created_at}"),
+            source: "qqbot".to_string(),
+            event_id: None,
+            content_hash: format!("h-{sender}-{created_at}"),
+            sender: sender.to_string(),
+            thread_key: "thread".to_string(),
+            content: content.to_string(),
+            disposition: disposition.to_string(),
+            matched_rule: Some("allowlist".to_string()),
+            scope: Some("chat".to_string()),
+            accept_mode: "observe".to_string(),
+            strength: Some("explicit".to_string()),
+            policy_version: "v1".to_string(),
+            reason: None,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn admission_line_counts_and_caps_pending_snippets() {
+        let rows = vec![
+            decision_row("would_accept", "Ada", "deploy the staging build", 300),
+            decision_row("would_accept", "Lin", "check the invoices", 200),
+            decision_row("would_accept", "Kim", "summarize the thread", 100),
+            decision_row("admitted", "Ada", "run the report", 90),
+            decision_row("rejected", "Mallory", "drop tables", 80),
+            decision_row("unresolved", "Eve", "assess me", 70),
+            decision_row("duplicate", "Ada", "deploy the staging build", 60),
+        ];
+        let line = admission_line(&rows).expect("non-duplicate rows produce a line");
+        assert_eq!(line.label, "admissions");
+        assert_eq!(
+            line.body,
+            "3 would-accept pending · 1 executed · 1 rejected · 1 unresolved \
+             (latest: Ada: deploy the staging build · Lin: check the invoices)"
+        );
+        assert!(
+            !line.body.contains("Kim"),
+            "at most {ADMISSION_SNIPPETS} pending snippets are rendered"
+        );
+    }
+
+    #[test]
+    fn admission_line_absent_for_empty_or_duplicate_only_windows() {
+        assert_eq!(admission_line(&[]), None);
+        assert_eq!(
+            admission_line(&[decision_row("duplicate", "Ada", "replayed", 1)]),
+            None,
+            "duplicate rows are replay evidence, not work state"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_stages_admission_line_from_state_db() {
+        let (_dir, paths) = setup();
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 9, 4, 9, 0, 0).unwrap();
+        let now_ts = now.timestamp();
+
+        fs::create_dir_all(paths.data()).unwrap();
+        let client = zen_repo::SqliteClient::open(&paths.data().join("state.db"))
+            .await
+            .unwrap();
+        let repo = AdmissionRepo::new(&client);
+        for (id, disposition, sender, content, age) in [
+            ("d1", "would_accept", "Ada", "deploy the staging build", 100),
+            ("d2", "would_accept", "Lin", "check the invoices", 200),
+            ("d3", "admitted", "Ada", "run the report", 90),
+            ("d4", "rejected", "Mallory", "drop tables", 80),
+            ("d5", "unresolved", "Eve", "assess me", 70),
+        ] {
+            repo.record_decision(zen_repo::DecisionRecord {
+                id,
+                source: "qqbot",
+                event_id: Some(id),
+                content_hash: id,
+                sender,
+                thread_key: "thread",
+                content,
+                disposition,
+                matched_rule: Some("allowlist"),
+                scope: Some("chat"),
+                accept_mode: "observe",
+                strength: Some("explicit"),
+                policy_version: "v1",
+                reason: None,
+                created_at: now_ts - age,
+            })
+            .await
+            .unwrap();
+        }
+        drop(client);
+
+        let worker = MorningBriefWorker::new();
+        let report = worker
+            .execute_with_paths(&paths, &WorkerContext::new(now))
+            .await
+            .unwrap();
+        assert!(report.success);
+        assert_eq!(report.fact_count, 4, "wisdom trio + admissions line");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(outbox_path(&paths, "2026-09-04")).unwrap())
+                .unwrap();
+        let lines = payload["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[3].as_str().unwrap(),
+            "admissions: 2 would-accept pending · 1 executed · 1 rejected · 1 unresolved \
+             (latest: Ada: deploy the staging build · Lin: check the invoices)"
+        );
         assert_eq!(payload["sensitivity"], "Private");
     }
 }

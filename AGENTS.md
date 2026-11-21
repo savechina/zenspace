@@ -83,10 +83,10 @@ Zen routes operations through a layered agentic pipeline: notes -- consolidation
 | Crate | Role | Path |
 |-------|------|------|
 | zen | Binary entry (13-line wrapper) | `crates/zen/` |
-| zen-cli | CLI library (23 commands, TUI, dispatch) | `crates/zen-cli/` |
+| zen-cli | CLI library (24 commands, TUI, dispatch) | `crates/zen-cli/` |
 | zen-core | Config layers, error taxonomy, path scoping, constants (23 modules) | `crates/zen-core/` |
 | zen-service | Starter/wps/cleanup business logic | `crates/zen-service/` |
-| zen-repo | Unified data layer: SqliteClient + 11 domain repositories (FTS5, vec0, graph) | `crates/zen-repo/` |
+| zen-repo | Unified data layer: SqliteClient + 12 domain repositories (FTS5, vec0, graph, admission) | `crates/zen-repo/` |
 | zen-vault | 10+ services: note, wiki, search, distill, tindy, notion, ingest, graph_verify, intent | `crates/zen-vault/` |
 | zen-agents | 13 agents, 4-tier registry, QualityPipeline, plan-DAG executor | `crates/zen-agents/` |
 | zen-provider | 13 providers, 3 protocol types, DefaultRouter factory, auth resolution | `crates/zen-provider/` |
@@ -143,7 +143,7 @@ zen serve start  → zen-gateway daemon + ZenScheduler (cron workers: journal, d
 zenspace/
 ├── crates/                     # 12 workspace crates (binary/library split)
 │   ├── zen/                    # Binary entry (13-line wrapper)
-│   ├── zen-cli/                # CLI library: 23 commands, TUI, clap derive
+│   ├── zen-cli/                # CLI library: 24 commands, TUI, clap derive
 │   │   ├── src/
 │   │   │   ├── lib.rs          # pub use cli::shell
 │   │   │   ├── cli.rs          # clap Parser/Subcommand (20 variants), shell() dispatcher
@@ -166,7 +166,7 @@ zenspace/
 │   │       └── turn_context.rs # TurnContext task-local (D30/W11.1): per-turn sensitivity/knowledge/history
 │   ├── zen-service/            # Business logic (starter, wps, cleanup)
 │   ├── zen-repo/               # Unified data layer (SqliteClient + 11 domain repos)
-│   │   ├── migrations/         # sqlx::migrate!() SQL files (001_initial … 015_workflow_status_vocabulary)
+│   │   ├── migrations/         # sqlx::migrate!() SQL files (001_initial … 016_admission)
 │   │   └── src/
 │   │       ├── client.rs       # SqliteClient (tokio_rusqlite writer + sqlx pool), run_migrations()
 │   │       ├── types.rs        # Row types + request structs (IndexNoteRequest, InsertRelationshipRequest, etc.)
@@ -497,7 +497,7 @@ bin/zentest              # Any zen command against ~/.zentest instead of ~/.zen
 bin/release patch        # Bump version, tag, push
 ```
 
-### Agentic Commands (23 commands)
+### Agentic Commands (24 commands)
 
 Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal memory/knowledge pipeline. Nine manual commands (`note`, `search`, `similar`, `notion`/`graph`, `research`, `ingest`, `routine`, `brief`, `dispatch`) were removed from the CLI surface — their capabilities live on internally via ZenScheduler workers and the distill loop; the command files remain on disk uncompiled, restorable when business scenarios require.
 
@@ -512,6 +512,7 @@ Personal-agent scope (2026-08-28, 005-agentic-loop): zen focuses on the personal
 | `zen session` | Session lifecycle | `session_command.rs` |
 | `zen serve` | Gateway daemon: start [--foreground] [--http] / status [--json] / stop / restart / mcp / install / uninstall (macOS launchd LaunchAgent); `status` shows binary vs running-daemon version with a `STALE`/`STALE-unknown` marker (JSON: `versionState`/`stale`/`binaryVersion`/`daemonVersion`); `restart` = `launchctl kickstart -k gui/{uid}/dev.zen.serve` when the LaunchAgent plist exists, else graceful stop (SIGTERM drain ≤10s + audited cancels) + start under StartupLock/readiness — a stopped daemon makes restart a plain start; `--http` (or `ZEN_GATEWAY_HTTP_ENABLED=1`) additionally mounts the loopback HTTP carrier `/health` + `/api/v1/{chat,agents,ws,mcp}` on the same dispatcher; SIGTERM drains in-flight turns ≤10s then cancels with audits (exit 0) | `serve_command.rs` |
 | `zen agent` | Agent registry | `agent_command.rs` |
+| `zen admission` | Inbound trust ledger + accept-mode surface: `list [--mode <m>] [--json]`, `show <id> [--json]`, `mode [<off\|observe\|auto>] [--channel qqbot] [--json]` (mode flip is config-guided: validates + prints the exact `config.toml` edit; config is the 5-layer read-only surface, D22) | `admission_command.rs` |
 | `zen workspace` | `.zen/` structure | `workspace_command.rs` |
 | `zen config` | Config layers | `config_command.rs` |
 | `zen provider` | LLM provider mgmt | `provider_command.rs` |
@@ -557,6 +558,8 @@ All tools registered in `ZenWiring::new()` (`crates/zen-agents/src/wiring.rs`), 
 | `plan.todos` (W6.2/D24, W15-granted) | mirrors session | zen-agents/plan_todos.rs | Durable todo ledger for multi-step work (Sisyphus only; W15: rides the Sisyphus push list — previously registered but never granted, unreachable): `op=set` replaces the draft list before any batch dispatches — items `{id,title,status?}` with status `pending|progressing|completed|failed|skipped`, at most one `progressing`, ≤12 items (LEDGER_MAX_ITEMS), duplicate ids rejected, NO agent field (engine assigns at dispatch); mint-once — while a plan for the session is running `set` is rejected, dispatch via `plan.execute` against the existing plan; `op=get` returns the ledger with per-item outcomes, readable across restarts (rows live in `workflow_tasks`, one plan row per session, D21 §3); parent sensitivity mirrored into the ledger via `plan_todos_sensitivity` (D24 §5); mutating for the quality gate but plan-row-only (excluded from vault-mutating classification, orchestrator.rs:959); item ids map 1:1 to `workflow_tasks.task_id` |
 | `plan.execute` (T375/T376) | Private | zen-agents/plan_task.rs | Sisyphus-only plan-DAG executor: args `{name?, tasks:[{id, agent, prompt, depends_on?, fork_mode?, model?}], resume_plan_id?}` (W11.5/T5: per-task `fork_mode: none|knowledge|history` + catalog-validated `model` hint, ≤5 distinct hints/batch, resolution sensitivity > LlmPreference > hint > default; runtime override still D2b — A-02 closed 2026-11-19: the hint switches the runtime model name within the routed provider; workflow_tasks.model records the REAL model name (executor-reported runtime_model, NULL on unavailability — never a source label, W15) and cost_usd producer is live (usage_to_cost_usd + model_metadata, needs usage echo + local-or-priced, else None — never fabricated)) (checkpoint replay matches task_id AND agent — agent-drift reruns); Kahn layering ≤12 tasks/≤3 layers; per-task hard gates via the SHARED `DelegateTaskTool::validate_task` path (known-agent/tier-matrix/depth-cap/bounded-32k — Sisyphus is rejected as a task agent by the O→O rule); per-layer parallel batches through delegate `run_single` (token budget + wall-clock timeout); `build_sub_agent` strips all `plan.*` tools unconditionally (W15); upstream failure → downstream skipped; merged deliverable through QualityPipeline (Hermes verdict in output + `loop.plan.completed` audit); persists to state.db `workflow_plans`/`workflow_tasks` (migration 006) with per-task idempotent checkpoints; `resume_plan_id` replays completed-checkpoints, re-runs pending; resume is claim-fenced (migration 007 `workflow_plans.owner` + `WorkflowRepo::claim_plan` conditional UPDATE — one live resume per plan, same-owner re-claim ok, stale claims older than the LIVE staleness window stealable (4× resolved `[gateway] turn_watchdog_secs` incl. env, default 3600s — one shared `zen_core::config::resolve_stale_claim_secs` for sweep + fence + morning-brief, W11.3/T3), lost race → `already being resumed`); terminal plans refuse resume; shares the `[agentic.delegate]` kill-switch (plans execute via delegation); result rows carry `status` `completed|failed|skipped` (vocabulary of record — W6.2 rename; audit key stays `tasks_ok`, Z1); **Wave 6 (D21) additions**: all batches run as rounds on the ONE `plan.todos` minted plan row (no per-batch rows); success archive `record_plan_archive` → `vault/wiki/wisdom/plans/<slug>.md` (frontmatter + task table + one-line summaries + verdict + duration, 256KiB char-boundary cap, sanitizer on response text, 90d retention) — mutually exclusive with the failure rewind `wisdom/rewinds/`: any failed ⇒ rewind only, ≥2 tasks + ≥1 completed ⇒ archive, single-task turn ⇒ neither; final answer = bounded synthesis pass (every task outcome in slot order, per-task ≤1200 chars excerpt, total ≤8000, timeout 60s cloud / min(300, first-token) local, token-reserved, sensitivity-routed — unreachable local ⇒ skip `skipped:no_provider`, never cloud; in-loop prose ≥2000 chars ⇒ skip `skipped:sufficient`, F4) whose output replaces the in-loop prose (non-stream; stream emits a labeled `### Synthesis` section after the gate marker), then the deterministic `Plan result` block (`id · agent · status · summary` rows, `verdict:`, optional `archived:`, `synthesis: ok|skipped:<reason>|failed`) — always on, no config key (code-tunable constants per D22); runs after the quality gate, never re-judges; `loop.plan.synthesis {ok, chars_in, chars_out, duration_ms, provider, skipped_reason?}` audit line, zero when no batch ran; **Wave 9 additions**: one advisory forecast line `plan N tasks · ~lo-hi min · ~$lo-$hi (estimate)` fired through PLAN_PROGRESS before the first batch — omitted entirely when no task's (agent, model) pair has recorded duration history (`workflow_tasks.model/duration_ms/cost_usd`, migration 014; cost segment only with cost history; cost/model producers deferred, key degenerates to agent); failure triage — `triage:` section in the Plan result block (after `verdict:`, both surface renderings) with ≤3 deduplicated proposals for RECOGNIZED failure classes only (`TRIAGE_TABLE`: timeout/provider/budget/approval needles, proposals cite `resume_plan_id` checkpoint reuse), unknown class ⇒ zero proposals + raw error stays in the task row, text-only never auto-executes; cancel seam — the walk registers a live-plan guard and races each batch against the `plan.control` cancel watch (`select!` with NO await inside the race: the watch Ref wraps a non-Send guard, finalization awaits strictly after), cancel ⇒ in-flight `failed` + pending `skipped` (W6.2b), row stays terminal-cancelled (no `complete_plan` rewrite), rewind skipped, audit `cancelled: true` |
 | `plan.control` (W9.3) | mirrors session | zen-agents/plan_control.rs | Sisyphous-only cancel/append control for live plans: `{op: cancel\|append, plan_id, tasks?}`; `cancel` flips the row terminal `cancelled` (`WorkflowRepo::cancel_running_plan`) + signals the in-process executor watch + one additive `loop.plan.cancelled` audit line; W12.11: the payload's `cancelled` field mirrors the REAL row flip (`cancelled:row_flipped` vs signal-only; failed-flip honesty pin), handle `signal_cancel` surfaced separately; `append` extends a running plan's ledger BETWEEN batches only (in-batch ⇒ structured refusal — the acceptance pin; registry-miss between invokes falls through to the row-status gate), drafts validated by the SHARED `DelegateTaskTool::validate_task` + unknown-dependency rejection, written pending with the `''` agent sentinel (W6.2: agent at dispatch); W15: appended specs persist into spec_json (items+tasks merge via `attach_batch_spec`'s running-guard) — get/resume/corpus-visible, previously discarded; process-level registry `LIVE_PLANS` with join-semantics guards (`register_live_plan` — last-guard-drop removes; pre-signal joins the same channel so a cancel racing the executor's registration still lands), `set_in_batch` batch gate, `is_live_between_batches`; mutating for the quality gate (W9.5-F1 pin: `plan.todos` stays read-only, `plan.control` not whitelisted); no config keys, no CLI |
+
+| `admission.list` (007 T014) | Public | zen-agents/admission_list.rs | Read-only agent view over the admission trust ledger (`admission_decisions` rows: disposition/sender/snippet/matched_rule/mode/created_at — the SAME store `zen admission list` reads; args `{status?, limit?}` default 20 clamp 1..=100, invalid ⇒ structured error). NO write tool exists — accept-mode flips and mandate withdrawal are CLI-only (host-enforced: agent text can never change trust state). Missing state.db ⇒ honest empty + note, never created. Parity pin: tool output field-matches AdmissionRepo rows (`admission_list_parity.rs`). Morning brief gains an `admissions` line (would-accept pending/executed/rejected/unresolved counts + latest snippets, 24h window, FR-010/FR-012) |
 
 ### Host-OS Safety Hardening (v0.0.6, FR-035..045)
 
@@ -807,7 +810,14 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
     Functionality: enables the QQ official-bot WS gateway client + v2 REST sender
     User impact: allowlisted QQ chats converse with persistent agent sessions; /new resets a chat's session, /status renders gateway health
     Default: absent → channel off; present-but-incomplete credentials → disabled with WARN
-    Values: app_id, client_secret (required); allowed_users (deny-by-default; matches BOTH namespaces — group `author.member_openid` AND C2C `author.id` — so allowlist entries may mix group-member and C2C user openids); home_channel (unused yet); outbox_drain_interval_secs (optional, default 300, clamped 60..=3600 — morning-brief outbox active-send tick; `OutboxDrainer` pushes staged `morning-brief-<date>.json` to live `qq_bindings` chats, group-first/C2C-fallback, Public-only unless allowlisted, never deletes undelivered)
+    Values: app_id, client_secret (required); accept_mode (off|observe|auto; 007 T001 —
+      Functionality: what the host-enforced admission gate does with an allowlisted inbound work request
+      User impact: off records+rejects; observe records a would-accept and executes NOTHING (default — owner
+        decision Q2=A: configured channels rehearse until promoted); auto admits into the standard hosted-turn
+        pipeline (in-flight granted mandates ride regardless of current mode, FR-014)
+      Interaction: no env key (D22 one-key exception, owner-ratified); invalid value warns and falls back to
+        observe (E11); policy version = stable hash over accept_mode+allowed_users recorded on every decision);
+      allowed_users (deny-by-default; matches BOTH namespaces — group `author.member_openid` AND C2C `author.id` — so allowlist entries may mix group-member and C2C user openids); home_channel (unused yet); outbox_drain_interval_secs (optional, default 300, clamped 60..=3600 — morning-brief outbox active-send tick; `OutboxDrainer` pushes staged `morning-brief-<date>.json` to live `qq_bindings` chats, group-first/C2C-fallback, Public-only unless allowlisted, never deletes undelivered)
     Interaction: enabling qqbot implies the loopback HTTP carrier (bind 127.0.0.1:9876 default) since it bridges via POST /api/v1/chat; ZEN_QQBOT_APP_ID/ZEN_QQBOT_CLIENT_SECRET env layer applies per standard 5-layer config
   ```
 - Schema migrations are forward-only additive (Principle XIII); `_sqlx_migrations` tracks applied versions; `sqlx::migrate!()` runs all pending on every `SqliteClient::open()`
@@ -842,6 +852,12 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 - Binary/library split: `zen` binary (13 lines) → `zen-cli` library (exporting `shell()`)
 
 ## Recent Changes
+
+- **007 个人代理主动准入派发（super-agent 接入层）落地（2026-11-21，/sdd 全流程 specify→plan→tasks→实施；owner Q1=A 外部入口收敛 + Q2=A observe 默认档）** — 20 任务/8 相：
+  - **Wave A 基础**：zen-core 纯准入门（强度二元 explicit/inferred、off→observe→auto 梯、提示文本结构性无权威参数面 + 门钉）+ accept_mode 配置面（E11 回落 observe、策略版本 sha256 记入每决策）；zen-repo migration 016 三表（decisions 去重唯一索引 + 内容哈希 partial 回退、mandates 不可变只可撤、tickets 独立生命周期）+ AdmissionRepo + 8 迁移钉。
+  - **Wave B 接线**：qqbot 接入缝——外来消息先过门再派发（内置命令绕过、命令级 seen 去重保留、observe 零副作用、auto=既有 hosted-turn 管线零新执行器、FR-014 活票据续乘免再准、fail-closed unresolved+brief 呈报）；CLI `zen admission`（list/show/mode——mode 翻转 v1 为配置引导式：校验+打印 config.toml 编辑，运行时态面留待后续迁移）；`admission.list` 只读代理工具（与 CLI 同库，无写工具——信任态 CLI-only）+ brief 信任节；retention：decisions 90d SQL 行龄删（mandate 引用行保留）、mandates/tickets 永久保留行 + 钉。
+  - **e2e 钉**：观察零副作用、注入语料零权限变化（SC-006）、重放 10×=1 决策+9 重复、off 档拒绝、auto 执行+回复+失败诚实报、活票据观察档续乘（FR-014）、授权完整性 why-when-what、代理-CLI parity。
+  - **纪律注记**：B-1 lane 越权预写 AGENTS.md 命令行（内容正确，主会话核对后保留并补完同步面）；`zen admission mode <value>` 为对 contracts/cli-admission.md 的记录在案偏差（config 5 层只读面，无运行时覆盖表——需迁移的后续项）。
 
 - **W15 CEO 评审整改波：编排链可达性 + 账本诚实（2026-11-20，/plan-ceo-review HOLD SCOPE「fix all」触发；lint 0 / verify 绿 / test 3903/0/28）** — 16 发现/15 修复（P1×3/P2×6/P3×6）：
   - **P1 可达性**：plan.todos 补上 Sisyphus 授予（此前注册但从未 grant，账本面默认不可达，含授予哨兵钉）；批间守卫重排修「arm 后被 register 替换击穿」（拒绝窗口现覆盖整个 invoke，波窗钉）；plan.control append 规格不再即弃——并入 spec_json（items+tasks，复用 attach_batch_spec 同守卫），get/resume/归纳语料全可见。

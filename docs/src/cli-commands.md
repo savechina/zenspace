@@ -1,6 +1,6 @@
 # CLI Commands Reference
 
-Zen's CLI surface is intentionally small: the TUI plus 23 subcommands. Heavy capabilities (search, research, dispatch, briefs) run autonomously through the background scheduler and distill loop rather than as manual commands — drop notes into `~/.zen/vault/inbox/` and the system works on them.
+Zen's CLI surface is intentionally small: the TUI plus 24 subcommands. Heavy capabilities (search, research, dispatch, briefs) run autonomously through the background scheduler and distill loop rather than as manual commands — drop notes into `~/.zen/vault/inbox/` and the system works on them.
 
 ## General
 
@@ -70,6 +70,9 @@ Zen's CLI surface is intentionally small: the TUI plus 23 subcommands. Heavy cap
 | `zen clean all` / `trash` | Destructive cleanup — asks for confirmation unless `--yes` |
 | `zen logs <service>` | View structured logs |
 | `zen audit` | Audit log operations |
+| `zen admission list` | Trust ledger: would-accepts, rejections, unresolved, admitted, duplicates (`--mode` filter, `--json`) |
+| `zen admission show <id>` | Full why-when-what decision record (sender, rule, scope, mode, policy version, trigger) |
+| `zen admission mode [<off\|observe\|auto>]` | Show effective accept mode + policy hash, or print the exact `config.toml` flip (`--channel`, `--json`) |
 | `zen sandbox test` | Verify sandbox isolation works |
 
 ## Workspace & Configuration

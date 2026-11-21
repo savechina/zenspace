@@ -351,6 +351,10 @@ auto_research = true
 # QQ Bot integration (FR-004) — configured under [channels.qqbot] (app_id,
 # client_secret, allowed_users); env ZEN_QQBOT_APP_ID/ZEN_QQBOT_CLIENT_SECRET.
 # A legacy top-level [qqbot] section is inertly ignored.
+# accept_mode (007): what the admission gate does with an allowlisted inbound work
+# request — off records+rejects | observe records a would-accept, executes NOTHING
+# (default, owner Q2=A) | auto admits into the standard hosted-turn pipeline.
+# accept_mode = "observe"
 # =============================================================================
 
 # =============================================================================
