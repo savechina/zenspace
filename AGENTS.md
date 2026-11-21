@@ -854,6 +854,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **Phase 14 收敛实现波（2026-11-21，/speckit-converge 8 findings → /speckit-implement 全清；lint 0 / test 4016/0/28 = +6 钉）** — 006 tasks.md Phase 14（G-35..G-42）：
+  - **G-40 实锤 P1 修复**：`kill_all_blocking` 的 SIGKILL escalation 循环原样探测 pid-0 的 agent-future 条目——POSIX pid-0 kill 语义即**调用者自身进程组**，daemon SIGTERM drain 携活委托任务时会自杀在审计行写出之前（emission-helper 钉 :254 绿恰因绕过 drain）；修 = 循环跳过 `child.is_none()` 条目（task_registry.rs:1562 守卫）；e2e 钉 `delegate_future_drain_kills_and_audits_one_line_each`（drain 返回 id、future aborted、**双审计行**、meta Killed）+ shell 路径回归钉全绿。
+  - **G-35 阻塞回执统一（属主裁决：additive 统一、spec 不改）**：`stamp_blocking_receipt`（delegate_task.rs:2056）为单发/批/错三路阻塞结果盖 `{task_index, agent, status, response|error, model_source}` 五键（model_source 仅前置解析错误才 "unresolved"）；钉 red→green；absent-byte-identity 钉与生产消费方（plan_task/plan_synthesis/aggregate_weights）零破坏。
+  - **G-37 pin-coverage 结案（零生产改动）**：后台拒准审计线**经管线 Terminate 路径已存在**（notify_invocation_error 对全 hook 链触发 audit_hook，wiring.rs 顺序 audit→approval）；三钉（audit 线/回调计数 0/父轮挂起空 + 无标记对照组证明观察器活体），mutation 验红后回绿。
+  - **G-36 云轮活体证据 + 目录漂移新发现**：W10.8 Gate 4 勘误——tasks.md:130 显示 11-07/08 已双轨关闭（当时 `deepseek-v4-flash` 有效），AGENTS.md 的"待跑"行才是陈旧记录；本轮在**当前二进制**重验 `provider="deepseek" model="deepseek-flash"` hosted 轮（ZEN_DEFAULT_PROVIDER env 层 + ~/.zen/.env 密钥 + launchd 隔离环境 remedy，23:21:03 日志）——**新发现：deepseek 账号目录现仅剩 deepseek-flash/deepseek-v4-pro，内嵌 deepseek-v4-flash 已失效**（provider 侧漂移，未来云轮需带模型覆盖）。config/env 已还原、daemon 复位。
+  - G-38/G-39/G-41/G-42：fan-out task_index 断言、会话 jsonl 负向钉（spawn_async→completion 后 session 文件字节等同 + payload 落 meta.json）、plan.md 计数措辞耐久化、SC-019/FR-033 refund 位置 dated 修正（W12.26 语义）。
+
 - **006 spec-remediation 波（2026-11-21，/speckit.analyze 14 findings → owner "continue fix it and implemented"；docs-only 零代码变更；lint 0，全测不受影响=4005/0/28）** — 三工件修复全落地：
   - **plan.md 复原（F1）**：retroactive 索引（波次→设计记录映射 + 技术约束 8 条 + 数据模型指针），解除 check-prerequisites 三工件阻塞——/sdd 波次时代从未生成过常规 plan.md，这是工作流债不是设计缺失。
   - **staleness 勘误（F2）**：spec 四处 2×/1800s → 4×/3600s——W12.2（11-18）已把代码改 4× 且 AGENTS.md 记录在案，spec 文本滞后；normative 两处就地修正、历史记录两处加日期前向注（历史不重写）。
