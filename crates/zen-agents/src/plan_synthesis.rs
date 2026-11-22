@@ -263,12 +263,12 @@ pub fn extract_snapshot(
                         .and_then(|v| v.as_str())
                         .unwrap_or("skipped")
                         .to_string();
-                    let response = t
-                        .get("response")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| t.get("error").and_then(|v| v.as_str()))
-                        .unwrap_or("")
-                        .to_string();
+                    let response = zen_core::sanitize::strip_user_content_markers(
+                        t.get("response")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| t.get("error").and_then(|v| v.as_str()))
+                            .unwrap_or(""),
+                    );
                     Some(PlanOutcomeRow {
                         id,
                         agent,
@@ -412,6 +412,27 @@ mod tests {
             output: json!({"content": "x"}),
         }];
         assert!(extract_snapshot(&results).is_none());
+    }
+
+    // Phase 17 G-44 pin: models occasionally echo the executor's
+    // [USER_CONTENT_START]/[USER_CONTENT_END] wrapping markers into task
+    // responses; the Plan result block and the synthesis prompt consume
+    // extract_snapshot rows and must render corpus-clean text (production:
+    // wisdom/plans/t1.md carried the markers verbatim, 2026-11-22).
+    #[test]
+    fn snapshot_rows_strip_user_content_markers() {
+        let results = vec![plan_result(
+            json!([
+                {"id": "t1", "agent": "Hermes", "status": "completed",
+                 "response": "[USER_CONTENT_START]report body[USER_CONTENT_END]"},
+                {"id": "t2", "agent": "Hermes", "status": "failed",
+                 "error": "[USER_CONTENT_START]boom[USER_CONTENT_END]"}
+            ]),
+            None,
+        )];
+        let snap = extract_snapshot(&results).expect("snapshot");
+        assert_eq!(snap.rows[0].response, "report body");
+        assert_eq!(snap.rows[1].response, "boom");
     }
 
     // SC-012 acceptance: a no-batch turn never runs the pass.

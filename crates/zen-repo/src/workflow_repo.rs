@@ -237,7 +237,15 @@ impl<'a> WorkflowRepo<'a> {
     /// `cancelled` with `summary = 'stale'` (the chosen reason record —
     /// one field, documented). Returns the cancelled plan ids for audit.
     /// A live plan (fresh `updated_at`, claimed owner) is never touched.
-    pub async fn mark_stale_plans(&self, now: i64, stale_secs: i64) -> Result<Vec<String>> {
+    ///
+    /// Phase 17 G-46: the swept plans' non-terminal task rows finalize in
+    /// the same writer call (mark-only left them `pending`/`progressing`
+    /// forever — a 90-day-retention vocabulary gap on the hard-kill path).
+    /// Mirrors the W6.2b cancel semantics: in-flight (`progressing`) →
+    /// `failed` with `error = 'stale sweep'`, never-dispatched (`pending`)
+    /// → `skipped`; terminal outcomes keep. The second tuple element is
+    /// the finalized-row count for the `loop.plan.swept` audit line.
+    pub async fn mark_stale_plans(&self, now: i64, stale_secs: i64) -> Result<(Vec<String>, u64)> {
         let cutoff = now - stale_secs;
         self.client
             .writer()
@@ -249,7 +257,21 @@ impl<'a> WorkflowRepo<'a> {
                 )?;
                 let rows =
                     stmt.query_map(rusqlite::params![cutoff, now], |r| r.get::<_, String>(0))?;
-                Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+                let cancelled = rows.collect::<rusqlite::Result<Vec<String>>>()?;
+                let mut finalized = 0u64;
+                for id in &cancelled {
+                    finalized += conn.execute(
+                        "UPDATE workflow_tasks SET status = 'failed', error = 'stale sweep', \
+                          updated_at = ?2 WHERE plan_id = ?1 AND status = 'progressing'",
+                        rusqlite::params![id, now],
+                    )? as u64;
+                    finalized += conn.execute(
+                        "UPDATE workflow_tasks SET status = 'skipped', updated_at = ?2 \
+                          WHERE plan_id = ?1 AND status = 'pending'",
+                        rusqlite::params![id, now],
+                    )? as u64;
+                }
+                Ok((cancelled, finalized))
             })
             .await
             .map_err(SqliteError::TokioRusqlite)
@@ -1025,8 +1047,9 @@ mod tests {
             .await
             .unwrap();
 
-        let cancelled = repo.mark_stale_plans(now, stale_secs).await.unwrap();
+        let (cancelled, finalized) = repo.mark_stale_plans(now, stale_secs).await.unwrap();
         assert_eq!(cancelled, vec!["old-running".to_string()], "audit ids");
+        assert_eq!(finalized, 0, "fixture has no task rows to finalize");
 
         let swept = repo.load_plan("old-running").await.unwrap().unwrap();
         assert_eq!(swept.status, "cancelled");
@@ -1039,11 +1062,67 @@ mod tests {
         assert_eq!(done.status, "completed", "terminal plans untouched");
 
         // Idempotent: a second sweep finds nothing.
-        assert!(
-            repo.mark_stale_plans(now, stale_secs)
-                .await
-                .unwrap()
-                .is_empty()
+        let (again, finalized_again) = repo.mark_stale_plans(now, stale_secs).await.unwrap();
+        assert!(again.is_empty());
+        assert_eq!(finalized_again, 0);
+    }
+
+    /// Phase 17 G-46 pin: a swept plan's orphaned task rows finalize with
+    /// it — in-flight (`progressing`) → `failed` with the `stale sweep`
+    /// error record, never-dispatched (`pending`) → `skipped`, terminal
+    /// outcomes untouched; the count feeds the `loop.plan.swept` audit
+    /// line. Production evidence: the hard-kill path left `workflow_tasks`
+    /// rows non-terminal forever while only the plan row flipped (review
+    /// 2026-11-22, F4).
+    #[tokio::test]
+    async fn mark_stale_plans_finalizes_non_terminal_task_rows() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wf_stale_task_finalize.db");
+        let client = crate::SqliteClient::open(&db).await.unwrap();
+        let repo = WorkflowRepo::new(&client);
+
+        let now = 10_000i64;
+        repo.create_plan("stale-plan", None, "{}", now - 3600)
+            .await
+            .unwrap();
+        for (task_id, status) in [
+            ("inflight", "progressing"),
+            ("queued", "pending"),
+            ("settled", "completed"),
+        ] {
+            repo.checkpoint_task(TaskCheckpoint {
+                plan_id: "stale-plan",
+                task_id,
+                agent: "Hephaestus",
+                status,
+                response: None,
+                error: None,
+                now: now - 3600,
+
+                model: None,
+                duration_ms: None,
+                cost_usd: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let (cancelled, finalized) = repo.mark_stale_plans(now, 1800).await.unwrap();
+        assert_eq!(cancelled, vec!["stale-plan".to_string()]);
+        assert_eq!(
+            finalized, 2,
+            "progressing+pending finalize; completed keeps"
+        );
+
+        let rows = repo.load_task_rows("stale-plan").await.unwrap();
+        let by_id = |id: &str| rows.iter().find(|r| r.task_id == id).unwrap();
+        assert_eq!(by_id("inflight").status, "failed");
+        assert_eq!(by_id("inflight").error.as_deref(), Some("stale sweep"));
+        assert_eq!(by_id("queued").status, "skipped");
+        assert_eq!(
+            by_id("settled").status,
+            "completed",
+            "terminal outcome keeps"
         );
     }
 

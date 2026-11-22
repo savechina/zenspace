@@ -519,8 +519,8 @@ async fn sweep_plans_due(audit_path: Option<&std::path::Path>) {
     // W11.3/T3 (SC-017): the sweep and the resume fence share ONE live
     // resolver — 2× the resolved base watchdog incl. the env layer.
     let stale_secs = zen_core::config::resolve_stale_claim_secs();
-    let cancelled = match repo.mark_stale_plans(now, stale_secs).await {
-        Ok(ids) => ids,
+    let (cancelled, finalized_tasks) = match repo.mark_stale_plans(now, stale_secs).await {
+        Ok((ids, finalized)) => (ids, finalized),
         Err(e) => {
             tracing::warn!(error = %e, "plan stale sweep failed (fail-open)");
             return;
@@ -538,6 +538,7 @@ async fn sweep_plans_due(audit_path: Option<&std::path::Path>) {
             "ts": background_audit_ts(),
             "kind": "loop.plan.swept",
             "cancelled": cancelled,
+            "finalized_tasks": finalized_tasks,
             "expired_rows": expired,
         });
         let _ = zen_core::jsonl::append_jsonl_line(path, &record);

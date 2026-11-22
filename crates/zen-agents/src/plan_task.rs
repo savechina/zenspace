@@ -884,6 +884,24 @@ async fn mint_fresh_plan(
 ) -> Result<String, serde_json::Value> {
     let plan_id = uuid::Uuid::new_v4().to_string();
     let repo = zen_repo::WorkflowRepo::new(db);
+    // Phase 17 G-45: mint-once for the ledger-less fresh path. The attach
+    // arm is guarded by `attach_batch_spec`'s running-guard and plan.todos
+    // `set` by its own `latest_plan_for_session` check, but a direct
+    // `plan.execute` with no turn ledger minted a twin `running` row while
+    // one was already live for the session. The DB row (not just the
+    // process registry) is authoritative: it covers daemon restarts.
+    if let Ok(Some(live)) = repo.latest_plan_for_session(session).await
+        && live.status == "running"
+    {
+        return Err(serde_json::json!({
+            "error": format!(
+                "plan `{}` is already running for this session (mint-once) — \
+                 dispatch further batches against it, resume it, or wait for \
+                 the stale sweep to close it",
+                live.plan_id
+            )
+        }));
+    }
     // W12.17 (review Q4): the fresh-mint path writes the SAME session_id +
     // sensitivity marker `plan.todos` set writes (D24 §5 spec_json shape) —
     // without it the mint-once guard (`latest_plan_for_session`) is blind
@@ -983,26 +1001,36 @@ fn record_plan_archive(
 ) -> Option<std::path::PathBuf> {
     let paths = zen_core::paths::ZenPaths::detect().ok()?;
     let plans_dir = paths.wiki().join("wisdom/plans");
+    let responses: Vec<String> = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(i, _t)| {
+            let outcome = outcomes[i].as_ref();
+            zen_core::sanitize::strip_user_content_markers(
+                outcome
+                    .map(|o| {
+                        o.value
+                            .get("response")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| o.value.get("error").and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                    })
+                    .unwrap_or(""),
+            )
+        })
+        .collect();
     let tasks: Vec<zen_vault::distill::reflection::PlanArchiveTask<'_>> = plan
         .tasks
         .iter()
         .enumerate()
         .map(|(i, t)| {
             let outcome = outcomes[i].as_ref();
-            let response = outcome
-                .map(|o| {
-                    o.value
-                        .get("response")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| o.value.get("error").and_then(|v| v.as_str()))
-                        .unwrap_or("")
-                })
-                .unwrap_or("");
             zen_vault::distill::reflection::PlanArchiveTask {
                 id: &t.id,
                 agent: &t.agent,
                 status: outcome.map_or("skipped", |o| o.status),
-                response,
+                response: &responses[i],
             }
         })
         .collect();
@@ -3978,6 +4006,47 @@ mod tests {
             .unwrap();
         assert_eq!(plans, 0, "no phantom plan row");
         assert_eq!(tasks, 0, "no orphan task rows");
+    }
+
+    /// Phase 17 G-45 pin: mint-once covers the ledger-less fresh path — a
+    /// second direct `plan.execute` while a `running` plan exists for the
+    /// session is a structured refusal (the DB row is authoritative, so a
+    /// daemon restart cannot reopen the double-mint window), and a terminal
+    /// live plan no longer blocks the next mint.
+    #[tokio::test]
+    async fn fresh_mint_refuses_while_session_plan_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("mint_once.db");
+        let client = Arc::new(zen_repo::SqliteClient::open(&db).await.unwrap());
+        let repo = zen_repo::WorkflowRepo::new(&client);
+        repo.create_plan("live-1", None, r#"{"session_id":"s-mint"}"#, 1000)
+            .await
+            .unwrap();
+
+        let args = serde_json::json!({ "tasks": [] });
+        let err = mint_fresh_plan(&client, &args, None, "s-mint", &Sensitivity::Private)
+            .await
+            .expect_err("a live session plan must refuse a second fresh mint");
+        let msg = err["error"].as_str().unwrap();
+        assert!(msg.contains("already running"), "{msg}");
+        assert!(msg.contains("mint-once"), "{msg}");
+        assert!(
+            msg.contains("live-1"),
+            "refusal names the blocking plan: {msg}"
+        );
+
+        // A different session is unaffected.
+        let other = mint_fresh_plan(&client, &args, None, "s-other", &Sensitivity::Private)
+            .await
+            .expect("other sessions mint freely");
+        assert_ne!(other, "live-1");
+
+        // Terminal plans no longer block: cancel the live row, mint again.
+        repo.cancel_running_plan("live-1", 1001).await.unwrap();
+        let replayed = mint_fresh_plan(&client, &args, None, "s-mint", &Sensitivity::Private)
+            .await
+            .expect("a terminal plan never blocks the next mint");
+        assert_ne!(replayed, "live-1");
     }
 
     /// W12.15 pin (half 1/2): the spec_json reader accepts both producer

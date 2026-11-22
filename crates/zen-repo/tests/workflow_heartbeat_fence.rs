@@ -75,7 +75,7 @@ async fn fresh_checkpoint_plan_is_not_swept_nor_stolen_within_the_window() {
             .unwrap(),
         "heartbeat-fresh claim must not be stealable within the window"
     );
-    let swept = repo.mark_stale_plans(t_probe, STALE_SECS).await.unwrap();
+    let (swept, _) = repo.mark_stale_plans(t_probe, STALE_SECS).await.unwrap();
     assert!(
         swept.is_empty(),
         "heartbeat-fresh running plan must not be stale-swept"
@@ -136,7 +136,7 @@ async fn stale_plan_without_progress_is_swept_and_stealable() {
 
     // The sweep then cancels only plan A (plan B is heartbeat-fresh again
     // via the claim write) — the two recovery paths are independent.
-    let cancelled = repo.mark_stale_plans(t_after, STALE_SECS).await.unwrap();
+    let (cancelled, _finalized) = repo.mark_stale_plans(t_after, STALE_SECS).await.unwrap();
     assert_eq!(
         cancelled,
         vec!["swept".to_string()],

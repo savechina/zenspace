@@ -1,6 +1,16 @@
 const CONTENT_START: &str = "[USER_CONTENT_START]";
 const CONTENT_END: &str = "[USER_CONTENT_END]";
 
+/// Strip the literal executor wrapping markers from model output. Models
+/// occasionally echo the `User: [USER_CONTENT_START]…[USER_CONTENT_END]`
+/// prompt-plumbing convention back into their responses; plan summary
+/// seams (Plan result block, synthesis prompt, wisdom archive) render that
+/// output verbatim and must not carry the artifacts into the corpus
+/// (production evidence: `wisdom/plans/t1.md`, 2026-11-22).
+pub fn strip_user_content_markers(text: &str) -> String {
+    text.replace(CONTENT_START, "").replace(CONTENT_END, "")
+}
+
 #[derive(Debug, Clone)]
 pub struct SanitizedContent {
     pub original: String,
