@@ -107,6 +107,24 @@ pub struct PromptAssembly {
     /// Priority 4: Custom prompt (--system-prompt flag)
     pub custom_prompt: Option<String>,
 
+    // -- Cacheable preamble / static-zone tail (additive, cache-prefix) --
+    /// Tool preamble rendered at the STATIC HEAD — the very first bytes of
+    /// the assembled prompt, before the prompt template, intro, or anything
+    /// else. Hoisting it above the dynamic boundary keeps the tool-call
+    /// convention inside the provider-cacheable prefix (Anthropic caches
+    /// `tools → system → messages`; DeepSeek matches the prefix from token 0).
+    ///
+    /// `None` ⇒ omitted, so legacy output is byte-identical.
+    pub tools_preamble: Option<String>,
+
+    /// Static-zone tail rendered at the END of the static zone — after the
+    /// actions/blast-radius slot and output format, immediately before the
+    /// `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` line. Used for stable,
+    /// cacheable instructions that belong after the definition sections.
+    ///
+    /// `None` ⇒ omitted, so legacy output is byte-identical.
+    pub static_tail: Option<String>,
+
     // -- Static Zone (sections 1-12, globally cacheable) --
     /// Section 1: Zen System Prefix
     pub system_prefix: Option<String>,
@@ -223,6 +241,8 @@ impl Default for PromptAssembly {
             coordinator_mode: false,
             agent_definition: None,
             custom_prompt: None,
+            tools_preamble: None,
+            static_tail: None,
             system_prefix: None,
             intro: None,
             cyber_risk: None,
@@ -375,6 +395,21 @@ impl PromptAssembly {
         result
     }
 
+    /// Join the static zone, prefixing the (optional) tool preamble.
+    ///
+    /// Extractable seam so the P3 and P5 builders share the same static-head
+    /// semantics: the preamble, when present and non-empty, becomes the very
+    /// first bytes of the assembled prompt. Absent/empty ⇒ the plain join,
+    /// byte-identical to the pre-preamble assembly.
+    fn join_static_zone(&self, static_parts: &[String]) -> String {
+        let joined = static_parts.join("\n\n");
+        match self.tools_preamble.as_deref() {
+            Some(preamble) if !preamble.is_empty() && joined.is_empty() => preamble.to_string(),
+            Some(preamble) if !preamble.is_empty() => format!("{preamble}\n\n{joined}"),
+            _ => joined,
+        }
+    }
+
     /// Build agent definition prompt (replacement chain).
     fn build_agent_prompt(&self, def: &AgentSpec) -> String {
         let mut static_parts = Vec::new();
@@ -407,6 +442,12 @@ impl PromptAssembly {
             static_parts.push(format!("## Output Format\n{}", format));
         }
 
+        if let Some(ref tail) = self.static_tail
+            && !tail.is_empty()
+        {
+            static_parts.push(tail.clone());
+        }
+
         // Section 13: Environment Info — rendered as the FIRST dynamic
         // section, mirroring the default 18-section path's order
         // (env_info → memory → signals). The executor assembly has set
@@ -435,7 +476,7 @@ impl PromptAssembly {
             dynamic_parts.push(claude_parts);
         }
 
-        let mut result = static_parts.join("\n\n");
+        let mut result = self.join_static_zone(&static_parts);
         if !dynamic_parts.is_empty() {
             result.push_str("\n\n");
             result.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
@@ -536,6 +577,12 @@ impl PromptAssembly {
             static_parts.push(Self::build_blast_radius_section(self.sensitivity));
         }
 
+        if let Some(ref tail) = self.static_tail
+            && !tail.is_empty()
+        {
+            static_parts.push(tail.clone());
+        }
+
         // Dynamic Zone (sections 13-18)
         // Section 13: Environment Info
         if let Some(ref env) = self.env_info
@@ -585,7 +632,7 @@ impl PromptAssembly {
         }
 
         // Build with cache boundary
-        let mut result = static_parts.join("\n\n");
+        let mut result = self.join_static_zone(&static_parts);
         if !dynamic_parts.is_empty() {
             result.push_str("\n\n");
             result.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
@@ -951,6 +998,18 @@ impl PromptAssemblyBuilder {
         self
     }
 
+    /// Set the cacheable tool preamble (renders as the static head).
+    pub fn tools_preamble(mut self, preamble: impl Into<String>) -> Self {
+        self.assembly.tools_preamble = Some(preamble.into());
+        self
+    }
+
+    /// Set the static-zone tail (renders immediately before the boundary).
+    pub fn static_tail(mut self, tail: impl Into<String>) -> Self {
+        self.assembly.static_tail = Some(tail.into());
+        self
+    }
+
     /// Section 1: Set system prefix.
     pub fn system_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.assembly.system_prefix = Some(prefix.into());
@@ -1019,6 +1078,19 @@ impl PromptAssemblyBuilder {
     ) -> Self {
         self.assembly.retrieved_knowledge = knowledge;
         self.assembly.conversation_history = history;
+        self
+    }
+
+    /// Section 17 variant without conversation history.
+    ///
+    /// For callers whose history already travels as a windowed provider
+    /// message array (Path A): MEMORY.md and retrieved knowledge still render,
+    /// while `## Conversation History` is omitted so the same turns are not
+    /// sent twice. Absent history ⇒ byte-identical to an empty-history
+    /// [`Self::memory_section`] call.
+    pub fn memory_section_without_history(mut self, knowledge: Vec<String>) -> Self {
+        self.assembly.retrieved_knowledge = knowledge;
+        self.assembly.conversation_history = Vec::new();
         self
     }
 

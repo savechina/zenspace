@@ -10,6 +10,7 @@ use rig_core::completion::message::ToolCall;
 use rig_core::completion::{AssistantContent, ToolDefinition};
 use serde_json::json;
 use tracing::{debug, instrument, warn};
+use zen_core::AgentSpec;
 use zen_core::notion_graph::NotionGraphProvider;
 use zen_core::paths::ZenPaths;
 use zen_core::sanitize::InputSanitizer;
@@ -841,6 +842,7 @@ pub struct ZenAgent {
     pub generic: GenericAgent,
     pub completion_model: ZenCompletionModel,
     identity: Option<IdentityContext>,
+    agent_definition: Option<AgentSpec>,
     signals: Option<SelfLearningSignals>,
     memvid_store: Option<MemvidStore>,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
@@ -1256,6 +1258,10 @@ impl ZenAgent {
 
         let mut builder = PromptAssembly::builder().sensitivity(session.sensitivity_policy);
 
+        if let Some(ref definition) = self.agent_definition {
+            builder = builder.agent_definition(definition.clone());
+        }
+
         if let Some(ref identity) = self.identity {
             if !identity.soul_content().is_empty() {
                 builder = builder.intro(identity.soul_content());
@@ -1281,13 +1287,7 @@ impl ZenAgent {
             }
         }
 
-        let history: Vec<(String, String)> = session
-            .conversation
-            .iter()
-            .map(|turn| (turn.role.to_string(), turn.content.clone()))
-            .collect();
-
-        builder = builder.memory_section(knowledge, history);
+        builder = builder.memory_section_without_history(knowledge);
         builder = builder.env_info(PromptAssembly::build_env_info(session));
         builder = builder.blast_radius(session.sensitivity_policy);
 
@@ -1318,42 +1318,29 @@ impl ZenAgent {
             }
         }
 
-        let mut prompt = builder.build().assemble();
-
-        // Inject the agent-scoped tool manifest. Without this the streaming
-        // path (zen chat / TUI / gateway) never advertises tools, so the
-        // AGENT_TOOLS whitelist is dead weight. Mirrors executor.rs:225-235.
+        // The agent-scoped tool preamble belongs in the cacheable static zone
+        // so the prefix hash stays stable across turns; one renderer serves
+        // both assembly paths.
         let tool_manifest = self.tool_manifest();
         if !tool_manifest.is_empty() {
-            prompt.push_str("\n\n## Available tools\n");
-            prompt.push_str(
-                "You can call tools to read/write files, fetch web pages, search the web, \
-                 and more. To call a tool, emit a fenced ```json block with the shape \
-                 {\"tool\": \"<name>\", \"args\": { ... }} (or an array of such objects). \
-                 The runtime parses, dispatches, and feeds results back for the next round.\n\
-                 For knowledge-base and note questions, search the indexed tiers first \
-                 (tier2_search for keywords, tier3_search for meaning, tier4_search for \
-                 entity links) before falling back to raw fs.grep/fs.read scans; fs tool \
-                 paths anchor under the zen root (~/.zen) with bare names falling back to \
-                 the vault (~/.zen/vault).\n\
-                 Respond in the user's language — 除非用户要求，回答的语言与用户提问的语言保持一致。\n\n",
-            );
-            prompt.push_str(&tool_manifest);
+            builder = builder.tools_preamble(crate::prompt_preamble::available_tools_preamble(
+                &tool_manifest,
+            ));
         }
 
         // D21 W6.1: the "plan before acting" rule lives in the PROMPT layer —
         // the classifier only biases (multi_step hint). Sisyphus-only: it is
-        // the sole holder of plan.execute/plan.todos. plan.todos lands in
-        // W6.2; naming it here is inert but harmless until then (ungranted
-        // calls are rejected structurally).
+        // the sole holder of plan.execute/plan.todos.
         if self.generic.name() == "Sisyphus" {
-            prompt.push_str("\n\n## Multi-step work\n");
-            prompt.push_str(
-                "When a request looks multi-step, plan before acting: outline the steps \
+            builder = builder.static_tail(
+                "## Multi-step work\n\
+                 When a request looks multi-step, plan before acting: outline the steps \
                  with the plan.todos tool, then execute them in batches with \
-                 plan.execute. Skip the ledger for single-step requests.\n",
+                 plan.execute. Skip the ledger for single-step requests.",
             );
         }
+
+        let prompt = builder.build().assemble();
 
         tracing::info!(
             prompt_len = prompt.len(),
@@ -1917,6 +1904,7 @@ pub struct ZenAgentBuilder {
     skill_ids: Vec<String>,
     tool_ids: Vec<String>,
     zen_paths: Option<ZenPaths>,
+    agent_definition: Option<AgentSpec>,
     memvid_store: Option<MemvidStore>,
     notion_graph: Option<Arc<dyn NotionGraphProvider>>,
     context_budget_chars: usize,
@@ -1929,6 +1917,7 @@ impl ZenAgentBuilder {
             skill_ids: Vec::new(),
             tool_ids: Vec::new(),
             zen_paths: None,
+            agent_definition: None,
             memvid_store: None,
             notion_graph: None,
             context_budget_chars: 12288,
@@ -1942,6 +1931,11 @@ impl ZenAgentBuilder {
 
     pub fn with_tool(mut self, id: impl Into<String>) -> Self {
         self.tool_ids.push(id.into());
+        self
+    }
+
+    pub fn agent_definition(mut self, definition: AgentSpec) -> Self {
+        self.agent_definition = Some(definition);
         self
     }
 
@@ -2003,6 +1997,7 @@ impl ZenAgentBuilder {
             generic,
             completion_model,
             identity,
+            agent_definition: self.agent_definition,
             signals,
             memvid_store: self.memvid_store,
             notion_graph: self.notion_graph,
@@ -2185,39 +2180,47 @@ mod chain_tests {
     }
 
     #[test]
-    fn characterization_path_a_omits_agent_definition_sections() {
+    fn path_a_renders_agent_definition_sections_when_provided() {
         use crate::wiring::ZenWiring;
+        use zen_core::definition::AgentSpec;
 
         let wiring = ZenWiring::new();
         let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+
+        // Converged contract (Phase 15, 2026-11-22): Path A feeds the agent
+        // definition (orchestrator `build_agent` threads the registry
+        // profile), so the streaming assembly renders the same
+        // definition sections as the executor path — flipped from the
+        // F13 characterization lock together with its executor twin.
+        let mut spec = AgentSpec::default_agent();
+        spec.prompt_template = "PATHA_TEMPLATE_MARKER_9f2".to_string();
+        spec.behavior_constraints = vec!["PATHA_CONSTRAINT_MARKER_7c1".to_string()];
+        spec.output_format = Some("PATHA_FORMAT_MARKER_3ee".to_string());
         let agent = ZenAgent::builder("Sisyphus")
+            .agent_definition(spec)
             .build(&wiring, &router)
             .expect("agent build");
 
         let session = SessionContext::new("s1".into(), "ignored".into());
         let prompt = agent.build_system_prompt_with_assembly(&session, None);
 
-        // Characterization lock (spec.md C9 / F13, 2026-11-21): Path A —
-        // the streaming assembly, which the orchestrator itself drives —
-        // never receives the agent definition (no `.agent_definition` call;
-        // grep-verified zero references in this file), so the
-        // agent-definition sections cannot render here while the executor
-        // path (mirror pin in executor.rs) renders them. Two prompt
-        // contracts for one turn type, locked: a convergence wave that
-        // unifies the paths must flip this assertion together with its
-        // executor twin — never silently.
         assert!(
-            !prompt.contains("## Behavior Constraints"),
-            "Path A characteristically omits agent behavior constraints"
+            prompt.contains("PATHA_TEMPLATE_MARKER_9f2"),
+            "Path A must render the agent prompt template"
         );
         assert!(
-            !prompt.contains("## Output Format"),
-            "Path A characteristically omits the agent output format"
+            prompt.contains("## Behavior Constraints")
+                && prompt.contains("PATHA_CONSTRAINT_MARKER_7c1"),
+            "Path A must render behavior constraints + the blast-radius block"
+        );
+        assert!(
+            prompt.contains("## Output Format") && prompt.contains("PATHA_FORMAT_MARKER_3ee"),
+            "Path A must render the agent output format"
         );
     }
 
     #[test]
-    fn characterization_path_a_manifest_lands_after_dynamic_boundary() {
+    fn path_a_manifest_lands_before_dynamic_boundary() {
         use crate::wiring::ZenWiring;
 
         let wiring = ZenWiring::new();
@@ -2236,20 +2239,18 @@ mod chain_tests {
             .find("## Available tools")
             .expect("manifest appended inside the assembly fn");
 
-        // KV-cache characterization (spec.md C9 / F13): the tool manifest
-        // lands AFTER the dynamic zone, so per-turn variable content
-        // (env/memory/signals) precedes it and a byte-stable prefix is
-        // impossible (DeepSeek prices the prefix cache ~50x cheaper). A
-        // wave that hoists the manifest above the boundary must flip this
-        // pin and re-measure cache hit rate.
+        // Converged contract (Phase 15): the manifest rides in the static
+        // zone (Anthropic caches tools → system → messages; DeepSeek
+        // matches the prefix from token 0) — a byte-stable prefix requires
+        // it BEFORE the dynamic boundary. Twin of the Path B pin.
         assert!(
-            manifest > boundary,
-            "Path A manifest lands after the dynamic boundary (cache-prefix break, locked)"
+            manifest < boundary,
+            "Path A manifest must land before the dynamic boundary (cacheable prefix)"
         );
     }
 
     #[test]
-    fn characterization_path_a_system_prompt_carries_full_unwindowed_history() {
+    fn path_a_system_prompt_history_rides_the_message_array_only() {
         use crate::wiring::ZenWiring;
         use zen_core::types::MessageRole;
 
@@ -2265,18 +2266,49 @@ mod chain_tests {
         }
         let prompt = agent.build_system_prompt_with_assembly(&session, None);
 
-        // Duplication half of record (spec.md C9 / F12): §17 renders the
-        // FULL conversation — unwindowed, including turns older than the
-        // 20-turn window the provider Message list uses (zen_agent.rs
-        // `window_size = 20` sites) — so the same old history reaches the
-        // provider twice on the streaming path (system prompt §17 AND the
-        // message list). This pin locks the unwindowed prompt half; a
-        // dedup wave must touch BOTH sites and flip this pin.
+        // Converged contract (Phase 15): history reaches the provider ONCE
+        // on the streaming path — via the windowed message array
+        // (`window_size = 20` sites in the call_llm_* helpers), never via
+        // §17. The old duplication (full unwindowed §17 + windowed
+        // messages, F12) is gone; Path B (single-string wire, no message
+        // array) keeps §17 as its sole carrier by design.
         assert!(
-            prompt.contains("TURNMARK_00"),
-            "§17 must render the full unwindowed history (locked shape)"
+            !prompt.contains("## Conversation History"),
+            "§17 must not carry conversation history on the streaming path"
         );
-        assert!(prompt.contains("TURNMARK_24"));
+        assert!(
+            !prompt.contains("TURNMARK_00"),
+            "pre-window turns must not leak into the system prompt"
+        );
+        assert!(
+            !prompt.contains("TURNMARK_24"),
+            "recent turns ride the message array, not the system prompt"
+        );
+    }
+
+    #[test]
+    fn path_a_preamble_is_the_shared_renderer_output() {
+        use crate::wiring::ZenWiring;
+
+        let wiring = ZenWiring::new();
+        let router = zen_provider::DefaultRouter::new(zen_provider::LlmConfig::default());
+        let agent = ZenAgent::builder("Sisyphus")
+            .with_tool("fs.read")
+            .build(&wiring, &router)
+            .expect("agent build");
+
+        let session = SessionContext::new("s1".into(), "ignored".into());
+        let manifest = agent.tool_manifest();
+        let prompt = agent.build_system_prompt_with_assembly(&session, None);
+        let expected = crate::prompt_preamble::available_tools_preamble(&manifest);
+
+        // One prose source serves both assembly paths: the streaming
+        // prompt embeds the shared renderer's output byte-for-byte, so the
+        // Path A / Path B tool contracts can never drift apart again.
+        assert!(
+            prompt.contains(&expected),
+            "Path A must embed the shared available_tools_preamble output verbatim"
+        );
     }
 
     #[test]

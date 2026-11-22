@@ -19,6 +19,7 @@ pub mod plan_synthesis;
 pub mod plan_task;
 pub mod plan_todos;
 pub mod prompt;
+pub mod prompt_preamble;
 pub mod telemetry;
 
 #[deprecated(

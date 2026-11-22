@@ -2470,11 +2470,16 @@ impl AgentOrchestrator {
         if let Some(store) = self.memvid_store.clone() {
             builder = builder.with_memvid_store(store);
         }
-        let preferences = self
-            .registry
-            .find_by_name(agent_name)
-            .map(|profile| profile.llm_preferences.clone())
-            .unwrap_or_else(|_| vec![LlmPreference::Any]);
+        let profile = self.registry.find_by_name(agent_name).ok();
+        // Phase-15 convergence: feed the registry definition so the
+        // streaming assembly (Path A) renders the same agent-definition
+        // sections as the executor path — one prompt contract per agent.
+        if let Some(definition) = profile.as_ref().and_then(|p| p.definition.clone()) {
+            builder = builder.agent_definition(definition);
+        }
+        let preferences = profile
+            .map(|p| p.llm_preferences.clone())
+            .unwrap_or_else(|| vec![LlmPreference::Any]);
         let provider =
             resolve_completion_provider(self.executor.router(), &preferences, sensitivity)?;
         builder.build_with_provider(&self.wiring, self.executor.router(), provider)

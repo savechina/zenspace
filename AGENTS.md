@@ -854,6 +854,13 @@ Superseded: the 001 ADR-009 Blackboard mandate — see
 
 ## Recent Changes
 
+- **提示词装配收敛波 Phase 15（2026-11-22，owner 触发器击发 "fix it all"；4 路侦察（3 explore 行锚定地图 + 1 librarian 官方缓存文档）→ 设计 → 实现；lint 0 / test **4019/0/28** = +3 钉）** — F12/F13 特征化钉全部翻转为收敛契约钉：
+  - **A/B 路径统一（根因修复）**：Path A（流式编排 zen_agent.rs）此前从不喂 `.agent_definition` → 恒落 Priority 5 默认 18 节（裸 SOUL/AGENTS.md 无头，def 段全丢）；现 ZenAgentBuilder 增 `agent_definition` 载体、orchestrator `build_agent` 单次 registry 解析线程化 definition+preferences → 两条装配路径同走 Priority 3 `build_agent_prompt`，一代理一提示词合同。
+  - **工具清单进静态区（缓存前缀修复）**：`## Available tools` 前言从两路的 assemble 后追加（全动态内容之后 = KV 前缀断裂）迁入引擎静态区**头部**新槽 `tools_preamble`（Anthropic 官方缓存层级 `tools → system → messages`、"Place static content at the beginning"；DeepSeek token-0 前缀全匹配）；prose 双份措辞收敛为单源 `zen-agents/src/prompt_preamble.rs`；`## Multi-step work` 入 `static_tail` 槽（静态区尾、boundary 前）。引擎槽位 additive：None ⇒ 字节等同（zen-memory 425/425 全绿实证）。
+  - **历史去重（仅 Path A）**：§17 不再渲染 `## Conversation History`——窗口 20 消息序列为唯一载体（原双写：全量未窗口 §17 + 窗口消息）；**Path B 保留 §17**（单串 wire 无消息数组，其 §17 是唯一载体——非分叉，是 wire 形状差异）。Sisyphus 走流式=消息阵列，delegate/非流式=单串。
+  - **钉账**：`path_a_renders_agent_definition_sections_when_provided` / `path_a_manifest_lands_before_dynamic_boundary`（+executor 孪生）/ `path_a_system_prompt_history_rides_the_message_array_only` + 新 `path_a_preamble_is_the_shared_renderer_output`（单源钉）+ helper 自钉 ×2；keep-green 全集零改动全绿（2142/2283、768/721、orchestrator manifest 群、zen-memory assemble 家族、extract_prompt、multi_round）。
+  - **留档（范围外）**：orchestrator `AgentRun.with_history` 装载在 CallModel 被 `prompt:_, history:_` 丢弃（死装载）；§18 AGENTS.md 在动态尾（会话内稳定——静态化列为后续候选）；env_info `Date` 逐轮字段在 boundary 后（无前缀危害）。实现事故记录：实现 agent 上下文耗尽半途而废（引擎+Path A+helper 落地，Path B/orchestrator/钉未落）——主会话接管外科收尾。
+
 - **Phase 14 收敛实现波（2026-11-21，/speckit-converge 8 findings → /speckit-implement 全清；lint 0 / test 4016/0/28 = +6 钉）** — 006 tasks.md Phase 14（G-35..G-42）：
   - **G-40 实锤 P1 修复**：`kill_all_blocking` 的 SIGKILL escalation 循环原样探测 pid-0 的 agent-future 条目——POSIX pid-0 kill 语义即**调用者自身进程组**，daemon SIGTERM drain 携活委托任务时会自杀在审计行写出之前（emission-helper 钉 :254 绿恰因绕过 drain）；修 = 循环跳过 `child.is_none()` 条目（task_registry.rs:1562 守卫）；e2e 钉 `delegate_future_drain_kills_and_audits_one_line_each`（drain 返回 id、future aborted、**双审计行**、meta Killed）+ shell 路径回归钉全绿。
   - **G-35 阻塞回执统一（属主裁决：additive 统一、spec 不改）**：`stamp_blocking_receipt`（delegate_task.rs:2056）为单发/批/错三路阻塞结果盖 `{task_index, agent, status, response|error, model_source}` 五键（model_source 仅前置解析错误才 "unresolved"）；钉 red→green；absent-byte-identity 钉与生产消费方（plan_task/plan_synthesis/aggregate_weights）零破坏。

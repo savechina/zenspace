@@ -271,26 +271,12 @@ impl AgentExecutor {
         tool_manifest: &str,
         tool_results: &str,
     ) -> String {
-        let system_prompt = self.assemble_system_prompt_with_identity(context, agent);
+        let system_prompt =
+            self.assemble_system_prompt_with_identity(context, agent, tool_manifest);
         let sanitizer = InputSanitizer::new();
         let sanitized_query = sanitizer.strip_dangerous_patterns(&context.user_query);
 
         let mut prompt = system_prompt;
-        if !tool_manifest.is_empty() {
-            prompt.push_str(
-                "\n\n## Available tools\n\
-                 You can call tools to read/write files, fetch web pages, search the web, and more.\n\
-                 When you need a tool, respond with ONLY a fenced JSON block — exactly this shape:\n\
-                 ```json\n{\"tool\": \"<tool_name>\", \"args\": { ... }}\n```\n\
-                 No XML-style wrappers (e.g. <tool_code>), no bare JSON lines, no extra prose:\n\
-                 unfenced or wrapped tool calls are NOT executed.\n\
-                 You may include multiple calls as a JSON array. After receiving results,\
-                 continue the conversation normally.\n\
-                 Respond in the user's language — 除非用户要求，回答的语言与用户提问的语言保持一致。\n\
-                 Tools:\n",
-            );
-            prompt.push_str(tool_manifest);
-        }
         prompt.push_str(&format!(
             "\n\nUser: [USER_CONTENT_START]{}[USER_CONTENT_END]",
             sanitized_query
@@ -311,6 +297,7 @@ impl AgentExecutor {
         &self,
         context: &AgentContext,
         agent: &crate::ZenAgent,
+        tool_manifest: &str,
     ) -> String {
         use zen_memory::PromptAssembly;
 
@@ -380,6 +367,15 @@ impl AgentExecutor {
             if !signals.priority_items.is_empty() {
                 builder = builder.priority_items(&signals.priority_items);
             }
+        }
+
+        // The agent-scoped tool preamble rides in the cacheable static zone
+        // (static-head slot) — same single-source renderer as the streaming
+        // path, so both paths keep a byte-stable prefix for provider caches.
+        if !tool_manifest.is_empty() {
+            builder = builder.tools_preamble(crate::prompt_preamble::available_tools_preamble(
+                tool_manifest,
+            ));
         }
 
         // Build and assemble with cache boundary
@@ -804,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn characterization_path_b_renders_agent_definition_sections() {
+    fn path_b_renders_agent_definition_sections() {
         use crate::context::AgentContext;
         use crate::registry::{AgentRegistry, DefaultAgentRegistry};
         use crate::wiring::ZenWiring;
@@ -821,10 +817,9 @@ mod tests {
             .build(&wiring, &router)
             .expect("agent builds");
 
-        // Mirror of the zen_agent.rs Path A pin: Path B renders the agent
-        // definition sections (prompt template / behavior constraints /
-        // output format) that Path A structurally cannot. Locked pair —
-        // spec.md C9 / F13; a convergence wave flips BOTH pins or neither.
+        // Converged contract (Phase 15, 2026-11-22): both assembly paths
+        // render the agent definition sections — this is the Path B twin
+        // of the Path A pin; a divergence between the two is a regression.
         let mut spec = AgentSpec::default_agent();
         spec.prompt_template = "PATHB_TEMPLATE_MARKER_9f2".to_string();
         spec.behavior_constraints = vec!["PATHB_CONSTRAINT_MARKER_7c1".to_string()];
@@ -859,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn characterization_path_b_manifest_lands_after_dynamic_boundary() {
+    fn path_b_manifest_lands_before_dynamic_boundary() {
         use crate::context::AgentContext;
         use crate::registry::{AgentRegistry, DefaultAgentRegistry};
         use crate::wiring::ZenWiring;
@@ -894,12 +889,13 @@ mod tests {
             .find("## Available tools")
             .expect("executor manifest appended after the system prompt");
 
-        // Twin of the zen_agent.rs Path A pin (spec.md C9 / F13): the
-        // manifest lands after the dynamic zone on BOTH paths — a
-        // convergence wave hoisting it above the boundary flips both.
+        // Converged contract (Phase 15): the manifest rides in the static
+        // zone (Anthropic caches tools → system → messages; DeepSeek
+        // matches the prefix from token 0) — a byte-stable prefix requires
+        // it BEFORE the dynamic boundary. Twin of the Path A pin.
         assert!(
-            manifest > boundary,
-            "Path B manifest lands after the dynamic boundary (cache-prefix break, locked)"
+            manifest < boundary,
+            "Path B manifest must land before the dynamic boundary (cacheable prefix)"
         );
     }
 
