@@ -967,6 +967,10 @@ mod tests {
         assert!(wiring.tools.get("system.fs_watcher").is_ok());
         assert!(wiring.tools.get("plugin.wasm_sandbox").is_ok());
         assert!(wiring.tools.get("shell.exec").is_ok());
+        // Audit-remediation R-3 (2026-11-22): the count alone cannot
+        // distinguish a same-count tool swap — pin the 007 ledger tool
+        // by name.
+        assert!(wiring.tools.get("admission.list").is_ok());
     }
 
     #[test]

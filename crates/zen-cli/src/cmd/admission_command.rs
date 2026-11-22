@@ -1,12 +1,14 @@
-//! `zen admission` — trust-ledger review + accept-mode request surface
-//! (007 T007/T013, FR-009).
+//! `zen admission` — trust-ledger review + accept-mode control surface
+//! (007 T007/T013/T021, FR-009).
 //!
 //! The ledger lives in `state.db` (migration 016). `list`/`show` are read-only
 //! views; `mode` without an argument shows the effective accept mode and
-//! policy-version hash, while `mode <value>` is a CONFIG-GUIDED request: it
-//! validates the value and prints the exact `config.toml` edit. Config is a
-//! 5-layer read-only surface (D22), so v1 deliberately does not write runtime
-//! state from this process; the daemon reads the edit after `zen serve restart`.
+//! policy-version hash, while `mode <value>` flips the RUNTIME override row
+//! (migration 017) directly in `state.db` — the daemon re-resolves it on the
+//! next inbound message, no restart. `--clear` removes the row (config is a
+//! 5-layer read-only surface, D22; the override is the hot path on top of it).
+//! Write paths refuse when `state.db` is absent — a mode flip without a
+//! running daemon has nothing to override (mirror of the D3 RPC-model rule).
 
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
@@ -317,7 +319,19 @@ async fn read_mode_override() -> Result<Option<String>, ZenError> {
 async fn write_mode_override(mode: &str) -> Result<(), ZenError> {
     let paths = ZenPaths::detect().map_err(|e| ZenError::Message(format!("path error: {e}")))?;
     let db = paths.data().join("state.db");
-    let client = SqliteClient::open(&db)
+    write_mode_override_at(&db, mode).await
+}
+
+async fn write_mode_override_at(db: &std::path::Path, mode: &str) -> Result<(), ZenError> {
+    if !db.exists() {
+        return Err(ZenError::Message(format!(
+            "state.db not found at {} — a runtime override has nothing to override; \
+             start the daemon first (`zen serve start`) or set accept_mode in \
+             config.toml [channels.qqbot]",
+            db.display()
+        )));
+    }
+    let client = SqliteClient::open(db)
         .await
         .map_err(|e| ZenError::Message(format!("open state.db: {e}")))?;
     AdmissionRepo::new(&client)
@@ -484,6 +498,32 @@ mod tests {
     fn admission_mode_validation_rejects_unknown_values() {
         assert_eq!(parse_requested_mode("AUTO").unwrap(), AcceptMode::Auto);
         assert_eq!(parse_requested_mode("off").unwrap(), AcceptMode::Off);
-        assert!(parse_requested_mode("everything").is_err());
+        assert_eq!(
+            parse_requested_mode("observe").unwrap(),
+            AcceptMode::Observe
+        );
+        assert!(parse_requested_mode("bogus").is_err());
+    }
+
+    /// Audit-remediation R-2 (2026-11-22): the mode write path refuses when
+    /// state.db is absent — a runtime override has nothing to override, the
+    /// error names the remedy, and the refusal must NOT create the db; an
+    /// initialized (empty-file) db migrates and accepts the flip.
+    #[tokio::test]
+    async fn mode_write_refuses_when_state_db_absent_then_accepts_after_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+
+        let err = write_mode_override_at(&db, "auto").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("state.db not found"), "{msg}");
+        assert!(msg.contains("zen serve start"), "{msg}");
+        assert!(!db.exists(), "refusal must not create the db");
+
+        SqliteClient::open(&db).await.expect("init db");
+
+        write_mode_override_at(&db, "auto")
+            .await
+            .expect("initialized db accepts the flip");
     }
 }

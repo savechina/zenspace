@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use admission_harness::{
-    ALLOWED_MEMBER, DENIED_MEMBER, EchoExec, group_event, open_db, spawn_stack, wait_for_decisions,
-    wait_identified,
+    ALLOWED_C2C_USER, ALLOWED_MEMBER, DENIED_MEMBER, EchoExec, c2c_event, decisions, group_event,
+    open_db, spawn_stack, wait_for_decisions, wait_for_group_reply, wait_identified,
 };
 use zen_core::config::{QqBotChannelConfig, admission_policy_version_for};
 use zen_repo::QqBindingRepo;
@@ -249,6 +249,88 @@ async fn off_mode_records_rejection() {
     assert_eq!(rows[0].accept_mode, "off");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(stack.mock.group_sends_snapshot().is_empty());
+
+    stack.shutdown().await;
+}
+
+/// (g) Audit-remediation R-6a (2026-11-22): built-in commands (`/new`)
+/// bypass the admission gate entirely — the confirmation reply still lands,
+/// the executor is never called, and the trust ledger records NOTHING
+/// (the owner's control channel must not pollute the ledger).
+#[tokio::test]
+async fn builtin_commands_bypass_the_admission_gate() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stack = spawn_stack(
+        Arc::new(EchoExec {
+            calls: Arc::clone(&calls),
+            slow_contains: None,
+        }),
+        None,
+    )
+    .await;
+    wait_identified(&stack).await;
+    let db = open_db(&stack).await;
+
+    stack
+        .mock
+        .inject(group_event("CMD1", ALLOWED_MEMBER, "/new"));
+
+    let sends = wait_for_group_reply(&stack, "CMD1").await;
+    assert!(
+        !sends.is_empty(),
+        "the /new confirmation reply must land through the normal reply path"
+    );
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let rows = decisions(&db).await;
+    assert!(
+        rows.is_empty(),
+        "built-in commands must not create ledger rows, got {rows:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    stack.shutdown().await;
+}
+
+/// (h) Audit-remediation R-6b (2026-11-22): C2C events flow through the SAME
+/// gate — the sender identity is the C2C `author.id` namespace, the
+/// allowlist matches it like a group openid, and observe keeps its
+/// zero-execution contract on the C2C reply path too (FR-001, SC-003).
+#[tokio::test]
+async fn c2c_events_flow_through_the_same_gate() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stack = spawn_stack(
+        Arc::new(EchoExec {
+            calls: Arc::clone(&calls),
+            slow_contains: None,
+        }),
+        None,
+    )
+    .await;
+    wait_identified(&stack).await;
+    let db = open_db(&stack).await;
+
+    stack
+        .mock
+        .inject(c2c_event("C2C1", ALLOWED_C2C_USER, "draft a summary"));
+
+    let rows = wait_for_decisions(&db, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.disposition, "would_accept");
+    assert_eq!(
+        row.sender, ALLOWED_C2C_USER,
+        "the C2C author.id namespace is the sender identity"
+    );
+    assert_eq!(row.strength.as_deref(), Some("explicit"));
+    assert_eq!(row.matched_rule.as_deref(), Some("allowlist"));
+    assert_eq!(row.accept_mode, "observe");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        stack.mock.c2c_sends_snapshot().is_empty(),
+        "observe must not reply on the C2C path either"
+    );
 
     stack.shutdown().await;
 }

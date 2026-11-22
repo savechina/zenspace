@@ -256,17 +256,28 @@ impl AcceptMode {
         let Some(raw) = raw else {
             return AcceptMode::Observe;
         };
-        match raw.trim().to_lowercase().as_str() {
-            "off" => AcceptMode::Off,
-            "observe" => AcceptMode::Observe,
-            "auto" => AcceptMode::Auto,
-            _ => {
+        match AcceptMode::classify(raw) {
+            Ok(mode) => mode,
+            Err(value) => {
                 tracing::warn!(
-                    value = %raw,
+                    value = %value,
                     "invalid [channels.qqbot] accept_mode (expected off/observe/auto); falling back to observe"
                 );
                 AcceptMode::Observe
             }
+        }
+    }
+
+    /// Classify one raw accept_mode spelling (pure): `Ok` for the three
+    /// recognized values (case-insensitive, whitespace-trimmed), `Err` with
+    /// the original input otherwise — `parse` warns and degrades to Observe
+    /// on the `Err` arm (E11 decision point, pinned separately from the warn).
+    pub fn classify(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_lowercase().as_str() {
+            "off" => Ok(AcceptMode::Off),
+            "observe" => Ok(AcceptMode::Observe),
+            "auto" => Ok(AcceptMode::Auto),
+            _ => Err(raw.to_string()),
         }
     }
 }

@@ -240,6 +240,19 @@ accept_mode = "bogus"
     assert_eq!(invalid.qqbot_accept_mode(), AcceptMode::Observe);
 }
 
+// Audit-remediation R-4 (2026-11-22): the E11 classification decision is a
+// pure function pinned separately from the warn side effect — recognized
+// spellings (case-insensitive, trimmed) classify, garbage carries the
+// ORIGINAL input in the Err so the warn log can name it.
+#[test]
+fn admission_accept_mode_classify_is_the_pure_e11_decision() {
+    assert_eq!(AcceptMode::classify("off"), Ok(AcceptMode::Off));
+    assert_eq!(AcceptMode::classify("Observe"), Ok(AcceptMode::Observe));
+    assert_eq!(AcceptMode::classify("  AUTO "), Ok(AcceptMode::Auto));
+    assert_eq!(AcceptMode::classify("bogus"), Err("bogus".to_string()));
+    assert_eq!(AcceptMode::classify(""), Err(String::new()));
+}
+
 // Pin 7 (D6): policy version is stable for the identical effective section and
 // changes when the mode or the identity set changes (order/dupes are canonical).
 #[test]

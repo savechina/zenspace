@@ -123,7 +123,11 @@ pub const SCOPE_RULE: &str = "rule";
 /// Order of adjudication:
 /// 1. Live-ticket thread continuation ⇒ `Admitted` with `Explicit` strength,
 ///    regardless of allowlist or mode — it rides an already-granted mandate
-///    (FR-014: mode changes affect future admissions only).
+///    (FR-014: mode changes affect future admissions only). The mandate
+///    scope is the THREAD (the originating conversation), not the sender:
+///    by design any member of that conversation may continue an open
+///    ticket, because the grant authorized the work request, not the person
+///    (audit-remediation R-5, 2026-11-22 — recorded, not a bug).
 /// 2. No explicit identity and no matched rule ⇒ `Rejected`
 ///    ("sender not allowlisted"), in every mode.
 /// 3. `Off` ⇒ `Rejected` ("mode off"), recorded, no execution.
